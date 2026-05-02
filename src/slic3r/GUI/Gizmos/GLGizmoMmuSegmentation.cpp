@@ -1995,6 +1995,8 @@ struct ManagedRegionColorSource
     std::vector<std::vector<TriangleSelector::FacetStateTriangle>> triangles_per_type;
     std::vector<std::unordered_map<int, std::vector<size_t>>>      by_source_triangle;
     std::vector<ColorRGBA>                                         state_colors;
+    std::vector<std::vector<int>>                                  nearby_source_triangles;
+    float                                                          nearby_painted_distance_sq = 0.f;
 };
 
 struct ManagedColorSourceFlags
@@ -2099,6 +2101,10 @@ static ManagedRegionColorSource build_managed_region_color_source(const ModelVol
     const std::vector<ColorRGBA> physical_colors = parse_managed_color_strings(physical_color_strings);
     const std::vector<ColorRGBA> display_colors = parse_managed_color_strings(display_color_strings);
     const unsigned int base_filament_id = volume.extruder_id() > 0 ? unsigned(volume.extruder_id()) : 1u;
+    const indexed_triangle_set &its = volume.mesh().its;
+    const float mesh_span = mesh_max_axis_span(its);
+    const float nearby_distance = std::max(mesh_span / 5000.f, 0.002f);
+    source.nearby_painted_distance_sq = nearby_distance * nearby_distance;
 
     source.state_colors.reserve(source.triangles_per_type.size());
     for (size_t state_idx = 0; state_idx < source.triangles_per_type.size(); ++state_idx) {
@@ -2113,20 +2119,49 @@ static ManagedRegionColorSource build_managed_region_color_source(const ModelVol
             by_source[source.triangles_per_type[state_idx][idx].source_triangle].emplace_back(idx);
     }
 
+    std::vector<std::vector<int>> triangles_by_vertex(its.vertices.size());
+    for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+        const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
+        for (int corner = 0; corner < 3; ++corner)
+            if (tri[corner] >= 0 && size_t(tri[corner]) < triangles_by_vertex.size())
+                triangles_by_vertex[size_t(tri[corner])].emplace_back(int(tri_idx));
+    }
+
+    source.nearby_source_triangles.resize(its.indices.size());
+    for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+        std::vector<int> &nearby = source.nearby_source_triangles[tri_idx];
+        nearby.emplace_back(int(tri_idx));
+        const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
+        for (int corner = 0; corner < 3; ++corner) {
+            if (tri[corner] < 0 || size_t(tri[corner]) >= triangles_by_vertex.size())
+                continue;
+            nearby.insert(nearby.end(), triangles_by_vertex[size_t(tri[corner])].begin(), triangles_by_vertex[size_t(tri[corner])].end());
+        }
+        std::sort(nearby.begin(), nearby.end());
+        nearby.erase(std::unique(nearby.begin(), nearby.end()), nearby.end());
+    }
+
     return source;
 }
 
-static std::optional<ColorRGBA> sample_managed_region_color_source(const ManagedRegionColorSource &source,
-                                                                   int                             source_triangle,
-                                                                   const Vec3f                    &point)
+struct ManagedRegionColorCandidate
 {
     std::optional<ColorRGBA> inside_color;
-    float best_inside_score = -std::numeric_limits<float>::max();
-    size_t best_inside_state = 0;
+    size_t                   inside_state = 0;
+    float                    inside_score = -std::numeric_limits<float>::max();
     std::optional<ColorRGBA> nearest_color;
-    float nearest_distance_sq = std::numeric_limits<float>::max();
-    size_t nearest_state = 0;
+    size_t                   nearest_state = 0;
+    float                    nearest_distance_sq = std::numeric_limits<float>::max();
+    std::optional<ColorRGBA> nearest_painted_color;
+    size_t                   nearest_painted_state = 0;
+    float                    nearest_painted_distance_sq = std::numeric_limits<float>::max();
+};
 
+static void consider_managed_region_source_triangle(const ManagedRegionColorSource &source,
+                                                    int                             source_triangle,
+                                                    const Vec3f                    &point,
+                                                    ManagedRegionColorCandidate    &candidate)
+{
     for (size_t state_idx = 0; state_idx < source.triangles_per_type.size(); ++state_idx) {
         if (state_idx >= source.by_source_triangle.size() || state_idx >= source.state_colors.size())
             continue;
@@ -2147,28 +2182,65 @@ static std::optional<ColorRGBA> sample_managed_region_color_source(const Managed
                 continue;
             if (weights.x() >= tolerance && weights.y() >= tolerance && weights.z() >= tolerance) {
                 const float score = std::min({ weights.x(), weights.y(), weights.z() });
-                if (!inside_color ||
-                    score > best_inside_score + 1e-6f ||
-                    (std::abs(score - best_inside_score) <= 1e-6f && state_idx > best_inside_state)) {
-                    inside_color = source.state_colors[state_idx];
-                    best_inside_score = score;
-                    best_inside_state = state_idx;
+                if (!candidate.inside_color ||
+                    score > candidate.inside_score + 1e-6f ||
+                    (std::abs(score - candidate.inside_score) <= 1e-6f && state_idx > candidate.inside_state)) {
+                    candidate.inside_color = source.state_colors[state_idx];
+                    candidate.inside_score = score;
+                    candidate.inside_state = state_idx;
                 }
             }
 
             const Vec3f closest = closest_point_on_triangle(point, facet.vertices[0], facet.vertices[1], facet.vertices[2]);
             const float distance_sq = (point - closest).squaredNorm();
-            if (!nearest_color ||
-                distance_sq < nearest_distance_sq - 1e-8f ||
-                (std::abs(distance_sq - nearest_distance_sq) <= 1e-8f && state_idx > nearest_state)) {
-                nearest_color = source.state_colors[state_idx];
-                nearest_distance_sq = distance_sq;
-                nearest_state = state_idx;
+            if (!candidate.nearest_color ||
+                distance_sq < candidate.nearest_distance_sq - 1e-8f ||
+                (std::abs(distance_sq - candidate.nearest_distance_sq) <= 1e-8f && state_idx > candidate.nearest_state)) {
+                candidate.nearest_color = source.state_colors[state_idx];
+                candidate.nearest_distance_sq = distance_sq;
+                candidate.nearest_state = state_idx;
+            }
+            if (state_idx > 0 &&
+                (!candidate.nearest_painted_color ||
+                 distance_sq < candidate.nearest_painted_distance_sq - 1e-8f ||
+                 (std::abs(distance_sq - candidate.nearest_painted_distance_sq) <= 1e-8f && state_idx > candidate.nearest_painted_state))) {
+                candidate.nearest_painted_color = source.state_colors[state_idx];
+                candidate.nearest_painted_distance_sq = distance_sq;
+                candidate.nearest_painted_state = state_idx;
             }
         }
     }
+}
 
-    return inside_color ? inside_color : nearest_color;
+static std::optional<ColorRGBA> sample_managed_region_color_source(const ManagedRegionColorSource &source,
+                                                                   int                             source_triangle,
+                                                                   const Vec3f                    &point)
+{
+    ManagedRegionColorCandidate same_triangle;
+    consider_managed_region_source_triangle(source, source_triangle, point, same_triangle);
+
+    if (same_triangle.inside_color && same_triangle.inside_state > 0)
+        return same_triangle.inside_color;
+
+    ManagedRegionColorCandidate nearby = same_triangle;
+    if (source_triangle >= 0 && size_t(source_triangle) < source.nearby_source_triangles.size()) {
+        for (const int nearby_triangle : source.nearby_source_triangles[size_t(source_triangle)]) {
+            if (nearby_triangle == source_triangle)
+                continue;
+            consider_managed_region_source_triangle(source, nearby_triangle, point, nearby);
+        }
+    }
+
+    if (nearby.nearest_painted_color && nearby.nearest_painted_distance_sq <= source.nearby_painted_distance_sq)
+        return nearby.nearest_painted_color;
+
+    if (same_triangle.inside_color)
+        return same_triangle.inside_color;
+    if (same_triangle.nearest_color)
+        return same_triangle.nearest_color;
+    if (nearby.nearest_color)
+        return nearby.nearest_color;
+    return std::nullopt;
 }
 
 static ColorRGBA sample_managed_volume_color_source(const ModelVolume                &volume,
@@ -2350,6 +2422,8 @@ static bool convert_object_to_image_texture(ModelObject &object, const ManagedCo
         const VolumeColorSource rgba_source = build_volume_color_source(*volume);
         const ManagedRegionColorSource region_source = build_managed_region_color_source(*volume);
         for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+            const uint32_t cell_x = uint32_t(tri_idx % grid);
+            const uint32_t cell_y = uint32_t(tri_idx / grid);
             const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
             if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
                 continue;
@@ -2395,8 +2469,10 @@ static bool convert_object_to_image_texture(ModelObject &object, const ManagedCo
                 for (int x_px = min_x; x_px <= max_x; ++x_px) {
                     Vec3f barycentric = Vec3f::Zero();
                     const Vec2f pixel(float(x_px) + 0.5f, float(y_px) + 0.5f);
-                    if (!conservative_barycentric_weights_2d(pixel, pixel_uvs[0], pixel_uvs[1], pixel_uvs[2], texture_padding, barycentric))
+                    if (!barycentric_weights_2d(pixel, pixel_uvs[0], pixel_uvs[1], pixel_uvs[2], barycentric))
                         continue;
+                    if (barycentric.x() < -1e-4f || barycentric.y() < -1e-4f || barycentric.z() < -1e-4f)
+                        barycentric = normalized_nonnegative_barycentric(barycentric);
 
                     const Vec3f point = vertices[0] * barycentric.x() +
                                         vertices[1] * barycentric.y() +
@@ -2871,8 +2947,7 @@ private:
         if (!clear_object_managed_color_data(*m_object, type))
             return;
 
-        refresh_managed_color_data_object(m_canvas, m_object);
-        notify_object_changed();
+        refresh_object_after_change();
         refresh_rows();
     }
 
@@ -2928,8 +3003,7 @@ private:
             if (!convert_object_managed_color_data(*m_object, type, source, this))
                 return;
 
-            refresh_managed_color_data_object(m_canvas, m_object);
-            notify_object_changed();
+            refresh_object_after_change();
             refresh_rows();
             return;
         }
@@ -2938,8 +3012,7 @@ private:
         if (!convert_object_managed_color_data(*m_object, type, source))
             return;
 
-        refresh_managed_color_data_object(m_canvas, m_object);
-        notify_object_changed();
+        refresh_object_after_change();
         refresh_rows();
     }
 
@@ -2947,6 +3020,15 @@ private:
     {
         if (m_on_object_changed)
             m_on_object_changed();
+    }
+
+    void refresh_object_after_change()
+    {
+        refresh_managed_color_data_object(m_canvas, m_object);
+        notify_object_changed();
+        m_canvas.set_as_dirty();
+        m_canvas.request_extra_frame();
+        m_canvas.render();
     }
 
     const char *clear_snapshot_name(ManagedColorDataType type) const
@@ -4321,6 +4403,7 @@ void GLGizmoMmuSegmentation::convert_selected_regions_to_vertex_colors()
         };
 
         std::vector<VertexColorAccumulator> accumulators(its.vertices.size());
+        std::vector<VertexColorAccumulator> painted_accumulators(its.vertices.size());
         bool accumulated_any = false;
         const unsigned int base_filament_id = volume->extruder_id() > 0 ? unsigned(volume->extruder_id()) : 1u;
 
@@ -4361,18 +4444,27 @@ void GLGizmoMmuSegmentation::convert_selected_regions_to_vertex_colors()
                 else
                     weights = Vec3f(1.f / 3.f, 1.f / 3.f, 1.f / 3.f);
 
-                const float area = 0.5f * (triangle.vertices[1] - triangle.vertices[0]).cross(triangle.vertices[2] - triangle.vertices[0]).norm();
+                const float area = 0.5f *
+                    (triangle.vertices[1] - triangle.vertices[0]).cross(triangle.vertices[2] - triangle.vertices[0]).norm();
                 const double area_weight = std::max(double(area), 1e-6);
                 const std::array<float, 3> bary = { weights.x(), weights.y(), weights.z() };
 
                 for (size_t corner = 0; corner < 3; ++corner) {
-                    VertexColorAccumulator &acc = accumulators[size_t(source_indices[corner])];
                     const double weight = area_weight * double(bary[corner]);
+                    VertexColorAccumulator &acc = accumulators[size_t(source_indices[corner])];
                     acc.r += double(state_color.r()) * weight;
                     acc.g += double(state_color.g()) * weight;
                     acc.b += double(state_color.b()) * weight;
                     acc.a += double(state_color.a()) * weight;
                     acc.weight += weight;
+                    if (state_idx > 0) {
+                        VertexColorAccumulator &painted_acc = painted_accumulators[size_t(source_indices[corner])];
+                        painted_acc.r += double(state_color.r()) * weight;
+                        painted_acc.g += double(state_color.g()) * weight;
+                        painted_acc.b += double(state_color.b()) * weight;
+                        painted_acc.a += double(state_color.a()) * weight;
+                        painted_acc.weight += weight;
+                    }
                 }
                 accumulated_any = true;
             }
@@ -4384,7 +4476,10 @@ void GLGizmoMmuSegmentation::convert_selected_regions_to_vertex_colors()
         const ColorRGBA fallback_color = color_for_filament_id(base_filament_id);
         std::vector<uint32_t> vertex_colors;
         vertex_colors.reserve(its.vertices.size());
-        for (const VertexColorAccumulator &acc : accumulators) {
+        for (size_t vertex_idx = 0; vertex_idx < accumulators.size(); ++vertex_idx) {
+            const VertexColorAccumulator &acc = painted_accumulators[vertex_idx].weight > 0.0 ?
+                painted_accumulators[vertex_idx] :
+                accumulators[vertex_idx];
             if (acc.weight > 0.0) {
                 vertex_colors.emplace_back(pack_vertex_color_rgba(ColorRGBA(float(acc.r / acc.weight),
                                                                             float(acc.g / acc.weight),
