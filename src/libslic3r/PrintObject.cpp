@@ -1089,6 +1089,13 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "interlocking_boundary_avoidance"
             || opt_key == "interlocking_beam_width") {
             steps.emplace_back(posSlice);
+        } else if (
+               opt_key == "texture_mapping_outer_wall_gradient_global_strength"
+            || opt_key == "texture_mapping_outer_wall_gradient_max_line_width"
+            || opt_key == "texture_mapping_outer_wall_gradient_min_line_width"
+            || opt_key == "texture_mapping_definitions"
+            || opt_key == "texture_mapping_global_settings") {
+            steps.emplace_back(posSlice);
 		} else if (
                opt_key == "elefant_foot_compensation"
             || opt_key == "elefant_foot_compensation_layers"

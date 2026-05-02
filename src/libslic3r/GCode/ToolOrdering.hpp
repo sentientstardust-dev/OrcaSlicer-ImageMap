@@ -237,6 +237,7 @@ public:
     std::vector<LayerTools>::const_iterator begin() const { return m_layer_tools.begin(); }
     std::vector<LayerTools>::const_iterator end()   const { return m_layer_tools.end(); }
     bool 				empty()       const { return m_layer_tools.empty(); }
+    const std::vector<LayerTools>& layer_tools() const { return m_layer_tools; }
     std::vector<LayerTools>& layer_tools() { return m_layer_tools; }
     bool 				has_wipe_tower() const { return ! m_layer_tools.empty() && m_first_printing_extruder != (unsigned int)-1 && m_layer_tools.front().has_wipe_tower; }
 

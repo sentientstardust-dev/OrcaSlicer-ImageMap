@@ -2,6 +2,7 @@
 #include "WipeTower2.hpp"
 
 #include <cassert>
+#include <algorithm>
 #include <iostream>
 #include <vector>
 #include <numeric>
@@ -658,6 +659,7 @@ public:
 	const Vec2f& 		 pos()   const { return m_current_pos; }
 	const Vec2f	 		 start_pos_rotated() const { return m_start_pos; }
 	const Vec2f  		 pos_rotated() const { return this->rotate(m_current_pos); }
+    const Vec2f          point_rotated(const Vec2f& pt) const { return this->rotate(pt); }
 	float 				 elapsed_time() const { return m_elapsed_time; }
     float                get_and_reset_used_filament_length() { float temp = m_used_filament_length; m_used_filament_length = 0.f; return temp; }
 
@@ -1213,6 +1215,255 @@ private:
 	}
 
 }; // class WipeTowerWriter2
+
+static float prime_tower_polygon_area(const std::vector<Vec2f>& points)
+{
+    double area = 0.0;
+    for (size_t i = 0; i < points.size(); ++i) {
+        const Vec2f& a = points[i];
+        const Vec2f& b = points[(i + 1) % points.size()];
+        area += double(a.x()) * double(b.y()) - double(b.x()) * double(a.y());
+    }
+    return float(0.5 * area);
+}
+
+static float prime_tower_flow_scale_for_width(float reference_width, float target_width, float layer_height)
+{
+    const float round_correction = layer_height * float(1. - M_PI / 4.);
+    const float reference_area = layer_height * std::max(0.001f, reference_width - round_correction);
+    const float target_area = layer_height * std::max(0.001f, target_width - round_correction);
+    return std::clamp(target_area / reference_area, 0.05f, 4.f);
+}
+
+static bool prime_tower_path_explicitly_closed(const std::vector<Vec2f>& points)
+{
+    return points.size() > 2 && (points.front() - points.back()).norm() <= EPSILON;
+}
+
+struct PrimeTowerPreparedTexturePath
+{
+    std::vector<Vec2f> points;
+    std::vector<Vec2f> sample_points;
+    float             anchor_distance = 0.f;
+};
+
+static float prime_tower_texture_anchor_distance(const std::vector<Vec2f>& points,
+                                                 size_t segment_count,
+                                                 const Vec2f& center,
+                                                 float angle_deg)
+{
+    float travelled = 0.f;
+    float fallback_distance = 0.f;
+    float fallback_dist = std::numeric_limits<float>::max();
+    float best_distance = std::numeric_limits<float>::max();
+    float best_projection = -std::numeric_limits<float>::max();
+    const float angle = Geometry::deg2rad(angle_deg);
+    const Vec2f ray_dir(std::cos(angle), std::sin(angle));
+    for (size_t i = 0; i < segment_count; ++i) {
+        const size_t next_i = i + 1 == points.size() ? 0 : i + 1;
+        const Vec2f a = points[i];
+        const Vec2f b = points[next_i];
+        const Vec2f delta = b - a;
+        const float len = delta.norm();
+        if (len <= EPSILON)
+            continue;
+
+        const Vec2f from_center = a - center;
+        const float denom = ray_dir.x() * delta.y() - ray_dir.y() * delta.x();
+        if (std::abs(denom) > EPSILON) {
+            const float projection = (from_center.x() * delta.y() - from_center.y() * delta.x()) / denom;
+            const float segment_t = (from_center.x() * ray_dir.y() - from_center.y() * ray_dir.x()) / denom;
+            if (projection >= -EPSILON && segment_t >= -EPSILON && segment_t <= 1.f + EPSILON && projection > best_projection) {
+                best_projection = projection;
+                best_distance = travelled + len * std::clamp(segment_t, 0.f, 1.f);
+            }
+        } else if (std::abs(from_center.x() * ray_dir.y() - from_center.y() * ray_dir.x()) <= EPSILON) {
+            const float projection_a = from_center.dot(ray_dir);
+            const float projection_b = (b - center).dot(ray_dir);
+            if (projection_a >= -EPSILON || projection_b >= -EPSILON) {
+                const bool use_b = projection_b > projection_a;
+                const float projection = use_b ? projection_b : projection_a;
+                if (projection > best_projection) {
+                    best_projection = projection;
+                    best_distance = travelled + (use_b ? len : 0.f);
+                }
+            }
+        }
+
+        const float fallback_t = std::clamp((center - a).dot(delta) / (len * len), 0.f, 1.f);
+        const Vec2f fallback_point = a + delta * fallback_t - center;
+        const float projection = fallback_point.dot(ray_dir);
+        const float perpendicular = fallback_point.x() * ray_dir.y() - fallback_point.y() * ray_dir.x();
+        const float fallback_score = perpendicular * perpendicular + (projection < 0.f ? projection * projection : 0.f);
+        if (fallback_score < fallback_dist - EPSILON) {
+            fallback_dist = fallback_score;
+            fallback_distance = travelled + len * fallback_t;
+        }
+        travelled += len;
+    }
+    return best_projection > -std::numeric_limits<float>::max() ? best_distance : fallback_distance;
+}
+
+static PrimeTowerPreparedTexturePath prime_tower_prepare_texture_path(WipeTowerWriter2& writer,
+                                                                      const std::vector<Vec2f>& points,
+                                                                      bool closed_path,
+                                                                      const Vec2f& center,
+                                                                      float angle_deg)
+{
+    const bool explicit_closed = prime_tower_path_explicitly_closed(points);
+    if (points.size() < 2) {
+        std::vector<Vec2f> sample_points;
+        sample_points.reserve(points.size());
+        for (const Vec2f& point : points)
+            sample_points.emplace_back(writer.point_rotated(point));
+        return {points, sample_points, 0.f};
+    }
+    if (!closed_path && !explicit_closed) {
+        std::vector<Vec2f> sample_points;
+        sample_points.reserve(points.size());
+        for (const Vec2f& point : points)
+            sample_points.emplace_back(writer.point_rotated(point));
+        return {points, sample_points, prime_tower_texture_anchor_distance(sample_points, sample_points.size() - 1, center, angle_deg)};
+    }
+
+    std::vector<Vec2f> unique_points(points.begin(), points.end());
+    if (explicit_closed)
+        unique_points.pop_back();
+    if (unique_points.size() < 2) {
+        std::vector<Vec2f> sample_points;
+        sample_points.reserve(points.size());
+        for (const Vec2f& point : points)
+            sample_points.emplace_back(writer.point_rotated(point));
+        return {points, sample_points, 0.f};
+    }
+    if (prime_tower_polygon_area(unique_points) < 0.f)
+        std::reverse(unique_points.begin(), unique_points.end());
+
+    std::vector<Vec2f> ordered = std::move(unique_points);
+    if (!closed_path)
+        ordered.emplace_back(ordered.front());
+    const size_t segment_count = closed_path ? ordered.size() : ordered.size() - 1;
+    std::vector<Vec2f> sample_points;
+    sample_points.reserve(ordered.size());
+    for (const Vec2f& point : ordered)
+        sample_points.emplace_back(writer.point_rotated(point));
+    return {ordered, sample_points, prime_tower_texture_anchor_distance(sample_points, segment_count, center, angle_deg)};
+}
+
+static void prime_tower_textured_path(WipeTowerWriter2& writer,
+                                      const PrimeTowerTextureRenderSettings& texture,
+                                      const std::vector<Vec2f>& points,
+                                      bool closed_path,
+                                      const Vec2f& texture_center,
+                                      float feedrate,
+                                      float extrusion_flow,
+                                      float reference_width,
+                                      float layer_height,
+                                      float print_z,
+                                      size_t current_tool)
+{
+    if (!texture.valid() || points.size() < 2)
+        return;
+
+    const PrimeTowerPreparedTexturePath texture_path = prime_tower_prepare_texture_path(
+        writer, points, closed_path, texture_center, std::clamp(texture.angle_offset_deg, 0.f, 360.f));
+    const std::vector<Vec2f>& texture_points = texture_path.points;
+    const std::vector<Vec2f>& sample_points = texture_path.sample_points;
+    const size_t segment_count = closed_path ? texture_points.size() : texture_points.size() - 1;
+    if (segment_count == 0)
+        return;
+
+    float total_length = 0.f;
+    for (size_t i = 0; i < segment_count; ++i) {
+        const size_t next_i = i + 1 == sample_points.size() ? 0 : i + 1;
+        total_length += (sample_points[next_i] - sample_points[i]).norm();
+    }
+    if (total_length <= EPSILON)
+        return;
+
+    const float area = prime_tower_polygon_area(texture_points);
+    const float orientation = area >= 0.f ? 1.f : -1.f;
+    const float v = texture.z_max > texture.z_min + EPSILON ?
+        std::clamp((print_z - texture.z_min) / (texture.z_max - texture.z_min), 0.f, 1.f) :
+        0.f;
+    const float base_width = std::max(0.05f, texture.max_line_width);
+    const float config_min_width = std::clamp(texture.min_line_width, 0.05f, base_width);
+    const float min_width_for_positive_spacing = layer_height * float(1. - 0.25 * PI) + 1e-4f;
+    const float min_width = std::clamp(std::max(config_min_width, min_width_for_positive_spacing), 0.05f, base_width);
+    const float width_range = (base_width - min_width) * std::clamp(texture.global_strength, 0.f, 1.f);
+    const float sample_step = std::max(0.35f, reference_width);
+
+    float travelled = 0.f;
+    bool have_shifted_pos = false;
+    Vec2f shifted_pos = writer.pos();
+    for (size_t i = 0; i < segment_count; ++i) {
+        const size_t next_i = i + 1 == texture_points.size() ? 0 : i + 1;
+        const Vec2f a = texture_points[i];
+        const Vec2f b = texture_points[next_i];
+        const Vec2f sample_a = sample_points[i];
+        const Vec2f sample_b = sample_points[next_i];
+        const Vec2f delta = b - a;
+        const Vec2f sample_delta = sample_b - sample_a;
+        const float len = delta.norm();
+        const float sample_len = sample_delta.norm();
+        if (len <= EPSILON)
+            continue;
+
+        const Vec2f dir = delta / len;
+        const Vec2f outward = orientation >= 0.f ? Vec2f(dir.y(), -dir.x()) : Vec2f(-dir.y(), dir.x());
+        const int steps = std::max(1, int(std::ceil(len / sample_step)));
+        for (int step = 0; step < steps; ++step) {
+            const float t0 = float(step) / float(steps);
+            const float t1 = float(step + 1) / float(steps);
+            const float mid_distance = travelled + sample_len * (0.5f * (t0 + t1));
+            const float u = (mid_distance - texture_path.anchor_distance) / total_length;
+            const float visibility = texture.sample_tool_visibility(current_tool, u, v);
+            const float target_width = base_width - (1.f - visibility) * width_range;
+            const float flow_scale = prime_tower_flow_scale_for_width(reference_width, target_width, layer_height);
+            const float centerline_shift = 0.5f * (base_width - reference_width) + 0.5f * (base_width - target_width);
+            const Vec2f p0 = a + delta * t0 - outward * centerline_shift;
+            const Vec2f p1 = a + delta * t1 - outward * centerline_shift;
+            if (!have_shifted_pos || (p0 - shifted_pos).norm() > 0.001f) {
+                writer.travel(p0);
+                shifted_pos = p0;
+                have_shifted_pos = true;
+            }
+            writer.extrude_explicit(p1, (p1 - p0).norm() * extrusion_flow * flow_scale, feedrate, true);
+            shifted_pos = p1;
+        }
+        travelled += sample_len;
+    }
+}
+
+static void prime_tower_textured_closed_path(WipeTowerWriter2& writer,
+                                             const PrimeTowerTextureRenderSettings& texture,
+                                             const std::vector<Vec2f>& points,
+                                             const Vec2f& texture_center,
+                                             float feedrate,
+                                             float extrusion_flow,
+                                             float reference_width,
+                                             float layer_height,
+                                             float print_z,
+                                             size_t current_tool)
+{
+    prime_tower_textured_path(
+        writer, texture, points, true, texture_center, feedrate, extrusion_flow, reference_width, layer_height, print_z, current_tool);
+}
+
+static void prime_tower_textured_open_path(WipeTowerWriter2& writer,
+                                           const PrimeTowerTextureRenderSettings& texture,
+                                           const std::vector<Vec2f>& points,
+                                           const Vec2f& texture_center,
+                                           float feedrate,
+                                           float extrusion_flow,
+                                           float reference_width,
+                                           float layer_height,
+                                           float print_z,
+                                           size_t current_tool)
+{
+    prime_tower_textured_path(
+        writer, texture, points, false, texture_center, feedrate, extrusion_flow, reference_width, layer_height, print_z, current_tool);
+}
 
 
 
@@ -2527,7 +2778,45 @@ Polygon WipeTower2::generate_support_rib_wall(WipeTowerWriter2&                 
         result_wall.push_back(to_polyline(wall_polygon));
         insert_skip_polygon = wall_polygon;
     }
-    writer.generate_path(result_wall, feedrate, retract_length, retract_speed, m_used_fillet);
+    bool textured_path_written = false;
+    if (m_prime_tower_texture.valid() && result_wall.size() == 1 && !result_wall.front().points.empty()) {
+        const bool closed_texture_path = !rib_wall && !skip_points;
+        std::vector<Vec2f> points;
+        points.reserve(result_wall.front().points.size());
+        for (const Point &point : result_wall.front().points)
+            points.emplace_back(unscaled<float>(point));
+        if (closed_texture_path && points.size() > 1 && (points.front() - points.back()).norm() <= EPSILON)
+            points.pop_back();
+        if (points.size() > 1) {
+            const Vec2f texture_center = writer.point_rotated((wt_box.ld + wt_box.ru) / 2.f);
+            if (closed_texture_path)
+                prime_tower_textured_closed_path(writer,
+                                                 m_prime_tower_texture,
+                                                 points,
+                                                 texture_center,
+                                                 float(feedrate),
+                                                 m_extrusion_flow,
+                                                 m_perimeter_width,
+                                                 m_layer_height,
+                                                 m_z_pos,
+                                                 m_current_tool);
+            else
+                prime_tower_textured_open_path(writer,
+                                               m_prime_tower_texture,
+                                               points,
+                                               texture_center,
+                                               float(feedrate),
+                                               m_extrusion_flow,
+                                               m_perimeter_width,
+                                               m_layer_height,
+                                               m_z_pos,
+                                               m_current_tool);
+            textured_path_written = true;
+        }
+    }
+    if (!textured_path_written) {
+        writer.generate_path(result_wall, feedrate, retract_length, retract_speed, m_used_fillet);
+    }
     //if (m_cur_layer_id == 0) {
     //    BoundingBox bbox = get_extents(result_wall);
     //    m_rib_offset     = Vec2f(-unscaled<float>(bbox.min.x()), -unscaled<float>(bbox.min.y()));
@@ -2619,6 +2908,25 @@ Polygon WipeTower2::generate_support_cone_wall(
             }
         }
     }
+    if (m_prime_tower_texture.valid() && polylines.empty()) {
+        std::vector<Vec2f> ordered;
+        ordered.reserve(pts.size());
+        for (size_t j = 0; j < pts.size(); ++j)
+            ordered.emplace_back(pts[(size_t(start_i) + j) % pts.size()].first);
+        const Vec2f texture_center = writer.point_rotated((wt_box.ld + wt_box.ru) / 2.f);
+        prime_tower_textured_closed_path(writer,
+                                         m_prime_tower_texture,
+                                         ordered,
+                                         texture_center,
+                                         float(feedrate),
+                                         m_extrusion_flow,
+                                         m_perimeter_width,
+                                         m_layer_height,
+                                         m_z_pos,
+                                         m_current_tool);
+        return poly;
+    }
+
     writer.travel(pts[start_i].first);
 
     // Now actually extrude the boundary (and possibly infill):

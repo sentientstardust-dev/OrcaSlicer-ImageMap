@@ -54,6 +54,7 @@ public:
 
 	// Iterates through prepared m_plan, generates ToolChangeResults and appends them to "result"
 	void generate(std::vector<std::vector<WipeTower::ToolChangeResult>> &result);
+    void set_prime_tower_texture(const PrimeTowerTextureRenderSettings &settings) { m_prime_tower_texture = settings; }
 
     float get_depth() const { return m_wipe_tower_depth; }
 	std::vector<std::pair<float, float>> get_z_and_depth_pairs() const;
@@ -327,6 +328,7 @@ private:
     // Stores information about used filament length per extruder:
     std::vector<float> m_used_filament_length;
 	std::vector<std::pair<float, std::vector<float>>> m_used_filament_length_until_layer;
+    PrimeTowerTextureRenderSettings m_prime_tower_texture;
 
     // Return index of first toolchange that switches to non-soluble extruder
     // ot -1 if there is no such toolchange.

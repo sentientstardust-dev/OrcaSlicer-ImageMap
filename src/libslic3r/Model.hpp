@@ -14,6 +14,7 @@
 #include "BrimEarsPoint.hpp"
 #include "TriangleMesh.hpp"
 #include "CustomGCode.hpp"
+#include "TextureMapping.hpp"
 #include "calib.hpp"
 #include "enum_bitmask.hpp"
 #include "TextConfiguration.hpp"
@@ -1775,6 +1776,7 @@ public:
     std::string mk_version;
     std::vector<std::string> md_name;
     std::vector<std::string> md_value;
+    TextureMappingPrimeTowerImage texture_mapping_prime_tower_image;
 
     void SetDesigner(std::string designer, std::string designer_user_id) {
         if (design_info == nullptr) {

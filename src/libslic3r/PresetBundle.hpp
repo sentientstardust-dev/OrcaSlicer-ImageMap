@@ -225,6 +225,7 @@ public:
     // and they are being used by slicing core.
     DynamicPrintConfig          project_config;
     TextureMappingManager       texture_mapping_zones;
+    TextureMappingGlobalSettings texture_mapping_global_settings;
 
     // There will be an entry for each system profile loaded,
     // and the system profiles will point to the VendorProfile instances owned by PresetBundle::vendors.

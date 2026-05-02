@@ -1896,12 +1896,14 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
         (opt_key == "texture_mapping_outer_wall_gradient_global_strength" ||
          opt_key == "texture_mapping_outer_wall_gradient_max_line_width" ||
          opt_key == "texture_mapping_outer_wall_gradient_min_line_width" ||
-         opt_key == "texture_mapping_definitions")) {
+         opt_key == "texture_mapping_definitions" ||
+         opt_key == "texture_mapping_global_settings")) {
         DynamicPrintConfig &project_cfg = wxGetApp().preset_bundle->project_config;
         if (const ConfigOption *opt = m_config->option(opt_key))
             project_cfg.set_key_value(opt_key, opt->clone());
         if (wxGetApp().plater() != nullptr)
-            wxGetApp().sidebar().update_texture_mapping_panel(opt_key == "texture_mapping_definitions");
+            wxGetApp().sidebar().update_texture_mapping_panel(opt_key == "texture_mapping_definitions" ||
+                                                              opt_key == "texture_mapping_global_settings");
     }
 
     if (m_postpone_update_ui) {

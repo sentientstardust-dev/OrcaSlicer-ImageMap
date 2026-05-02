@@ -579,6 +579,7 @@ Model& Model::assign_copy(const Model &rhs)
     this->mk_version = rhs.mk_version;
     this->md_name = rhs.md_name;
     this->md_value = rhs.md_value;
+    this->texture_mapping_prime_tower_image = rhs.texture_mapping_prime_tower_image;
 
     return *this;
 }
@@ -614,6 +615,7 @@ Model& Model::assign_copy(Model &&rhs)
     this->mk_version = rhs.mk_version;
     this->md_name = rhs.md_name;
     this->md_value = rhs.md_value;
+    this->texture_mapping_prime_tower_image = std::move(rhs.texture_mapping_prime_tower_image);
     this->backup_path = std::move(rhs.backup_path);
     this->object_backup_id_map = std::move(rhs.object_backup_id_map);
     this->next_object_backup_id = rhs.next_object_backup_id;

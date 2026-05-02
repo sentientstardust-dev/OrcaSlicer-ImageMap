@@ -1294,6 +1294,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloatsNullable,      filament_flush_volumetric_speed))
     ((ConfigOptionIntsNullable,        filament_flush_temp))
     ((ConfigOptionString,              texture_mapping_definitions))
+    ((ConfigOptionString,              texture_mapping_global_settings))
     // BBS
     ((ConfigOptionBool,                scan_first_layer))
     ((ConfigOptionEnum<PowerLossRecoveryMode>, enable_power_loss_recovery))

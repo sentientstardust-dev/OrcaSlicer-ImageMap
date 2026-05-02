@@ -1122,9 +1122,10 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", Line %1%: enter")%__LINE__;
     // Normalize the config.
 	new_full_config.option("print_settings_id",            true);
-	new_full_config.option("filament_settings_id",         true);
-	new_full_config.option("printer_settings_id",          true);
+    new_full_config.option("filament_settings_id",         true);
+    new_full_config.option("printer_settings_id",          true);
     new_full_config.option("texture_mapping_definitions", true);
+    new_full_config.option("texture_mapping_global_settings", true);
 
     // BBS
     std::vector <unsigned int> used_filaments = this->extruders(true);
@@ -1239,6 +1240,8 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     std::scoped_lock<std::mutex> lock(this->state_mutex());
     if (const ConfigOptionStrings *color_opt = new_full_config.option<ConfigOptionStrings>("filament_colour", false); color_opt != nullptr)
         m_texture_mapping_mgr.load_entries(new_full_config.opt_string("texture_mapping_definitions"), color_opt->values);
+    m_texture_mapping_global_settings.load(new_full_config.opt_string("texture_mapping_global_settings"));
+    m_texture_mapping_prime_tower_image = model.texture_mapping_prime_tower_image;
 
     // The following call may stop the background processing.
     if (! print_diff.empty())

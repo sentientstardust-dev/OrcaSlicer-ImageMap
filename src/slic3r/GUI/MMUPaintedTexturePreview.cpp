@@ -42,6 +42,14 @@ struct TexturePreviewMixCandidate
     std::vector<float> weights;
 };
 
+struct TexturePreviewMixCandidateKdNode
+{
+    uint32_t candidate_idx { 0 };
+    int left { -1 };
+    int right { -1 };
+    uint8_t axis { 0 };
+};
+
 struct TexturePreviewSimulationSettings
 {
     int mapping_mode = int(TextureMappingZone::TextureMappingFilamentBlending);
@@ -51,11 +59,14 @@ struct TexturePreviewSimulationSettings
     bool compact_offset_mode = false;
     float contrast_pct = 100.f;
     float tone_gamma = 1.f;
+    int generic_solver_lookup_mode = int(TextureMappingZone::GenericSolverClosestMix);
     std::vector<unsigned int> component_ids;
     std::vector<std::array<float, 3>> component_colors;
     std::vector<float> component_strength_factors;
     std::vector<size_t> semantic_component_indices;
     std::vector<TexturePreviewMixCandidate> generic_mix_candidates;
+    std::vector<TexturePreviewMixCandidateKdNode> generic_mix_candidate_kd_nodes;
+    int generic_mix_candidate_kd_root { -1 };
 };
 
 struct SurfaceGradientPreviewSettings
@@ -558,10 +569,16 @@ std::vector<TexturePreviewMixCandidate> build_generic_mix_candidates(const std::
         return {};
 
     const size_t component_count = component_colors.size();
-    const int total_units = component_count <= 4 ? 20 : (component_count <= 6 ? 10 : 6);
+    const int total_units = component_count <= 4 ? 40 : (component_count == 5 ? 24 : (component_count == 6 ? 20 : 12));
     std::vector<int> units(component_count, 0);
     std::vector<TexturePreviewMixCandidate> candidates;
-    candidates.reserve(4096);
+    const size_t n = size_t(total_units) + component_count - 1;
+    size_t k = component_count - 1;
+    k = std::min(k, n - k);
+    size_t candidate_count = 1;
+    for (size_t idx = 1; idx <= k; ++idx)
+        candidate_count = (candidate_count * (n - k + idx)) / idx;
+    candidates.reserve(candidate_count);
 
     std::function<void(size_t, int)> recurse = [&](size_t idx, int remaining_units) {
         if (idx + 1 == component_count) {
@@ -584,23 +601,172 @@ std::vector<TexturePreviewMixCandidate> build_generic_mix_candidates(const std::
     return candidates;
 }
 
+int build_generic_mix_candidate_kd_tree(const std::vector<TexturePreviewMixCandidate> &candidates,
+                                        std::vector<TexturePreviewMixCandidateKdNode> &nodes,
+                                        std::vector<uint32_t> &indices,
+                                        size_t begin,
+                                        size_t end,
+                                        uint8_t axis)
+{
+    if (begin >= end)
+        return -1;
+
+    const size_t mid = begin + (end - begin) / 2;
+    auto axis_value = [&candidates, axis](uint32_t candidate_idx) {
+        return candidates[size_t(candidate_idx)].rgb[size_t(axis)];
+    };
+    std::nth_element(indices.begin() + begin, indices.begin() + mid, indices.begin() + end, [&axis_value](uint32_t lhs, uint32_t rhs) {
+        return axis_value(lhs) < axis_value(rhs);
+    });
+
+    const int node_idx = int(nodes.size());
+    TexturePreviewMixCandidateKdNode node;
+    node.candidate_idx = indices[mid];
+    node.axis = axis;
+    nodes.emplace_back(node);
+
+    const uint8_t next_axis = uint8_t((axis + 1) % 3);
+    const int left = build_generic_mix_candidate_kd_tree(candidates, nodes, indices, begin, mid, next_axis);
+    const int right = build_generic_mix_candidate_kd_tree(candidates, nodes, indices, mid + 1, end, next_axis);
+    nodes[size_t(node_idx)].left = left;
+    nodes[size_t(node_idx)].right = right;
+    return node_idx;
+}
+
+int build_generic_mix_candidate_kd_tree(const std::vector<TexturePreviewMixCandidate> &candidates,
+                                        std::vector<TexturePreviewMixCandidateKdNode> &nodes)
+{
+    nodes.clear();
+    if (candidates.empty())
+        return -1;
+
+    std::vector<uint32_t> indices(candidates.size(), 0);
+    for (size_t idx = 0; idx < candidates.size(); ++idx)
+        indices[idx] = uint32_t(idx);
+
+    nodes.reserve(candidates.size());
+    return build_generic_mix_candidate_kd_tree(candidates, nodes, indices, 0, candidates.size(), uint8_t(0));
+}
+
+struct TexturePreviewMixNearestResult
+{
+    size_t best_idx { size_t(-1) };
+    size_t second_idx { size_t(-1) };
+    float best_error { std::numeric_limits<float>::max() };
+    float second_error { std::numeric_limits<float>::max() };
+};
+
+void update_texture_preview_mix_nearest_result(TexturePreviewMixNearestResult &result, size_t candidate_idx, float error)
+{
+    if (candidate_idx == result.best_idx || candidate_idx == result.second_idx)
+        return;
+
+    if (error < result.best_error) {
+        result.second_error = result.best_error;
+        result.second_idx = result.best_idx;
+        result.best_error = error;
+        result.best_idx = candidate_idx;
+    } else if (error < result.second_error) {
+        result.second_error = error;
+        result.second_idx = candidate_idx;
+    }
+}
+
+float texture_preview_mix_candidate_error(const TexturePreviewMixCandidate &candidate, const std::array<float, 3> &target_rgb)
+{
+    const float dr = candidate.rgb[0] - target_rgb[0];
+    const float dg = candidate.rgb[1] - target_rgb[1];
+    const float db = candidate.rgb[2] - target_rgb[2];
+    return dr * dr + dg * dg + db * db;
+}
+
+TexturePreviewMixNearestResult nearest_texture_preview_mix_candidates_linear(const std::vector<TexturePreviewMixCandidate> &candidates,
+                                                                             const std::array<float, 3> &target_rgb)
+{
+    TexturePreviewMixNearestResult result;
+    for (size_t candidate_idx = 0; candidate_idx < candidates.size(); ++candidate_idx)
+        update_texture_preview_mix_nearest_result(result,
+                                                  candidate_idx,
+                                                  texture_preview_mix_candidate_error(candidates[candidate_idx], target_rgb));
+    return result;
+}
+
+void query_texture_preview_mix_candidate_kd_tree(const std::vector<TexturePreviewMixCandidate> &candidates,
+                                                 const std::vector<TexturePreviewMixCandidateKdNode> &nodes,
+                                                 const std::array<float, 3> &target_rgb,
+                                                 int node_idx,
+                                                 TexturePreviewMixNearestResult &result)
+{
+    if (node_idx < 0 || size_t(node_idx) >= nodes.size())
+        return;
+
+    const TexturePreviewMixCandidateKdNode &node = nodes[size_t(node_idx)];
+    if (size_t(node.candidate_idx) >= candidates.size()) {
+        query_texture_preview_mix_candidate_kd_tree(candidates, nodes, target_rgb, node.left, result);
+        query_texture_preview_mix_candidate_kd_tree(candidates, nodes, target_rgb, node.right, result);
+        return;
+    }
+
+    const TexturePreviewMixCandidate &candidate = candidates[size_t(node.candidate_idx)];
+    update_texture_preview_mix_nearest_result(result,
+                                              size_t(node.candidate_idx),
+                                              texture_preview_mix_candidate_error(candidate, target_rgb));
+
+    const size_t axis = std::min<size_t>(node.axis, 2);
+    const float split_delta = target_rgb[axis] - candidate.rgb[axis];
+    const int near_node = split_delta <= 0.f ? node.left : node.right;
+    const int far_node = split_delta <= 0.f ? node.right : node.left;
+
+    query_texture_preview_mix_candidate_kd_tree(candidates, nodes, target_rgb, near_node, result);
+    if (split_delta * split_delta <= result.second_error)
+        query_texture_preview_mix_candidate_kd_tree(candidates, nodes, target_rgb, far_node, result);
+}
+
+TexturePreviewMixNearestResult nearest_texture_preview_mix_candidates(const std::vector<TexturePreviewMixCandidate> &candidates,
+                                                                      const std::vector<TexturePreviewMixCandidateKdNode> &nodes,
+                                                                      int root,
+                                                                      const std::array<float, 3> &target_rgb)
+{
+    TexturePreviewMixNearestResult result;
+    if (root >= 0 && !nodes.empty())
+        query_texture_preview_mix_candidate_kd_tree(candidates, nodes, target_rgb, root, result);
+    if (result.best_idx >= candidates.size())
+        result = nearest_texture_preview_mix_candidates_linear(candidates, target_rgb);
+    return result;
+}
+
 std::vector<float> best_component_mix_weights_for_target(const std::vector<TexturePreviewMixCandidate> &candidates,
-                                                         const std::array<float, 3>                    &target_rgb)
+                                                         const std::vector<TexturePreviewMixCandidateKdNode> &nodes,
+                                                         int root,
+                                                         const std::array<float, 3> &target_rgb,
+                                                         int generic_solver_lookup_mode)
 {
     if (candidates.empty())
         return {};
 
-    const TexturePreviewMixCandidate *best_candidate = nullptr;
-    float best_error = std::numeric_limits<float>::max();
-    for (const TexturePreviewMixCandidate &candidate : candidates) {
-        const float error = color_distance_sq(candidate.rgb, target_rgb);
-        if (error < best_error) {
-            best_error = error;
-            best_candidate = &candidate;
-        }
-    }
+    const TexturePreviewMixNearestResult nearest = nearest_texture_preview_mix_candidates(candidates, nodes, root, target_rgb);
+    if (nearest.best_idx >= candidates.size())
+        return {};
 
-    return best_candidate != nullptr ? best_candidate->weights : std::vector<float>{};
+    const int clamped_mode = std::clamp(generic_solver_lookup_mode,
+                                        int(TextureMappingZone::GenericSolverClosestMix),
+                                        int(TextureMappingZone::GenericSolverBlendClosestTwo));
+    if (clamped_mode == int(TextureMappingZone::GenericSolverClosestMix) ||
+        nearest.second_idx >= candidates.size() ||
+        nearest.best_error <= 1e-12f)
+        return candidates[nearest.best_idx].weights;
+
+    const TexturePreviewMixCandidate &best_candidate = candidates[nearest.best_idx];
+    const TexturePreviewMixCandidate &second_candidate = candidates[nearest.second_idx];
+    const float best_inv = 1.f / std::max(nearest.best_error, 1e-12f);
+    const float second_inv = 1.f / std::max(nearest.second_error, 1e-12f);
+    const float inv_sum = std::max(best_inv + second_inv, 1e-12f);
+    std::vector<float> weights(best_candidate.weights.size(), 0.f);
+    for (size_t idx = 0; idx < weights.size(); ++idx) {
+        const float second_weight = idx < second_candidate.weights.size() ? second_candidate.weights[idx] : 0.f;
+        weights[idx] = clamp01((best_candidate.weights[idx] * best_inv + second_weight * second_inv) / inv_sum);
+    }
+    return weights;
 }
 
 float apply_texture_tone_gamma(float channel, float tone_gamma)
@@ -786,7 +952,11 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
         if (optimized.size() == component_count)
             desired = std::move(optimized);
         else {
-            std::vector<float> best = best_component_mix_weights_for_target(settings.generic_mix_candidates, target);
+            std::vector<float> best = best_component_mix_weights_for_target(settings.generic_mix_candidates,
+                                                                            settings.generic_mix_candidate_kd_nodes,
+                                                                            settings.generic_mix_candidate_kd_root,
+                                                                            target,
+                                                                            settings.generic_solver_lookup_mode);
             if (best.size() == component_count)
                 desired = std::move(best);
         }
@@ -820,6 +990,8 @@ void prepare_texture_preview_simulation_settings(TexturePreviewSimulationSetting
         settings.generic_mix_candidates = build_generic_mix_candidates(settings.component_colors);
     else
         settings.generic_mix_candidates.clear();
+    settings.generic_mix_candidate_kd_root =
+        build_generic_mix_candidate_kd_tree(settings.generic_mix_candidates, settings.generic_mix_candidate_kd_nodes);
 }
 
 ColorRGBA simulated_texture_preview_color_for_vertex_color(const ColorRGBA *source_color,
@@ -871,6 +1043,9 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
     settings.tone_gamma = (!std::isfinite(zone->tone_gamma) || zone->tone_gamma <= 0.f) ?
         1.f :
         std::clamp(zone->tone_gamma, 0.5f, 3.f);
+    settings.generic_solver_lookup_mode = std::clamp(zone->generic_solver_lookup_mode,
+                                                     int(TextureMappingZone::GenericSolverClosestMix),
+                                                     int(TextureMappingZone::GenericSolverBlendClosestTwo));
     settings.component_ids = TextureMappingManager::effective_texture_component_ids(*zone, num_physical, physical_colors);
     if (settings.component_ids.empty())
         return std::nullopt;
@@ -913,6 +1088,7 @@ size_t texture_preview_simulation_signature(const ModelVolume &model_volume,
     mix(std::hash<int>{}(settings.force_sequential_filaments ? 1 : 0));
     mix(std::hash<int>{}(settings.limit_texture_resolution ? 1 : 0));
     mix(std::hash<int>{}(settings.compact_offset_mode ? 1 : 0));
+    mix(std::hash<int>{}(settings.generic_solver_lookup_mode));
     mix(std::hash<int>{}(int(std::lround(settings.contrast_pct * 100.f))));
     mix(std::hash<int>{}(int(std::lround(settings.tone_gamma * 1000.f))));
     for (const unsigned int id : settings.component_ids)

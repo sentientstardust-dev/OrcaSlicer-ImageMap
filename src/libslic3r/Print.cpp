@@ -22,6 +22,8 @@
 #include <float.h>
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <limits>
 #include <unordered_set>
 #include <boost/filesystem/path.hpp>
@@ -47,6 +49,144 @@ using namespace nlohmann;
 #define L(s) Slic3r::I18N::translate(s)
 
 namespace Slic3r {
+
+static std::array<float, 3> prime_tower_parse_hex_color_for_print(const std::string &hex)
+{
+    auto hex_byte = [](char hi, char lo) {
+        auto nibble = [](char c) {
+            if (c >= '0' && c <= '9') return int(c - '0');
+            if (c >= 'a' && c <= 'f') return int(c - 'a') + 10;
+            if (c >= 'A' && c <= 'F') return int(c - 'A') + 10;
+            return 0;
+        };
+        return float(nibble(hi) * 16 + nibble(lo)) / 255.f;
+    };
+    if (hex.size() >= 7 && hex[0] == '#')
+        return {hex_byte(hex[1], hex[2]), hex_byte(hex[3], hex[4]), hex_byte(hex[5], hex[6])};
+    return {1.f, 1.f, 1.f};
+}
+
+static float prime_tower_color_distance2_for_print(const std::array<float, 3> &a, const std::array<float, 3> &b)
+{
+    const float dr = a[0] - b[0];
+    const float dg = a[1] - b[1];
+    const float db = a[2] - b[2];
+    return dr * dr + dg * dg + db * db;
+}
+
+static std::vector<std::array<float, 3>> prime_tower_semantic_colors_for_print(int color_mode)
+{
+    switch (color_mode) {
+    case PrimeTowerTextureRenderSettings::CMY:
+        return {{{0.f, 1.f, 1.f}, {1.f, 0.f, 1.f}, {1.f, 1.f, 0.f}}};
+    case PrimeTowerTextureRenderSettings::CMYK:
+        return {{{0.f, 1.f, 1.f}, {1.f, 0.f, 1.f}, {1.f, 1.f, 0.f}, {0.f, 0.f, 0.f}}};
+    case PrimeTowerTextureRenderSettings::CMYW:
+        return {{{0.f, 1.f, 1.f}, {1.f, 0.f, 1.f}, {1.f, 1.f, 0.f}, {1.f, 1.f, 1.f}}};
+    case PrimeTowerTextureRenderSettings::RGB:
+        return {{{1.f, 0.f, 0.f}, {0.f, 1.f, 0.f}, {0.f, 0.f, 1.f}}};
+    case PrimeTowerTextureRenderSettings::RGBK:
+        return {{{1.f, 0.f, 0.f}, {0.f, 1.f, 0.f}, {0.f, 0.f, 1.f}, {0.f, 0.f, 0.f}}};
+    case PrimeTowerTextureRenderSettings::RGBW:
+        return {{{1.f, 0.f, 0.f}, {0.f, 1.f, 0.f}, {0.f, 0.f, 1.f}, {1.f, 1.f, 1.f}}};
+    case PrimeTowerTextureRenderSettings::BW:
+        return {{{0.f, 0.f, 0.f}, {1.f, 1.f, 1.f}}};
+    default:
+        return {};
+    }
+}
+
+static float prime_tower_layer_mode_score_for_print(const std::vector<size_t>               &tool_indices,
+                                                    const std::vector<std::array<float, 3>> &filament_colors,
+                                                    const std::vector<std::array<float, 3>> &semantic_colors)
+{
+    if (tool_indices.empty() || semantic_colors.empty())
+        return 0.f;
+
+    std::vector<char> used(tool_indices.size(), 0);
+    float error = 0.f;
+    size_t assigned = 0;
+    for (const std::array<float, 3> &semantic_color : semantic_colors) {
+        size_t best = size_t(-1);
+        float best_error = std::numeric_limits<float>::max();
+        for (size_t i = 0; i < tool_indices.size(); ++i) {
+            if (used[i] || tool_indices[i] >= filament_colors.size())
+                continue;
+            const float candidate_error = prime_tower_color_distance2_for_print(filament_colors[tool_indices[i]], semantic_color);
+            if (candidate_error < best_error) {
+                best_error = candidate_error;
+                best = i;
+            }
+        }
+        if (best == size_t(-1))
+            continue;
+        used[best] = 1;
+        error += std::sqrt(best_error) / std::sqrt(3.f);
+        ++assigned;
+    }
+
+    const float coverage = float(assigned) / float(semantic_colors.size());
+    const float average_error = assigned > 0 ? error / float(assigned) : 1.f;
+    return coverage * 100.f - average_error * 60.f;
+}
+
+static int prime_tower_auto_color_mode_for_print(const ToolOrdering &tool_ordering, const std::vector<std::string> &filament_colours)
+{
+    std::vector<std::array<float, 3>> filament_colors;
+    filament_colors.reserve(filament_colours.size());
+    for (const std::string &color : filament_colours)
+        filament_colors.emplace_back(prime_tower_parse_hex_color_for_print(color));
+
+    std::vector<std::vector<size_t>> layer_tools;
+    for (const LayerTools &lt : tool_ordering.layer_tools()) {
+        if (!lt.has_wipe_tower)
+            continue;
+        std::vector<size_t> tools;
+        for (const unsigned int extruder_id : lt.extruders) {
+            if (extruder_id < filament_colors.size() && std::find(tools.begin(), tools.end(), size_t(extruder_id)) == tools.end())
+                tools.emplace_back(size_t(extruder_id));
+        }
+        if (!tools.empty())
+            layer_tools.emplace_back(std::move(tools));
+    }
+
+    if (layer_tools.empty()) {
+        std::vector<size_t> all_tools;
+        all_tools.reserve(filament_colors.size());
+        for (size_t i = 0; i < filament_colors.size(); ++i)
+            all_tools.emplace_back(i);
+        if (!all_tools.empty())
+            layer_tools.emplace_back(std::move(all_tools));
+    }
+
+    const int candidate_modes[] = {
+        PrimeTowerTextureRenderSettings::CMYK,
+        PrimeTowerTextureRenderSettings::CMYW,
+        PrimeTowerTextureRenderSettings::RGBK,
+        PrimeTowerTextureRenderSettings::RGBW,
+        PrimeTowerTextureRenderSettings::CMY,
+        PrimeTowerTextureRenderSettings::RGB,
+        PrimeTowerTextureRenderSettings::BW
+    };
+
+    int best_mode = PrimeTowerTextureRenderSettings::GenericSolver;
+    float best_score = -std::numeric_limits<float>::max();
+    for (int candidate_mode : candidate_modes) {
+        const std::vector<std::array<float, 3>> semantic_colors = prime_tower_semantic_colors_for_print(candidate_mode);
+        if (semantic_colors.empty())
+            continue;
+        float score = 0.f;
+        for (const std::vector<size_t> &tools : layer_tools)
+            score += prime_tower_layer_mode_score_for_print(tools, filament_colors, semantic_colors);
+        score /= float(std::max<size_t>(1, layer_tools.size()));
+        if (score > best_score) {
+            best_score = score;
+            best_mode = candidate_mode;
+        }
+    }
+
+    return best_score >= 55.f ? best_mode : PrimeTowerTextureRenderSettings::GenericSolver;
+}
 
 template class PrintState<PrintStep, psCount>;
 template class PrintState<PrintObjectStep, posCount>;
@@ -146,6 +286,7 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
         "texture_mapping_outer_wall_gradient_max_line_width",
         "texture_mapping_outer_wall_gradient_min_line_width",
         "texture_mapping_definitions",
+        "texture_mapping_global_settings",
         "outer_wall_acceleration",
         "inner_wall_acceleration",
         "initial_layer_acceleration",
@@ -3205,6 +3346,60 @@ void Print::_make_wipe_tower()
     }
     this->throw_if_canceled();
 
+    auto build_prime_tower_texture = [this]() {
+        PrimeTowerTextureRenderSettings texture;
+        if (!m_texture_mapping_global_settings.effective_enabled(m_texture_mapping_prime_tower_image))
+            return texture;
+
+        const std::string mode = TextureMappingGlobalSettings::normalize_color_mode_name(
+            m_texture_mapping_global_settings.prime_tower_color_mode);
+        const bool auto_mode = mode == "auto";
+        if (auto_mode)
+            texture.color_mode = prime_tower_auto_color_mode_for_print(m_wipe_tower_data.tool_ordering, m_config.filament_colour.values);
+        else if (mode == "generic_solver")
+            texture.color_mode = PrimeTowerTextureRenderSettings::GenericSolver;
+        else if (mode == "cmy")
+            texture.color_mode = PrimeTowerTextureRenderSettings::CMY;
+        else if (mode == "cmyw")
+            texture.color_mode = PrimeTowerTextureRenderSettings::CMYW;
+        else if (mode == "rgb")
+            texture.color_mode = PrimeTowerTextureRenderSettings::RGB;
+        else if (mode == "rgbk")
+            texture.color_mode = PrimeTowerTextureRenderSettings::RGBK;
+        else if (mode == "rgbw")
+            texture.color_mode = PrimeTowerTextureRenderSettings::RGBW;
+        else if (mode == "bw")
+            texture.color_mode = PrimeTowerTextureRenderSettings::BW;
+        else
+            texture.color_mode = PrimeTowerTextureRenderSettings::CMYK;
+
+        texture.enabled = true;
+        texture.generic_fallback_for_missing_channels = auto_mode;
+        texture.angle_offset_deg = m_texture_mapping_global_settings.angle_offset_deg;
+        texture.global_strength = std::clamp(float(m_config.texture_mapping_outer_wall_gradient_global_strength.value) / 100.f, 0.f, 1.f);
+        texture.max_line_width = std::max(0.05f, float(m_config.texture_mapping_outer_wall_gradient_max_line_width.value));
+        texture.min_line_width = std::max(0.05f, float(m_config.texture_mapping_outer_wall_gradient_min_line_width.value));
+        texture.image_rgba = m_texture_mapping_prime_tower_image.rgba;
+        texture.image_width = m_texture_mapping_prime_tower_image.width;
+        texture.image_height = m_texture_mapping_prime_tower_image.height;
+        texture.filament_colours = m_config.filament_colour.values;
+        texture.filament_colours.resize(m_config.filament_diameter.values.size(), "#FFFFFF");
+
+        bool have_z = false;
+        for (const LayerTools &lt : m_wipe_tower_data.tool_ordering.layer_tools()) {
+            if (!lt.has_wipe_tower)
+                continue;
+            const float z = float(lt.print_z);
+            texture.z_min = have_z ? std::min(texture.z_min, z) : z;
+            texture.z_max = have_z ? std::max(texture.z_max, z) : z;
+            have_z = true;
+        }
+        if (!have_z)
+            texture.enabled = false;
+        return texture;
+    };
+    const PrimeTowerTextureRenderSettings prime_tower_texture = build_prime_tower_texture();
+
     if (!is_wipe_tower_type2) {
         // in BBL machine, wipe tower is only use to prime extruder. So just use a global wipe volume.
         WipeTower wipe_tower(m_config, m_plate_index, m_origin, m_wipe_tower_data.tool_ordering.first_extruder(),
@@ -3214,6 +3409,8 @@ void Print::_make_wipe_tower()
         // Set the extruder & material properties at the wipe tower object.
         for (size_t i = 0; i < number_of_extruders; ++i)
             wipe_tower.set_extruder(i, m_config);
+        if (prime_tower_texture.valid())
+            wipe_tower.set_prime_tower_texture(prime_tower_texture);
 
         // BBS: remove priming logic
         // m_wipe_tower_data.priming = Slic3r::make_unique<std::vector<WipeTower::ToolChangeResult>>(
@@ -3362,6 +3559,8 @@ void Print::_make_wipe_tower()
         // Set the extruder & material properties at the wipe tower object.
         for (size_t i = 0; i < number_of_extruders; ++i)
             wipe_tower.set_extruder(i, m_config);
+        if (prime_tower_texture.valid())
+            wipe_tower.set_prime_tower_texture(prime_tower_texture);
 
         m_wipe_tower_data.priming = Slic3r::make_unique<std::vector<WipeTower::ToolChangeResult>>(
             wipe_tower.prime((float)this->skirt_first_layer_height(), m_wipe_tower_data.tool_ordering.all_extruders(), false));

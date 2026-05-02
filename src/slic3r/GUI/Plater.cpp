@@ -953,8 +953,13 @@ public:
                                         bool seam_hiding,
                                         bool nonlinear_offset_adjustment,
                                         bool compact_offset_mode,
+                                        int generic_solver_lookup_mode,
+                                        const TextureMappingGlobalSettings &global_settings,
+                                        const TextureMappingPrimeTowerImage &prime_tower_image,
                                         int initial_options_tab)
         : wxDialog(parent, wxID_ANY, _L("Texture Mapping Options"), wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
+        , m_global_settings(global_settings)
+        , m_prime_tower_image(prime_tower_image)
     {
         const int gap = FromDIP(8);
         auto *root = new wxBoxSizer(wxVERTICAL);
@@ -965,8 +970,9 @@ public:
         tab_choices.Add(_L("Filament Calibration"));
         tab_choices.Add(_L("Preview Options"));
         tab_choices.Add(_L("Experimental Options"));
+        tab_choices.Add(_L("Global Settings"));
         m_options_tab_choice = new wxChoice(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, tab_choices);
-        m_options_tab_choice->SetSelection(std::clamp(initial_options_tab, 0, 3));
+        m_options_tab_choice->SetSelection(std::clamp(initial_options_tab, 0, 4));
         tab_row->Add(m_options_tab_choice, 1, wxALIGN_CENTER_VERTICAL);
         root->Add(tab_row, 0, wxEXPAND | wxALL, gap);
 
@@ -983,6 +989,9 @@ public:
         auto *experimental_page = new wxPanel(m_options_book, wxID_ANY);
         auto *experimental_root = new wxBoxSizer(wxVERTICAL);
         experimental_page->SetSizer(experimental_root);
+        auto *global_page = new wxPanel(m_options_book, wxID_ANY);
+        auto *global_root = new wxBoxSizer(wxVERTICAL);
+        global_page->SetSizer(global_root);
 
         auto *mapping_row = new wxBoxSizer(wxHORIZONTAL);
         mapping_row->Add(new wxStaticText(image_page, wxID_ANY, _L("Interpret texture color as")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
@@ -1108,19 +1117,95 @@ public:
         m_compact_offset_mode_checkbox->SetToolTip(
             _L("Normalizes sampled filament offsets so the strongest active color uses the full maximum line width."));
         experimental_box->Add(m_compact_offset_mode_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        auto *generic_solver_row = new wxBoxSizer(wxHORIZONTAL);
+        generic_solver_row->Add(new wxStaticText(experimental_page, wxID_ANY, _L("Generic solver lookup")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        wxArrayString generic_solver_choices;
+        generic_solver_choices.Add(_L("Closest mix"));
+        generic_solver_choices.Add(_L("Blend closest two"));
+        m_generic_solver_lookup_choice = new wxChoice(experimental_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, generic_solver_choices);
+        m_generic_solver_lookup_choice->SetSelection(std::clamp(generic_solver_lookup_mode,
+                                                                int(TextureMappingZone::GenericSolverClosestMix),
+                                                                int(TextureMappingZone::GenericSolverBlendClosestTwo)));
+        m_generic_solver_lookup_choice->SetToolTip(_L("Controls how the fallback Generic Solver picks from precomputed filament color mixes."));
+        generic_solver_row->Add(m_generic_solver_lookup_choice, 1, wxALIGN_CENTER_VERTICAL);
+        experimental_box->Add(generic_solver_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
         experimental_root->Add(experimental_box, 0, wxEXPAND | wxALL, gap);
+
+        m_prime_tower_mapping_enabled_checkbox = new wxCheckBox(global_page, wxID_ANY, _L("Enable prime tower image mapping"));
+        m_prime_tower_mapping_enabled_checkbox->SetValue(m_global_settings.enabled);
+        global_root->Add(m_prime_tower_mapping_enabled_checkbox, 0, wxEXPAND | wxALL, gap);
+
+        auto *prime_image_box = new wxStaticBoxSizer(wxVERTICAL, global_page, _L("Prime Tower Image"));
+        m_prime_tower_image_label = new wxStaticText(global_page, wxID_ANY, wxEmptyString);
+        prime_image_box->Add(m_prime_tower_image_label, 0, wxEXPAND | wxALL, gap);
+        auto *prime_image_buttons = new wxBoxSizer(wxHORIZONTAL);
+        auto *load_prime_image_button = new wxButton(global_page, wxID_ANY, _L("Load Image"));
+        auto *clear_prime_image_button = new wxButton(global_page, wxID_ANY, _L("Clear Image"));
+        prime_image_buttons->Add(load_prime_image_button, 0, wxRIGHT, gap);
+        prime_image_buttons->Add(clear_prime_image_button, 0);
+        prime_image_box->Add(prime_image_buttons, 0, wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        global_root->Add(prime_image_box, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
+        auto *angle_row = new wxBoxSizer(wxHORIZONTAL);
+        angle_row->Add(new wxStaticText(global_page, wxID_ANY, _L("Angle offset")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        m_prime_tower_angle_spin = new wxSpinCtrlDouble(global_page,
+                                                        wxID_ANY,
+                                                        wxEmptyString,
+                                                        wxDefaultPosition,
+                                                        wxSize(FromDIP(96), -1),
+                                                        wxSP_ARROW_KEYS | wxALIGN_RIGHT,
+                                                        0.0,
+                                                        360.0,
+                                                        std::clamp(double(m_global_settings.angle_offset_deg), 0.0, 360.0),
+                                                        1.0);
+        m_prime_tower_angle_spin->SetDigits(1);
+        angle_row->Add(m_prime_tower_angle_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, std::max(FromDIP(2), gap / 2));
+        angle_row->Add(new wxStaticText(global_page, wxID_ANY, _L("deg")), 0, wxALIGN_CENTER_VERTICAL);
+        angle_row->AddStretchSpacer(1);
+        global_root->Add(angle_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
+        auto *color_mode_row = new wxBoxSizer(wxHORIZONTAL);
+        color_mode_row->Add(new wxStaticText(global_page, wxID_ANY, _L("Prime tower color mode")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        wxArrayString prime_color_modes;
+        prime_color_modes.Add(_L("Auto"));
+        prime_color_modes.Add(_L("Generic solver"));
+        prime_color_modes.Add(_L("CMY"));
+        prime_color_modes.Add(_L("CMYK"));
+        prime_color_modes.Add(_L("CMYW"));
+        prime_color_modes.Add(_L("RGB"));
+        prime_color_modes.Add(_L("RGBK"));
+        prime_color_modes.Add(_L("RGBW"));
+        prime_color_modes.Add(_L("BW"));
+        m_prime_tower_color_mode_choice = new wxChoice(global_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, prime_color_modes);
+        m_prime_tower_color_mode_choice->SetSelection(prime_tower_color_mode_selection(m_global_settings.prime_tower_color_mode));
+        color_mode_row->Add(m_prime_tower_color_mode_choice, 1, wxALIGN_CENTER_VERTICAL);
+        global_root->Add(color_mode_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
+        load_prime_image_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { load_prime_tower_image(); });
+        clear_prime_image_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+            m_prime_tower_image.clear();
+            m_global_settings.clear_image_reference();
+            update_prime_tower_image_label();
+        });
+        update_prime_tower_image_label();
 
         m_options_book->AddPage(image_page, _L("Image Options"), true);
         m_options_book->AddPage(filament_page, _L("Filament Calibration"));
         m_options_book->AddPage(preview_page, _L("Preview Options"));
         m_options_book->AddPage(experimental_page, _L("Experimental Options"));
-        m_options_book->SetMinSize(wxSize(FromDIP(420), std::max({image_page->GetBestSize().y, filament_page->GetBestSize().y, preview_page->GetBestSize().y, experimental_page->GetBestSize().y})));
+        m_options_book->AddPage(global_page, _L("Global Settings"));
+        m_options_book->SetMinSize(wxSize(FromDIP(420),
+                                          std::max({image_page->GetBestSize().y,
+                                                    filament_page->GetBestSize().y,
+                                                    preview_page->GetBestSize().y,
+                                                    experimental_page->GetBestSize().y,
+                                                    global_page->GetBestSize().y})));
         m_options_tab_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &evt) {
             if (m_options_book)
-                m_options_book->SetSelection(std::clamp(evt.GetSelection(), 0, 3));
+                m_options_book->SetSelection(std::clamp(evt.GetSelection(), 0, 4));
         });
         if (m_options_book)
-            m_options_book->SetSelection(std::clamp(initial_options_tab, 0, 3));
+            m_options_book->SetSelection(std::clamp(initial_options_tab, 0, 4));
         root->Add(m_options_book, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
         if (wxSizer *buttons = CreateStdDialogButtonSizer(wxOK | wxCANCEL))
             root->Add(buttons, 0, wxEXPAND | wxALL, gap);
@@ -1148,7 +1233,33 @@ public:
     bool seam_hiding() const { return m_seam_hiding_checkbox && m_seam_hiding_checkbox->GetValue(); }
     bool nonlinear_offset_adjustment() const { return m_nonlinear_offset_adjustment_checkbox && m_nonlinear_offset_adjustment_checkbox->GetValue(); }
     bool compact_offset_mode() const { return m_compact_offset_mode_checkbox && m_compact_offset_mode_checkbox->GetValue(); }
-    int selected_options_tab() const { return std::clamp(m_options_tab_choice ? m_options_tab_choice->GetSelection() : 0, 0, 3); }
+    int generic_solver_lookup_mode() const
+    {
+        return m_generic_solver_lookup_choice ?
+            std::clamp(m_generic_solver_lookup_choice->GetSelection(),
+                       int(TextureMappingZone::GenericSolverClosestMix),
+                       int(TextureMappingZone::GenericSolverBlendClosestTwo)) :
+            int(TextureMappingZone::GenericSolverClosestMix);
+    }
+
+    TextureMappingGlobalSettings global_settings() const
+    {
+        TextureMappingGlobalSettings settings = m_global_settings;
+        settings.enabled = m_prime_tower_mapping_enabled_checkbox != nullptr && m_prime_tower_mapping_enabled_checkbox->GetValue();
+        settings.angle_offset_deg = float(std::clamp(m_prime_tower_angle_spin ? m_prime_tower_angle_spin->GetValue() : 0.0, 0.0, 360.0));
+        settings.prime_tower_color_mode =
+            prime_tower_color_mode_name(m_prime_tower_color_mode_choice ? m_prime_tower_color_mode_choice->GetSelection() : 0);
+        if (m_prime_tower_image.valid()) {
+            settings.image_file = "Metadata/texture_mapping/prime_tower_image.png";
+            settings.image_name = m_prime_tower_image.image_name;
+            settings.image_width = m_prime_tower_image.width;
+            settings.image_height = m_prime_tower_image.height;
+        }
+        return settings;
+    }
+
+    const TextureMappingPrimeTowerImage& prime_tower_image() const { return m_prime_tower_image; }
+    int selected_options_tab() const { return std::clamp(m_options_tab_choice ? m_options_tab_choice->GetSelection() : 0, 0, 4); }
 
     std::vector<float> component_strengths_pct() const
     {
@@ -1169,6 +1280,88 @@ public:
     }
 
 private:
+    static std::string prime_tower_color_mode_name(int selection)
+    {
+        switch (selection) {
+        case 1: return "generic_solver";
+        case 2: return "cmy";
+        case 3: return "cmyk";
+        case 4: return "cmyw";
+        case 5: return "rgb";
+        case 6: return "rgbk";
+        case 7: return "rgbw";
+        case 8: return "bw";
+        default: return "auto";
+        }
+    }
+
+    static int prime_tower_color_mode_selection(const std::string &mode)
+    {
+        const std::string normalized = TextureMappingGlobalSettings::normalize_color_mode_name(mode);
+        if (normalized == "generic_solver") return 1;
+        if (normalized == "cmy") return 2;
+        if (normalized == "cmyk") return 3;
+        if (normalized == "cmyw") return 4;
+        if (normalized == "rgb") return 5;
+        if (normalized == "rgbk") return 6;
+        if (normalized == "rgbw") return 7;
+        if (normalized == "bw") return 8;
+        return 0;
+    }
+
+    void update_prime_tower_image_label()
+    {
+        if (m_prime_tower_image_label == nullptr)
+            return;
+        if (m_prime_tower_image.valid()) {
+            wxString name = from_u8(m_prime_tower_image.image_name);
+            if (name.empty())
+                name = _L("Loaded image");
+            m_prime_tower_image_label->SetLabel(wxString::Format("%s (%u x %u)", name.c_str(), m_prime_tower_image.width, m_prime_tower_image.height));
+        } else {
+            m_prime_tower_image_label->SetLabel(_L("No image loaded"));
+        }
+        Layout();
+        Fit();
+    }
+
+    void load_prime_tower_image()
+    {
+        wxFileDialog dlg(this,
+                         _L("Load prime tower image"),
+                         wxEmptyString,
+                         wxEmptyString,
+                         _L("Image files (*.png;*.jpg;*.jpeg;*.bmp)|*.png;*.jpg;*.jpeg;*.bmp"),
+                         wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+        if (dlg.ShowModal() != wxID_OK)
+            return;
+
+        wxImage image;
+        if (!image.LoadFile(dlg.GetPath(), wxBITMAP_TYPE_ANY) || !image.IsOk() || image.GetWidth() <= 0 || image.GetHeight() <= 0)
+            return;
+
+        TextureMappingPrimeTowerImage loaded;
+        loaded.width = unsigned(image.GetWidth());
+        loaded.height = unsigned(image.GetHeight());
+        loaded.rgba.assign(size_t(loaded.width) * size_t(loaded.height) * 4, uint8_t(255));
+        unsigned char *rgb = image.GetData();
+        unsigned char *alpha = image.HasAlpha() ? image.GetAlpha() : nullptr;
+        for (size_t i = 0; i < size_t(loaded.width) * size_t(loaded.height); ++i) {
+            loaded.rgba[4 * i + 0] = rgb[3 * i + 0];
+            loaded.rgba[4 * i + 1] = rgb[3 * i + 1];
+            loaded.rgba[4 * i + 2] = rgb[3 * i + 2];
+            loaded.rgba[4 * i + 3] = alpha != nullptr ? alpha[i] : uint8_t(255);
+        }
+        loaded.image_name = boost::filesystem::path(into_u8(dlg.GetPath())).filename().string();
+
+        m_prime_tower_image = std::move(loaded);
+        m_global_settings.image_file = "Metadata/texture_mapping/prime_tower_image.png";
+        m_global_settings.image_name = m_prime_tower_image.image_name;
+        m_global_settings.image_width = m_prime_tower_image.width;
+        m_global_settings.image_height = m_prime_tower_image.height;
+        update_prime_tower_image_label();
+    }
+
     void reset_strengths_and_offsets()
     {
         for (wxSlider *slider : m_minimum_offset_sliders)
@@ -1199,6 +1392,13 @@ private:
     wxCheckBox *m_seam_hiding_checkbox {nullptr};
     wxCheckBox *m_nonlinear_offset_adjustment_checkbox {nullptr};
     wxCheckBox *m_compact_offset_mode_checkbox {nullptr};
+    wxChoice *m_generic_solver_lookup_choice {nullptr};
+    wxCheckBox *m_prime_tower_mapping_enabled_checkbox {nullptr};
+    wxStaticText *m_prime_tower_image_label {nullptr};
+    wxSpinCtrlDouble *m_prime_tower_angle_spin {nullptr};
+    wxChoice *m_prime_tower_color_mode_choice {nullptr};
+    TextureMappingGlobalSettings m_global_settings;
+    TextureMappingPrimeTowerImage m_prime_tower_image;
     std::vector<wxSlider*> m_minimum_offset_sliders;
     std::vector<wxSpinCtrl*> m_minimum_offset_spins;
     std::vector<wxSlider*> m_strength_sliders;
@@ -4775,13 +4975,16 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
 
     TextureMappingManager &mgr = bundle->texture_mapping_zones;
     TextureMappingManager *mgr_ptr = &mgr;
-    if (sync_manager)
+    if (sync_manager) {
         mgr.load_entries(get_config_string("texture_mapping_definitions"), physical_colors);
+        bundle->texture_mapping_global_settings.load(get_config_string("texture_mapping_global_settings"));
+    }
     for (TextureMappingZone &zone : mgr.zones())
         if (!zone.deleted)
             zone.enabled = true;
     mgr.normalize_zone_ids(num_physical);
     set_config_string("texture_mapping_definitions", mgr.serialize_entries());
+    set_config_string("texture_mapping_global_settings", bundle->texture_mapping_global_settings.serialize());
 
     wxSizer *content_sizer = p->m_panel_texture_mapping_content->GetSizer();
     if (content_sizer == nullptr)
@@ -5099,6 +5302,9 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.seam_hiding,
                                                     updated.nonlinear_offset_adjustment,
                                                     updated.compact_offset_mode,
+                                                    updated.generic_solver_lookup_mode,
+                                                    bundle->texture_mapping_global_settings,
+                                                    wxGetApp().model().texture_mapping_prime_tower_image,
                                                     p->m_texture_mapping_advanced_options_tab);
             const int result = dlg.ShowModal();
             p->m_texture_mapping_advanced_options_tab = dlg.selected_options_tab();
@@ -5115,6 +5321,10 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.seam_hiding = dlg.seam_hiding();
             updated.nonlinear_offset_adjustment = dlg.nonlinear_offset_adjustment();
             updated.compact_offset_mode = dlg.compact_offset_mode();
+            updated.generic_solver_lookup_mode = dlg.generic_solver_lookup_mode();
+            bundle->texture_mapping_global_settings = dlg.global_settings();
+            wxGetApp().model().texture_mapping_prime_tower_image = dlg.prime_tower_image();
+            set_config_string("texture_mapping_global_settings", bundle->texture_mapping_global_settings.serialize());
             if (updated.filament_strengths_pct.size() < palette.size())
                 updated.filament_strengths_pct.resize(palette.size(), 100.f);
             const std::vector<float> dlg_strengths = dlg.component_strengths_pct();
@@ -16917,6 +17127,8 @@ int Plater::export_3mf(const boost::filesystem::path& output_path, SaveStrategy 
     publish(p->model, strategy);
 
     DynamicPrintConfig cfg = wxGetApp().preset_bundle->full_config_secure();
+    cfg.set_key_value("texture_mapping_definitions", new ConfigOptionString(wxGetApp().preset_bundle->texture_mapping_zones.serialize_entries()));
+    cfg.set_key_value("texture_mapping_global_settings", new ConfigOptionString(wxGetApp().preset_bundle->texture_mapping_global_settings.serialize()));
     const std::string path_u8 = into_u8(path);
     wxBusyCursor wait;
 

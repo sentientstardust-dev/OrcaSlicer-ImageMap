@@ -55,6 +55,11 @@ struct TextureMappingZone
         FilamentColorBW = 7
     };
 
+    enum GenericSolverLookupMode : uint8_t {
+        GenericSolverClosestMix = 0,
+        GenericSolverBlendClosestTwo = 1
+    };
+
     static constexpr int   DefaultSurfacePattern = int(ImageTexture);
     static constexpr int   DefaultOffsetMode = int(OffsetBasic);
     static constexpr bool  DefaultOffsetRotationEnabled = true;
@@ -71,6 +76,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultSeamHiding = false;
     static constexpr bool  DefaultNonlinearOffsetAdjustment = false;
     static constexpr bool  DefaultCompactOffsetMode = true;
+    static constexpr int   DefaultGenericSolverLookupMode = int(GenericSolverClosestMix);
     static constexpr float DefaultContrastPct = 100.f;
     static constexpr bool  DefaultHighResolutionSampling = true;
     static constexpr float DefaultToneGamma = 1.f;
@@ -108,6 +114,7 @@ struct TextureMappingZone
     bool        seam_hiding = DefaultSeamHiding;
     bool        nonlinear_offset_adjustment = DefaultNonlinearOffsetAdjustment;
     bool        compact_offset_mode = DefaultCompactOffsetMode;
+    int         generic_solver_lookup_mode = DefaultGenericSolverLookupMode;
     float       contrast_pct = DefaultContrastPct;
     bool        high_resolution_sampling = DefaultHighResolutionSampling;
     float       tone_gamma = DefaultToneGamma;
@@ -145,6 +152,7 @@ struct TextureMappingZone
         seam_hiding = DefaultSeamHiding;
         nonlinear_offset_adjustment = DefaultNonlinearOffsetAdjustment;
         compact_offset_mode = DefaultCompactOffsetMode;
+        generic_solver_lookup_mode = DefaultGenericSolverLookupMode;
         contrast_pct = DefaultContrastPct;
         high_resolution_sampling = DefaultHighResolutionSampling;
         tone_gamma = DefaultToneGamma;
@@ -174,6 +182,47 @@ struct TextureMappingZone
 
     bool operator==(const TextureMappingZone &rhs) const;
     bool operator!=(const TextureMappingZone &rhs) const { return !(*this == rhs); }
+};
+
+struct TextureMappingPrimeTowerImage
+{
+    std::vector<uint8_t> rgba;
+    unsigned int width = 0;
+    unsigned int height = 0;
+    std::string image_name;
+
+    bool valid() const
+    {
+        return width > 0 && height > 0 && rgba.size() >= size_t(width) * size_t(height) * 4;
+    }
+
+    void clear()
+    {
+        rgba.clear();
+        width = 0;
+        height = 0;
+        image_name.clear();
+    }
+};
+
+struct TextureMappingGlobalSettings
+{
+    bool enabled = false;
+    float angle_offset_deg = 0.f;
+    std::string prime_tower_color_mode = "auto";
+    std::string image_file;
+    std::string image_name;
+    unsigned int image_width = 0;
+    unsigned int image_height = 0;
+
+    bool has_image_reference() const { return !image_file.empty() || image_width > 0 || image_height > 0; }
+    bool effective_enabled(const TextureMappingPrimeTowerImage &image) const { return enabled && image.valid(); }
+
+    std::string serialize() const;
+    void load(const std::string &serialized);
+    void clear_image_reference();
+    static std::string normalize_color_mode_name(const std::string &mode);
+    static bool is_generic_solver_color_mode(const std::string &mode);
 };
 
 class TextureMappingManager

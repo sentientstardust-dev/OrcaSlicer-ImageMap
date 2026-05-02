@@ -506,7 +506,111 @@ static int color_model_from_name(const std::string &name)
     return int(TextureMappingZone::FilamentColorAny);
 }
 
+static std::string generic_solver_lookup_mode_name(int mode)
+{
+    return clamp_int(mode,
+                     int(TextureMappingZone::GenericSolverClosestMix),
+                     int(TextureMappingZone::GenericSolverBlendClosestTwo)) ==
+               int(TextureMappingZone::GenericSolverBlendClosestTwo) ?
+        std::string("blend_closest_two") :
+        std::string("closest_mix");
+}
+
+static int generic_solver_lookup_mode_from_name(const std::string &name)
+{
+    return name == "blend_closest_two" ?
+        int(TextureMappingZone::GenericSolverBlendClosestTwo) :
+        int(TextureMappingZone::GenericSolverClosestMix);
+}
+
+static std::string normalized_prime_tower_color_mode_name(std::string name)
+{
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    if (name == "auto" || name.empty())
+        return "auto";
+    if (name == "generic" || name == "generic_solver" || name == "solver")
+        return "generic_solver";
+    if (name == "rgb" || name == "cmy" || name == "cmyk" || name == "cmyw" ||
+        name == "rgbk" || name == "rgbw" || name == "bw")
+        return name;
+    return "auto";
+}
+
 } // namespace
+
+std::string TextureMappingGlobalSettings::serialize() const
+{
+    const std::string normalized_mode = normalize_color_mode_name(prime_tower_color_mode);
+    if (!enabled &&
+        std::abs((std::isfinite(angle_offset_deg) ? angle_offset_deg : 0.f)) <= 1e-6f &&
+        normalized_mode == "auto" &&
+        image_file.empty() &&
+        image_name.empty() &&
+        image_width == 0 &&
+        image_height == 0)
+        return {};
+
+    nlohmann::json root;
+    root["schema"] = 1;
+    nlohmann::json prime_tower_texture_mapping;
+    prime_tower_texture_mapping["enabled"] = enabled;
+    prime_tower_texture_mapping["angle_offset_deg"] = std::clamp(std::isfinite(angle_offset_deg) ? angle_offset_deg : 0.f, 0.f, 360.f);
+    prime_tower_texture_mapping["prime_tower_color_mode"] = normalized_mode;
+    prime_tower_texture_mapping["image_file"] = image_file;
+    prime_tower_texture_mapping["image_name"] = image_name;
+    prime_tower_texture_mapping["image_width"] = image_width;
+    prime_tower_texture_mapping["image_height"] = image_height;
+    root["prime_tower_texture_mapping"] = std::move(prime_tower_texture_mapping);
+    return root.dump();
+}
+
+void TextureMappingGlobalSettings::load(const std::string &serialized)
+{
+    *this = TextureMappingGlobalSettings();
+    if (serialized.empty())
+        return;
+
+    nlohmann::json root;
+    try {
+        root = nlohmann::json::parse(serialized);
+    } catch (const std::exception &e) {
+        BOOST_LOG_TRIVIAL(warning) << "TextureMappingGlobalSettings::load JSON parse failed: " << e.what();
+        return;
+    }
+    if (!root.is_object())
+        return;
+
+    const auto prime_tower_texture_mapping_it = root.find("prime_tower_texture_mapping");
+    if (prime_tower_texture_mapping_it == root.end() || !prime_tower_texture_mapping_it->is_object())
+        return;
+
+    const nlohmann::json &prime_tower_texture_mapping = *prime_tower_texture_mapping_it;
+    enabled = prime_tower_texture_mapping.value("enabled", false);
+    angle_offset_deg = std::clamp(prime_tower_texture_mapping.value("angle_offset_deg", 0.f), 0.f, 360.f);
+    prime_tower_color_mode = normalize_color_mode_name(prime_tower_texture_mapping.value("prime_tower_color_mode", std::string("auto")));
+    image_file = prime_tower_texture_mapping.value("image_file", std::string());
+    image_name = prime_tower_texture_mapping.value("image_name", std::string());
+    image_width = prime_tower_texture_mapping.value("image_width", 0u);
+    image_height = prime_tower_texture_mapping.value("image_height", 0u);
+}
+
+void TextureMappingGlobalSettings::clear_image_reference()
+{
+    image_file.clear();
+    image_name.clear();
+    image_width = 0;
+    image_height = 0;
+}
+
+std::string TextureMappingGlobalSettings::normalize_color_mode_name(const std::string &mode)
+{
+    return normalized_prime_tower_color_mode_name(mode);
+}
+
+bool TextureMappingGlobalSettings::is_generic_solver_color_mode(const std::string &mode)
+{
+    return normalize_color_mode_name(mode) == "generic_solver";
+}
 
 bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
 {
@@ -547,6 +651,7 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            seam_hiding == rhs.seam_hiding &&
            nonlinear_offset_adjustment == rhs.nonlinear_offset_adjustment &&
            compact_offset_mode == rhs.compact_offset_mode &&
+           generic_solver_lookup_mode == rhs.generic_solver_lookup_mode &&
            std::abs(contrast_pct - rhs.contrast_pct) <= eps &&
            high_resolution_sampling == rhs.high_resolution_sampling &&
            std::abs(tone_gamma - rhs.tone_gamma) <= eps &&
@@ -762,6 +867,7 @@ std::string TextureMappingManager::serialize_entries()
         texture["hide_seams"] = zone.seam_hiding;
         texture["nonlinear_offset_adjustment"] = zone.nonlinear_offset_adjustment;
         texture["compact_offset_mode"] = zone.compact_offset_mode;
+        texture["generic_solver_lookup"] = generic_solver_lookup_mode_name(zone.generic_solver_lookup_mode);
         texture["contrast_pct"] = std::clamp(finite_or(zone.contrast_pct, 100.f), 25.f, 300.f);
         texture["high_resolution_sampling"] = zone.high_resolution_sampling;
         texture["tone_gamma"] = normalize_tone_gamma(zone.tone_gamma);
@@ -882,6 +988,8 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.seam_hiding = texture.value("hide_seams", false);
         zone.nonlinear_offset_adjustment = texture.value("nonlinear_offset_adjustment", false);
         zone.compact_offset_mode = texture.value("compact_offset_mode", TextureMappingZone::DefaultCompactOffsetMode);
+        zone.generic_solver_lookup_mode =
+            generic_solver_lookup_mode_from_name(texture.value("generic_solver_lookup", std::string("closest_mix")));
         zone.contrast_pct = std::clamp(texture.value("contrast_pct", 100.f), 25.f, 300.f);
         zone.high_resolution_sampling = texture.value("high_resolution_sampling", true);
         zone.tone_gamma = normalize_tone_gamma(texture.value("tone_gamma", 1.f));

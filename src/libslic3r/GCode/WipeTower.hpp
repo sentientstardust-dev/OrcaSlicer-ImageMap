@@ -6,6 +6,11 @@
 #include <sstream>
 #include <utility>
 #include <algorithm>
+#include <array>
+#include <cstdint>
+#include <initializer_list>
+#include <limits>
+#include <vector>
 
 #include "libslic3r/Point.hpp"
 #include "libslic3r/Polygon.hpp"
@@ -19,6 +24,198 @@ namespace Slic3r
 class WipeTowerWriter;
 class PrintConfig;
 enum GCodeFlavor : unsigned char;
+
+struct PrimeTowerTextureRenderSettings
+{
+    enum ColorMode : int {
+        Auto = 0,
+        GenericSolver,
+        CMY,
+        CMYK,
+        CMYW,
+        RGB,
+        RGBK,
+        RGBW,
+        BW
+    };
+
+    bool enabled = false;
+    float angle_offset_deg = 0.f;
+    int color_mode = Auto;
+    bool generic_fallback_for_missing_channels = false;
+    float global_strength = 1.f;
+    float max_line_width = 0.95f;
+    float min_line_width = 0.32f;
+    std::vector<uint8_t> image_rgba;
+    unsigned int image_width = 0;
+    unsigned int image_height = 0;
+    std::vector<std::string> filament_colours;
+    float z_min = 0.f;
+    float z_max = 0.f;
+
+    bool valid() const
+    {
+        return enabled && image_width > 0 && image_height > 0 &&
+               image_rgba.size() >= size_t(image_width) * size_t(image_height) * 4;
+    }
+
+    float sample_tool_visibility(size_t tool, float u, float v) const
+    {
+        if (!valid())
+            return 1.f;
+        u -= std::floor(u);
+        v = std::clamp(v, 0.f, 1.f);
+        const float x = u * float(image_width);
+        const float y = (1.f - v) * float(image_height - 1);
+        const unsigned int ix = std::min<unsigned int>(image_width - 1, unsigned(std::floor(x)));
+        const unsigned int iy = std::min<unsigned int>(image_height - 1, unsigned(std::floor(y)));
+        const size_t offset = (size_t(iy) * size_t(image_width) + size_t(ix)) * 4;
+        const float r = float(image_rgba[offset + 0]) / 255.f;
+        const float g = float(image_rgba[offset + 1]) / 255.f;
+        const float b = float(image_rgba[offset + 2]) / 255.f;
+        return color_mode == GenericSolver || color_mode == Auto ? generic_visibility(tool, r, g, b) : fixed_mode_visibility(tool, r, g, b);
+    }
+
+private:
+    static std::array<float, 3> parse_color(const std::string &hex)
+    {
+        auto hex_byte = [](char hi, char lo) {
+            auto nibble = [](char c) {
+                if (c >= '0' && c <= '9') return int(c - '0');
+                if (c >= 'a' && c <= 'f') return int(c - 'a') + 10;
+                if (c >= 'A' && c <= 'F') return int(c - 'A') + 10;
+                return 0;
+            };
+            return float(nibble(hi) * 16 + nibble(lo)) / 255.f;
+        };
+        if (hex.size() >= 7 && hex[0] == '#')
+            return {hex_byte(hex[1], hex[2]), hex_byte(hex[3], hex[4]), hex_byte(hex[5], hex[6])};
+        return {1.f, 1.f, 1.f};
+    }
+
+    static float color_distance2(const std::array<float, 3> &a, const std::array<float, 3> &b)
+    {
+        const float dr = a[0] - b[0];
+        const float dg = a[1] - b[1];
+        const float db = a[2] - b[2];
+        return dr * dr + dg * dg + db * db;
+    }
+
+    static float print_visibility_strength(float value)
+    {
+        return std::clamp(std::pow(std::max(0.f, value), 0.85f), 0.f, 1.f);
+    }
+
+    static float safe_div(float numerator, float denominator)
+    {
+        return denominator <= 1e-6f ? 0.f : std::clamp(numerator / denominator, 0.f, 1.f);
+    }
+
+    std::array<float, 3> tool_color(size_t tool) const
+    {
+        return tool < filament_colours.size() ? parse_color(filament_colours[tool]) : std::array<float, 3>{1.f, 1.f, 1.f};
+    }
+
+    float generic_visibility(size_t tool, float r, float g, float b) const
+    {
+        const std::array<float, 3> target{r, g, b};
+        const float distance = std::sqrt(color_distance2(tool_color(tool), target));
+        return std::clamp(1.f - distance / std::sqrt(3.f), 0.f, 1.f);
+    }
+
+    float fixed_mode_visibility(size_t tool, float r, float g, float b) const
+    {
+        std::vector<std::array<float, 3>> ideals;
+        std::vector<float> weights;
+        r = std::clamp(r, 0.f, 1.f);
+        g = std::clamp(g, 0.f, 1.f);
+        b = std::clamp(b, 0.f, 1.f);
+        const float whiteness = std::min({r, g, b});
+        const float darkness = 1.f - std::max({r, g, b});
+        switch (color_mode) {
+        case CMY:
+            ideals = {{{0.f, 1.f, 1.f}, {1.f, 0.f, 1.f}, {1.f, 1.f, 0.f}}};
+            weights = {print_visibility_strength(1.f - r),
+                       print_visibility_strength(1.f - g),
+                       print_visibility_strength(1.f - b)};
+            break;
+        case CMYK: {
+            const float k = std::clamp(darkness, 0.f, 1.f);
+            const float inv = 1.f - k;
+            ideals = {{{0.f, 1.f, 1.f}, {1.f, 0.f, 1.f}, {1.f, 1.f, 0.f}, {0.f, 0.f, 0.f}}};
+            weights = {print_visibility_strength(safe_div(1.f - r - k, inv)),
+                       print_visibility_strength(safe_div(1.f - g - k, inv)),
+                       print_visibility_strength(safe_div(1.f - b - k, inv)),
+                       print_visibility_strength(k)};
+            break;
+        }
+        case CMYW: {
+            const float inv = 1.f - whiteness;
+            const float r_no_w = safe_div(r - whiteness, inv);
+            const float g_no_w = safe_div(g - whiteness, inv);
+            const float b_no_w = safe_div(b - whiteness, inv);
+            ideals = {{{0.f, 1.f, 1.f}, {1.f, 0.f, 1.f}, {1.f, 1.f, 0.f}, {1.f, 1.f, 1.f}}};
+            weights = {print_visibility_strength(std::clamp((1.f - r_no_w) * inv, 0.f, 1.f)),
+                       print_visibility_strength(std::clamp((1.f - g_no_w) * inv, 0.f, 1.f)),
+                       print_visibility_strength(std::clamp((1.f - b_no_w) * inv, 0.f, 1.f)),
+                       std::clamp(std::pow(whiteness, 1.35f), 0.f, 1.f)};
+            break;
+        }
+        case RGB:
+            ideals = {{{1.f, 0.f, 0.f}, {0.f, 1.f, 0.f}, {0.f, 0.f, 1.f}}};
+            weights = {print_visibility_strength(r),
+                       print_visibility_strength(g),
+                       print_visibility_strength(b)};
+            break;
+        case RGBK: {
+            const float k = std::clamp(darkness, 0.f, 1.f);
+            const float inv = 1.f - k;
+            ideals = {{{1.f, 0.f, 0.f}, {0.f, 1.f, 0.f}, {0.f, 0.f, 1.f}, {0.f, 0.f, 0.f}}};
+            weights = {print_visibility_strength(safe_div(r - k, inv)),
+                       print_visibility_strength(safe_div(g - k, inv)),
+                       print_visibility_strength(safe_div(b - k, inv)),
+                       print_visibility_strength(k)};
+            break;
+        }
+        case RGBW: {
+            const float inv = 1.f - whiteness;
+            ideals = {{{1.f, 0.f, 0.f}, {0.f, 1.f, 0.f}, {0.f, 0.f, 1.f}, {1.f, 1.f, 1.f}}};
+            weights = {print_visibility_strength(safe_div(r - whiteness, inv)),
+                       print_visibility_strength(safe_div(g - whiteness, inv)),
+                       print_visibility_strength(safe_div(b - whiteness, inv)),
+                       print_visibility_strength(whiteness)};
+            break;
+        }
+        case BW: {
+            const float gray = std::clamp(0.2126f * r + 0.7152f * g + 0.0722f * b, 0.f, 1.f);
+            ideals = {{{0.f, 0.f, 0.f}, {1.f, 1.f, 1.f}}};
+            weights = {print_visibility_strength(gray >= 0.5f ? 2.f * (1.f - gray) : 1.f),
+                       print_visibility_strength(gray <= 0.5f ? 2.f * gray : 1.f)};
+            break;
+        }
+        default:
+            ideals = {{{0.f, 1.f, 1.f}, {1.f, 0.f, 1.f}, {1.f, 1.f, 0.f}, {0.f, 0.f, 0.f}}};
+            weights = {print_visibility_strength(1.f - r),
+                       print_visibility_strength(1.f - g),
+                       print_visibility_strength(1.f - b),
+                       print_visibility_strength(darkness)};
+            break;
+        }
+        const std::array<float, 3> actual = tool_color(tool);
+        size_t best = 0;
+        float best_distance = std::numeric_limits<float>::max();
+        for (size_t i = 0; i < ideals.size(); ++i) {
+            const float distance = color_distance2(actual, ideals[i]);
+            if (distance < best_distance) {
+                best_distance = distance;
+                best = i;
+            }
+        }
+        if (generic_fallback_for_missing_channels && best_distance > 0.35f)
+            return generic_visibility(tool, r, g, b);
+        return best < weights.size() ? std::clamp(weights[best], 0.f, 1.f) : generic_visibility(tool, r, g, b);
+    }
+};
 
 
 class WipeTower
@@ -189,6 +386,7 @@ public:
 
 	// Iterates through prepared m_plan, generates ToolChangeResults and appends them to "result"
 	void generate(std::vector<std::vector<ToolChangeResult>> &result);
+    void set_prime_tower_texture(const PrimeTowerTextureRenderSettings &settings) { m_prime_tower_texture = settings; }
 
 	WipeTower::ToolChangeResult only_generate_out_wall(bool is_new_mode = false);
     Polygon generate_support_wall(WipeTowerWriter &writer, const box_coordinates &wt_box, double feedrate, bool first_layer);
@@ -559,6 +757,7 @@ private:
 
     // Stores information about used filament length per extruder:
     std::vector<float> m_used_filament_length;
+    PrimeTowerTextureRenderSettings m_prime_tower_texture;
 
     // BBS: consider both soluable and support properties
     // Return index of first toolchange that switches to non-soluble extruder

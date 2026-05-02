@@ -42,6 +42,7 @@ static std::vector<std::string> s_project_options {
     "filament_colour_type",
     "filament_multi_colour",
     "texture_mapping_definitions",
+    "texture_mapping_global_settings",
     "wipe_tower_x",
     "wipe_tower_y",
     "wipe_tower_rotation_angle",
@@ -308,6 +309,7 @@ PresetBundle::PresetBundle()
     this->project_config.apply_only(FullPrintConfig::defaults(), s_project_options);
     if (const auto *color_opt = this->project_config.option<ConfigOptionStrings>("filament_colour", false); color_opt != nullptr)
         this->texture_mapping_zones.load_entries(this->project_config.opt_string("texture_mapping_definitions"), color_opt->values);
+    this->texture_mapping_global_settings.load(this->project_config.opt_string("texture_mapping_global_settings"));
 }
 
 PresetBundle::PresetBundle(const PresetBundle &rhs)
@@ -327,6 +329,7 @@ PresetBundle& PresetBundle::operator=(const PresetBundle &rhs)
     filament_presets    = rhs.filament_presets;
     project_config      = rhs.project_config;
     texture_mapping_zones = rhs.texture_mapping_zones;
+    texture_mapping_global_settings = rhs.texture_mapping_global_settings;
     vendors             = rhs.vendors;
     obsolete_presets    = rhs.obsolete_presets;
     m_errors    = rhs.m_errors;

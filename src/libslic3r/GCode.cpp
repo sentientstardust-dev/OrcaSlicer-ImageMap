@@ -497,6 +497,15 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
         return Point(scale_(wipe_tower_pt.x() - gcodegen.origin()(0)), scale_(wipe_tower_pt.y() - gcodegen.origin()(1)));
     }
 
+    Vec2f WipeTowerIntegration::offset_for_extruder(int extruder_id) const
+    {
+        if (extruder_id >= 0 && size_t(extruder_id) < m_extruder_offsets.size())
+            return m_extruder_offsets[size_t(extruder_id)].cast<float>();
+        if (m_extruder_offsets.empty())
+            return Vec2f::Zero();
+        return m_extruder_offsets.front().cast<float>();
+    }
+
     // set volumetric speed of outer wall ,ignore per obejct & region ,just use default setting
     static float get_outer_wall_volumetric_speed(const FullPrintConfig& config, const Print& print, int filament_id, int extruder_id) {
         float outer_wall_volumetric_speed = 0;
@@ -1378,9 +1387,9 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
     {
         Vec2f extruder_offset;
         if (m_single_extruder_multi_material)
-            extruder_offset = m_extruder_offsets[0].cast<float>();
+            extruder_offset = offset_for_extruder(0);
         else
-            extruder_offset = m_extruder_offsets[tcr.initial_tool].cast<float>();
+            extruder_offset = offset_for_extruder(tcr.initial_tool);
 
         std::istringstream gcode_str(tcr.gcode);
         std::string gcode_out;
@@ -1430,7 +1439,8 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
                     oss << " ";
                     line.replace(line.find(cur_gcode_start), 3, oss.str());
                     old_pos = transformed_pos;
-                }
+                } else if (line.find_first_not_of(" \t\r", cur_gcode_start.size()) == std::string::npos)
+                    line.clear();
             }
 
             gcode_out += line + "\n";
@@ -1439,10 +1449,10 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
             if (line == "[change_filament_gcode]") {
                 // BBS
                 if (!m_single_extruder_multi_material) {
-                    extruder_offset = m_extruder_offsets[tcr.new_tool].cast<float>();
+                    extruder_offset = offset_for_extruder(tcr.new_tool);
 
                     // If the extruder offset changed, add an extra move so everything is continuous
-                    if (extruder_offset != m_extruder_offsets[tcr.initial_tool].cast<float>()) {
+                    if (extruder_offset != offset_for_extruder(tcr.initial_tool)) {
                         std::ostringstream oss;
                         oss << std::fixed << std::setprecision(3)
                             << "G1 X" << transformed_pos.x() - extruder_offset.x()
@@ -2011,6 +2021,10 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     // BBS
     m_curr_print = print;
     m_warned_texture_mapping_filament_count_mismatch = false;
+    m_generic_solver_mix_candidate_cache.clear();
+    ScopeGuard clear_generic_solver_mix_candidate_cache([this]() {
+        m_generic_solver_mix_candidate_cache.clear();
+    });
 
     GCodeWriter::full_gcode_comment = print->config().gcode_comments;
     CNumericLocalesSetter locales_setter;
@@ -6131,45 +6145,271 @@ static std::array<float, 3> mix_component_colors_with_filament_mixer_for_gcode(c
     return { out_r, out_g, out_b };
 }
 
-static std::vector<float> best_component_mix_weights_for_target_for_gcode(const std::vector<std::array<float, 3>> &component_colors,
-                                                                          const std::array<float, 3>              &target_rgb)
+static std::string generic_mix_candidate_cache_key_for_gcode(const std::vector<std::array<float, 3>> &component_colors)
 {
+    std::ostringstream key;
+    key << component_colors.size();
+    for (const std::array<float, 3> &color : component_colors) {
+        key << '|'
+            << int(std::lround(clamp01f_for_gcode(color[0]) * 65535.f)) << ','
+            << int(std::lround(clamp01f_for_gcode(color[1]) * 65535.f)) << ','
+            << int(std::lround(clamp01f_for_gcode(color[2]) * 65535.f));
+    }
+    return key.str();
+}
+
+static int generic_mix_total_units_for_component_count_for_gcode(size_t component_count)
+{
+    return component_count <= 4 ? 40 : (component_count == 5 ? 24 : (component_count == 6 ? 20 : 12));
+}
+
+static size_t generic_mix_candidate_count_for_gcode(size_t component_count, int total_units)
+{
+    if (component_count == 0)
+        return 0;
+
+    const size_t n = size_t(total_units) + component_count - 1;
+    size_t k = component_count - 1;
+    k = std::min(k, n - k);
+
+    size_t result = 1;
+    for (size_t idx = 1; idx <= k; ++idx)
+        result = (result * (n - k + idx)) / idx;
+    return result;
+}
+
+static int build_generic_mix_candidate_kd_tree_for_gcode(GCodeGenericMixCandidateSet &candidates,
+                                                         std::vector<uint32_t>       &indices,
+                                                         size_t                       begin,
+                                                         size_t                       end,
+                                                         uint8_t                      axis)
+{
+    if (begin >= end)
+        return -1;
+
+    const size_t mid = begin + (end - begin) / 2;
+    auto axis_value = [&candidates, axis](uint32_t candidate_idx) {
+        return candidates.rgbs[size_t(candidate_idx) * 3 + size_t(axis)];
+    };
+    std::nth_element(indices.begin() + begin,
+                     indices.begin() + mid,
+                     indices.begin() + end,
+                     [&axis_value](uint32_t lhs, uint32_t rhs) {
+                         return axis_value(lhs) < axis_value(rhs);
+                     });
+
+    const int node_idx = int(candidates.kd_nodes.size());
+    GCodeGenericMixCandidateSet::KdNode node;
+    node.candidate_idx = indices[mid];
+    node.axis = axis;
+    candidates.kd_nodes.emplace_back(node);
+
+    const uint8_t next_axis = uint8_t((axis + 1) % 3);
+    const int left = build_generic_mix_candidate_kd_tree_for_gcode(candidates, indices, begin, mid, next_axis);
+    const int right = build_generic_mix_candidate_kd_tree_for_gcode(candidates, indices, mid + 1, end, next_axis);
+    candidates.kd_nodes[size_t(node_idx)].left = left;
+    candidates.kd_nodes[size_t(node_idx)].right = right;
+    return node_idx;
+}
+
+static void build_generic_mix_candidate_kd_tree_for_gcode(GCodeGenericMixCandidateSet &candidates)
+{
+    const size_t candidate_count = candidates.rgbs.size() / 3;
+    candidates.kd_nodes.clear();
+    candidates.kd_root = -1;
+    if (candidate_count == 0)
+        return;
+
+    std::vector<uint32_t> indices(candidate_count, 0);
+    for (size_t idx = 0; idx < candidate_count; ++idx)
+        indices[idx] = uint32_t(idx);
+
+    candidates.kd_nodes.reserve(candidate_count);
+    candidates.kd_root = build_generic_mix_candidate_kd_tree_for_gcode(candidates,
+                                                                       indices,
+                                                                       0,
+                                                                       candidate_count,
+                                                                       uint8_t(0));
+}
+
+static GCodeGenericMixCandidateSet build_generic_mix_candidates_for_gcode(
+    const std::vector<std::array<float, 3>> &component_colors)
+{
+    GCodeGenericMixCandidateSet candidates;
     if (component_colors.empty())
-        return {};
-    if (component_colors.size() == 1)
-        return { 1.f };
+        return candidates;
 
     const size_t component_count = component_colors.size();
-    const int total_units = component_count <= 4 ? 20 : (component_count <= 6 ? 10 : 6);
+    const int total_units = generic_mix_total_units_for_component_count_for_gcode(component_count);
     std::vector<int> units(component_count, 0);
-    std::vector<int> best_units(component_count, 0);
-    float            best_error = std::numeric_limits<float>::max();
+    const size_t estimated_candidate_count = generic_mix_candidate_count_for_gcode(component_count, total_units);
+    candidates.component_count = component_count;
+    candidates.rgbs.reserve(estimated_candidate_count * 3);
+    candidates.weights.reserve(estimated_candidate_count * component_count);
 
     std::function<void(size_t, int)> recurse = [&](size_t idx, int remaining_units) {
         if (idx + 1 == component_count) {
             units[idx] = remaining_units;
             const std::array<float, 3> mixed = mix_component_colors_with_filament_mixer_for_gcode(component_colors, units);
-            const float dr = mixed[0] - target_rgb[0];
-            const float dg = mixed[1] - target_rgb[1];
-            const float db = mixed[2] - target_rgb[2];
-            const float error = dr * dr + dg * dg + db * db;
-            if (error < best_error) {
-                best_error = error;
-                best_units = units;
-            }
+            candidates.rgbs.emplace_back(mixed[0]);
+            candidates.rgbs.emplace_back(mixed[1]);
+            candidates.rgbs.emplace_back(mixed[2]);
+            for (size_t weight_idx = 0; weight_idx < component_count; ++weight_idx)
+                candidates.weights.emplace_back(float(units[weight_idx]) / float(std::max(1, total_units)));
             return;
         }
 
-        for (int u = 0; u <= remaining_units; ++u) {
-            units[idx] = u;
-            recurse(idx + 1, remaining_units - u);
+        for (int unit = 0; unit <= remaining_units; ++unit) {
+            units[idx] = unit;
+            recurse(idx + 1, remaining_units - unit);
         }
     };
     recurse(0, total_units);
+    build_generic_mix_candidate_kd_tree_for_gcode(candidates);
+    return candidates;
+}
 
-    std::vector<float> weights(component_count, 0.f);
-    for (size_t i = 0; i < component_count; ++i)
-        weights[i] = float(best_units[i]) / float(std::max(1, total_units));
+static const GCodeGenericMixCandidateSet &generic_mix_candidates_for_gcode(
+    std::map<std::string, GCodeGenericMixCandidateSet> &cache,
+    const std::vector<std::array<float, 3>>             &component_colors)
+{
+    const std::string key = generic_mix_candidate_cache_key_for_gcode(component_colors);
+    auto it = cache.find(key);
+    if (it != cache.end())
+        return it->second;
+    return cache.emplace(key, build_generic_mix_candidates_for_gcode(component_colors)).first->second;
+}
+
+struct GCodeGenericMixNearestResult {
+    size_t best_idx { size_t(-1) };
+    size_t second_idx { size_t(-1) };
+    float  best_error { std::numeric_limits<float>::max() };
+    float  second_error { std::numeric_limits<float>::max() };
+};
+
+static void update_generic_mix_nearest_result_for_gcode(GCodeGenericMixNearestResult &result,
+                                                        size_t                        candidate_idx,
+                                                        float                         error)
+{
+    if (candidate_idx == result.best_idx || candidate_idx == result.second_idx)
+        return;
+
+    if (error < result.best_error) {
+        result.second_error = result.best_error;
+        result.second_idx = result.best_idx;
+        result.best_error = error;
+        result.best_idx = candidate_idx;
+    } else if (error < result.second_error) {
+        result.second_error = error;
+        result.second_idx = candidate_idx;
+    }
+}
+
+static float generic_mix_candidate_error_for_gcode(const GCodeGenericMixCandidateSet &candidates,
+                                                   size_t                             candidate_idx,
+                                                   const std::array<float, 3>        &target_rgb)
+{
+    const size_t rgb_idx = candidate_idx * 3;
+    const float dr = candidates.rgbs[rgb_idx + 0] - target_rgb[0];
+    const float dg = candidates.rgbs[rgb_idx + 1] - target_rgb[1];
+    const float db = candidates.rgbs[rgb_idx + 2] - target_rgb[2];
+    return dr * dr + dg * dg + db * db;
+}
+
+static GCodeGenericMixNearestResult nearest_generic_mix_candidates_linear_for_gcode(
+    const GCodeGenericMixCandidateSet &candidates,
+    const std::array<float, 3>        &target_rgb)
+{
+    GCodeGenericMixNearestResult result;
+    const size_t candidate_count = candidates.rgbs.size() / 3;
+    for (size_t candidate_idx = 0; candidate_idx < candidate_count; ++candidate_idx) {
+        update_generic_mix_nearest_result_for_gcode(result,
+                                                    candidate_idx,
+                                                    generic_mix_candidate_error_for_gcode(candidates,
+                                                                                         candidate_idx,
+                                                                                         target_rgb));
+    }
+    return result;
+}
+
+static void query_generic_mix_candidate_kd_tree_for_gcode(const GCodeGenericMixCandidateSet &candidates,
+                                                          const std::array<float, 3>        &target_rgb,
+                                                          int                                node_idx,
+                                                          GCodeGenericMixNearestResult      &result)
+{
+    if (node_idx < 0 || size_t(node_idx) >= candidates.kd_nodes.size())
+        return;
+
+    const size_t candidate_count = candidates.rgbs.size() / 3;
+    const GCodeGenericMixCandidateSet::KdNode &node = candidates.kd_nodes[size_t(node_idx)];
+    if (size_t(node.candidate_idx) >= candidate_count) {
+        query_generic_mix_candidate_kd_tree_for_gcode(candidates, target_rgb, node.left, result);
+        query_generic_mix_candidate_kd_tree_for_gcode(candidates, target_rgb, node.right, result);
+        return;
+    }
+
+    update_generic_mix_nearest_result_for_gcode(result,
+                                                size_t(node.candidate_idx),
+                                                generic_mix_candidate_error_for_gcode(candidates,
+                                                                                     size_t(node.candidate_idx),
+                                                                                     target_rgb));
+
+    const size_t rgb_idx = size_t(node.candidate_idx) * 3;
+    const size_t axis = std::min<size_t>(node.axis, 2);
+    const float split_delta = target_rgb[axis] - candidates.rgbs[rgb_idx + axis];
+    const int near_node = split_delta <= 0.f ? node.left : node.right;
+    const int far_node = split_delta <= 0.f ? node.right : node.left;
+
+    query_generic_mix_candidate_kd_tree_for_gcode(candidates, target_rgb, near_node, result);
+    if (split_delta * split_delta <= result.second_error)
+        query_generic_mix_candidate_kd_tree_for_gcode(candidates, target_rgb, far_node, result);
+}
+
+static GCodeGenericMixNearestResult nearest_generic_mix_candidates_for_gcode(
+    const GCodeGenericMixCandidateSet &candidates,
+    const std::array<float, 3>        &target_rgb)
+{
+    GCodeGenericMixNearestResult result;
+    const size_t candidate_count = candidates.rgbs.size() / 3;
+    if (candidates.kd_root >= 0 && !candidates.kd_nodes.empty())
+        query_generic_mix_candidate_kd_tree_for_gcode(candidates, target_rgb, candidates.kd_root, result);
+    if (result.best_idx >= candidate_count)
+        result = nearest_generic_mix_candidates_linear_for_gcode(candidates, target_rgb);
+    return result;
+}
+
+static std::vector<float> best_component_mix_weights_for_target_for_gcode(const GCodeGenericMixCandidateSet &candidates,
+                                                                          const std::array<float, 3>        &target_rgb,
+                                                                          int                                generic_solver_lookup_mode)
+{
+    if (candidates.empty())
+        return {};
+
+    const size_t candidate_count = candidates.rgbs.size() / 3;
+    const GCodeGenericMixNearestResult nearest = nearest_generic_mix_candidates_for_gcode(candidates, target_rgb);
+    if (nearest.best_idx >= candidate_count)
+        return {};
+
+    const int clamped_mode = std::clamp(generic_solver_lookup_mode,
+                                        int(TextureMappingZone::GenericSolverClosestMix),
+                                        int(TextureMappingZone::GenericSolverBlendClosestTwo));
+    std::vector<float> weights(candidates.component_count, 0.f);
+    const size_t best_weight_idx = nearest.best_idx * candidates.component_count;
+    if (clamped_mode == int(TextureMappingZone::GenericSolverClosestMix) ||
+        nearest.second_idx >= candidate_count ||
+        nearest.best_error <= 1e-12f) {
+        for (size_t idx = 0; idx < candidates.component_count; ++idx)
+            weights[idx] = candidates.weights[best_weight_idx + idx];
+        return weights;
+    }
+
+    const size_t second_weight_idx = nearest.second_idx * candidates.component_count;
+    const float best_inv = 1.f / std::max(nearest.best_error, 1e-12f);
+    const float second_inv = 1.f / std::max(nearest.second_error, 1e-12f);
+    const float inv_sum = std::max(best_inv + second_inv, 1e-12f);
+    for (size_t idx = 0; idx < candidates.component_count; ++idx)
+        weights[idx] = clamp01f_for_gcode((candidates.weights[best_weight_idx + idx] * best_inv +
+                                           candidates.weights[second_weight_idx + idx] * second_inv) / inv_sum);
     return weights;
 }
 
@@ -6492,6 +6732,8 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                                                                                 bool                                      raw_values_mode,
                                                                                 int                                       filament_color_mode,
                                                                                 bool                                      force_sequential_filaments,
+                                                                                int                                       generic_solver_lookup_mode,
+                                                                                std::map<std::string, GCodeGenericMixCandidateSet> *generic_mix_candidate_cache,
                                                                                 float                                     texture_contrast_pct,
                                                                                 float                                     texture_tone_gamma,
                                                                                 bool                                      layer_aware_weighting,
@@ -6735,6 +6977,25 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
 
     const size_t component_count = component_colors.size();
     const size_t sample_count = samples.size();
+    GCodeGenericMixCandidateSet local_generic_mix_candidates;
+    const GCodeGenericMixCandidateSet *generic_mix_candidates = nullptr;
+    if (!raw_values_mode) {
+        const std::array<float, 3> probe_target { 0.f, 0.f, 0.f };
+        const std::vector<float> optimized_probe =
+            optimized_primary_component_weights_for_target_for_gcode(probe_target,
+                                                                     component_count,
+                                                                     filament_color_mode,
+                                                                     component_colors,
+                                                                     force_sequential_filaments);
+        if (optimized_probe.size() != component_count) {
+            if (generic_mix_candidate_cache != nullptr)
+                generic_mix_candidates = &generic_mix_candidates_for_gcode(*generic_mix_candidate_cache, component_colors);
+            else {
+                local_generic_mix_candidates = build_generic_mix_candidates_for_gcode(component_colors);
+                generic_mix_candidates = &local_generic_mix_candidates;
+            }
+        }
+    }
 
     weight_field.component_count = component_count;
     weight_field.sample_x_mm.resize(sample_count);
@@ -6781,7 +7042,11 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
             if (optimized.size() == component_count)
                 desired = std::move(optimized);
             else {
-                std::vector<float> best = best_component_mix_weights_for_target_for_gcode(component_colors, target);
+                std::vector<float> best = generic_mix_candidates != nullptr ?
+                    best_component_mix_weights_for_target_for_gcode(*generic_mix_candidates,
+                                                                    target,
+                                                                    generic_solver_lookup_mode) :
+                    std::vector<float>{};
                 if (best.size() == component_count)
                     desired = std::move(best);
             }
@@ -7891,6 +8156,9 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                 int(TextureMappingZone::FilamentColorAny),
                                 int(TextureMappingZone::FilamentColorBW));
                             const bool texture_force_sequential_filaments = zone->force_sequential_filaments;
+                            const int generic_solver_lookup_mode = std::clamp(zone->generic_solver_lookup_mode,
+                                                                              int(TextureMappingZone::GenericSolverClosestMix),
+                                                                              int(TextureMappingZone::GenericSolverBlendClosestTwo));
                             const float texture_contrast_pct = std::clamp(zone->contrast_pct, 25.f, 300.f);
                             const float texture_tone_gamma =
                                 (!std::isfinite(zone->tone_gamma) || zone->tone_gamma <= 0.f) ?
@@ -7900,6 +8168,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                 std::isfinite(zone->sagging_ratio) ? std::clamp(zone->sagging_ratio, 0.f, 6.f) : 0.f;
 
                             const VertexColorOverhangWeightField *vertex_color_weight_field = nullptr;
+                            auto *generic_mix_candidate_cache = &m_generic_solver_mix_candidate_cache;
                             if (vertex_color_match_mode && layer_object != nullptr) {
                                 const bool raw_texture_mapping_mode =
                                     zone->texture_mapping_mode == int(TextureMappingZone::TextureMappingRawValues);
@@ -7934,6 +8203,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                     component_key_stream << (raw_texture_mapping_mode ? "|raw" : "|blend");
                                     component_key_stream << "|fc" << texture_filament_color_mode;
                                     component_key_stream << "|fs" << (texture_force_sequential_filaments ? 1 : 0);
+                                    component_key_stream << "|gl" << generic_solver_lookup_mode;
                                     component_key_stream << "|ct" << int(std::lround(texture_contrast_pct));
                                     component_key_stream << "|tg" << int(std::lround(texture_tone_gamma * 100.f));
                                     component_key_stream << "|hr" << (high_resolution_texture_sampling ? 1 : 0);
@@ -7949,6 +8219,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                                                                                          raw_texture_mapping_mode,
                                                                                                          texture_filament_color_mode,
                                                                                                          texture_force_sequential_filaments,
+                                                                                                         generic_solver_lookup_mode,
+                                                                                                         generic_mix_candidate_cache,
                                                                                                          texture_contrast_pct,
                                                                                                          texture_tone_gamma,
                                                                                                          use_layer_aware_weighting,

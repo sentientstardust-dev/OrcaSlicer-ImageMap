@@ -49,6 +49,29 @@ namespace CustomGCode{ struct Item; }
 struct PrintInstance;
 class ConstPrintObjectPtrsAdaptor;
 
+struct GCodeGenericMixCandidateSet {
+    struct KdNode {
+        uint32_t candidate_idx { 0 };
+        int      left { -1 };
+        int      right { -1 };
+        uint8_t  axis { 0 };
+    };
+
+    size_t component_count { 0 };
+    std::vector<float> rgbs;
+    std::vector<float> weights;
+    std::vector<KdNode> kd_nodes;
+    int kd_root { -1 };
+
+    bool empty() const
+    {
+        return component_count == 0 ||
+               rgbs.empty() ||
+               rgbs.size() % 3 != 0 ||
+               weights.size() != (rgbs.size() / 3) * component_count;
+    }
+};
+
 struct VertexColorOverhangWeightField {
     float min_x_mm { 0.f };
     float min_y_mm { 0.f };
@@ -162,6 +185,7 @@ private:
 
     // Postprocesses gcode: rotates and moves G1 extrusions and returns result
     std::string post_process_wipe_tower_moves(const WipeTower::ToolChangeResult& tcr, const Vec2f& translation, float angle) const;
+    Vec2f offset_for_extruder(int extruder_id) const;
     // Left / right edges of the wipe tower, for the planning of wipe moves.
     const float                                                  m_left;
     const float                                                  m_right;
@@ -523,6 +547,7 @@ private:
     ExtrusionQualityEstimator m_extrusion_quality_estimator;
 
     std::map<std::tuple<const PrintObject*, unsigned int, std::string>, VertexColorOverhangWeightField> m_vertex_color_overhang_weight_field_cache;
+    std::map<std::string, GCodeGenericMixCandidateSet> m_generic_solver_mix_candidate_cache;
     bool                                m_warned_texture_mapping_filament_count_mismatch { false };
 
     /* Origin of print coordinates expressed in unscaled G-code coordinates.
