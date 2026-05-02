@@ -334,7 +334,9 @@ public:
     bool check_objects_empty_and_gcode3mf(std::vector<int> &result) const;
     // get used filaments from config, 1 based idx
     std::vector<int> get_extruders(bool conside_custom_gcode = false) const;
+    std::vector<int> get_wipe_tower_extruders(bool conside_custom_gcode = false) const;
     std::vector<int> get_extruders_under_cli(bool conside_custom_gcode, DynamicPrintConfig& full_config) const;
+    std::vector<int> get_wipe_tower_extruders_under_cli(bool conside_custom_gcode, DynamicPrintConfig& full_config) const;
     std::vector<int> get_extruders_without_support(bool conside_custom_gcode = false) const;
     // get used filaments from gcode result, 1 based idx
     std::vector<int> get_used_filaments();
@@ -763,6 +765,7 @@ public:
     Pointfs get_wrapping_exclude_area() const { return m_wrapping_exclude_areas; }
 
     std::set<int> get_extruders(bool conside_custom_gcode = false) const;
+    std::set<int> get_wipe_tower_extruders(bool conside_custom_gcode = false) const;
 
     //select plate
     int select_plate(int index);

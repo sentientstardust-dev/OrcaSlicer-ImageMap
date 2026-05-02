@@ -238,6 +238,7 @@ const std::string BBS_PROJECT_CONFIG_FILE = "Metadata/project_settings.config";
 const std::string BBS_MODEL_CONFIG_FILE = "Metadata/model_settings.config";
 const std::string BBS_MODEL_CONFIG_RELS_FILE = "Metadata/_rels/model_settings.config.rels";
 const std::string PRIME_TOWER_TEXTURE_FILE = "Metadata/texture_mapping/prime_tower_image.png";
+const std::string PRIME_TOWER_TEXTURE_FILE_BACK = "Metadata/texture_mapping/prime_tower_image_back.png";
 const std::string SLICE_INFO_CONFIG_FILE = "Metadata/slice_info.config";
 const std::string BBS_LAYER_HEIGHTS_PROFILE_FILE = "Metadata/layer_heights_profile.txt";
 const std::string LAYER_CONFIG_RANGES_FILE = "Metadata/layer_config_ranges.xml";
@@ -3620,6 +3621,7 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
                                                                        Model &model)
     {
         model.texture_mapping_prime_tower_image.clear();
+        model.texture_mapping_prime_tower_image_back.clear();
 
         const ConfigOptionString *settings_opt = config.option<ConfigOptionString>("texture_mapping_global_settings");
         if (settings_opt == nullptr || settings_opt->value.empty())
@@ -3627,27 +3629,37 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
 
         TextureMappingGlobalSettings settings;
         settings.load(settings_opt->value);
-        if (settings.image_file.empty())
+        if (settings.image_file.empty() && settings.image_file_back.empty())
             return;
 
-        std::vector<uint8_t> image_payload;
-        if (!try_extract_file_from_archive(archive, settings.image_file, image_payload)) {
-            BOOST_LOG_TRIVIAL(warning) << "3MF prime tower texture payload missing for image='" << settings.image_file << "'";
-            return;
-        }
+        auto restore_image = [&archive](const std::string &image_file,
+                                         const std::string &image_name,
+                                         TextureMappingPrimeTowerImage &target) {
+            if (image_file.empty())
+                return;
 
-        std::vector<uint8_t> imported_rgba;
-        uint32_t imported_width = 0;
-        uint32_t imported_height = 0;
-        if (!decode_png_rgba_from_memory(image_payload, imported_rgba, imported_width, imported_height)) {
-            BOOST_LOG_TRIVIAL(warning) << "3MF prime tower texture image decode failed for image='" << settings.image_file << "'";
-            return;
-        }
+            std::vector<uint8_t> image_payload;
+            if (!try_extract_file_from_archive(archive, image_file, image_payload)) {
+                BOOST_LOG_TRIVIAL(warning) << "3MF prime tower texture payload missing for image='" << image_file << "'";
+                return;
+            }
 
-        model.texture_mapping_prime_tower_image.rgba = std::move(imported_rgba);
-        model.texture_mapping_prime_tower_image.width = imported_width;
-        model.texture_mapping_prime_tower_image.height = imported_height;
-        model.texture_mapping_prime_tower_image.image_name = settings.image_name;
+            std::vector<uint8_t> imported_rgba;
+            uint32_t imported_width = 0;
+            uint32_t imported_height = 0;
+            if (!decode_png_rgba_from_memory(image_payload, imported_rgba, imported_width, imported_height)) {
+                BOOST_LOG_TRIVIAL(warning) << "3MF prime tower texture image decode failed for image='" << image_file << "'";
+                return;
+            }
+
+            target.rgba = std::move(imported_rgba);
+            target.width = imported_width;
+            target.height = imported_height;
+            target.image_name = image_name;
+        };
+
+        restore_image(settings.image_file, settings.image_name, model.texture_mapping_prime_tower_image);
+        restore_image(settings.image_file_back, settings.image_name_back, model.texture_mapping_prime_tower_image_back);
     }
 
     /*
@@ -8973,20 +8985,29 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
         TextureMappingGlobalSettings settings;
         if (const ConfigOptionString *opt = config_copy.option<ConfigOptionString>("texture_mapping_global_settings"))
             settings.load(opt->value);
+        settings.clear_image_reference();
         if (model.texture_mapping_prime_tower_image.valid()) {
             settings.image_file = PRIME_TOWER_TEXTURE_FILE;
             settings.image_name = model.texture_mapping_prime_tower_image.image_name;
             settings.image_width = model.texture_mapping_prime_tower_image.width;
             settings.image_height = model.texture_mapping_prime_tower_image.height;
         }
+        if (model.texture_mapping_prime_tower_image_back.valid()) {
+            settings.image_file_back = PRIME_TOWER_TEXTURE_FILE_BACK;
+            settings.image_name_back = model.texture_mapping_prime_tower_image_back.image_name;
+            settings.image_width_back = model.texture_mapping_prime_tower_image_back.width;
+            settings.image_height_back = model.texture_mapping_prime_tower_image_back.height;
+        }
         config_copy.set_key_value("texture_mapping_global_settings", new ConfigOptionString(settings.serialize()));
         config_copy.save_to_json(temp_file, std::string("project_settings"), std::string("project"), std::string(SLIC3R_VERSION));
         return _add_file_to_archive(archive, BBS_PROJECT_CONFIG_FILE, temp_file);
     }
 
-    bool _BBS_3MF_Exporter::_add_prime_tower_texture_file_to_archive(mz_zip_archive& archive, const Model& model)
+    static bool add_prime_tower_texture_file_to_archive(mz_zip_archive& archive,
+                                                        const TextureMappingPrimeTowerImage &image,
+                                                        const std::string &image_file,
+                                                        std::string &error_message)
     {
-        const TextureMappingPrimeTowerImage &image = model.texture_mapping_prime_tower_image;
         if (!image.valid())
             return true;
 
@@ -8999,18 +9020,40 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
                                                                     MZ_DEFAULT_COMPRESSION,
                                                                     1);
         if (png_data == nullptr) {
-            add_error("Unable to encode prime tower texture image");
+            error_message = "Unable to encode prime tower texture image";
             return false;
         }
 
         const bool added_png = mz_zip_writer_add_mem(&archive,
-                                                     PRIME_TOWER_TEXTURE_FILE.c_str(),
+                                                     image_file.c_str(),
                                                      png_data,
                                                      png_size,
                                                      MZ_NO_COMPRESSION);
         mz_free(png_data);
         if (!added_png) {
-            add_error("Unable to add prime tower texture image file to archive");
+            error_message = "Unable to add prime tower texture image file to archive";
+            return false;
+        }
+        return true;
+    }
+
+    bool _BBS_3MF_Exporter::_add_prime_tower_texture_file_to_archive(mz_zip_archive& archive, const Model& model)
+    {
+        std::string error_message;
+        const bool added_front = add_prime_tower_texture_file_to_archive(archive,
+                                                                         model.texture_mapping_prime_tower_image,
+                                                                         PRIME_TOWER_TEXTURE_FILE,
+                                                                         error_message);
+        if (!added_front) {
+            add_error(error_message);
+            return false;
+        }
+        const bool added_back = add_prime_tower_texture_file_to_archive(archive,
+                                                                        model.texture_mapping_prime_tower_image_back,
+                                                                        PRIME_TOWER_TEXTURE_FILE_BACK,
+                                                                        error_message);
+        if (!added_back) {
+            add_error(error_message);
             return false;
         }
         return true;

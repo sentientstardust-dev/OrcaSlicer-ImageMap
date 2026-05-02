@@ -835,10 +835,296 @@ void GLVolume::render_sinking_contours()
     m_sinking_contours.render();
 }
 
+static constexpr float prime_tower_preview_epsilon = 1e-6f;
+static constexpr float prime_tower_preview_offset = 0.001f;
+
+float prime_tower_preview_anchor_distance(const std::array<Vec2f, 4> &points, const Vec2f &center, float angle_deg)
+{
+    float travelled = 0.f;
+    float fallback_distance = 0.f;
+    float fallback_dist = std::numeric_limits<float>::max();
+    float best_distance = std::numeric_limits<float>::max();
+    float best_projection = -std::numeric_limits<float>::max();
+    const float angle = angle_deg * float(M_PI / 180.);
+    const Vec2f ray_dir(std::cos(angle), std::sin(angle));
+
+    for (size_t i = 0; i < points.size(); ++i) {
+        const Vec2f a = points[i];
+        const Vec2f b = points[(i + 1) % points.size()];
+        const Vec2f delta = b - a;
+        const float len = delta.norm();
+        if (len <= prime_tower_preview_epsilon)
+            continue;
+
+        const Vec2f from_center = a - center;
+        const float denom = ray_dir.x() * delta.y() - ray_dir.y() * delta.x();
+        if (std::abs(denom) > prime_tower_preview_epsilon) {
+            const float projection = (from_center.x() * delta.y() - from_center.y() * delta.x()) / denom;
+            const float segment_t = (from_center.x() * ray_dir.y() - from_center.y() * ray_dir.x()) / denom;
+            if (projection >= -prime_tower_preview_epsilon &&
+                segment_t >= -prime_tower_preview_epsilon &&
+                segment_t <= 1.f + prime_tower_preview_epsilon &&
+                projection > best_projection) {
+                best_projection = projection;
+                best_distance = travelled + len * std::clamp(segment_t, 0.f, 1.f);
+            }
+        } else if (std::abs(from_center.x() * ray_dir.y() - from_center.y() * ray_dir.x()) <= prime_tower_preview_epsilon) {
+            const float projection_a = from_center.dot(ray_dir);
+            const float projection_b = (b - center).dot(ray_dir);
+            if (projection_a >= -prime_tower_preview_epsilon || projection_b >= -prime_tower_preview_epsilon) {
+                const bool use_b = projection_b > projection_a;
+                const float projection = use_b ? projection_b : projection_a;
+                if (projection > best_projection) {
+                    best_projection = projection;
+                    best_distance = travelled + (use_b ? len : 0.f);
+                }
+            }
+        }
+
+        const float fallback_t = std::clamp((center - a).dot(delta) / (len * len), 0.f, 1.f);
+        const Vec2f fallback_point = a + delta * fallback_t - center;
+        const float projection = fallback_point.dot(ray_dir);
+        const float perpendicular = fallback_point.x() * ray_dir.y() - fallback_point.y() * ray_dir.x();
+        const float fallback_score = perpendicular * perpendicular + (projection < 0.f ? projection * projection : 0.f);
+        if (fallback_score < fallback_dist - prime_tower_preview_epsilon) {
+            fallback_dist = fallback_score;
+            fallback_distance = travelled + len * fallback_t;
+        }
+        travelled += len;
+    }
+
+    return best_projection > -std::numeric_limits<float>::max() ? best_distance : fallback_distance;
+}
+
+float prime_tower_preview_texture_v(float z, float texture_z_min, float texture_z_max)
+{
+    const float v = texture_z_max > texture_z_min + prime_tower_preview_epsilon ?
+        std::clamp((z - texture_z_min) / (texture_z_max - texture_z_min), 0.f, 1.f) :
+        0.f;
+    return 1.f - v;
+}
+
+float prime_tower_preview_anchor_angle(const std::array<Vec2f, 4> &points, float angle_deg)
+{
+    Vec2f min_pt(std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
+    Vec2f max_pt(std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest());
+    for (const Vec2f &point : points) {
+        min_pt.x() = std::min(min_pt.x(), point.x());
+        min_pt.y() = std::min(min_pt.y(), point.y());
+        max_pt.x() = std::max(max_pt.x(), point.x());
+        max_pt.y() = std::max(max_pt.y(), point.y());
+    }
+    float angle = std::clamp(angle_deg, 0.f, 360.f);
+    if (max_pt.y() - min_pt.y() > max_pt.x() - min_pt.x() + prime_tower_preview_epsilon)
+        angle += 90.f;
+    return angle >= 360.f ? angle - 360.f : angle;
+}
+
+GUI::GLModel::Geometry prime_tower_image_preview_geometry(float width,
+                                                          float depth,
+                                                          float height,
+                                                          float angle_offset_deg,
+                                                          float texture_z_min,
+                                                          float texture_z_max,
+                                                          int image_slot)
+{
+    GUI::GLModel::Geometry data;
+    data.format = {GUI::GLModel::Geometry::EPrimitiveType::Triangles, GUI::GLModel::Geometry::EVertexLayout::P3N3T2};
+
+    if (width <= prime_tower_preview_epsilon || depth <= prime_tower_preview_epsilon || height <= prime_tower_preview_epsilon)
+        return data;
+
+    const std::array<Vec2f, 4> points = {Vec2f(0.f, 0.f), Vec2f(width, 0.f), Vec2f(width, depth), Vec2f(0.f, depth)};
+    const std::array<float, 4> distances = {0.f, width, width + depth, 2.f * width + depth};
+    const float total_length = 2.f * (width + depth);
+    const float anchor_distance = prime_tower_preview_anchor_distance(points,
+                                                                      Vec2f(width * 0.5f, depth * 0.5f),
+                                                                      prime_tower_preview_anchor_angle(points, angle_offset_deg));
+
+    std::vector<float> z_levels = {0.f, height};
+    if (texture_z_min > prime_tower_preview_epsilon && texture_z_min < height - prime_tower_preview_epsilon)
+        z_levels.emplace_back(texture_z_min);
+    if (texture_z_max > prime_tower_preview_epsilon && texture_z_max < height - prime_tower_preview_epsilon)
+        z_levels.emplace_back(texture_z_max);
+    std::sort(z_levels.begin(), z_levels.end());
+    z_levels.erase(std::unique(z_levels.begin(), z_levels.end(), [](float lhs, float rhs) {
+        return std::abs(lhs - rhs) <= prime_tower_preview_epsilon;
+    }), z_levels.end());
+
+    data.reserve_vertices(16 * points.size() * (z_levels.size() - 1));
+    data.reserve_indices(24 * points.size() * (z_levels.size() - 1));
+
+    auto texture_u = [anchor_distance, total_length, image_slot](float distance, float mid_distance) {
+        const float raw_u = (distance - anchor_distance) / total_length;
+        const float mid_raw_u = (mid_distance - anchor_distance) / total_length;
+        const float base = std::floor(mid_raw_u);
+        if (image_slot == 0)
+            return std::clamp(raw_u - base, 0.f, 1.f);
+        return image_slot == 1 ?
+            std::clamp(2.f * (raw_u - base), 0.f, 1.f) :
+            std::clamp(2.f * (raw_u - base - 0.5f), 0.f, 1.f);
+    };
+
+    for (size_t side_idx = 0; side_idx < points.size(); ++side_idx) {
+        const size_t next_idx = (side_idx + 1) % points.size();
+        const Vec2f a = points[side_idx];
+        const Vec2f b = points[next_idx];
+        const Vec2f delta = b - a;
+        const float len = delta.norm();
+        if (len <= prime_tower_preview_epsilon)
+            continue;
+
+        const Vec2f dir = delta / len;
+        const Vec2f outward(dir.y(), -dir.x());
+        const Vec3f normal(outward.x(), outward.y(), 0.f);
+        const float side_start = distances[side_idx];
+        const float side_end = next_idx == 0 ? total_length : distances[next_idx];
+
+        std::vector<float> cuts = {side_start, side_end};
+        const int first = int(std::floor((side_start - anchor_distance) / total_length)) - 1;
+        const int last = int(std::ceil((side_end - anchor_distance) / total_length)) + 1;
+        for (int wrap = first; wrap <= last; ++wrap) {
+            const float wrap_cut = anchor_distance + total_length * float(wrap);
+            if (wrap_cut > side_start + prime_tower_preview_epsilon && wrap_cut < side_end - prime_tower_preview_epsilon)
+                cuts.emplace_back(wrap_cut);
+            if (image_slot != 0) {
+                const float half_cut = anchor_distance + total_length * (float(wrap) + 0.5f);
+                if (half_cut > side_start + prime_tower_preview_epsilon && half_cut < side_end - prime_tower_preview_epsilon)
+                    cuts.emplace_back(half_cut);
+            }
+        }
+        std::sort(cuts.begin(), cuts.end());
+        cuts.erase(std::unique(cuts.begin(), cuts.end(), [](float lhs, float rhs) {
+            return std::abs(lhs - rhs) <= prime_tower_preview_epsilon;
+        }), cuts.end());
+
+        for (size_t cut_idx = 0; cut_idx + 1 < cuts.size(); ++cut_idx) {
+            const float d0 = cuts[cut_idx];
+            const float d1 = cuts[cut_idx + 1];
+            if (d1 - d0 <= prime_tower_preview_epsilon)
+                continue;
+
+            if (image_slot != 0) {
+                const float mid_raw_u = (0.5f * (d0 + d1) - anchor_distance) / total_length;
+                const float mid_u = mid_raw_u - std::floor(mid_raw_u);
+                if ((mid_u >= 0.5f ? 2 : 1) != image_slot)
+                    continue;
+            }
+
+            const float t0 = std::clamp((d0 - side_start) / len, 0.f, 1.f);
+            const float t1 = std::clamp((d1 - side_start) / len, 0.f, 1.f);
+            const Vec2f p0 = a + delta * t0 + outward * prime_tower_preview_offset;
+            const Vec2f p1 = a + delta * t1 + outward * prime_tower_preview_offset;
+            const float mid_distance = 0.5f * (d0 + d1);
+            const float u0 = texture_u(d0, mid_distance);
+            const float u1 = texture_u(d1, mid_distance);
+
+            for (size_t z_idx = 0; z_idx + 1 < z_levels.size(); ++z_idx) {
+                const float z0 = z_levels[z_idx];
+                const float z1 = z_levels[z_idx + 1];
+                const float v0 = prime_tower_preview_texture_v(z0, texture_z_min, texture_z_max);
+                const float v1 = prime_tower_preview_texture_v(z1, texture_z_min, texture_z_max);
+                const unsigned int base = unsigned(data.vertices_count());
+
+                data.add_vertex(Vec3f(p0.x(), p0.y(), z0), normal, Vec2f(u0, v0));
+                data.add_vertex(Vec3f(p1.x(), p1.y(), z0), normal, Vec2f(u1, v0));
+                data.add_vertex(Vec3f(p1.x(), p1.y(), z1), normal, Vec2f(u1, v1));
+                data.add_vertex(Vec3f(p0.x(), p0.y(), z1), normal, Vec2f(u0, v1));
+                data.add_triangle(base, base + 1, base + 2);
+                data.add_triangle(base, base + 2, base + 3);
+            }
+        }
+    }
+
+    return data;
+}
+
+void set_prime_tower_preview_uniforms(GLShaderProgram &shader,
+                                      const Transform3d &model_matrix,
+                                      const Transform3d &view_matrix,
+                                      const Transform3d &projection_matrix,
+                                      const std::array<float, 2> &z_range,
+                                      const std::array<double, 4> &clipping_plane,
+                                      int print_volume_type,
+                                      const std::array<float, 4> &print_volume_xy,
+                                      const std::array<float, 2> &print_volume_z)
+{
+    const Transform3d view_model_matrix = view_matrix * model_matrix;
+    const Matrix3d view_normal_matrix = view_matrix.matrix().block(0, 0, 3, 3) *
+                                        model_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
+
+    shader.set_uniform("view_model_matrix", view_model_matrix);
+    shader.set_uniform("projection_matrix", projection_matrix);
+    shader.set_uniform("view_normal_matrix", view_normal_matrix);
+    shader.set_uniform("volume_world_matrix", model_matrix);
+    shader.set_uniform("z_range", z_range);
+    shader.set_uniform("clipping_plane", clipping_plane);
+    shader.set_uniform("print_volume.type", print_volume_type);
+    shader.set_uniform("print_volume.xy_data", print_volume_xy);
+    shader.set_uniform("print_volume.z_data", print_volume_z);
+}
+
 GLWipeTowerVolume::GLWipeTowerVolume(const std::vector<ColorRGBA>& colors)
     : GLVolume()
 {
     m_colors = colors;
+}
+
+void GLWipeTowerVolume::set_prime_tower_image_preview(std::vector<unsigned char> image_rgba,
+                                                       unsigned int image_width,
+                                                       unsigned int image_height,
+                                                       std::vector<unsigned char> image_rgba_back,
+                                                       unsigned int image_width_back,
+                                                       unsigned int image_height_back,
+                                                       float angle_offset_deg,
+                                                       float width,
+                                                       float depth,
+                                                       float height,
+                                                       float texture_z_min,
+                                                       float texture_z_max)
+{
+    auto reset_image = [](PrimeTowerPreviewImage &image) {
+        image.model.reset();
+        image.texture.reset();
+        image.rgba.clear();
+        image.width = 0;
+        image.height = 0;
+    };
+    auto valid_image = [](const std::vector<unsigned char> &rgba, unsigned int width, unsigned int height) {
+        return width > 0 && height > 0 && rgba.size() >= size_t(width) * size_t(height) * 4;
+    };
+    auto assign_image = [&](PrimeTowerPreviewImage &target,
+                            std::vector<unsigned char> rgba,
+                            unsigned int image_w,
+                            unsigned int image_h,
+                            int image_slot) {
+        if (!valid_image(rgba, image_w, image_h))
+            return;
+
+        GUI::GLModel::Geometry image_geometry =
+            prime_tower_image_preview_geometry(width, depth, height, angle_offset_deg, texture_z_min, texture_z_max, image_slot);
+        if (image_geometry.is_empty())
+            return;
+
+        target.rgba = std::move(rgba);
+        target.width = image_w;
+        target.height = image_h;
+        target.model.init_from(std::move(image_geometry));
+    };
+
+    reset_image(m_prime_tower_image);
+    reset_image(m_prime_tower_image_back);
+
+    const bool front_valid = valid_image(image_rgba, image_width, image_height);
+    const bool back_valid = valid_image(image_rgba_back, image_width_back, image_height_back);
+    if (front_valid && back_valid) {
+        assign_image(m_prime_tower_image, std::move(image_rgba), image_width, image_height, 1);
+        assign_image(m_prime_tower_image_back, std::move(image_rgba_back), image_width_back, image_height_back, 2);
+    } else if (front_valid) {
+        assign_image(m_prime_tower_image, std::move(image_rgba), image_width, image_height, 0);
+    } else if (back_valid) {
+        assign_image(m_prime_tower_image_back, std::move(image_rgba_back), image_width_back, image_height_back, 0);
+    }
 }
 
 void GLWipeTowerVolume::render()
@@ -867,7 +1153,106 @@ void GLWipeTowerVolume::render()
         glFrontFace(GL_CCW);
 }
 
+void GLWipeTowerVolume::render_prime_tower_image_preview(const Transform3d& view_matrix,
+                                                         const Transform3d& projection_matrix,
+                                                         const std::array<float, 2>& z_range,
+                                                         const std::array<double, 4>& clipping_plane,
+                                                         int print_volume_type,
+                                                         const std::array<float, 4>& print_volume_xy,
+                                                         const std::array<float, 2>& print_volume_z)
+{
+    if (!is_active || picking || (!m_prime_tower_image.model.is_initialized() && !m_prime_tower_image_back.model.is_initialized()))
+        return;
+
+    GLShaderProgram *shader = GUI::wxGetApp().get_shader("painted_texture_preview");
+    if (shader == nullptr)
+        return;
+
+    GLboolean blend_enabled = glIsEnabled(GL_BLEND);
+    GLboolean cull_face_enabled = glIsEnabled(GL_CULL_FACE);
+    GLboolean depth_mask = GL_TRUE;
+    GLint cull_face_mode = GL_BACK;
+    GLint depth_func = GL_LESS;
+    glsafe(::glGetBooleanv(GL_DEPTH_WRITEMASK, &depth_mask));
+    glsafe(::glGetIntegerv(GL_CULL_FACE_MODE, &cull_face_mode));
+    glsafe(::glGetIntegerv(GL_DEPTH_FUNC, &depth_func));
+
+    if (this->is_left_handed())
+        glFrontFace(GL_CW);
+
+    glsafe(::glEnable(GL_BLEND));
+    glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
+    glsafe(::glEnable(GL_CULL_FACE));
+    glsafe(::glCullFace(GL_BACK));
+    glsafe(::glDepthMask(GL_FALSE));
+    glsafe(::glDepthFunc(GL_LEQUAL));
+
+    shader->start_using();
+    set_prime_tower_preview_uniforms(*shader,
+                                     world_matrix(),
+                                     view_matrix,
+                                     projection_matrix,
+                                     z_range,
+                                     clipping_plane,
+                                     print_volume_type,
+                                     print_volume_xy,
+                                     print_volume_z);
+
+    glsafe(::glActiveTexture(GL_TEXTURE0));
+    shader->set_uniform("uniform_texture", 0);
+    shader->set_uniform("texture_preview_mix", 1.f);
+    shader->set_uniform("invalid_texture_mapping", false);
+
+    auto render_image = [](PrimeTowerPreviewImage &image) {
+        if (!image.model.is_initialized())
+            return;
+        if (image.texture.get_id() == 0) {
+            if (image.width == 0 || image.height == 0 || image.rgba.empty())
+                return;
+
+            std::vector<unsigned char> texture_data = image.rgba;
+            if (!image.texture.load_from_raw_data(std::move(texture_data), image.width, image.height))
+                return;
+
+            glsafe(::glBindTexture(GL_TEXTURE_2D, image.texture.get_id()));
+            glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR));
+            glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR));
+            glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE));
+            glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE));
+            image.rgba.clear();
+        }
+
+        glsafe(::glBindTexture(GL_TEXTURE_2D, image.texture.get_id()));
+        image.model.set_color(ColorRGBA(1.f, 1.f, 1.f, 0.82f));
+        image.model.render();
+    };
+
+    render_image(m_prime_tower_image);
+    render_image(m_prime_tower_image_back);
+
+    glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
+    shader->stop_using();
+
+    glsafe(::glDepthFunc(depth_func));
+    glsafe(::glDepthMask(depth_mask));
+    glsafe(::glCullFace(cull_face_mode));
+    if (cull_face_enabled)
+        glsafe(::glEnable(GL_CULL_FACE));
+    else
+        glsafe(::glDisable(GL_CULL_FACE));
+    if (blend_enabled)
+        glsafe(::glEnable(GL_BLEND));
+    else
+        glsafe(::glDisable(GL_BLEND));
+
+    if (this->is_left_handed())
+        glFrontFace(GL_CCW);
+}
+
 bool GLWipeTowerVolume::IsTransparent() { 
+    if (m_prime_tower_image.model.is_initialized() || m_prime_tower_image_back.model.is_initialized())
+        return true;
+
     for (size_t i = 0; i < m_colors.size(); i++) {
         if (m_colors[i].is_transparent()) { 
             return true;
@@ -995,7 +1380,7 @@ void GLVolumeCollection::load_object_auxiliary(
 
 int GLVolumeCollection::load_wipe_tower_preview(
     int obj_idx, float pos_x, float pos_y, float width, float depth, float height,
-    float rotation_angle, bool size_unknown, float brim_width)
+    float rotation_angle, bool size_unknown, float brim_width, float texture_z_min, float texture_z_max)
 {
     int plate_idx = obj_idx - 1000;
 
@@ -1007,7 +1392,7 @@ int GLVolumeCollection::load_wipe_tower_preview(
     std::vector<ColorRGBA> extruder_colors = GUI::wxGetApp().plater()->get_extruders_colors();
     std::vector<ColorRGBA> colors;
     GUI::PartPlateList& ppl = GUI::wxGetApp().plater()->get_partplate_list();
-    std::vector<int> plate_extruders = ppl.get_plate(plate_idx)->get_extruders(true);
+    std::vector<int> plate_extruders = ppl.get_plate(plate_idx)->get_wipe_tower_extruders(true);
     TriangleMesh wipe_tower_shell = make_cube(width, depth, height);
     for (int extruder_id : plate_extruders) {
         if (extruder_id <= extruder_colors.size())
@@ -1026,6 +1411,28 @@ int GLVolumeCollection::load_wipe_tower_preview(
         TriangleMesh color_part = make_cube(width, depth / colors.size(), height);
         color_part.translate({ 0.f, depth * i / colors.size(), 0. });
         v.model_per_colors[i].init_from(color_part);
+    }
+    const TextureMappingGlobalSettings *texture_mapping_global_settings = GUI::wxGetApp().preset_bundle != nullptr ?
+        &GUI::wxGetApp().preset_bundle->texture_mapping_global_settings :
+        nullptr;
+    const TextureMappingPrimeTowerImage &prime_tower_image = GUI::wxGetApp().model().texture_mapping_prime_tower_image;
+    const TextureMappingPrimeTowerImage &prime_tower_image_back = GUI::wxGetApp().model().texture_mapping_prime_tower_image_back;
+    if (texture_mapping_global_settings != nullptr &&
+        texture_mapping_global_settings->effective_enabled(prime_tower_image, prime_tower_image_back)) {
+        std::vector<unsigned char> texture_data(prime_tower_image.rgba.begin(), prime_tower_image.rgba.end());
+        std::vector<unsigned char> texture_data_back(prime_tower_image_back.rgba.begin(), prime_tower_image_back.rgba.end());
+        v.set_prime_tower_image_preview(std::move(texture_data),
+                                        prime_tower_image.width,
+                                        prime_tower_image.height,
+                                        std::move(texture_data_back),
+                                        prime_tower_image_back.width,
+                                        prime_tower_image_back.height,
+                                        texture_mapping_global_settings->angle_offset_deg,
+                                        width,
+                                        depth,
+                                        height,
+                                        texture_z_min,
+                                        texture_z_max);
     }
     v.model.init_from(wipe_tower_shell);
     v.mesh_raycaster = std::make_unique<GUI::MeshRaycaster>(std::make_shared<const TriangleMesh>(wipe_tower_shell));
@@ -1263,6 +1670,20 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType       type,
             volume.first->render_with_outline(cnv_size);
         else
             volume.first->render();
+
+        if (GLWipeTowerVolume *wipe_tower_volume = dynamic_cast<GLWipeTowerVolume *>(volume.first)) {
+            const int texture_preview_print_volume_type =
+                volume.first->partly_inside && partly_inside_enable ? static_cast<int>(m_print_volume.type) : -1;
+            shader->stop_using();
+            wipe_tower_volume->render_prime_tower_image_preview(view_matrix,
+                                                                projection_matrix,
+                                                                m_z_range,
+                                                                m_clipping_plane,
+                                                                texture_preview_print_volume_type,
+                                                                m_print_volume.data,
+                                                                m_print_volume.zs);
+            shader->start_using();
+        }
 
 #if ENABLE_ENVIRONMENT_MAP
         if (use_environment_texture)

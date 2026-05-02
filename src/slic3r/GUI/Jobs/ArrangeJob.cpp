@@ -291,6 +291,7 @@ void ArrangeJob::prepare_wipe_tower()
     bool enable_prime_tower = op && op->getBool();
     if (!enable_prime_tower || params.is_seq_print) return;
 
+    PartPlateList& ppl = wxGetApp().plater()->get_partplate_list();
     bool smooth_timelapse = false;
     auto sop = current_config.option("timelapse_type");
     if (sop) { smooth_timelapse = sop->getInt() == TimelapseType::tlSmooth; }
@@ -322,6 +323,19 @@ void ArrangeJob::prepare_wipe_tower()
             }
         }
     }
+    if (!need_wipe_tower) {
+        std::set<int> wipe_tower_extruders;
+        if (only_on_partplate) {
+            auto plate_extruders = ppl.get_curr_plate()->get_wipe_tower_extruders(true);
+            wipe_tower_extruders.insert(plate_extruders.begin(), plate_extruders.end());
+        } else {
+            wipe_tower_extruders = ppl.get_wipe_tower_extruders(true);
+        }
+        if (wipe_tower_extruders.size() > 1) {
+            need_wipe_tower = true;
+            BOOST_LOG_TRIVIAL(info) << "arrange: need wipe tower because virtual filament assignment expands to multiple physical filaments";
+        }
+    }
     BOOST_LOG_TRIVIAL(info) << "arrange: need_wipe_tower=" << need_wipe_tower;
 
 
@@ -332,10 +346,9 @@ void ArrangeJob::prepare_wipe_tower()
     const GLCanvas3D* canvas3D = static_cast<const GLCanvas3D*>(m_plater->canvas3D());
 
     std::set<int> extruder_ids;
-    PartPlateList& ppl = wxGetApp().plater()->get_partplate_list();
     int plate_count = ppl.get_plate_count();
     if (!only_on_partplate) {
-        extruder_ids = ppl.get_extruders(true);
+        extruder_ids = ppl.get_wipe_tower_extruders(true);
     }
 
     int bedid_unlocked = 0;
@@ -352,7 +365,7 @@ void ArrangeJob::prepare_wipe_tower()
         }
         else if (need_wipe_tower) {
             if (only_on_partplate) {
-                auto plate_extruders = pl->get_extruders(true);
+                auto plate_extruders = pl->get_wipe_tower_extruders(true);
                 extruder_ids.clear();
                 extruder_ids.insert(plate_extruders.begin(), plate_extruders.end());
             }

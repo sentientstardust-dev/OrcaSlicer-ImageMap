@@ -1777,6 +1777,7 @@ public:
     std::vector<std::string> md_name;
     std::vector<std::string> md_value;
     TextureMappingPrimeTowerImage texture_mapping_prime_tower_image;
+    TextureMappingPrimeTowerImage texture_mapping_prime_tower_image_back;
 
     void SetDesigner(std::string designer, std::string designer_user_id) {
         if (design_info == nullptr) {

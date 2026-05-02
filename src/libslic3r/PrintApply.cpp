@@ -1242,6 +1242,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
         m_texture_mapping_mgr.load_entries(new_full_config.opt_string("texture_mapping_definitions"), color_opt->values);
     m_texture_mapping_global_settings.load(new_full_config.opt_string("texture_mapping_global_settings"));
     m_texture_mapping_prime_tower_image = model.texture_mapping_prime_tower_image;
+    m_texture_mapping_prime_tower_image_back = model.texture_mapping_prime_tower_image_back;
 
     // The following call may stop the background processing.
     if (! print_diff.empty())

@@ -948,6 +948,7 @@ public:
     TextureMappingManager&      texture_mapping_manager() { return m_texture_mapping_mgr; }
     const TextureMappingGlobalSettings& texture_mapping_global_settings() const { return m_texture_mapping_global_settings; }
     const TextureMappingPrimeTowerImage& texture_mapping_prime_tower_image() const { return m_texture_mapping_prime_tower_image; }
+    const TextureMappingPrimeTowerImage& texture_mapping_prime_tower_image_back() const { return m_texture_mapping_prime_tower_image_back; }
     const PrintObjectConfig&    default_object_config() const { return m_default_object_config; }
     const PrintRegionConfig& default_region_config() const { return m_default_region_config; }
     ConstPrintObjectPtrsAdaptor objects() const { return ConstPrintObjectPtrsAdaptor(&m_objects); }
@@ -1135,6 +1136,7 @@ private:
     TextureMappingManager                   m_texture_mapping_mgr;
     TextureMappingGlobalSettings            m_texture_mapping_global_settings;
     TextureMappingPrimeTowerImage           m_texture_mapping_prime_tower_image;
+    TextureMappingPrimeTowerImage           m_texture_mapping_prime_tower_image_back;
     PrintObjectConfig                       m_default_object_config;
     PrintRegionConfig                       m_default_region_config;
     PrintObjectPtrs                         m_objects;

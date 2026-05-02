@@ -2800,7 +2800,7 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
     // BBS
     if (printer_technology == ptFFF && m_config->has("filament_colour") && (m_canvas_type != ECanvasType::CanvasAssembleView)) {
         // Should the wipe tower be visualized ?
-        unsigned int filaments_count = (unsigned int)dynamic_cast<const ConfigOptionStrings*>(m_config->option("filament_colour"))->values.size();
+        unsigned int config_filaments_count = (unsigned int)dynamic_cast<const ConfigOptionStrings*>(m_config->option("filament_colour"))->values.size();
 
         bool wt = dynamic_cast<const ConfigOptionBool*>(m_config->option("enable_prime_tower"))->value;
         auto co = dynamic_cast<const ConfigOptionEnum<PrintSequence>*>(m_config->option<ConfigOptionEnum<PrintSequence>>("print_sequence"));
@@ -2813,7 +2813,7 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
             need_wipe_tower |= dynamic_cast<const ConfigOptionBool*>(dconfig.option("enable_wrapping_detection"))->value;
         }
 
-        if (wt && (need_wipe_tower || filaments_count > 1) && !wxGetApp().plater()->only_gcode_mode() && !wxGetApp().plater()->is_gcode_3mf()) {
+        if (wt && !wxGetApp().plater()->only_gcode_mode() && !wxGetApp().plater()->is_gcode_3mf()) {
             for (int plate_id = 0; plate_id < n_plates; plate_id++) {
                 // If print ByObject and there is only one object in the plate, the wipe tower is allowed to be generated.
                 PartPlate* part_plate = ppl.get_plate(plate_id);
@@ -2834,13 +2834,25 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
 
                 const Print* print = m_process->fff_print();
                 const Print* current_print = part_plate->fff_print();
-                if (!need_wipe_tower && part_plate->get_extruders(true).size() < 2) continue;
+                const std::vector<int> wipe_tower_extruders = part_plate->get_wipe_tower_extruders(true);
+                const size_t wipe_tower_filaments_count = need_wipe_tower ?
+                    std::max<size_t>(1, wipe_tower_extruders.size()) :
+                    wipe_tower_extruders.size();
+                if (!need_wipe_tower && wipe_tower_filaments_count < 2) continue;
                 if (part_plate->get_objects_on_this_plate().empty()) continue;
 
-                float brim_width = print->wipe_tower_data(filaments_count).brim_width;
+                float brim_width = print->wipe_tower_data(wipe_tower_filaments_count > 0 ? wipe_tower_filaments_count : size_t(config_filaments_count)).brim_width;
                 const DynamicPrintConfig &print_cfg   = wxGetApp().preset_bundle->prints.get_edited_preset().config;
                 int nozzle_nums = wxGetApp().preset_bundle->get_printer_extruder_count();
-                Vec3d wipe_tower_size = ppl.get_plate(plate_id)->estimate_wipe_tower_size(print_cfg, w, v, nozzle_nums, 0, false, dynamic_cast<const ConfigOptionBool*>(dconfig.option("enable_wrapping_detection"))->value);
+                Vec3d wipe_tower_size = ppl.get_plate(plate_id)->estimate_wipe_tower_size(print_cfg,
+                                                                                          w,
+                                                                                          v,
+                                                                                          nozzle_nums,
+                                                                                          int(wipe_tower_filaments_count),
+                                                                                          false,
+                                                                                          dynamic_cast<const ConfigOptionBool*>(dconfig.option("enable_wrapping_detection"))->value);
+                const float texture_z_min = 0.f;
+                const float texture_z_max = float(wipe_tower_size(2));
 
                 {
                     const float                 margin     = WIPE_TOWER_MARGIN + brim_width;
@@ -2863,7 +2875,7 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
                             int volume_idx_wipe_tower_new = m_volumes.load_wipe_tower_preview(1000 + plate_id, x + plate_origin(0), y + plate_origin(1),
                                                                                               (float) wipe_tower_size(0), (float) wipe_tower_size(1), (float) wipe_tower_size(2),
                                                                                               a,
-                                                                                              /*!print->is_step_done(psWipeTower)*/ true, brim_width);
+                                                                                              /*!print->is_step_done(psWipeTower)*/ true, brim_width, texture_z_min, texture_z_max);
                             int volume_idx_wipe_tower_old = volume_idxs_wipe_tower_old[plate_id];
                             if (volume_idx_wipe_tower_old != -1) map_glvolume_old_to_new[volume_idx_wipe_tower_old] = volume_idx_wipe_tower_new;
                         }

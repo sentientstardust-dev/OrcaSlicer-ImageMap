@@ -3834,7 +3834,7 @@ int CLI::run(int argc, char **argv)
             return;
         }
 
-        std::vector<int> extruders = plate->get_extruders_under_cli(true, print_config);
+        std::vector<int> extruders = plate->get_wipe_tower_extruders_under_cli(true, print_config);
         unsigned int filaments_cnt = extruders.size();
         if ((filaments_cnt <= 1) && !is_smooth_timelapse){
             plate_obj_size_info.has_wipe_tower = false;
@@ -4603,6 +4603,8 @@ int CLI::run(int argc, char **argv)
                 Model& model = m_models[0];
                 arrange_cfg = ArrangeParams();  // reset all params
                 get_print_sequence(cur_plate, m_print_config, arrange_cfg.is_seq_print);
+                const size_t wipe_tower_filaments_count = cur_plate->get_wipe_tower_extruders_under_cli(true, m_print_config).size();
+                const size_t arrange_filaments_count = std::max<size_t>(assemble_plate.filaments_count, wipe_tower_filaments_count);
 
                 //Step-1: prepare the arranged data
                 partplate_list.lock_plate(i, false);
@@ -4623,7 +4625,8 @@ int CLI::run(int argc, char **argv)
                     }
                 }
 
-                if (!arrange_cfg.is_seq_print && (assemble_plate.filaments_count > 1)||(enable_wrapping_detect && !current_wrapping_exclude_area.empty()))
+                if ((!arrange_cfg.is_seq_print && arrange_filaments_count > 1) ||
+                    (enable_wrapping_detect && !current_wrapping_exclude_area.empty()))
                 {
                     //prepare the wipe tower
                     int plate_count = partplate_list.get_plate_count();
@@ -4663,7 +4666,13 @@ int CLI::run(int argc, char **argv)
                     wipe_y_option->set_at(&wt_y_opt, i, 0);
 
                     Vec3d wipe_tower_size, wipe_tower_pos;
-                    ArrangePolygon wipe_tower_ap = cur_plate->estimate_wipe_tower_polygon(m_print_config, i, wipe_tower_pos, wipe_tower_size, new_extruder_count, assemble_plate.filaments_count, true);
+                    ArrangePolygon wipe_tower_ap = cur_plate->estimate_wipe_tower_polygon(m_print_config,
+                                                                                          i,
+                                                                                          wipe_tower_pos,
+                                                                                          wipe_tower_size,
+                                                                                          new_extruder_count,
+                                                                                          int(arrange_filaments_count),
+                                                                                          true);
 
                     //update the new wp position
                     wt_x_opt.value = wipe_tower_pos(0);
@@ -4767,8 +4776,10 @@ int CLI::run(int argc, char **argv)
 
                 bool is_seq_print = false;
                 get_print_sequence(cur_plate, m_print_config, is_seq_print);
+                const size_t wipe_tower_filaments_count = cur_plate->get_wipe_tower_extruders_under_cli(true, m_print_config).size();
+                const size_t arrange_filaments_count = std::max<size_t>(assemble_plate.filaments_count, wipe_tower_filaments_count);
 
-                if (!is_seq_print && (assemble_plate.filaments_count > 1) && !has_wipe_tower_position)
+                if (!is_seq_print && arrange_filaments_count > 1 && !has_wipe_tower_position)
                 {
                     //prepare the wipe tower
                     auto printer_structure_opt = m_print_config.option<ConfigOptionEnum<PrinterStructure>>("printer_structure");
@@ -4960,8 +4971,16 @@ int CLI::run(int argc, char **argv)
                                 wipe_y_option->set_at(&wt_y_opt, plate_index_valid, 0);
                             }
 
+                            Slic3r::GUI::PartPlate* plate = partplate_list.get_plate(plate_index_valid);
+                            int plate_extruder_size = std::max<int>(extruder_size, int(plate->get_wipe_tower_extruders_under_cli(true, m_print_config).size()));
                             Vec3d wipe_tower_size, wipe_tower_pos;
-                            ArrangePolygon wipe_tower_ap = partplate_list.get_plate(plate_index_valid)->estimate_wipe_tower_polygon(m_print_config, plate_index_valid, wipe_tower_pos, wipe_tower_size, new_extruder_count, extruder_size, true);
+                            ArrangePolygon wipe_tower_ap = plate->estimate_wipe_tower_polygon(m_print_config,
+                                                                                               plate_index_valid,
+                                                                                               wipe_tower_pos,
+                                                                                               wipe_tower_size,
+                                                                                               new_extruder_count,
+                                                                                               plate_extruder_size,
+                                                                                               true);
 
                             //update the new wp position
                             if (bedid < plate_count) {
@@ -5044,7 +5063,7 @@ int CLI::run(int argc, char **argv)
                         if ((filaments_cnt == 0) || need_skip)
                         {
                             // slice filaments info invalid
-                            std::vector<int> extruders = cur_plate->get_extruders_under_cli(true, m_print_config);
+                            std::vector<int> extruders = cur_plate->get_wipe_tower_extruders_under_cli(true, m_print_config);
                             filaments_cnt = extruders.size();
                             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format("arrange: slice filaments info invalid or need_skip, get from partplate: filament_count %1%")%filaments_cnt;
                         }

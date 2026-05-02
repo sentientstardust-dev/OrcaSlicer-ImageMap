@@ -214,9 +214,21 @@ struct TextureMappingGlobalSettings
     std::string image_name;
     unsigned int image_width = 0;
     unsigned int image_height = 0;
+    std::string image_file_back;
+    std::string image_name_back;
+    unsigned int image_width_back = 0;
+    unsigned int image_height_back = 0;
 
-    bool has_image_reference() const { return !image_file.empty() || image_width > 0 || image_height > 0; }
+    bool has_image_reference() const
+    {
+        return !image_file.empty() || image_width > 0 || image_height > 0 ||
+               !image_file_back.empty() || image_width_back > 0 || image_height_back > 0;
+    }
     bool effective_enabled(const TextureMappingPrimeTowerImage &image) const { return enabled && image.valid(); }
+    bool effective_enabled(const TextureMappingPrimeTowerImage &image, const TextureMappingPrimeTowerImage &image_back) const
+    {
+        return enabled && (image.valid() || image_back.valid());
+    }
 
     std::string serialize() const;
     void load(const std::string &serialized);

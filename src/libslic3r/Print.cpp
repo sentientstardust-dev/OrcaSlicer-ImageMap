@@ -3348,7 +3348,7 @@ void Print::_make_wipe_tower()
 
     auto build_prime_tower_texture = [this]() {
         PrimeTowerTextureRenderSettings texture;
-        if (!m_texture_mapping_global_settings.effective_enabled(m_texture_mapping_prime_tower_image))
+        if (!m_texture_mapping_global_settings.effective_enabled(m_texture_mapping_prime_tower_image, m_texture_mapping_prime_tower_image_back))
             return texture;
 
         const std::string mode = TextureMappingGlobalSettings::normalize_color_mode_name(
@@ -3382,6 +3382,9 @@ void Print::_make_wipe_tower()
         texture.image_rgba = m_texture_mapping_prime_tower_image.rgba;
         texture.image_width = m_texture_mapping_prime_tower_image.width;
         texture.image_height = m_texture_mapping_prime_tower_image.height;
+        texture.image_rgba_back = m_texture_mapping_prime_tower_image_back.rgba;
+        texture.image_width_back = m_texture_mapping_prime_tower_image_back.width;
+        texture.image_height_back = m_texture_mapping_prime_tower_image_back.height;
         texture.filament_colours = m_config.filament_colour.values;
         texture.filament_colours.resize(m_config.filament_diameter.values.size(), "#FFFFFF");
 

@@ -358,6 +358,8 @@ static int texture_mapping_depth_for_budget(size_t triangle_count, int requested
 
 static constexpr float TRUE_COLOR_BRUSH_SUBDIVISION_FRACTION = 1.f / 8.f;
 static constexpr float TRUE_COLOR_BRUSH_MIN_SUBDIVISION_EDGE_MM = 0.1f;
+static constexpr float IMAGE_PROJECTION_RGB_TARGET_TRIANGLE_IMAGE_FRACTION = 1.f / 128.f;
+static constexpr float IMAGE_PROJECTION_RGB_MIN_TARGET_TRIANGLE_IMAGE_PX = 2.f;
 
 static float true_color_brush_subdivision_target(float brush_radius)
 {
@@ -1451,6 +1453,54 @@ static bool projection_triangle_intersects_overlay(const ProjectionContext      
            min_x <= context.overlay_left + context.overlay_width &&
            max_y >= context.overlay_top &&
            min_y <= context.overlay_top + context.overlay_height;
+}
+
+static bool project_point_to_image_pixel(const ProjectionContext &context,
+                                         const Vec3d             &world_point,
+                                         Vec2f                   &image_pixel)
+{
+    if (context.overlay_width <= EPSILON ||
+        context.overlay_height <= EPSILON ||
+        context.image_width == 0 ||
+        context.image_height == 0)
+        return false;
+
+    Vec2f screen = Vec2f::Zero();
+    if (!project_point_to_screen(context, world_point, screen))
+        return false;
+
+    image_pixel.x() = ((screen.x() - context.overlay_left) / context.overlay_width) * float(context.image_width);
+    image_pixel.y() = ((screen.y() - context.overlay_top) / context.overlay_height) * float(context.image_height);
+    return std::isfinite(image_pixel.x()) && std::isfinite(image_pixel.y());
+}
+
+static float projection_triangle_image_pixel_span(const ProjectionContext     &context,
+                                                  const Transform3d          &world_matrix,
+                                                  const std::array<Vec3f, 3> &vertices)
+{
+    std::array<Vec2f, 3> image_pixels;
+    size_t projected_count = 0;
+    for (const Vec3f &vertex : vertices) {
+        Vec2f image_pixel = Vec2f::Zero();
+        if (project_point_to_image_pixel(context, world_matrix * vertex.cast<double>(), image_pixel))
+            image_pixels[projected_count++] = image_pixel;
+    }
+
+    if (projected_count < 2)
+        return 0.f;
+
+    float span = 0.f;
+    for (size_t i = 0; i + 1 < projected_count; ++i)
+        for (size_t j = i + 1; j < projected_count; ++j)
+            span = std::max(span, (image_pixels[i] - image_pixels[j]).norm());
+    return span;
+}
+
+static float image_projection_rgb_target_triangle_pixel_span(const ProjectionContext &context)
+{
+    const float image_span = float(std::max(context.image_width, context.image_height));
+    return std::max(image_span * IMAGE_PROJECTION_RGB_TARGET_TRIANGLE_IMAGE_FRACTION,
+                    IMAGE_PROJECTION_RGB_MIN_TARGET_TRIANGLE_IMAGE_PX);
 }
 
 static bool barycentric_weights_2d(const Vec2f &point, const Vec2f &a, const Vec2f &b, const Vec2f &c, Vec3f &weights)
@@ -6686,6 +6736,9 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
         const ColorRGBA fallback_color = projection_base_color_for_volume(*volume);
         const Transform3d world_matrix = projection_world_matrix_for_volume(m_parent, object, volume, instance_idx);
         std::vector<bool> projected_triangles(its.indices.size(), false);
+        std::vector<int> projected_triangle_depths(its.indices.size(), 0);
+        const float projection_target_span = image_projection_rgb_target_triangle_pixel_span(context);
+        size_t projected_triangle_count = 0;
 
         for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
             const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
@@ -6701,7 +6754,15 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
                 its.vertices[size_t(tri[1])].cast<float>(),
                 its.vertices[size_t(tri[2])].cast<float>()
             };
-            projected_triangles[tri_idx] = projection_triangle_intersects_overlay(context, world_matrix, vertices);
+            const bool projected_triangle = projection_triangle_intersects_overlay(context, world_matrix, vertices);
+            projected_triangles[tri_idx] = projected_triangle;
+            if (projected_triangle) {
+                projected_triangle_depths[tri_idx] =
+                    texture_mapping_depth_from_span(projection_triangle_image_pixel_span(context, world_matrix, vertices),
+                                                    projection_target_span,
+                                                    7);
+                ++projected_triangle_count;
+            }
         }
 
         TextureMappingColorSampler sampler = [this, volume, source, context, world_matrix, fallback_color, &projected_triangles, &visibility](size_t tri_idx,
@@ -6721,19 +6782,63 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
         };
 
         const float mesh_span = mesh_max_axis_span(its);
-        const int safe_max_depth = texture_mapping_depth_for_budget(its.indices.size(), 7, 2200000);
+        const int background_safe_max_depth = texture_mapping_depth_for_budget(its.indices.size(), 7, 2200000);
+        const int projected_safe_max_depth = projected_triangle_count == 0 ?
+            background_safe_max_depth :
+            texture_mapping_depth_for_budget(projected_triangle_count, 7, 2200000);
+        const int safe_max_depth = std::max(background_safe_max_depth, projected_safe_max_depth);
         const float split_threshold = safe_max_depth < 5 ? 0.018f : 0.012f;
         TextureMappingColorSubdivisionDepths subdivision_depths =
-            [volume, mesh_span, safe_max_depth, &projected_triangles](size_t tri_idx, const std::array<Vec3f, 3> &vertices) {
-            int base_depth = model_volume_has_bakeable_image_texture_data(volume) ?
-                texture_mapping_depth_from_span(texture_triangle_uv_pixel_span(volume, tri_idx), 8.f, safe_max_depth) :
-                texture_mapping_depth_from_span(triangle_max_edge_length(vertices), std::max(mesh_span / 180.f, 0.18f), std::min(6, safe_max_depth));
-            if (tri_idx < projected_triangles.size() && projected_triangles[tri_idx])
-                base_depth = std::min(std::max(base_depth, 4), safe_max_depth);
-            return std::make_pair(base_depth, safe_max_depth);
+            [volume,
+             mesh_span,
+             background_safe_max_depth,
+             projected_safe_max_depth,
+             &projected_triangles,
+             &projected_triangle_depths](size_t tri_idx, const std::array<Vec3f, 3> &vertices) {
+            const bool projected_triangle = tri_idx < projected_triangles.size() && projected_triangles[tri_idx];
+            const int triangle_max_depth = projected_triangle ? projected_safe_max_depth : background_safe_max_depth;
+            int depth = 0;
+            if (model_volume_has_bakeable_image_texture_data(volume)) {
+                depth = texture_mapping_depth_from_span(texture_triangle_uv_pixel_span(volume, tri_idx), 8.f, triangle_max_depth);
+            } else if (!projected_triangle) {
+                depth = texture_mapping_depth_from_span(triangle_max_edge_length(vertices),
+                                                        std::max(mesh_span / 180.f, 0.18f),
+                                                        std::min(6, triangle_max_depth));
+            }
+            if (projected_triangle && tri_idx < projected_triangle_depths.size())
+                depth = std::max(depth, std::min(projected_triangle_depths[tri_idx], triangle_max_depth));
+            depth = std::clamp(depth, 0, triangle_max_depth);
+            return std::make_pair(depth, depth);
         };
 
-        volume->texture_mapping_color_facets.set_from_triangle_sampler(*volume, sampler, safe_max_depth, split_threshold, subdivision_depths);
+        TextureMappingColorLeafResamplePredicate resample_leaf =
+            [this, context, world_matrix, &visibility, &projected_triangles](size_t tri_idx,
+                                                                             const std::array<Vec3f, 3> &vertices,
+                                                                             const std::array<Vec3f, 3> &,
+                                                                             uint32_t) {
+            if (tri_idx >= projected_triangles.size() || !projected_triangles[tri_idx])
+                return false;
+            if (!projection_triangle_intersects_overlay(context, world_matrix, vertices))
+                return false;
+            if (m_pass_through_model)
+                return true;
+
+            const Vec3f centroid = (vertices[0] + vertices[1] + vertices[2]) / 3.f;
+            if (projection_point_is_visible(visibility, context, world_matrix, centroid))
+                return true;
+            for (const Vec3f &vertex : vertices)
+                if (projection_point_is_visible(visibility, context, world_matrix, vertex))
+                    return true;
+            return false;
+        };
+
+        volume->texture_mapping_color_facets.set_from_triangle_sampler(*volume,
+                                                                       sampler,
+                                                                       safe_max_depth,
+                                                                       split_threshold,
+                                                                       subdivision_depths,
+                                                                       &projected_triangles,
+                                                                       resample_leaf);
         if (volume->texture_mapping_color_facets.metadata_json().empty())
             volume->texture_mapping_color_facets.set_metadata_json(rgb_metadata_json(ColorRGBA(1.f, 1.f, 1.f, 1.f)));
         changed = true;

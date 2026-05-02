@@ -389,12 +389,42 @@ public:
     GLWipeTowerVolume(const std::vector<ColorRGBA>& colors);
     void render() override;
     void render_with_outline(const GUI::Size& cnv_size) override { render(); }
+    void set_prime_tower_image_preview(std::vector<unsigned char> image_rgba,
+                                        unsigned int image_width,
+                                        unsigned int image_height,
+                                        std::vector<unsigned char> image_rgba_back,
+                                        unsigned int image_width_back,
+                                        unsigned int image_height_back,
+                                        float angle_offset_deg,
+                                        float width,
+                                        float depth,
+                                        float height,
+                                        float texture_z_min,
+                                        float texture_z_max);
+    void render_prime_tower_image_preview(const Transform3d& view_matrix,
+                                          const Transform3d& projection_matrix,
+                                          const std::array<float, 2>& z_range,
+                                          const std::array<double, 4>& clipping_plane,
+                                          int print_volume_type,
+                                          const std::array<float, 4>& print_volume_xy,
+                                          const std::array<float, 2>& print_volume_z);
 
     std::vector<GUI::GLModel> model_per_colors;
     bool                              IsTransparent();
 
 private:
+    struct PrimeTowerPreviewImage
+    {
+        GUI::GLModel model;
+        GUI::GLTexture texture;
+        std::vector<unsigned char> rgba;
+        unsigned int width { 0 };
+        unsigned int height { 0 };
+    };
+
     std::vector<ColorRGBA> m_colors;
+    PrimeTowerPreviewImage m_prime_tower_image;
+    PrimeTowerPreviewImage m_prime_tower_image_back;
 };
 
 typedef std::vector<GLVolume*> GLVolumePtrs;
@@ -493,8 +523,17 @@ public:
         // Timestamp of the last change of the milestone
         size_t                          timestamp);
 
-    int load_wipe_tower_preview(
-        int obj_idx, float pos_x, float pos_y, float width, float depth, float height, float rotation_angle, bool size_unknown, float brim_width);
+    int load_wipe_tower_preview(int obj_idx,
+                                float pos_x,
+                                float pos_y,
+                                float width,
+                                float depth,
+                                float height,
+                                float rotation_angle,
+                                bool size_unknown,
+                                float brim_width,
+                                float texture_z_min = 0.f,
+                                float texture_z_max = 0.f);
     int load_real_wipe_tower_preview(
     int obj_idx, float pos_x, float pos_y,const TriangleMesh& wt_mesh,const TriangleMesh &brim_mesh,bool render_brim, float rotation_angle, bool size_unknown,  bool opengl_initialized);
     GLVolume* new_toolpath_volume(const ColorRGBA& rgba);

@@ -49,14 +49,16 @@ struct PrimeTowerTextureRenderSettings
     std::vector<uint8_t> image_rgba;
     unsigned int image_width = 0;
     unsigned int image_height = 0;
+    std::vector<uint8_t> image_rgba_back;
+    unsigned int image_width_back = 0;
+    unsigned int image_height_back = 0;
     std::vector<std::string> filament_colours;
     float z_min = 0.f;
     float z_max = 0.f;
 
     bool valid() const
     {
-        return enabled && image_width > 0 && image_height > 0 &&
-               image_rgba.size() >= size_t(image_width) * size_t(image_height) * 4;
+        return enabled && (image_valid(false) || image_valid(true));
     }
 
     float sample_tool_visibility(size_t tool, float u, float v) const
@@ -65,18 +67,47 @@ struct PrimeTowerTextureRenderSettings
             return 1.f;
         u -= std::floor(u);
         v = std::clamp(v, 0.f, 1.f);
-        const float x = u * float(image_width);
-        const float y = (1.f - v) * float(image_height - 1);
-        const unsigned int ix = std::min<unsigned int>(image_width - 1, unsigned(std::floor(x)));
-        const unsigned int iy = std::min<unsigned int>(image_height - 1, unsigned(std::floor(y)));
-        const size_t offset = (size_t(iy) * size_t(image_width) + size_t(ix)) * 4;
-        const float r = float(image_rgba[offset + 0]) / 255.f;
-        const float g = float(image_rgba[offset + 1]) / 255.f;
-        const float b = float(image_rgba[offset + 2]) / 255.f;
-        return color_mode == GenericSolver || color_mode == Auto ? generic_visibility(tool, r, g, b) : fixed_mode_visibility(tool, r, g, b);
+        const bool front_valid = image_valid(false);
+        const bool back_valid = image_valid(true);
+        bool use_back = false;
+        if (front_valid && back_valid) {
+            use_back = u >= 0.5f;
+            u = use_back ? (u - 0.5f) * 2.f : u * 2.f;
+        } else {
+            use_back = back_valid;
+        }
+        return sample_image_tool_visibility(tool, u, v, use_back);
     }
 
 private:
+    bool image_valid(bool back) const
+    {
+        return back ?
+            image_width_back > 0 && image_height_back > 0 &&
+                image_rgba_back.size() >= size_t(image_width_back) * size_t(image_height_back) * 4 :
+            image_width > 0 && image_height > 0 &&
+                image_rgba.size() >= size_t(image_width) * size_t(image_height) * 4;
+    }
+
+    float sample_image_tool_visibility(size_t tool, float u, float v, bool back) const
+    {
+        const std::vector<uint8_t> &rgba = back ? image_rgba_back : image_rgba;
+        const unsigned int width = back ? image_width_back : image_width;
+        const unsigned int height = back ? image_height_back : image_height;
+        if (width == 0 || height == 0 || rgba.size() < size_t(width) * size_t(height) * 4)
+            return 1.f;
+
+        const float x = u * float(width);
+        const float y = (1.f - v) * float(height - 1);
+        const unsigned int ix = std::min<unsigned int>(width - 1, unsigned(std::floor(x)));
+        const unsigned int iy = std::min<unsigned int>(height - 1, unsigned(std::floor(y)));
+        const size_t offset = (size_t(iy) * size_t(width) + size_t(ix)) * 4;
+        const float r = float(rgba[offset + 0]) / 255.f;
+        const float g = float(rgba[offset + 1]) / 255.f;
+        const float b = float(rgba[offset + 2]) / 255.f;
+        return color_mode == GenericSolver || color_mode == Auto ? generic_visibility(tool, r, g, b) : fixed_mode_visibility(tool, r, g, b);
+    }
+
     static std::array<float, 3> parse_color(const std::string &hex)
     {
         auto hex_byte = [](char hi, char lo) {

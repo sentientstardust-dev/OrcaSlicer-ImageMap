@@ -1320,6 +1320,25 @@ static float prime_tower_texture_anchor_distance(const std::vector<Vec2f> &point
     return best_projection > -std::numeric_limits<float>::max() ? best_distance : fallback_distance;
 }
 
+static float prime_tower_texture_anchor_angle(const std::vector<Vec2f> &points, float angle_deg)
+{
+    if (points.empty())
+        return std::clamp(angle_deg, 0.f, 360.f);
+
+    Vec2f min_pt(std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
+    Vec2f max_pt(std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest());
+    for (const Vec2f &point : points) {
+        min_pt.x() = std::min(min_pt.x(), point.x());
+        min_pt.y() = std::min(min_pt.y(), point.y());
+        max_pt.x() = std::max(max_pt.x(), point.x());
+        max_pt.y() = std::max(max_pt.y(), point.y());
+    }
+    float angle = std::clamp(angle_deg, 0.f, 360.f);
+    if (max_pt.y() - min_pt.y() > max_pt.x() - min_pt.x() + EPSILON)
+        angle += 90.f;
+    return angle >= 360.f ? angle - 360.f : angle;
+}
+
 static PrimeTowerPreparedTexturePath prime_tower_prepare_texture_path(WipeTowerWriter &writer,
                                                                       const std::vector<Vec2f> &points,
                                                                       const Vec2f &center,
@@ -1350,7 +1369,8 @@ static PrimeTowerPreparedTexturePath prime_tower_prepare_texture_path(WipeTowerW
     sample_points.reserve(unique_points.size());
     for (const Vec2f &point : unique_points)
         sample_points.emplace_back(writer.point_rotated(point));
-    const float anchor_distance = prime_tower_texture_anchor_distance(sample_points, sample_points.size(), center, angle_deg);
+    const float anchor_distance =
+        prime_tower_texture_anchor_distance(sample_points, sample_points.size(), center, prime_tower_texture_anchor_angle(sample_points, angle_deg));
     return {std::move(unique_points), std::move(sample_points), anchor_distance};
 }
 

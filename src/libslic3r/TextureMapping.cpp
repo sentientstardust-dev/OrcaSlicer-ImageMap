@@ -547,7 +547,11 @@ std::string TextureMappingGlobalSettings::serialize() const
         image_file.empty() &&
         image_name.empty() &&
         image_width == 0 &&
-        image_height == 0)
+        image_height == 0 &&
+        image_file_back.empty() &&
+        image_name_back.empty() &&
+        image_width_back == 0 &&
+        image_height_back == 0)
         return {};
 
     nlohmann::json root;
@@ -560,6 +564,10 @@ std::string TextureMappingGlobalSettings::serialize() const
     prime_tower_texture_mapping["image_name"] = image_name;
     prime_tower_texture_mapping["image_width"] = image_width;
     prime_tower_texture_mapping["image_height"] = image_height;
+    prime_tower_texture_mapping["image_file_back"] = image_file_back;
+    prime_tower_texture_mapping["image_name_back"] = image_name_back;
+    prime_tower_texture_mapping["image_width_back"] = image_width_back;
+    prime_tower_texture_mapping["image_height_back"] = image_height_back;
     root["prime_tower_texture_mapping"] = std::move(prime_tower_texture_mapping);
     return root.dump();
 }
@@ -592,6 +600,10 @@ void TextureMappingGlobalSettings::load(const std::string &serialized)
     image_name = prime_tower_texture_mapping.value("image_name", std::string());
     image_width = prime_tower_texture_mapping.value("image_width", 0u);
     image_height = prime_tower_texture_mapping.value("image_height", 0u);
+    image_file_back = prime_tower_texture_mapping.value("image_file_back", std::string());
+    image_name_back = prime_tower_texture_mapping.value("image_name_back", std::string());
+    image_width_back = prime_tower_texture_mapping.value("image_width_back", 0u);
+    image_height_back = prime_tower_texture_mapping.value("image_height_back", 0u);
 }
 
 void TextureMappingGlobalSettings::clear_image_reference()
@@ -600,6 +612,10 @@ void TextureMappingGlobalSettings::clear_image_reference()
     image_name.clear();
     image_width = 0;
     image_height = 0;
+    image_file_back.clear();
+    image_name_back.clear();
+    image_width_back = 0;
+    image_height_back = 0;
 }
 
 std::string TextureMappingGlobalSettings::normalize_color_mode_name(const std::string &mode)

@@ -956,10 +956,12 @@ public:
                                         int generic_solver_lookup_mode,
                                         const TextureMappingGlobalSettings &global_settings,
                                         const TextureMappingPrimeTowerImage &prime_tower_image,
+                                        const TextureMappingPrimeTowerImage &prime_tower_image_back,
                                         int initial_options_tab)
         : wxDialog(parent, wxID_ANY, _L("Texture Mapping Options"), wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
         , m_global_settings(global_settings)
         , m_prime_tower_image(prime_tower_image)
+        , m_prime_tower_image_back(prime_tower_image_back)
     {
         const int gap = FromDIP(8);
         auto *root = new wxBoxSizer(wxVERTICAL);
@@ -970,7 +972,7 @@ public:
         tab_choices.Add(_L("Filament Calibration"));
         tab_choices.Add(_L("Preview Options"));
         tab_choices.Add(_L("Experimental Options"));
-        tab_choices.Add(_L("Global Settings"));
+        tab_choices.Add(_L("Prime Tower Texture Mapping"));
         m_options_tab_choice = new wxChoice(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, tab_choices);
         m_options_tab_choice->SetSelection(std::clamp(initial_options_tab, 0, 4));
         tab_row->Add(m_options_tab_choice, 1, wxALIGN_CENTER_VERTICAL);
@@ -1135,15 +1137,30 @@ public:
         m_prime_tower_mapping_enabled_checkbox->SetValue(m_global_settings.enabled);
         global_root->Add(m_prime_tower_mapping_enabled_checkbox, 0, wxEXPAND | wxALL, gap);
 
-        auto *prime_image_box = new wxStaticBoxSizer(wxVERTICAL, global_page, _L("Prime Tower Image"));
-        m_prime_tower_image_label = new wxStaticText(global_page, wxID_ANY, wxEmptyString);
-        prime_image_box->Add(m_prime_tower_image_label, 0, wxEXPAND | wxALL, gap);
-        auto *prime_image_buttons = new wxBoxSizer(wxHORIZONTAL);
-        auto *load_prime_image_button = new wxButton(global_page, wxID_ANY, _L("Load Image"));
-        auto *clear_prime_image_button = new wxButton(global_page, wxID_ANY, _L("Clear Image"));
-        prime_image_buttons->Add(load_prime_image_button, 0, wxRIGHT, gap);
-        prime_image_buttons->Add(clear_prime_image_button, 0);
-        prime_image_box->Add(prime_image_buttons, 0, wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        auto *prime_image_box = new wxStaticBoxSizer(wxVERTICAL, global_page, _L("Prime Tower Images"));
+        wxButton *load_prime_image_button = nullptr;
+        wxButton *clear_prime_image_button = nullptr;
+        wxButton *load_prime_image_back_button = nullptr;
+        wxButton *clear_prime_image_back_button = nullptr;
+        auto add_prime_image_row = [&](const wxString &title,
+                                       wxStaticText *&label,
+                                       wxButton *&load_button,
+                                       wxButton *&clear_button) {
+            auto *row = new wxBoxSizer(wxHORIZONTAL);
+            auto *title_label = new wxStaticText(global_page, wxID_ANY, title);
+            title_label->SetMinSize(wxSize(FromDIP(44), -1));
+            label = new wxStaticText(global_page, wxID_ANY, wxEmptyString);
+            label->SetMinSize(wxSize(FromDIP(120), -1));
+            load_button = new wxButton(global_page, wxID_ANY, _L("Load..."));
+            clear_button = new wxButton(global_page, wxID_ANY, _L("Clear"));
+            row->Add(title_label, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+            row->Add(label, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+            row->Add(load_button, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, std::max(FromDIP(2), gap / 2));
+            row->Add(clear_button, 0, wxALIGN_CENTER_VERTICAL);
+            prime_image_box->Add(row, 0, wxEXPAND | wxALL, gap);
+        };
+        add_prime_image_row(_L("Front"), m_prime_tower_image_label, load_prime_image_button, clear_prime_image_button);
+        add_prime_image_row(_L("Back"), m_prime_tower_image_back_label, load_prime_image_back_button, clear_prime_image_back_button);
         global_root->Add(prime_image_box, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
 
         auto *angle_row = new wxBoxSizer(wxHORIZONTAL);
@@ -1181,10 +1198,22 @@ public:
         color_mode_row->Add(m_prime_tower_color_mode_choice, 1, wxALIGN_CENTER_VERTICAL);
         global_root->Add(color_mode_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
 
-        load_prime_image_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { load_prime_tower_image(); });
+        load_prime_image_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { load_prime_tower_image(false); });
         clear_prime_image_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
             m_prime_tower_image.clear();
-            m_global_settings.clear_image_reference();
+            m_global_settings.image_file.clear();
+            m_global_settings.image_name.clear();
+            m_global_settings.image_width = 0;
+            m_global_settings.image_height = 0;
+            update_prime_tower_image_label();
+        });
+        load_prime_image_back_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { load_prime_tower_image(true); });
+        clear_prime_image_back_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+            m_prime_tower_image_back.clear();
+            m_global_settings.image_file_back.clear();
+            m_global_settings.image_name_back.clear();
+            m_global_settings.image_width_back = 0;
+            m_global_settings.image_height_back = 0;
             update_prime_tower_image_label();
         });
         update_prime_tower_image_label();
@@ -1193,7 +1222,7 @@ public:
         m_options_book->AddPage(filament_page, _L("Filament Calibration"));
         m_options_book->AddPage(preview_page, _L("Preview Options"));
         m_options_book->AddPage(experimental_page, _L("Experimental Options"));
-        m_options_book->AddPage(global_page, _L("Global Settings"));
+        m_options_book->AddPage(global_page, _L("Prime Tower Texture Mapping"));
         m_options_book->SetMinSize(wxSize(FromDIP(420),
                                           std::max({image_page->GetBestSize().y,
                                                     filament_page->GetBestSize().y,
@@ -1249,16 +1278,31 @@ public:
         settings.angle_offset_deg = float(std::clamp(m_prime_tower_angle_spin ? m_prime_tower_angle_spin->GetValue() : 0.0, 0.0, 360.0));
         settings.prime_tower_color_mode =
             prime_tower_color_mode_name(m_prime_tower_color_mode_choice ? m_prime_tower_color_mode_choice->GetSelection() : 0);
+        settings.image_file.clear();
+        settings.image_name.clear();
+        settings.image_width = 0;
+        settings.image_height = 0;
         if (m_prime_tower_image.valid()) {
             settings.image_file = "Metadata/texture_mapping/prime_tower_image.png";
             settings.image_name = m_prime_tower_image.image_name;
             settings.image_width = m_prime_tower_image.width;
             settings.image_height = m_prime_tower_image.height;
         }
+        settings.image_file_back.clear();
+        settings.image_name_back.clear();
+        settings.image_width_back = 0;
+        settings.image_height_back = 0;
+        if (m_prime_tower_image_back.valid()) {
+            settings.image_file_back = "Metadata/texture_mapping/prime_tower_image_back.png";
+            settings.image_name_back = m_prime_tower_image_back.image_name;
+            settings.image_width_back = m_prime_tower_image_back.width;
+            settings.image_height_back = m_prime_tower_image_back.height;
+        }
         return settings;
     }
 
     const TextureMappingPrimeTowerImage& prime_tower_image() const { return m_prime_tower_image; }
+    const TextureMappingPrimeTowerImage& prime_tower_image_back() const { return m_prime_tower_image_back; }
     int selected_options_tab() const { return std::clamp(m_options_tab_choice ? m_options_tab_choice->GetSelection() : 0, 0, 4); }
 
     std::vector<float> component_strengths_pct() const
@@ -1311,24 +1355,33 @@ private:
 
     void update_prime_tower_image_label()
     {
-        if (m_prime_tower_image_label == nullptr)
-            return;
-        if (m_prime_tower_image.valid()) {
-            wxString name = from_u8(m_prime_tower_image.image_name);
+        auto update_label = [](wxStaticText *label, const TextureMappingPrimeTowerImage &image) {
+            if (label == nullptr)
+                return;
+            if (!image.valid()) {
+                label->SetLabel(_L("No image loaded"));
+                label->SetToolTip(wxEmptyString);
+                return;
+            }
+            wxString name = from_u8(image.image_name);
             if (name.empty())
                 name = _L("Loaded image");
-            m_prime_tower_image_label->SetLabel(wxString::Format("%s (%u x %u)", name.c_str(), m_prime_tower_image.width, m_prime_tower_image.height));
-        } else {
-            m_prime_tower_image_label->SetLabel(_L("No image loaded"));
-        }
+            wxString display_name = name;
+            if (display_name.length() > 34)
+                display_name = display_name.Left(15) + "..." + display_name.Right(16);
+            const wxString dimensions = wxString::Format("%u x %u", image.width, image.height);
+            label->SetLabel(wxString::Format("%s (%s)", display_name.c_str(), dimensions.c_str()));
+            label->SetToolTip(wxString::Format("%s (%s)", name.c_str(), dimensions.c_str()));
+        };
+        update_label(m_prime_tower_image_label, m_prime_tower_image);
+        update_label(m_prime_tower_image_back_label, m_prime_tower_image_back);
         Layout();
-        Fit();
     }
 
-    void load_prime_tower_image()
+    void load_prime_tower_image(bool back)
     {
         wxFileDialog dlg(this,
-                         _L("Load prime tower image"),
+                         back ? _L("Load prime tower back image") : _L("Load prime tower front image"),
                          wxEmptyString,
                          wxEmptyString,
                          _L("Image files (*.png;*.jpg;*.jpeg;*.bmp)|*.png;*.jpg;*.jpeg;*.bmp"),
@@ -1354,11 +1407,22 @@ private:
         }
         loaded.image_name = boost::filesystem::path(into_u8(dlg.GetPath())).filename().string();
 
-        m_prime_tower_image = std::move(loaded);
-        m_global_settings.image_file = "Metadata/texture_mapping/prime_tower_image.png";
-        m_global_settings.image_name = m_prime_tower_image.image_name;
-        m_global_settings.image_width = m_prime_tower_image.width;
-        m_global_settings.image_height = m_prime_tower_image.height;
+        TextureMappingPrimeTowerImage &target = back ? m_prime_tower_image_back : m_prime_tower_image;
+        target = std::move(loaded);
+        if (back) {
+            m_global_settings.image_file_back = "Metadata/texture_mapping/prime_tower_image_back.png";
+            m_global_settings.image_name_back = target.image_name;
+            m_global_settings.image_width_back = target.width;
+            m_global_settings.image_height_back = target.height;
+        } else {
+            m_global_settings.image_file = "Metadata/texture_mapping/prime_tower_image.png";
+            m_global_settings.image_name = target.image_name;
+            m_global_settings.image_width = target.width;
+            m_global_settings.image_height = target.height;
+        }
+        m_global_settings.enabled = true;
+        if (m_prime_tower_mapping_enabled_checkbox != nullptr)
+            m_prime_tower_mapping_enabled_checkbox->SetValue(true);
         update_prime_tower_image_label();
     }
 
@@ -1395,10 +1459,12 @@ private:
     wxChoice *m_generic_solver_lookup_choice {nullptr};
     wxCheckBox *m_prime_tower_mapping_enabled_checkbox {nullptr};
     wxStaticText *m_prime_tower_image_label {nullptr};
+    wxStaticText *m_prime_tower_image_back_label {nullptr};
     wxSpinCtrlDouble *m_prime_tower_angle_spin {nullptr};
     wxChoice *m_prime_tower_color_mode_choice {nullptr};
     TextureMappingGlobalSettings m_global_settings;
     TextureMappingPrimeTowerImage m_prime_tower_image;
+    TextureMappingPrimeTowerImage m_prime_tower_image_back;
     std::vector<wxSlider*> m_minimum_offset_sliders;
     std::vector<wxSpinCtrl*> m_minimum_offset_spins;
     std::vector<wxSlider*> m_strength_sliders;
@@ -5305,6 +5371,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.generic_solver_lookup_mode,
                                                     bundle->texture_mapping_global_settings,
                                                     wxGetApp().model().texture_mapping_prime_tower_image,
+                                                    wxGetApp().model().texture_mapping_prime_tower_image_back,
                                                     p->m_texture_mapping_advanced_options_tab);
             const int result = dlg.ShowModal();
             p->m_texture_mapping_advanced_options_tab = dlg.selected_options_tab();
@@ -5324,6 +5391,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.generic_solver_lookup_mode = dlg.generic_solver_lookup_mode();
             bundle->texture_mapping_global_settings = dlg.global_settings();
             wxGetApp().model().texture_mapping_prime_tower_image = dlg.prime_tower_image();
+            wxGetApp().model().texture_mapping_prime_tower_image_back = dlg.prime_tower_image_back();
             set_config_string("texture_mapping_global_settings", bundle->texture_mapping_global_settings.serialize());
             if (updated.filament_strengths_pct.size() < palette.size())
                 updated.filament_strengths_pct.resize(palette.size(), 100.f);
@@ -5342,6 +5410,12 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             while (!updated.filament_minimum_offsets_pct.empty() && std::abs(updated.filament_minimum_offsets_pct.back()) <= 1e-6f)
                 updated.filament_minimum_offsets_pct.pop_back();
             apply_zone(std::move(updated));
+            if (p->plater != nullptr) {
+                if (GLCanvas3D *canvas = p->plater->get_view3D_canvas3D())
+                    canvas->reload_scene(true, true);
+                if (GLCanvas3D *canvas = p->plater->get_assmeble_canvas3D())
+                    canvas->reload_scene(true, true);
+            }
             update_texture_mapping_panel(false);
         });
 
