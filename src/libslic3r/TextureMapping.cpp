@@ -523,6 +523,24 @@ static int generic_solver_lookup_mode_from_name(const std::string &name)
         int(TextureMappingZone::GenericSolverClosestMix);
 }
 
+static std::string generic_solver_mode_name(int mode)
+{
+    return clamp_int(mode,
+                     int(TextureMappingZone::GenericSolverLegacy),
+                     int(TextureMappingZone::GenericSolverV2)) ==
+               int(TextureMappingZone::GenericSolverLegacy) ?
+        std::string("legacy") :
+        std::string("v2");
+}
+
+static int generic_solver_mode_from_name(std::string name)
+{
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    return name == "legacy" || name == "v1" ?
+        int(TextureMappingZone::GenericSolverLegacy) :
+        int(TextureMappingZone::GenericSolverV2);
+}
+
 static std::string normalized_prime_tower_color_mode_name(std::string name)
 {
     std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return char(std::tolower(c)); });
@@ -667,7 +685,9 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            seam_hiding == rhs.seam_hiding &&
            nonlinear_offset_adjustment == rhs.nonlinear_offset_adjustment &&
            compact_offset_mode == rhs.compact_offset_mode &&
+           use_legacy_fixed_color_mode == rhs.use_legacy_fixed_color_mode &&
            generic_solver_lookup_mode == rhs.generic_solver_lookup_mode &&
+           generic_solver_mode == rhs.generic_solver_mode &&
            std::abs(contrast_pct - rhs.contrast_pct) <= eps &&
            high_resolution_sampling == rhs.high_resolution_sampling &&
            std::abs(tone_gamma - rhs.tone_gamma) <= eps &&
@@ -883,7 +903,9 @@ std::string TextureMappingManager::serialize_entries()
         texture["hide_seams"] = zone.seam_hiding;
         texture["nonlinear_offset_adjustment"] = zone.nonlinear_offset_adjustment;
         texture["compact_offset_mode"] = zone.compact_offset_mode;
+        texture["use_legacy_fixed_color_mode"] = zone.use_legacy_fixed_color_mode;
         texture["generic_solver_lookup"] = generic_solver_lookup_mode_name(zone.generic_solver_lookup_mode);
+        texture["generic_solver_mode"] = generic_solver_mode_name(zone.generic_solver_mode);
         texture["contrast_pct"] = std::clamp(finite_or(zone.contrast_pct, 100.f), 25.f, 300.f);
         texture["high_resolution_sampling"] = zone.high_resolution_sampling;
         texture["tone_gamma"] = normalize_tone_gamma(zone.tone_gamma);
@@ -1004,8 +1026,17 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.seam_hiding = texture.value("hide_seams", false);
         zone.nonlinear_offset_adjustment = texture.value("nonlinear_offset_adjustment", false);
         zone.compact_offset_mode = texture.value("compact_offset_mode", TextureMappingZone::DefaultCompactOffsetMode);
+        zone.use_legacy_fixed_color_mode =
+            texture.value("use_legacy_fixed_color_mode", TextureMappingZone::DefaultUseLegacyFixedColorMode);
         zone.generic_solver_lookup_mode =
             generic_solver_lookup_mode_from_name(texture.value("generic_solver_lookup", std::string("closest_mix")));
+        const auto generic_solver_mode_it = texture.find("generic_solver_mode");
+        zone.generic_solver_mode =
+            generic_solver_mode_it != texture.end() && generic_solver_mode_it->is_string() ?
+                generic_solver_mode_from_name(generic_solver_mode_it->get<std::string>()) :
+                (zone.filament_color_mode == int(TextureMappingZone::FilamentColorAny) ?
+                     int(TextureMappingZone::GenericSolverLegacy) :
+                     int(TextureMappingZone::GenericSolverV2));
         zone.contrast_pct = std::clamp(texture.value("contrast_pct", 100.f), 25.f, 300.f);
         zone.high_resolution_sampling = texture.value("high_resolution_sampling", true);
         zone.tone_gamma = normalize_tone_gamma(texture.value("tone_gamma", 1.f));

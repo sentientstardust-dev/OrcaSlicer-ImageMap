@@ -3,6 +3,7 @@
 #include "Print.hpp"
 
 #include <boost/log/trivial.hpp>
+#include <nlohmann/json.hpp>
 #include <cfloat>
 
 namespace Slic3r {
@@ -225,6 +226,64 @@ static bool custom_per_printz_gcodes_tool_changes_differ(const std::vector<Custo
 	return false;
 }
 
+static inline bool config_options_equal(const ConfigOption *lhs, const ConfigOption *rhs)
+{
+    if (lhs == nullptr || rhs == nullptr)
+        return false;
+    if (lhs->type() != rhs->type())
+        return false;
+    return *lhs == *rhs;
+}
+
+static void remove_texture_mapping_preview_options(nlohmann::json &root)
+{
+    if (!root.is_array())
+        return;
+    for (nlohmann::json &entry : root) {
+        if (!entry.is_object())
+            continue;
+        auto texture_it = entry.find("texture_options");
+        if (texture_it == entry.end() || !texture_it->is_object())
+            continue;
+        texture_it->erase("preview_opacity_pct");
+        texture_it->erase("simulate_preview_colors");
+        texture_it->erase("limit_preview_resolution");
+    }
+}
+
+static bool texture_mapping_definitions_equal_for_gcode(const ConfigOption *lhs, const ConfigOption *rhs)
+{
+    if (config_options_equal(lhs, rhs))
+        return true;
+    if (lhs == nullptr || rhs == nullptr || lhs->type() != coString || rhs->type() != coString)
+        return false;
+
+    nlohmann::json lhs_json;
+    nlohmann::json rhs_json;
+    try {
+        lhs_json = nlohmann::json::parse(static_cast<const ConfigOptionString *>(lhs)->value);
+        rhs_json = nlohmann::json::parse(static_cast<const ConfigOptionString *>(rhs)->value);
+    } catch (const nlohmann::json::exception &) {
+        return false;
+    }
+
+    remove_texture_mapping_preview_options(lhs_json);
+    remove_texture_mapping_preview_options(rhs_json);
+    return lhs_json == rhs_json;
+}
+
+static void remove_texture_mapping_preview_only_diff(t_config_option_keys     &diff,
+                                                     const ConfigBase         &current_config,
+                                                     const DynamicPrintConfig &new_full_config)
+{
+    auto it = std::find(diff.begin(), diff.end(), "texture_mapping_definitions");
+    if (it == diff.end())
+        return;
+    if (texture_mapping_definitions_equal_for_gcode(current_config.option("texture_mapping_definitions"),
+                                                   new_full_config.option("texture_mapping_definitions")))
+        diff.erase(it);
+}
+
 // Collect changes to print config, account for overrides of extruder retract values by filament presets.
 //BBS: add plate index
 static t_config_option_keys print_config_diffs(
@@ -250,6 +309,8 @@ static t_config_option_keys print_config_diffs(
         if (opt_new_filament != nullptr) {
             compute_filament_override_value(opt_key, opt_old, opt_new, opt_new_filament, new_full_config, print_diff, filament_overrides, filament_maps);
         } else if (*opt_new != *opt_old) {
+            if (opt_key == "texture_mapping_definitions" && texture_mapping_definitions_equal_for_gcode(opt_old, opt_new))
+                continue;
             //BBS: add plate_index logic for wipe_tower_x/wipe_tower_y
             if (!opt_key.compare("wipe_tower_x") || !opt_key.compare("wipe_tower_y")) {
                 const ConfigOptionFloats* option_new = dynamic_cast<const ConfigOptionFloats*>(opt_new);
@@ -281,6 +342,8 @@ static t_config_option_keys full_print_config_diffs(const DynamicPrintConfig &cu
         const ConfigOption *opt_old = current_full_config.option(opt_key);
         const ConfigOption *opt_new = new_full_config.option(opt_key);
         if (opt_old == nullptr || *opt_new != *opt_old) {
+            if (opt_key == "texture_mapping_definitions" && texture_mapping_definitions_equal_for_gcode(opt_old, opt_new))
+                continue;
             //BBS: add plate_index logic for wipe_tower_x/wipe_tower_y
             if (opt_old && (!opt_key.compare("wipe_tower_x") || !opt_key.compare("wipe_tower_y"))) {
                 const ConfigOptionFloats* option_new = dynamic_cast<const ConfigOptionFloats*>(opt_new);
@@ -1184,6 +1247,8 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     // Collect changes to object and region configs.
     t_config_option_keys object_diff      = m_default_object_config.diff(new_full_config);
     t_config_option_keys region_diff      = m_default_region_config.diff(new_full_config);
+    remove_texture_mapping_preview_only_diff(object_diff, m_default_object_config, new_full_config);
+    remove_texture_mapping_preview_only_diff(region_diff, m_default_region_config, new_full_config);
 
     //BBS: process the filament_map related logic
     std::unordered_set<std::string> print_diff_set(print_diff.begin(), print_diff.end());

@@ -1621,6 +1621,8 @@ void Model::load_from(Model& model)
     mk_version = model.mk_version;
     md_name = model.md_name;
     md_value = model.md_value;
+    texture_mapping_prime_tower_image = std::move(model.texture_mapping_prime_tower_image);
+    texture_mapping_prime_tower_image_back = std::move(model.texture_mapping_prime_tower_image_back);
     model.design_info.reset();
     model.model_info.reset();
     model.profile_info.reset();

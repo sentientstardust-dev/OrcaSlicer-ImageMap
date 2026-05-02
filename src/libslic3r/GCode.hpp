@@ -59,9 +59,12 @@ struct GCodeGenericMixCandidateSet {
 
     size_t component_count { 0 };
     std::vector<float> rgbs;
+    std::vector<float> perceptual_coords;
     std::vector<float> weights;
     std::vector<KdNode> kd_nodes;
+    std::vector<KdNode> perceptual_kd_nodes;
     int kd_root { -1 };
+    int perceptual_kd_root { -1 };
 
     bool empty() const
     {

@@ -30,6 +30,7 @@ namespace Slic3r {
 namespace {
 
 constexpr float k_preview_offset = 0.001f;
+constexpr float k_preview_clip_padding = 2.f * k_preview_offset;
 constexpr float k_polygon_offset_factor = -1.f;
 constexpr float k_polygon_offset_units = -1.f;
 constexpr float k_epsilon = 1e-6f;
@@ -39,6 +40,7 @@ constexpr size_t k_simulated_texture_preview_max_pixels = 1024ull * 1024ull;
 struct TexturePreviewMixCandidate
 {
     std::array<float, 3> rgb;
+    std::array<float, 3> perceptual;
     std::vector<float> weights;
 };
 
@@ -57,16 +59,21 @@ struct TexturePreviewSimulationSettings
     bool force_sequential_filaments = false;
     bool limit_texture_resolution = true;
     bool compact_offset_mode = false;
+    bool use_legacy_fixed_color_mode = false;
+    bool use_fixed_color_generic_solver = false;
     float contrast_pct = 100.f;
     float tone_gamma = 1.f;
     int generic_solver_lookup_mode = int(TextureMappingZone::GenericSolverClosestMix);
+    int generic_solver_mode = int(TextureMappingZone::GenericSolverV2);
     std::vector<unsigned int> component_ids;
     std::vector<std::array<float, 3>> component_colors;
     std::vector<float> component_strength_factors;
     std::vector<size_t> semantic_component_indices;
     std::vector<TexturePreviewMixCandidate> generic_mix_candidates;
     std::vector<TexturePreviewMixCandidateKdNode> generic_mix_candidate_kd_nodes;
+    std::vector<TexturePreviewMixCandidateKdNode> generic_mix_candidate_perceptual_kd_nodes;
     int generic_mix_candidate_kd_root { -1 };
+    int generic_mix_candidate_perceptual_kd_root { -1 };
 };
 
 struct SurfaceGradientPreviewSettings
@@ -266,6 +273,40 @@ ColorRGBA blend_component_colors(const std::vector<std::array<float, 3>> &colors
 float clamp01(float value)
 {
     return std::clamp(value, 0.f, 1.f);
+}
+
+float srgb_to_linear_component(float value)
+{
+    const float x = clamp01(value);
+    return x <= 0.04045f ? x / 12.92f : std::pow((x + 0.055f) / 1.055f, 2.4f);
+}
+
+std::array<float, 3> oklab_from_srgb(const std::array<float, 3> &rgb)
+{
+    const float r = srgb_to_linear_component(rgb[0]);
+    const float g = srgb_to_linear_component(rgb[1]);
+    const float b = srgb_to_linear_component(rgb[2]);
+
+    const float l = std::cbrt(0.4122214708f * r + 0.5363325363f * g + 0.0514459929f * b);
+    const float m = std::cbrt(0.2119034982f * r + 0.6806995451f * g + 0.1073969566f * b);
+    const float s = std::cbrt(0.0883024619f * r + 0.2817188376f * g + 0.6299787005f * b);
+
+    return {
+        0.2104542553f * l + 0.7936177850f * m - 0.0040720468f * s,
+        1.9779984951f * l - 2.4285922050f * m + 0.4505937099f * s,
+        0.0259040371f * l + 0.7827717662f * m - 0.8086757660f * s
+    };
+}
+
+std::array<float, 3> generic_solver_v2_axis_weights(const std::array<float, 3> &target_oklab)
+{
+    const float chroma = std::hypot(target_oklab[1], target_oklab[2]);
+    const float chroma_factor = std::clamp((chroma - 0.015f) / 0.13f, 0.f, 1.f);
+    return {
+        1.f + (0.25f - 1.f) * chroma_factor,
+        1.25f + (8.f - 1.25f) * chroma_factor,
+        1.25f + (8.f - 1.25f) * chroma_factor
+    };
 }
 
 unsigned char to_u8(float value)
@@ -533,10 +574,52 @@ std::vector<size_t> semantic_component_indices_for_texture_preview(const std::ve
     return best_matching_component_indices_for_semantic_colors(component_colors, semantic_colors);
 }
 
+std::vector<std::array<float, 3>> fixed_color_generic_solver_component_colors(int filament_color_mode)
+{
+    switch (std::clamp(filament_color_mode,
+                       int(TextureMappingZone::FilamentColorAny),
+                       int(TextureMappingZone::FilamentColorBW))) {
+    case int(TextureMappingZone::FilamentColorRGB):
+        return { { { 1.f, 0.f, 0.f } }, { { 0.f, 1.f, 0.f } }, { { 0.f, 0.f, 1.f } } };
+    case int(TextureMappingZone::FilamentColorCMY):
+        return { { { 0.f, 1.f, 1.f } }, { { 1.f, 0.f, 1.f } }, { { 1.f, 1.f, 0.f } } };
+    case int(TextureMappingZone::FilamentColorCMYK):
+        return { { { 0.f, 1.f, 1.f } }, { { 1.f, 0.f, 1.f } }, { { 1.f, 1.f, 0.f } }, { { 0.f, 0.f, 0.f } } };
+    case int(TextureMappingZone::FilamentColorCMYW):
+        return { { { 0.f, 1.f, 1.f } }, { { 1.f, 0.f, 1.f } }, { { 1.f, 1.f, 0.f } }, { { 1.f, 1.f, 1.f } } };
+    case int(TextureMappingZone::FilamentColorRGBK):
+        return { { { 1.f, 0.f, 0.f } }, { { 0.f, 1.f, 0.f } }, { { 0.f, 0.f, 1.f } }, { { 0.f, 0.f, 0.f } } };
+    case int(TextureMappingZone::FilamentColorRGBW):
+        return { { { 1.f, 0.f, 0.f } }, { { 0.f, 1.f, 0.f } }, { { 0.f, 0.f, 1.f } }, { { 1.f, 1.f, 1.f } } };
+    default:
+        return {};
+    }
+}
+
+bool texture_preview_uses_fixed_color_generic_solver(const TexturePreviewSimulationSettings &settings)
+{
+    if (settings.mapping_mode == int(TextureMappingZone::TextureMappingRawValues) ||
+        settings.use_legacy_fixed_color_mode)
+        return false;
+
+    const std::vector<std::array<float, 3>> fixed_colors =
+        fixed_color_generic_solver_component_colors(settings.filament_color_mode);
+    return !fixed_colors.empty() && fixed_colors.size() == settings.component_colors.size();
+}
+
+std::vector<std::array<float, 3>> generic_solver_component_colors(const TexturePreviewSimulationSettings &settings)
+{
+    if (texture_preview_uses_fixed_color_generic_solver(settings))
+        return fixed_color_generic_solver_component_colors(settings.filament_color_mode);
+    return settings.component_colors;
+}
+
 bool texture_preview_uses_generic_solver(const TexturePreviewSimulationSettings &settings)
 {
     if (settings.mapping_mode == int(TextureMappingZone::TextureMappingRawValues))
         return false;
+    if (settings.use_fixed_color_generic_solver)
+        return true;
 
     const int clamped_mode = std::clamp(settings.filament_color_mode,
                                         int(TextureMappingZone::FilamentColorAny),
@@ -588,6 +671,7 @@ std::vector<TexturePreviewMixCandidate> build_generic_mix_candidates(const std::
             for (size_t weight_idx = 0; weight_idx < component_count; ++weight_idx)
                 candidate.weights[weight_idx] = float(units[weight_idx]) / float(std::max(1, total_units));
             candidate.rgb = mix_component_colors_with_filament_mixer(component_colors, candidate.weights);
+            candidate.perceptual = oklab_from_srgb(candidate.rgb);
             candidates.emplace_back(std::move(candidate));
             return;
         }
@@ -606,14 +690,16 @@ int build_generic_mix_candidate_kd_tree(const std::vector<TexturePreviewMixCandi
                                         std::vector<uint32_t> &indices,
                                         size_t begin,
                                         size_t end,
-                                        uint8_t axis)
+                                        uint8_t axis,
+                                        bool perceptual_coords)
 {
     if (begin >= end)
         return -1;
 
     const size_t mid = begin + (end - begin) / 2;
-    auto axis_value = [&candidates, axis](uint32_t candidate_idx) {
-        return candidates[size_t(candidate_idx)].rgb[size_t(axis)];
+    auto axis_value = [&candidates, axis, perceptual_coords](uint32_t candidate_idx) {
+        const TexturePreviewMixCandidate &candidate = candidates[size_t(candidate_idx)];
+        return perceptual_coords ? candidate.perceptual[size_t(axis)] : candidate.rgb[size_t(axis)];
     };
     std::nth_element(indices.begin() + begin, indices.begin() + mid, indices.begin() + end, [&axis_value](uint32_t lhs, uint32_t rhs) {
         return axis_value(lhs) < axis_value(rhs);
@@ -626,15 +712,16 @@ int build_generic_mix_candidate_kd_tree(const std::vector<TexturePreviewMixCandi
     nodes.emplace_back(node);
 
     const uint8_t next_axis = uint8_t((axis + 1) % 3);
-    const int left = build_generic_mix_candidate_kd_tree(candidates, nodes, indices, begin, mid, next_axis);
-    const int right = build_generic_mix_candidate_kd_tree(candidates, nodes, indices, mid + 1, end, next_axis);
+    const int left = build_generic_mix_candidate_kd_tree(candidates, nodes, indices, begin, mid, next_axis, perceptual_coords);
+    const int right = build_generic_mix_candidate_kd_tree(candidates, nodes, indices, mid + 1, end, next_axis, perceptual_coords);
     nodes[size_t(node_idx)].left = left;
     nodes[size_t(node_idx)].right = right;
     return node_idx;
 }
 
 int build_generic_mix_candidate_kd_tree(const std::vector<TexturePreviewMixCandidate> &candidates,
-                                        std::vector<TexturePreviewMixCandidateKdNode> &nodes)
+                                        std::vector<TexturePreviewMixCandidateKdNode> &nodes,
+                                        bool perceptual_coords = false)
 {
     nodes.clear();
     if (candidates.empty())
@@ -645,7 +732,7 @@ int build_generic_mix_candidate_kd_tree(const std::vector<TexturePreviewMixCandi
         indices[idx] = uint32_t(idx);
 
     nodes.reserve(candidates.size());
-    return build_generic_mix_candidate_kd_tree(candidates, nodes, indices, 0, candidates.size(), uint8_t(0));
+    return build_generic_mix_candidate_kd_tree(candidates, nodes, indices, 0, candidates.size(), uint8_t(0), perceptual_coords);
 }
 
 struct TexturePreviewMixNearestResult
@@ -735,16 +822,102 @@ TexturePreviewMixNearestResult nearest_texture_preview_mix_candidates(const std:
     return result;
 }
 
+float texture_preview_mix_candidate_perceptual_error(const TexturePreviewMixCandidate &candidate,
+                                                     const std::array<float, 3> &target_oklab,
+                                                     const std::array<float, 3> &axis_weights)
+{
+    const float dl = candidate.perceptual[0] - target_oklab[0];
+    const float da = candidate.perceptual[1] - target_oklab[1];
+    const float db = candidate.perceptual[2] - target_oklab[2];
+    return axis_weights[0] * dl * dl + axis_weights[1] * da * da + axis_weights[2] * db * db;
+}
+
+TexturePreviewMixNearestResult nearest_texture_preview_mix_candidates_perceptual_linear(
+    const std::vector<TexturePreviewMixCandidate> &candidates,
+    const std::array<float, 3> &target_oklab,
+    const std::array<float, 3> &axis_weights)
+{
+    TexturePreviewMixNearestResult result;
+    for (size_t candidate_idx = 0; candidate_idx < candidates.size(); ++candidate_idx)
+        update_texture_preview_mix_nearest_result(result,
+                                                  candidate_idx,
+                                                  texture_preview_mix_candidate_perceptual_error(candidates[candidate_idx], target_oklab, axis_weights));
+    return result;
+}
+
+void query_texture_preview_mix_candidate_perceptual_kd_tree(const std::vector<TexturePreviewMixCandidate> &candidates,
+                                                            const std::vector<TexturePreviewMixCandidateKdNode> &nodes,
+                                                            const std::array<float, 3> &target_oklab,
+                                                            const std::array<float, 3> &axis_weights,
+                                                            int node_idx,
+                                                            TexturePreviewMixNearestResult &result)
+{
+    if (node_idx < 0 || size_t(node_idx) >= nodes.size())
+        return;
+
+    const TexturePreviewMixCandidateKdNode &node = nodes[size_t(node_idx)];
+    if (size_t(node.candidate_idx) >= candidates.size()) {
+        query_texture_preview_mix_candidate_perceptual_kd_tree(candidates, nodes, target_oklab, axis_weights, node.left, result);
+        query_texture_preview_mix_candidate_perceptual_kd_tree(candidates, nodes, target_oklab, axis_weights, node.right, result);
+        return;
+    }
+
+    const TexturePreviewMixCandidate &candidate = candidates[size_t(node.candidate_idx)];
+    update_texture_preview_mix_nearest_result(
+        result,
+        size_t(node.candidate_idx),
+        texture_preview_mix_candidate_perceptual_error(candidate, target_oklab, axis_weights));
+
+    const size_t axis = std::min<size_t>(node.axis, 2);
+    const float split_delta = target_oklab[axis] - candidate.perceptual[axis];
+    const int near_node = split_delta <= 0.f ? node.left : node.right;
+    const int far_node = split_delta <= 0.f ? node.right : node.left;
+
+    query_texture_preview_mix_candidate_perceptual_kd_tree(candidates, nodes, target_oklab, axis_weights, near_node, result);
+    if (axis_weights[axis] * split_delta * split_delta <= result.second_error)
+        query_texture_preview_mix_candidate_perceptual_kd_tree(candidates, nodes, target_oklab, axis_weights, far_node, result);
+}
+
+TexturePreviewMixNearestResult nearest_texture_preview_mix_candidates_perceptual(
+    const std::vector<TexturePreviewMixCandidate> &candidates,
+    const std::vector<TexturePreviewMixCandidateKdNode> &nodes,
+    int root,
+    const std::array<float, 3> &target_rgb)
+{
+    TexturePreviewMixNearestResult result;
+    if (candidates.empty())
+        return result;
+
+    const std::array<float, 3> target_oklab = oklab_from_srgb(target_rgb);
+    const std::array<float, 3> axis_weights = generic_solver_v2_axis_weights(target_oklab);
+    if (root >= 0 && !nodes.empty())
+        query_texture_preview_mix_candidate_perceptual_kd_tree(candidates, nodes, target_oklab, axis_weights, root, result);
+    if (result.best_idx >= candidates.size())
+        result = nearest_texture_preview_mix_candidates_perceptual_linear(candidates, target_oklab, axis_weights);
+    return result;
+}
+
 std::vector<float> best_component_mix_weights_for_target(const std::vector<TexturePreviewMixCandidate> &candidates,
                                                          const std::vector<TexturePreviewMixCandidateKdNode> &nodes,
                                                          int root,
+                                                         const std::vector<TexturePreviewMixCandidateKdNode> &perceptual_nodes,
+                                                         int perceptual_root,
                                                          const std::array<float, 3> &target_rgb,
-                                                         int generic_solver_lookup_mode)
+                                                         int generic_solver_lookup_mode,
+                                                         int generic_solver_mode)
 {
     if (candidates.empty())
         return {};
 
-    const TexturePreviewMixNearestResult nearest = nearest_texture_preview_mix_candidates(candidates, nodes, root, target_rgb);
+    const int clamped_solver_mode = std::clamp(generic_solver_mode,
+                                               int(TextureMappingZone::GenericSolverLegacy),
+                                               int(TextureMappingZone::GenericSolverV2));
+    TexturePreviewMixNearestResult nearest =
+        clamped_solver_mode == int(TextureMappingZone::GenericSolverV2) ?
+            nearest_texture_preview_mix_candidates_perceptual(candidates, perceptual_nodes, perceptual_root, target_rgb) :
+            nearest_texture_preview_mix_candidates(candidates, nodes, root, target_rgb);
+    if (nearest.best_idx >= candidates.size() && clamped_solver_mode == int(TextureMappingZone::GenericSolverV2))
+        nearest = nearest_texture_preview_mix_candidates(candidates, nodes, root, target_rgb);
     if (nearest.best_idx >= candidates.size())
         return {};
 
@@ -943,20 +1116,25 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
             desired[channel_idx] = clamp01(channels[channel_idx]);
         mapped_component_count = channel_count;
     } else {
-        std::vector<float> optimized = optimized_primary_component_weights_for_target(target,
-                                                                                      component_count,
-                                                                                      settings.filament_color_mode,
-                                                                                      settings.component_colors,
-                                                                                      settings.force_sequential_filaments,
-                                                                                      settings.semantic_component_indices);
+        std::vector<float> optimized;
+        if (!settings.use_fixed_color_generic_solver)
+            optimized = optimized_primary_component_weights_for_target(target,
+                                                                       component_count,
+                                                                       settings.filament_color_mode,
+                                                                       settings.component_colors,
+                                                                       settings.force_sequential_filaments,
+                                                                       settings.semantic_component_indices);
         if (optimized.size() == component_count)
             desired = std::move(optimized);
         else {
             std::vector<float> best = best_component_mix_weights_for_target(settings.generic_mix_candidates,
                                                                             settings.generic_mix_candidate_kd_nodes,
                                                                             settings.generic_mix_candidate_kd_root,
+                                                                            settings.generic_mix_candidate_perceptual_kd_nodes,
+                                                                            settings.generic_mix_candidate_perceptual_kd_root,
                                                                             target,
-                                                                            settings.generic_solver_lookup_mode);
+                                                                            settings.generic_solver_lookup_mode,
+                                                                            settings.generic_solver_mode);
             if (best.size() == component_count)
                 desired = std::move(best);
         }
@@ -982,16 +1160,19 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
 
 void prepare_texture_preview_simulation_settings(TexturePreviewSimulationSettings &settings)
 {
+    settings.use_fixed_color_generic_solver = texture_preview_uses_fixed_color_generic_solver(settings);
     settings.semantic_component_indices =
         semantic_component_indices_for_texture_preview(settings.component_colors,
                                                        settings.filament_color_mode,
                                                        settings.force_sequential_filaments);
     if (texture_preview_uses_generic_solver(settings))
-        settings.generic_mix_candidates = build_generic_mix_candidates(settings.component_colors);
+        settings.generic_mix_candidates = build_generic_mix_candidates(generic_solver_component_colors(settings));
     else
         settings.generic_mix_candidates.clear();
     settings.generic_mix_candidate_kd_root =
         build_generic_mix_candidate_kd_tree(settings.generic_mix_candidates, settings.generic_mix_candidate_kd_nodes);
+    settings.generic_mix_candidate_perceptual_kd_root =
+        build_generic_mix_candidate_kd_tree(settings.generic_mix_candidates, settings.generic_mix_candidate_perceptual_kd_nodes, true);
 }
 
 ColorRGBA simulated_texture_preview_color_for_vertex_color(const ColorRGBA *source_color,
@@ -1039,6 +1220,7 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
     settings.force_sequential_filaments = zone->force_sequential_filaments;
     settings.limit_texture_resolution = zone->preview_limit_resolution;
     settings.compact_offset_mode = zone->compact_offset_mode;
+    settings.use_legacy_fixed_color_mode = zone->use_legacy_fixed_color_mode;
     settings.contrast_pct = std::clamp(zone->contrast_pct, 25.f, 300.f);
     settings.tone_gamma = (!std::isfinite(zone->tone_gamma) || zone->tone_gamma <= 0.f) ?
         1.f :
@@ -1046,6 +1228,9 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
     settings.generic_solver_lookup_mode = std::clamp(zone->generic_solver_lookup_mode,
                                                      int(TextureMappingZone::GenericSolverClosestMix),
                                                      int(TextureMappingZone::GenericSolverBlendClosestTwo));
+    settings.generic_solver_mode = std::clamp(zone->generic_solver_mode,
+                                              int(TextureMappingZone::GenericSolverLegacy),
+                                              int(TextureMappingZone::GenericSolverV2));
     settings.component_ids = TextureMappingManager::effective_texture_component_ids(*zone, num_physical, physical_colors);
     if (settings.component_ids.empty())
         return std::nullopt;
@@ -1088,7 +1273,9 @@ size_t texture_preview_simulation_signature(const ModelVolume &model_volume,
     mix(std::hash<int>{}(settings.force_sequential_filaments ? 1 : 0));
     mix(std::hash<int>{}(settings.limit_texture_resolution ? 1 : 0));
     mix(std::hash<int>{}(settings.compact_offset_mode ? 1 : 0));
+    mix(std::hash<int>{}(settings.use_legacy_fixed_color_mode ? 1 : 0));
     mix(std::hash<int>{}(settings.generic_solver_lookup_mode));
+    mix(std::hash<int>{}(settings.generic_solver_mode));
     mix(std::hash<int>{}(int(std::lround(settings.contrast_pct * 100.f))));
     mix(std::hash<int>{}(int(std::lround(settings.tone_gamma * 1000.f))));
     for (const unsigned int id : settings.component_ids)
@@ -2226,8 +2413,10 @@ void set_common_uniforms(GLShaderProgram &shader,
     shader.set_uniform("view_model_matrix", view_model_matrix);
     shader.set_uniform("projection_matrix", projection_matrix);
     shader.set_uniform("view_normal_matrix", view_normal_matrix);
+    const std::array<float, 2> preview_z_range = { z_range[0] - k_preview_clip_padding,
+                                                   z_range[1] + k_preview_clip_padding };
     shader.set_uniform("volume_world_matrix", model_matrix);
-    shader.set_uniform("z_range", z_range);
+    shader.set_uniform("z_range", preview_z_range);
     shader.set_uniform("clipping_plane", clipping_plane);
     shader.set_uniform("print_volume.type", print_volume_type);
     shader.set_uniform("print_volume.xy_data", print_volume_xy);
@@ -2505,6 +2694,9 @@ size_t texture_preview_settings_signature(size_t num_physical, const TextureMapp
         signature_mix(std::hash<int>{}(zone.force_sequential_filaments ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.nonlinear_offset_adjustment ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.compact_offset_mode ? 1 : 0));
+        signature_mix(std::hash<int>{}(zone.use_legacy_fixed_color_mode ? 1 : 0));
+        signature_mix(std::hash<int>{}(zone.generic_solver_lookup_mode));
+        signature_mix(std::hash<int>{}(zone.generic_solver_mode));
         signature_mix(std::hash<int>{}(zone.preview_simulate_colors ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.preview_limit_resolution ? 1 : 0));
         signature_mix_float(zone.sagging_ratio);

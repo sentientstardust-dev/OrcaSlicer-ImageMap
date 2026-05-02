@@ -60,6 +60,11 @@ struct TextureMappingZone
         GenericSolverBlendClosestTwo = 1
     };
 
+    enum GenericSolverMode : uint8_t {
+        GenericSolverLegacy = 0,
+        GenericSolverV2 = 1
+    };
+
     static constexpr int   DefaultSurfacePattern = int(ImageTexture);
     static constexpr int   DefaultOffsetMode = int(OffsetBasic);
     static constexpr bool  DefaultOffsetRotationEnabled = true;
@@ -76,7 +81,9 @@ struct TextureMappingZone
     static constexpr bool  DefaultSeamHiding = false;
     static constexpr bool  DefaultNonlinearOffsetAdjustment = false;
     static constexpr bool  DefaultCompactOffsetMode = true;
+    static constexpr bool  DefaultUseLegacyFixedColorMode = false;
     static constexpr int   DefaultGenericSolverLookupMode = int(GenericSolverClosestMix);
+    static constexpr int   DefaultGenericSolverMode = int(GenericSolverV2);
     static constexpr float DefaultContrastPct = 100.f;
     static constexpr bool  DefaultHighResolutionSampling = true;
     static constexpr float DefaultToneGamma = 1.f;
@@ -114,7 +121,9 @@ struct TextureMappingZone
     bool        seam_hiding = DefaultSeamHiding;
     bool        nonlinear_offset_adjustment = DefaultNonlinearOffsetAdjustment;
     bool        compact_offset_mode = DefaultCompactOffsetMode;
+    bool        use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
     int         generic_solver_lookup_mode = DefaultGenericSolverLookupMode;
+    int         generic_solver_mode = DefaultGenericSolverMode;
     float       contrast_pct = DefaultContrastPct;
     bool        high_resolution_sampling = DefaultHighResolutionSampling;
     float       tone_gamma = DefaultToneGamma;
@@ -152,7 +161,9 @@ struct TextureMappingZone
         seam_hiding = DefaultSeamHiding;
         nonlinear_offset_adjustment = DefaultNonlinearOffsetAdjustment;
         compact_offset_mode = DefaultCompactOffsetMode;
+        use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
         generic_solver_lookup_mode = DefaultGenericSolverLookupMode;
+        generic_solver_mode = DefaultGenericSolverMode;
         contrast_pct = DefaultContrastPct;
         high_resolution_sampling = DefaultHighResolutionSampling;
         tone_gamma = DefaultToneGamma;

@@ -352,6 +352,7 @@ private:
     uint32_t             m_image_height = 0;
     GLTexture            m_overlay_texture;
     bool                 m_overlay_texture_dirty = false;
+    bool                 m_show_overlay = true;
     float                m_projection_opacity = 1.f;
     bool                 m_apply_transparency_as_background = false;
     bool                 m_pass_through_model = false;

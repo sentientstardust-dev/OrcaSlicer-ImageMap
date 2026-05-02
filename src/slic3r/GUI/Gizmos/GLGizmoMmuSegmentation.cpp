@@ -1460,7 +1460,10 @@ static bool project_point_to_screen(const ProjectionContext &context, const Vec3
     return true;
 }
 
-static bool project_point_to_depth_clipped_screen(const ProjectionContext &context, const Vec3d &world_point, Vec2f &screen)
+static bool project_point_to_depth_clipped_screen(const ProjectionContext &context,
+                                                  const Vec3d             &world_point,
+                                                  Vec2f                   &screen,
+                                                  float                   *ndc_z = nullptr)
 {
     const Vec4d clip = context.view_projection * Vec4d(world_point.x(), world_point.y(), world_point.z(), 1.0);
     if (clip.w() <= 0.0)
@@ -1472,6 +1475,8 @@ static bool project_point_to_depth_clipped_screen(const ProjectionContext &conte
 
     screen.x() = float((ndc.x() * 0.5 + 0.5) * double(context.canvas_width));
     screen.y() = float((1.0 - (ndc.y() * 0.5 + 0.5)) * double(context.canvas_height));
+    if (ndc_z != nullptr)
+        *ndc_z = float(ndc.z());
     return std::isfinite(screen.x()) && std::isfinite(screen.y());
 }
 
@@ -1508,7 +1513,7 @@ static bool projection_triangle_intersects_overlay(const ProjectionContext      
 
     for (const Vec3f &vertex : vertices) {
         Vec2f screen = Vec2f::Zero();
-        if (!project_point_to_screen(context, world_matrix * vertex.cast<double>(), screen))
+        if (!project_point_to_depth_clipped_screen(context, world_matrix * vertex.cast<double>(), screen))
             continue;
         min_x = std::min(min_x, screen.x());
         min_y = std::min(min_y, screen.y());
@@ -1537,6 +1542,25 @@ static bool project_point_to_image_pixel(const ProjectionContext &context,
 
     Vec2f screen = Vec2f::Zero();
     if (!project_point_to_screen(context, world_point, screen))
+        return false;
+
+    image_pixel.x() = ((screen.x() - context.overlay_left) / context.overlay_width) * float(context.image_width);
+    image_pixel.y() = ((screen.y() - context.overlay_top) / context.overlay_height) * float(context.image_height);
+    return std::isfinite(image_pixel.x()) && std::isfinite(image_pixel.y());
+}
+
+static bool project_depth_clipped_point_to_image_pixel(const ProjectionContext &context,
+                                                       const Vec3d             &world_point,
+                                                       Vec2f                   &image_pixel)
+{
+    if (context.overlay_width <= EPSILON ||
+        context.overlay_height <= EPSILON ||
+        context.image_width == 0 ||
+        context.image_height == 0)
+        return false;
+
+    Vec2f screen = Vec2f::Zero();
+    if (!project_point_to_depth_clipped_screen(context, world_point, screen))
         return false;
 
     image_pixel.x() = ((screen.x() - context.overlay_left) / context.overlay_width) * float(context.image_width);
@@ -2240,13 +2264,24 @@ struct ProjectionVisibility
     float              top = 0.f;
     float              scale = 1.f;
     std::vector<float> depth;
+    std::vector<uint64_t> triangle_keys;
 };
+
+static constexpr float PROJECTION_VISIBILITY_DEPTH_TOLERANCE = 2e-4f;
+static constexpr float PROJECTION_VISIBILITY_SAME_TRIANGLE_DEPTH_TOLERANCE = 2e-3f;
+static constexpr uint64_t PROJECTION_VISIBILITY_INVALID_TRIANGLE_KEY = std::numeric_limits<uint64_t>::max();
+
+static uint64_t projection_visibility_triangle_key(size_t volume_idx, size_t tri_idx)
+{
+    return (uint64_t(volume_idx) << 32) | uint64_t(tri_idx);
+}
 
 static bool projection_visibility_valid(const ProjectionVisibility &visibility)
 {
     return visibility.width > 0 &&
            visibility.height > 0 &&
-           visibility.depth.size() == size_t(visibility.width) * size_t(visibility.height);
+           visibility.depth.size() == size_t(visibility.width) * size_t(visibility.height) &&
+           visibility.triangle_keys.size() == visibility.depth.size();
 }
 
 static ProjectionVisibility build_projection_visibility(const ProjectionContext &context,
@@ -2265,8 +2300,9 @@ static ProjectionVisibility build_projection_visibility(const ProjectionContext 
     visibility.left = context.overlay_left;
     visibility.top = context.overlay_top;
     visibility.depth.assign(size_t(visibility.width) * size_t(visibility.height), std::numeric_limits<float>::max());
+    visibility.triangle_keys.assign(visibility.depth.size(), PROJECTION_VISIBILITY_INVALID_TRIANGLE_KEY);
 
-    auto rasterize_triangle = [&visibility](const std::array<Vec2f, 3> &screen, const std::array<float, 3> &depths) {
+    auto rasterize_triangle = [&visibility](const std::array<Vec2f, 3> &screen, const std::array<float, 3> &depths, uint64_t triangle_key) {
         const float min_screen_x = std::min({ screen[0].x(), screen[1].x(), screen[2].x() });
         const float max_screen_x = std::max({ screen[0].x(), screen[1].x(), screen[2].x() });
         const float min_screen_y = std::min({ screen[0].y(), screen[1].y(), screen[2].y() });
@@ -2281,19 +2317,26 @@ static ProjectionVisibility build_projection_visibility(const ProjectionContext 
                 const Vec2f pixel(visibility.left + (float(x) + 0.5f) / visibility.scale,
                                   visibility.top + (float(y) + 0.5f) / visibility.scale);
                 Vec3f weights = Vec3f::Zero();
-                if (!barycentric_weights_2d(pixel, screen[0], screen[1], screen[2], weights))
-                    continue;
-                if (weights.x() < -1e-4f || weights.y() < -1e-4f || weights.z() < -1e-4f)
+                if (!conservative_barycentric_weights_2d(pixel,
+                                                          screen[0],
+                                                          screen[1],
+                                                          screen[2],
+                                                          0.7072f / visibility.scale,
+                                                          weights))
                     continue;
 
                 const float depth = depths[0] * weights.x() + depths[1] * weights.y() + depths[2] * weights.z();
                 const size_t idx = size_t(y) * size_t(visibility.width) + size_t(x);
-                visibility.depth[idx] = std::min(visibility.depth[idx], depth);
+                if (depth < visibility.depth[idx]) {
+                    visibility.depth[idx] = depth;
+                    visibility.triangle_keys[idx] = triangle_key;
+                }
             }
         }
     };
 
-    for (const ModelVolume *volume : object->volumes) {
+    for (size_t volume_idx = 0; volume_idx < object->volumes.size(); ++volume_idx) {
+        const ModelVolume *volume = object->volumes[volume_idx];
         if (volume == nullptr || !volume->is_model_part())
             continue;
 
@@ -2302,7 +2345,8 @@ static ProjectionVisibility build_projection_visibility(const ProjectionContext 
             continue;
 
         const Transform3d world_matrix = projection_world_matrix_for_volume(parent, object, volume, instance_idx);
-        for (const stl_triangle_vertex_indices &tri : its.indices) {
+        for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+            const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
             if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
                 continue;
             if (size_t(tri[0]) >= its.vertices.size() ||
@@ -2322,13 +2366,16 @@ static ProjectionVisibility build_projection_visibility(const ProjectionContext 
             std::array<float, 3> depths;
             bool projected = true;
             for (size_t idx = 0; idx < vertices.size(); ++idx) {
-                if (!project_point_to_screen(context, world_matrix * vertices[idx].cast<double>(), screen[idx], &depths[idx])) {
+                if (!project_point_to_depth_clipped_screen(context,
+                                                           world_matrix * vertices[idx].cast<double>(),
+                                                           screen[idx],
+                                                           &depths[idx])) {
                     projected = false;
                     break;
                 }
             }
             if (projected)
-                rasterize_triangle(screen, depths);
+                rasterize_triangle(screen, depths, projection_visibility_triangle_key(volume_idx, tri_idx));
         }
     }
 
@@ -2338,7 +2385,8 @@ static ProjectionVisibility build_projection_visibility(const ProjectionContext 
 static bool projection_point_is_visible(const ProjectionVisibility &visibility,
                                         const ProjectionContext    &context,
                                         const Transform3d         &world_matrix,
-                                        const Vec3f               &point)
+                                        const Vec3f               &point,
+                                        uint64_t                   triangle_key = PROJECTION_VISIBILITY_INVALID_TRIANGLE_KEY)
 {
     if (!projection_visibility_valid(visibility))
         return true;
@@ -2356,7 +2404,58 @@ static bool projection_point_is_visible(const ProjectionVisibility &visibility,
     const float nearest = visibility.depth[size_t(y) * size_t(visibility.width) + size_t(x)];
     if (!std::isfinite(nearest))
         return false;
-    return depth <= nearest + 2e-3f;
+
+    const size_t key_idx = size_t(y) * size_t(visibility.width) + size_t(x);
+    const float tolerance =
+        triangle_key != PROJECTION_VISIBILITY_INVALID_TRIANGLE_KEY && visibility.triangle_keys[key_idx] == triangle_key ?
+        PROJECTION_VISIBILITY_SAME_TRIANGLE_DEPTH_TOLERANCE :
+        PROJECTION_VISIBILITY_DEPTH_TOLERANCE;
+    return depth <= nearest + tolerance;
+}
+
+static bool projection_screen_triangle_has_visible_sample(const ProjectionVisibility   &visibility,
+                                                          const std::array<Vec2f, 3>  &screen,
+                                                          const std::array<float, 3>  &depths,
+                                                          uint64_t                     triangle_key)
+{
+    if (!projection_visibility_valid(visibility))
+        return true;
+
+    const float min_screen_x = std::min({ screen[0].x(), screen[1].x(), screen[2].x() });
+    const float max_screen_x = std::max({ screen[0].x(), screen[1].x(), screen[2].x() });
+    const float min_screen_y = std::min({ screen[0].y(), screen[1].y(), screen[2].y() });
+    const float max_screen_y = std::max({ screen[0].y(), screen[1].y(), screen[2].y() });
+    const int min_x = std::clamp(int(std::floor((min_screen_x - visibility.left) * visibility.scale)) - 1, 0, visibility.width - 1);
+    const int max_x = std::clamp(int(std::ceil((max_screen_x - visibility.left) * visibility.scale)) + 1, 0, visibility.width - 1);
+    const int min_y = std::clamp(int(std::floor((min_screen_y - visibility.top) * visibility.scale)) - 1, 0, visibility.height - 1);
+    const int max_y = std::clamp(int(std::ceil((max_screen_y - visibility.top) * visibility.scale)) + 1, 0, visibility.height - 1);
+
+    for (int y = min_y; y <= max_y; ++y) {
+        for (int x = min_x; x <= max_x; ++x) {
+            const Vec2f pixel(visibility.left + (float(x) + 0.5f) / visibility.scale,
+                              visibility.top + (float(y) + 0.5f) / visibility.scale);
+            Vec3f weights = Vec3f::Zero();
+            if (!conservative_barycentric_weights_2d(pixel,
+                                                      screen[0],
+                                                      screen[1],
+                                                      screen[2],
+                                                      0.7072f / visibility.scale,
+                                                      weights))
+                continue;
+
+            const float depth = depths[0] * weights.x() + depths[1] * weights.y() + depths[2] * weights.z();
+            const size_t key_idx = size_t(y) * size_t(visibility.width) + size_t(x);
+            const float nearest = visibility.depth[key_idx];
+            const float tolerance =
+                triangle_key != PROJECTION_VISIBILITY_INVALID_TRIANGLE_KEY && visibility.triangle_keys[key_idx] == triangle_key ?
+                PROJECTION_VISIBILITY_SAME_TRIANGLE_DEPTH_TOLERANCE :
+                PROJECTION_VISIBILITY_DEPTH_TOLERANCE;
+            if (std::isfinite(nearest) && depth <= nearest + tolerance)
+                return true;
+        }
+    }
+
+    return false;
 }
 
 struct ProjectionPaintableImageMask
@@ -2450,7 +2549,7 @@ static bool projection_triangle_image_pixel_bounds(const ProjectionContext     &
 
     for (const Vec3f &vertex : vertices) {
         Vec2f image_pixel = Vec2f::Zero();
-        if (!project_point_to_image_pixel(context, world_matrix * vertex.cast<double>(), image_pixel))
+        if (!project_depth_clipped_point_to_image_pixel(context, world_matrix * vertex.cast<double>(), image_pixel))
             continue;
         min_x = std::min(min_x, image_pixel.x());
         min_y = std::min(min_y, image_pixel.y());
@@ -2489,34 +2588,42 @@ static bool projection_triangle_intersects_paintable_image(const ProjectionConte
 static bool projection_triangle_has_visible_sample(const ProjectionVisibility &visibility,
                                                    const ProjectionContext    &context,
                                                    const Transform3d         &world_matrix,
-                                                   const std::array<Vec3f, 3> &vertices)
+                                                   const std::array<Vec3f, 3> &vertices,
+                                                   uint64_t                   triangle_key)
 {
     if (!projection_visibility_valid(visibility))
         return true;
 
-    if (projection_point_is_visible(visibility, context, world_matrix, (vertices[0] + vertices[1] + vertices[2]) / 3.f))
+    if (projection_point_is_visible(visibility, context, world_matrix, (vertices[0] + vertices[1] + vertices[2]) / 3.f, triangle_key))
         return true;
 
     for (const Vec3f &vertex : vertices)
-        if (projection_point_is_visible(visibility, context, world_matrix, vertex))
+        if (projection_point_is_visible(visibility, context, world_matrix, vertex, triangle_key))
             return true;
 
     for (size_t idx = 0; idx < 3; ++idx)
-        if (projection_point_is_visible(visibility, context, world_matrix, (vertices[idx] + vertices[(idx + 1) % 3]) * 0.5f))
+        if (projection_point_is_visible(visibility, context, world_matrix, (vertices[idx] + vertices[(idx + 1) % 3]) * 0.5f, triangle_key))
             return true;
 
-    return false;
+    std::array<Vec2f, 3> screen;
+    std::array<float, 3> depths;
+    for (size_t idx = 0; idx < vertices.size(); ++idx)
+        if (!project_point_to_depth_clipped_screen(context, world_matrix * vertices[idx].cast<double>(), screen[idx], &depths[idx]))
+            return false;
+
+    return projection_screen_triangle_has_visible_sample(visibility, screen, depths, triangle_key);
 }
 
 static bool projection_triangle_should_project(const ProjectionContext            &context,
                                                const ProjectionVisibility         &visibility,
                                                const ProjectionPaintableImageMask &paintable_mask,
                                                const Transform3d                 &world_matrix,
-                                               const std::array<Vec3f, 3>        &vertices)
+                                               const std::array<Vec3f, 3>        &vertices,
+                                               uint64_t                           triangle_key)
 {
     return projection_triangle_intersects_overlay(context, world_matrix, vertices) &&
            projection_triangle_intersects_paintable_image(context, paintable_mask, world_matrix, vertices) &&
-           projection_triangle_has_visible_sample(visibility, context, world_matrix, vertices);
+           projection_triangle_has_visible_sample(visibility, context, world_matrix, vertices, triangle_key);
 }
 
 struct ProjectionRegionStateSource
@@ -2882,7 +2989,8 @@ static bool project_texture_mapping_zone_to_regions(ModelObject             &obj
         Vec3f(0.f, 0.f, 1.f)
     };
 
-    for (ModelVolume *volume : object.volumes) {
+    for (size_t volume_idx = 0; volume_idx < object.volumes.size(); ++volume_idx) {
+        ModelVolume *volume = object.volumes[volume_idx];
         if (volume == nullptr || !volume->is_model_part())
             continue;
 
@@ -2909,7 +3017,12 @@ static bool project_texture_mapping_zone_to_regions(ModelObject             &obj
                 its.vertices[size_t(tri[1])].cast<float>(),
                 its.vertices[size_t(tri[2])].cast<float>()
             };
-            if (!projection_triangle_should_project(context, visibility, paintable_mask, world_matrix, vertices))
+            if (!projection_triangle_should_project(context,
+                                                    visibility,
+                                                    paintable_mask,
+                                                    world_matrix,
+                                                    vertices,
+                                                    projection_visibility_triangle_key(volume_idx, tri_idx)))
                 continue;
 
             projected_triangles[tri_idx] = true;
@@ -2939,12 +3052,18 @@ static bool project_texture_mapping_zone_to_regions(ModelObject             &obj
              world_matrix,
              pass_through_model,
              texture_mapping_filament_id,
+             volume_idx,
              &visibility,
              &projected_triangles,
              &state_source](size_t tri_idx, const Vec3f &point, const Vec3f &) {
             unsigned int state = sample_projection_region_state(state_source, int(tri_idx), point);
             if (tri_idx < projected_triangles.size() && projected_triangles[tri_idx]) {
-                if (pass_through_model || projection_point_is_visible(visibility, context, world_matrix, point)) {
+                if (pass_through_model ||
+                    projection_point_is_visible(visibility,
+                                                context,
+                                                world_matrix,
+                                                point,
+                                                projection_visibility_triangle_key(volume_idx, tri_idx))) {
                     if (std::optional<ColorRGBA> projected = projected_image_color_at_point(context, world_matrix, point);
                         projected && projection_overlay_has_paintable_alpha(*projected, context)) {
                         state = texture_mapping_filament_id;
@@ -7139,6 +7258,7 @@ void GLGizmoImageProjection::on_set_state()
 {
     if (get_state() == On) {
         m_parent.enable_picking(false);
+        m_show_overlay = true;
         m_projection_mode_initialized = false;
     } else if (get_state() == Off) {
         m_parent.enable_picking(true);
@@ -7190,6 +7310,7 @@ bool GLGizmoImageProjection::load_projection_image()
     m_image_width = width;
     m_image_height = height;
     m_overlay_texture_dirty = true;
+    m_show_overlay = true;
     m_parent.set_as_dirty();
     return true;
 }
@@ -7203,6 +7324,7 @@ void GLGizmoImageProjection::clear_projection_image()
     m_image_height = 0;
     m_overlay_texture.reset();
     m_overlay_texture_dirty = false;
+    m_show_overlay = false;
     m_parent.set_as_dirty();
 }
 
@@ -7342,7 +7464,7 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
 {
     update_default_projection_mode();
 
-    if (ensure_overlay_texture()) {
+    if (m_show_overlay && ensure_overlay_texture()) {
         const OverlayRect rect = overlay_rect();
         if (rect.width > 0.f && rect.height > 0.f) {
             ImGui::SetNextWindowPos(ImVec2(rect.left, rect.top), ImGuiCond_Always);
@@ -7388,6 +7510,11 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
         m_imgui->text(from_u8(slash == std::string::npos ? m_image_path : m_image_path.substr(slash + 1)));
     }
 
+    if (!m_image_rgba.empty() && ImGui::Checkbox("Show image overlay", &m_show_overlay)) {
+        m_parent.set_as_dirty();
+        m_parent.request_extra_frame();
+    }
+
     if (m_imgui->button(_L("Manage Color Data for this object")))
         open_color_data_management_dialog();
 
@@ -7424,8 +7551,11 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
     ImGui::Checkbox("Pass through model", &m_pass_through_model);
 
     m_imgui->disabled_begin(m_image_rgba.empty());
-    if (m_imgui->button(_L("Project image onto model")))
-        project_image_to_selected_object();
+    if (m_imgui->button(_L("Project image onto model")) && project_image_to_selected_object()) {
+        m_show_overlay = false;
+        m_parent.set_as_dirty();
+        m_parent.request_extra_frame();
+    }
     m_imgui->disabled_end();
 
     if (!m_image_error.empty())
@@ -7527,7 +7657,8 @@ bool GLGizmoImageProjection::project_to_vertex_colors(ModelObject *object)
         build_projection_visibility(context, m_parent, object, instance_idx);
 
     bool changed = false;
-    for (ModelVolume *volume : object->volumes) {
+    for (size_t volume_idx = 0; volume_idx < object->volumes.size(); ++volume_idx) {
+        ModelVolume *volume = object->volumes[volume_idx];
         if (volume == nullptr || !volume->is_model_part())
             continue;
 
@@ -7594,7 +7725,12 @@ bool GLGizmoImageProjection::project_to_vertex_colors(ModelObject *object)
             };
             for (int corner = 0; corner < 3; ++corner) {
                 const size_t vertex_idx = size_t(tri[corner]);
-                if (!m_pass_through_model && !projection_point_is_visible(visibility, context, world_matrix, vertices[size_t(corner)]))
+                if (!m_pass_through_model &&
+                    !projection_point_is_visible(visibility,
+                                                 context,
+                                                 world_matrix,
+                                                 vertices[size_t(corner)],
+                                                 projection_visibility_triangle_key(volume_idx, tri_idx)))
                     continue;
                 if (std::optional<ColorRGBA> projected = projected_image_color_at_point(context, world_matrix, vertices[size_t(corner)])) {
                     if (!context.apply_transparency_as_background && !projection_overlay_has_paintable_alpha(*projected, context))
@@ -7654,7 +7790,8 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
         build_projection_visibility(context, m_parent, object, instance_idx);
 
     bool changed = false;
-    for (ModelVolume *volume : object->volumes) {
+    for (size_t volume_idx = 0; volume_idx < object->volumes.size(); ++volume_idx) {
+        ModelVolume *volume = object->volumes[volume_idx];
         if (volume == nullptr || !volume->is_model_part())
             continue;
 
@@ -7763,7 +7900,12 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
                                             volume->imported_texture_width,
                                             wrapped_texture_pixel(x_px, volume->imported_texture_width),
                                             wrapped_texture_pixel(y_px, volume->imported_texture_height));
-                        if (m_pass_through_model || projection_point_is_visible(visibility, context, world_matrix, point)) {
+                        if (m_pass_through_model ||
+                            projection_point_is_visible(visibility,
+                                                        context,
+                                                        world_matrix,
+                                                        point,
+                                                        projection_visibility_triangle_key(volume_idx, tri_idx))) {
                             if (std::optional<ColorRGBA> projected = projected_image_color_at_point(context, world_matrix, point)) {
                                 const bool transparent_sample =
                                     !context.apply_transparency_as_background &&
@@ -7824,7 +7966,8 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
     const ProjectionPaintableImageMask paintable_mask = build_projection_paintable_image_mask(context, true);
 
     bool changed = false;
-    for (ModelVolume *volume : object->volumes) {
+    for (size_t volume_idx = 0; volume_idx < object->volumes.size(); ++volume_idx) {
+        ModelVolume *volume = object->volumes[volume_idx];
         if (volume == nullptr || !volume->is_model_part())
             continue;
 
@@ -7858,7 +8001,8 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
                                                                                visibility,
                                                                                paintable_mask,
                                                                                world_matrix,
-                                                                               vertices);
+                                                                               vertices,
+                                                                               projection_visibility_triangle_key(volume_idx, tri_idx));
             projected_triangles[tri_idx] = projected_triangle;
             if (projected_triangle) {
                 projected_triangle_depths[tri_idx] =
@@ -7872,12 +8016,25 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
         if (projected_triangle_count == 0)
             continue;
 
-        TextureMappingColorSampler sampler = [this, volume, source, context, world_matrix, fallback_color, &projected_triangles, &visibility](size_t tri_idx,
-                                                                                                                                             const Vec3f &point,
-                                                                                                                                             const Vec3f &barycentric) {
+        TextureMappingColorSampler sampler = [this,
+                                              volume,
+                                              source,
+                                              context,
+                                              world_matrix,
+                                              fallback_color,
+                                              volume_idx,
+                                              &projected_triangles,
+                                              &visibility](size_t tri_idx,
+                                                           const Vec3f &point,
+                                                           const Vec3f &barycentric) {
             ColorRGBA color = sample_volume_color_source(*volume, source, tri_idx, point, barycentric, true, &fallback_color);
             if (tri_idx < projected_triangles.size() && projected_triangles[tri_idx]) {
-                if (m_pass_through_model || projection_point_is_visible(visibility, context, world_matrix, point)) {
+                if (m_pass_through_model ||
+                    projection_point_is_visible(visibility,
+                                                context,
+                                                world_matrix,
+                                                point,
+                                                projection_visibility_triangle_key(volume_idx, tri_idx))) {
                     if (std::optional<ColorRGBA> projected = projected_image_color_at_point(context, world_matrix, point)) {
                         if (!context.apply_transparency_as_background && !projection_overlay_has_paintable_alpha(*projected, context))
                             return pack_vertex_color_rgba(color);
@@ -7919,10 +8076,10 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
         };
 
         TextureMappingColorLeafResamplePredicate resample_leaf =
-            [this, context, world_matrix, &visibility, &projected_triangles](size_t tri_idx,
-                                                                             const std::array<Vec3f, 3> &vertices,
-                                                                             const std::array<Vec3f, 3> &,
-                                                                             uint32_t) {
+            [this, context, world_matrix, volume_idx, &visibility, &projected_triangles](size_t tri_idx,
+                                                                                         const std::array<Vec3f, 3> &vertices,
+                                                                                         const std::array<Vec3f, 3> &,
+                                                                                         uint32_t) {
             if (tri_idx >= projected_triangles.size() || !projected_triangles[tri_idx])
                 return false;
             if (!projection_triangle_intersects_overlay(context, world_matrix, vertices))
@@ -7931,10 +8088,18 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
                 return true;
 
             const Vec3f centroid = (vertices[0] + vertices[1] + vertices[2]) / 3.f;
-            if (projection_point_is_visible(visibility, context, world_matrix, centroid))
+            if (projection_point_is_visible(visibility,
+                                            context,
+                                            world_matrix,
+                                            centroid,
+                                            projection_visibility_triangle_key(volume_idx, tri_idx)))
                 return true;
             for (const Vec3f &vertex : vertices)
-                if (projection_point_is_visible(visibility, context, world_matrix, vertex))
+                if (projection_point_is_visible(visibility,
+                                                context,
+                                                world_matrix,
+                                                vertex,
+                                                projection_visibility_triangle_key(volume_idx, tri_idx)))
                     return true;
             return false;
         };

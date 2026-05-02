@@ -6145,6 +6145,40 @@ static std::array<float, 3> mix_component_colors_with_filament_mixer_for_gcode(c
     return { out_r, out_g, out_b };
 }
 
+static float srgb_to_linear_component_for_gcode(float value)
+{
+    const float x = clamp01f_for_gcode(value);
+    return x <= 0.04045f ? x / 12.92f : std::pow((x + 0.055f) / 1.055f, 2.4f);
+}
+
+static std::array<float, 3> oklab_from_srgb_for_gcode(const std::array<float, 3> &rgb)
+{
+    const float r = srgb_to_linear_component_for_gcode(rgb[0]);
+    const float g = srgb_to_linear_component_for_gcode(rgb[1]);
+    const float b = srgb_to_linear_component_for_gcode(rgb[2]);
+
+    const float l = std::cbrt(0.4122214708f * r + 0.5363325363f * g + 0.0514459929f * b);
+    const float m = std::cbrt(0.2119034982f * r + 0.6806995451f * g + 0.1073969566f * b);
+    const float s = std::cbrt(0.0883024619f * r + 0.2817188376f * g + 0.6299787005f * b);
+
+    return {
+        0.2104542553f * l + 0.7936177850f * m - 0.0040720468f * s,
+        1.9779984951f * l - 2.4285922050f * m + 0.4505937099f * s,
+        0.0259040371f * l + 0.7827717662f * m - 0.8086757660f * s
+    };
+}
+
+static std::array<float, 3> generic_solver_v2_axis_weights_for_gcode(const std::array<float, 3> &target_oklab)
+{
+    const float chroma = std::hypot(target_oklab[1], target_oklab[2]);
+    const float chroma_factor = std::clamp((chroma - 0.015f) / 0.13f, 0.f, 1.f);
+    return {
+        1.f + (0.25f - 1.f) * chroma_factor,
+        1.25f + (8.f - 1.25f) * chroma_factor,
+        1.25f + (8.f - 1.25f) * chroma_factor
+    };
+}
+
 static std::string generic_mix_candidate_cache_key_for_gcode(const std::vector<std::array<float, 3>> &component_colors)
 {
     std::ostringstream key;
@@ -6178,18 +6212,20 @@ static size_t generic_mix_candidate_count_for_gcode(size_t component_count, int 
     return result;
 }
 
-static int build_generic_mix_candidate_kd_tree_for_gcode(GCodeGenericMixCandidateSet &candidates,
-                                                         std::vector<uint32_t>       &indices,
-                                                         size_t                       begin,
-                                                         size_t                       end,
-                                                         uint8_t                      axis)
+static int build_generic_mix_candidate_kd_tree_for_gcode(
+    const std::vector<float>                         &coords,
+    std::vector<GCodeGenericMixCandidateSet::KdNode> &nodes,
+    std::vector<uint32_t>                            &indices,
+    size_t                                            begin,
+    size_t                                            end,
+    uint8_t                                           axis)
 {
     if (begin >= end)
         return -1;
 
     const size_t mid = begin + (end - begin) / 2;
-    auto axis_value = [&candidates, axis](uint32_t candidate_idx) {
-        return candidates.rgbs[size_t(candidate_idx) * 3 + size_t(axis)];
+    auto axis_value = [&coords, axis](uint32_t candidate_idx) {
+        return coords[size_t(candidate_idx) * 3 + size_t(axis)];
     };
     std::nth_element(indices.begin() + begin,
                      indices.begin() + mid,
@@ -6198,38 +6234,52 @@ static int build_generic_mix_candidate_kd_tree_for_gcode(GCodeGenericMixCandidat
                          return axis_value(lhs) < axis_value(rhs);
                      });
 
-    const int node_idx = int(candidates.kd_nodes.size());
+    const int node_idx = int(nodes.size());
     GCodeGenericMixCandidateSet::KdNode node;
     node.candidate_idx = indices[mid];
     node.axis = axis;
-    candidates.kd_nodes.emplace_back(node);
+    nodes.emplace_back(node);
 
     const uint8_t next_axis = uint8_t((axis + 1) % 3);
-    const int left = build_generic_mix_candidate_kd_tree_for_gcode(candidates, indices, begin, mid, next_axis);
-    const int right = build_generic_mix_candidate_kd_tree_for_gcode(candidates, indices, mid + 1, end, next_axis);
-    candidates.kd_nodes[size_t(node_idx)].left = left;
-    candidates.kd_nodes[size_t(node_idx)].right = right;
+    const int left = build_generic_mix_candidate_kd_tree_for_gcode(coords, nodes, indices, begin, mid, next_axis);
+    const int right = build_generic_mix_candidate_kd_tree_for_gcode(coords, nodes, indices, mid + 1, end, next_axis);
+    nodes[size_t(node_idx)].left = left;
+    nodes[size_t(node_idx)].right = right;
     return node_idx;
 }
 
-static void build_generic_mix_candidate_kd_tree_for_gcode(GCodeGenericMixCandidateSet &candidates)
+static int build_generic_mix_candidate_kd_tree_for_gcode(
+    const std::vector<float>                         &coords,
+    std::vector<GCodeGenericMixCandidateSet::KdNode> &nodes)
 {
-    const size_t candidate_count = candidates.rgbs.size() / 3;
-    candidates.kd_nodes.clear();
-    candidates.kd_root = -1;
+    const size_t candidate_count = coords.size() / 3;
+    nodes.clear();
     if (candidate_count == 0)
-        return;
+        return -1;
 
     std::vector<uint32_t> indices(candidate_count, 0);
     for (size_t idx = 0; idx < candidate_count; ++idx)
         indices[idx] = uint32_t(idx);
 
-    candidates.kd_nodes.reserve(candidate_count);
-    candidates.kd_root = build_generic_mix_candidate_kd_tree_for_gcode(candidates,
-                                                                       indices,
-                                                                       0,
-                                                                       candidate_count,
-                                                                       uint8_t(0));
+    nodes.reserve(candidate_count);
+    return build_generic_mix_candidate_kd_tree_for_gcode(coords,
+                                                         nodes,
+                                                         indices,
+                                                         0,
+                                                         candidate_count,
+                                                         uint8_t(0));
+}
+
+static void build_generic_mix_candidate_kd_tree_for_gcode(GCodeGenericMixCandidateSet &candidates)
+{
+    candidates.kd_root = build_generic_mix_candidate_kd_tree_for_gcode(candidates.rgbs, candidates.kd_nodes);
+    if (candidates.perceptual_coords.size() == candidates.rgbs.size()) {
+        candidates.perceptual_kd_root =
+            build_generic_mix_candidate_kd_tree_for_gcode(candidates.perceptual_coords, candidates.perceptual_kd_nodes);
+    } else {
+        candidates.perceptual_kd_nodes.clear();
+        candidates.perceptual_kd_root = -1;
+    }
 }
 
 static GCodeGenericMixCandidateSet build_generic_mix_candidates_for_gcode(
@@ -6245,15 +6295,20 @@ static GCodeGenericMixCandidateSet build_generic_mix_candidates_for_gcode(
     const size_t estimated_candidate_count = generic_mix_candidate_count_for_gcode(component_count, total_units);
     candidates.component_count = component_count;
     candidates.rgbs.reserve(estimated_candidate_count * 3);
+    candidates.perceptual_coords.reserve(estimated_candidate_count * 3);
     candidates.weights.reserve(estimated_candidate_count * component_count);
 
     std::function<void(size_t, int)> recurse = [&](size_t idx, int remaining_units) {
         if (idx + 1 == component_count) {
             units[idx] = remaining_units;
             const std::array<float, 3> mixed = mix_component_colors_with_filament_mixer_for_gcode(component_colors, units);
+            const std::array<float, 3> perceptual = oklab_from_srgb_for_gcode(mixed);
             candidates.rgbs.emplace_back(mixed[0]);
             candidates.rgbs.emplace_back(mixed[1]);
             candidates.rgbs.emplace_back(mixed[2]);
+            candidates.perceptual_coords.emplace_back(perceptual[0]);
+            candidates.perceptual_coords.emplace_back(perceptual[1]);
+            candidates.perceptual_coords.emplace_back(perceptual[2]);
             for (size_t weight_idx = 0; weight_idx < component_count; ++weight_idx)
                 candidates.weights.emplace_back(float(units[weight_idx]) / float(std::max(1, total_units)));
             return;
@@ -6378,15 +6433,103 @@ static GCodeGenericMixNearestResult nearest_generic_mix_candidates_for_gcode(
     return result;
 }
 
+static float generic_mix_candidate_perceptual_error_for_gcode(const GCodeGenericMixCandidateSet &candidates,
+                                                              size_t                             candidate_idx,
+                                                              const std::array<float, 3>        &target_oklab,
+                                                              const std::array<float, 3>        &axis_weights)
+{
+    const size_t coord_idx = candidate_idx * 3;
+    const float dl = candidates.perceptual_coords[coord_idx + 0] - target_oklab[0];
+    const float da = candidates.perceptual_coords[coord_idx + 1] - target_oklab[1];
+    const float db = candidates.perceptual_coords[coord_idx + 2] - target_oklab[2];
+    return axis_weights[0] * dl * dl + axis_weights[1] * da * da + axis_weights[2] * db * db;
+}
+
+static GCodeGenericMixNearestResult nearest_generic_mix_candidates_perceptual_linear_for_gcode(
+    const GCodeGenericMixCandidateSet &candidates,
+    const std::array<float, 3>        &target_oklab,
+    const std::array<float, 3>        &axis_weights)
+{
+    GCodeGenericMixNearestResult result;
+    const size_t candidate_count = candidates.perceptual_coords.size() / 3;
+    for (size_t candidate_idx = 0; candidate_idx < candidate_count; ++candidate_idx)
+        update_generic_mix_nearest_result_for_gcode(
+            result,
+            candidate_idx,
+            generic_mix_candidate_perceptual_error_for_gcode(candidates, candidate_idx, target_oklab, axis_weights));
+    return result;
+}
+
+static void query_generic_mix_candidate_perceptual_kd_tree_for_gcode(const GCodeGenericMixCandidateSet &candidates,
+                                                                     const std::array<float, 3>        &target_oklab,
+                                                                     const std::array<float, 3>        &axis_weights,
+                                                                     int                                node_idx,
+                                                                     GCodeGenericMixNearestResult      &result)
+{
+    if (node_idx < 0 || size_t(node_idx) >= candidates.perceptual_kd_nodes.size())
+        return;
+
+    const size_t candidate_count = candidates.perceptual_coords.size() / 3;
+    const GCodeGenericMixCandidateSet::KdNode &node = candidates.perceptual_kd_nodes[size_t(node_idx)];
+    if (size_t(node.candidate_idx) >= candidate_count) {
+        query_generic_mix_candidate_perceptual_kd_tree_for_gcode(candidates, target_oklab, axis_weights, node.left, result);
+        query_generic_mix_candidate_perceptual_kd_tree_for_gcode(candidates, target_oklab, axis_weights, node.right, result);
+        return;
+    }
+
+    update_generic_mix_nearest_result_for_gcode(
+        result,
+        size_t(node.candidate_idx),
+        generic_mix_candidate_perceptual_error_for_gcode(candidates, size_t(node.candidate_idx), target_oklab, axis_weights));
+
+    const size_t coord_idx = size_t(node.candidate_idx) * 3;
+    const size_t axis = std::min<size_t>(node.axis, 2);
+    const float split_delta = target_oklab[axis] - candidates.perceptual_coords[coord_idx + axis];
+    const int near_node = split_delta <= 0.f ? node.left : node.right;
+    const int far_node = split_delta <= 0.f ? node.right : node.left;
+
+    query_generic_mix_candidate_perceptual_kd_tree_for_gcode(candidates, target_oklab, axis_weights, near_node, result);
+    if (axis_weights[axis] * split_delta * split_delta <= result.second_error)
+        query_generic_mix_candidate_perceptual_kd_tree_for_gcode(candidates, target_oklab, axis_weights, far_node, result);
+}
+
+static GCodeGenericMixNearestResult nearest_generic_mix_candidates_perceptual_for_gcode(
+    const GCodeGenericMixCandidateSet &candidates,
+    const std::array<float, 3>        &target_rgb)
+{
+    GCodeGenericMixNearestResult result;
+    const size_t candidate_count = candidates.perceptual_coords.size() / 3;
+    if (candidate_count == 0 || candidates.perceptual_coords.size() != candidates.rgbs.size())
+        return result;
+
+    const std::array<float, 3> target_oklab = oklab_from_srgb_for_gcode(target_rgb);
+    const std::array<float, 3> axis_weights = generic_solver_v2_axis_weights_for_gcode(target_oklab);
+    if (candidates.perceptual_kd_root >= 0 && !candidates.perceptual_kd_nodes.empty())
+        query_generic_mix_candidate_perceptual_kd_tree_for_gcode(
+            candidates, target_oklab, axis_weights, candidates.perceptual_kd_root, result);
+    if (result.best_idx >= candidate_count)
+        result = nearest_generic_mix_candidates_perceptual_linear_for_gcode(candidates, target_oklab, axis_weights);
+    return result;
+}
+
 static std::vector<float> best_component_mix_weights_for_target_for_gcode(const GCodeGenericMixCandidateSet &candidates,
                                                                           const std::array<float, 3>        &target_rgb,
-                                                                          int                                generic_solver_lookup_mode)
+                                                                          int                                generic_solver_lookup_mode,
+                                                                          int                                generic_solver_mode)
 {
     if (candidates.empty())
         return {};
 
     const size_t candidate_count = candidates.rgbs.size() / 3;
-    const GCodeGenericMixNearestResult nearest = nearest_generic_mix_candidates_for_gcode(candidates, target_rgb);
+    const int clamped_solver_mode = std::clamp(generic_solver_mode,
+                                               int(TextureMappingZone::GenericSolverLegacy),
+                                               int(TextureMappingZone::GenericSolverV2));
+    GCodeGenericMixNearestResult nearest =
+        clamped_solver_mode == int(TextureMappingZone::GenericSolverV2) ?
+            nearest_generic_mix_candidates_perceptual_for_gcode(candidates, target_rgb) :
+            nearest_generic_mix_candidates_for_gcode(candidates, target_rgb);
+    if (nearest.best_idx >= candidate_count && clamped_solver_mode == int(TextureMappingZone::GenericSolverV2))
+        nearest = nearest_generic_mix_candidates_for_gcode(candidates, target_rgb);
     if (nearest.best_idx >= candidate_count)
         return {};
 
@@ -6625,6 +6768,28 @@ static std::vector<size_t> semantic_component_indices_for_gcode(const std::vecto
     return best_matching_component_indices_for_semantic_colors_for_gcode(component_colors, semantic_colors);
 }
 
+static std::vector<std::array<float, 3>> fixed_color_generic_solver_component_colors_for_gcode(int filament_color_mode)
+{
+    switch (std::clamp(filament_color_mode,
+                       int(TextureMappingZone::FilamentColorAny),
+                       int(TextureMappingZone::FilamentColorBW))) {
+    case int(TextureMappingZone::FilamentColorRGB):
+        return { { { 1.f, 0.f, 0.f } }, { { 0.f, 1.f, 0.f } }, { { 0.f, 0.f, 1.f } } };
+    case int(TextureMappingZone::FilamentColorCMY):
+        return { { { 0.f, 1.f, 1.f } }, { { 1.f, 0.f, 1.f } }, { { 1.f, 1.f, 0.f } } };
+    case int(TextureMappingZone::FilamentColorCMYK):
+        return { { { 0.f, 1.f, 1.f } }, { { 1.f, 0.f, 1.f } }, { { 1.f, 1.f, 0.f } }, { { 0.f, 0.f, 0.f } } };
+    case int(TextureMappingZone::FilamentColorCMYW):
+        return { { { 0.f, 1.f, 1.f } }, { { 1.f, 0.f, 1.f } }, { { 1.f, 1.f, 0.f } }, { { 1.f, 1.f, 1.f } } };
+    case int(TextureMappingZone::FilamentColorRGBK):
+        return { { { 1.f, 0.f, 0.f } }, { { 0.f, 1.f, 0.f } }, { { 0.f, 0.f, 1.f } }, { { 0.f, 0.f, 0.f } } };
+    case int(TextureMappingZone::FilamentColorRGBW):
+        return { { { 1.f, 0.f, 0.f } }, { { 0.f, 1.f, 0.f } }, { { 0.f, 0.f, 1.f } }, { { 1.f, 1.f, 1.f } } };
+    default:
+        return {};
+    }
+}
+
 static std::vector<float> optimized_primary_component_weights_for_target_for_gcode(const std::array<float, 3> &target_rgb,
                                                                                    size_t                      component_count,
                                                                                    int                         filament_color_mode,
@@ -6756,6 +6921,8 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                                                                                 int                                       filament_color_mode,
                                                                                 bool                                      force_sequential_filaments,
                                                                                 int                                       generic_solver_lookup_mode,
+                                                                                int                                       generic_solver_mode,
+                                                                                bool                                      use_legacy_fixed_color_mode,
                                                                                 std::map<std::string, GCodeGenericMixCandidateSet> *generic_mix_candidate_cache,
                                                                                 float                                     texture_contrast_pct,
                                                                                 float                                     texture_tone_gamma,
@@ -7169,22 +7336,33 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
         return VertexColorOverhangWeightField{};
 
     const size_t component_count = component_colors.size();
+    const std::vector<std::array<float, 3>> fixed_color_solver_component_colors =
+        fixed_color_generic_solver_component_colors_for_gcode(filament_color_mode);
+    const bool use_fixed_color_generic_solver =
+        !raw_values_mode &&
+        !use_legacy_fixed_color_mode &&
+        fixed_color_solver_component_colors.size() == component_count;
+    const std::vector<std::array<float, 3>> &generic_solver_component_colors =
+        use_fixed_color_generic_solver ? fixed_color_solver_component_colors : component_colors;
     const size_t sample_count = samples.size();
     GCodeGenericMixCandidateSet local_generic_mix_candidates;
     const GCodeGenericMixCandidateSet *generic_mix_candidates = nullptr;
     if (!raw_values_mode) {
-        const std::array<float, 3> probe_target { 0.f, 0.f, 0.f };
-        const std::vector<float> optimized_probe =
-            optimized_primary_component_weights_for_target_for_gcode(probe_target,
-                                                                     component_count,
-                                                                     filament_color_mode,
-                                                                     component_colors,
-                                                                     force_sequential_filaments);
+        std::vector<float> optimized_probe;
+        if (!use_fixed_color_generic_solver) {
+            const std::array<float, 3> probe_target { 0.f, 0.f, 0.f };
+            optimized_probe =
+                optimized_primary_component_weights_for_target_for_gcode(probe_target,
+                                                                         component_count,
+                                                                         filament_color_mode,
+                                                                         component_colors,
+                                                                         force_sequential_filaments);
+        }
         if (optimized_probe.size() != component_count) {
             if (generic_mix_candidate_cache != nullptr)
-                generic_mix_candidates = &generic_mix_candidates_for_gcode(*generic_mix_candidate_cache, component_colors);
+                generic_mix_candidates = &generic_mix_candidates_for_gcode(*generic_mix_candidate_cache, generic_solver_component_colors);
             else {
-                local_generic_mix_candidates = build_generic_mix_candidates_for_gcode(component_colors);
+                local_generic_mix_candidates = build_generic_mix_candidates_for_gcode(generic_solver_component_colors);
                 generic_mix_candidates = &local_generic_mix_candidates;
             }
         }
@@ -7227,18 +7405,21 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                 desired[channel_idx] = clamp01f_for_gcode(channels[channel_idx]);
             mapped_component_count = channel_count;
         } else {
-            std::vector<float> optimized = optimized_primary_component_weights_for_target_for_gcode(target,
-                                                                                                    component_count,
-                                                                                                    filament_color_mode,
-                                                                                                    component_colors,
-                                                                                                    force_sequential_filaments);
+            std::vector<float> optimized;
+            if (!use_fixed_color_generic_solver)
+                optimized = optimized_primary_component_weights_for_target_for_gcode(target,
+                                                                                    component_count,
+                                                                                    filament_color_mode,
+                                                                                    component_colors,
+                                                                                    force_sequential_filaments);
             if (optimized.size() == component_count)
                 desired = std::move(optimized);
             else {
                 std::vector<float> best = generic_mix_candidates != nullptr ?
                     best_component_mix_weights_for_target_for_gcode(*generic_mix_candidates,
                                                                     target,
-                                                                    generic_solver_lookup_mode) :
+                                                                    generic_solver_lookup_mode,
+                                                                    generic_solver_mode) :
                     std::vector<float>{};
                 if (best.size() == component_count)
                     desired = std::move(best);
@@ -7558,9 +7739,386 @@ static float component_angular_influence_for_gcode(unsigned int                 
     return 0.f;
 }
 
-std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoop &)
+std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoop &loop)
 {
-    return std::nullopt;
+    if (m_curr_print == nullptr ||
+        m_layer == nullptr ||
+        m_layer->upper_layer == nullptr ||
+        m_writer.filament() == nullptr ||
+        loop.paths.empty() ||
+        !is_external_perimeter(loop.role()))
+        return std::nullopt;
+
+    const size_t num_physical = m_config.filament_diameter.values.size();
+    const unsigned int texture_zone_id = unsigned(std::max(0, m_config.wall_filament.value));
+    const TextureMappingManager &texture_mgr = m_curr_print->texture_mapping_manager();
+    if (num_physical == 0 || texture_zone_id == 0 || !texture_mgr.is_texture_mapping_zone_id(texture_zone_id))
+        return std::nullopt;
+
+    const TextureMappingZone *zone = texture_mgr.zone_from_id(texture_zone_id);
+    if (zone == nullptr ||
+        !zone->seam_hiding ||
+        !is_vertex_color_match_overhang_row_for_gcode(*zone) ||
+        !is_horizontal_overhang_gradient_row_for_gcode(*zone))
+        return std::nullopt;
+
+    const PrintObject *layer_object = m_layer->object();
+    const Layer *upper_layer = m_layer->upper_layer;
+    const int object_layer_count = layer_object ? int(layer_object->layer_count()) : 0;
+    if (layer_object == nullptr || upper_layer == nullptr || object_layer_count <= 0)
+        return std::nullopt;
+
+    std::vector<unsigned int> component_ids =
+        TextureMappingManager::effective_texture_component_ids(*zone,
+                                                               num_physical,
+                                                               m_config.filament_colour.values);
+    if (component_ids.empty())
+        component_ids = decode_offset_component_ids_for_gcode(*zone, num_physical);
+    if (component_ids.empty())
+        return std::nullopt;
+
+    const int texture_filament_color_mode = std::clamp(zone->filament_color_mode,
+                                                       int(TextureMappingZone::FilamentColorAny),
+                                                       int(TextureMappingZone::FilamentColorBW));
+    const bool raw_texture_mapping_mode =
+        zone->texture_mapping_mode == int(TextureMappingZone::TextureMappingRawValues);
+    const bool texture_force_sequential_filaments = zone->force_sequential_filaments;
+    const int generic_solver_lookup_mode = std::clamp(zone->generic_solver_lookup_mode,
+                                                      int(TextureMappingZone::GenericSolverClosestMix),
+                                                      int(TextureMappingZone::GenericSolverBlendClosestTwo));
+    const int generic_solver_mode = std::clamp(zone->generic_solver_mode,
+                                               int(TextureMappingZone::GenericSolverLegacy),
+                                               int(TextureMappingZone::GenericSolverV2));
+    const bool compact_offset_mode = zone->compact_offset_mode;
+    const bool use_legacy_fixed_color_mode = zone->use_legacy_fixed_color_mode;
+    const float texture_contrast_pct = std::clamp(zone->contrast_pct, 25.f, 300.f);
+    const float texture_tone_gamma =
+        (!std::isfinite(zone->tone_gamma) || zone->tone_gamma <= 0.f) ?
+            1.f :
+            std::clamp(zone->tone_gamma, 0.5f, 3.f);
+    const bool high_resolution_texture_sampling = zone->high_resolution_sampling;
+
+    std::vector<std::array<float, 3>> component_colors;
+    component_colors.reserve(component_ids.size());
+    bool missing_component_color = false;
+    for (const unsigned int id : component_ids) {
+        if (id < 1 || id > m_config.filament_colour.values.size()) {
+            if (raw_texture_mapping_mode)
+                component_colors.push_back({ 0.f, 0.f, 0.f });
+            else
+                missing_component_color = true;
+            continue;
+        }
+        ColorRGB decoded;
+        if (!decode_color(m_config.filament_colour.get_at(size_t(id - 1)), decoded)) {
+            if (raw_texture_mapping_mode)
+                component_colors.push_back({ 0.f, 0.f, 0.f });
+            else
+                missing_component_color = true;
+            continue;
+        }
+        component_colors.push_back({ decoded.r(), decoded.g(), decoded.b() });
+    }
+    if (missing_component_color || component_colors.size() != component_ids.size() || component_colors.empty())
+        return std::nullopt;
+
+    std::ostringstream component_key_stream;
+    for (size_t idx = 0; idx < component_ids.size(); ++idx) {
+        if (idx > 0)
+            component_key_stream << '/';
+        component_key_stream << component_ids[idx];
+    }
+    component_key_stream << (raw_texture_mapping_mode ? "|raw" : "|blend");
+    component_key_stream << "|fc" << texture_filament_color_mode;
+    component_key_stream << "|fs" << (texture_force_sequential_filaments ? 1 : 0);
+    component_key_stream << "|gl" << generic_solver_lookup_mode;
+    component_key_stream << "|gm" << generic_solver_mode;
+    component_key_stream << "|lf" << (use_legacy_fixed_color_mode ? 1 : 0);
+    component_key_stream << "|ct" << int(std::lround(texture_contrast_pct));
+    component_key_stream << "|tg" << int(std::lround(texture_tone_gamma * 100.f));
+    component_key_stream << "|hr" << (high_resolution_texture_sampling ? 1 : 0);
+    const std::string component_key_prefix = component_key_stream.str();
+
+    struct SeamLayerTextureState {
+        const Layer *layer { nullptr };
+        float        layer_height_mm { 0.f };
+        unsigned int active_component_id { 0 };
+        size_t       active_component_idx { size_t(-1) };
+        const VertexColorOverhangWeightField *weight_field { nullptr };
+        float        active_component_strength_factor { 1.f };
+        float        active_component_minimum_offset_factor { 0.f };
+        float        signed_fade_factor { 1.f };
+        float        fade_factor { 1.f };
+    };
+
+    auto texture_state_for_layer = [&](const Layer *layer,
+                                       unsigned int active_component_override) -> std::optional<SeamLayerTextureState> {
+        if (layer == nullptr)
+            return std::nullopt;
+
+        const int layer_index = int(layer->id());
+        const float layer_height_mm = std::max(0.01f, float(layer->height));
+        const float z_progress = object_layer_count > 1 ?
+            std::clamp(float(layer_index) / float(object_layer_count - 1), 0.f, 1.f) :
+            0.f;
+        const unsigned int active_component_id = active_component_override != 0 ?
+            active_component_override :
+            texture_mgr.resolve_zone_component(texture_zone_id, num_physical, layer_index);
+        const auto active_component_it = std::find(component_ids.begin(), component_ids.end(), active_component_id);
+        if (active_component_it == component_ids.end())
+            return std::nullopt;
+
+        std::ostringstream layer_key_stream;
+        layer_key_stream << component_key_prefix << "|seamL" << layer->id();
+        const auto cache_key = std::make_tuple(layer_object, texture_zone_id, layer_key_stream.str());
+        auto cache_it = m_vertex_color_overhang_weight_field_cache.find(cache_key);
+        if (cache_it == m_vertex_color_overhang_weight_field_cache.end()) {
+            const float layer_sample_falloff_mm = high_resolution_texture_sampling ?
+                std::max(0.03f, layer_height_mm * 0.5f) :
+                std::max(0.12f, layer_height_mm * 1.5f);
+            cache_it = m_vertex_color_overhang_weight_field_cache
+                           .emplace(cache_key,
+                                    build_vertex_color_weight_field_for_gcode(*layer_object,
+                                                                              component_colors,
+                                                                              raw_texture_mapping_mode,
+                                                                              texture_filament_color_mode,
+                                                                              texture_force_sequential_filaments,
+                                                                              generic_solver_lookup_mode,
+                                                                              generic_solver_mode,
+                                                                              use_legacy_fixed_color_mode,
+                                                                              &m_generic_solver_mix_candidate_cache,
+                                                                              texture_contrast_pct,
+                                                                              texture_tone_gamma,
+                                                                              true,
+                                                                              float(layer->print_z),
+                                                                              layer_sample_falloff_mm,
+                                                                              high_resolution_texture_sampling))
+                           .first;
+        }
+        const VertexColorOverhangWeightField &weight_field = cache_it->second;
+        if (weight_field.empty())
+            return std::nullopt;
+
+        const float signed_fade_factor =
+            offset_fade_factor_for_gcode(zone->offset_fade_mode, z_progress);
+        const float fade_factor = std::abs(signed_fade_factor);
+        if (fade_factor <= EPSILON)
+            return std::nullopt;
+
+        return SeamLayerTextureState{
+            layer,
+            layer_height_mm,
+            active_component_id,
+            size_t(active_component_it - component_ids.begin()),
+            &weight_field,
+            overhang_filament_strength_factor_for_gcode(*zone, active_component_id),
+            overhang_filament_minimum_offset_factor_for_gcode(*zone, active_component_id),
+            signed_fade_factor,
+            fade_factor
+        };
+    };
+
+    const unsigned int current_component_id = unsigned(m_writer.filament()->id() + 1);
+    const std::optional<SeamLayerTextureState> current_state = texture_state_for_layer(m_layer, current_component_id);
+    const std::optional<SeamLayerTextureState> upper_state = texture_state_for_layer(upper_layer, 0);
+    if (!current_state || !upper_state)
+        return std::nullopt;
+
+    std::vector<float> reference_nozzles;
+    reference_nozzles.reserve(component_ids.size() + 2);
+    auto append_nozzle = [&reference_nozzles, this](unsigned int component_id) {
+        if (component_id == 0)
+            return;
+        const size_t idx = size_t(component_id - 1);
+        if (idx < m_config.nozzle_diameter.values.size())
+            reference_nozzles.emplace_back(float(m_config.nozzle_diameter.get_at(idx)));
+    };
+    for (unsigned int id : component_ids)
+        append_nozzle(id);
+    append_nozzle(zone->component_a);
+    append_nozzle(zone->component_b);
+
+    const float reference_nozzle = reference_nozzles.empty() ?
+        float(m_config.nozzle_diameter.values.empty() ? 0.4 : m_config.nozzle_diameter.values.front()) :
+        std::accumulate(reference_nozzles.begin(), reference_nozzles.end(), 0.f) / float(reference_nozzles.size());
+    const float max_allowed_distance_mm = TextureMappingManager::max_component_surface_offset_mm(reference_nozzle);
+    if (max_allowed_distance_mm <= EPSILON)
+        return std::nullopt;
+
+    const float global_strength_factor =
+        std::clamp(float(m_config.texture_mapping_outer_wall_gradient_global_strength.value) / 100.f, 0.f, 1.f);
+    const float texture_sagging_ratio =
+        std::isfinite(zone->sagging_ratio) ? std::clamp(zone->sagging_ratio, 0.f, 6.f) : 0.f;
+    if (global_strength_factor <= EPSILON)
+        return std::nullopt;
+
+    struct SeamCandidate {
+        Point  point;
+        float  score_mm { 0.f };
+        double length_mm { 0.0 };
+    };
+
+    std::vector<SeamCandidate> candidates;
+    double total_length_mm = 0.0;
+    float best_score_mm = -1.f;
+    float min_score_mm = std::numeric_limits<float>::max();
+    Point best_point;
+    const Point object_center = layer_object->bounding_box().center();
+
+    for (const ExtrusionPath &path : loop.paths) {
+        if (!is_external_perimeter(path.role()) || path.polyline.points.size() < 2)
+            continue;
+
+        const float base_outer_width_mm = std::max(
+            0.05f,
+            float(m_config.texture_mapping_outer_wall_gradient_max_line_width.value));
+
+        auto exterior_inset_for_state = [&](const SeamLayerTextureState &state,
+                                            float                        mid_x_mm,
+                                            float                        mid_y_mm) {
+            const float layer_height_mm = std::max(
+                0.01f,
+                path.height > EPSILON ? path.height : state.layer_height_mm);
+            const float config_min_gradient_width_mm = std::clamp(
+                float(m_config.texture_mapping_outer_wall_gradient_min_line_width.value),
+                0.05f,
+                base_outer_width_mm);
+            const float min_width_for_positive_spacing_mm =
+                layer_height_mm * float(1. - 0.25 * PI) + 1e-4f;
+            const float safe_min_gradient_width_mm = std::clamp(
+                std::max(config_min_gradient_width_mm, min_width_for_positive_spacing_mm),
+                0.05f,
+                base_outer_width_mm);
+            const float max_width_delta_mm = std::max(0.f, base_outer_width_mm - safe_min_gradient_width_mm);
+            const float effective_max_width_delta_mm = max_width_delta_mm * global_strength_factor;
+            float max_width_delta_limit_mm = std::min(effective_max_width_delta_mm, 2.f * max_allowed_distance_mm);
+            if (texture_sagging_ratio > EPSILON)
+                max_width_delta_limit_mm = std::min(max_width_delta_limit_mm,
+                                                    layer_height_mm * texture_sagging_ratio);
+            if (!std::isfinite(max_width_delta_limit_mm) || max_width_delta_limit_mm <= EPSILON)
+                return 0.f;
+
+            const float desired_strength =
+                sample_vertex_color_weight_field_for_gcode(*state.weight_field,
+                                                           mid_x_mm,
+                                                           mid_y_mm,
+                                                           state.active_component_idx,
+                                                           high_resolution_texture_sampling,
+                                                           compact_offset_mode);
+            const float inset_strength = std::clamp((1.f - desired_strength) * state.fade_factor, 0.f, 1.f);
+            const float variable_width_delta_mm =
+                variable_width_delta_for_overhang_range_for_gcode(inset_strength,
+                                                                  max_width_delta_limit_mm,
+                                                                  state.active_component_minimum_offset_factor,
+                                                                  state.active_component_strength_factor);
+            const float width_delta_mm = std::clamp(variable_width_delta_mm, 0.f, max_width_delta_limit_mm);
+            if (!std::isfinite(width_delta_mm))
+                return std::numeric_limits<float>::quiet_NaN();
+
+            return state.signed_fade_factor >= 0.f ? width_delta_mm : 0.f;
+        };
+
+        const Points &points = path.polyline.points;
+        for (size_t point_idx = 1; point_idx < points.size(); ++point_idx) {
+            const Point &a = points[point_idx - 1];
+            const Point &b = points[point_idx];
+            const float ax_mm = unscale<float>(a.x());
+            const float ay_mm = unscale<float>(a.y());
+            const float bx_mm = unscale<float>(b.x());
+            const float by_mm = unscale<float>(b.y());
+            const double len_mm = std::hypot(double(bx_mm - ax_mm), double(by_mm - ay_mm));
+            if (len_mm <= EPSILON)
+                continue;
+
+            const float mid_x_mm = 0.5f * (ax_mm + bx_mm);
+            const float mid_y_mm = 0.5f * (ay_mm + by_mm);
+            const float current_inset_mm = exterior_inset_for_state(*current_state, mid_x_mm, mid_y_mm);
+            const float upper_inset_mm = exterior_inset_for_state(*upper_state, mid_x_mm, mid_y_mm);
+            if (!std::isfinite(current_inset_mm) || !std::isfinite(upper_inset_mm))
+                continue;
+
+            const Point mid_point(coord_t(std::llround(0.5 * (double(a.x()) + double(b.x())))),
+                                  coord_t(std::llround(0.5 * (double(a.y()) + double(b.y())))));
+            const double dx_scaled = double(b.x()) - double(a.x());
+            const double dy_scaled = double(b.y()) - double(a.y());
+            const double len_scaled = std::hypot(dx_scaled, dy_scaled);
+            if (len_scaled <= EPSILON)
+                continue;
+
+            double outward_x = 0.0;
+            double outward_y = 0.0;
+            resolve_segment_shift_outward_normal_for_gcode(m_layer,
+                                                           mid_point,
+                                                           dx_scaled,
+                                                           dy_scaled,
+                                                           len_scaled,
+                                                           double(mid_point.x()) - double(object_center.x()),
+                                                           double(mid_point.y()) - double(object_center.y()),
+                                                           outward_x,
+                                                           outward_y);
+
+            const double half_width_scaled = scale_(0.5 * double(base_outer_width_mm));
+            const Point current_base_edge(
+                coord_t(std::llround(double(mid_point.x()) + outward_x * half_width_scaled)),
+                coord_t(std::llround(double(mid_point.y()) + outward_y * half_width_scaled)));
+
+            Point upper_base_edge;
+            if (!find_nearest_layer_slice_boundary_point_for_gcode(upper_layer, current_base_edge, upper_base_edge))
+                continue;
+
+            const double edge_delta_x = double(upper_base_edge.x()) - double(current_base_edge.x());
+            const double edge_delta_y = double(upper_base_edge.y()) - double(current_base_edge.y());
+            const double edge_distance_scaled = std::hypot(edge_delta_x, edge_delta_y);
+            const double edge_normal_delta_scaled = edge_delta_x * outward_x + edge_delta_y * outward_y;
+            const double edge_tangent_delta_scaled_sq =
+                std::max(0.0, edge_distance_scaled * edge_distance_scaled - edge_normal_delta_scaled * edge_normal_delta_scaled);
+            const float edge_tangent_delta_mm = unscale<float>(std::sqrt(edge_tangent_delta_scaled_sq));
+            const float max_local_edge_tangent_delta_mm = std::max(1.0f, base_outer_width_mm * 2.f);
+            if (!std::isfinite(edge_tangent_delta_mm) || edge_tangent_delta_mm > max_local_edge_tangent_delta_mm)
+                continue;
+
+            const float base_edge_cover_mm = unscale<float>(edge_normal_delta_scaled);
+            if (!std::isfinite(base_edge_cover_mm))
+                continue;
+            const float max_local_edge_normal_delta_mm =
+                std::max(2.0f, base_outer_width_mm * 4.f + 2.f * max_allowed_distance_mm);
+            if (std::abs(base_edge_cover_mm) > max_local_edge_normal_delta_mm)
+                continue;
+
+            const float texture_cover_delta_mm = current_inset_mm - upper_inset_mm;
+            const float actual_cover_mm = base_edge_cover_mm + texture_cover_delta_mm;
+            const float score_mm =
+                texture_cover_delta_mm > 0.005f && actual_cover_mm > 0.005f ? actual_cover_mm : 0.f;
+
+            candidates.push_back({ mid_point, score_mm, len_mm });
+            total_length_mm += len_mm;
+            min_score_mm = std::min(min_score_mm, score_mm);
+            if (score_mm > best_score_mm) {
+                best_score_mm = score_mm;
+                best_point = mid_point;
+            }
+        }
+    }
+
+    if (candidates.empty() || total_length_mm <= EPSILON || best_score_mm <= 0.f || !std::isfinite(best_score_mm))
+        return std::nullopt;
+
+    const float score_range_mm = best_score_mm - min_score_mm;
+    const float useful_score_mm = std::max(0.015f, best_score_mm * 0.35f);
+    const float required_range_mm = std::max(0.01f, best_score_mm * 0.2f);
+    if (best_score_mm < useful_score_mm || score_range_mm < required_range_mm)
+        return std::nullopt;
+
+    const float strong_score_mm = std::max(useful_score_mm, best_score_mm * 0.65f);
+    double strong_length_mm = 0.0;
+    for (const SeamCandidate &candidate : candidates)
+        if (candidate.score_mm >= strong_score_mm)
+            strong_length_mm += candidate.length_mm;
+
+    if (strong_length_mm / total_length_mm < 0.12)
+        return std::nullopt;
+
+    return best_point;
 }
 
 std::string GCode::extrude_loop(ExtrusionLoop loop, std::string description, double speed, const ExtrusionEntitiesPtr& region_perimeters, const Point* start_point)
@@ -7588,7 +8146,13 @@ std::string GCode::extrude_loop(ExtrusionLoop loop, std::string description, dou
     float seam_overhang = std::numeric_limits<float>::lowest();
     if (!m_config.spiral_mode && description == "perimeter") {
         assert(m_layer != nullptr);
-        m_seam_placer.place_seam(m_layer, loop, last_pos, seam_overhang);
+        if (std::optional<Point> texture_hidden_seam = texture_mapping_seam_hiding_point(loop)) {
+            seam_overhang = 0.f;
+            if (!loop.split_at_vertex(*texture_hidden_seam, scaled<double>(0.0015)))
+                loop.split_at(*texture_hidden_seam, true);
+        } else {
+            m_seam_placer.place_seam(m_layer, loop, last_pos, seam_overhang);
+        }
     } else
         loop.split_at(last_pos, false);
 
@@ -8352,6 +8916,10 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                             const int generic_solver_lookup_mode = std::clamp(zone->generic_solver_lookup_mode,
                                                                               int(TextureMappingZone::GenericSolverClosestMix),
                                                                               int(TextureMappingZone::GenericSolverBlendClosestTwo));
+                            const int generic_solver_mode = std::clamp(zone->generic_solver_mode,
+                                                                       int(TextureMappingZone::GenericSolverLegacy),
+                                                                       int(TextureMappingZone::GenericSolverV2));
+                            const bool use_legacy_fixed_color_mode = zone->use_legacy_fixed_color_mode;
                             const float texture_contrast_pct = std::clamp(zone->contrast_pct, 25.f, 300.f);
                             const float texture_tone_gamma =
                                 (!std::isfinite(zone->tone_gamma) || zone->tone_gamma <= 0.f) ?
@@ -8397,6 +8965,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                     component_key_stream << "|fc" << texture_filament_color_mode;
                                     component_key_stream << "|fs" << (texture_force_sequential_filaments ? 1 : 0);
                                     component_key_stream << "|gl" << generic_solver_lookup_mode;
+                                    component_key_stream << "|gm" << generic_solver_mode;
+                                    component_key_stream << "|lf" << (use_legacy_fixed_color_mode ? 1 : 0);
                                     component_key_stream << "|ct" << int(std::lround(texture_contrast_pct));
                                     component_key_stream << "|tg" << int(std::lround(texture_tone_gamma * 100.f));
                                     component_key_stream << "|hr" << (high_resolution_texture_sampling ? 1 : 0);
@@ -8413,6 +8983,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                                                                                          texture_filament_color_mode,
                                                                                                          texture_force_sequential_filaments,
                                                                                                          generic_solver_lookup_mode,
+                                                                                                         generic_solver_mode,
+                                                                                                         use_legacy_fixed_color_mode,
                                                                                                          generic_mix_candidate_cache,
                                                                                                          texture_contrast_pct,
                                                                                                          texture_tone_gamma,

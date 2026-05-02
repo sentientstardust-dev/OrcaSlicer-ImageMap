@@ -953,7 +953,9 @@ public:
                                         bool seam_hiding,
                                         bool nonlinear_offset_adjustment,
                                         bool compact_offset_mode,
+                                        bool use_legacy_fixed_color_mode,
                                         int generic_solver_lookup_mode,
+                                        int generic_solver_mode,
                                         const TextureMappingGlobalSettings &global_settings,
                                         const TextureMappingPrimeTowerImage &prime_tower_image,
                                         const TextureMappingPrimeTowerImage &prime_tower_image_back,
@@ -1119,6 +1121,20 @@ public:
         m_compact_offset_mode_checkbox->SetToolTip(
             _L("Normalizes sampled filament offsets so the strongest active color uses the full maximum line width."));
         experimental_box->Add(m_compact_offset_mode_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        m_use_legacy_fixed_color_mode_checkbox = new wxCheckBox(experimental_page, wxID_ANY, _L("Use legacy fixed color mode"));
+        m_use_legacy_fixed_color_mode_checkbox->SetValue(use_legacy_fixed_color_mode);
+        experimental_box->Add(m_use_legacy_fixed_color_mode_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        auto *generic_solver_mode_row = new wxBoxSizer(wxHORIZONTAL);
+        generic_solver_mode_row->Add(new wxStaticText(experimental_page, wxID_ANY, _L("Generic solver")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        wxArrayString generic_solver_mode_choices;
+        generic_solver_mode_choices.Add(_L("Legacy RGB"));
+        generic_solver_mode_choices.Add(_L("V2 Oklab"));
+        m_generic_solver_mode_choice = new wxChoice(experimental_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, generic_solver_mode_choices);
+        m_generic_solver_mode_choice->SetSelection(std::clamp(generic_solver_mode,
+                                                              int(TextureMappingZone::GenericSolverLegacy),
+                                                              int(TextureMappingZone::GenericSolverV2)));
+        generic_solver_mode_row->Add(m_generic_solver_mode_choice, 1, wxALIGN_CENTER_VERTICAL);
+        experimental_box->Add(generic_solver_mode_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
         auto *generic_solver_row = new wxBoxSizer(wxHORIZONTAL);
         generic_solver_row->Add(new wxStaticText(experimental_page, wxID_ANY, _L("Generic solver lookup")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         wxArrayString generic_solver_choices;
@@ -1262,6 +1278,7 @@ public:
     bool seam_hiding() const { return m_seam_hiding_checkbox && m_seam_hiding_checkbox->GetValue(); }
     bool nonlinear_offset_adjustment() const { return m_nonlinear_offset_adjustment_checkbox && m_nonlinear_offset_adjustment_checkbox->GetValue(); }
     bool compact_offset_mode() const { return m_compact_offset_mode_checkbox && m_compact_offset_mode_checkbox->GetValue(); }
+    bool use_legacy_fixed_color_mode() const { return m_use_legacy_fixed_color_mode_checkbox && m_use_legacy_fixed_color_mode_checkbox->GetValue(); }
     int generic_solver_lookup_mode() const
     {
         return m_generic_solver_lookup_choice ?
@@ -1269,6 +1286,15 @@ public:
                        int(TextureMappingZone::GenericSolverClosestMix),
                        int(TextureMappingZone::GenericSolverBlendClosestTwo)) :
             int(TextureMappingZone::GenericSolverClosestMix);
+    }
+
+    int generic_solver_mode() const
+    {
+        return m_generic_solver_mode_choice ?
+            std::clamp(m_generic_solver_mode_choice->GetSelection(),
+                       int(TextureMappingZone::GenericSolverLegacy),
+                       int(TextureMappingZone::GenericSolverV2)) :
+            int(TextureMappingZone::GenericSolverV2);
     }
 
     TextureMappingGlobalSettings global_settings() const
@@ -1456,7 +1482,9 @@ private:
     wxCheckBox *m_seam_hiding_checkbox {nullptr};
     wxCheckBox *m_nonlinear_offset_adjustment_checkbox {nullptr};
     wxCheckBox *m_compact_offset_mode_checkbox {nullptr};
+    wxCheckBox *m_use_legacy_fixed_color_mode_checkbox {nullptr};
     wxChoice *m_generic_solver_lookup_choice {nullptr};
+    wxChoice *m_generic_solver_mode_choice {nullptr};
     wxCheckBox *m_prime_tower_mapping_enabled_checkbox {nullptr};
     wxStaticText *m_prime_tower_image_label {nullptr};
     wxStaticText *m_prime_tower_image_back_label {nullptr};
@@ -5103,6 +5131,27 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         return;
     }
 
+    auto is_preview_only_texture_row_change = [](const TextureMappingZone &before, const TextureMappingZone &after) {
+        TextureMappingZone before_gcode = before;
+        TextureMappingZone after_gcode = after;
+        before_gcode.preview_opacity_pct = TextureMappingZone::DefaultPreviewOpacityPct;
+        before_gcode.preview_simulate_colors = TextureMappingZone::DefaultPreviewSimulateColors;
+        before_gcode.preview_limit_resolution = TextureMappingZone::DefaultPreviewLimitResolution;
+        after_gcode.preview_opacity_pct = TextureMappingZone::DefaultPreviewOpacityPct;
+        after_gcode.preview_simulate_colors = TextureMappingZone::DefaultPreviewSimulateColors;
+        after_gcode.preview_limit_resolution = TextureMappingZone::DefaultPreviewLimitResolution;
+        return before != after && before_gcode == after_gcode;
+    };
+
+    auto refresh_texture_mapping_preview = [this]() {
+        if (p->plater == nullptr || p->plater->is_preview_shown())
+            return;
+        if (GLCanvas3D *canvas = p->plater->get_view3D_canvas3D())
+            canvas->reload_scene(true, true);
+        if (GLCanvas3D *canvas = p->plater->get_assmeble_canvas3D())
+            canvas->reload_scene(true, true);
+    };
+
     auto persist_rows = [mgr_ptr, set_config_string, notify_change]() {
         set_config_string("texture_mapping_definitions", mgr_ptr->serialize_entries());
         notify_change();
@@ -5178,14 +5227,20 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 swatch->set_data(parse_texture_mapping_color(zone.display_color), zone_id);
         };
 
-        auto apply_zone = [zone_index, mgr_ptr, num_physical, persist_rows, refresh_summary_preview](TextureMappingZone updated) {
+        auto apply_zone = [zone_index, mgr_ptr, num_physical, set_config_string, notify_change, refresh_texture_mapping_preview,
+                           is_preview_only_texture_row_change, refresh_summary_preview](TextureMappingZone updated) {
             auto &rows = mgr_ptr->zones();
             if (zone_index >= rows.size())
                 return;
+            const bool preview_only_change = is_preview_only_texture_row_change(rows[zone_index], updated);
             rows[zone_index] = std::move(updated);
             mgr_ptr->normalize_zone_ids(num_physical);
             refresh_summary_preview(rows[zone_index]);
-            persist_rows();
+            set_config_string("texture_mapping_definitions", mgr_ptr->serialize_entries());
+            if (preview_only_change)
+                refresh_texture_mapping_preview();
+            else
+                notify_change();
         };
 
         auto *surface_row = new wxBoxSizer(wxHORIZONTAL);
@@ -5368,7 +5423,9 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.seam_hiding,
                                                     updated.nonlinear_offset_adjustment,
                                                     updated.compact_offset_mode,
+                                                    updated.use_legacy_fixed_color_mode,
                                                     updated.generic_solver_lookup_mode,
+                                                    updated.generic_solver_mode,
                                                     bundle->texture_mapping_global_settings,
                                                     wxGetApp().model().texture_mapping_prime_tower_image,
                                                     wxGetApp().model().texture_mapping_prime_tower_image_back,
@@ -5388,11 +5445,18 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.seam_hiding = dlg.seam_hiding();
             updated.nonlinear_offset_adjustment = dlg.nonlinear_offset_adjustment();
             updated.compact_offset_mode = dlg.compact_offset_mode();
+            updated.use_legacy_fixed_color_mode = dlg.use_legacy_fixed_color_mode();
             updated.generic_solver_lookup_mode = dlg.generic_solver_lookup_mode();
-            bundle->texture_mapping_global_settings = dlg.global_settings();
+            updated.generic_solver_mode = dlg.generic_solver_mode();
+            const TextureMappingGlobalSettings dlg_global_settings = dlg.global_settings();
+            const bool global_settings_changed =
+                dlg_global_settings.serialize() != bundle->texture_mapping_global_settings.serialize();
+            if (global_settings_changed)
+                bundle->texture_mapping_global_settings = dlg_global_settings;
             wxGetApp().model().texture_mapping_prime_tower_image = dlg.prime_tower_image();
             wxGetApp().model().texture_mapping_prime_tower_image_back = dlg.prime_tower_image_back();
-            set_config_string("texture_mapping_global_settings", bundle->texture_mapping_global_settings.serialize());
+            if (global_settings_changed)
+                set_config_string("texture_mapping_global_settings", bundle->texture_mapping_global_settings.serialize());
             if (updated.filament_strengths_pct.size() < palette.size())
                 updated.filament_strengths_pct.resize(palette.size(), 100.f);
             const std::vector<float> dlg_strengths = dlg.component_strengths_pct();
@@ -5410,7 +5474,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             while (!updated.filament_minimum_offsets_pct.empty() && std::abs(updated.filament_minimum_offsets_pct.back()) <= 1e-6f)
                 updated.filament_minimum_offsets_pct.pop_back();
             apply_zone(std::move(updated));
-            if (p->plater != nullptr) {
+            if (p->plater != nullptr && !p->plater->is_preview_shown()) {
                 if (GLCanvas3D *canvas = p->plater->get_view3D_canvas3D())
                     canvas->reload_scene(true, true);
                 if (GLCanvas3D *canvas = p->plater->get_assmeble_canvas3D())
