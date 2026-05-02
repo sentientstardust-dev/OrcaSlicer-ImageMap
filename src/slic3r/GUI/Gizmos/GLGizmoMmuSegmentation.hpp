@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -63,7 +64,6 @@ public:
 
     // IDs of the Vertex Array Objects, into which the geometry has been loaded.
     // Zero if the VBOs are not sent to GPU yet.
-    unsigned int              vertices_VAO_id{ 0 };
     unsigned int              vertices_VBO_id{0};
     std::vector<unsigned int> triangle_indices_VBO_ids;
 };
@@ -78,11 +78,8 @@ public:
 
     void data_changed(bool is_serializing) override;
 
-    // TriangleSelector::serialization/deserialization has a limit to store 19 different states.
-    // EXTRUDER_LIMIT + 1 states are used to storing the painting because also uncolored triangles are stored.
-    // When increasing EXTRUDER_LIMIT, it needs to ensure that TriangleSelector::serialization/deserialization
-    // will be also extended to support additional states, requiring at least one state to remain free out of 19 states.
-    static const constexpr size_t EXTRUDERS_LIMIT = 16;
+    // Keep this in sync with the shared triangle-selector state range.
+    static const constexpr size_t EXTRUDERS_LIMIT = static_cast<size_t>(EnforcerBlockerType::ExtruderMax);
 
     const float get_cursor_radius_min() const override { return CursorRadiusMin; }
 
@@ -95,12 +92,17 @@ protected:
     ColorRGBA get_cursor_hover_color() const override;
     void on_set_state() override;
 
-    EnforcerBlockerType get_left_button_state_type() const override { return EnforcerBlockerType(m_selected_extruder_idx + 1); }
+    EnforcerBlockerType get_left_button_state_type() const override
+    {
+        if (m_selected_extruder_idx < m_display_filament_ids.size())
+            return EnforcerBlockerType(m_display_filament_ids[m_selected_extruder_idx]);
+        return EnforcerBlockerType::Extruder1;
+    }
     EnforcerBlockerType get_right_button_state_type() const override { return EnforcerBlockerType(-1); }
 
     void on_render_input_window(float x, float y, float bottom_limit) override;
     std::string on_get_name() const override;
-    void render_tooltip_button(float x, float y);
+    void show_tooltip_information(float caption_max, float x, float y);
     bool on_is_selectable() const override;
     bool on_is_activable() const override;
 
@@ -165,13 +167,6 @@ private:
     // This map holds all translated description texts, so they can be easily referenced during layout calculations
     // etc. When language changes, GUI is recreated and this class constructed again, so the change takes effect.
     std::map<std::string, wxString> m_desc;
-
-    // Contains all shortcuts in the format of {shortcut, description}, e.g. {alt + _L("Left mouse button"), _L("Part_selection")}
-    std::vector<std::pair<wxString, wxString>> m_shortcuts_brush;
-    // Contains all shortcuts in the format of {shortcut, description}, e.g. {alt + _L("Left mouse button"), _L("Part_selection")}
-    std::vector<std::pair<wxString, wxString>> m_shortcuts_bucket_fill;
-    // Contains all shortcuts in the format of {shortcut, description}, e.g. {alt + _L("Left mouse button"), _L("Part_selection")}
-    std::vector<std::pair<wxString, wxString>> m_shortcuts_gap_fill;
 };
 
 class GLGizmoTrueColorPainting : public GLGizmoPainterBase
@@ -225,6 +220,7 @@ private:
     void init_model_triangle_selectors();
     ModelObject *selected_model_object() const;
     void update_selected_object_color_state();
+    void open_color_data_management_dialog();
     bool selected_object_has_rgb_data() const;
     bool selected_object_has_imported_color_data() const;
     void initialize_selected_object_rgb_data();
@@ -232,6 +228,8 @@ private:
     void convert_selected_object_image_texture_to_rgb_data();
     void refresh_selected_object_after_rgb_change(ModelObject *object);
     void update_triangle_selectors_color();
+    bool record_brush_stroke_point(const Vec2d &mouse_position);
+    void clear_brush_stroke_points();
     bool pick_color_from_model(const Vec2d &mouse_position);
     bool sample_color_from_model(const Vec2d &mouse_position, ColorRGBA &color) const;
     void set_active_color_from_sample(const ColorRGBA &color);
@@ -277,7 +275,10 @@ private:
     bool                 m_selected_can_convert_vertex = false;
     bool                 m_selected_can_convert_image = false;
     bool                 m_color_picker_active = false;
+    bool                 m_brush_stroke_active = false;
     ObjectID             m_selected_color_state_object_id;
+    std::vector<std::vector<Vec3f>> m_brush_stroke_points_by_volume;
+    std::vector<std::unique_ptr<ColorFacetsAnnotation>> m_preview_rgb_data_by_volume;
     struct ColorPickerVolumeSourceCache
     {
         ObjectID volume_id;
@@ -328,6 +329,7 @@ private:
     bool ensure_overlay_texture();
     OverlayRect overlay_rect() const;
     ModelObject *selected_model_object() const;
+    void open_color_data_management_dialog();
     void update_default_projection_mode();
     ProjectionMode default_projection_mode() const;
     bool projection_mode_allowed(ProjectionMode mode) const;

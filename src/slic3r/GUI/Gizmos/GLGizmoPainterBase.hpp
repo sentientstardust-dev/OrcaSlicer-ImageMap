@@ -132,6 +132,7 @@ public:
     void set_none_state_rendered(bool rendered) { m_render_none_state = rendered; }
     void set_texture_preview_needed(bool needed) { m_texture_preview_needed = needed; }
     void set_texture_preview_opaque(bool opaque) { m_texture_preview_opaque = opaque; }
+    void set_texture_mapping_color_preview(const ColorFacetsAnnotation *preview) { m_texture_mapping_color_preview = preview; }
 
     constexpr static float GapAreaMin = 0.f;
     constexpr static float GapAreaMax = 5.f;
@@ -196,6 +197,7 @@ protected:
     mutable std::vector<GLModel> m_vertex_color_preview_models;
     std::vector<ColorRGBA>  m_vertex_color_preview_colors;
     std::vector<unsigned int> m_vertex_color_preview_filament_ids;
+    const ColorFacetsAnnotation *m_texture_mapping_color_preview { nullptr };
 
     bool                        m_filter_state = false;
     bool                        m_render_none_state = true;

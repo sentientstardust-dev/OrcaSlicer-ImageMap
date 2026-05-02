@@ -1685,7 +1685,18 @@ void TriangleSelectorPatch::update_render_data()
             const TextureMappingManager *texture_mgr = wxGetApp().preset_bundle != nullptr ?
                 &wxGetApp().preset_bundle->texture_mapping_zones : nullptr;
             m_texture_preview_visual_signature = texture_preview_settings_signature(num_physical, texture_mgr);
-            if (model_volume_has_texture_preview_data_for_painting(*m_model_volume)) {
+            if (m_texture_mapping_color_preview != nullptr && !m_texture_mapping_color_preview->empty()) {
+                build_mmu_vertex_color_preview_models(*m_model_volume,
+                                                      triangles_per_type,
+                                                      m_ebt_colors,
+                                                      m_model_volume->extruder_id() > 0 ? unsigned(m_model_volume->extruder_id()) : 0u,
+                                                      num_physical,
+                                                      texture_mgr,
+                                                      m_vertex_color_preview_models,
+                                                      m_vertex_color_preview_colors,
+                                                      m_vertex_color_preview_filament_ids,
+                                                      m_texture_mapping_color_preview);
+            } else if (model_volume_has_texture_preview_data_for_painting(*m_model_volume)) {
                 build_mmu_texture_preview_models(*m_model_volume,
                                                  triangles_per_type,
                                                  m_ebt_colors,

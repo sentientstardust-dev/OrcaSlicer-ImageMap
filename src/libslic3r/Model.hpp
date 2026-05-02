@@ -37,6 +37,7 @@
 #include <array>
 #include <algorithm>
 #include <functional>
+#include <initializer_list>
 #include <optional>
 
 namespace cereal {
@@ -867,6 +868,10 @@ public:
     void set_metadata_json(std::string metadata_json);
     bool empty() const { return m_data.triangles_to_split.empty(); }
     void reset();
+    static std::unique_ptr<ColorFacetsAnnotation> make_temporary()
+    {
+        return std::unique_ptr<ColorFacetsAnnotation>(new ColorFacetsAnnotation());
+    }
     void reserve(int n_triangles) { m_data.triangles_to_split.reserve(n_triangles); }
     void shrink_to_fit()
     {
@@ -903,6 +908,55 @@ private:
     }
 
     TriangleColorSplittingData m_data;
+};
+
+template<class T>
+class ModelVolumeImportedVector final : public ObjectBase, public std::vector<T>
+{
+public:
+    using std::vector<T>::vector;
+
+    ModelVolumeImportedVector() = default;
+    ModelVolumeImportedVector(const ModelVolumeImportedVector &rhs) = default;
+    ModelVolumeImportedVector(ModelVolumeImportedVector &&rhs) = default;
+    ModelVolumeImportedVector& operator=(const ModelVolumeImportedVector &rhs) = default;
+    ModelVolumeImportedVector& operator=(ModelVolumeImportedVector &&rhs) = default;
+
+    ModelVolumeImportedVector& operator=(const std::vector<T> &rhs)
+    {
+        this->as_vector() = rhs;
+        return *this;
+    }
+
+    ModelVolumeImportedVector& operator=(std::vector<T> &&rhs)
+    {
+        this->as_vector() = std::move(rhs);
+        return *this;
+    }
+
+    ModelVolumeImportedVector& operator=(std::initializer_list<T> rhs)
+    {
+        this->as_vector() = rhs;
+        return *this;
+    }
+
+private:
+    explicit ModelVolumeImportedVector(int) : ObjectBase(-1) {}
+
+    std::vector<T>& as_vector() { return static_cast<std::vector<T>&>(*this); }
+    const std::vector<T>& as_vector() const { return static_cast<const std::vector<T>&>(*this); }
+
+    friend class cereal::access;
+    friend class UndoRedo::StackImpl;
+    friend class ModelVolume;
+
+    template<class Archive> void save(Archive &ar) const { ar(as_vector()); }
+    template<class Archive> void load(Archive &ar)
+    {
+        std::vector<T> loaded;
+        ar(loaded);
+        this->as_vector().swap(loaded);
+    }
 };
 
 // An object STL, or a modifier volume, over which a different set of parameters shall be applied.
@@ -993,11 +1047,11 @@ public:
 
     ColorFacetsAnnotation texture_mapping_color_facets;
 
-    std::vector<uint32_t> imported_vertex_colors_rgba;
+    ModelVolumeImportedVector<uint32_t> imported_vertex_colors_rgba;
 
-    std::vector<float>   imported_texture_uvs_per_face;
-    std::vector<uint8_t> imported_texture_uv_valid;
-    std::vector<uint8_t> imported_texture_rgba;
+    ModelVolumeImportedVector<float>    imported_texture_uvs_per_face;
+    ModelVolumeImportedVector<uint8_t>  imported_texture_uv_valid;
+    ModelVolumeImportedVector<uint8_t>  imported_texture_rgba;
     uint32_t             imported_texture_width{0};
     uint32_t             imported_texture_height{0};
 
@@ -1128,6 +1182,10 @@ public:
         this->seam_facets.set_new_unique_id();
         this->mmu_segmentation_facets.set_new_unique_id();
         this->texture_mapping_color_facets.set_new_unique_id();
+        this->imported_vertex_colors_rgba.set_new_unique_id();
+        this->imported_texture_uvs_per_face.set_new_unique_id();
+        this->imported_texture_uv_valid.set_new_unique_id();
+        this->imported_texture_rgba.set_new_unique_id();
         this->fuzzy_skin_facets.set_new_unique_id();
     }
 
@@ -1311,7 +1369,7 @@ private:
 	friend class cereal::access;
 	friend class UndoRedo::StackImpl;
 	// Used for deserialization, therefore no IDs are allocated.
-	ModelVolume() : ObjectBase(-1), config(-1), supported_facets(-1), seam_facets(-1), mmu_segmentation_facets(-1), texture_mapping_color_facets(-1), fuzzy_skin_facets(-1), object(nullptr) {
+	ModelVolume() : ObjectBase(-1), config(-1), supported_facets(-1), seam_facets(-1), mmu_segmentation_facets(-1), texture_mapping_color_facets(-1), imported_vertex_colors_rgba(-1), imported_texture_uvs_per_face(-1), imported_texture_uv_valid(-1), imported_texture_rgba(-1), fuzzy_skin_facets(-1), object(nullptr) {
 		assert(this->id().invalid());
         assert(this->config.id().invalid());
         assert(this->supported_facets.id().invalid());
@@ -1339,8 +1397,11 @@ private:
         t = texture_mapping_color_facets.timestamp();
         cereal::load_by_value(ar, texture_mapping_color_facets);
         mesh_changed |= t != texture_mapping_color_facets.timestamp();
-        ar(imported_vertex_colors_rgba);
-        ar(imported_texture_uvs_per_face, imported_texture_uv_valid, imported_texture_rgba, imported_texture_width, imported_texture_height);
+        cereal::load_by_value(ar, imported_vertex_colors_rgba);
+        cereal::load_by_value(ar, imported_texture_uvs_per_face);
+        cereal::load_by_value(ar, imported_texture_uv_valid);
+        cereal::load_by_value(ar, imported_texture_rgba);
+        ar(imported_texture_width, imported_texture_height);
         cereal::load_by_value(ar, fuzzy_skin_facets);
         mesh_changed |= t != fuzzy_skin_facets.timestamp();
         cereal::load_by_value(ar, config);
@@ -1374,8 +1435,11 @@ private:
         cereal::save_by_value(ar, seam_facets);
         cereal::save_by_value(ar, mmu_segmentation_facets);
         cereal::save_by_value(ar, texture_mapping_color_facets);
-        ar(imported_vertex_colors_rgba);
-        ar(imported_texture_uvs_per_face, imported_texture_uv_valid, imported_texture_rgba, imported_texture_width, imported_texture_height);
+        cereal::save_by_value(ar, imported_vertex_colors_rgba);
+        cereal::save_by_value(ar, imported_texture_uvs_per_face);
+        cereal::save_by_value(ar, imported_texture_uv_valid);
+        cereal::save_by_value(ar, imported_texture_rgba);
+        ar(imported_texture_width, imported_texture_height);
         cereal::save_by_value(ar, fuzzy_skin_facets);
         cereal::save_by_value(ar, config);
         cereal::save(ar, text_configuration);
@@ -1952,6 +2016,8 @@ static const double SINKING_MIN_Z_THRESHOLD = 0.05;
 
 namespace cereal
 {
+    template <class Archive, class T>
+    struct specialize<Archive, Slic3r::ModelVolumeImportedVector<T>, cereal::specialization::member_load_save> {};
     template <class Archive> struct specialize<Archive, Slic3r::ModelVolume, cereal::specialization::member_load_save> {};
     // BBS: backup
     template <class Archive> struct specialize<Archive, Slic3r::Model, cereal::specialization::member_load_save> {};

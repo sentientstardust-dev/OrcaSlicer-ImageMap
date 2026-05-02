@@ -881,7 +881,7 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.reduce_outer_surface_texture = texture.value("reduce_outer_surface_texture", false);
         zone.seam_hiding = texture.value("hide_seams", false);
         zone.nonlinear_offset_adjustment = texture.value("nonlinear_offset_adjustment", false);
-        zone.compact_offset_mode = texture.value("compact_offset_mode", false);
+        zone.compact_offset_mode = texture.value("compact_offset_mode", TextureMappingZone::DefaultCompactOffsetMode);
         zone.contrast_pct = std::clamp(texture.value("contrast_pct", 100.f), 25.f, 300.f);
         zone.high_resolution_sampling = texture.value("high_resolution_sampling", true);
         zone.tone_gamma = normalize_tone_gamma(texture.value("tone_gamma", 1.f));

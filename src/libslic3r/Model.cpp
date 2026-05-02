@@ -3347,6 +3347,10 @@ void ModelVolume::assign_new_unique_ids_recursive()
     seam_facets.set_new_unique_id();
     mmu_segmentation_facets.set_new_unique_id();
     texture_mapping_color_facets.set_new_unique_id();
+    imported_vertex_colors_rgba.set_new_unique_id();
+    imported_texture_uvs_per_face.set_new_unique_id();
+    imported_texture_uv_valid.set_new_unique_id();
+    imported_texture_rgba.set_new_unique_id();
     fuzzy_skin_facets.set_new_unique_id();
 }
 

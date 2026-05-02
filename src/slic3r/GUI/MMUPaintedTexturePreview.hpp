@@ -36,7 +36,8 @@ bool build_mmu_vertex_color_preview_models(
     const Transform3d                                                    &world_matrix,
     std::vector<GUI::GLModel>                                            &out_models,
     std::vector<ColorRGBA>                                               &out_colors,
-    std::vector<unsigned int>                                            &out_filament_ids);
+    std::vector<unsigned int>                                            &out_filament_ids,
+    const ColorFacetsAnnotation                                          *texture_mapping_color_facets_override = nullptr);
 
 bool build_mmu_vertex_color_preview_models(
     const ModelVolume                                                    &model_volume,
@@ -47,7 +48,8 @@ bool build_mmu_vertex_color_preview_models(
     const TextureMappingManager                                          *texture_mgr,
     std::vector<GUI::GLModel>                                            &out_models,
     std::vector<ColorRGBA>                                               &out_colors,
-    std::vector<unsigned int>                                            &out_filament_ids);
+    std::vector<unsigned int>                                            &out_filament_ids,
+    const ColorFacetsAnnotation                                          *texture_mapping_color_facets_override = nullptr);
 
 size_t model_volume_texture_preview_signature(const ModelVolume &model_volume);
 size_t model_volume_texture_mapping_color_preview_signature(const ModelVolume &model_volume);

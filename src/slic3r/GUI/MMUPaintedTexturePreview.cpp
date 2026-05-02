@@ -1387,13 +1387,17 @@ bool build_texture_mapping_color_preview_model_for_state(
     const ModelVolume                                      &model_volume,
     const std::vector<TriangleSelector::FacetStateTriangle> &state_triangles,
     const TexturePreviewSimulationSettings                  *simulation_settings,
-    GUI::GLModel                                            &out_model)
+    GUI::GLModel                                            &out_model,
+    const ColorFacetsAnnotation                             *texture_mapping_color_facets_override = nullptr)
 {
-    if (!model_volume_has_texture_mapping_color_preview_data(model_volume) || state_triangles.empty())
+    const ColorFacetsAnnotation *color_source = texture_mapping_color_facets_override;
+    if (color_source == nullptr || color_source->empty())
+        color_source = &model_volume.texture_mapping_color_facets;
+    if (color_source == nullptr || color_source->empty() || state_triangles.empty())
         return false;
 
     std::vector<ColorFacetTriangle> color_facets;
-    model_volume.texture_mapping_color_facets.get_facet_triangles(model_volume, color_facets);
+    color_source->get_facet_triangles(model_volume, color_facets);
     if (color_facets.empty())
         return false;
 
@@ -2053,18 +2057,44 @@ bool build_mmu_vertex_color_preview_models(
     const Transform3d                                                    &world_matrix,
     std::vector<GUI::GLModel>                                            &out_models,
     std::vector<ColorRGBA>                                               &out_colors,
-    std::vector<unsigned int>                                            &out_filament_ids)
+    std::vector<unsigned int>                                            &out_filament_ids,
+    const ColorFacetsAnnotation                                          *texture_mapping_color_facets_override)
 {
     out_models.clear();
     out_colors.clear();
     out_filament_ids.clear();
+
+    const bool has_texture_mapping_color_override =
+        texture_mapping_color_facets_override != nullptr && !texture_mapping_color_facets_override->empty();
+    if (triangles_per_type.empty() || (texture_mgr == nullptr && !has_texture_mapping_color_override))
+        return false;
 
     const std::vector<std::string> physical_colors = physical_filament_colors_for_texture_preview(num_physical);
     bool built_any = false;
     for (size_t state_id = 0; state_id < triangles_per_type.size(); ++state_id) {
         const unsigned int filament_id = filament_id_for_state(state_id, base_filament_id);
         const TextureMappingZone *zone = zone_for_filament(filament_id, num_physical, texture_mgr);
-        if (zone == nullptr || (!is_image_zone(*zone) && !is_gradient_zone(*zone)))
+        if (zone == nullptr) {
+            if (!has_texture_mapping_color_override || state_id != 0)
+                continue;
+
+            GUI::GLModel model;
+            if (!build_texture_mapping_color_preview_model_for_state(model_volume,
+                                                                     triangles_per_type[state_id],
+                                                                     nullptr,
+                                                                     model,
+                                                                     texture_mapping_color_facets_override) ||
+                !model.is_initialized())
+                continue;
+
+            out_models.emplace_back(std::move(model));
+            out_colors.emplace_back(state_id < state_colors.size() ? state_colors[state_id] :
+                                    (state_colors.empty() ? ColorRGBA(0.15f, 0.65f, 0.6f, 1.f) : state_colors.back()));
+            out_filament_ids.emplace_back(0u);
+            built_any = true;
+            continue;
+        }
+        if (!is_image_zone(*zone) && !is_gradient_zone(*zone))
             continue;
 
         GUI::GLModel model;
@@ -2079,11 +2109,16 @@ bool build_mmu_vertex_color_preview_models(
                 texture_preview_simulation_settings_for_filament(filament_id, num_physical, texture_mgr, physical_colors);
             if (simulation_settings)
                 prepare_texture_preview_simulation_settings(*simulation_settings);
-            if (model_volume_has_texture_mapping_color_preview_data(model_volume)) {
+            const bool has_texture_mapping_color_preview =
+                has_texture_mapping_color_override || model_volume_has_texture_mapping_color_preview_data(model_volume);
+            if (has_texture_mapping_color_preview) {
+                const ColorFacetsAnnotation *preview_override =
+                    has_texture_mapping_color_override ? texture_mapping_color_facets_override : nullptr;
                 if (!build_texture_mapping_color_preview_model_for_state(model_volume,
                                                                          triangles_per_type[state_id],
                                                                          simulation_settings ? &*simulation_settings : nullptr,
-                                                                         model))
+                                                                         model,
+                                                                         preview_override))
                     continue;
             } else {
                 if (!build_vertex_color_preview_model_for_state(model_volume,
@@ -2112,7 +2147,8 @@ bool build_mmu_vertex_color_preview_models(
     const TextureMappingManager                                          *texture_mgr,
     std::vector<GUI::GLModel>                                            &out_models,
     std::vector<ColorRGBA>                                               &out_colors,
-    std::vector<unsigned int>                                            &out_filament_ids)
+    std::vector<unsigned int>                                            &out_filament_ids,
+    const ColorFacetsAnnotation                                          *texture_mapping_color_facets_override)
 {
     return build_mmu_vertex_color_preview_models(model_volume,
                                                  triangles_per_type,
@@ -2123,7 +2159,8 @@ bool build_mmu_vertex_color_preview_models(
                                                  Transform3d::Identity(),
                                                  out_models,
                                                  out_colors,
-                                                 out_filament_ids);
+                                                 out_filament_ids,
+                                                 texture_mapping_color_facets_override);
 }
 
 size_t model_volume_texture_preview_signature(const ModelVolume &model_volume)
@@ -2285,8 +2322,13 @@ void render_model_texture_preview_models(
     const size_t texture_signature = model_volume_texture_preview_signature(model_volume);
     GLuint bound_texture_id = 0;
     for (size_t idx = 0; idx < models.size(); ++idx) {
-        const float mix = texture_preview_mix_for_filament(filament_ids[idx], num_physical, texture_mgr);
-        const bool invalid = texture_preview_settings_invalid_for_filament(filament_ids[idx], num_physical, texture_mgr);
+        const bool raw_vertex_color_preview = filament_ids[idx] == 0;
+        const float mix = raw_vertex_color_preview ?
+            1.f :
+            texture_preview_mix_for_filament(filament_ids[idx], num_physical, texture_mgr);
+        const bool invalid = raw_vertex_color_preview ?
+            false :
+            texture_preview_settings_invalid_for_filament(filament_ids[idx], num_physical, texture_mgr);
         if (mix <= 0.f && !invalid)
             continue;
 

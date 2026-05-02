@@ -70,7 +70,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultReduceOuterSurfaceTexture = false;
     static constexpr bool  DefaultSeamHiding = false;
     static constexpr bool  DefaultNonlinearOffsetAdjustment = false;
-    static constexpr bool  DefaultCompactOffsetMode = false;
+    static constexpr bool  DefaultCompactOffsetMode = true;
     static constexpr float DefaultContrastPct = 100.f;
     static constexpr bool  DefaultHighResolutionSampling = true;
     static constexpr float DefaultToneGamma = 1.f;
