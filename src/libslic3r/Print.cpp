@@ -3376,9 +3376,23 @@ void Print::_make_wipe_tower()
         texture.enabled = true;
         texture.generic_fallback_for_missing_channels = auto_mode;
         texture.angle_offset_deg = m_texture_mapping_global_settings.angle_offset_deg;
-        texture.global_strength = std::clamp(float(m_config.texture_mapping_outer_wall_gradient_global_strength.value) / 100.f, 0.f, 1.f);
-        texture.max_line_width = std::max(0.05f, float(m_config.texture_mapping_outer_wall_gradient_max_line_width.value));
-        texture.min_line_width = std::max(0.05f, float(m_config.texture_mapping_outer_wall_gradient_min_line_width.value));
+        float texture_global_strength_pct = float(m_default_region_config.texture_mapping_outer_wall_gradient_global_strength.value);
+        float texture_max_line_width = float(m_default_region_config.texture_mapping_outer_wall_gradient_max_line_width.value);
+        float texture_min_line_width = float(m_default_region_config.texture_mapping_outer_wall_gradient_min_line_width.value);
+        for (const PrintRegion *region : m_print_regions) {
+            if (region == nullptr)
+                continue;
+            const PrintRegionConfig &region_config = region->config();
+            texture_global_strength_pct = std::max(texture_global_strength_pct,
+                                                   float(region_config.texture_mapping_outer_wall_gradient_global_strength.value));
+            texture_max_line_width = std::max(texture_max_line_width,
+                                              float(region_config.texture_mapping_outer_wall_gradient_max_line_width.value));
+            texture_min_line_width = std::min(texture_min_line_width,
+                                              float(region_config.texture_mapping_outer_wall_gradient_min_line_width.value));
+        }
+        texture.global_strength = std::clamp(texture_global_strength_pct / 100.f, 0.f, 1.f);
+        texture.max_line_width = std::max(0.05f, texture_max_line_width);
+        texture.min_line_width = std::max(0.05f, texture_min_line_width);
         texture.image_rgba = m_texture_mapping_prime_tower_image.rgba;
         texture.image_width = m_texture_mapping_prime_tower_image.width;
         texture.image_height = m_texture_mapping_prime_tower_image.height;

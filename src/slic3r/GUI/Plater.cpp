@@ -5393,7 +5393,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             apply_zone(std::move(updated));
             update_texture_mapping_panel(false);
         });
-        advanced_btn->Bind(wxEVT_BUTTON, [this, zone_index, mgr_ptr, palette, apply_zone](wxCommandEvent &) {
+        advanced_btn->Bind(wxEVT_BUTTON, [this, zone_index, mgr_ptr, palette, apply_zone, bundle, set_config_string](wxCommandEvent &) {
             if (zone_index >= mgr_ptr->zones().size())
                 return;
             TextureMappingZone updated = mgr_ptr->zones()[zone_index];

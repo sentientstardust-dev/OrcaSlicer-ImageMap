@@ -52,6 +52,11 @@ static inline void show_notification_extruders_limit_exceeded()
                                            "first %1% filaments will be available in painting tool."), GLGizmoMmuSegmentation::EXTRUDERS_LIMIT));
 }
 
+static std::vector<ColorRGBA> get_extruders_colors()
+{
+    return wxGetApp().plater() != nullptr ? wxGetApp().plater()->get_extruders_colors() : std::vector<ColorRGBA>{};
+}
+
 void GLGizmoMmuSegmentation::on_opening()
 {
     if (get_extruders_colors().size() > GLGizmoMmuSegmentation::EXTRUDERS_LIMIT)
@@ -80,21 +85,6 @@ bool GLGizmoMmuSegmentation::on_is_activable() const
     const Selection& selection = m_parent.get_selection();
     return !selection.is_empty() && (selection.is_single_full_instance() || selection.is_any_volume()) && wxGetApp().filaments_cnt() > 1;
 }
-
-//BBS: use the global one in 3DScene.cpp
-/*static std::vector<ColorRGBA> get_extruders_colors()
-{
-    unsigned char                     rgb_color[3] = {};
-    std::vector<std::string>          colors       = Slic3r::GUI::wxGetApp().plater()->get_extruder_colors_from_plater_config();
-    std::vector<ColorRGBA> colors_out(colors.size());
-    for (const std::string &color : colors) {
-        Slic3r::GUI::BitmapCache::parse_color(color, rgb_color);
-        size_t color_idx      = &color - &colors.front();
-        colors_out[color_idx] = {float(rgb_color[0]) / 255.f, float(rgb_color[1]) / 255.f, float(rgb_color[2]) / 255.f, 1.f};
-    }
-
-    return colors_out;
-}*/
 
 static std::vector<int> get_extruder_id_for_volumes(const ModelObject &model_object)
 {
@@ -4158,8 +4148,18 @@ static bool convert_object_to_color_regions(ModelObject &object, const ManagedCo
     std::vector<unsigned char> filament_ids;
     unsigned char first_extruder_id = 1;
     const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config();
-    ObjColorDialog color_dlg(parent, input_colors, is_single_color, extruder_colours, filament_ids, first_extruder_id);
-    if (color_dlg.ShowModal() != wxID_OK || filament_ids.size() != input_colors.size())
+    ObjDialogInOut in_out;
+    in_out.input_colors = input_colors;
+    in_out.is_single_color = is_single_color;
+    in_out.filament_ids = filament_ids;
+    in_out.first_extruder_id = first_extruder_id;
+    in_out.deal_vertex_color = true;
+    ObjColorDialog color_dlg(parent, in_out, extruder_colours);
+    if (color_dlg.ShowModal() != wxID_OK)
+        return false;
+    filament_ids = in_out.filament_ids;
+    first_extruder_id = in_out.first_extruder_id;
+    if (filament_ids.size() != input_colors.size())
         return false;
 
     Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Create 3mf color regions", UndoRedo::SnapshotType::GizmoAction);
@@ -5419,9 +5419,17 @@ void GLGizmoMmuSegmentation::open_obj_vertex_color_mapping_dialog()
     std::vector<unsigned char> filament_ids;
     unsigned char first_extruder_id = 1;
     const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config();
-    ObjColorDialog color_dlg(nullptr, input_colors, is_single_color, extruder_colours, filament_ids, first_extruder_id);
+    ObjDialogInOut in_out;
+    in_out.input_colors = input_colors;
+    in_out.is_single_color = is_single_color;
+    in_out.filament_ids = filament_ids;
+    in_out.first_extruder_id = first_extruder_id;
+    in_out.deal_vertex_color = true;
+    ObjColorDialog color_dlg(nullptr, in_out, extruder_colours);
     if (color_dlg.ShowModal() != wxID_OK)
         return;
+    filament_ids = in_out.filament_ids;
+    first_extruder_id = in_out.first_extruder_id;
     if (filament_ids.empty())
         return;
 

@@ -116,7 +116,7 @@ struct TexturePreviewSimulationCacheEntry
     std::future<TexturePreviewSimulationResult> pending_future;
 };
 
-bool model_volume_has_texture_preview_data(const ModelVolume &model_volume)
+bool model_volume_has_texture_preview_data_impl(const ModelVolume &model_volume)
 {
     return !model_volume.imported_texture_rgba.empty() &&
            model_volume.imported_texture_width > 0 &&
@@ -127,13 +127,13 @@ bool model_volume_has_texture_preview_data(const ModelVolume &model_volume)
                size_t(model_volume.imported_texture_width) * size_t(model_volume.imported_texture_height) * 4;
 }
 
-bool model_volume_has_vertex_color_preview_data(const ModelVolume &model_volume)
+bool model_volume_has_vertex_color_preview_data_impl(const ModelVolume &model_volume)
 {
     return !model_volume.imported_vertex_colors_rgba.empty() &&
            model_volume.imported_vertex_colors_rgba.size() == model_volume.mesh().its.vertices.size();
 }
 
-bool model_volume_has_texture_mapping_color_preview_data(const ModelVolume &model_volume)
+bool model_volume_has_texture_mapping_color_preview_data_impl(const ModelVolume &model_volume)
 {
     return !model_volume.texture_mapping_color_facets.empty();
 }
@@ -2424,6 +2424,21 @@ void set_common_uniforms(GLShaderProgram &shader,
 }
 
 } // namespace
+
+bool model_volume_has_texture_preview_data(const ModelVolume &model_volume)
+{
+    return model_volume_has_texture_preview_data_impl(model_volume);
+}
+
+bool model_volume_has_vertex_color_preview_data(const ModelVolume &model_volume)
+{
+    return model_volume_has_vertex_color_preview_data_impl(model_volume);
+}
+
+bool model_volume_has_texture_mapping_color_preview_data(const ModelVolume &model_volume)
+{
+    return model_volume_has_texture_mapping_color_preview_data_impl(model_volume);
+}
 
 bool texture_preview_simulation_is_pending()
 {
