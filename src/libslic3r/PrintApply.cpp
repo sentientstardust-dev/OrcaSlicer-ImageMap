@@ -80,6 +80,12 @@ static inline void model_volume_list_copy_configs(ModelObject &model_object_dst,
         mv_dst.mmu_segmentation_facets.assign(mv_src.mmu_segmentation_facets);
         assert(mv_dst.texture_mapping_color_facets.id() == mv_src.texture_mapping_color_facets.id());
         mv_dst.texture_mapping_color_facets.assign(mv_src.texture_mapping_color_facets);
+        mv_dst.imported_vertex_colors_rgba = mv_src.imported_vertex_colors_rgba;
+        mv_dst.imported_texture_uvs_per_face = mv_src.imported_texture_uvs_per_face;
+        mv_dst.imported_texture_uv_valid = mv_src.imported_texture_uv_valid;
+        mv_dst.imported_texture_rgba = mv_src.imported_texture_rgba;
+        mv_dst.imported_texture_width = mv_src.imported_texture_width;
+        mv_dst.imported_texture_height = mv_src.imported_texture_height;
         assert(mv_dst.fuzzy_skin_facets.id() == mv_src.fuzzy_skin_facets.id());
         mv_dst.fuzzy_skin_facets.assign(mv_src.fuzzy_skin_facets);
         //FIXME what to do with the materials?

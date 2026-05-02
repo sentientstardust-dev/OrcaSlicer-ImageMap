@@ -4307,6 +4307,78 @@ static void color_facets_append_sampled_triangle(TriangleColorSplittingData     
     data.colors_rgba.emplace_back(cc);
 }
 
+static bool color_facets_append_existing_or_sampled_triangle(
+    const TriangleColorSplittingData                &old_data,
+    TriangleColorSplittingData                      &new_data,
+    const TextureMappingColorSampler                &sampler,
+    const TextureMappingColorLeafResamplePredicate  &resample_leaf,
+    size_t                                           source_triangle,
+    int                                              bitstream_end,
+    size_t                                           color_end,
+    int                                             &bit_idx,
+    size_t                                          &color_idx,
+    const std::array<Vec3f, 3>                      &vertices,
+    const std::array<Vec3f, 3>                      &barycentrics,
+    int                                              depth,
+    int                                              min_depth,
+    int                                              max_depth,
+    float                                            split_color_threshold)
+{
+    if (bit_idx + 3 >= bitstream_end)
+        return false;
+
+    int code = 0;
+    for (int bit = 0; bit < 4; ++bit)
+        code |= int(old_data.bitstream[size_t(bit_idx++)]) << bit;
+
+    const int split_sides = code & 0b11;
+    if (split_sides == 0) {
+        if (color_idx >= color_end || color_idx >= old_data.colors_rgba.size())
+            return false;
+
+        const uint32_t rgba = old_data.colors_rgba[color_idx++];
+        if (resample_leaf && resample_leaf(source_triangle, vertices, barycentrics, rgba)) {
+            color_facets_append_sampled_triangle(new_data,
+                                                 sampler,
+                                                 source_triangle,
+                                                 vertices,
+                                                 barycentrics,
+                                                 depth,
+                                                 min_depth,
+                                                 max_depth,
+                                                 split_color_threshold);
+        } else {
+            color_facets_append_nibble(new_data.bitstream, 0u);
+            new_data.colors_rgba.emplace_back(rgba);
+        }
+        return true;
+    }
+
+    const int special_side = (code >> 2) & 0b11;
+    color_facets_append_nibble(new_data.bitstream, unsigned(code));
+    const std::array<std::array<Vec3f, 3>, 4> child_vertices = color_facets_split_triangle(vertices, split_sides, special_side);
+    const std::array<std::array<Vec3f, 3>, 4> child_barycentrics = color_facets_split_triangle(barycentrics, split_sides, special_side);
+    for (int child_idx = split_sides; child_idx >= 0; --child_idx) {
+        if (!color_facets_append_existing_or_sampled_triangle(old_data,
+                                                              new_data,
+                                                              sampler,
+                                                              resample_leaf,
+                                                              source_triangle,
+                                                              bitstream_end,
+                                                              color_end,
+                                                              bit_idx,
+                                                              color_idx,
+                                                              child_vertices[size_t(child_idx)],
+                                                              child_barycentrics[size_t(child_idx)],
+                                                              depth + 1,
+                                                              min_depth,
+                                                              max_depth,
+                                                              split_color_threshold))
+            return false;
+    }
+    return true;
+}
+
 static void color_facets_extract_triangle(const TriangleColorSplittingData &data,
                                           int                               bitstream_end,
                                           size_t                            color_end,
@@ -4445,12 +4517,18 @@ bool ColorFacetsAnnotation::set_from_triangle_sampler(const ModelVolume         
                                                       const TextureMappingColorSampler &sampler,
                                                       int                               max_depth,
                                                       float                             split_color_threshold,
-                                                      const TextureMappingColorSubdivisionDepths &subdivision_depths)
+                                                      const TextureMappingColorSubdivisionDepths &subdivision_depths,
+                                                      const std::vector<bool> *resample_triangles,
+                                                      const TextureMappingColorLeafResamplePredicate &resample_leaf)
 {
     TriangleColorSplittingData new_data;
     new_data.metadata_json = m_data.metadata_json;
     const indexed_triangle_set &its = mv.mesh().its;
     new_data.triangles_to_split.reserve(its.indices.size());
+    if (resample_triangles != nullptr) {
+        new_data.bitstream.reserve(m_data.bitstream.size());
+        new_data.colors_rgba.reserve(m_data.colors_rgba.size());
+    }
 
     const std::array<Vec3f, 3> root_barycentrics = {
         Vec3f(1.f, 0.f, 0.f),
@@ -4460,6 +4538,60 @@ bool ColorFacetsAnnotation::set_from_triangle_sampler(const ModelVolume         
 
     max_depth = std::clamp(max_depth, 0, 7);
     split_color_threshold = std::max(split_color_threshold, 0.f);
+
+    size_t preserved_mapping_idx = 0;
+    auto existing_triangle_range = [this, &preserved_mapping_idx](size_t tri_idx,
+                                                                  int &bitstream_start,
+                                                                  int &bitstream_end,
+                                                                  int &color_start,
+                                                                  size_t &color_end) {
+        while (preserved_mapping_idx < m_data.triangles_to_split.size() &&
+               m_data.triangles_to_split[preserved_mapping_idx].triangle_idx < int(tri_idx))
+            ++preserved_mapping_idx;
+
+        if (preserved_mapping_idx >= m_data.triangles_to_split.size() ||
+            m_data.triangles_to_split[preserved_mapping_idx].triangle_idx != int(tri_idx))
+            return false;
+
+        const auto mapping_it = m_data.triangles_to_split.begin() + preserved_mapping_idx;
+        const auto next_it = std::next(mapping_it);
+        bitstream_start = mapping_it->bitstream_start_idx;
+        bitstream_end = next_it == m_data.triangles_to_split.end() ?
+            int(m_data.bitstream.size()) :
+            next_it->bitstream_start_idx;
+        color_start = mapping_it->color_start_idx;
+        color_end = next_it == m_data.triangles_to_split.end() ?
+            m_data.colors_rgba.size() :
+            size_t(next_it->color_start_idx);
+
+        if (bitstream_start < 0 ||
+            bitstream_start >= bitstream_end ||
+            size_t(bitstream_end) > m_data.bitstream.size() ||
+            color_start < 0 ||
+            size_t(color_start) >= color_end ||
+            color_end > m_data.colors_rgba.size())
+            return false;
+
+        return true;
+    };
+
+    auto append_preserved_triangle = [this, &new_data, &existing_triangle_range](size_t tri_idx) {
+        int bitstream_start = 0;
+        int bitstream_end = 0;
+        int color_start = 0;
+        size_t color_end = 0;
+        if (!existing_triangle_range(tri_idx, bitstream_start, bitstream_end, color_start, color_end))
+            return false;
+
+        new_data.triangles_to_split.emplace_back(int(tri_idx), int(new_data.bitstream.size()), int(new_data.colors_rgba.size()));
+        new_data.bitstream.insert(new_data.bitstream.end(),
+                                  m_data.bitstream.begin() + bitstream_start,
+                                  m_data.bitstream.begin() + bitstream_end);
+        new_data.colors_rgba.insert(new_data.colors_rgba.end(),
+                                    m_data.colors_rgba.begin() + color_start,
+                                    m_data.colors_rgba.begin() + color_end);
+        return true;
+    };
 
     for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
         const auto &tri = its.indices[tri_idx];
@@ -4476,6 +4608,16 @@ bool ColorFacetsAnnotation::set_from_triangle_sampler(const ModelVolume         
             its.vertices[size_t(tri[2])].cast<float>()
         };
 
+        const bool should_resample_triangle =
+            resample_triangles == nullptr ||
+            tri_idx >= resample_triangles->size() ||
+            (*resample_triangles)[tri_idx];
+        if (resample_triangles != nullptr &&
+            tri_idx < resample_triangles->size() &&
+            !(*resample_triangles)[tri_idx] &&
+            append_preserved_triangle(tri_idx))
+            continue;
+
         int triangle_min_depth = 0;
         int triangle_max_depth = max_depth;
         if (subdivision_depths) {
@@ -4487,6 +4629,36 @@ bool ColorFacetsAnnotation::set_from_triangle_sampler(const ModelVolume         
         }
 
         new_data.triangles_to_split.emplace_back(int(tri_idx), int(new_data.bitstream.size()), int(new_data.colors_rgba.size()));
+        if (resample_leaf && should_resample_triangle) {
+            int bitstream_start = 0;
+            int bitstream_end = 0;
+            int color_start = 0;
+            size_t color_end = 0;
+            if (existing_triangle_range(tri_idx, bitstream_start, bitstream_end, color_start, color_end)) {
+                int bit_idx = bitstream_start;
+                size_t color_idx = size_t(color_start);
+                const size_t new_bitstream_start = new_data.bitstream.size();
+                const size_t new_color_start = new_data.colors_rgba.size();
+                if (color_facets_append_existing_or_sampled_triangle(m_data,
+                                                                     new_data,
+                                                                     sampler,
+                                                                     resample_leaf,
+                                                                     tri_idx,
+                                                                     bitstream_end,
+                                                                     color_end,
+                                                                     bit_idx,
+                                                                     color_idx,
+                                                                     vertices,
+                                                                     root_barycentrics,
+                                                                     0,
+                                                                     triangle_min_depth,
+                                                                     triangle_max_depth,
+                                                                     split_color_threshold))
+                    continue;
+                new_data.bitstream.resize(new_bitstream_start);
+                new_data.colors_rgba.resize(new_color_start);
+            }
+        }
         color_facets_append_sampled_triangle(new_data,
                                              sampler,
                                              tri_idx,
@@ -4666,12 +4838,29 @@ bool model_mmu_segmentation_data_changed(const ModelObject& mo, const ModelObjec
         });
 }
 
+template<class T>
+static bool model_volume_imported_vector_matches(const ModelVolumeImportedVector<T> &lhs, const ModelVolumeImportedVector<T> &rhs)
+{
+    return lhs.size() == rhs.size() && std::equal(lhs.begin(), lhs.end(), rhs.begin());
+}
+
+static bool model_volume_texture_mapping_data_matches(const ModelVolume &mv_old, const ModelVolume &mv_new)
+{
+    return mv_old.texture_mapping_color_facets.timestamp_matches(mv_new.texture_mapping_color_facets) &&
+           model_volume_imported_vector_matches(mv_old.imported_vertex_colors_rgba, mv_new.imported_vertex_colors_rgba) &&
+           model_volume_imported_vector_matches(mv_old.imported_texture_uvs_per_face, mv_new.imported_texture_uvs_per_face) &&
+           model_volume_imported_vector_matches(mv_old.imported_texture_uv_valid, mv_new.imported_texture_uv_valid) &&
+           model_volume_imported_vector_matches(mv_old.imported_texture_rgba, mv_new.imported_texture_rgba) &&
+           mv_old.imported_texture_width == mv_new.imported_texture_width &&
+           mv_old.imported_texture_height == mv_new.imported_texture_height;
+}
+
 bool model_texture_mapping_color_data_changed(const ModelObject& mo, const ModelObject& mo_new)
 {
     return model_property_changed(mo, mo_new,
         [](const ModelVolumeType t) { return t == ModelVolumeType::MODEL_PART; },
         [](const ModelVolume &mv_old, const ModelVolume &mv_new) {
-            return mv_old.texture_mapping_color_facets.timestamp_matches(mv_new.texture_mapping_color_facets);
+            return model_volume_texture_mapping_data_matches(mv_old, mv_new);
         });
 }
 

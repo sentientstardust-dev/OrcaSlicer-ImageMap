@@ -846,6 +846,8 @@ struct ColorFacetTriangle
 
 using TextureMappingColorSampler = std::function<uint32_t(size_t, const Vec3f &, const Vec3f &)>;
 using TextureMappingColorSubdivisionDepths = std::function<std::pair<int, int>(size_t, const std::array<Vec3f, 3> &)>;
+using TextureMappingColorLeafResamplePredicate =
+    std::function<bool(size_t, const std::array<Vec3f, 3> &, const std::array<Vec3f, 3> &, uint32_t)>;
 
 class ColorFacetsAnnotation final : public ObjectWithTimestamp {
 public:
@@ -886,7 +888,9 @@ public:
                                    const TextureMappingColorSampler &sampler,
                                    int max_depth = 2,
                                    float split_color_threshold = 0.045f,
-                                   const TextureMappingColorSubdivisionDepths &subdivision_depths = {});
+                                   const TextureMappingColorSubdivisionDepths &subdivision_depths = {},
+                                   const std::vector<bool> *resample_triangles = nullptr,
+                                   const TextureMappingColorLeafResamplePredicate &resample_leaf = {});
     void get_facet_triangles(const ModelVolume &mv, std::vector<ColorFacetTriangle> &facets) const;
 
 private:

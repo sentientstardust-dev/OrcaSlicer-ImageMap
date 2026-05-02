@@ -706,6 +706,36 @@ static float distance_between_segments(const Vec3f &p1, const Vec3f &q1, const V
     return (p1 + d1 * s - (p2 + d2 * t)).norm();
 }
 
+static bool rgb_point_in_triangle(const Vec3f &point, const std::array<Vec3f, 3> &triangle)
+{
+    Vec3f weights = Vec3f::Zero();
+    const float tolerance = -1e-4f;
+    return barycentric_weights_for_region_vertex_colors(point, triangle[0], triangle[1], triangle[2], weights) &&
+           weights.x() >= tolerance &&
+           weights.y() >= tolerance &&
+           weights.z() >= tolerance;
+}
+
+static bool rgb_triangles_overlap(const std::array<Vec3f, 3> &lhs, const std::array<Vec3f, 3> &rhs)
+{
+    for (const Vec3f &point : lhs)
+        if (rgb_point_in_triangle(point, rhs))
+            return true;
+    for (const Vec3f &point : rhs)
+        if (rgb_point_in_triangle(point, lhs))
+            return true;
+
+    const float edge_tolerance = 1e-4f;
+    for (size_t lhs_idx = 0; lhs_idx < 3; ++lhs_idx)
+        for (size_t rhs_idx = 0; rhs_idx < 3; ++rhs_idx)
+            if (distance_between_segments(lhs[lhs_idx],
+                                          lhs[(lhs_idx + 1) % 3],
+                                          rhs[rhs_idx],
+                                          rhs[(rhs_idx + 1) % 3]) <= edge_tolerance)
+                return true;
+    return false;
+}
+
 static Vec3f transform_point(const Transform3d &matrix, const Vec3f &point)
 {
     return (matrix * point.cast<double>()).cast<float>();
@@ -963,27 +993,43 @@ static std::vector<bool> rgb_brush_candidate_source_triangles(
     return candidates;
 }
 
-static int rgb_leaf_count_depth(size_t leaf_count)
+static int rgb_color_tree_max_depth(const TriangleColorSplittingData &data, int bitstream_end, int &bit_idx, int depth)
 {
-    int depth = 0;
-    size_t depth_leaf_count = 1;
-    while (depth_leaf_count < leaf_count && depth < 7) {
-        depth_leaf_count *= 4;
-        ++depth;
-    }
-    return depth;
+    if (bit_idx + 3 >= bitstream_end)
+        return std::clamp(depth, 0, 7);
+
+    int code = 0;
+    for (int bit = 0; bit < 4; ++bit)
+        code |= int(data.bitstream[size_t(bit_idx++)]) << bit;
+
+    const int split_sides = code & 0b11;
+    if (split_sides == 0)
+        return std::clamp(depth, 0, 7);
+
+    int max_depth = std::clamp(depth + 1, 0, 7);
+    for (int child_idx = split_sides; child_idx >= 0; --child_idx)
+        max_depth = std::max(max_depth, rgb_color_tree_max_depth(data, bitstream_end, bit_idx, depth + 1));
+    return std::clamp(max_depth, 0, 7);
 }
 
-static std::vector<int> rgb_existing_source_triangle_depths(const std::vector<ColorFacetTriangle> &facets, size_t triangle_count)
+static std::vector<int> rgb_existing_source_triangle_depths(const TriangleColorSplittingData &data, size_t triangle_count)
 {
-    std::vector<size_t> leaf_counts(triangle_count, 0);
-    for (const ColorFacetTriangle &facet : facets)
-        if (facet.source_triangle >= 0 && size_t(facet.source_triangle) < leaf_counts.size())
-            ++leaf_counts[size_t(facet.source_triangle)];
-
     std::vector<int> depths(triangle_count, 0);
-    for (size_t tri_idx = 0; tri_idx < leaf_counts.size(); ++tri_idx)
-        depths[tri_idx] = rgb_leaf_count_depth(leaf_counts[tri_idx]);
+    for (auto mapping_it = data.triangles_to_split.begin(); mapping_it != data.triangles_to_split.end(); ++mapping_it) {
+        if (mapping_it->triangle_idx < 0 || size_t(mapping_it->triangle_idx) >= depths.size())
+            continue;
+
+        const auto next_it = std::next(mapping_it);
+        const int bitstream_start = mapping_it->bitstream_start_idx;
+        const int bitstream_end = next_it == data.triangles_to_split.end() ?
+            int(data.bitstream.size()) :
+            next_it->bitstream_start_idx;
+        if (bitstream_start < 0 || bitstream_start >= bitstream_end || size_t(bitstream_end) > data.bitstream.size())
+            continue;
+
+        int bit_idx = bitstream_start;
+        depths[size_t(mapping_it->triangle_idx)] = rgb_color_tree_max_depth(data, bitstream_end, bit_idx, 0);
+    }
     return depths;
 }
 
@@ -1076,7 +1122,7 @@ static bool apply_rgb_stroke_to_volume(ModelVolume                              
     const int safe_max_depth = texture_mapping_depth_for_budget(volume.mesh().its.indices.size(), 7, 1800000);
     const float brush_subdivision_target = true_color_brush_subdivision_target(brush_radius);
     const std::vector<int> existing_source_triangle_depths =
-        rgb_existing_source_triangle_depths(existing_facets, volume.mesh().its.indices.size());
+        rgb_existing_source_triangle_depths(volume.texture_mapping_color_facets.get_data(), volume.mesh().its.indices.size());
     TextureMappingColorSubdivisionDepths subdivision_depths =
         [mesh_span,
          safe_max_depth,
@@ -1103,7 +1149,49 @@ static bool apply_rgb_stroke_to_volume(ModelVolume                              
         return std::make_pair(min_depth, max_depth);
     };
 
-    return volume.texture_mapping_color_facets.set_from_triangle_sampler(volume, sampler, safe_max_depth, 0.012f, subdivision_depths);
+    TextureMappingColorLeafResamplePredicate resample_leaf =
+        [opacity,
+         brush_radius,
+         use_brush_path,
+         &brush_stroke_points_world,
+         &world_matrix,
+         &stroke_by_source_triangle,
+         &stroke_facets](size_t tri_idx, const std::array<Vec3f, 3> &vertices, const std::array<Vec3f, 3> &, uint32_t) {
+        if (opacity <= 0.f || brush_radius <= EPSILON)
+            return false;
+
+        if (use_brush_path) {
+            const std::array<Vec3f, 3> world_vertices = transform_triangle(world_matrix, vertices);
+            for (size_t point_idx = 0; point_idx < brush_stroke_points_world.size(); ++point_idx) {
+                const Vec3f segment_a = brush_stroke_points_world[point_idx];
+                const Vec3f segment_b = point_idx + 1 < brush_stroke_points_world.size() ?
+                    brush_stroke_points_world[point_idx + 1] :
+                    brush_stroke_points_world[point_idx];
+                if (triangle_intersects_brush_segment(world_vertices, segment_a, segment_b, brush_radius))
+                    return true;
+            }
+            return false;
+        }
+
+        auto found = stroke_by_source_triangle.find(int(tri_idx));
+        if (found == stroke_by_source_triangle.end())
+            return false;
+        for (const size_t facet_idx : found->second) {
+            if (facet_idx >= stroke_facets.size())
+                continue;
+            if (rgb_triangles_overlap(vertices, stroke_facets[facet_idx].vertices))
+                return true;
+        }
+        return false;
+    };
+
+    return volume.texture_mapping_color_facets.set_from_triangle_sampler(volume,
+                                                                         sampler,
+                                                                         safe_max_depth,
+                                                                         0.012f,
+                                                                         subdivision_depths,
+                                                                         &brush_candidate_triangles,
+                                                                         resample_leaf);
 }
 
 static bool build_volume_rgb_data(const ModelVolume &volume, const ColorRGBA &background, ColorFacetsAnnotation &out)
@@ -6228,7 +6316,7 @@ bool GLGizmoImageProjection::project_to_vertex_colors(ModelObject *object)
     const OverlayRect rect = overlay_rect();
 
     ProjectionContext context;
-    context.view_projection = (camera.get_projection_matrix() * camera.get_view_matrix()).matrix();
+    context.view_projection = camera.get_projection_matrix().matrix() * camera.get_view_matrix().matrix();
     context.canvas_width = std::max(1, viewport[2]);
     context.canvas_height = std::max(1, viewport[3]);
     context.overlay_left = rect.left;
@@ -6355,7 +6443,7 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
     const OverlayRect rect = overlay_rect();
 
     ProjectionContext context;
-    context.view_projection = (camera.get_projection_matrix() * camera.get_view_matrix()).matrix();
+    context.view_projection = camera.get_projection_matrix().matrix() * camera.get_view_matrix().matrix();
     context.canvas_width = std::max(1, viewport[2]);
     context.canvas_height = std::max(1, viewport[3]);
     context.overlay_left = rect.left;
@@ -6522,7 +6610,7 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
     const OverlayRect rect = overlay_rect();
 
     ProjectionContext context;
-    context.view_projection = (camera.get_projection_matrix() * camera.get_view_matrix()).matrix();
+    context.view_projection = camera.get_projection_matrix().matrix() * camera.get_view_matrix().matrix();
     context.canvas_width = std::max(1, viewport[2]);
     context.canvas_height = std::max(1, viewport[3]);
     context.overlay_left = rect.left;
