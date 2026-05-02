@@ -6503,29 +6503,52 @@ static std::array<Vec2f, 3> unwrap_triangle_uvs_for_sampling_for_gcode(const Vec
     std::array<Vec2f, 3> out { uv0, uv1, uv2 };
 
     auto unwrap_axis = [&out](bool use_u_axis) {
-        float values[3] = {
+        std::array<float, 3> values = {
             use_u_axis ? out[0].x() : out[0].y(),
             use_u_axis ? out[1].x() : out[1].y(),
             use_u_axis ? out[2].x() : out[2].y()
         };
-        const float v_min = std::min({ values[0], values[1], values[2] });
-        const float v_max = std::max({ values[0], values[1], values[2] });
-        if (v_max - v_min <= 0.5f)
+
+        if (!std::all_of(values.begin(), values.end(), [](float value) { return std::isfinite(value); }))
             return;
 
-        for (size_t i = 0; i < 3; ++i) {
-            if (values[i] < 0.5f)
-                values[i] += 1.f;
+        auto span = [](const std::array<float, 3> &v) {
+            return std::max({ v[0], v[1], v[2] }) - std::min({ v[0], v[1], v[2] });
+        };
+
+        const bool has_repeat_evidence = std::any_of(values.begin(), values.end(), [](float value) {
+            constexpr float eps = 1e-6f;
+            return value < -eps || value > 1.f + eps;
+        });
+        const float original_span = span(values);
+        if (!has_repeat_evidence || original_span <= 0.5f)
+            return;
+
+        std::array<float, 3> best = values;
+        float best_span = original_span;
+        for (size_t anchor = 0; anchor < values.size(); ++anchor) {
+            std::array<float, 3> candidate = values;
+            for (size_t i = 0; i < candidate.size(); ++i) {
+                const float delta = values[i] - values[anchor];
+                candidate[i] = values[anchor] + delta - std::round(delta);
+            }
+            const float candidate_span = span(candidate);
+            if (candidate_span + 1e-6f < best_span) {
+                best = candidate;
+                best_span = candidate_span;
+            }
         }
+        if (best_span >= original_span - 1e-6f)
+            return;
 
         if (use_u_axis) {
-            out[0].x() = values[0];
-            out[1].x() = values[1];
-            out[2].x() = values[2];
+            out[0].x() = best[0];
+            out[1].x() = best[1];
+            out[2].x() = best[2];
         } else {
-            out[0].y() = values[0];
-            out[1].y() = values[1];
-            out[2].y() = values[2];
+            out[0].y() = best[0];
+            out[1].y() = best[1];
+            out[2].y() = best[2];
         }
     };
 
@@ -6789,10 +6812,127 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
         samples.push_back({ x_mm, y_mm, rgba, sample_weight });
     };
 
+    struct LayerPlaneSamplePoint {
+        Vec3d p;
+        Vec3f barycentric;
+    };
+
+    auto accumulate_layer_plane_triangle_samples = [&](const Vec3d &p0,
+                                                       const Vec3d &p1,
+                                                       const Vec3d &p2,
+                                                       const auto  &sample_rgba_for_barycentric) {
+        if (!use_layer_weighting)
+            return false;
+
+        const float z0 = float(p0.z());
+        const float z1 = float(p1.z());
+        const float z2 = float(p2.z());
+        if (!std::isfinite(z0) || !std::isfinite(z1) || !std::isfinite(z2))
+            return false;
+
+        const float min_z = std::min({ z0, z1, z2 });
+        const float max_z = std::max({ z0, z1, z2 });
+        const float z_eps = std::max(1e-5f, safe_layer_z_falloff_mm * 1e-4f);
+        if (layer_z_mm < min_z - z_eps || layer_z_mm > max_z + z_eps || max_z - min_z <= z_eps)
+            return false;
+
+        const std::array<Vec3d, 3> vertices = { p0, p1, p2 };
+        const std::array<Vec3f, 3> barycentrics = {
+            Vec3f(1.f, 0.f, 0.f),
+            Vec3f(0.f, 1.f, 0.f),
+            Vec3f(0.f, 0.f, 1.f)
+        };
+        const std::array<float, 3> zs = { z0, z1, z2 };
+        std::vector<LayerPlaneSamplePoint> layer_points;
+        layer_points.reserve(3);
+
+        auto add_layer_point = [&layer_points](const Vec3d &p, const Vec3f &barycentric) {
+            if (!p.allFinite() || !barycentric.allFinite())
+                return;
+            for (const LayerPlaneSamplePoint &existing : layer_points)
+                if ((existing.p - p).squaredNorm() <= 1e-10)
+                    return;
+            layer_points.push_back({ p, barycentric });
+        };
+
+        const std::array<std::pair<size_t, size_t>, 3> edges = {
+            std::make_pair(size_t(0), size_t(1)),
+            std::make_pair(size_t(1), size_t(2)),
+            std::make_pair(size_t(2), size_t(0))
+        };
+        for (const auto &edge : edges) {
+            const size_t a = edge.first;
+            const size_t b = edge.second;
+            const float da = zs[a] - layer_z_mm;
+            const float db = zs[b] - layer_z_mm;
+            const bool a_on_layer = std::abs(da) <= z_eps;
+            const bool b_on_layer = std::abs(db) <= z_eps;
+
+            if (a_on_layer)
+                add_layer_point(vertices[a], barycentrics[a]);
+            if (b_on_layer)
+                add_layer_point(vertices[b], barycentrics[b]);
+            if (a_on_layer || b_on_layer)
+                continue;
+            if ((da < 0.f && db > 0.f) || (da > 0.f && db < 0.f)) {
+                const float t = (layer_z_mm - zs[a]) / (zs[b] - zs[a]);
+                if (!std::isfinite(t) || t < -1e-4f || t > 1.f + 1e-4f)
+                    continue;
+                const float clamped_t = std::clamp(t, 0.f, 1.f);
+                add_layer_point(vertices[a] * double(1.f - clamped_t) + vertices[b] * double(clamped_t),
+                                barycentrics[a] * (1.f - clamped_t) + barycentrics[b] * clamped_t);
+            }
+        }
+
+        if (layer_points.size() < 2)
+            return false;
+
+        size_t best_a = 0;
+        size_t best_b = 1;
+        double best_length_sq = 0.0;
+        for (size_t i = 0; i + 1 < layer_points.size(); ++i) {
+            for (size_t j = i + 1; j < layer_points.size(); ++j) {
+                const double length_sq = (layer_points[i].p - layer_points[j].p).squaredNorm();
+                if (length_sq > best_length_sq) {
+                    best_a = i;
+                    best_b = j;
+                    best_length_sq = length_sq;
+                }
+            }
+        }
+
+        const double segment_length_mm = std::sqrt(best_length_sq);
+        if (!std::isfinite(segment_length_mm) || segment_length_mm <= EPSILON)
+            return false;
+
+        const float sample_pitch_mm = high_resolution_texture_sampling ? 0.08f : 0.16f;
+        const int sample_count = std::clamp(int(std::ceil(segment_length_mm / std::max(float(EPSILON), sample_pitch_mm))), 1, 2000);
+        const float sample_weight = std::max(0.05f, float(segment_length_mm) / float(sample_count));
+        for (int sample_idx = 0; sample_idx < sample_count; ++sample_idx) {
+            const float t = (float(sample_idx) + 0.5f) / float(sample_count);
+            Vec3f barycentric = layer_points[best_a].barycentric * (1.f - t) + layer_points[best_b].barycentric * t;
+            barycentric.x() = std::max(0.f, barycentric.x());
+            barycentric.y() = std::max(0.f, barycentric.y());
+            barycentric.z() = std::max(0.f, barycentric.z());
+            const float barycentric_sum = barycentric.x() + barycentric.y() + barycentric.z();
+            if (!std::isfinite(barycentric_sum) || barycentric_sum <= EPSILON)
+                continue;
+            barycentric /= barycentric_sum;
+
+            const Vec3d world_pos = p0 * double(barycentric.x()) + p1 * double(barycentric.y()) + p2 * double(barycentric.z());
+            accumulate_sample(float(world_pos.x()), float(world_pos.y()), sample_rgba_for_barycentric(barycentric), sample_weight);
+        }
+
+        return true;
+    };
+
     auto accumulate_constant_surface_triangle_samples = [&](const Vec3d &p0,
                                                             const Vec3d &p1,
                                                             const Vec3d &p2,
                                                             const std::array<float, 4> &rgba) {
+        if (accumulate_layer_plane_triangle_samples(p0, p1, p2, [&rgba](const Vec3f &) { return rgba; }))
+            return;
+
         const float max_world_edge_mm = std::max({
             float((p1 - p0).norm()),
             float((p2 - p1).norm()),
@@ -6914,6 +7054,21 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                 if (!uv0.allFinite() || !uv1.allFinite() || !uv2.allFinite())
                     continue;
                 const std::array<Vec2f, 3> tri_uv = unwrap_triangle_uvs_for_sampling_for_gcode(uv0, uv1, uv2);
+
+                auto sample_rgba_for_barycentric = [&](const Vec3f &barycentric) {
+                    const Vec2f uv = tri_uv[0] * barycentric.x() + tri_uv[1] * barycentric.y() + tri_uv[2] * barycentric.z();
+                    std::array<float, 4> rgba = sample_texture_rgba_bilinear_for_gcode(volume->imported_texture_rgba,
+                                                                                        volume->imported_texture_width,
+                                                                                        volume->imported_texture_height,
+                                                                                        uv.x(),
+                                                                                        uv.y());
+                    rgba[3] = 1.f;
+                    return rgba;
+                };
+                if (accumulate_layer_plane_triangle_samples(p0, p1, p2, sample_rgba_for_barycentric)) {
+                    sampled_from_uv_texture = true;
+                    continue;
+                }
 
                 const float max_uv_edge_texel = std::max({
                     uv_edge_texel_length(tri_uv[0], tri_uv[1]),
