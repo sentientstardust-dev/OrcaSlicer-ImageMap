@@ -290,6 +290,61 @@ static ColorRGBA sample_texture_rgba_for_vertex_bake(const std::vector<uint8_t> 
     return ColorRGBA(blend_channel(0), blend_channel(1), blend_channel(2), 1.f);
 }
 
+static Vec3f texture_barycentric_for_bleed_safe_sampling(const Vec3f &barycentric,
+                                                         const Vec2f &uv0,
+                                                         const Vec2f &uv1,
+                                                         const Vec2f &uv2,
+                                                         uint32_t     width,
+                                                         uint32_t     height)
+{
+    auto normalized_nonnegative = [](Vec3f weights) {
+        weights.x() = std::max(weights.x(), 0.f);
+        weights.y() = std::max(weights.y(), 0.f);
+        weights.z() = std::max(weights.z(), 0.f);
+        const float sum = weights.x() + weights.y() + weights.z();
+        if (sum <= EPSILON)
+            return Vec3f(1.f / 3.f, 1.f / 3.f, 1.f / 3.f);
+        weights /= sum;
+        return weights;
+    };
+
+    Vec3f safe = normalized_nonnegative(barycentric);
+    if (width == 0 || height == 0)
+        return safe;
+
+    auto pixel_edge_length = [width, height](const Vec2f &a, const Vec2f &b) {
+        const Vec2f delta = b - a;
+        return std::sqrt(Slic3r::sqr(delta.x() * float(width)) + Slic3r::sqr(delta.y() * float(height)));
+    };
+    const float max_edge = std::max({ pixel_edge_length(uv0, uv1),
+                                      pixel_edge_length(uv1, uv2),
+                                      pixel_edge_length(uv2, uv0) });
+    if (!std::isfinite(max_edge) || max_edge <= EPSILON)
+        return safe;
+
+    const float min_barycentric = std::min(0.08f, 0.75f / max_edge);
+    if (min_barycentric <= 0.f)
+        return safe;
+
+    safe.x() = std::max(safe.x(), min_barycentric);
+    safe.y() = std::max(safe.y(), min_barycentric);
+    safe.z() = std::max(safe.z(), min_barycentric);
+    return normalized_nonnegative(safe);
+}
+
+static ColorRGBA sample_texture_rgba_for_face_bake(const std::vector<uint8_t> &rgba,
+                                                   uint32_t                    width,
+                                                   uint32_t                    height,
+                                                   const Vec2f                &uv0,
+                                                   const Vec2f                &uv1,
+                                                   const Vec2f                &uv2,
+                                                   const Vec3f                &barycentric)
+{
+    const Vec3f safe_barycentric = texture_barycentric_for_bleed_safe_sampling(barycentric, uv0, uv1, uv2, width, height);
+    const Vec2f uv = uv0 * safe_barycentric.x() + uv1 * safe_barycentric.y() + uv2 * safe_barycentric.z();
+    return sample_texture_rgba_for_vertex_bake(rgba, width, height, uv);
+}
+
 static uint32_t pack_vertex_color_rgba(const ColorRGBA &color)
 {
     auto to_u8 = [](float value) -> uint32_t {
@@ -1405,6 +1460,21 @@ static bool project_point_to_screen(const ProjectionContext &context, const Vec3
     return true;
 }
 
+static bool project_point_to_depth_clipped_screen(const ProjectionContext &context, const Vec3d &world_point, Vec2f &screen)
+{
+    const Vec4d clip = context.view_projection * Vec4d(world_point.x(), world_point.y(), world_point.z(), 1.0);
+    if (clip.w() <= 0.0)
+        return false;
+
+    const Vec3d ndc = clip.head<3>() / clip.w();
+    if (ndc.z() < -1.0 || ndc.z() > 1.0)
+        return false;
+
+    screen.x() = float((ndc.x() * 0.5 + 0.5) * double(context.canvas_width));
+    screen.y() = float((1.0 - (ndc.y() * 0.5 + 0.5)) * double(context.canvas_height));
+    return std::isfinite(screen.x()) && std::isfinite(screen.y());
+}
+
 static std::optional<ColorRGBA> projected_image_color_at_point(const ProjectionContext &context,
                                                                const Transform3d      &world_matrix,
                                                                const Vec3f            &point)
@@ -1493,6 +1563,82 @@ static float projection_triangle_image_pixel_span(const ProjectionContext     &c
     for (size_t i = 0; i + 1 < projected_count; ++i)
         for (size_t j = i + 1; j < projected_count; ++j)
             span = std::max(span, (image_pixels[i] - image_pixels[j]).norm());
+    return span;
+}
+
+static void projection_clip_screen_polygon(std::vector<Vec2f> &polygon, int axis, float bound, bool keep_greater)
+{
+    if (polygon.empty())
+        return;
+
+    std::vector<Vec2f> clipped;
+    clipped.reserve(polygon.size() + 1);
+
+    auto component = [axis](const Vec2f &point) {
+        return axis == 0 ? point.x() : point.y();
+    };
+    auto inside = [&component, bound, keep_greater](const Vec2f &point) {
+        return keep_greater ? component(point) >= bound : component(point) <= bound;
+    };
+
+    Vec2f previous = polygon.back();
+    bool previous_inside = inside(previous);
+    for (const Vec2f &current : polygon) {
+        const bool current_inside = inside(current);
+        if (current_inside != previous_inside) {
+            const float denom = component(current) - component(previous);
+            if (std::abs(denom) > EPSILON) {
+                const float t = std::clamp((bound - component(previous)) / denom, 0.f, 1.f);
+                clipped.emplace_back(previous + (current - previous) * t);
+            }
+        }
+        if (current_inside)
+            clipped.emplace_back(current);
+        previous = current;
+        previous_inside = current_inside;
+    }
+
+    polygon = std::move(clipped);
+}
+
+static float projection_triangle_overlay_image_pixel_span(const ProjectionContext     &context,
+                                                          const Transform3d          &world_matrix,
+                                                          const std::array<Vec3f, 3> &vertices)
+{
+    if (context.overlay_width <= EPSILON ||
+        context.overlay_height <= EPSILON ||
+        context.image_width == 0 ||
+        context.image_height == 0)
+        return 0.f;
+
+    std::vector<Vec2f> polygon;
+    polygon.reserve(3);
+    for (const Vec3f &vertex : vertices) {
+        Vec2f screen = Vec2f::Zero();
+        if (project_point_to_depth_clipped_screen(context, world_matrix * vertex.cast<double>(), screen))
+            polygon.emplace_back(screen);
+    }
+
+    if (polygon.size() < 2)
+        return projection_triangle_image_pixel_span(context, world_matrix, vertices);
+
+    projection_clip_screen_polygon(polygon, 0, context.overlay_left, true);
+    projection_clip_screen_polygon(polygon, 0, context.overlay_left + context.overlay_width, false);
+    projection_clip_screen_polygon(polygon, 1, context.overlay_top, true);
+    projection_clip_screen_polygon(polygon, 1, context.overlay_top + context.overlay_height, false);
+    if (polygon.size() < 2)
+        return projection_triangle_image_pixel_span(context, world_matrix, vertices);
+
+    float span = 0.f;
+    for (size_t i = 0; i + 1 < polygon.size(); ++i) {
+        const Vec2f pixel_i(((polygon[i].x() - context.overlay_left) / context.overlay_width) * float(context.image_width),
+                            ((polygon[i].y() - context.overlay_top) / context.overlay_height) * float(context.image_height));
+        for (size_t j = i + 1; j < polygon.size(); ++j) {
+            const Vec2f pixel_j(((polygon[j].x() - context.overlay_left) / context.overlay_width) * float(context.image_width),
+                                ((polygon[j].y() - context.overlay_top) / context.overlay_height) * float(context.image_height));
+            span = std::max(span, (pixel_i - pixel_j).norm());
+        }
+    }
     return span;
 }
 
@@ -1654,11 +1800,13 @@ static ColorRGBA sample_volume_color_source(const ModelVolume       &volume,
             const Vec2f uv0(volume.imported_texture_uvs_per_face[uv_offset + 0], volume.imported_texture_uvs_per_face[uv_offset + 1]);
             const Vec2f uv1(volume.imported_texture_uvs_per_face[uv_offset + 2], volume.imported_texture_uvs_per_face[uv_offset + 3]);
             const Vec2f uv2(volume.imported_texture_uvs_per_face[uv_offset + 4], volume.imported_texture_uvs_per_face[uv_offset + 5]);
-            const Vec2f uv = uv0 * barycentric.x() + uv1 * barycentric.y() + uv2 * barycentric.z();
-            return sample_texture_rgba_for_vertex_bake(volume.imported_texture_rgba,
-                                                       volume.imported_texture_width,
-                                                       volume.imported_texture_height,
-                                                       uv);
+            return sample_texture_rgba_for_face_bake(volume.imported_texture_rgba,
+                                                     volume.imported_texture_width,
+                                                     volume.imported_texture_height,
+                                                     uv0,
+                                                     uv1,
+                                                     uv2,
+                                                     barycentric);
         }
     }
 
@@ -1746,13 +1894,271 @@ static ColorRGBA projection_base_color_for_volume(const ModelVolume &volume)
     return ColorRGBA(0.15f, 0.65f, 0.6f, 1.f);
 }
 
-static uint32_t projection_texture_size_for_triangles(size_t triangle_count)
+static constexpr uint32_t GENERATED_IMAGE_TEXTURE_SIZE = 4096;
+
+struct GeneratedImageTextureIsland
 {
-    const uint32_t grid = uint32_t(std::max<size_t>(1, size_t(std::ceil(std::sqrt(double(std::max<size_t>(triangle_count, 1)))))));
-    uint32_t size = 256;
-    while (size < grid * 8 && size < 4096)
-        size *= 2;
-    return std::clamp<uint32_t>(size, 256, 4096);
+    size_t tri_idx = 0;
+    std::array<Vec2f, 3> local_uvs;
+    float width = 0.f;
+    float height = 0.f;
+    int rect_width = 0;
+    int rect_height = 0;
+    int x = 0;
+    int y = 0;
+};
+
+struct GeneratedImageTextureAtlas
+{
+    int padding_px = 0;
+    float scale = 0.f;
+    std::vector<GeneratedImageTextureIsland> islands;
+    std::vector<int> island_by_triangle;
+};
+
+static bool make_generated_image_texture_island(const indexed_triangle_set &its,
+                                                size_t                      tri_idx,
+                                                const Transform3d          *metric_matrix,
+                                                GeneratedImageTextureIsland &island)
+{
+    if (tri_idx >= its.indices.size())
+        return false;
+
+    const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
+    if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
+        return false;
+    if (size_t(tri[0]) >= its.vertices.size() ||
+        size_t(tri[1]) >= its.vertices.size() ||
+        size_t(tri[2]) >= its.vertices.size())
+        return false;
+
+    auto transformed_vertex = [&its, &tri, metric_matrix](int corner) -> Vec3f {
+        const Vec3f local = its.vertices[size_t(tri[corner])].cast<float>();
+        if (metric_matrix == nullptr)
+            return local;
+        return ((*metric_matrix) * local.cast<double>()).cast<float>();
+    };
+    const std::array<Vec3f, 3> vertices = { transformed_vertex(0), transformed_vertex(1), transformed_vertex(2) };
+    const float edge_01 = (vertices[1] - vertices[0]).norm();
+    const float edge_12 = (vertices[2] - vertices[1]).norm();
+    const float edge_20 = (vertices[0] - vertices[2]).norm();
+
+    int a = 0;
+    int b = 1;
+    int c = 2;
+    float base_length = edge_01;
+    if (edge_12 > base_length) {
+        a = 1;
+        b = 2;
+        c = 0;
+        base_length = edge_12;
+    }
+    if (edge_20 > base_length) {
+        a = 2;
+        b = 0;
+        c = 1;
+        base_length = edge_20;
+    }
+    if (!std::isfinite(base_length) || base_length <= EPSILON)
+        return false;
+
+    const Vec3f base = vertices[b] - vertices[a];
+    const Vec3f side = vertices[c] - vertices[a];
+    const float projected = side.dot(base) / base_length;
+    const float height_sq = std::max(0.f, side.squaredNorm() - projected * projected);
+    const float height = std::sqrt(height_sq);
+
+    std::array<Vec2f, 3> local_uvs;
+    local_uvs[size_t(a)] = Vec2f(0.f, 0.f);
+    local_uvs[size_t(b)] = Vec2f(base_length, 0.f);
+    local_uvs[size_t(c)] = Vec2f(projected, height);
+
+    const float min_x = std::min({ local_uvs[0].x(), local_uvs[1].x(), local_uvs[2].x() });
+    const float min_y = std::min({ local_uvs[0].y(), local_uvs[1].y(), local_uvs[2].y() });
+    const float max_x = std::max({ local_uvs[0].x(), local_uvs[1].x(), local_uvs[2].x() });
+    const float max_y = std::max({ local_uvs[0].y(), local_uvs[1].y(), local_uvs[2].y() });
+    for (Vec2f &uv : local_uvs)
+        uv -= Vec2f(min_x, min_y);
+
+    island.tri_idx = tri_idx;
+    island.local_uvs = local_uvs;
+    island.width = std::max(max_x - min_x, 1e-4f);
+    island.height = std::max(max_y - min_y, 1e-4f);
+    return std::isfinite(island.width) && std::isfinite(island.height);
+}
+
+static bool pack_generated_image_texture_islands(std::vector<GeneratedImageTextureIsland> &islands,
+                                                 uint32_t                                  texture_size,
+                                                 int                                       padding_px,
+                                                 float                                     scale)
+{
+    if (islands.empty() || texture_size == 0 || !std::isfinite(scale) || scale <= 0.f)
+        return false;
+
+    const int atlas_size = int(texture_size);
+    for (GeneratedImageTextureIsland &island : islands) {
+        const int content_width = std::max(1, int(std::ceil(island.width * scale))) + 1;
+        const int content_height = std::max(1, int(std::ceil(island.height * scale))) + 1;
+        island.rect_width = content_width + padding_px * 2;
+        island.rect_height = content_height + padding_px * 2;
+        if (island.rect_width > atlas_size || island.rect_height > atlas_size)
+            return false;
+    }
+
+    std::vector<size_t> order(islands.size());
+    for (size_t idx = 0; idx < order.size(); ++idx)
+        order[idx] = idx;
+    std::sort(order.begin(), order.end(), [&islands](size_t lhs, size_t rhs) {
+        const GeneratedImageTextureIsland &a = islands[lhs];
+        const GeneratedImageTextureIsland &b = islands[rhs];
+        if (a.rect_height != b.rect_height)
+            return a.rect_height > b.rect_height;
+        if (a.rect_width != b.rect_width)
+            return a.rect_width > b.rect_width;
+        return a.tri_idx < b.tri_idx;
+    });
+
+    int x = 0;
+    int y = 0;
+    int row_height = 0;
+    for (const size_t island_idx : order) {
+        GeneratedImageTextureIsland &island = islands[island_idx];
+        if (x + island.rect_width > atlas_size) {
+            y += row_height;
+            x = 0;
+            row_height = 0;
+        }
+        if (y + island.rect_height > atlas_size)
+            return false;
+        island.x = x;
+        island.y = y;
+        x += island.rect_width;
+        row_height = std::max(row_height, island.rect_height);
+    }
+
+    return true;
+}
+
+static bool pack_generated_image_texture_atlas(GeneratedImageTextureAtlas &atlas, uint32_t texture_size)
+{
+    if (atlas.islands.empty())
+        return false;
+
+    float max_dimension = 0.f;
+    for (const GeneratedImageTextureIsland &island : atlas.islands)
+        max_dimension = std::max({ max_dimension, island.width, island.height });
+    if (!std::isfinite(max_dimension) || max_dimension <= EPSILON)
+        return false;
+
+    const std::array<int, 3> padding_options = { 2, 1, 0 };
+    for (const int padding_px : padding_options) {
+        const float available = float(int(texture_size) - padding_px * 2 - 1);
+        if (available <= 0.f)
+            continue;
+
+        float high = available / max_dimension;
+        if (!std::isfinite(high) || high <= 0.f)
+            continue;
+
+        bool found = false;
+        std::vector<GeneratedImageTextureIsland> best;
+        float best_scale = 0.f;
+        float upper = high;
+        for (int attempt = 0; attempt < 12; ++attempt) {
+            std::vector<GeneratedImageTextureIsland> candidate = atlas.islands;
+            if (pack_generated_image_texture_islands(candidate, texture_size, padding_px, high)) {
+                found = true;
+                best = std::move(candidate);
+                best_scale = high;
+                break;
+            }
+            upper = high;
+            high *= 0.5f;
+        }
+        if (!found)
+            continue;
+
+        float low = best_scale;
+        high = upper;
+        for (int iter = 0; iter < 24; ++iter) {
+            const float mid = (low + high) * 0.5f;
+            std::vector<GeneratedImageTextureIsland> candidate = atlas.islands;
+            if (pack_generated_image_texture_islands(candidate, texture_size, padding_px, mid)) {
+                low = mid;
+                best = std::move(candidate);
+                best_scale = mid;
+            } else {
+                high = mid;
+            }
+        }
+
+        atlas.padding_px = padding_px;
+        atlas.scale = best_scale;
+        atlas.islands = std::move(best);
+        atlas.island_by_triangle.assign(atlas.island_by_triangle.size(), -1);
+        for (size_t island_idx = 0; island_idx < atlas.islands.size(); ++island_idx)
+            if (atlas.islands[island_idx].tri_idx < atlas.island_by_triangle.size())
+                atlas.island_by_triangle[atlas.islands[island_idx].tri_idx] = int(island_idx);
+        return true;
+    }
+
+    return false;
+}
+
+static bool initialize_generated_image_texture(ModelVolume                &volume,
+                                               const ColorRGBA            &background,
+                                               GeneratedImageTextureAtlas *atlas_out,
+                                               const Transform3d          *metric_matrix = nullptr)
+{
+    const indexed_triangle_set &its = volume.mesh().its;
+    if (its.vertices.empty() || its.indices.empty())
+        return false;
+
+    GeneratedImageTextureAtlas atlas;
+    atlas.island_by_triangle.assign(its.indices.size(), -1);
+    atlas.islands.reserve(its.indices.size());
+    for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+        GeneratedImageTextureIsland island;
+        if (make_generated_image_texture_island(its, tri_idx, metric_matrix, island))
+            atlas.islands.emplace_back(island);
+    }
+    if (!pack_generated_image_texture_atlas(atlas, GENERATED_IMAGE_TEXTURE_SIZE))
+        return false;
+
+    const uint8_t r = uint8_t(std::clamp(background.r(), 0.f, 1.f) * 255.f + 0.5f);
+    const uint8_t g = uint8_t(std::clamp(background.g(), 0.f, 1.f) * 255.f + 0.5f);
+    const uint8_t b = uint8_t(std::clamp(background.b(), 0.f, 1.f) * 255.f + 0.5f);
+    const uint8_t a = uint8_t(std::clamp(background.a(), 0.f, 1.f) * 255.f + 0.5f);
+
+    volume.imported_texture_width = GENERATED_IMAGE_TEXTURE_SIZE;
+    volume.imported_texture_height = GENERATED_IMAGE_TEXTURE_SIZE;
+    volume.imported_texture_rgba.assign(size_t(GENERATED_IMAGE_TEXTURE_SIZE) * size_t(GENERATED_IMAGE_TEXTURE_SIZE) * 4, 0);
+    for (size_t idx = 0; idx < size_t(GENERATED_IMAGE_TEXTURE_SIZE) * size_t(GENERATED_IMAGE_TEXTURE_SIZE); ++idx) {
+        volume.imported_texture_rgba[idx * 4 + 0] = r;
+        volume.imported_texture_rgba[idx * 4 + 1] = g;
+        volume.imported_texture_rgba[idx * 4 + 2] = b;
+        volume.imported_texture_rgba[idx * 4 + 3] = a;
+    }
+    volume.imported_texture_uv_valid.assign(its.indices.size(), 0);
+    volume.imported_texture_uvs_per_face.assign(its.indices.size() * 6, 0.f);
+
+    const float texture_size = float(GENERATED_IMAGE_TEXTURE_SIZE);
+    for (const GeneratedImageTextureIsland &island : atlas.islands) {
+        if (island.tri_idx >= its.indices.size())
+            continue;
+        volume.imported_texture_uv_valid[island.tri_idx] = 1;
+        const size_t uv_offset = island.tri_idx * 6;
+        for (size_t corner = 0; corner < 3; ++corner) {
+            const Vec2f pixel(float(island.x + atlas.padding_px) + 0.5f + island.local_uvs[corner].x() * atlas.scale,
+                              float(island.y + atlas.padding_px) + 0.5f + island.local_uvs[corner].y() * atlas.scale);
+            volume.imported_texture_uvs_per_face[uv_offset + corner * 2 + 0] = std::clamp(pixel.x() / texture_size, 0.f, 1.f);
+            volume.imported_texture_uvs_per_face[uv_offset + corner * 2 + 1] = std::clamp(pixel.y() / texture_size, 0.f, 1.f);
+        }
+    }
+
+    if (atlas_out != nullptr)
+        *atlas_out = std::move(atlas);
+    return true;
 }
 
 static bool write_rgba_pixel(std::vector<uint8_t> &rgba, uint32_t width, uint32_t x, uint32_t y, const ColorRGBA &color)
@@ -1928,6 +2334,658 @@ static bool projection_point_is_visible(const ProjectionVisibility &visibility,
     if (!std::isfinite(nearest))
         return false;
     return depth <= nearest + 2e-3f;
+}
+
+struct ProjectionPaintableImageMask
+{
+    uint32_t              width = 0;
+    uint32_t              height = 0;
+    bool                  all_paintable = false;
+    std::vector<uint32_t> prefix;
+};
+
+static ProjectionPaintableImageMask build_projection_paintable_image_mask(const ProjectionContext &context,
+                                                                          bool                     transparent_bg_paintable = false)
+{
+    ProjectionPaintableImageMask mask;
+    mask.width = context.image_width;
+    mask.height = context.image_height;
+    if (context.image_rgba == nullptr ||
+        context.image_width == 0 ||
+        context.image_height == 0 ||
+        context.image_rgba->size() < size_t(context.image_width) * size_t(context.image_height) * 4)
+        return mask;
+
+    if (transparent_bg_paintable && context.apply_transparency_as_background) {
+        mask.all_paintable = true;
+        return mask;
+    }
+
+    const size_t stride = size_t(mask.width) + 1;
+    mask.prefix.assign((size_t(mask.height) + 1) * stride, 0);
+    const float opacity = std::clamp(context.image_opacity, 0.f, 1.f);
+    for (uint32_t y = 0; y < mask.height; ++y) {
+        uint32_t row_sum = 0;
+        for (uint32_t x = 0; x < mask.width; ++x) {
+            const size_t pixel_idx = (size_t(y) * size_t(mask.width) + size_t(x)) * 4 + 3;
+            const bool paintable = float((*context.image_rgba)[pixel_idx]) * opacity > 0.5f;
+            row_sum += paintable ? 1u : 0u;
+            mask.prefix[(size_t(y) + 1) * stride + size_t(x) + 1] =
+                mask.prefix[size_t(y) * stride + size_t(x) + 1] + row_sum;
+        }
+    }
+    return mask;
+}
+
+static bool projection_image_rect_has_paintable_alpha(const ProjectionPaintableImageMask &mask,
+                                                      int                                 min_x,
+                                                      int                                 min_y,
+                                                      int                                 max_x,
+                                                      int                                 max_y)
+{
+    if (mask.width == 0 || mask.height == 0)
+        return false;
+    if (mask.all_paintable)
+        return true;
+    if (mask.prefix.empty())
+        return false;
+    if (max_x < 0 || max_y < 0 || min_x >= int(mask.width) || min_y >= int(mask.height))
+        return false;
+
+    min_x = std::clamp(min_x, 0, int(mask.width) - 1);
+    max_x = std::clamp(max_x, 0, int(mask.width) - 1);
+    min_y = std::clamp(min_y, 0, int(mask.height) - 1);
+    max_y = std::clamp(max_y, 0, int(mask.height) - 1);
+    if (max_x < min_x || max_y < min_y)
+        return false;
+
+    const size_t stride = size_t(mask.width) + 1;
+    const size_t x0 = size_t(min_x);
+    const size_t y0 = size_t(min_y);
+    const size_t x1 = size_t(max_x) + 1;
+    const size_t y1 = size_t(max_y) + 1;
+    const uint32_t count = mask.prefix[y1 * stride + x1] -
+                           mask.prefix[y0 * stride + x1] -
+                           mask.prefix[y1 * stride + x0] +
+                           mask.prefix[y0 * stride + x0];
+    return count > 0;
+}
+
+static bool projection_triangle_image_pixel_bounds(const ProjectionContext     &context,
+                                                   const Transform3d          &world_matrix,
+                                                   const std::array<Vec3f, 3> &vertices,
+                                                   float                      &min_x,
+                                                   float                      &min_y,
+                                                   float                      &max_x,
+                                                   float                      &max_y)
+{
+    min_x = std::numeric_limits<float>::max();
+    min_y = std::numeric_limits<float>::max();
+    max_x = std::numeric_limits<float>::lowest();
+    max_y = std::numeric_limits<float>::lowest();
+    bool any_projected = false;
+
+    for (const Vec3f &vertex : vertices) {
+        Vec2f image_pixel = Vec2f::Zero();
+        if (!project_point_to_image_pixel(context, world_matrix * vertex.cast<double>(), image_pixel))
+            continue;
+        min_x = std::min(min_x, image_pixel.x());
+        min_y = std::min(min_y, image_pixel.y());
+        max_x = std::max(max_x, image_pixel.x());
+        max_y = std::max(max_y, image_pixel.y());
+        any_projected = true;
+    }
+
+    return any_projected;
+}
+
+static bool projection_triangle_intersects_paintable_image(const ProjectionContext            &context,
+                                                           const ProjectionPaintableImageMask &mask,
+                                                           const Transform3d                 &world_matrix,
+                                                           const std::array<Vec3f, 3>        &vertices)
+{
+    if (mask.width == 0 || mask.height == 0)
+        return false;
+    if (mask.all_paintable)
+        return true;
+
+    float min_x = 0.f;
+    float min_y = 0.f;
+    float max_x = 0.f;
+    float max_y = 0.f;
+    if (!projection_triangle_image_pixel_bounds(context, world_matrix, vertices, min_x, min_y, max_x, max_y))
+        return false;
+
+    return projection_image_rect_has_paintable_alpha(mask,
+                                                     int(std::floor(min_x)) - 1,
+                                                     int(std::floor(min_y)) - 1,
+                                                     int(std::ceil(max_x)) + 1,
+                                                     int(std::ceil(max_y)) + 1);
+}
+
+static bool projection_triangle_has_visible_sample(const ProjectionVisibility &visibility,
+                                                   const ProjectionContext    &context,
+                                                   const Transform3d         &world_matrix,
+                                                   const std::array<Vec3f, 3> &vertices)
+{
+    if (!projection_visibility_valid(visibility))
+        return true;
+
+    if (projection_point_is_visible(visibility, context, world_matrix, (vertices[0] + vertices[1] + vertices[2]) / 3.f))
+        return true;
+
+    for (const Vec3f &vertex : vertices)
+        if (projection_point_is_visible(visibility, context, world_matrix, vertex))
+            return true;
+
+    for (size_t idx = 0; idx < 3; ++idx)
+        if (projection_point_is_visible(visibility, context, world_matrix, (vertices[idx] + vertices[(idx + 1) % 3]) * 0.5f))
+            return true;
+
+    return false;
+}
+
+static bool projection_triangle_should_project(const ProjectionContext            &context,
+                                               const ProjectionVisibility         &visibility,
+                                               const ProjectionPaintableImageMask &paintable_mask,
+                                               const Transform3d                 &world_matrix,
+                                               const std::array<Vec3f, 3>        &vertices)
+{
+    return projection_triangle_intersects_overlay(context, world_matrix, vertices) &&
+           projection_triangle_intersects_paintable_image(context, paintable_mask, world_matrix, vertices) &&
+           projection_triangle_has_visible_sample(visibility, context, world_matrix, vertices);
+}
+
+struct ProjectionRegionStateSource
+{
+    std::vector<std::vector<TriangleSelector::FacetStateTriangle>> triangles_per_type;
+    std::vector<std::unordered_map<int, std::vector<size_t>>>      by_source_triangle;
+    std::vector<std::vector<int>>                                  nearby_source_triangles;
+    float                                                          nearby_painted_distance_sq = 0.f;
+};
+
+static ProjectionRegionStateSource build_projection_region_state_source(const ModelVolume &volume)
+{
+    ProjectionRegionStateSource source;
+    if (volume.mmu_segmentation_facets.empty())
+        return source;
+
+    volume.mmu_segmentation_facets.get_facet_triangles(volume, source.triangles_per_type);
+    source.by_source_triangle.resize(source.triangles_per_type.size());
+    for (size_t state_idx = 0; state_idx < source.triangles_per_type.size(); ++state_idx) {
+        std::unordered_map<int, std::vector<size_t>> &by_source = source.by_source_triangle[state_idx];
+        by_source.reserve(source.triangles_per_type[state_idx].size());
+        for (size_t idx = 0; idx < source.triangles_per_type[state_idx].size(); ++idx)
+            by_source[source.triangles_per_type[state_idx][idx].source_triangle].emplace_back(idx);
+    }
+
+    const indexed_triangle_set &its = volume.mesh().its;
+    const float mesh_span = mesh_max_axis_span(its);
+    const float nearby_distance = std::max(mesh_span / 5000.f, 0.002f);
+    source.nearby_painted_distance_sq = nearby_distance * nearby_distance;
+
+    std::vector<std::vector<int>> triangles_by_vertex(its.vertices.size());
+    for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+        const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
+        for (int corner = 0; corner < 3; ++corner)
+            if (tri[corner] >= 0 && size_t(tri[corner]) < triangles_by_vertex.size())
+                triangles_by_vertex[size_t(tri[corner])].emplace_back(int(tri_idx));
+    }
+
+    source.nearby_source_triangles.resize(its.indices.size());
+    for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+        std::vector<int> &nearby = source.nearby_source_triangles[tri_idx];
+        nearby.emplace_back(int(tri_idx));
+        const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
+        for (int corner = 0; corner < 3; ++corner) {
+            if (tri[corner] < 0 || size_t(tri[corner]) >= triangles_by_vertex.size())
+                continue;
+            nearby.insert(nearby.end(), triangles_by_vertex[size_t(tri[corner])].begin(), triangles_by_vertex[size_t(tri[corner])].end());
+        }
+        std::sort(nearby.begin(), nearby.end());
+        nearby.erase(std::unique(nearby.begin(), nearby.end()), nearby.end());
+    }
+
+    return source;
+}
+
+struct ProjectionRegionStateCandidate
+{
+    std::optional<unsigned int> inside_state;
+    float                       inside_score = -std::numeric_limits<float>::max();
+    std::optional<unsigned int> nearest_state;
+    float                       nearest_distance_sq = std::numeric_limits<float>::max();
+    std::optional<unsigned int> nearest_painted_state;
+    float                       nearest_painted_distance_sq = std::numeric_limits<float>::max();
+};
+
+static void consider_projection_region_source_triangle(const ProjectionRegionStateSource &source,
+                                                       int                                source_triangle,
+                                                       const Vec3f                       &point,
+                                                       ProjectionRegionStateCandidate    &candidate)
+{
+    for (size_t state_idx = 0; state_idx < source.triangles_per_type.size(); ++state_idx) {
+        if (state_idx >= source.by_source_triangle.size())
+            continue;
+
+        const auto found = source.by_source_triangle[state_idx].find(source_triangle);
+        if (found == source.by_source_triangle[state_idx].end())
+            continue;
+
+        const float tolerance = -1e-4f;
+        const std::vector<TriangleSelector::FacetStateTriangle> &state_triangles = source.triangles_per_type[state_idx];
+        for (const size_t facet_idx : found->second) {
+            if (facet_idx >= state_triangles.size())
+                continue;
+
+            const TriangleSelector::FacetStateTriangle &facet = state_triangles[facet_idx];
+            Vec3f weights = Vec3f::Zero();
+            if (!barycentric_weights_for_region_vertex_colors(point, facet.vertices[0], facet.vertices[1], facet.vertices[2], weights))
+                continue;
+            const unsigned int state = unsigned(state_idx);
+            if (weights.x() >= tolerance && weights.y() >= tolerance && weights.z() >= tolerance) {
+                const float score = std::min({ weights.x(), weights.y(), weights.z() });
+                if (!candidate.inside_state ||
+                    score > candidate.inside_score + 1e-6f ||
+                    (std::abs(score - candidate.inside_score) <= 1e-6f && state > *candidate.inside_state)) {
+                    candidate.inside_state = state;
+                    candidate.inside_score = score;
+                }
+            }
+
+            const Vec3f closest = closest_point_on_triangle(point, facet.vertices[0], facet.vertices[1], facet.vertices[2]);
+            const float distance_sq = (point - closest).squaredNorm();
+            if (!candidate.nearest_state ||
+                distance_sq < candidate.nearest_distance_sq - 1e-8f ||
+                (std::abs(distance_sq - candidate.nearest_distance_sq) <= 1e-8f && state > *candidate.nearest_state)) {
+                candidate.nearest_state = state;
+                candidate.nearest_distance_sq = distance_sq;
+            }
+            if (state > 0 &&
+                (!candidate.nearest_painted_state ||
+                 distance_sq < candidate.nearest_painted_distance_sq - 1e-8f ||
+                 (std::abs(distance_sq - candidate.nearest_painted_distance_sq) <= 1e-8f && state > *candidate.nearest_painted_state))) {
+                candidate.nearest_painted_state = state;
+                candidate.nearest_painted_distance_sq = distance_sq;
+            }
+        }
+    }
+}
+
+static unsigned int sample_projection_region_state(const ProjectionRegionStateSource &source,
+                                                   int                                source_triangle,
+                                                   const Vec3f                       &point)
+{
+    ProjectionRegionStateCandidate same_triangle;
+    consider_projection_region_source_triangle(source, source_triangle, point, same_triangle);
+
+    if (same_triangle.inside_state)
+        return *same_triangle.inside_state;
+
+    ProjectionRegionStateCandidate nearby = same_triangle;
+    if (source_triangle >= 0 && size_t(source_triangle) < source.nearby_source_triangles.size()) {
+        for (const int nearby_triangle : source.nearby_source_triangles[size_t(source_triangle)]) {
+            if (nearby_triangle == source_triangle)
+                continue;
+            consider_projection_region_source_triangle(source, nearby_triangle, point, nearby);
+        }
+    }
+
+    if (nearby.nearest_painted_state && nearby.nearest_painted_distance_sq <= source.nearby_painted_distance_sq)
+        return *nearby.nearest_painted_state;
+
+    if (same_triangle.nearest_state)
+        return *same_triangle.nearest_state;
+    if (nearby.nearest_state)
+        return *nearby.nearest_state;
+    return 0;
+}
+
+static bool projection_region_triangle_bitstream_range(const TriangleSelector::TriangleSplittingData &data,
+                                                       size_t                                         tri_idx,
+                                                       int                                           &bitstream_start,
+                                                       int                                           &bitstream_end)
+{
+    auto mapping_it = std::lower_bound(data.triangles_to_split.begin(),
+                                       data.triangles_to_split.end(),
+                                       int(tri_idx),
+                                       [](const TriangleSelector::TriangleBitStreamMapping &lhs, int rhs) {
+                                           return lhs.triangle_idx < rhs;
+                                       });
+    if (mapping_it == data.triangles_to_split.end() || mapping_it->triangle_idx != int(tri_idx))
+        return false;
+
+    const auto next_it = std::next(mapping_it);
+    bitstream_start = mapping_it->bitstream_start_idx;
+    bitstream_end = next_it == data.triangles_to_split.end() ?
+        int(data.bitstream.size()) :
+        next_it->bitstream_start_idx;
+    return bitstream_start >= 0 &&
+           bitstream_start < bitstream_end &&
+           size_t(bitstream_end) <= data.bitstream.size();
+}
+
+static int projection_region_read_nibble(const TriangleSelector::TriangleSplittingData &data,
+                                         int                                            bitstream_end,
+                                         int                                           &bit_idx)
+{
+    if (bit_idx + 3 >= bitstream_end || size_t(bit_idx + 3) >= data.bitstream.size())
+        return -1;
+
+    int code = 0;
+    for (int bit = 0; bit < 4; ++bit)
+        code |= int(data.bitstream[size_t(bit_idx++)]) << bit;
+    return code;
+}
+
+static int projection_region_tree_max_depth(const TriangleSelector::TriangleSplittingData &data,
+                                            int                                            bitstream_end,
+                                            int                                           &bit_idx,
+                                            int                                            depth)
+{
+    const int code = projection_region_read_nibble(data, bitstream_end, bit_idx);
+    if (code < 0)
+        return std::clamp(depth, 0, 7);
+
+    const int split_sides = code & 0b11;
+    if (split_sides == 0) {
+        if ((code & 0b1100) == 0b1100) {
+            int next_code = projection_region_read_nibble(data, bitstream_end, bit_idx);
+            while (next_code == 0b1111)
+                next_code = projection_region_read_nibble(data, bitstream_end, bit_idx);
+        }
+        return std::clamp(depth, 0, 7);
+    }
+
+    int max_depth = std::clamp(depth + 1, 0, 7);
+    for (int child_idx = split_sides; child_idx >= 0; --child_idx)
+        max_depth = std::max(max_depth, projection_region_tree_max_depth(data, bitstream_end, bit_idx, depth + 1));
+    return std::clamp(max_depth, 0, 7);
+}
+
+static std::vector<int> projection_region_existing_source_triangle_depths(const TriangleSelector::TriangleSplittingData &data,
+                                                                          size_t                                         triangle_count)
+{
+    std::vector<int> depths(triangle_count, 0);
+    for (auto mapping_it = data.triangles_to_split.begin(); mapping_it != data.triangles_to_split.end(); ++mapping_it) {
+        if (mapping_it->triangle_idx < 0 || size_t(mapping_it->triangle_idx) >= depths.size())
+            continue;
+
+        int bitstream_start = 0;
+        int bitstream_end = 0;
+        if (!projection_region_triangle_bitstream_range(data, size_t(mapping_it->triangle_idx), bitstream_start, bitstream_end))
+            continue;
+
+        int bit_idx = bitstream_start;
+        depths[size_t(mapping_it->triangle_idx)] = projection_region_tree_max_depth(data, bitstream_end, bit_idx, 0);
+    }
+    return depths;
+}
+
+static void projection_region_append_nibble(std::vector<bool> &bitstream, unsigned int code)
+{
+    for (size_t bit_idx = 0; bit_idx < 4; ++bit_idx)
+        bitstream.push_back((code & (1u << bit_idx)) != 0);
+}
+
+static void projection_region_append_leaf(TriangleSelector::TriangleSplittingData &data, unsigned int state)
+{
+    state = std::min<unsigned int>(state, static_cast<unsigned int>(EnforcerBlockerType::ExtruderMax));
+    if (state <= 2) {
+        projection_region_append_nibble(data.bitstream, state << 2);
+        return;
+    }
+
+    projection_region_append_nibble(data.bitstream, 0b1100u);
+    state -= 3;
+    while (state >= 15) {
+        projection_region_append_nibble(data.bitstream, 0b1111u);
+        state -= 15;
+    }
+    projection_region_append_nibble(data.bitstream, state);
+}
+
+static std::array<std::array<Vec3f, 3>, 4> projection_region_split_triangle(const std::array<Vec3f, 3> &vertices)
+{
+    const Vec3f &a = vertices[0];
+    const Vec3f &b = vertices[1];
+    const Vec3f &c = vertices[2];
+    const Vec3f ab = 0.5f * (a + b);
+    const Vec3f bc = 0.5f * (b + c);
+    const Vec3f ca = 0.5f * (c + a);
+    return {
+        std::array<Vec3f, 3>{ a, ab, ca },
+        std::array<Vec3f, 3>{ ab, b, bc },
+        std::array<Vec3f, 3>{ bc, c, ca },
+        std::array<Vec3f, 3>{ ab, bc, ca }
+    };
+}
+
+using ProjectionRegionStateSampler = std::function<unsigned int(size_t, const Vec3f &, const Vec3f &)>;
+
+static bool projection_region_append_sampled_triangle(TriangleSelector::TriangleSplittingData &data,
+                                                      const ProjectionRegionStateSampler      &sampler,
+                                                      size_t                                   source_triangle,
+                                                      const std::array<Vec3f, 3>              &vertices,
+                                                      const std::array<Vec3f, 3>              &barycentrics,
+                                                      int                                      depth,
+                                                      int                                      target_depth)
+{
+    if (depth < target_depth) {
+        projection_region_append_nibble(data.bitstream, 3u);
+        const std::array<std::array<Vec3f, 3>, 4> child_vertices = projection_region_split_triangle(vertices);
+        const std::array<std::array<Vec3f, 3>, 4> child_barycentrics = projection_region_split_triangle(barycentrics);
+        bool has_painted_state = false;
+        for (int child_idx = 3; child_idx >= 0; --child_idx)
+            has_painted_state |= projection_region_append_sampled_triangle(data,
+                                                                           sampler,
+                                                                           source_triangle,
+                                                                           child_vertices[size_t(child_idx)],
+                                                                           child_barycentrics[size_t(child_idx)],
+                                                                           depth + 1,
+                                                                           target_depth);
+        return has_painted_state;
+    }
+
+    const Vec3f centroid = (vertices[0] + vertices[1] + vertices[2]) / 3.f;
+    const Vec3f centroid_bary = (barycentrics[0] + barycentrics[1] + barycentrics[2]) / 3.f;
+    const unsigned int state = sampler(source_triangle, centroid, centroid_bary);
+    projection_region_append_leaf(data, state);
+    return state != 0;
+}
+
+static bool projection_region_append_preserved_triangle(const TriangleSelector::TriangleSplittingData &old_data,
+                                                        TriangleSelector::TriangleSplittingData       &new_data,
+                                                        size_t                                         tri_idx)
+{
+    int bitstream_start = 0;
+    int bitstream_end = 0;
+    if (!projection_region_triangle_bitstream_range(old_data, tri_idx, bitstream_start, bitstream_end))
+        return false;
+
+    new_data.triangles_to_split.emplace_back(int(tri_idx), int(new_data.bitstream.size()));
+    new_data.bitstream.insert(new_data.bitstream.end(),
+                              old_data.bitstream.begin() + bitstream_start,
+                              old_data.bitstream.begin() + bitstream_end);
+    return true;
+}
+
+static bool object_is_whole_image_texture_mapped_without_regions(const ModelObject &object)
+{
+    if (wxGetApp().preset_bundle == nullptr)
+        return false;
+
+    const TextureMappingManager &texture_mgr = wxGetApp().preset_bundle->texture_mapping_zones;
+    bool has_model_part = false;
+    for (const ModelVolume *volume : object.volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+
+        has_model_part = true;
+        if (!volume->mmu_segmentation_facets.empty())
+            return false;
+
+        const int extruder_id = volume->extruder_id();
+        if (extruder_id <= 0)
+            return false;
+
+        const TextureMappingZone *zone = texture_mgr.zone_from_id(unsigned(extruder_id));
+        if (zone == nullptr || !zone->enabled || zone->deleted || !zone->is_image_texture())
+            return false;
+    }
+    return has_model_part;
+}
+
+static bool project_texture_mapping_zone_to_regions(ModelObject             &object,
+                                                    const GLCanvas3D       &parent,
+                                                    const ProjectionContext &context,
+                                                    int                      instance_idx,
+                                                    bool                     pass_through_model,
+                                                    unsigned int             texture_mapping_filament_id)
+{
+    if (texture_mapping_filament_id == 0)
+        return false;
+
+    const ProjectionVisibility visibility = pass_through_model ?
+        ProjectionVisibility() :
+        build_projection_visibility(context, parent, &object, instance_idx);
+    const ProjectionPaintableImageMask paintable_mask = build_projection_paintable_image_mask(context);
+    const float projection_target_span = image_projection_rgb_target_triangle_pixel_span(context);
+    bool changed = false;
+
+    const std::array<Vec3f, 3> root_barycentrics = {
+        Vec3f(1.f, 0.f, 0.f),
+        Vec3f(0.f, 1.f, 0.f),
+        Vec3f(0.f, 0.f, 1.f)
+    };
+
+    for (ModelVolume *volume : object.volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+
+        const indexed_triangle_set &its = volume->mesh().its;
+        if (its.vertices.empty() || its.indices.empty())
+            continue;
+
+        const Transform3d world_matrix = projection_world_matrix_for_volume(parent, &object, volume, instance_idx);
+        std::vector<bool> projected_triangles(its.indices.size(), false);
+        std::vector<int> projected_triangle_depths(its.indices.size(), 0);
+        size_t projected_triangle_count = 0;
+
+        for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+            const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
+            if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
+                continue;
+            if (size_t(tri[0]) >= its.vertices.size() ||
+                size_t(tri[1]) >= its.vertices.size() ||
+                size_t(tri[2]) >= its.vertices.size())
+                continue;
+
+            const std::array<Vec3f, 3> vertices = {
+                its.vertices[size_t(tri[0])].cast<float>(),
+                its.vertices[size_t(tri[1])].cast<float>(),
+                its.vertices[size_t(tri[2])].cast<float>()
+            };
+            if (!projection_triangle_should_project(context, visibility, paintable_mask, world_matrix, vertices))
+                continue;
+
+            projected_triangles[tri_idx] = true;
+            projected_triangle_depths[tri_idx] =
+                texture_mapping_depth_from_span(projection_triangle_overlay_image_pixel_span(context, world_matrix, vertices),
+                                                projection_target_span,
+                                                7);
+            ++projected_triangle_count;
+        }
+
+        if (projected_triangle_count == 0)
+            continue;
+
+        const TriangleSelector::TriangleSplittingData &old_data = volume->mmu_segmentation_facets.get_data();
+        const std::vector<int> existing_depths = projection_region_existing_source_triangle_depths(old_data, its.indices.size());
+        const std::vector<int> rgb_depths =
+            rgb_existing_source_triangle_depths(volume->texture_mapping_color_facets.get_data(), its.indices.size());
+        const ProjectionRegionStateSource state_source = build_projection_region_state_source(*volume);
+        const int projected_safe_max_depth = texture_mapping_depth_for_budget(projected_triangle_count, 7, 2200000);
+
+        TriangleSelector::TriangleSplittingData new_data;
+        new_data.triangles_to_split.reserve(std::max(old_data.triangles_to_split.size(), projected_triangle_count));
+        new_data.bitstream.reserve(old_data.bitstream.size() + projected_triangle_count * 4);
+
+        ProjectionRegionStateSampler sampler =
+            [context,
+             world_matrix,
+             pass_through_model,
+             texture_mapping_filament_id,
+             &visibility,
+             &projected_triangles,
+             &state_source](size_t tri_idx, const Vec3f &point, const Vec3f &) {
+            unsigned int state = sample_projection_region_state(state_source, int(tri_idx), point);
+            if (tri_idx < projected_triangles.size() && projected_triangles[tri_idx]) {
+                if (pass_through_model || projection_point_is_visible(visibility, context, world_matrix, point)) {
+                    if (std::optional<ColorRGBA> projected = projected_image_color_at_point(context, world_matrix, point);
+                        projected && projection_overlay_has_paintable_alpha(*projected, context)) {
+                        state = texture_mapping_filament_id;
+                    }
+                }
+            }
+            return state;
+        };
+
+        for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+            const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
+            if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
+                continue;
+            if (size_t(tri[0]) >= its.vertices.size() ||
+                size_t(tri[1]) >= its.vertices.size() ||
+                size_t(tri[2]) >= its.vertices.size())
+                continue;
+
+            if (tri_idx >= projected_triangles.size() || !projected_triangles[tri_idx]) {
+                projection_region_append_preserved_triangle(old_data, new_data, tri_idx);
+                continue;
+            }
+
+            const std::array<Vec3f, 3> vertices = {
+                its.vertices[size_t(tri[0])].cast<float>(),
+                its.vertices[size_t(tri[1])].cast<float>(),
+                its.vertices[size_t(tri[2])].cast<float>()
+            };
+
+            int target_depth = 0;
+            if (model_volume_has_bakeable_image_texture_data(volume))
+                target_depth = texture_mapping_depth_from_span(texture_triangle_uv_pixel_span(volume, tri_idx),
+                                                               8.f,
+                                                               projected_safe_max_depth);
+            target_depth = std::max(target_depth, std::min(projected_triangle_depths[tri_idx], projected_safe_max_depth));
+            if (tri_idx < existing_depths.size())
+                target_depth = std::max(target_depth, existing_depths[tri_idx]);
+            if (tri_idx < rgb_depths.size())
+                target_depth = std::max(target_depth, rgb_depths[tri_idx]);
+            target_depth = std::clamp(target_depth, 0, 7);
+
+            const size_t bitstream_start = new_data.bitstream.size();
+            new_data.triangles_to_split.emplace_back(int(tri_idx), int(bitstream_start));
+            if (!projection_region_append_sampled_triangle(new_data,
+                                                           sampler,
+                                                           tri_idx,
+                                                           vertices,
+                                                           root_barycentrics,
+                                                           0,
+                                                           target_depth)) {
+                new_data.triangles_to_split.pop_back();
+                new_data.bitstream.resize(bitstream_start);
+            }
+        }
+
+        new_data.triangles_to_split.shrink_to_fit();
+        new_data.bitstream.shrink_to_fit();
+
+        TriangleSelector selector(volume->mesh());
+        selector.deserialize(new_data, false);
+        changed |= volume->mmu_segmentation_facets.set(selector);
+    }
+
+    return changed;
 }
 
 enum class ManagedColorDataType
@@ -2443,11 +3501,13 @@ static ColorRGBA sample_managed_volume_color_source(const ModelVolume           
             const Vec2f uv0(volume.imported_texture_uvs_per_face[uv_offset + 0], volume.imported_texture_uvs_per_face[uv_offset + 1]);
             const Vec2f uv1(volume.imported_texture_uvs_per_face[uv_offset + 2], volume.imported_texture_uvs_per_face[uv_offset + 3]);
             const Vec2f uv2(volume.imported_texture_uvs_per_face[uv_offset + 4], volume.imported_texture_uvs_per_face[uv_offset + 5]);
-            const Vec2f uv = uv0 * barycentric.x() + uv1 * barycentric.y() + uv2 * barycentric.z();
-            return sample_texture_rgba_for_vertex_bake(volume.imported_texture_rgba,
-                                                       volume.imported_texture_width,
-                                                       volume.imported_texture_height,
-                                                       uv);
+            return sample_texture_rgba_for_face_bake(volume.imported_texture_rgba,
+                                                     volume.imported_texture_width,
+                                                     volume.imported_texture_height,
+                                                     uv0,
+                                                     uv1,
+                                                     uv2,
+                                                     barycentric);
         }
     }
 
@@ -2551,7 +3611,6 @@ static bool convert_object_to_image_texture(ModelObject &object, const ManagedCo
     bool changed = false;
     const ManagedColorSourceFlags source_flags = managed_color_source_flags(source);
     const ColorRGBA fallback_color = blank_color_for_managed_target(ManagedColorDataType::ImageTexture);
-    const uint32_t fallback_packed = pack_vertex_color_rgba(fallback_color);
     for (ModelVolume *volume : object.volumes) {
         if (volume == nullptr || !volume->is_model_part())
             continue;
@@ -2560,42 +3619,16 @@ static bool convert_object_to_image_texture(ModelObject &object, const ManagedCo
         if (its.vertices.empty() || its.indices.empty())
             continue;
 
-        const uint32_t texture_size = projection_texture_size_for_triangles(its.indices.size());
-        const uint32_t grid = uint32_t(std::ceil(std::sqrt(double(std::max<size_t>(its.indices.size(), 1)))));
-        const float tile = float(texture_size) / float(std::max<uint32_t>(grid, 1));
-        volume->imported_texture_width = texture_size;
-        volume->imported_texture_height = texture_size;
-        volume->imported_texture_rgba.assign(size_t(texture_size) * size_t(texture_size) * 4, 0);
-        for (size_t idx = 0; idx < size_t(texture_size) * size_t(texture_size); ++idx) {
-            volume->imported_texture_rgba[idx * 4 + 0] = uint8_t((fallback_packed >> 24) & 0xFFu);
-            volume->imported_texture_rgba[idx * 4 + 1] = uint8_t((fallback_packed >> 16) & 0xFFu);
-            volume->imported_texture_rgba[idx * 4 + 2] = uint8_t((fallback_packed >> 8) & 0xFFu);
-            volume->imported_texture_rgba[idx * 4 + 3] = uint8_t(fallback_packed & 0xFFu);
-        }
-        volume->imported_texture_uv_valid.assign(its.indices.size(), 1);
-        volume->imported_texture_uvs_per_face.assign(its.indices.size() * 6, 0.f);
-
-        for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
-            const uint32_t cell_x = uint32_t(tri_idx % grid);
-            const uint32_t cell_y = uint32_t(tri_idx / grid);
-            const float left = float(cell_x) * tile + 0.5f;
-            const float top = float(cell_y) * tile + 0.5f;
-            const float right = std::min(float(texture_size) - 0.5f, float(cell_x + 1) * tile - 0.5f);
-            const float bottom = std::min(float(texture_size) - 0.5f, float(cell_y + 1) * tile - 0.5f);
-            const size_t uv = tri_idx * 6;
-            volume->imported_texture_uvs_per_face[uv + 0] = left / float(texture_size);
-            volume->imported_texture_uvs_per_face[uv + 1] = top / float(texture_size);
-            volume->imported_texture_uvs_per_face[uv + 2] = right / float(texture_size);
-            volume->imported_texture_uvs_per_face[uv + 3] = top / float(texture_size);
-            volume->imported_texture_uvs_per_face[uv + 4] = left / float(texture_size);
-            volume->imported_texture_uvs_per_face[uv + 5] = bottom / float(texture_size);
-        }
+        GeneratedImageTextureAtlas generated_atlas;
+        Transform3d metric_matrix = volume->get_matrix();
+        if (!object.instances.empty() && object.instances.front() != nullptr)
+            metric_matrix = object.instances.front()->get_transformation().get_matrix() * metric_matrix;
+        if (!initialize_generated_image_texture(*volume, fallback_color, &generated_atlas, &metric_matrix))
+            continue;
 
         const VolumeColorSource rgba_source = build_volume_color_source(*volume);
         const ManagedRegionColorSource region_source = build_managed_region_color_source(*volume);
         for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
-            const uint32_t cell_x = uint32_t(tri_idx % grid);
-            const uint32_t cell_y = uint32_t(tri_idx / grid);
             const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
             if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
                 continue;
@@ -2604,7 +3637,13 @@ static bool convert_object_to_image_texture(ModelObject &object, const ManagedCo
                 size_t(tri[2]) >= its.vertices.size())
                 continue;
 
+            if (tri_idx >= volume->imported_texture_uv_valid.size() ||
+                volume->imported_texture_uv_valid[tri_idx] == 0)
+                continue;
             const size_t uv_offset = tri_idx * 6;
+            if (uv_offset + 5 >= volume->imported_texture_uvs_per_face.size())
+                continue;
+
             const std::array<Vec2f, 3> uvs = unwrap_projection_uvs(std::array<Vec2f, 3>{
                 Vec2f(volume->imported_texture_uvs_per_face[uv_offset + 0], volume->imported_texture_uvs_per_face[uv_offset + 1]),
                 Vec2f(volume->imported_texture_uvs_per_face[uv_offset + 2], volume->imported_texture_uvs_per_face[uv_offset + 3]),
@@ -2622,21 +3661,21 @@ static bool convert_object_to_image_texture(ModelObject &object, const ManagedCo
                 Vec2f(uvs[1].x() * texture_width, uvs[1].y() * texture_height),
                 Vec2f(uvs[2].x() * texture_width, uvs[2].y() * texture_height)
             };
-            const float texture_padding = 2.f;
-            const int padding_px = int(std::ceil(texture_padding));
+            const int padding_px = std::max(generated_atlas.padding_px, 0);
             int min_x = int(std::floor(std::min({ uvs[0].x(), uvs[1].x(), uvs[2].x() }) * texture_width)) - padding_px;
             int max_x = int(std::ceil(std::max({ uvs[0].x(), uvs[1].x(), uvs[2].x() }) * texture_width)) + padding_px;
             int min_y = int(std::floor(std::min({ uvs[0].y(), uvs[1].y(), uvs[2].y() }) * texture_height)) - padding_px;
             int max_y = int(std::ceil(std::max({ uvs[0].y(), uvs[1].y(), uvs[2].y() }) * texture_height)) + padding_px;
-            const int cell_min_x = std::clamp(int(std::floor(float(cell_x) * tile)), 0, int(volume->imported_texture_width) - 1);
-            const int cell_max_x = std::clamp(int(std::ceil(float(cell_x + 1) * tile)) - 1, 0, int(volume->imported_texture_width) - 1);
-            const int cell_min_y = std::clamp(int(std::floor(float(cell_y) * tile)), 0, int(volume->imported_texture_height) - 1);
-            const int cell_max_y = std::clamp(int(std::ceil(float(cell_y + 1) * tile)) - 1, 0, int(volume->imported_texture_height) - 1);
-
-            min_x = std::clamp(min_x, cell_min_x, cell_max_x);
-            max_x = std::clamp(max_x, cell_min_x, cell_max_x);
-            min_y = std::clamp(min_y, cell_min_y, cell_max_y);
-            max_y = std::clamp(max_y, cell_min_y, cell_max_y);
+            if (tri_idx < generated_atlas.island_by_triangle.size()) {
+                const int island_idx = generated_atlas.island_by_triangle[tri_idx];
+                if (island_idx >= 0 && size_t(island_idx) < generated_atlas.islands.size()) {
+                    const GeneratedImageTextureIsland &island = generated_atlas.islands[size_t(island_idx)];
+                    min_x = std::clamp(min_x, island.x, island.x + island.rect_width - 1);
+                    max_x = std::clamp(max_x, island.x, island.x + island.rect_width - 1);
+                    min_y = std::clamp(min_y, island.y, island.y + island.rect_height - 1);
+                    max_y = std::clamp(max_y, island.y, island.y + island.rect_height - 1);
+                }
+            }
             for (int y_px = min_y; y_px <= max_y; ++y_px) {
                 for (int x_px = min_x; x_px <= max_x; ++x_px) {
                     Vec3f barycentric = Vec3f::Zero();
@@ -3015,6 +4054,7 @@ static void refresh_managed_color_data_object(GLCanvas3D &parent, ModelObject *o
     const ModelObjectPtrs &objects = wxGetApp().model().objects;
     const size_t object_idx = size_t(std::find(objects.begin(), objects.end(), object) - objects.begin());
     if (object_idx < objects.size()) {
+        parent.invalidate_texture_mapping_preview_for_object(object_idx);
         wxGetApp().obj_list()->update_info_items(object_idx);
         wxGetApp().plater()->get_partplate_list().notify_instance_update(object_idx, 0);
     }
@@ -4252,6 +5292,7 @@ void GLGizmoMmuSegmentation::open_obj_vertex_color_mapping_dialog()
     const ModelObjectPtrs &objects = wxGetApp().model().objects;
     const size_t object_idx = size_t(std::find(objects.begin(), objects.end(), object) - objects.begin());
     if (object_idx < objects.size()) {
+        m_parent.invalidate_texture_mapping_preview_for_object(object_idx);
         wxGetApp().obj_list()->update_info_items(object_idx);
         wxGetApp().plater()->get_partplate_list().notify_instance_update(object_idx, 0);
     }
@@ -4310,10 +5351,15 @@ void GLGizmoMmuSegmentation::bake_selected_object_image_texture_to_vertex_colors
             const std::array<int, 3> vertex_indices = { tri[0], tri[1], tri[2] };
 
             for (size_t corner = 0; corner < 3; ++corner) {
-                const ColorRGBA color = sample_texture_rgba_for_vertex_bake(volume->imported_texture_rgba,
-                                                                            volume->imported_texture_width,
-                                                                            volume->imported_texture_height,
-                                                                            uvs[corner]);
+                Vec3f barycentric = Vec3f::Zero();
+                barycentric[int(corner)] = 1.f;
+                const ColorRGBA color = sample_texture_rgba_for_face_bake(volume->imported_texture_rgba,
+                                                                          volume->imported_texture_width,
+                                                                          volume->imported_texture_height,
+                                                                          uvs[0],
+                                                                          uvs[1],
+                                                                          uvs[2],
+                                                                          barycentric);
                 VertexColorAccumulator &acc = accumulators[size_t(vertex_indices[corner])];
                 acc.r += double(color.r()) * weight;
                 acc.g += double(color.g()) * weight;
@@ -4477,11 +5523,13 @@ void GLGizmoMmuSegmentation::convert_selected_object_image_texture_to_texture_ma
             const Vec2f uv0(volume->imported_texture_uvs_per_face[uv_offset + 0], volume->imported_texture_uvs_per_face[uv_offset + 1]);
             const Vec2f uv1(volume->imported_texture_uvs_per_face[uv_offset + 2], volume->imported_texture_uvs_per_face[uv_offset + 3]);
             const Vec2f uv2(volume->imported_texture_uvs_per_face[uv_offset + 4], volume->imported_texture_uvs_per_face[uv_offset + 5]);
-            const Vec2f uv = uv0 * barycentric.x() + uv1 * barycentric.y() + uv2 * barycentric.z();
-            return pack_vertex_color_rgba(sample_texture_rgba_for_vertex_bake(volume->imported_texture_rgba,
-                                                                              volume->imported_texture_width,
-                                                                              volume->imported_texture_height,
-                                                                              uv));
+            return pack_vertex_color_rgba(sample_texture_rgba_for_face_bake(volume->imported_texture_rgba,
+                                                                            volume->imported_texture_width,
+                                                                            volume->imported_texture_height,
+                                                                            uv0,
+                                                                            uv1,
+                                                                            uv2,
+                                                                            barycentric));
         };
 
         const int safe_max_depth = texture_mapping_depth_for_budget(its.indices.size(), 7, 3200000);
@@ -5325,11 +6373,13 @@ void GLGizmoTrueColorPainting::convert_selected_object_image_texture_to_rgb_data
             const Vec2f uv0(volume->imported_texture_uvs_per_face[uv_offset + 0], volume->imported_texture_uvs_per_face[uv_offset + 1]);
             const Vec2f uv1(volume->imported_texture_uvs_per_face[uv_offset + 2], volume->imported_texture_uvs_per_face[uv_offset + 3]);
             const Vec2f uv2(volume->imported_texture_uvs_per_face[uv_offset + 4], volume->imported_texture_uvs_per_face[uv_offset + 5]);
-            const Vec2f uv = uv0 * barycentric.x() + uv1 * barycentric.y() + uv2 * barycentric.z();
-            return pack_vertex_color_rgba(sample_texture_rgba_for_vertex_bake(volume->imported_texture_rgba,
-                                                                              volume->imported_texture_width,
-                                                                              volume->imported_texture_height,
-                                                                              uv));
+            return pack_vertex_color_rgba(sample_texture_rgba_for_face_bake(volume->imported_texture_rgba,
+                                                                            volume->imported_texture_width,
+                                                                            volume->imported_texture_height,
+                                                                            uv0,
+                                                                            uv1,
+                                                                            uv2,
+                                                                            barycentric));
         };
 
         const int safe_max_depth = texture_mapping_depth_for_budget(its.indices.size(), 7, 3200000);
@@ -6218,13 +7268,13 @@ GLGizmoImageProjection::ProjectionMode GLGizmoImageProjection::default_projectio
 {
     if (selected_object_has_rgb_data())
         return ProjectionMode::RGBData;
-    if (selected_object_has_image_texture_data())
-        return ProjectionMode::ImageTexture;
-    return ProjectionMode::RGBData;
+    return ProjectionMode::ImageTexture;
 }
 
 bool GLGizmoImageProjection::projection_mode_allowed(ProjectionMode mode) const
 {
+    if (mode == ProjectionMode::ImageTexture)
+        return true;
     if (selected_object_has_rgb_data())
         return mode == ProjectionMode::RGBData;
     if (selected_object_has_image_texture_data())
@@ -6389,12 +7439,36 @@ bool GLGizmoImageProjection::project_image_to_selected_object()
     if (!changed)
         return false;
 
-    const unsigned int texture_mapping_filament_id = ensure_texture_mapping_zone();
-    if (texture_mapping_filament_id != 0) {
-        object->config.set("extruder", int(texture_mapping_filament_id));
-        for (ModelVolume *volume : object->volumes)
-            if (volume != nullptr && volume->is_model_part())
-                volume->config.set("extruder", int(texture_mapping_filament_id));
+    if (!object_is_whole_image_texture_mapped_without_regions(*object)) {
+        const unsigned int texture_mapping_filament_id = ensure_texture_mapping_zone();
+        if (texture_mapping_filament_id != 0) {
+            const Selection &selection = m_parent.get_selection();
+            const int instance_idx = selection.get_instance_idx();
+            const Camera &camera = wxGetApp().plater()->get_camera();
+            const std::array<int, 4> &viewport = camera.get_viewport();
+            const OverlayRect rect = overlay_rect();
+
+            ProjectionContext context;
+            context.view_projection = camera.get_projection_matrix().matrix() * camera.get_view_matrix().matrix();
+            context.canvas_width = std::max(1, viewport[2]);
+            context.canvas_height = std::max(1, viewport[3]);
+            context.overlay_left = rect.left;
+            context.overlay_top = rect.top;
+            context.overlay_width = rect.width;
+            context.overlay_height = rect.height;
+            context.image_rgba = &m_image_rgba;
+            context.image_width = m_image_width;
+            context.image_height = m_image_height;
+            context.image_opacity = m_projection_opacity;
+            context.apply_transparency_as_background = m_apply_transparency_as_background;
+
+            project_texture_mapping_zone_to_regions(*object,
+                                                    m_parent,
+                                                    context,
+                                                    instance_idx,
+                                                    m_pass_through_model,
+                                                    texture_mapping_filament_id);
+        }
     }
 
     refresh_projected_object(object);
@@ -6565,37 +7639,16 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
         if (its.vertices.empty() || its.indices.empty())
             continue;
 
+        const ColorRGBA fallback_color = projection_base_color_for_volume(*volume);
+        const Transform3d world_matrix = projection_world_matrix_for_volume(m_parent, object, volume, instance_idx);
         const bool generated_texture = !model_volume_has_bakeable_image_texture_data(volume);
+        GeneratedImageTextureAtlas generated_atlas;
         if (generated_texture) {
-            const uint32_t texture_size = projection_texture_size_for_triangles(its.indices.size());
-            const uint32_t grid = uint32_t(std::ceil(std::sqrt(double(std::max<size_t>(its.indices.size(), 1)))));
-            const float tile = float(texture_size) / float(std::max<uint32_t>(grid, 1));
-            volume->imported_texture_width = texture_size;
-            volume->imported_texture_height = texture_size;
-            volume->imported_texture_rgba.assign(size_t(texture_size) * size_t(texture_size) * 4, 255);
-            volume->imported_texture_uv_valid.assign(its.indices.size(), 1);
-            volume->imported_texture_uvs_per_face.assign(its.indices.size() * 6, 0.f);
-
-            for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
-                const uint32_t cell_x = uint32_t(tri_idx % grid);
-                const uint32_t cell_y = uint32_t(tri_idx / grid);
-                const float left = float(cell_x) * tile + 0.5f;
-                const float top = float(cell_y) * tile + 0.5f;
-                const float right = std::min(float(texture_size) - 0.5f, float(cell_x + 1) * tile - 0.5f);
-                const float bottom = std::min(float(texture_size) - 0.5f, float(cell_y + 1) * tile - 0.5f);
-                const size_t uv = tri_idx * 6;
-                volume->imported_texture_uvs_per_face[uv + 0] = left / float(texture_size);
-                volume->imported_texture_uvs_per_face[uv + 1] = top / float(texture_size);
-                volume->imported_texture_uvs_per_face[uv + 2] = right / float(texture_size);
-                volume->imported_texture_uvs_per_face[uv + 3] = top / float(texture_size);
-                volume->imported_texture_uvs_per_face[uv + 4] = left / float(texture_size);
-                volume->imported_texture_uvs_per_face[uv + 5] = bottom / float(texture_size);
-            }
+            if (!initialize_generated_image_texture(*volume, fallback_color, &generated_atlas, &world_matrix))
+                continue;
         }
 
         const VolumeColorSource source = build_volume_color_source(*volume);
-        const ColorRGBA fallback_color = projection_base_color_for_volume(*volume);
-        const Transform3d world_matrix = projection_world_matrix_for_volume(m_parent, object, volume, instance_idx);
         const bool rewrite_texture_base = generated_texture || !volume->texture_mapping_color_facets.empty();
         const std::vector<uint8_t> source_texture_rgba(volume->imported_texture_rgba.begin(), volume->imported_texture_rgba.end());
         bool volume_changed = generated_texture;
@@ -6639,10 +7692,21 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
             const float max_u = std::max({ uvs[0].x(), uvs[1].x(), uvs[2].x() });
             const float min_v = std::min({ uvs[0].y(), uvs[1].y(), uvs[2].y() });
             const float max_v = std::max({ uvs[0].y(), uvs[1].y(), uvs[2].y() });
-            int min_x = int(std::floor(min_u * texture_width)) - 1;
-            int max_x = int(std::ceil(max_u * texture_width)) + 1;
-            int min_y = int(std::floor(min_v * texture_height)) - 1;
-            int max_y = int(std::ceil(max_v * texture_height)) + 1;
+            const int padding_px = generated_texture ? std::max(generated_atlas.padding_px, 0) : 1;
+            int min_x = int(std::floor(min_u * texture_width)) - padding_px;
+            int max_x = int(std::ceil(max_u * texture_width)) + padding_px;
+            int min_y = int(std::floor(min_v * texture_height)) - padding_px;
+            int max_y = int(std::ceil(max_v * texture_height)) + padding_px;
+            if (generated_texture && tri_idx < generated_atlas.island_by_triangle.size()) {
+                const int island_idx = generated_atlas.island_by_triangle[tri_idx];
+                if (island_idx >= 0 && size_t(island_idx) < generated_atlas.islands.size()) {
+                    const GeneratedImageTextureIsland &island = generated_atlas.islands[size_t(island_idx)];
+                    min_x = std::clamp(min_x, island.x, island.x + island.rect_width - 1);
+                    max_x = std::clamp(max_x, island.x, island.x + island.rect_width - 1);
+                    min_y = std::clamp(min_y, island.y, island.y + island.rect_height - 1);
+                    max_y = std::clamp(max_y, island.y, island.y + island.rect_height - 1);
+                }
+            }
             const bool uv_raster_too_large =
                 max_x - min_x > int(volume->imported_texture_width) * 2 ||
                 max_y - min_y > int(volume->imported_texture_height) * 2;
@@ -6652,8 +7716,20 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
                     for (int x_px = min_x; x_px <= max_x; ++x_px) {
                         const Vec2f pixel(float(x_px) + 0.5f, float(y_px) + 0.5f);
                         Vec3f barycentric = Vec3f::Zero();
-                        if (!conservative_barycentric_weights_2d(pixel, pixel_uvs[0], pixel_uvs[1], pixel_uvs[2], 0.7072f, barycentric))
-                            continue;
+                        if (generated_texture) {
+                            if (!barycentric_weights_2d(pixel, pixel_uvs[0], pixel_uvs[1], pixel_uvs[2], barycentric))
+                                continue;
+                            if (barycentric.x() < -1e-4f || barycentric.y() < -1e-4f || barycentric.z() < -1e-4f)
+                                barycentric = normalized_nonnegative_barycentric(barycentric);
+                        } else {
+                            if (!conservative_barycentric_weights_2d(pixel,
+                                                                      pixel_uvs[0],
+                                                                      pixel_uvs[1],
+                                                                      pixel_uvs[2],
+                                                                      float(padding_px) + 0.7072f,
+                                                                      barycentric))
+                                continue;
+                        }
 
                         const Vec3f point = vertices[0] * barycentric.x() +
                                             vertices[1] * barycentric.y() +
@@ -6722,6 +7798,7 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
     const ProjectionVisibility visibility = m_pass_through_model ?
         ProjectionVisibility() :
         build_projection_visibility(context, m_parent, object, instance_idx);
+    const ProjectionPaintableImageMask paintable_mask = build_projection_paintable_image_mask(context, true);
 
     bool changed = false;
     for (ModelVolume *volume : object->volumes) {
@@ -6754,7 +7831,11 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
                 its.vertices[size_t(tri[1])].cast<float>(),
                 its.vertices[size_t(tri[2])].cast<float>()
             };
-            const bool projected_triangle = projection_triangle_intersects_overlay(context, world_matrix, vertices);
+            const bool projected_triangle = projection_triangle_should_project(context,
+                                                                               visibility,
+                                                                               paintable_mask,
+                                                                               world_matrix,
+                                                                               vertices);
             projected_triangles[tri_idx] = projected_triangle;
             if (projected_triangle) {
                 projected_triangle_depths[tri_idx] =
@@ -6764,6 +7845,9 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
                 ++projected_triangle_count;
             }
         }
+
+        if (projected_triangle_count == 0)
+            continue;
 
         TextureMappingColorSampler sampler = [this, volume, source, context, world_matrix, fallback_color, &projected_triangles, &visibility](size_t tri_idx,
                                                                                                                                              const Vec3f &point,
@@ -6850,10 +7934,12 @@ void GLGizmoImageProjection::refresh_projected_object(ModelObject *object)
 {
     m_parent.update_volumes_colors_by_extruder();
     m_parent.set_as_dirty();
+    m_parent.request_extra_frame();
 
     const ModelObjectPtrs &objects = wxGetApp().model().objects;
     const size_t object_idx = size_t(std::find(objects.begin(), objects.end(), object) - objects.begin());
     if (object_idx < objects.size()) {
+        m_parent.invalidate_texture_mapping_preview_for_object(object_idx);
         wxGetApp().obj_list()->update_info_items(object_idx);
         wxGetApp().plater()->get_partplate_list().notify_instance_update(object_idx, 0);
     }

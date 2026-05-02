@@ -123,6 +123,24 @@ bool model_volume_has_any_texture_preview_data(const ModelVolume &model_volume)
             model_volume.imported_texture_height > 0);
 }
 
+bool texture_preview_has_surface_gradient_state(size_t states_count,
+                                                unsigned int base_filament_id,
+                                                size_t num_physical,
+                                                const TextureMappingManager *texture_mgr)
+{
+    if (texture_mgr == nullptr)
+        return false;
+
+    for (size_t state_id = 0; state_id < states_count; ++state_id) {
+        const unsigned int filament_id = state_id == 0 ? base_filament_id : unsigned(state_id);
+        const TextureMappingZone *zone = texture_mgr->zone_from_id(filament_id);
+        if (zone != nullptr && zone->enabled && !zone->deleted && zone->is_2d_gradient())
+            return true;
+    }
+
+    return false;
+}
+
 } // namespace
 
 
@@ -628,6 +646,8 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
         const unsigned int base_filament_id = model_volume->extruder_id() > 0 ? unsigned(model_volume->extruder_id()) : 0u;
         const TextureMappingZone *base_zone = texture_mgr != nullptr ? texture_mgr->zone_from_id(base_filament_id) : nullptr;
         const bool has_mmu_segmentation = !model_volume->mmu_segmentation_facets.empty();
+        const bool has_texture_mapping_color_preview_data = model_volume_has_texture_mapping_color_preview_data(*model_volume);
+        const bool has_texture_preview_data = model_volume_has_texture_preview_data(*model_volume);
         const bool has_texture_preview =
             base_zone != nullptr &&
             base_zone->enabled &&
@@ -682,25 +702,31 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
                                       fallback_color);
             state_colors.insert(state_colors.end(), extruder_colors.begin(), extruder_colors.end());
 
-            build_mmu_texture_preview_models(*model_volume,
-                                             triangles_per_type,
-                                             state_colors,
-                                             base_filament_id,
-                                             num_physical,
-                                             texture_mgr,
-                                             mmuseg_texture_preview_models,
-                                             mmuseg_texture_preview_colors,
-                                             mmuseg_texture_preview_filament_ids);
-            build_mmu_vertex_color_preview_models(*model_volume,
-                                                  triangles_per_type,
-                                                  state_colors,
-                                                  base_filament_id,
-                                                  num_physical,
-                                                  texture_mgr,
-                                                  this->world_matrix(),
-                                                  mmuseg_vertex_color_preview_models,
-                                                  mmuseg_vertex_color_preview_colors,
-                                                  mmuseg_vertex_color_preview_filament_ids);
+            if (!has_texture_mapping_color_preview_data && has_texture_preview_data) {
+                build_mmu_texture_preview_models(*model_volume,
+                                                 triangles_per_type,
+                                                 state_colors,
+                                                 base_filament_id,
+                                                 num_physical,
+                                                 texture_mgr,
+                                                 mmuseg_texture_preview_models,
+                                                 mmuseg_texture_preview_colors,
+                                                 mmuseg_texture_preview_filament_ids);
+            }
+            if (has_texture_mapping_color_preview_data ||
+                !has_texture_preview_data ||
+                texture_preview_has_surface_gradient_state(triangles_per_type.size(), base_filament_id, num_physical, texture_mgr)) {
+                build_mmu_vertex_color_preview_models(*model_volume,
+                                                      triangles_per_type,
+                                                      state_colors,
+                                                      base_filament_id,
+                                                      num_physical,
+                                                      texture_mgr,
+                                                      this->world_matrix(),
+                                                      mmuseg_vertex_color_preview_models,
+                                                      mmuseg_vertex_color_preview_colors,
+                                                      mmuseg_vertex_color_preview_filament_ids);
+            }
             mmuseg_ts = model_volume->mmu_segmentation_facets.timestamp();
             mmuseg_texture_preview_visual_signature = preview_visual_signature;
         }
@@ -812,6 +838,21 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
     }
     if (this->is_left_handed())
         glFrontFace(GL_CCW);
+}
+
+void GLVolume::invalidate_texture_mapping_preview()
+{
+    mmuseg_models.clear();
+    mmuseg_texture_preview_models.clear();
+    mmuseg_texture_preview_colors.clear();
+    mmuseg_texture_preview_filament_ids.clear();
+    mmuseg_vertex_color_preview_models.clear();
+    mmuseg_vertex_color_preview_colors.clear();
+    mmuseg_vertex_color_preview_filament_ids.clear();
+    mmuseg_texture_preview.reset();
+    mmuseg_texture_preview_signature = 0;
+    mmuseg_texture_preview_visual_signature = 0;
+    mmuseg_ts = 0;
 }
 
 bool GLVolume::is_sla_support() const { return this->composite_id.volume_id == -int(slaposSupportTree); }
@@ -1259,6 +1300,19 @@ bool GLWipeTowerVolume::IsTransparent() {
         }
     }
     return false; 
+}
+
+void GLVolumeCollection::invalidate_texture_mapping_preview_for_object(int object_idx)
+{
+    bool changed = false;
+    for (GLVolume *volume : volumes) {
+        if (volume == nullptr || volume->object_idx() != object_idx)
+            continue;
+        volume->invalidate_texture_mapping_preview();
+        changed = true;
+    }
+    if (changed)
+        clear_texture_preview_simulation_cache();
 }
 
 std::vector<int> GLVolumeCollection::load_object(

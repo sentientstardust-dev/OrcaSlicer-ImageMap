@@ -53,6 +53,9 @@ bool build_mmu_vertex_color_preview_models(
 
 size_t model_volume_texture_preview_signature(const ModelVolume &model_volume);
 size_t model_volume_texture_mapping_color_preview_signature(const ModelVolume &model_volume);
+bool model_volume_has_texture_preview_data(const ModelVolume &model_volume);
+bool model_volume_has_vertex_color_preview_data(const ModelVolume &model_volume);
+bool model_volume_has_texture_mapping_color_preview_data(const ModelVolume &model_volume);
 
 bool ensure_model_volume_texture_preview(const ModelVolume &model_volume,
                                          GUI::GLTexture    &texture,

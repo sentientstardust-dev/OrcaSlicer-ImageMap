@@ -768,6 +768,7 @@ public:
     unsigned int get_volumes_count() const { return (unsigned int)m_volumes.volumes.size(); }
     const GLVolumeCollection& get_volumes() const { return m_volumes; }
     void reset_volumes();
+    void invalidate_texture_mapping_preview_for_object(size_t object_idx);
     ModelInstanceEPrintVolumeState check_volumes_outside_state(ObjectFilamentResults* object_results = nullptr) const;
     void check_volumes_outside_state(GLVolumeCollection& volumes) const { check_volumes_outside_state(volumes, nullptr, false); }
     bool is_all_plates_selected() { return m_sel_plate_toolbar.m_all_plates_stats_item && m_sel_plate_toolbar.m_all_plates_stats_item->selected; }

@@ -73,6 +73,7 @@
 #include <float.h>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 #ifndef IMGUI_DEFINE_MATH_OPERATORS
 #define IMGUI_DEFINE_MATH_OPERATORS
@@ -1350,6 +1351,12 @@ void GLCanvas3D::reset_volumes()
     m_dirty = true;
 
     _set_warning_notification(EWarning::ObjectOutside, false);
+}
+
+void GLCanvas3D::invalidate_texture_mapping_preview_for_object(size_t object_idx)
+{
+    if (object_idx <= size_t(std::numeric_limits<int>::max()))
+        m_volumes.invalidate_texture_mapping_preview_for_object(int(object_idx));
 }
 
 //BBS: get current plater's bounding box

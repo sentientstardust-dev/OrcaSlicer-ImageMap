@@ -6789,6 +6789,60 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
         samples.push_back({ x_mm, y_mm, rgba, sample_weight });
     };
 
+    auto accumulate_constant_surface_triangle_samples = [&](const Vec3d &p0,
+                                                            const Vec3d &p1,
+                                                            const Vec3d &p2,
+                                                            const std::array<float, 4> &rgba) {
+        const float max_world_edge_mm = std::max({
+            float((p1 - p0).norm()),
+            float((p2 - p1).norm()),
+            float((p0 - p2).norm())
+        });
+        if (!std::isfinite(max_world_edge_mm))
+            return;
+
+        const double tri_area_mm2 = 0.5 * ((p1 - p0).cross(p2 - p0)).norm();
+        if (!std::isfinite(tri_area_mm2))
+            return;
+
+        const float world_sample_pitch_mm = high_resolution_texture_sampling ? 0.08f : 0.16f;
+        const int max_bary_steps = high_resolution_texture_sampling ? 80 : 40;
+        const int bary_steps = std::clamp(int(std::ceil(max_world_edge_mm / world_sample_pitch_mm)), 1, max_bary_steps);
+        const int sample_count = bary_steps * (bary_steps + 1) / 2;
+        if (sample_count <= 0)
+            return;
+
+        const float area_weight = std::max(0.05f, float(tri_area_mm2)) / float(sample_count);
+        if (!std::isfinite(area_weight))
+            return;
+
+        const float inv_steps = 1.f / float(bary_steps);
+        for (int i = 0; i < bary_steps; ++i) {
+            for (int j = 0; j < (bary_steps - i); ++j) {
+                const float b1 = (float(i) + 0.33333334f) * inv_steps;
+                const float b2 = (float(j) + 0.33333334f) * inv_steps;
+                const float b0 = 1.f - b1 - b2;
+                if (b0 < 0.f)
+                    continue;
+
+                const Vec3d world_pos = p0 * double(b0) + p1 * double(b1) + p2 * double(b2);
+                float sample_weight = area_weight;
+                if (use_layer_weighting) {
+                    const float dz = std::abs(float(world_pos.z()) - layer_z_mm);
+                    const float z_norm = dz / safe_layer_z_falloff_mm;
+                    const float z_weight = std::exp(-0.5f * z_norm * z_norm);
+                    if (!std::isfinite(z_weight))
+                        continue;
+                    sample_weight *= z_weight;
+                }
+                if (sample_weight <= EPSILON)
+                    continue;
+
+                accumulate_sample(float(world_pos.x()), float(world_pos.y()), rgba, sample_weight);
+            }
+        }
+    };
+
     const Transform3d object_trafo = print_object.trafo_centered();
     for (const ModelVolume *volume : model_object->volumes) {
         if (volume == nullptr)
@@ -6811,26 +6865,10 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                 if (!p0.allFinite() || !p1.allFinite() || !p2.allFinite())
                     continue;
 
-                const Vec3d world_pos = (p0 + p1 + p2) / 3.0;
                 std::array<float, 4> rgba = unpack_rgba_u32(facet.rgba);
                 rgba[3] = 1.f;
 
-                const double tri_area_mm2 = 0.5 * ((p1 - p0).cross(p2 - p0)).norm();
-                if (!std::isfinite(tri_area_mm2))
-                    continue;
-                float sample_weight = std::max(0.05f, float(tri_area_mm2));
-                if (use_layer_weighting) {
-                    const float dz = std::abs(float(world_pos.z()) - layer_z_mm);
-                    const float z_norm = dz / safe_layer_z_falloff_mm;
-                    const float z_weight = std::exp(-0.5f * z_norm * z_norm);
-                    if (!std::isfinite(z_weight))
-                        continue;
-                    sample_weight *= z_weight;
-                }
-                if (sample_weight <= EPSILON)
-                    continue;
-
-                accumulate_sample(float(world_pos.x()), float(world_pos.y()), rgba, sample_weight);
+                accumulate_constant_surface_triangle_samples(p0, p1, p2, rgba);
             }
             continue;
         }

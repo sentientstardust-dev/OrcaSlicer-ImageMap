@@ -359,6 +359,7 @@ public:
 
     //BBS: add simple render function for thumbnail
     void simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_objects, std::vector<ColorRGBA>& extruder_colors, bool ban_light =false);
+    void invalidate_texture_mapping_preview();
 
     void                set_bounding_boxes_as_dirty() {
         m_transformed_bounding_box.reset();
@@ -553,6 +554,7 @@ public:
 
     // Clear the geometry
     void clear() { clear_texture_preview_simulation_cache(); for (auto *v : volumes) delete v; volumes.clear(); }
+    void invalidate_texture_mapping_preview_for_object(int object_idx);
 
     bool empty() const { return volumes.empty(); }
     void set_range(double low, double high) { for (GLVolume *vol : this->volumes) vol->set_range(low, high); }

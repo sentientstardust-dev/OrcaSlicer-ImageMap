@@ -1559,6 +1559,63 @@ std::optional<ColorRGBA> sample_texture_mapping_color_preview(
     return unpack_vertex_color(color_facets[found->second.front()].rgba);
 }
 
+std::vector<Vec3f> clip_preview_triangle_to_triangle(const std::array<Vec3f, 3> &subject, const std::array<Vec3f, 3> &clip)
+{
+    std::vector<Vec3f> polygon(subject.begin(), subject.end());
+    const float tolerance = -1e-5f;
+
+    for (size_t side = 0; side < 3 && !polygon.empty(); ++side) {
+        std::vector<Vec3f> clipped;
+        clipped.reserve(polygon.size() + 1);
+
+        auto weight_for_side = [&clip, side](const Vec3f &point) {
+            Vec3f weights = Vec3f::Zero();
+            if (!barycentric_weights(point, clip[0], clip[1], clip[2], weights))
+                return -std::numeric_limits<float>::max();
+            return weights[side];
+        };
+
+        Vec3f previous = polygon.back();
+        float previous_weight = weight_for_side(previous);
+        bool previous_inside = previous_weight >= tolerance;
+
+        for (const Vec3f &current : polygon) {
+            const float current_weight = weight_for_side(current);
+            const bool current_inside = current_weight >= tolerance;
+
+            if (current_inside != previous_inside) {
+                const float denom = previous_weight - current_weight;
+                if (std::abs(denom) > k_epsilon) {
+                    const float t = std::clamp(previous_weight / denom, 0.f, 1.f);
+                    clipped.emplace_back(previous + (current - previous) * t);
+                }
+            }
+
+            if (current_inside)
+                clipped.emplace_back(current);
+
+            previous = current;
+            previous_weight = current_weight;
+            previous_inside = current_inside;
+        }
+
+        polygon = std::move(clipped);
+    }
+
+    return polygon;
+}
+
+bool preview_polygon_has_area(const std::vector<Vec3f> &polygon, const Vec3f &normal)
+{
+    if (polygon.size() < 3)
+        return false;
+
+    float area = 0.f;
+    for (size_t idx = 1; idx + 1 < polygon.size(); ++idx)
+        area += std::abs((polygon[idx] - polygon[0]).cross(polygon[idx + 1] - polygon[0]).dot(normal));
+    return area > k_epsilon;
+}
+
 bool build_texture_mapping_color_preview_model_for_state(
     const ModelVolume                                      &model_volume,
     const std::vector<TriangleSelector::FacetStateTriangle> &state_triangles,
@@ -1624,25 +1681,23 @@ bool build_texture_mapping_color_preview_model_for_state(
         bool emitted_color_facets = false;
         auto color_facets_for_triangle = facets_by_source_triangle.find(triangle.source_triangle);
         if (color_facets_for_triangle != facets_by_source_triangle.end()) {
-            const float tolerance = -1e-4f;
             for (const size_t facet_idx : color_facets_for_triangle->second) {
                 if (facet_idx >= color_facets.size())
                     continue;
 
                 const ColorFacetTriangle &facet = color_facets[facet_idx];
-                const Vec3f centroid = (facet.vertices[0] + facet.vertices[1] + facet.vertices[2]) / 3.f;
-                Vec3f weights = Vec3f::Zero();
-                if (!barycentric_weights(centroid, triangle.vertices[0], triangle.vertices[1], triangle.vertices[2], weights))
-                    continue;
-                if (weights.x() < tolerance || weights.y() < tolerance || weights.z() < tolerance)
+                const std::vector<Vec3f> clipped = clip_preview_triangle_to_triangle(facet.vertices, triangle.vertices);
+                if (!preview_polygon_has_area(clipped, normal))
                     continue;
 
                 const ColorRGBA color = preview_color(unpack_vertex_color(facet.rgba));
-                geometry.add_vertex(facet.vertices[0] + offset, normal, color);
-                geometry.add_vertex(facet.vertices[1] + offset, normal, color);
-                geometry.add_vertex(facet.vertices[2] + offset, normal, color);
-                geometry.add_triangle(vertex_index, vertex_index + 1, vertex_index + 2);
-                vertex_index += 3;
+                for (size_t poly_idx = 1; poly_idx + 1 < clipped.size(); ++poly_idx) {
+                    geometry.add_vertex(clipped[0] + offset, normal, color);
+                    geometry.add_vertex(clipped[poly_idx] + offset, normal, color);
+                    geometry.add_vertex(clipped[poly_idx + 1] + offset, normal, color);
+                    geometry.add_triangle(vertex_index, vertex_index + 1, vertex_index + 2);
+                    vertex_index += 3;
+                }
                 emitted_color_facets = true;
             }
         }
