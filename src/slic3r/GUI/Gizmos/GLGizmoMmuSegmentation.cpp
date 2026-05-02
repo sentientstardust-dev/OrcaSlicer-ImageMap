@@ -141,6 +141,40 @@ static std::vector<unsigned int> get_display_filament_ids(size_t total_filaments
     return sanitized_filament_ids;
 }
 
+static size_t display_filament_index_for_requested_id(const std::vector<unsigned int> &display_filament_ids,
+                                                      size_t                          current_idx,
+                                                      int                             requested_id)
+{
+    if (display_filament_ids.empty())
+        return 0;
+
+    const unsigned int requested = requested_id <= 0 ? 1u : unsigned(requested_id);
+    auto exact_it = std::find(display_filament_ids.begin(), display_filament_ids.end(), requested);
+    if (exact_it != display_filament_ids.end())
+        return size_t(std::distance(display_filament_ids.begin(), exact_it));
+
+    std::vector<unsigned int> sorted_ids = display_filament_ids;
+    std::sort(sorted_ids.begin(), sorted_ids.end());
+    sorted_ids.erase(std::unique(sorted_ids.begin(), sorted_ids.end()), sorted_ids.end());
+
+    const unsigned int current_id =
+        current_idx < display_filament_ids.size() ? display_filament_ids[current_idx] : display_filament_ids.front();
+    unsigned int selected_id = sorted_ids.front();
+    if (requested > current_id) {
+        auto it = std::lower_bound(sorted_ids.begin(), sorted_ids.end(), requested);
+        selected_id = it == sorted_ids.end() ? sorted_ids.back() : *it;
+    } else {
+        auto it = std::upper_bound(sorted_ids.begin(), sorted_ids.end(), requested);
+        if (it == sorted_ids.begin())
+            selected_id = sorted_ids.front();
+        else
+            selected_id = *(--it);
+    }
+
+    auto selected_it = std::find(display_filament_ids.begin(), display_filament_ids.end(), selected_id);
+    return selected_it != display_filament_ids.end() ? size_t(std::distance(display_filament_ids.begin(), selected_it)) : 0;
+}
+
 static unsigned int ensure_texture_mapping_zone()
 {
     if (wxGetApp().preset_bundle == nullptr || wxGetApp().plater() == nullptr)
@@ -3460,7 +3494,10 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
     const float minimal_slider_width = m_imgui->scaled(4.f);
     const float color_button_width = m_imgui->calc_text_size(std::string_view{""}).x + m_imgui->scaled(1.75f);
     const size_t total_filament_count = m_extruders_colors.size();
-    const std::string max_filament_label = std::to_string(std::max<size_t>(total_filament_count, 1));
+    const unsigned int max_display_filament_id = m_display_filament_ids.empty() ?
+        unsigned(std::max<size_t>(total_filament_count, 1)) :
+        *std::max_element(m_display_filament_ids.begin(), m_display_filament_ids.end());
+    const std::string max_filament_label = std::to_string(std::max<unsigned int>(max_display_filament_id, 1u));
     const ImVec2 max_filament_label_size = ImGui::CalcTextSize(max_filament_label.c_str(), NULL, true);
 
     float caption_max = 0.f;
@@ -3509,7 +3546,7 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
         const ColorRGBA &extruder_color = m_extruders_colors[actual_filament_id - 1];
         ImVec4           color_vec      = ImGuiWrapper::to_ImVec4(extruder_color);
         std::string color_label = std::string("##extruder color ") + std::to_string(extruder_idx);
-        std::string item_text = std::to_string(extruder_idx + 1);
+        std::string item_text = std::to_string(actual_filament_id);
         const ImVec2 label_size = ImGui::CalcTextSize(item_text.c_str(), NULL, true);
 
         const ImVec2 button_size(max_filament_label_size.x + m_imgui->scaled(0.5f), 0.f);
@@ -3543,9 +3580,12 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
 
         if (ImGui::IsItemHovered()) {
             if (extruder_idx < 9)
-                m_imgui->tooltip(_L("Shortcut Key ") + std::to_string(extruder_idx + 1), max_tooltip_width);
+                m_imgui->tooltip(wxString::Format(_L("Shortcut Key %d: Filament %u"),
+                                                   int(extruder_idx + 1),
+                                                   actual_filament_id),
+                                  max_tooltip_width);
             else
-                m_imgui->tooltip(wxString::Format(_L("Filament %d"), int(extruder_idx + 1)), max_tooltip_width);
+                m_imgui->tooltip(wxString::Format(_L("Filament %u"), actual_filament_id), max_tooltip_width);
         }
 
         // draw filament id
@@ -3563,17 +3603,19 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
     ImGui::Dummy(ImVec2(0.0f, ImGui::GetFontSize() * 0.1));
 
     if (n_extruder_colors > 0) {
-        int selected_filament = int(m_selected_extruder_idx) + 1;
+        int selected_filament = m_selected_extruder_idx < m_display_filament_ids.size() ?
+            int(m_display_filament_ids[m_selected_extruder_idx]) :
+            int(m_selected_extruder_idx) + 1;
         ImGui::AlignTextToFramePadding();
         m_imgui->text(_L("Selected filament"));
         ImGui::SameLine();
         ImGui::PushItemWidth(m_imgui->scaled(4.5f));
         if (ImGui::InputInt("##selected_filament", &selected_filament, 1, 10, ImGuiInputTextFlags_CharsDecimal)) {
-            selected_filament = std::clamp(selected_filament, 1, int(n_extruder_colors));
-            m_selected_extruder_idx = size_t(selected_filament - 1);
+            m_selected_extruder_idx =
+                display_filament_index_for_requested_id(m_display_filament_ids, m_selected_extruder_idx, selected_filament);
         }
         ImGui::SameLine();
-        m_imgui->text(wxString::Format(_L("/ %d"), int(n_extruder_colors)));
+        m_imgui->text(wxString::Format(_L("/ %u"), max_display_filament_id));
         ImGui::Dummy(ImVec2(0.0f, ImGui::GetFontSize() * 0.1));
     }
 
@@ -3839,7 +3881,7 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
         m_show_filament_remap_ui = !m_show_filament_remap_ui;
         if (m_show_filament_remap_ui) {
             // reset remap to identity on opening
-            m_extruder_remap.resize(m_extruders_colors.size());
+            m_extruder_remap.resize(m_display_filament_ids.size());
             for (size_t i = 0; i < m_extruder_remap.size(); ++i)
                 m_extruder_remap[i] = i;
         }
@@ -4716,7 +4758,11 @@ wxString GLGizmoMmuSegmentation::handle_snapshot_action_name(bool shift_down, GL
     if (shift_down)
         action_name = _L("Remove painted color");
     else {
-        action_name        = GUI::format(_L("Painted using: Filament %1%"), m_selected_extruder_idx + 1);
+        const unsigned int filament_id =
+            m_selected_extruder_idx < m_display_filament_ids.size() ?
+                m_display_filament_ids[m_selected_extruder_idx] :
+                unsigned(m_selected_extruder_idx + 1);
+        action_name        = GUI::format(_L("Painted using: Filament %1%"), filament_id);
     }
     return action_name;
 }
@@ -6788,9 +6834,12 @@ void GLMmSegmentationGizmo3DScene::finalize_triangle_indices()
 
 void GLGizmoMmuSegmentation::render_filament_remap_ui(float window_width, float max_tooltip_width)
 {
-    size_t n_extr = std::min((size_t)EnforcerBlockerType::ExtruderMax, m_display_filament_ids.size());
+    size_t n_extr = std::min({(size_t)EnforcerBlockerType::ExtruderMax, m_display_filament_ids.size(), m_extruder_remap.size()});
 
-    const std::string max_label = std::to_string(std::max<size_t>(n_extr, 1));
+    unsigned int max_label_id = 1;
+    for (size_t idx = 0; idx < n_extr; ++idx)
+        max_label_id = std::max(max_label_id, m_display_filament_ids[idx]);
+    const std::string max_label = std::to_string(max_label_id);
     const ImVec2 max_label_size = ImGui::CalcTextSize(max_label.c_str(), NULL, true);
     const ImVec2 button_size(max_label_size.x + m_imgui->scaled(0.5f), 0.f);
     const int max_items_per_line = 8;
@@ -6798,7 +6847,8 @@ void GLGizmoMmuSegmentation::render_filament_remap_ui(float window_width, float 
     const float start_pos_x = ImGui::GetCursorPosX();
 
     for (int src = 0; src < (int)n_extr; ++src) {
-        const unsigned int dst_filament_id = m_extruder_remap[src] < m_display_filament_ids.size() ? m_display_filament_ids[m_extruder_remap[src]] : 0;
+        const unsigned int dst_filament_id =
+            m_extruder_remap[src] < m_display_filament_ids.size() ? m_display_filament_ids[m_extruder_remap[src]] : 0;
         if (dst_filament_id == 0 || dst_filament_id > m_extruders_colors.size())
             continue;
         const ColorRGBA &dst_col = m_extruders_colors[dst_filament_id - 1];
@@ -6831,7 +6881,7 @@ void GLGizmoMmuSegmentation::render_filament_remap_ui(float window_width, float 
         #endif
 
         // overlay destination number with proper contrast calculation
-        std::string dst_txt = std::to_string(m_extruder_remap[src] + 1);
+        std::string dst_txt = std::to_string(dst_filament_id);
         float gray = 0.299f * dst_col.r() + 0.587f * dst_col.g() + 0.114f * dst_col.b();
         ImVec2 txt_sz = ImGui::CalcTextSize(dst_txt.c_str());
         ImVec2 pos = ImGui::GetItemRectMin();
@@ -6901,9 +6951,9 @@ void GLGizmoMmuSegmentation::render_filament_remap_ui(float window_width, float 
                     ImGui::PopStyleVar(2);
                     ImGui::PopStyleColor(1);
                 #endif
-                
+
                 // overlay destination number on popup buttons
-                std::string dst_num_txt = std::to_string(dst + 1);
+                std::string dst_num_txt = std::to_string(popup_filament_id);
                 float dst_gray = 0.299f * dst_col_popup.r() + 0.587f * dst_col_popup.g() + 0.114f * dst_col_popup.b();
                 ImVec2 dst_txt_sz = ImGui::CalcTextSize(dst_num_txt.c_str());
                 ImVec2 dst_pos = ImGui::GetItemRectMin();
