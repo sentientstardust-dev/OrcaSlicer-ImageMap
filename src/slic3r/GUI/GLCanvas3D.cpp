@@ -2001,7 +2001,12 @@ void GLCanvas3D::render(bool only_init)
         //only_body = true;
         only_current = true;
     }
-    else if ((gizmo_type == GLGizmosManager::FdmSupports) || (gizmo_type == GLGizmosManager::Seam) || (gizmo_type == GLGizmosManager::MmSegmentation) || (gizmo_type == GLGizmosManager::FuzzySkin))
+    else if ((gizmo_type == GLGizmosManager::FdmSupports) ||
+             (gizmo_type == GLGizmosManager::Seam) ||
+             (gizmo_type == GLGizmosManager::MmSegmentation) ||
+             (gizmo_type == GLGizmosManager::TrueColorPainting) ||
+             (gizmo_type == GLGizmosManager::ImageProjection) ||
+             (gizmo_type == GLGizmosManager::FuzzySkin))
         no_partplate = true;
     else if (gizmo_type == GLGizmosManager::BrimEars && !camera.is_looking_downward())
         show_grid = false;
@@ -3416,7 +3421,9 @@ void GLCanvas3D::on_char(wxKeyEvent& evt)
                 if (keyCode < '7')  keyCode += 10;
                 m_timer_set_color.Stop();
             }
-            if (m_gizmos.get_current_type() != GLGizmosManager::MmSegmentation)
+            if (m_gizmos.get_current_type() != GLGizmosManager::MmSegmentation &&
+                m_gizmos.get_current_type() != GLGizmosManager::TrueColorPainting &&
+                m_gizmos.get_current_type() != GLGizmosManager::ImageProjection)
                 obj_list->set_extruder_for_selected_items(keyCode - '0');
             break;
         }
@@ -3958,7 +3965,9 @@ void GLCanvas3D::on_render_timer(wxTimerEvent& evt)
 void GLCanvas3D::on_set_color_timer(wxTimerEvent& evt)
 {
     auto obj_list = wxGetApp().obj_list();
-    if (m_gizmos.get_current_type() != GLGizmosManager::MmSegmentation)
+    if (m_gizmos.get_current_type() != GLGizmosManager::MmSegmentation &&
+        m_gizmos.get_current_type() != GLGizmosManager::TrueColorPainting &&
+        m_gizmos.get_current_type() != GLGizmosManager::ImageProjection)
         obj_list->set_extruder_for_selected_items(1);
     m_timer_set_color.Stop();
 }
@@ -4113,7 +4122,10 @@ void GLCanvas3D::on_mouse(wxMouseEvent& evt)
         m_dirty = true;
         // do not return if dragging or tooltip not empty to allow for tooltip update
         // also, do not return if the mouse is moving and also is inside MM gizmo to allow update seed fill selection
-        if (!m_mouse.dragging && m_tooltip.is_empty() && (m_gizmos.get_current_type() != GLGizmosManager::MmSegmentation || !evt.Moving()))
+        if (!m_mouse.dragging && m_tooltip.is_empty() &&
+            ((m_gizmos.get_current_type() != GLGizmosManager::MmSegmentation &&
+              m_gizmos.get_current_type() != GLGizmosManager::TrueColorPainting &&
+              m_gizmos.get_current_type() != GLGizmosManager::ImageProjection) || !evt.Moving()))
             return;
     }
 
@@ -4314,6 +4326,8 @@ void GLCanvas3D::on_mouse(wxMouseEvent& evt)
                     && m_gizmos.get_current_type() != GLGizmosManager::Seam
                     && m_gizmos.get_current_type() != GLGizmosManager::Cut
                     && m_gizmos.get_current_type() != GLGizmosManager::MmSegmentation
+                    && m_gizmos.get_current_type() != GLGizmosManager::TrueColorPainting
+                    && m_gizmos.get_current_type() != GLGizmosManager::ImageProjection
                     && m_gizmos.get_current_type() != GLGizmosManager::FuzzySkin) {
                     m_rectangle_selection.start_dragging(m_mouse.position, evt.ShiftDown() ? GLSelectionRectangle::Select : GLSelectionRectangle::Deselect);
                     m_dirty = true;
@@ -4466,6 +4480,8 @@ void GLCanvas3D::on_mouse(wxMouseEvent& evt)
                 const Vec3d rot = (Vec3d(pos.x(), pos.y(), 0.) - m_mouse.drag.start_position_3D) * (PI * TRACKBALLSIZE / 180.) * mult;
                 if (this->m_canvas_type == ECanvasType::CanvasAssembleView || m_gizmos.get_current_type() == GLGizmosManager::FdmSupports ||
                     m_gizmos.get_current_type() == GLGizmosManager::Seam || m_gizmos.get_current_type() == GLGizmosManager::MmSegmentation ||
+                    m_gizmos.get_current_type() == GLGizmosManager::TrueColorPainting ||
+                    m_gizmos.get_current_type() == GLGizmosManager::ImageProjection ||
                     m_gizmos.get_current_type() == GLGizmosManager::FuzzySkin) {
                     Vec3d rotate_target = Vec3d::Zero();
                     if (!m_selection.is_empty())
@@ -8942,7 +8958,9 @@ void GLCanvas3D::_render_assemble_control()
         GLVolume::explosion_ratio = m_explosion_ratio = 1.0;
         return;
     }
-    if (m_gizmos.get_current_type() == GLGizmosManager::EType::MmSegmentation) {
+    if (m_gizmos.get_current_type() == GLGizmosManager::EType::MmSegmentation ||
+        m_gizmos.get_current_type() == GLGizmosManager::EType::TrueColorPainting ||
+        m_gizmos.get_current_type() == GLGizmosManager::EType::ImageProjection) {
         m_gizmos.m_assemble_view_data->model_objects_clipper()->set_position(0.0, true);
         return;
     }

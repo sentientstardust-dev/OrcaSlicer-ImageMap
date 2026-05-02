@@ -357,6 +357,7 @@ static constexpr const char* CUSTOM_SUPPORTS_ATTR = "paint_supports";
 static constexpr const char* CUSTOM_FUZZY_SKIN_ATTR  = "paint_fuzzy_skin";
 static constexpr const char* CUSTOM_SEAM_ATTR = "paint_seam";
 static constexpr const char* MMU_SEGMENTATION_ATTR = "paint_color";
+static constexpr const char* TEXTURE_MAPPING_COLOR_ATTR = "texture_mapping_color";
 // BBS
 static constexpr const char* FACE_PROPERTY_ATTR = "face_property";
 
@@ -940,8 +941,9 @@ static bool decode_jpeg_rgba_from_memory(const std::vector<uint8_t> &encoded,
     while (cinfo.output_scanline < cinfo.output_height) {
         jpeg_read_scanlines(&cinfo, scanline, 1);
         const unsigned char *src = scanline[0];
+        const uint32_t dst_y = height - 1 - y;
         for (uint32_t x = 0; x < width; ++x) {
-            const size_t dst = (size_t(y) * size_t(width) + size_t(x)) * 4;
+            const size_t dst = (size_t(dst_y) * size_t(width) + size_t(x)) * 4;
             if (components >= 3) {
                 const size_t s = size_t(x) * size_t(components);
                 out_rgba[dst + 0] = src[s + 0];
@@ -1274,6 +1276,7 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
             std::vector<std::string> custom_supports;
             std::vector<std::string> custom_seam;
             std::vector<std::string> mmu_segmentation;
+            std::vector<std::string> texture_mapping_color;
             std::vector<std::string> fuzzy_skin;
             // BBS
             std::vector<std::string> face_properties;
@@ -1293,6 +1296,9 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
                 std::swap(triangles, o.triangles);
                 std::swap(custom_supports, o.custom_supports);
                 std::swap(custom_seam, o.custom_seam);
+                std::swap(mmu_segmentation, o.mmu_segmentation);
+                std::swap(texture_mapping_color, o.texture_mapping_color);
+                std::swap(fuzzy_skin, o.fuzzy_skin);
                 std::swap(face_properties, o.face_properties);
                 std::swap(texture_uvs_per_face, o.texture_uvs_per_face);
                 std::swap(texture_uv_valid, o.texture_uv_valid);
@@ -1309,6 +1315,7 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
                 custom_supports.clear();
                 custom_seam.clear();
                 mmu_segmentation.clear();
+                texture_mapping_color.clear();
                 fuzzy_skin.clear();
                 face_properties.clear();
                 texture_uvs_per_face.clear();
@@ -4472,6 +4479,8 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
             m_curr_object->geometry.custom_supports.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_SUPPORTS_ATTR));
             m_curr_object->geometry.custom_seam.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_SEAM_ATTR));
             m_curr_object->geometry.mmu_segmentation.push_back(bbs_get_attribute_value_string(attributes, num_attributes, MMU_SEGMENTATION_ATTR));
+            m_curr_object->geometry.texture_mapping_color.push_back(
+                bbs_get_attribute_value_string(attributes, num_attributes, TEXTURE_MAPPING_COLOR_ATTR));
             m_curr_object->geometry.fuzzy_skin.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_FUZZY_SKIN_ATTR));
             // BBS
             m_curr_object->geometry.face_properties.push_back(bbs_get_attribute_value_string(attributes, num_attributes, FACE_PROPERTY_ATTR));
@@ -5717,11 +5726,13 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
                 volume->supported_facets.reserve(triangles_count);
                 volume->seam_facets.reserve(triangles_count);
                 volume->mmu_segmentation_facets.reserve(triangles_count);
+                volume->texture_mapping_color_facets.reserve(triangles_count);
                 volume->fuzzy_skin_facets.reserve(triangles_count);
                 for (size_t i=0; i<triangles_count; ++i) {
                     assert(i < sub_object->geometry.custom_supports.size());
                     assert(i < sub_object->geometry.custom_seam.size());
                     assert(i < sub_object->geometry.mmu_segmentation.size());
+                    assert(i < sub_object->geometry.texture_mapping_color.size());
                     assert(i < sub_object->geometry.fuzzy_skin.size());
                     if (! sub_object->geometry.custom_supports[i].empty())
                         volume->supported_facets.set_triangle_from_string(i, sub_object->geometry.custom_supports[i]);
@@ -5729,6 +5740,8 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
                         volume->seam_facets.set_triangle_from_string(i, sub_object->geometry.custom_seam[i]);
                     if (! sub_object->geometry.mmu_segmentation[i].empty())
                         volume->mmu_segmentation_facets.set_triangle_from_string(i, sub_object->geometry.mmu_segmentation[i]);
+                    if (!sub_object->geometry.texture_mapping_color[i].empty())
+                        volume->texture_mapping_color_facets.set_triangle_from_string(i, sub_object->geometry.texture_mapping_color[i]);
                     if (!sub_object->geometry.fuzzy_skin[i].empty())
                         volume->fuzzy_skin_facets.set_triangle_from_string(i, sub_object->geometry.fuzzy_skin[i]);
                 }
@@ -5736,6 +5749,8 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
                 volume->seam_facets.shrink_to_fit();
                 volume->mmu_segmentation_facets.shrink_to_fit();
                 volume->mmu_segmentation_facets.touch();
+                volume->texture_mapping_color_facets.shrink_to_fit();
+                volume->texture_mapping_color_facets.touch();
                 volume->fuzzy_skin_facets.shrink_to_fit();
                 volume->fuzzy_skin_facets.touch();
             }
@@ -5927,21 +5942,26 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
             volume->supported_facets.reserve(triangles_count);
             volume->seam_facets.reserve(triangles_count);
             volume->mmu_segmentation_facets.reserve(triangles_count);
+            volume->texture_mapping_color_facets.reserve(triangles_count);
             for (size_t i=0; i<triangles_count; ++i) {
                 size_t index = volume_data.first_triangle_id + i;
                 assert(index < geometry.custom_supports.size());
                 assert(index < geometry.custom_seam.size());
                 assert(index < geometry.mmu_segmentation.size());
+                assert(index < geometry.texture_mapping_color.size());
                 if (! geometry.custom_supports[index].empty())
                     volume->supported_facets.set_triangle_from_string(i, geometry.custom_supports[index]);
                 if (! geometry.custom_seam[index].empty())
                     volume->seam_facets.set_triangle_from_string(i, geometry.custom_seam[index]);
                 if (! geometry.mmu_segmentation[index].empty())
                     volume->mmu_segmentation_facets.set_triangle_from_string(i, geometry.mmu_segmentation[index]);
+                if (! geometry.texture_mapping_color[index].empty())
+                    volume->texture_mapping_color_facets.set_triangle_from_string(i, geometry.texture_mapping_color[index]);
             }
             volume->supported_facets.shrink_to_fit();
             volume->seam_facets.shrink_to_fit();
             volume->mmu_segmentation_facets.shrink_to_fit();
+            volume->texture_mapping_color_facets.shrink_to_fit();
 
             volume->set_type(volume_data.part_type);
 
@@ -6339,6 +6359,8 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
             current_object->geometry.custom_supports.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_SUPPORTS_ATTR));
             current_object->geometry.custom_seam.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_SEAM_ATTR));
             current_object->geometry.mmu_segmentation.push_back(bbs_get_attribute_value_string(attributes, num_attributes, MMU_SEGMENTATION_ATTR));
+            current_object->geometry.texture_mapping_color.push_back(
+                bbs_get_attribute_value_string(attributes, num_attributes, TEXTURE_MAPPING_COLOR_ATTR));
             current_object->geometry.fuzzy_skin.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_FUZZY_SKIN_ATTR));
             // BBS
             current_object->geometry.face_properties.push_back(bbs_get_attribute_value_string(attributes, num_attributes, FACE_PROPERTY_ATTR));
@@ -7814,6 +7836,7 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
                                 if ((shared_volume->supported_facets.equals(volume->supported_facets))
                                     && (shared_volume->seam_facets.equals(volume->seam_facets))
                                     && (shared_volume->mmu_segmentation_facets.equals(volume->mmu_segmentation_facets))
+                                    && (shared_volume->texture_mapping_color_facets.equals(volume->texture_mapping_color_facets))
                                     && (shared_volume->fuzzy_skin_facets.equals(volume->fuzzy_skin_facets))
                                     && (shared_volume->imported_vertex_colors_rgba == volume->imported_vertex_colors_rgba)
                                     && (shared_volume->imported_texture_uvs_per_face == volume->imported_texture_uvs_per_face)
@@ -8454,6 +8477,15 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
                     output_buffer += MMU_SEGMENTATION_ATTR;
                     output_buffer += "=\"";
                     output_buffer += mmu_painting_data_string;
+                    output_buffer += "\"";
+                }
+
+                std::string texture_mapping_color_data_string = volume->texture_mapping_color_facets.get_triangle_as_string(i);
+                if (! texture_mapping_color_data_string.empty()) {
+                    output_buffer += " ";
+                    output_buffer += TEXTURE_MAPPING_COLOR_ATTR;
+                    output_buffer += "=\"";
+                    output_buffer += texture_mapping_color_data_string;
                     output_buffer += "\"";
                 }
 

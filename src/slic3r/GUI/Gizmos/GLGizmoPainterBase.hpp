@@ -29,6 +29,7 @@ enum class PainterGizmoType {
     FDM_SUPPORTS,
     SEAM,
     MM_SEGMENTATION,
+    TRUE_COLOR,
     FUZZY_SKIN
 };
 
@@ -128,6 +129,9 @@ public:
 
     void set_ebt_colors(const std::vector<ColorRGBA> ebt_colors) { m_ebt_colors = ebt_colors; }
     void set_filter_state(bool is_filter_state);
+    void set_none_state_rendered(bool rendered) { m_render_none_state = rendered; }
+    void set_texture_preview_needed(bool needed) { m_texture_preview_needed = needed; }
+    void set_texture_preview_opaque(bool opaque) { m_texture_preview_opaque = opaque; }
 
     constexpr static float GapAreaMin = 0.f;
     constexpr static float GapAreaMax = 5.f;
@@ -194,6 +198,9 @@ protected:
     std::vector<unsigned int> m_vertex_color_preview_filament_ids;
 
     bool                        m_filter_state = false;
+    bool                        m_render_none_state = true;
+    bool                        m_texture_preview_needed = true;
+    bool                        m_texture_preview_opaque = false;
 
 private:
     void update_render_data();
@@ -335,6 +342,7 @@ protected:
     ClippingPlaneDataWrapper get_clipping_plane_data() const;
 
     TriangleSelector::ClippingPlane get_clipping_plane_in_volume_coordinates(const Transform3d &trafo) const;
+    bool raycast_to_selected_mesh(const Vec2d &mouse_position, int &mesh_id, Vec3f &hit, size_t &facet) const;
 
 private:
     std::vector<std::vector<ProjectedMousePosition>> get_projected_mouse_positions(const Vec2d &mouse_position, double resolution, const std::vector<Transform3d> &trafo_matrices) const;

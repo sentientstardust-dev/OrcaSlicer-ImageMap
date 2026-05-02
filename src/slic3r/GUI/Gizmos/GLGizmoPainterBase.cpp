@@ -23,6 +23,9 @@ namespace {
 
 bool model_volume_has_texture_preview_data_for_painting(const ModelVolume &model_volume)
 {
+    if (!model_volume.texture_mapping_color_facets.empty())
+        return false;
+
     return !model_volume.imported_texture_rgba.empty() &&
            model_volume.imported_texture_width > 0 &&
            model_volume.imported_texture_height > 0 &&
@@ -100,6 +103,14 @@ void GLGizmoPainterBase::render_triangles(const Selection& selection) const
     ClippingPlaneDataWrapper clp_data = this->get_clipping_plane_data();
     shader->set_uniform("clipping_plane", clp_data.clp_dataf);
     shader->set_uniform("z_range", clp_data.z_range);
+
+    const GLboolean cull_face_enabled = glIsEnabled(GL_CULL_FACE);
+    ScopeGuard cull_face_guard([cull_face_enabled]() {
+        if (cull_face_enabled)
+            glsafe(::glEnable(GL_CULL_FACE));
+        else
+            glsafe(::glDisable(GL_CULL_FACE));
+    });
 
     // BBS: to improve the random white pixel issue
     glsafe(::glDisable(GL_CULL_FACE));
@@ -1069,6 +1080,57 @@ bool GLGizmoPainterBase::on_mouse(const wxMouseEvent &mouse_event)
     return false;
 }
 
+bool GLGizmoPainterBase::raycast_to_selected_mesh(const Vec2d &mouse_position, int &mesh_id, Vec3f &hit, size_t &facet) const
+{
+    mesh_id = -1;
+    hit = Vec3f::Zero();
+    facet = 0;
+
+    if (m_c == nullptr || m_c->selection_info() == nullptr)
+        return false;
+
+    const ModelObject *mo = m_c->selection_info()->model_object();
+    if (mo == nullptr)
+        return false;
+
+    const Selection &selection = m_parent.get_selection();
+    const int instance_idx = selection.get_instance_idx();
+    if (instance_idx < 0 || size_t(instance_idx) >= mo->instances.size() || mo->instances[size_t(instance_idx)] == nullptr)
+        return false;
+
+    const ModelInstance *mi = mo->instances[size_t(instance_idx)];
+    const Transform3d instance_trafo = m_parent.get_canvas_type() == GLCanvas3D::CanvasAssembleView ?
+        mi->get_assemble_transformation().get_matrix() :
+        mi->get_transformation().get_matrix();
+
+    std::vector<Transform3d> trafo_matrices;
+    for (const ModelVolume *mv : mo->volumes) {
+        if (mv == nullptr || !mv->is_model_part())
+            continue;
+
+        if (m_parent.get_canvas_type() == GLCanvas3D::CanvasAssembleView) {
+            Transform3d temp = instance_trafo * mv->get_matrix();
+            temp.translate(mv->get_transformation().get_offset() * (GLVolume::explosion_ratio - 1.0) + mi->get_offset_to_assembly() * (GLVolume::explosion_ratio - 1.0));
+            trafo_matrices.emplace_back(temp);
+        } else {
+            trafo_matrices.emplace_back(instance_trafo * mv->get_matrix());
+        }
+    }
+
+    if (trafo_matrices.empty())
+        return false;
+
+    m_rr.mouse_position = Vec2d(std::numeric_limits<double>::lowest(), std::numeric_limits<double>::lowest());
+    update_raycast_cache(mouse_position, wxGetApp().plater()->get_camera(), trafo_matrices);
+    if (m_rr.mesh_id == -1)
+        return false;
+
+    mesh_id = m_rr.mesh_id;
+    hit = m_rr.hit;
+    facet = m_rr.facet;
+    return true;
+}
+
 void GLGizmoPainterBase::update_raycast_cache(const Vec2d& mouse_position,
                                               const Camera& camera,
                                               const std::vector<Transform3d>& trafo_matrices) const
@@ -1409,6 +1471,8 @@ void TriangleSelectorPatch::update_triangles_per_type()
             continue;
 
         int state = (int)triangle.get_state();
+        if (!m_render_none_state && state == int(EnforcerBlockerType::NONE))
+            continue;
         auto& patch = m_triangle_patches[state];
         //patch.triangle_indices.insert(patch.triangle_indices.end(), triangle.verts_idxs.begin(), triangle.verts_idxs.end());
         for (int i = 0; i < 3; ++i) {
@@ -1614,7 +1678,7 @@ void TriangleSelectorPatch::update_render_data()
         m_vertex_color_preview_models.clear();
         m_vertex_color_preview_colors.clear();
         m_vertex_color_preview_filament_ids.clear();
-        if (m_model_volume != nullptr) {
+        if (m_texture_preview_needed && m_model_volume != nullptr) {
             std::vector<std::vector<TriangleSelector::FacetStateTriangle>> triangles_per_type;
             get_facet_triangles(triangles_per_type);
             const size_t num_physical = std::max(0, wxGetApp().filaments_cnt());
@@ -1759,7 +1823,7 @@ void TriangleSelectorPatch::render_texture_preview(const Transform3d&          m
                                                    const std::array<float, 2>& z_range,
                                                    const std::array<float, 4>& clipping_plane) const
 {
-    if (m_model_volume == nullptr)
+    if (!m_texture_preview_needed || m_model_volume == nullptr)
         return;
 
     const size_t num_physical = std::max(0, wxGetApp().filaments_cnt());
@@ -1775,10 +1839,13 @@ void TriangleSelectorPatch::render_texture_preview(const Transform3d&          m
     if (m_texture_preview_models.empty() && m_vertex_color_preview_models.empty())
         return;
 
-    auto adjusted_preview_colors = [](const std::vector<ColorRGBA> &colors) {
+    auto adjusted_preview_colors = [this](const std::vector<ColorRGBA> &colors) {
         std::vector<ColorRGBA> preview_colors = colors;
-        for (ColorRGBA &preview_color : preview_colors)
+        for (ColorRGBA &preview_color : preview_colors) {
             preview_color = adjust_color_for_rendering(preview_color);
+            if (m_texture_preview_opaque)
+                preview_color.a(1.f);
+        }
         return preview_colors;
     };
 
@@ -1795,7 +1862,11 @@ void TriangleSelectorPatch::render_texture_preview(const Transform3d&          m
                                             view_matrix,
                                             projection_matrix,
                                             z_range,
-                                            clipping_plane);
+                                            clipping_plane,
+                                            -1,
+                                            std::array<float, 4>{ 0.f, 0.f, 0.f, 0.f },
+                                            std::array<float, 2>{ 0.f, 0.f },
+                                            m_texture_preview_opaque);
     }
 
     if (!m_vertex_color_preview_models.empty()) {
@@ -1808,7 +1879,11 @@ void TriangleSelectorPatch::render_texture_preview(const Transform3d&          m
                                                  view_matrix,
                                                  projection_matrix,
                                                  z_range,
-                                                 clipping_plane);
+                                                 clipping_plane,
+                                                 -1,
+                                                 std::array<float, 4>{ 0.f, 0.f, 0.f, 0.f },
+                                                 std::array<float, 2>{ 0.f, 0.f },
+                                                 m_texture_preview_opaque);
     }
 }
 

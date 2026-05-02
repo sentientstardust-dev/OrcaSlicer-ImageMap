@@ -84,6 +84,8 @@ public:
         Seam,
         FuzzySkin,
         MmSegmentation,
+        TrueColorPainting,
+        ImageProjection,
         Emboss,
         Svg,
         Measure,

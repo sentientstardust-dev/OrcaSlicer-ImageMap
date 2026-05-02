@@ -34,6 +34,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <array>
 #include <algorithm>
 #include <functional>
 #include <optional>
@@ -791,6 +792,119 @@ private:
     friend class ModelVolume;
 };
 
+struct ColorTriangleBitStreamMapping
+{
+    int triangle_idx        = -1;
+    int bitstream_start_idx = -1;
+    int color_start_idx     = -1;
+
+    ColorTriangleBitStreamMapping() = default;
+    ColorTriangleBitStreamMapping(int triangle_idx_, int bitstream_start_idx_, int color_start_idx_)
+        : triangle_idx(triangle_idx_), bitstream_start_idx(bitstream_start_idx_), color_start_idx(color_start_idx_) {}
+
+    friend bool operator==(const ColorTriangleBitStreamMapping &lhs, const ColorTriangleBitStreamMapping &rhs)
+    {
+        return lhs.triangle_idx == rhs.triangle_idx &&
+               lhs.bitstream_start_idx == rhs.bitstream_start_idx &&
+               lhs.color_start_idx == rhs.color_start_idx;
+    }
+    friend bool operator!=(const ColorTriangleBitStreamMapping &lhs, const ColorTriangleBitStreamMapping &rhs) { return !(lhs == rhs); }
+
+private:
+    friend class cereal::access;
+    template<class Archive> void serialize(Archive &ar) { ar(triangle_idx, bitstream_start_idx, color_start_idx); }
+};
+
+struct TriangleColorSplittingData
+{
+    std::vector<ColorTriangleBitStreamMapping> triangles_to_split;
+    std::vector<bool>                          bitstream;
+    std::vector<uint32_t>                      colors_rgba;
+    std::string                                metadata_json;
+
+    friend bool operator==(const TriangleColorSplittingData &lhs, const TriangleColorSplittingData &rhs)
+    {
+        return lhs.triangles_to_split == rhs.triangles_to_split &&
+               lhs.bitstream == rhs.bitstream &&
+               lhs.colors_rgba == rhs.colors_rgba &&
+               lhs.metadata_json == rhs.metadata_json;
+    }
+    friend bool operator!=(const TriangleColorSplittingData &lhs, const TriangleColorSplittingData &rhs) { return !(lhs == rhs); }
+
+private:
+    friend class cereal::access;
+    template<class Archive> void serialize(Archive &ar) { ar(triangles_to_split, bitstream, colors_rgba, metadata_json); }
+};
+
+struct ColorFacetTriangle
+{
+    std::array<Vec3f, 3> vertices;
+    int                  source_triangle = -1;
+    uint32_t             rgba = 0xFFFFFFFFu;
+};
+
+using TextureMappingColorSampler = std::function<uint32_t(size_t, const Vec3f &, const Vec3f &)>;
+using TextureMappingColorSubdivisionDepths = std::function<std::pair<int, int>(size_t, const std::array<Vec3f, 3> &)>;
+
+class ColorFacetsAnnotation final : public ObjectWithTimestamp {
+public:
+    void assign(const ColorFacetsAnnotation &rhs)
+    {
+        if (!this->timestamp_matches(rhs)) {
+            m_data = rhs.m_data;
+            this->copy_timestamp(rhs);
+        }
+    }
+    void assign(ColorFacetsAnnotation &&rhs)
+    {
+        if (!this->timestamp_matches(rhs)) {
+            m_data = std::move(rhs.m_data);
+            this->copy_timestamp(rhs);
+        }
+    }
+    const TriangleColorSplittingData &get_data() const noexcept { return m_data; }
+    const std::string &metadata_json() const noexcept { return m_data.metadata_json; }
+    void set_metadata_json(std::string metadata_json);
+    bool empty() const { return m_data.triangles_to_split.empty(); }
+    void reset();
+    void reserve(int n_triangles) { m_data.triangles_to_split.reserve(n_triangles); }
+    void shrink_to_fit()
+    {
+        m_data.triangles_to_split.shrink_to_fit();
+        m_data.bitstream.shrink_to_fit();
+        m_data.colors_rgba.shrink_to_fit();
+    }
+    bool equals(const ColorFacetsAnnotation &other) const;
+    std::string get_triangle_as_string(int triangle_idx) const;
+    void set_triangle_from_string(int triangle_id, const std::string &str);
+    bool set_from_triangle_sampler(const ModelVolume &mv,
+                                   const TextureMappingColorSampler &sampler,
+                                   int max_depth = 2,
+                                   float split_color_threshold = 0.045f,
+                                   const TextureMappingColorSubdivisionDepths &subdivision_depths = {});
+    void get_facet_triangles(const ModelVolume &mv, std::vector<ColorFacetTriangle> &facets) const;
+
+private:
+    explicit ColorFacetsAnnotation() = default;
+    explicit ColorFacetsAnnotation(int) : ObjectWithTimestamp(-1) {}
+    explicit ColorFacetsAnnotation(const ColorFacetsAnnotation &rhs) = default;
+    explicit ColorFacetsAnnotation(ColorFacetsAnnotation &&rhs) = default;
+
+    ColorFacetsAnnotation& operator=(const ColorFacetsAnnotation &rhs) = default;
+    ColorFacetsAnnotation& operator=(ColorFacetsAnnotation &&rhs) = default;
+
+    friend class cereal::access;
+    friend class UndoRedo::StackImpl;
+    friend class ModelVolume;
+
+    template<class Archive> void serialize(Archive &ar)
+    {
+        ar(cereal::base_class<ObjectWithTimestamp>(this), m_data);
+    }
+
+    TriangleColorSplittingData m_data;
+};
+
 // An object STL, or a modifier volume, over which a different set of parameters shall be applied.
 // ModelVolume instances are owned by a ModelObject.
 class ModelVolume final : public ObjectBase
@@ -876,6 +990,8 @@ public:
 
     // List of mesh facets painted for MMU segmentation.
     FacetsAnnotation    mmu_segmentation_facets;
+
+    ColorFacetsAnnotation texture_mapping_color_facets;
 
     std::vector<uint32_t> imported_vertex_colors_rgba;
 
@@ -1011,12 +1127,14 @@ public:
         this->supported_facets.set_new_unique_id();
         this->seam_facets.set_new_unique_id();
         this->mmu_segmentation_facets.set_new_unique_id();
+        this->texture_mapping_color_facets.set_new_unique_id();
         this->fuzzy_skin_facets.set_new_unique_id();
     }
 
     bool is_fdm_support_painted() const { return !this->supported_facets.empty(); }
     bool is_seam_painted() const { return !this->seam_facets.empty(); }
     bool is_mm_painted() const { return !this->mmu_segmentation_facets.empty(); }
+    bool has_texture_mapping_color_data() const { return !this->texture_mapping_color_facets.empty(); }
     bool is_fuzzy_skin_painted() const { return !this->fuzzy_skin_facets.empty(); }
     
     // Orca: Implement prusa's filament shrink compensation approach
@@ -1069,11 +1187,13 @@ private:
         assert(this->supported_facets.id().valid());
         assert(this->seam_facets.id().valid());
         assert(this->mmu_segmentation_facets.id().valid());
+        assert(this->texture_mapping_color_facets.id().valid());
         assert(this->fuzzy_skin_facets.id().valid());
         assert(this->id() != this->config.id());
         assert(this->id() != this->supported_facets.id());
         assert(this->id() != this->seam_facets.id());
         assert(this->id() != this->mmu_segmentation_facets.id());
+        assert(this->id() != this->texture_mapping_color_facets.id());
         assert(this->id() != this->fuzzy_skin_facets.id());
         if (mesh.facets_count() > 1)
             calculate_convex_hull();
@@ -1085,11 +1205,13 @@ private:
         assert(this->supported_facets.id().valid());
         assert(this->seam_facets.id().valid());
         assert(this->mmu_segmentation_facets.id().valid());
+        assert(this->texture_mapping_color_facets.id().valid());
         assert(this->fuzzy_skin_facets.id().valid());
         assert(this->id() != this->config.id());
         assert(this->id() != this->supported_facets.id());
         assert(this->id() != this->seam_facets.id());
         assert(this->id() != this->mmu_segmentation_facets.id());
+        assert(this->id() != this->texture_mapping_color_facets.id());
         assert(this->id() != this->fuzzy_skin_facets.id());
     }
     ModelVolume(ModelObject *object, TriangleMesh &&mesh, TriangleMesh &&convex_hull, ModelVolumeType type = ModelVolumeType::MODEL_PART) :
@@ -1099,11 +1221,13 @@ private:
         assert(this->supported_facets.id().valid());
         assert(this->seam_facets.id().valid());
         assert(this->mmu_segmentation_facets.id().valid());
+        assert(this->texture_mapping_color_facets.id().valid());
         assert(this->fuzzy_skin_facets.id().valid());
         assert(this->id() != this->config.id());
         assert(this->id() != this->supported_facets.id());
         assert(this->id() != this->seam_facets.id());
         assert(this->id() != this->mmu_segmentation_facets.id());
+        assert(this->id() != this->texture_mapping_color_facets.id());
         assert(this->id() != this->fuzzy_skin_facets.id());
 	}
 
@@ -1113,6 +1237,7 @@ private:
         name(other.name), source(other.source), m_mesh(other.m_mesh), m_convex_hull(other.m_convex_hull),
         config(other.config), m_type(other.m_type), object(object), m_transformation(other.m_transformation),
         supported_facets(other.supported_facets), seam_facets(other.seam_facets), mmu_segmentation_facets(other.mmu_segmentation_facets),
+        texture_mapping_color_facets(other.texture_mapping_color_facets),
         imported_vertex_colors_rgba(other.imported_vertex_colors_rgba),
         imported_texture_uvs_per_face(other.imported_texture_uvs_per_face),
         imported_texture_uv_valid(other.imported_texture_uv_valid),
@@ -1126,16 +1251,19 @@ private:
         assert(this->supported_facets.id().valid());
         assert(this->seam_facets.id().valid());
         assert(this->mmu_segmentation_facets.id().valid());
+        assert(this->texture_mapping_color_facets.id().valid());
         assert(this->fuzzy_skin_facets.id().valid());
         assert(this->id() != this->config.id());
         assert(this->id() != this->supported_facets.id());
         assert(this->id() != this->seam_facets.id());
         assert(this->id() != this->mmu_segmentation_facets.id());
+        assert(this->id() != this->texture_mapping_color_facets.id());
 		assert(this->id() == other.id());
         assert(this->config.id() == other.config.id());
         assert(this->supported_facets.id() == other.supported_facets.id());
         assert(this->seam_facets.id() == other.seam_facets.id());
         assert(this->mmu_segmentation_facets.id() == other.mmu_segmentation_facets.id());
+        assert(this->texture_mapping_color_facets.id() == other.texture_mapping_color_facets.id());
         assert(this->fuzzy_skin_facets.id() == other.fuzzy_skin_facets.id());
         this->set_material_id(other.material_id());
     }
@@ -1149,11 +1277,13 @@ private:
         assert(this->supported_facets.id().valid());
         assert(this->seam_facets.id().valid());
         assert(this->mmu_segmentation_facets.id().valid());
+        assert(this->texture_mapping_color_facets.id().valid());
         assert(this->fuzzy_skin_facets.id().valid());
         assert(this->id() != this->config.id());
         assert(this->id() != this->supported_facets.id());
         assert(this->id() != this->seam_facets.id());
         assert(this->id() != this->mmu_segmentation_facets.id());
+        assert(this->id() != this->texture_mapping_color_facets.id());
         assert(this->id() != this->fuzzy_skin_facets.id());
 		assert(this->id() != other.id());
         assert(this->config.id() == other.config.id());
@@ -1166,11 +1296,13 @@ private:
         assert(this->supported_facets.id() != other.supported_facets.id());
         assert(this->seam_facets.id() != other.seam_facets.id());
         assert(this->mmu_segmentation_facets.id() != other.mmu_segmentation_facets.id());
+        assert(this->texture_mapping_color_facets.id() != other.texture_mapping_color_facets.id());
         assert(this->fuzzy_skin_facets.id() != other.fuzzy_skin_facets.id());
         assert(this->id() != this->config.id());
         assert(this->supported_facets.empty());
         assert(this->seam_facets.empty());
         assert(this->mmu_segmentation_facets.empty());
+        assert(this->texture_mapping_color_facets.empty());
         assert(this->fuzzy_skin_facets.empty());
     }
 
@@ -1179,12 +1311,13 @@ private:
 	friend class cereal::access;
 	friend class UndoRedo::StackImpl;
 	// Used for deserialization, therefore no IDs are allocated.
-	ModelVolume() : ObjectBase(-1), config(-1), supported_facets(-1), seam_facets(-1), mmu_segmentation_facets(-1), fuzzy_skin_facets(-1), object(nullptr) {
+	ModelVolume() : ObjectBase(-1), config(-1), supported_facets(-1), seam_facets(-1), mmu_segmentation_facets(-1), texture_mapping_color_facets(-1), fuzzy_skin_facets(-1), object(nullptr) {
 		assert(this->id().invalid());
         assert(this->config.id().invalid());
         assert(this->supported_facets.id().invalid());
         assert(this->seam_facets.id().invalid());
         assert(this->mmu_segmentation_facets.id().invalid());
+        assert(this->texture_mapping_color_facets.id().invalid());
         assert(this->fuzzy_skin_facets.id().invalid());
 	}
 	template<class Archive> void load(Archive &ar) {
@@ -1203,6 +1336,9 @@ private:
         t = mmu_segmentation_facets.timestamp();
         cereal::load_by_value(ar, mmu_segmentation_facets);
         mesh_changed |= t != mmu_segmentation_facets.timestamp();
+        t = texture_mapping_color_facets.timestamp();
+        cereal::load_by_value(ar, texture_mapping_color_facets);
+        mesh_changed |= t != texture_mapping_color_facets.timestamp();
         ar(imported_vertex_colors_rgba);
         ar(imported_texture_uvs_per_face, imported_texture_uv_valid, imported_texture_rgba, imported_texture_width, imported_texture_height);
         cereal::load_by_value(ar, fuzzy_skin_facets);
@@ -1210,6 +1346,16 @@ private:
         cereal::load_by_value(ar, config);
         cereal::load(ar, text_configuration);
         cereal::load(ar, emboss_shape);
+		if (!m_mesh) {
+            m_mesh = std::make_shared<const TriangleMesh>();
+            imported_vertex_colors_rgba.clear();
+            imported_texture_uvs_per_face.clear();
+            imported_texture_uv_valid.clear();
+            imported_texture_rgba.clear();
+            imported_texture_width = 0;
+            imported_texture_height = 0;
+            texture_mapping_color_facets.reset();
+        }
 		assert(m_mesh);
 		if (has_convex_hull) {
 			cereal::load_optional(ar, m_convex_hull);
@@ -1227,6 +1373,7 @@ private:
         cereal::save_by_value(ar, supported_facets);
         cereal::save_by_value(ar, seam_facets);
         cereal::save_by_value(ar, mmu_segmentation_facets);
+        cereal::save_by_value(ar, texture_mapping_color_facets);
         ar(imported_vertex_colors_rgba);
         ar(imported_texture_uvs_per_face, imported_texture_uv_valid, imported_texture_rgba, imported_texture_width, imported_texture_height);
         cereal::save_by_value(ar, fuzzy_skin_facets);
@@ -1777,6 +1924,8 @@ bool model_custom_seam_data_changed(const ModelObject& mo, const ModelObject& mo
 // Test whether the now ModelObject has newer MMU segmentation data than the old one.
 // The function assumes that volumes list is synchronized.
 extern bool model_mmu_segmentation_data_changed(const ModelObject& mo, const ModelObject& mo_new);
+
+extern bool model_texture_mapping_color_data_changed(const ModelObject& mo, const ModelObject& mo_new);
 
 // Test whether the now ModelObject has newer fuzzy skin data than the old one.
 // The function assumes that volumes list is synchronized.

@@ -216,8 +216,11 @@ static std::vector<std::string> collect_texture_mapping_vertex_color_match_warni
 
     bool has_imported_vertex_color_data = false;
     bool has_imported_texture_data = false;
+    bool has_texture_mapping_color_data = false;
     bool has_uv_texture_reference_but_no_image = false;
     for (const ModelVolume *volume : model_object->volumes) {
+        if (volume != nullptr && !volume->texture_mapping_color_facets.empty())
+            has_texture_mapping_color_data = true;
         if (volume != nullptr && !volume->imported_vertex_colors_rgba.empty())
             has_imported_vertex_color_data = true;
         if (volume != nullptr &&
@@ -236,11 +239,11 @@ static std::vector<std::string> collect_texture_mapping_vertex_color_match_warni
             !volume->imported_texture_uvs_per_face.empty()) {
             has_imported_texture_data = true;
         }
-        if (has_imported_vertex_color_data || has_imported_texture_data)
+        if (has_texture_mapping_color_data || has_imported_vertex_color_data || has_imported_texture_data)
             break;
     }
 
-    if (has_imported_vertex_color_data || has_imported_texture_data)
+    if (has_texture_mapping_color_data || has_imported_vertex_color_data || has_imported_texture_data)
         return {};
 
     if (has_uv_texture_reference_but_no_image)

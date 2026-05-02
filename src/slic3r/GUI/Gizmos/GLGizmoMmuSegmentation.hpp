@@ -3,6 +3,12 @@
 
 #include "GLGizmoPainterBase.hpp"
 
+#include <array>
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 namespace Slic3r::GUI {
 
 class GLMmSegmentationGizmo3DScene
@@ -100,13 +106,14 @@ protected:
 
     wxString handle_snapshot_action_name(bool shift_down, Button button_down) const override;
 
-    std::string get_gizmo_entering_text() const override { return "Entering color painting"; }
-    std::string get_gizmo_leaving_text() const override { return "Leaving color painting"; }
-    std::string get_action_snapshot_name() const override { return "Color painting editing"; }
+    std::string get_gizmo_entering_text() const override { return "Entering color region painting"; }
+    std::string get_gizmo_leaving_text() const override { return "Leaving color region painting"; }
+    std::string get_action_snapshot_name() const override { return "Color region painting editing"; }
 
     // BBS
     size_t                            m_selected_extruder_idx = 0;
     std::vector<ColorRGBA>            m_extruders_colors;
+    std::vector<unsigned int>         m_display_filament_ids;
     std::vector<int>                  m_volumes_extruder_idxs;
 
     // BBS
@@ -114,10 +121,8 @@ protected:
     bool                              m_detect_geometry_edge = true;
     
     // Filament remap feature
-    bool                              m_show_remap_panel = false;
     std::vector<size_t>               m_extruder_remap;      // index → target extruder index
-    // ORCA: Cache used filaments to filter UI
-    std::set<size_t>                  m_used_filaments;      // Set of used filament indices (cached)
+    bool                              m_show_filament_remap_ui = false;
 
     static const constexpr float      CursorRadiusMin = 0.1f; // cannot be zero
 
@@ -139,6 +144,7 @@ private:
     // BBS
     void update_triangle_selectors_colors();
     void init_extruders_data();
+    void init_extruders_data(const std::vector<ColorRGBA> &extruder_colors);
     
     // Filament remapping methods
     void remap_filament_assignments();
@@ -146,13 +152,15 @@ private:
     bool selected_object_has_imported_vertex_colors() const;
     bool selected_object_has_imported_texture_data() const;
     bool selected_object_has_bakeable_image_texture_data() const;
+    bool selected_object_has_texture_mapping_color_data() const;
     bool selected_object_has_painted_regions() const;
     void open_obj_vertex_color_mapping_dialog();
     void bake_selected_object_image_texture_to_vertex_colors();
+    void convert_selected_object_vertex_colors_to_texture_mapping_colors();
+    void convert_selected_object_image_texture_to_texture_mapping_colors();
     void convert_selected_regions_to_vertex_colors();
     void clear_selected_object_image_texture_data();
-    // ORCA: Helper to update the cache of used filaments
-    void update_used_filaments();
+    void clear_selected_object_texture_mapping_color_data();
 
     // This map holds all translated description texts, so they can be easily referenced during layout calculations
     // etc. When language changes, GUI is recreated and this class constructed again, so the change takes effect.
@@ -164,6 +172,187 @@ private:
     std::vector<std::pair<wxString, wxString>> m_shortcuts_bucket_fill;
     // Contains all shortcuts in the format of {shortcut, description}, e.g. {alt + _L("Left mouse button"), _L("Part_selection")}
     std::vector<std::pair<wxString, wxString>> m_shortcuts_gap_fill;
+};
+
+class GLGizmoTrueColorPainting : public GLGizmoPainterBase
+{
+public:
+    GLGizmoTrueColorPainting(GLCanvas3D& parent, const std::string& icon_filename, unsigned int sprite_id);
+    ~GLGizmoTrueColorPainting() override = default;
+
+    void render_painter_gizmo() override;
+    bool gizmo_event(SLAGizmoEventType action, const Vec2d& mouse_position, bool shift_down, bool alt_down, bool control_down) override;
+
+    const float get_cursor_radius_min() const override { return CursorRadiusMin; }
+
+protected:
+    ColorRGBA get_cursor_hover_color() const override;
+    ColorRGBA get_cursor_sphere_left_button_color() const override;
+    EnforcerBlockerType get_left_button_state_type() const override { return EnforcerBlockerType::ENFORCER; }
+    EnforcerBlockerType get_right_button_state_type() const override { return EnforcerBlockerType(-1); }
+
+    void on_render_input_window(float x, float y, float bottom_limit) override;
+    std::string on_get_name() const override;
+    bool on_is_selectable() const override;
+    bool on_is_activable() const override;
+
+    wxString handle_snapshot_action_name(bool shift_down, Button button_down) const override;
+
+    std::string get_gizmo_entering_text() const override { return "Entering true color painting"; }
+    std::string get_gizmo_leaving_text() const override { return "Leaving true color painting"; }
+    std::string get_action_snapshot_name() const override { return "True color painting editing"; }
+
+private:
+    enum class ColorInputMode : int
+    {
+        FilamentColors,
+        RGB,
+        CMY,
+        CMYK,
+        CMYW,
+        RGBK,
+        RGBW,
+        BW
+    };
+
+    bool on_init() override;
+    void update_model_object() override;
+    void update_from_model_object(bool first_update = false) override;
+    void on_opening() override;
+    void on_shutdown() override;
+    PainterGizmoType get_painter_type() const override;
+
+    void init_model_triangle_selectors();
+    ModelObject *selected_model_object() const;
+    void update_selected_object_color_state();
+    bool selected_object_has_rgb_data() const;
+    bool selected_object_has_imported_color_data() const;
+    void initialize_selected_object_rgb_data();
+    void convert_selected_object_vertex_colors_to_rgb_data();
+    void convert_selected_object_image_texture_to_rgb_data();
+    void refresh_selected_object_after_rgb_change(ModelObject *object);
+    void update_triangle_selectors_color();
+    bool pick_color_from_model(const Vec2d &mouse_position);
+    bool sample_color_from_model(const Vec2d &mouse_position, ColorRGBA &color) const;
+    void set_active_color_from_sample(const ColorRGBA &color);
+    void sync_cmy_from_rgb();
+    void sync_rgb_from_cmy();
+    void sync_cmyk_from_rgb();
+    void sync_rgb_from_cmyk();
+    void sync_cmyw_from_rgb();
+    void sync_rgb_from_cmyw();
+    void sync_rgbk_from_rgb();
+    void sync_rgb_from_rgbk();
+    void sync_rgbw_from_rgb();
+    void sync_rgb_from_rgbw();
+    void sync_bw_from_rgb();
+    void sync_rgb_from_bw();
+    void ensure_filament_mix_colors();
+    void sync_filament_mix_from_rgb();
+    void sync_rgb_from_filament_mix();
+    void sync_active_color_mode_from_rgb(bool update_filament_mix);
+    bool render_rgb_picker(float item_width);
+    bool render_cmy_picker(float item_width);
+    bool render_cmyk_picker(float item_width);
+    bool render_cmyw_picker(float item_width);
+    bool render_rgbk_picker(float item_width);
+    bool render_rgbw_picker(float item_width);
+    bool render_bw_picker(float item_width);
+    bool render_filament_colors_picker(float item_width);
+
+    std::array<float, 4> m_rgb_color { 0.f, 0.f, 0.f, 1.f };
+    std::array<float, 3> m_cmy_color { 1.f, 1.f, 1.f };
+    std::array<float, 4> m_cmyk_color { 0.f, 0.f, 0.f, 1.f };
+    std::array<float, 4> m_cmyw_color { 0.f, 0.f, 0.f, 1.f };
+    std::array<float, 4> m_rgbk_color { 0.f, 0.f, 0.f, 1.f };
+    std::array<float, 4> m_rgbw_color { 0.f, 0.f, 0.f, 1.f };
+    std::array<float, 2> m_bw_color { 1.f, 0.f };
+    std::vector<ColorRGBA> m_filament_mix_colors;
+    std::vector<float>  m_filament_mix;
+    float                m_brush_hardness = 1.f;
+    float                m_opacity = 1.f;
+    ColorInputMode       m_color_input_mode = ColorInputMode::RGB;
+    bool                 m_selected_has_rgb_data = false;
+    bool                 m_selected_has_imported_color_data = false;
+    bool                 m_selected_can_convert_vertex = false;
+    bool                 m_selected_can_convert_image = false;
+    bool                 m_color_picker_active = false;
+    ObjectID             m_selected_color_state_object_id;
+    struct ColorPickerVolumeSourceCache
+    {
+        ObjectID volume_id;
+        ObjectBase::Timestamp timestamp = 0;
+        std::vector<ColorFacetTriangle>              rgb_facets;
+        std::unordered_map<int, std::vector<size_t>> rgb_by_source_triangle;
+    };
+    const ColorPickerVolumeSourceCache &cached_volume_color_source(const ModelVolume &volume) const;
+    mutable std::vector<ColorPickerVolumeSourceCache> m_color_picker_source_cache;
+
+    static const constexpr float CursorRadiusMin = 0.1f;
+};
+
+class GLGizmoImageProjection : public GLGizmoBase
+{
+public:
+    GLGizmoImageProjection(GLCanvas3D& parent, const std::string& icon_filename, unsigned int sprite_id);
+    ~GLGizmoImageProjection() override = default;
+
+protected:
+    bool on_init() override;
+    void on_render() override;
+    void on_render_input_window(float x, float y, float bottom_limit) override;
+    std::string on_get_name() const override;
+    void on_set_state() override;
+    bool on_is_selectable() const override;
+    bool on_is_activable() const override;
+    CommonGizmosDataID on_get_requirements() const override;
+
+private:
+    enum class ProjectionMode : int
+    {
+        VertexColors,
+        ImageTexture,
+        RGBData
+    };
+
+    struct OverlayRect
+    {
+        float left = 0.f;
+        float top = 0.f;
+        float width = 0.f;
+        float height = 0.f;
+    };
+
+    bool load_projection_image();
+    void clear_projection_image();
+    bool ensure_overlay_texture();
+    OverlayRect overlay_rect() const;
+    ModelObject *selected_model_object() const;
+    void update_default_projection_mode();
+    ProjectionMode default_projection_mode() const;
+    bool projection_mode_allowed(ProjectionMode mode) const;
+    bool selected_object_has_image_texture_data() const;
+    bool selected_object_has_vertex_color_data() const;
+    bool selected_object_has_rgb_data() const;
+    bool project_image_to_selected_object();
+    bool project_to_vertex_colors(ModelObject *object);
+    bool project_to_image_texture(ModelObject *object);
+    bool project_to_rgb_data(ModelObject *object);
+    void refresh_projected_object(ModelObject *object);
+
+    ProjectionMode       m_projection_mode = ProjectionMode::RGBData;
+    bool                 m_projection_mode_initialized = false;
+    ObjectID             m_projection_mode_object_id;
+    std::string          m_image_path;
+    std::string          m_image_error;
+    std::vector<uint8_t> m_image_rgba;
+    uint32_t             m_image_width = 0;
+    uint32_t             m_image_height = 0;
+    GLTexture            m_overlay_texture;
+    bool                 m_overlay_texture_dirty = false;
+    float                m_projection_opacity = 1.f;
+    bool                 m_apply_transparency_as_background = false;
+    bool                 m_pass_through_model = false;
 };
 
 } // namespace Slic3r

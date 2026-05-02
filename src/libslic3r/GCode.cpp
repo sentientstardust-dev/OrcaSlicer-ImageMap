@@ -6559,6 +6559,40 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
         const indexed_triangle_set &its = mesh_ptr->its;
         const Transform3d volume_trafo = object_trafo * volume->get_matrix();
 
+        if (!volume->texture_mapping_color_facets.empty()) {
+            std::vector<ColorFacetTriangle> color_facets;
+            volume->texture_mapping_color_facets.get_facet_triangles(*volume, color_facets);
+            for (const ColorFacetTriangle &facet : color_facets) {
+                const Vec3d p0 = volume_trafo * facet.vertices[0].cast<double>();
+                const Vec3d p1 = volume_trafo * facet.vertices[1].cast<double>();
+                const Vec3d p2 = volume_trafo * facet.vertices[2].cast<double>();
+                if (!p0.allFinite() || !p1.allFinite() || !p2.allFinite())
+                    continue;
+
+                const Vec3d world_pos = (p0 + p1 + p2) / 3.0;
+                std::array<float, 4> rgba = unpack_rgba_u32(facet.rgba);
+                rgba[3] = 1.f;
+
+                const double tri_area_mm2 = 0.5 * ((p1 - p0).cross(p2 - p0)).norm();
+                if (!std::isfinite(tri_area_mm2))
+                    continue;
+                float sample_weight = std::max(0.05f, float(tri_area_mm2));
+                if (use_layer_weighting) {
+                    const float dz = std::abs(float(world_pos.z()) - layer_z_mm);
+                    const float z_norm = dz / safe_layer_z_falloff_mm;
+                    const float z_weight = std::exp(-0.5f * z_norm * z_norm);
+                    if (!std::isfinite(z_weight))
+                        continue;
+                    sample_weight *= z_weight;
+                }
+                if (sample_weight <= EPSILON)
+                    continue;
+
+                accumulate_sample(float(world_pos.x()), float(world_pos.y()), rgba, sample_weight);
+            }
+            continue;
+        }
+
         bool sampled_from_uv_texture = false;
         const bool has_uv_texture =
             !volume->imported_texture_rgba.empty() &&

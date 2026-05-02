@@ -67,7 +67,9 @@ std::vector<size_t> GLGizmosManager::get_selectable_idxs() const
                 m_gizmos[i]->get_sprite_id() == (unsigned int) Rotate ||
                 m_gizmos[i]->get_sprite_id() == (unsigned int) Measure ||
                 m_gizmos[i]->get_sprite_id() == (unsigned int) Assembly ||
-                m_gizmos[i]->get_sprite_id() == (unsigned int) MmSegmentation)
+                m_gizmos[i]->get_sprite_id() == (unsigned int) MmSegmentation ||
+                m_gizmos[i]->get_sprite_id() == (unsigned int) TrueColorPainting ||
+                m_gizmos[i]->get_sprite_id() == (unsigned int) ImageProjection)
                 out.push_back(i);
     }
     else {
@@ -161,6 +163,12 @@ void GLGizmosManager::switch_gizmos_icon_filename()
         case(EType::MmSegmentation):
             gizmo->set_icon_filename(m_is_dark ? "mmu_segmentation_dark.svg" : "mmu_segmentation.svg");
             break;
+        case(EType::TrueColorPainting):
+            gizmo->set_icon_filename(m_is_dark ? "true_color_painting_dark.svg" : "true_color_painting.svg");
+            break;
+        case(EType::ImageProjection):
+            gizmo->set_icon_filename(m_is_dark ? "image_projection_dark.svg" : "image_projection.svg");
+            break;
         case(EType::FuzzySkin):
             gizmo->set_icon_filename(m_is_dark ? "toolbar_fuzzy_skin_paint_dark.svg" : "toolbar_fuzzy_skin_paint.svg");
             break;
@@ -213,6 +221,12 @@ bool GLGizmosManager::init()
     m_gizmos.emplace_back(new GLGizmoSeam(m_parent, m_is_dark ? "toolbar_seam_dark.svg" : "toolbar_seam.svg", EType::Seam));
     m_gizmos.emplace_back(new GLGizmoFuzzySkin(m_parent, m_is_dark ? "toolbar_fuzzy_skin_paint_dark.svg" : "toolbar_fuzzy_skin_paint.svg", EType::FuzzySkin));
     m_gizmos.emplace_back(new GLGizmoMmuSegmentation(m_parent, m_is_dark ? "mmu_segmentation_dark.svg" : "mmu_segmentation.svg", EType::MmSegmentation));
+    m_gizmos.emplace_back(new GLGizmoTrueColorPainting(m_parent,
+                                                       m_is_dark ? "true_color_painting_dark.svg" : "true_color_painting.svg",
+                                                       EType::TrueColorPainting));
+    m_gizmos.emplace_back(new GLGizmoImageProjection(m_parent,
+                                                     m_is_dark ? "image_projection_dark.svg" : "image_projection.svg",
+                                                     EType::ImageProjection));
     m_gizmos.emplace_back(new GLGizmoEmboss(m_parent, m_is_dark ? "toolbar_text_dark.svg" : "toolbar_text.svg", EType::Emboss));
     m_gizmos.emplace_back(new GLGizmoSVG(m_parent));
     m_gizmos.emplace_back(new GLGizmoMeasure(m_parent, m_is_dark ? "toolbar_measure_dark.svg" : "toolbar_measure.svg", EType::Measure));
@@ -516,6 +530,9 @@ bool GLGizmosManager::gizmo_event(SLAGizmoEventType action, const Vec2d& mouse_p
         return dynamic_cast<GLGizmoSeam*>(m_gizmos[Seam].get())->gizmo_event(action, mouse_position, shift_down, alt_down, control_down);
     else if (m_current == MmSegmentation)
         return dynamic_cast<GLGizmoMmuSegmentation*>(m_gizmos[MmSegmentation].get())->gizmo_event(action, mouse_position, shift_down, alt_down, control_down);
+    else if (m_current == TrueColorPainting)
+        return dynamic_cast<GLGizmoTrueColorPainting*>(m_gizmos[TrueColorPainting].get())
+            ->gizmo_event(action, mouse_position, shift_down, alt_down, control_down);
     else if (m_current == Measure)
         return dynamic_cast<GLGizmoMeasure *>(m_gizmos[Measure].get())->gizmo_event(action, mouse_position, shift_down, alt_down, control_down);
     else if (m_current == Assembly)
@@ -536,6 +553,7 @@ bool GLGizmosManager::is_paint_gizmo()
 {
     return m_current == EType::FdmSupports ||
            m_current == EType::MmSegmentation ||
+           m_current == EType::TrueColorPainting ||
            m_current == EType::FuzzySkin ||
            m_current == EType::Seam;
 }
@@ -635,7 +653,8 @@ bool GLGizmosManager::on_mouse_wheel(const wxMouseEvent &evt)
 {
     bool processed = false;
 
-    if (/*m_current == SlaSupports || m_current == Hollow ||*/ m_current == FdmSupports || m_current == Seam || m_current == MmSegmentation || m_current == FuzzySkin || m_current == BrimEars) {
+    if (/*m_current == SlaSupports || m_current == Hollow ||*/ m_current == FdmSupports || m_current == Seam ||
+        m_current == MmSegmentation || m_current == TrueColorPainting || m_current == FuzzySkin || m_current == BrimEars) {
         float rot = (float)evt.GetWheelRotation() / (float)evt.GetWheelDelta();
         if (gizmo_event((rot > 0.f ? SLAGizmoEventType::MouseWheelUp : SLAGizmoEventType::MouseWheelDown), Vec2d::Zero(), evt.ShiftDown(), evt.AltDown()
             // BBS
@@ -1468,7 +1487,11 @@ std::string get_name_from_gizmo_etype(GLGizmosManager::EType type)
     case GLGizmosManager::EType::Emboss:
         return "Text";
     case GLGizmosManager::EType::MmSegmentation:
-        return "Color Painting";
+        return "Color Region Painting";
+    case GLGizmosManager::EType::TrueColorPainting:
+        return "True Color Painting";
+    case GLGizmosManager::EType::ImageProjection:
+        return "Project image to model surface";
     case GLGizmosManager::EType::FuzzySkin:
         return "Fuzzy Skin Painting";
     default:

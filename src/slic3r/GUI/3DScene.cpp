@@ -116,7 +116,8 @@ std::vector<TriangleSelector::FacetStateTriangle> build_full_mesh_texture_previe
 
 bool model_volume_has_any_texture_preview_data(const ModelVolume &model_volume)
 {
-    return !model_volume.imported_vertex_colors_rgba.empty() ||
+    return !model_volume.texture_mapping_color_facets.empty() ||
+           !model_volume.imported_vertex_colors_rgba.empty() ||
            (!model_volume.imported_texture_rgba.empty() &&
             model_volume.imported_texture_width > 0 &&
             model_volume.imported_texture_height > 0);
@@ -646,6 +647,8 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
         preview_visual_signature ^= model_volume->imported_vertex_colors_rgba.size() + 0x9e3779b97f4a7c15ull +
                                     (preview_visual_signature << 6) + (preview_visual_signature >> 2);
         preview_visual_signature ^= reinterpret_cast<size_t>(model_volume->imported_vertex_colors_rgba.data()) + 0x9e3779b97f4a7c15ull +
+                                    (preview_visual_signature << 6) + (preview_visual_signature >> 2);
+        preview_visual_signature ^= model_volume_texture_mapping_color_preview_signature(*model_volume) + 0x9e3779b97f4a7c15ull +
                                     (preview_visual_signature << 6) + (preview_visual_signature >> 2);
         if (model_volume->mmu_segmentation_facets.timestamp() != mmuseg_ts ||
             preview_visual_signature != mmuseg_texture_preview_visual_signature) {

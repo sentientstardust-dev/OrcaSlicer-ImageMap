@@ -115,6 +115,11 @@ bool model_volume_has_vertex_color_preview_data(const ModelVolume &model_volume)
            model_volume.imported_vertex_colors_rgba.size() == model_volume.mesh().its.vertices.size();
 }
 
+bool model_volume_has_texture_mapping_color_preview_data(const ModelVolume &model_volume)
+{
+    return !model_volume.texture_mapping_color_facets.empty();
+}
+
 std::array<Vec2f, 3> unwrap_triangle_uvs(const Vec2f &uv0, const Vec2f &uv1, const Vec2f &uv2)
 {
     std::array<Vec2f, 3> out{ uv0, uv1, uv2 };
@@ -1352,6 +1357,151 @@ bool build_vertex_color_preview_model_for_state(const ModelVolume               
     return true;
 }
 
+std::optional<ColorRGBA> sample_texture_mapping_color_preview(
+    const std::vector<ColorFacetTriangle>     &color_facets,
+    const std::unordered_map<int, std::vector<size_t>> &facets_by_source_triangle,
+    int                                        source_triangle,
+    const Vec3f                               &point)
+{
+    auto found = facets_by_source_triangle.find(source_triangle);
+    if (found == facets_by_source_triangle.end() || found->second.empty())
+        return std::nullopt;
+
+    const float tolerance = -1e-4f;
+    for (const size_t facet_idx : found->second) {
+        if (facet_idx >= color_facets.size())
+            continue;
+
+        const ColorFacetTriangle &facet = color_facets[facet_idx];
+        Vec3f weights = Vec3f::Zero();
+        if (!barycentric_weights(point, facet.vertices[0], facet.vertices[1], facet.vertices[2], weights))
+            continue;
+        if (weights.x() >= tolerance && weights.y() >= tolerance && weights.z() >= tolerance)
+            return unpack_vertex_color(facet.rgba);
+    }
+
+    return unpack_vertex_color(color_facets[found->second.front()].rgba);
+}
+
+bool build_texture_mapping_color_preview_model_for_state(
+    const ModelVolume                                      &model_volume,
+    const std::vector<TriangleSelector::FacetStateTriangle> &state_triangles,
+    const TexturePreviewSimulationSettings                  *simulation_settings,
+    GUI::GLModel                                            &out_model)
+{
+    if (!model_volume_has_texture_mapping_color_preview_data(model_volume) || state_triangles.empty())
+        return false;
+
+    std::vector<ColorFacetTriangle> color_facets;
+    model_volume.texture_mapping_color_facets.get_facet_triangles(model_volume, color_facets);
+    if (color_facets.empty())
+        return false;
+
+    std::unordered_map<int, std::vector<size_t>> facets_by_source_triangle;
+    facets_by_source_triangle.reserve(color_facets.size());
+    for (size_t idx = 0; idx < color_facets.size(); ++idx)
+        facets_by_source_triangle[color_facets[idx].source_triangle].emplace_back(idx);
+
+    GUI::GLModel::Geometry geometry;
+    geometry.format = { GUI::GLModel::Geometry::EPrimitiveType::Triangles, GUI::GLModel::Geometry::EVertexLayout::P3N3C4 };
+    geometry.reserve_vertices(color_facets.size() * 3);
+    geometry.reserve_indices(color_facets.size() * 3);
+
+    std::unordered_map<uint32_t, ColorRGBA> simulated_color_cache;
+    if (simulation_settings != nullptr)
+        simulated_color_cache.reserve(std::min(color_facets.size(), size_t(65536)));
+    auto preview_color = [simulation_settings, &simulated_color_cache](const ColorRGBA &source_color) {
+        if (simulation_settings == nullptr)
+            return source_color;
+
+        const uint32_t key = (uint32_t(std::clamp(source_color.r(), 0.f, 1.f) * 255.f + 0.5f) << 24) |
+                             (uint32_t(std::clamp(source_color.g(), 0.f, 1.f) * 255.f + 0.5f) << 16) |
+                             (uint32_t(std::clamp(source_color.b(), 0.f, 1.f) * 255.f + 0.5f) << 8) |
+                             uint32_t(std::clamp(source_color.a(), 0.f, 1.f) * 255.f + 0.5f);
+        auto cached = simulated_color_cache.find(key);
+        if (cached != simulated_color_cache.end())
+            return cached->second;
+
+        const ColorRGBA simulated_color = simulated_texture_preview_color_for_vertex_color(&source_color, simulation_settings);
+        simulated_color_cache.emplace(key, simulated_color);
+        return simulated_color;
+    };
+
+    unsigned int vertex_index = 0;
+    for (const TriangleSelector::FacetStateTriangle &triangle : state_triangles) {
+        if (triangle.source_triangle < 0)
+            continue;
+
+        const Vec3f edge_0 = triangle.vertices[1] - triangle.vertices[0];
+        const Vec3f edge_1 = triangle.vertices[2] - triangle.vertices[0];
+        Vec3f normal = edge_0.cross(edge_1);
+        const float normal_len = normal.norm();
+        if (normal_len <= k_epsilon)
+            continue;
+        normal /= normal_len;
+        const Vec3f offset = normal * k_preview_offset;
+
+        bool emitted_color_facets = false;
+        auto color_facets_for_triangle = facets_by_source_triangle.find(triangle.source_triangle);
+        if (color_facets_for_triangle != facets_by_source_triangle.end()) {
+            const float tolerance = -1e-4f;
+            for (const size_t facet_idx : color_facets_for_triangle->second) {
+                if (facet_idx >= color_facets.size())
+                    continue;
+
+                const ColorFacetTriangle &facet = color_facets[facet_idx];
+                const Vec3f centroid = (facet.vertices[0] + facet.vertices[1] + facet.vertices[2]) / 3.f;
+                Vec3f weights = Vec3f::Zero();
+                if (!barycentric_weights(centroid, triangle.vertices[0], triangle.vertices[1], triangle.vertices[2], weights))
+                    continue;
+                if (weights.x() < tolerance || weights.y() < tolerance || weights.z() < tolerance)
+                    continue;
+
+                const ColorRGBA color = preview_color(unpack_vertex_color(facet.rgba));
+                geometry.add_vertex(facet.vertices[0] + offset, normal, color);
+                geometry.add_vertex(facet.vertices[1] + offset, normal, color);
+                geometry.add_vertex(facet.vertices[2] + offset, normal, color);
+                geometry.add_triangle(vertex_index, vertex_index + 1, vertex_index + 2);
+                vertex_index += 3;
+                emitted_color_facets = true;
+            }
+        }
+
+        if (emitted_color_facets)
+            continue;
+
+        std::array<ColorRGBA, 3> leaf_colors;
+        bool valid_leaf = true;
+        for (size_t vertex_idx = 0; vertex_idx < triangle.vertices.size(); ++vertex_idx) {
+            std::optional<ColorRGBA> sampled =
+                sample_texture_mapping_color_preview(color_facets,
+                                                     facets_by_source_triangle,
+                                                     triangle.source_triangle,
+                                                     triangle.vertices[vertex_idx]);
+            if (!sampled) {
+                valid_leaf = false;
+                break;
+            }
+            leaf_colors[vertex_idx] = preview_color(*sampled);
+        }
+
+        if (!valid_leaf)
+            continue;
+
+        geometry.add_vertex(triangle.vertices[0] + offset, normal, leaf_colors[0]);
+        geometry.add_vertex(triangle.vertices[1] + offset, normal, leaf_colors[1]);
+        geometry.add_vertex(triangle.vertices[2] + offset, normal, leaf_colors[2]);
+        geometry.add_triangle(vertex_index, vertex_index + 1, vertex_index + 2);
+        vertex_index += 3;
+    }
+
+    if (geometry.is_empty())
+        return false;
+
+    out_model.init_from(std::move(geometry));
+    return true;
+}
+
 float normalize_angle(float angle)
 {
     if (!std::isfinite(angle))
@@ -1771,26 +1921,35 @@ bool build_surface_gradient_vertex_color_preview_model_for_state(const std::vect
 struct TexturePreviewRenderState
 {
     GLboolean blend_enabled { GL_FALSE };
+    GLboolean cull_face_enabled { GL_FALSE };
     GLboolean polygon_offset_fill_enabled { GL_FALSE };
     GLboolean depth_mask { GL_TRUE };
+    GLint     cull_face_mode { GL_BACK };
     GLfloat   polygon_offset_factor { 0.f };
     GLfloat   polygon_offset_units { 0.f };
     GLint     depth_func { GL_LESS };
 };
 
-TexturePreviewRenderState begin_render_state()
+TexturePreviewRenderState begin_render_state(bool opaque)
 {
     TexturePreviewRenderState state;
     state.blend_enabled = glIsEnabled(GL_BLEND);
+    state.cull_face_enabled = glIsEnabled(GL_CULL_FACE);
     state.polygon_offset_fill_enabled = glIsEnabled(GL_POLYGON_OFFSET_FILL);
     glsafe(::glGetBooleanv(GL_DEPTH_WRITEMASK, &state.depth_mask));
+    glsafe(::glGetIntegerv(GL_CULL_FACE_MODE, &state.cull_face_mode));
     glsafe(::glGetFloatv(GL_POLYGON_OFFSET_FACTOR, &state.polygon_offset_factor));
     glsafe(::glGetFloatv(GL_POLYGON_OFFSET_UNITS, &state.polygon_offset_units));
     glsafe(::glGetIntegerv(GL_DEPTH_FUNC, &state.depth_func));
 
-    glsafe(::glEnable(GL_BLEND));
-    glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
-    glsafe(::glDepthMask(GL_FALSE));
+    if (opaque) {
+        glsafe(::glDisable(GL_BLEND));
+    } else {
+        glsafe(::glEnable(GL_BLEND));
+        glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
+    }
+    glsafe(::glDisable(GL_CULL_FACE));
+    glsafe(::glDepthMask(opaque ? GL_TRUE : GL_FALSE));
     glsafe(::glDepthFunc(GL_LEQUAL));
     glsafe(::glEnable(GL_POLYGON_OFFSET_FILL));
     glsafe(::glPolygonOffset(k_polygon_offset_factor, k_polygon_offset_units));
@@ -1804,7 +1963,14 @@ void restore_render_state(const TexturePreviewRenderState &state)
         glsafe(::glDisable(GL_POLYGON_OFFSET_FILL));
     glsafe(::glDepthFunc(state.depth_func));
     glsafe(::glDepthMask(state.depth_mask));
-    if (!state.blend_enabled)
+    glsafe(::glCullFace(state.cull_face_mode));
+    if (state.cull_face_enabled)
+        glsafe(::glEnable(GL_CULL_FACE));
+    else
+        glsafe(::glDisable(GL_CULL_FACE));
+    if (state.blend_enabled)
+        glsafe(::glEnable(GL_BLEND));
+    else
         glsafe(::glDisable(GL_BLEND));
 }
 
@@ -1913,11 +2079,19 @@ bool build_mmu_vertex_color_preview_models(
                 texture_preview_simulation_settings_for_filament(filament_id, num_physical, texture_mgr, physical_colors);
             if (simulation_settings)
                 prepare_texture_preview_simulation_settings(*simulation_settings);
-            if (!build_vertex_color_preview_model_for_state(model_volume,
-                                                            triangles_per_type[state_id],
-                                                            simulation_settings ? &*simulation_settings : nullptr,
-                                                            model))
-                continue;
+            if (model_volume_has_texture_mapping_color_preview_data(model_volume)) {
+                if (!build_texture_mapping_color_preview_model_for_state(model_volume,
+                                                                         triangles_per_type[state_id],
+                                                                         simulation_settings ? &*simulation_settings : nullptr,
+                                                                         model))
+                    continue;
+            } else {
+                if (!build_vertex_color_preview_model_for_state(model_volume,
+                                                                triangles_per_type[state_id],
+                                                                simulation_settings ? &*simulation_settings : nullptr,
+                                                                model))
+                    continue;
+            }
         }
 
         out_models.emplace_back(std::move(model));
@@ -1966,6 +2140,31 @@ size_t model_volume_texture_preview_signature(const ModelVolume &model_volume)
     mix(reinterpret_cast<size_t>(model_volume.imported_texture_uvs_per_face.data()));
     mix(model_volume.imported_texture_uv_valid.size());
     mix(reinterpret_cast<size_t>(model_volume.imported_texture_uv_valid.data()));
+    return signature;
+}
+
+size_t model_volume_texture_mapping_color_preview_signature(const ModelVolume &model_volume)
+{
+    size_t signature = 1469598103934665603ull;
+    auto mix = [&signature](size_t value) {
+        signature ^= value + 0x9e3779b97f4a7c15ull + (signature << 6) + (signature >> 2);
+    };
+
+    const TriangleColorSplittingData &data = model_volume.texture_mapping_color_facets.get_data();
+    mix(data.triangles_to_split.size());
+    mix(data.bitstream.size());
+    mix(data.colors_rgba.size());
+    for (const ColorTriangleBitStreamMapping &mapping : data.triangles_to_split) {
+        mix(size_t(mapping.triangle_idx));
+        mix(size_t(mapping.bitstream_start_idx));
+        mix(size_t(mapping.color_start_idx));
+    }
+    for (const bool bit : data.bitstream)
+        mix(bit ? 1u : 0u);
+    for (const uint32_t color : data.colors_rgba)
+        mix(size_t(color));
+    for (const char ch : data.metadata_json)
+        mix(size_t(static_cast<unsigned char>(ch)));
     return signature;
 }
 
@@ -2067,7 +2266,8 @@ void render_model_texture_preview_models(
     const std::array<float, 4>      &clipping_plane,
     int                              print_volume_type,
     const std::array<float, 4>      &print_volume_xy,
-    const std::array<float, 2>      &print_volume_z)
+    const std::array<float, 2>      &print_volume_z,
+    bool                             opaque)
 {
     if (models.empty() || colors.size() != models.size() || filament_ids.size() != models.size() || texture.get_id() == 0)
         return;
@@ -2076,7 +2276,7 @@ void render_model_texture_preview_models(
     if (shader == nullptr)
         return;
 
-    const TexturePreviewRenderState render_state = begin_render_state();
+    const TexturePreviewRenderState render_state = begin_render_state(opaque);
     shader->start_using();
     set_common_uniforms(*shader, model_matrix, view_matrix, projection_matrix, z_range, clipping_plane, print_volume_type, print_volume_xy, print_volume_z);
     glsafe(::glActiveTexture(GL_TEXTURE0));
@@ -2128,7 +2328,8 @@ void render_model_vertex_color_preview_models(
     const std::array<float, 4>      &clipping_plane,
     int                              print_volume_type,
     const std::array<float, 4>      &print_volume_xy,
-    const std::array<float, 2>      &print_volume_z)
+    const std::array<float, 2>      &print_volume_z,
+    bool                             opaque)
 {
     if (models.empty() || colors.size() != models.size() || filament_ids.size() != models.size())
         return;
@@ -2137,7 +2338,7 @@ void render_model_vertex_color_preview_models(
     if (shader == nullptr)
         return;
 
-    const TexturePreviewRenderState render_state = begin_render_state();
+    const TexturePreviewRenderState render_state = begin_render_state(opaque);
     shader->start_using();
     set_common_uniforms(*shader, model_matrix, view_matrix, projection_matrix, z_range, clipping_plane, print_volume_type, print_volume_xy, print_volume_z);
 

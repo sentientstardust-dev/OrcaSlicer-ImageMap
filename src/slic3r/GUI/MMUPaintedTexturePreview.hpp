@@ -50,6 +50,7 @@ bool build_mmu_vertex_color_preview_models(
     std::vector<unsigned int>                                            &out_filament_ids);
 
 size_t model_volume_texture_preview_signature(const ModelVolume &model_volume);
+size_t model_volume_texture_mapping_color_preview_signature(const ModelVolume &model_volume);
 
 bool ensure_model_volume_texture_preview(const ModelVolume &model_volume,
                                          GUI::GLTexture    &texture,
@@ -75,7 +76,8 @@ void render_model_texture_preview_models(
     const std::array<float, 4>      &clipping_plane,
     int                              print_volume_type = -1,
     const std::array<float, 4>      &print_volume_xy = std::array<float, 4>{ 0.f, 0.f, 0.f, 0.f },
-    const std::array<float, 2>      &print_volume_z = std::array<float, 2>{ 0.f, 0.f });
+    const std::array<float, 2>      &print_volume_z = std::array<float, 2>{ 0.f, 0.f },
+    bool                             opaque = false);
 
 void render_model_vertex_color_preview_models(
     std::vector<GUI::GLModel>       &models,
@@ -90,7 +92,8 @@ void render_model_vertex_color_preview_models(
     const std::array<float, 4>      &clipping_plane,
     int                              print_volume_type = -1,
     const std::array<float, 4>      &print_volume_xy = std::array<float, 4>{ 0.f, 0.f, 0.f, 0.f },
-    const std::array<float, 2>      &print_volume_z = std::array<float, 2>{ 0.f, 0.f });
+    const std::array<float, 2>      &print_volume_z = std::array<float, 2>{ 0.f, 0.f },
+    bool                             opaque = false);
 
 } // namespace Slic3r
 

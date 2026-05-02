@@ -655,7 +655,7 @@ void ObjectList::set_tooltip_for_item(const wxPoint& pt)
     }
     else if (col->GetModelColumn() == (unsigned int)colColorPaint) {
         if (node->HasColorPainting())
-            tooltip = _(L("Click the icon to edit color painting of the object"));
+            tooltip = _(L("Click the icon to edit color region painting of the object"));
     }
     else if (col->GetModelColumn() == (unsigned int)colSinking) {
         if (node->HasSinking())
@@ -2662,7 +2662,7 @@ void ObjectList::del_info_item(const int obj_idx, InfoItemType type)
 
     case InfoItemType::MmSegmentation:
         cnv->get_gizmos_manager().reset_all_states();
-        Plater::TakeSnapshot(plater, "Remove color painting");
+        Plater::TakeSnapshot(plater, "Remove color region painting");
         for (ModelVolume* mv : (*m_objects)[obj_idx]->volumes)
             mv->mmu_segmentation_facets.reset();
         break;

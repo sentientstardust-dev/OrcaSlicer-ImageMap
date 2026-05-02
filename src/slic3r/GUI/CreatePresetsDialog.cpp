@@ -245,7 +245,10 @@ static bool delete_filament_preset_by_name(std::string delete_preset_name, std::
     try {
         // BBS delete preset
         Preset *need_delete_preset = m_presets.find_preset(delete_preset_name);
-        if (!need_delete_preset) BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" can't find delete preset and name: %1%") % delete_preset_name;
+        if (!need_delete_preset) {
+            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " can't find delete preset and name: " << delete_preset_name;
+            return false;
+        }
         if (!need_delete_preset->setting_id.empty()) {
             BOOST_LOG_TRIVIAL(info) << "delete preset = " << need_delete_preset->name << ", setting_id = " << need_delete_preset->setting_id;
             m_presets.set_sync_info_and_save(need_delete_preset->name, need_delete_preset->setting_id, "delete", 0);
@@ -4754,27 +4757,29 @@ wxWindow *EditFilamentPresetDialog::create_dialog_buttons()
                           _L("Delete filament"), wxYES | wxCANCEL | wxCANCEL_DEFAULT | wxCENTRE);
         int res = dlg.ShowModal();
         if (wxID_YES == res) {
-            PresetBundle *preset_bundle = wxGetApp().preset_bundle;
-            std::set<std::shared_ptr<Preset>> inherit_preset_names;
-            std::set<std::shared_ptr<Preset>> root_preset_names;
-            for (std::pair<std::string, std::vector<std::shared_ptr<Preset>>> printer_and_preset : m_printer_compatible_presets) {
-                for (std::shared_ptr<Preset> preset : printer_and_preset.second) {
+            std::set<std::string> inherit_preset_names;
+            std::set<std::string> root_preset_names;
+            for (const std::pair<std::string, std::vector<std::shared_ptr<Preset>>> &printer_and_preset : m_printer_compatible_presets) {
+                for (const std::shared_ptr<Preset> &preset : printer_and_preset.second) {
+                    if (!preset) continue;
                     if (preset->inherits().empty()) {
-                        root_preset_names.insert(preset);
+                        root_preset_names.insert(preset->name);
                     } else {
-                        inherit_preset_names.insert(preset);
+                        inherit_preset_names.insert(preset->name);
                     }
                 }
             }
             // delete inherit preset first
             std::string next_selected_preset_name = wxGetApp().preset_bundle->filaments.get_selected_preset().name;
-            for (std::shared_ptr<Preset> preset : inherit_preset_names) {
-                bool delete_result = delete_filament_preset_by_name(preset->name, next_selected_preset_name);
-                BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " inherit filament name: " << preset->name << (delete_result ? " delete successful" : " delete failed");
+            for (const std::string &preset_name : inherit_preset_names) {
+                bool delete_result = delete_filament_preset_by_name(preset_name, next_selected_preset_name);
+                BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " inherit filament name: " << preset_name
+                                        << (delete_result ? " delete successful" : " delete failed");
             }
-            for (std::shared_ptr<Preset> preset : root_preset_names) {
-                bool delete_result = delete_filament_preset_by_name(preset->name, next_selected_preset_name);
-                BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " root filament name: " << preset->name << (delete_result ? " delete successful" : " delete failed");
+            for (const std::string &preset_name : root_preset_names) {
+                bool delete_result = delete_filament_preset_by_name(preset_name, next_selected_preset_name);
+                BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " root filament name: " << preset_name
+                                        << (delete_result ? " delete successful" : " delete failed");
             }
             m_printer_compatible_presets.clear();
             wxGetApp().preset_bundle->filaments.select_preset_by_name(next_selected_preset_name,true);

@@ -267,8 +267,8 @@ void KBShortcutsDialog::fill_shortcuts()
         Shortcuts gizmos_shortcuts = {
             {L("Esc"), L("Deselect all")},
             {shift, L("Move: press to snap by 1mm")},
-            {ctrl + L("Mouse wheel"), L("Support/Color Painting: adjust pen radius")},
-            {alt + L("Mouse wheel"), L("Support/Color Painting: adjust section position")},
+            {ctrl + L("Mouse wheel"), L("Support/Color Region Painting: adjust pen radius")},
+            {alt + L("Mouse wheel"), L("Support/Color Region Painting: adjust section position")},
         };
         m_full_shortcuts.push_back({{_L("Gizmo"), ""}, gizmos_shortcuts});
 
