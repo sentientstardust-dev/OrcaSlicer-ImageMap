@@ -41,6 +41,7 @@ static std::vector<std::string> s_project_options {
     "filament_colour",
     "filament_colour_type",
     "filament_multi_colour",
+    "texture_mapping_definitions",
     "wipe_tower_x",
     "wipe_tower_y",
     "wipe_tower_rotation_angle",
@@ -305,6 +306,8 @@ PresetBundle::PresetBundle()
     this->printers.select_preset(0);
 
     this->project_config.apply_only(FullPrintConfig::defaults(), s_project_options);
+    if (const auto *color_opt = this->project_config.option<ConfigOptionStrings>("filament_colour", false); color_opt != nullptr)
+        this->texture_mapping_zones.load_entries(this->project_config.opt_string("texture_mapping_definitions"), color_opt->values);
 }
 
 PresetBundle::PresetBundle(const PresetBundle &rhs)
@@ -323,6 +326,7 @@ PresetBundle& PresetBundle::operator=(const PresetBundle &rhs)
 
     filament_presets    = rhs.filament_presets;
     project_config      = rhs.project_config;
+    texture_mapping_zones = rhs.texture_mapping_zones;
     vendors             = rhs.vendors;
     obsolete_presets    = rhs.obsolete_presets;
     m_errors    = rhs.m_errors;
@@ -2224,6 +2228,8 @@ void PresetBundle::set_num_filaments(unsigned int n, std::vector<std::string> ne
     }
 
     update_multi_material_filament_presets();
+    texture_mapping_zones.refresh(filament_color->values);
+    project_config.set_key_value("texture_mapping_definitions", new ConfigOptionString(texture_mapping_zones.serialize_entries()));
 }
 void PresetBundle::set_num_filaments(unsigned int n, std::string new_color)
 {
@@ -2261,6 +2267,8 @@ void PresetBundle::set_num_filaments(unsigned int n, std::string new_color)
     }
 
     update_multi_material_filament_presets();
+    texture_mapping_zones.refresh(filament_color->values);
+    project_config.set_key_value("texture_mapping_definitions", new ConfigOptionString(texture_mapping_zones.serialize_entries()));
 }
 
 void PresetBundle::update_num_filaments(unsigned int to_del_flament_id)
@@ -2312,6 +2320,9 @@ void PresetBundle::update_num_filaments(unsigned int to_del_flament_id)
     erase_or_resize(ams_multi_color_filment);
 
     update_multi_material_filament_presets(to_del_flament_id);
+    texture_mapping_zones.remove_physical_filament(to_del_flament_id + 1);
+    texture_mapping_zones.refresh(filament_color->values);
+    project_config.set_key_value("texture_mapping_definitions", new ConfigOptionString(texture_mapping_zones.serialize_entries()));
 }
 
 
@@ -3744,6 +3755,8 @@ void PresetBundle::load_config_file_config(const std::string &name_or_path, bool
 
         // 4) Load the project config values (the per extruder wipe matrix etc).
         this->project_config.apply_only(config, s_project_options);
+        if (const auto *color_opt = this->project_config.option<ConfigOptionStrings>("filament_colour", false); color_opt != nullptr)
+            this->texture_mapping_zones.load_entries(this->project_config.opt_string("texture_mapping_definitions"), color_opt->values);
 
         break;
     }

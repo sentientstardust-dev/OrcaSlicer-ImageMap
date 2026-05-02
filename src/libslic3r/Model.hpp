@@ -29,6 +29,7 @@
 #include "Format/OBJ.hpp"
 
 #include <map>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
@@ -735,6 +736,8 @@ public:
     indexed_triangle_set get_facets(const ModelVolume& mv, EnforcerBlockerType type) const;
     // BBS
     void get_facets(const ModelVolume& mv, std::vector<indexed_triangle_set>& facets_per_type) const;
+    void get_facet_triangles(const ModelVolume& mv,
+                             std::vector<std::vector<TriangleSelector::FacetStateTriangle>>& facets_per_type) const;
     void                 set_enforcer_block_type_limit(const ModelVolume  &mv,
                                                        EnforcerBlockerType max_type,
                                                        EnforcerBlockerType to_delete_filament = EnforcerBlockerType::NONE,
@@ -873,6 +876,14 @@ public:
 
     // List of mesh facets painted for MMU segmentation.
     FacetsAnnotation    mmu_segmentation_facets;
+
+    std::vector<uint32_t> imported_vertex_colors_rgba;
+
+    std::vector<float>   imported_texture_uvs_per_face;
+    std::vector<uint8_t> imported_texture_uv_valid;
+    std::vector<uint8_t> imported_texture_rgba;
+    uint32_t             imported_texture_width{0};
+    uint32_t             imported_texture_height{0};
 
     // List of mesh facets painted for fuzzy skin.
     FacetsAnnotation    fuzzy_skin_facets;
@@ -1102,6 +1113,12 @@ private:
         name(other.name), source(other.source), m_mesh(other.m_mesh), m_convex_hull(other.m_convex_hull),
         config(other.config), m_type(other.m_type), object(object), m_transformation(other.m_transformation),
         supported_facets(other.supported_facets), seam_facets(other.seam_facets), mmu_segmentation_facets(other.mmu_segmentation_facets),
+        imported_vertex_colors_rgba(other.imported_vertex_colors_rgba),
+        imported_texture_uvs_per_face(other.imported_texture_uvs_per_face),
+        imported_texture_uv_valid(other.imported_texture_uv_valid),
+        imported_texture_rgba(other.imported_texture_rgba),
+        imported_texture_width(other.imported_texture_width),
+        imported_texture_height(other.imported_texture_height),
         fuzzy_skin_facets(other.fuzzy_skin_facets), cut_info(other.cut_info), text_configuration(other.text_configuration), emboss_shape(other.emboss_shape)
     {
 		assert(this->id().valid()); 
@@ -1186,6 +1203,8 @@ private:
         t = mmu_segmentation_facets.timestamp();
         cereal::load_by_value(ar, mmu_segmentation_facets);
         mesh_changed |= t != mmu_segmentation_facets.timestamp();
+        ar(imported_vertex_colors_rgba);
+        ar(imported_texture_uvs_per_face, imported_texture_uv_valid, imported_texture_rgba, imported_texture_width, imported_texture_height);
         cereal::load_by_value(ar, fuzzy_skin_facets);
         mesh_changed |= t != fuzzy_skin_facets.timestamp();
         cereal::load_by_value(ar, config);
@@ -1208,6 +1227,8 @@ private:
         cereal::save_by_value(ar, supported_facets);
         cereal::save_by_value(ar, seam_facets);
         cereal::save_by_value(ar, mmu_segmentation_facets);
+        ar(imported_vertex_colors_rgba);
+        ar(imported_texture_uvs_per_face, imported_texture_uv_valid, imported_texture_rgba, imported_texture_width, imported_texture_height);
         cereal::save_by_value(ar, fuzzy_skin_facets);
         cereal::save_by_value(ar, config);
         cereal::save(ar, text_configuration);
@@ -1596,10 +1617,14 @@ public:
                                 ImportstlProgressFn        stlFn                = nullptr,
                                 BBLProject *               project              = nullptr,
                                 int                        plate_id             = 0,
-                                ObjImportColorFn           objFn                = nullptr
-                                );
+                                ObjImportColorFn           objFn                = nullptr,
+                                ObjImportModeFn            objModeFn            = nullptr
+    );
     // BBS
     static bool    obj_import_vertex_color_deal(const std::vector<unsigned char> &vertex_filament_ids, const unsigned char &first_extruder_id, Model *model);
+    static bool    obj_import_vertex_color_deal_for_object(const std::vector<unsigned char> &vertex_filament_ids,
+                                                           const unsigned char &first_extruder_id,
+                                                           ModelObject *object);
     static bool    obj_import_face_color_deal(const std::vector<unsigned char> &face_filament_ids, const unsigned char &first_extruder_id, Model *model);
     static double findMaxSpeed(const ModelObject* object);
     static double getThermalLength(const ModelVolume* modelVolumePtr);

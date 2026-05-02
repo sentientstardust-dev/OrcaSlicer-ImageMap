@@ -7,6 +7,7 @@
 #include "GCode/ToolOrderUtils.hpp"
 #include "FilamentGroupUtils.hpp"
 #include "I18N.hpp"
+#include "../TextureMapping.hpp"
 
 // #define SLIC3R_DEBUG
 
@@ -83,19 +84,25 @@ bool check_filament_printable_after_group(const std::vector<unsigned int> &used_
 unsigned int LayerTools::wall_filament(const PrintRegion &region) const
 {
 	assert(region.config().wall_filament.value > 0);
-	return ((this->extruder_override == 0) ? region.config().wall_filament.value : this->extruder_override) - 1;
+    const unsigned int filament_id = (this->extruder_override == 0) ? region.config().wall_filament.value : this->extruder_override;
+    const unsigned int resolved = this->resolve_filament_id(filament_id);
+	return resolved > 0 ? resolved - 1 : 0;
 }
 
 unsigned int LayerTools::sparse_infill_filament(const PrintRegion &region) const
 {
 	assert(region.config().sparse_infill_filament.value > 0);
-	return ((this->extruder_override == 0) ? region.config().sparse_infill_filament.value : this->extruder_override) - 1;
+    const unsigned int filament_id = (this->extruder_override == 0) ? region.config().sparse_infill_filament.value : this->extruder_override;
+    const unsigned int resolved = this->resolve_filament_id(filament_id);
+	return resolved > 0 ? resolved - 1 : 0;
 }
 
 unsigned int LayerTools::solid_infill_filament(const PrintRegion &region) const
 {
 	assert(region.config().solid_infill_filament.value > 0);
-	return ((this->extruder_override == 0) ? region.config().solid_infill_filament.value : this->extruder_override) - 1;
+    const unsigned int filament_id = (this->extruder_override == 0) ? region.config().solid_infill_filament.value : this->extruder_override;
+    const unsigned int resolved = this->resolve_filament_id(filament_id);
+	return resolved > 0 ? resolved - 1 : 0;
 }
 
 // Returns a zero based extruder this eec should be printed with, according to PrintRegion config or extruder_override if overriden.
@@ -117,7 +124,19 @@ unsigned int LayerTools::extruder(const ExtrusionEntityCollection &extrusions, c
     } else
         extruder = this->extruder_override;
 
-    return (extruder == 0) ? 0 : extruder - 1;
+    const unsigned int resolved = this->resolve_filament_id(extruder);
+    return (resolved == 0) ? 0 : resolved - 1;
+}
+
+unsigned int LayerTools::resolve_filament_id(unsigned int filament_id_1based) const
+{
+    if (filament_id_1based == 0)
+        return 0;
+    if (texture_mapping_manager != nullptr &&
+        num_physical_filaments > 0 &&
+        texture_mapping_manager->is_texture_mapping_zone_id(filament_id_1based))
+        return texture_mapping_manager->resolve_zone_component(filament_id_1based, num_physical_filaments, layer_index);
+    return filament_id_1based;
 }
 
 static double calc_max_layer_height(const PrintConfig &config, double max_object_layer_height)
@@ -527,7 +546,12 @@ std::vector<unsigned int> ToolOrdering::generate_first_layer_tool_order(const Pr
             return tool_order;
 
         for (auto layerm : target_layer->regions()) {
-            int extruder_id = layerm->region().config().option("wall_filament")->getInt();
+            const int raw_extruder_id = layerm->region().config().option("wall_filament")->getInt();
+            const unsigned int resolved_extruder_id = raw_extruder_id <= 0 ? 0 :
+                print.texture_mapping_manager().resolve_zone_component(unsigned(raw_extruder_id), print.config().filament_colour.size(), int(target_layer->id()));
+            if (resolved_extruder_id == 0 || resolved_extruder_id > print.config().filament_colour.size())
+                continue;
+            int extruder_id = int(resolved_extruder_id);
 
             for (auto expoly : layerm->raw_slices) {
                 const double nozzle_diameter = print.config().nozzle_diameter.get_at(0);
@@ -591,7 +615,12 @@ std::vector<unsigned int> ToolOrdering::generate_first_layer_tool_order(const Pr
         return tool_order;
 
     for (auto layerm : target_layer->regions()) {
-        int extruder_id = layerm->region().config().option("wall_filament")->getInt();
+        const int raw_extruder_id = layerm->region().config().option("wall_filament")->getInt();
+        const unsigned int resolved_extruder_id = raw_extruder_id <= 0 ? 0 :
+            object.print()->texture_mapping_manager().resolve_zone_component(unsigned(raw_extruder_id), object.print()->config().filament_colour.size(), int(target_layer->id()));
+        if (resolved_extruder_id == 0 || resolved_extruder_id > object.print()->config().filament_colour.size())
+            continue;
+        int extruder_id = int(resolved_extruder_id);
         for (auto expoly : layerm->raw_slices) {
             const double nozzle_diameter = object.print()->config().nozzle_diameter.get_at(0);
             const coordf_t line_width = object.config().get_abs_value("line_width", nozzle_diameter);
@@ -639,6 +668,12 @@ void ToolOrdering::initialize_layers(std::vector<coordf_t> &zs)
         for (; j < zs.size() && zs[j] <= zmax; ++ j) ;
         // Assign an average print_z to the set of layers with nearly equal print_z.
         m_layer_tools.emplace_back(LayerTools(0.5 * (zs[i] + zs[j-1])));
+        LayerTools &layer_tools = m_layer_tools.back();
+        layer_tools.layer_index = int(m_layer_tools.size() - 1);
+        if (m_print != nullptr) {
+            layer_tools.texture_mapping_manager = &m_print->texture_mapping_manager();
+            layer_tools.num_physical_filaments = m_print->config().filament_colour.size();
+        }
         i = j;
     }
 }
@@ -682,9 +717,10 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
                 }
 
                 if (something_nonoverriddable){
-               		layer_tools.extruders.emplace_back((extruder_override == 0) ? region.config().wall_filament.value : extruder_override);
+                    const unsigned int filament_id = (extruder_override == 0) ? region.config().wall_filament.value : extruder_override;
+                    layer_tools.extruders.emplace_back(layer_tools.resolve_filament_id(filament_id));
                     if (layerCount == 0) {
-                        firstLayerExtruders.emplace_back((extruder_override == 0) ? region.config().wall_filament.value : extruder_override);
+                        firstLayerExtruders.emplace_back(layer_tools.resolve_filament_id(filament_id));
                     }
                 }
 
@@ -710,13 +746,13 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
             }
 
             if (something_nonoverriddable || !m_print_config_ptr) {
-            	if (extruder_override == 0) {
+                if (extruder_override == 0) {
 	                if (has_solid_infill)
-	                    layer_tools.extruders.emplace_back(region.config().solid_infill_filament);
+	                    layer_tools.extruders.emplace_back(layer_tools.resolve_filament_id(region.config().solid_infill_filament));
 	                if (has_infill)
-	                    layer_tools.extruders.emplace_back(region.config().sparse_infill_filament);
-            	} else if (has_solid_infill || has_infill)
-            		layer_tools.extruders.emplace_back(extruder_override);
+	                    layer_tools.extruders.emplace_back(layer_tools.resolve_filament_id(region.config().sparse_infill_filament));
+                } else if (has_solid_infill || has_infill)
+                    layer_tools.extruders.emplace_back(layer_tools.resolve_filament_id(extruder_override));
             }
             if (has_solid_infill || has_infill)
                 layer_tools.has_object = true;
@@ -741,6 +777,8 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
         }
         unsigned int extruder_support   = object.config().support_filament.value;
         unsigned int extruder_interface = object.config().support_interface_filament.value;
+        extruder_support = layer_tools.resolve_filament_id(extruder_support);
+        extruder_interface = layer_tools.resolve_filament_id(extruder_interface);
         if (has_support) {
             if (extruder_support > 0 || !has_interface || extruder_interface == 0 || layer_tools.has_object)
                 layer_tools.extruders.push_back(extruder_support);

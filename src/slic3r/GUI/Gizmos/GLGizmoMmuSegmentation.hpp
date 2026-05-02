@@ -143,6 +143,14 @@ private:
     // Filament remapping methods
     void remap_filament_assignments();
     void render_filament_remap_ui(float window_width, float max_tooltip_width);
+    bool selected_object_has_imported_vertex_colors() const;
+    bool selected_object_has_imported_texture_data() const;
+    bool selected_object_has_bakeable_image_texture_data() const;
+    bool selected_object_has_painted_regions() const;
+    void open_obj_vertex_color_mapping_dialog();
+    void bake_selected_object_image_texture_to_vertex_colors();
+    void convert_selected_regions_to_vertex_colors();
+    void clear_selected_object_image_texture_data();
     // ORCA: Helper to update the cache of used filaments
     void update_used_filaments();
 

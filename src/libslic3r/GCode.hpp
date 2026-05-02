@@ -29,10 +29,15 @@
 
 #include "GCode/TimelapsePosPicker.hpp"
 
+#include <array>
+#include <cstdint>
 #include <memory>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
+#include <tuple>
+#include <vector>
 #include <cfloat>
 
 namespace Slic3r {
@@ -43,6 +48,33 @@ class GCode;
 namespace CustomGCode{ struct Item; }
 struct PrintInstance;
 class ConstPrintObjectPtrsAdaptor;
+
+struct VertexColorOverhangWeightField {
+    float min_x_mm { 0.f };
+    float min_y_mm { 0.f };
+    float bucket_width_mm { 1.f };
+    float bucket_height_mm { 1.f };
+    int bucket_width { 0 };
+    int bucket_height { 0 };
+    size_t component_count { 0 };
+    std::vector<float> sample_x_mm;
+    std::vector<float> sample_y_mm;
+    std::vector<float> sample_weight;
+    std::vector<float> sample_component_weights;
+    std::vector<std::vector<uint32_t>> buckets;
+    std::vector<float> fallback_weights;
+
+    bool empty() const
+    {
+        return bucket_width <= 0 ||
+               bucket_height <= 0 ||
+               component_count == 0 ||
+               sample_x_mm.empty() ||
+               sample_y_mm.size() != sample_x_mm.size() ||
+               sample_weight.size() != sample_x_mm.size() ||
+               sample_component_weights.size() != sample_x_mm.size() * component_count;
+    }
+};
 
 class OozePrevention {
 public:
@@ -490,6 +522,8 @@ private:
 
     ExtrusionQualityEstimator m_extrusion_quality_estimator;
 
+    std::map<std::tuple<const PrintObject*, unsigned int, std::string>, VertexColorOverhangWeightField> m_vertex_color_overhang_weight_field_cache;
+    bool                                m_warned_texture_mapping_filament_count_mismatch { false };
 
     /* Origin of print coordinates expressed in unscaled G-code coordinates.
        This affects the input arguments supplied to the extrude*() and travel_to()
@@ -641,6 +675,7 @@ private:
 
     double      calc_max_volumetric_speed(const double layer_height, const double line_width, const std::string co_str);
     std::string _extrude(const ExtrusionPath &path, std::string description = "", double speed = -1);
+    std::optional<Point> texture_mapping_seam_hiding_point(const ExtrusionLoop &loop);
     bool _needSAFC(const ExtrusionPath &path);
     void print_machine_envelope(GCodeOutputStream& file, Print& print);
     void _print_first_layer_bed_temperature(GCodeOutputStream &file, Print &print, const std::string &gcode, unsigned int first_printing_extruder_id, bool wait);

@@ -4,6 +4,7 @@
 #include "GLGizmoBase.hpp"
 
 #include "slic3r/GUI/GLModel.hpp"
+#include "slic3r/GUI/GLTexture.hpp"
 
 #include "libslic3r/ObjectID.hpp"
 #include "libslic3r/TriangleSelector.hpp"
@@ -12,6 +13,7 @@
 #include <cereal/types/vector.hpp>
 #include <glad/gl.h>
 
+#include <array>
 #include <memory>
 
 
@@ -37,6 +39,11 @@ public:
     virtual ~TriangleSelectorGUI() = default;
 
     virtual void render(ImGuiWrapper* imgui, const Transform3d& matrix);
+    virtual void render_texture_preview(const Transform3d&          matrix,
+                                        const Transform3d&          view_matrix,
+                                        const Transform3d&          projection_matrix,
+                                        const std::array<float, 2>& z_range,
+                                        const std::array<float, 4>& clipping_plane) const {}
     //void         render(const Transform3d& matrix) { this->render(nullptr, matrix); }
     void         set_wireframe_needed(bool need_wireframe) { m_need_wireframe = need_wireframe; }
     bool         get_wireframe_needed() { return m_need_wireframe; }
@@ -101,11 +108,18 @@ class TriangleSelectorPatch : public TriangleSelectorGUI {
 public:
     explicit TriangleSelectorPatch(const TriangleMesh& mesh, const std::vector<ColorRGBA> ebt_colors, float edge_limit = 0.6f)
         : TriangleSelectorGUI(mesh, edge_limit), m_ebt_colors(ebt_colors) {}
+    explicit TriangleSelectorPatch(const TriangleMesh& mesh, const ModelVolume* model_volume, const std::vector<ColorRGBA> ebt_colors, float edge_limit = 0.6f)
+        : TriangleSelectorGUI(mesh, edge_limit), m_model_volume(model_volume), m_ebt_colors(ebt_colors) {}
     virtual ~TriangleSelectorPatch() = default;
 
     // Render current selection. Transformation matrices are supposed
     // to be already set.
     void render(ImGuiWrapper* imgui, const Transform3d& matrix) override;
+    void render_texture_preview(const Transform3d&          matrix,
+                                const Transform3d&          view_matrix,
+                                const Transform3d&          projection_matrix,
+                                const std::array<float, 2>& z_range,
+                                const std::array<float, 4>& clipping_plane) const override;
     // TriangleSelector.m_triangles => m_gizmo_scene.triangle_patches
     void update_triangles_per_type();
     // m_gizmo_scene.triangle_patches => TriangleSelector.m_triangles
@@ -167,7 +181,17 @@ protected:
     std::vector<unsigned int>   m_vertices_VBO_ids;
     std::vector<unsigned int>   m_triangle_indices_VBO_ids;
 
+    const ModelVolume*       m_model_volume { nullptr };
     std::vector<ColorRGBA> m_ebt_colors;
+    mutable std::vector<GLModel> m_texture_preview_models;
+    std::vector<ColorRGBA>  m_texture_preview_colors;
+    std::vector<unsigned int> m_texture_preview_filament_ids;
+    mutable GLTexture       m_texture_preview;
+    mutable size_t          m_texture_preview_signature { 0 };
+    size_t                  m_texture_preview_visual_signature { 0 };
+    mutable std::vector<GLModel> m_vertex_color_preview_models;
+    std::vector<ColorRGBA>  m_vertex_color_preview_colors;
+    std::vector<unsigned int> m_vertex_color_preview_filament_ids;
 
     bool                        m_filter_state = false;
 

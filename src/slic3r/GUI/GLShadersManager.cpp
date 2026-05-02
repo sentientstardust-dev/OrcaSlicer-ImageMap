@@ -80,6 +80,10 @@ std::pair<bool, std::string> GLShadersManager::init()
     valid &= append_shader("variable_layer_height", { prefix + "variable_layer_height.vs", prefix + "variable_layer_height.fs" });
     // used to render highlight contour around selected triangles inside the multi-material gizmo
     valid &= append_shader("mm_contour", { prefix + "mm_contour.vs", prefix + "mm_contour.fs" });
+#if !SLIC3R_OPENGL_ES
+    valid &= append_shader("painted_texture_preview", { prefix + "painted_texture_preview.vs", prefix + "painted_texture_preview.fs" });
+    valid &= append_shader("painted_vertex_color_preview", { prefix + "painted_vertex_color_preview.vs", prefix + "painted_vertex_color_preview.fs" });
+#endif // !SLIC3R_OPENGL_ES
     // Used to render painted triangles inside the multi-material gizmo. Triangle normals are computed inside fragment shader.
     // For Apple's on Arm CPU computed triangle normals inside fragment shader using dFdx and dFdy has the opposite direction.
     // Because of this, objects had darker colors inside the multi-material gizmo.
@@ -117,4 +121,3 @@ GLShaderProgram* GLShadersManager::get_current_shader()
 }
 
 } // namespace Slic3r
-

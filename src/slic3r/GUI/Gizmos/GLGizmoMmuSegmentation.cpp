@@ -10,13 +10,22 @@
 #include "slic3r/GUI/GUI_ObjectList.hpp"
 #include "slic3r/GUI/NotificationManager.hpp"
 #include "slic3r/GUI/GUI.hpp"
+#include "slic3r/GUI/MainFrame.hpp"
+#include "slic3r/GUI/ObjColorDialog.hpp"
+#include "slic3r/GUI/Tab.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/TextureMapping.hpp"
 #include "slic3r/Utils/UndoRedo.hpp"
 #include "GLGizmoUtils.hpp"
 
 
 #include <glad/gl.h>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
 
 namespace Slic3r::GUI {
 
@@ -28,6 +37,156 @@ static inline void show_notification_extruders_limit_exceeded()
         ->push_notification(NotificationType::MmSegmentationExceededExtrudersLimit, NotificationManager::NotificationLevel::PrintInfoNotificationLevel,
                             GUI::format(_L("Filament count exceeds the maximum number that painting tool supports. Only the "
                                            "first %1% filaments will be available in painting tool."), GLGizmoMmuSegmentation::EXTRUDERS_LIMIT));
+}
+
+static unsigned int ensure_texture_mapping_zone()
+{
+    if (wxGetApp().preset_bundle == nullptr || wxGetApp().plater() == nullptr)
+        return 0;
+
+    TextureMappingManager &mgr = wxGetApp().preset_bundle->texture_mapping_zones;
+    const size_t num_physical = static_cast<size_t>(std::max(wxGetApp().filaments_cnt(), 0));
+    std::vector<std::string> physical_colors = wxGetApp().plater()->get_extruder_colors_from_plater_config(nullptr, false);
+    physical_colors.resize(num_physical, "#26A69A");
+
+    if (unsigned int existing_id = mgr.find_image_texture_zone_id(num_physical); existing_id != 0) {
+        if (TextureMappingZone *zone = mgr.zone_from_id(existing_id);
+            zone == nullptr || !TextureMappingManager::auto_adjust_texture_component_ids(*zone, num_physical, physical_colors)) {
+            return existing_id;
+        }
+    } else if (num_physical < 2) {
+        return 0;
+    } else {
+        mgr.ensure_image_texture_zone(num_physical, physical_colors);
+    }
+
+    const std::string texture_serialized = mgr.serialize_entries();
+    DynamicPrintConfig *print_cfg = &wxGetApp().preset_bundle->prints.get_edited_preset().config;
+    if (ConfigOptionString *opt = print_cfg->option<ConfigOptionString>("texture_mapping_definitions"))
+        opt->value = texture_serialized;
+    else
+        print_cfg->set_key_value("texture_mapping_definitions", new ConfigOptionString(texture_serialized));
+
+    if (ConfigOptionString *opt = wxGetApp().preset_bundle->project_config.option<ConfigOptionString>("texture_mapping_definitions"))
+        opt->value = texture_serialized;
+    else
+        wxGetApp().preset_bundle->project_config.set_key_value("texture_mapping_definitions", new ConfigOptionString(texture_serialized));
+
+    wxGetApp().sidebar().update_texture_mapping_panel(false);
+    wxGetApp().sidebar().update_dynamic_filament_list();
+    if (auto *print_tab = wxGetApp().get_tab(Preset::TYPE_PRINT))
+        print_tab->update_dirty();
+    if (wxGetApp().mainframe != nullptr)
+        wxGetApp().mainframe->on_config_changed(print_cfg);
+
+    return mgr.find_image_texture_zone_id(num_physical);
+}
+
+static bool model_volume_has_imported_image_texture_data(const ModelVolume *volume)
+{
+    return volume != nullptr &&
+           !volume->imported_texture_rgba.empty() &&
+           volume->imported_texture_width > 0 &&
+           volume->imported_texture_height > 0;
+}
+
+static bool model_volume_has_bakeable_image_texture_data(const ModelVolume *volume)
+{
+    if (!model_volume_has_imported_image_texture_data(volume))
+        return false;
+
+    const indexed_triangle_set &its = volume->mesh().its;
+    return !its.vertices.empty() &&
+           !its.indices.empty() &&
+           volume->imported_texture_uv_valid.size() == its.indices.size() &&
+           volume->imported_texture_uvs_per_face.size() >= its.indices.size() * 6 &&
+           volume->imported_texture_rgba.size() >= size_t(volume->imported_texture_width) * size_t(volume->imported_texture_height) * 4 &&
+           std::any_of(volume->imported_texture_uv_valid.begin(), volume->imported_texture_uv_valid.end(), [](uint8_t valid) {
+               return valid != 0;
+           });
+}
+
+static float wrap_texture_uv_for_vertex_bake(float uv)
+{
+    if (!std::isfinite(uv))
+        return 0.f;
+
+    float wrapped = uv - std::floor(uv);
+    if (wrapped < 0.f)
+        wrapped += 1.f;
+    return wrapped;
+}
+
+static ColorRGBA sample_texture_rgba_for_vertex_bake(const std::vector<uint8_t> &rgba,
+                                                     uint32_t                    width,
+                                                     uint32_t                    height,
+                                                     const Vec2f                &uv)
+{
+    if (width == 0 || height == 0 || rgba.size() < size_t(width) * size_t(height) * 4)
+        return ColorRGBA(1.f, 1.f, 1.f, 1.f);
+
+    const float u = wrap_texture_uv_for_vertex_bake(uv.x());
+    const float v = wrap_texture_uv_for_vertex_bake(uv.y());
+    const float x = u * float(width > 1 ? width - 1 : 0);
+    const float y = v * float(height > 1 ? height - 1 : 0);
+    const size_t x0 = std::min<size_t>(size_t(std::floor(x)), size_t(width - 1));
+    const size_t y0 = std::min<size_t>(size_t(std::floor(y)), size_t(height - 1));
+    const size_t x1 = std::min<size_t>(x0 + 1, size_t(width - 1));
+    const size_t y1 = std::min<size_t>(y0 + 1, size_t(height - 1));
+    const float tx = x - float(x0);
+    const float ty = y - float(y0);
+
+    auto sample_channel = [&rgba, width](size_t sx, size_t sy, size_t channel) {
+        const size_t idx = (sy * size_t(width) + sx) * 4 + channel;
+        return float(rgba[idx]) / 255.f;
+    };
+    auto blend_channel = [&](size_t channel) {
+        const float c00 = sample_channel(x0, y0, channel);
+        const float c10 = sample_channel(x1, y0, channel);
+        const float c01 = sample_channel(x0, y1, channel);
+        const float c11 = sample_channel(x1, y1, channel);
+        const float cx0 = c00 + (c10 - c00) * tx;
+        const float cx1 = c01 + (c11 - c01) * tx;
+        return std::clamp(cx0 + (cx1 - cx0) * ty, 0.f, 1.f);
+    };
+
+    return ColorRGBA(blend_channel(0), blend_channel(1), blend_channel(2), 1.f);
+}
+
+static uint32_t pack_vertex_color_rgba(const ColorRGBA &color)
+{
+    auto to_u8 = [](float value) -> uint32_t {
+        return uint32_t(std::clamp(value, 0.f, 1.f) * 255.f + 0.5f);
+    };
+    const uint32_t r = to_u8(color.r());
+    const uint32_t g = to_u8(color.g());
+    const uint32_t b = to_u8(color.b());
+    const uint32_t a = to_u8(color.a());
+    return (r << 24) | (g << 16) | (b << 8) | a;
+}
+
+static bool barycentric_weights_for_region_vertex_colors(const Vec3f &point,
+                                                         const Vec3f &p0,
+                                                         const Vec3f &p1,
+                                                         const Vec3f &p2,
+                                                         Vec3f       &weights)
+{
+    const Vec3f edge_0 = p1 - p0;
+    const Vec3f edge_1 = p2 - p0;
+    const Vec3f delta = point - p0;
+    const float d00 = edge_0.dot(edge_0);
+    const float d01 = edge_0.dot(edge_1);
+    const float d11 = edge_1.dot(edge_1);
+    const float d20 = delta.dot(edge_0);
+    const float d21 = delta.dot(edge_1);
+    const float denom = d00 * d11 - d01 * d01;
+    if (std::abs(denom) <= EPSILON)
+        return false;
+
+    weights.y() = (d11 * d20 - d01 * d21) / denom;
+    weights.z() = (d00 * d21 - d01 * d20) / denom;
+    weights.x() = 1.f - weights.y() - weights.z();
+    return std::isfinite(weights.x()) && std::isfinite(weights.y()) && std::isfinite(weights.z());
 }
 
 void GLGizmoMmuSegmentation::on_opening()
@@ -599,6 +758,59 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
     }
 
     ImGui::Separator();
+
+    const bool can_convert_regions_to_vertex_colors = selected_object_has_painted_regions();
+    m_imgui->disabled_begin(!can_convert_regions_to_vertex_colors);
+    if (m_imgui->button(_L("Convert regions to vertex colors")))
+        convert_selected_regions_to_vertex_colors();
+    if (ImGui::IsItemHovered()) {
+        if (can_convert_regions_to_vertex_colors)
+            m_imgui->tooltip(_L("Convert painted color regions into imported vertex color data, clear the regions, and assign a texture mapping zone."), max_tooltip_width);
+        else
+            m_imgui->tooltip(_L("This object does not have painted color regions."), max_tooltip_width);
+    }
+    m_imgui->disabled_end();
+
+    const bool can_bake_image_texture_data = selected_object_has_bakeable_image_texture_data();
+    m_imgui->disabled_begin(!can_bake_image_texture_data);
+    if (m_imgui->button(_L("Bake image texture to vertex colors")))
+        bake_selected_object_image_texture_to_vertex_colors();
+    if (ImGui::IsItemHovered()) {
+        if (can_bake_image_texture_data)
+            m_imgui->tooltip(_L("Sample imported image texture UVs into stored vertex colors, then discard the baked image texture data."), max_tooltip_width);
+        else
+            m_imgui->tooltip(_L("This object does not have imported image texture data with UVs."), max_tooltip_width);
+    }
+    m_imgui->disabled_end();
+
+    const bool can_clear_image_texture_data = selected_object_has_imported_texture_data();
+    m_imgui->disabled_begin(!can_clear_image_texture_data);
+    if (m_imgui->button(_L("Clear Image Texture Data")))
+        clear_selected_object_image_texture_data();
+    if (ImGui::IsItemHovered()) {
+        if (can_clear_image_texture_data)
+            m_imgui->tooltip(_L("Discard imported image texture data from the selected object."), max_tooltip_width);
+        else
+            m_imgui->tooltip(_L("This object does not have imported image texture data."), max_tooltip_width);
+    }
+    m_imgui->disabled_end();
+
+    ImGui::Separator();
+
+    const bool can_apply_stored_vertex_colors = selected_object_has_imported_vertex_colors();
+    m_imgui->disabled_begin(!can_apply_stored_vertex_colors);
+    if (m_imgui->button(_L("Convert vertex colors to regions (will erase painting)")))
+        open_obj_vertex_color_mapping_dialog();
+    if (ImGui::IsItemHovered()) {
+        if (can_apply_stored_vertex_colors)
+            m_imgui->tooltip(_L("Open OBJ color mapping dialog using stored imported vertex colors."), max_tooltip_width);
+        else
+            m_imgui->tooltip(_L("This object does not have stored imported vertex colors."), max_tooltip_width);
+    }
+    m_imgui->disabled_end();
+
+    ImGui::Separator();
+
     // ORCA: Remap filaments section (Border only, Title in border). 
     // Styled as a panel for visual grouping.
     if (m_imgui->button(m_desc.at("perform_remap"))) {
@@ -749,7 +961,7 @@ void GLGizmoMmuSegmentation::init_model_triangle_selectors()
 
         // This mesh does not account for the possible Z up SLA offset.
         const TriangleMesh* mesh = &mv->mesh();
-        m_triangle_selectors.emplace_back(std::make_unique<TriangleSelectorPatch>(*mesh, ebt_colors, 0.2));
+        m_triangle_selectors.emplace_back(std::make_unique<TriangleSelectorPatch>(*mesh, mv, ebt_colors, 0.2));
         // Reset of TriangleSelector is done inside TriangleSelectorMmGUI's constructor, so we don't need it to perform it again in deserialize().
         EnforcerBlockerType max_ebt = (EnforcerBlockerType)std::min(m_extruders_colors.size(), (size_t)EnforcerBlockerType::ExtruderMax);
         m_triangle_selectors.back()->deserialize(mv->mmu_segmentation_facets.get_data(), false, max_ebt);
@@ -798,6 +1010,455 @@ void GLGizmoMmuSegmentation::tool_changed(wchar_t old_tool, wchar_t new_tool)
         TriangleSelectorPatch* tsp = dynamic_cast<TriangleSelectorPatch*>(selector_ptr.get());
         tsp->set_filter_state(new_tool == ImGui::GapFillIcon);
     }
+}
+
+bool GLGizmoMmuSegmentation::selected_object_has_imported_vertex_colors() const
+{
+    const ModelObject *object = m_c->selection_info()->model_object();
+    if (object == nullptr)
+        return false;
+
+    for (const ModelVolume *volume : object->volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+        if (!volume->imported_vertex_colors_rgba.empty())
+            return true;
+    }
+    return false;
+}
+
+bool GLGizmoMmuSegmentation::selected_object_has_imported_texture_data() const
+{
+    const ModelObject *object = m_c->selection_info()->model_object();
+    if (object == nullptr)
+        return false;
+
+    for (const ModelVolume *volume : object->volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+        if (model_volume_has_imported_image_texture_data(volume))
+            return true;
+    }
+    return false;
+}
+
+bool GLGizmoMmuSegmentation::selected_object_has_bakeable_image_texture_data() const
+{
+    const ModelObject *object = m_c->selection_info()->model_object();
+    if (object == nullptr)
+        return false;
+
+    for (const ModelVolume *volume : object->volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+        if (model_volume_has_bakeable_image_texture_data(volume))
+            return true;
+    }
+    return false;
+}
+
+bool GLGizmoMmuSegmentation::selected_object_has_painted_regions() const
+{
+    for (const auto &selector : m_triangle_selectors) {
+        if (selector == nullptr)
+            continue;
+        const TriangleSelector::TriangleSplittingData data = selector->serialize();
+        for (size_t state_idx = static_cast<size_t>(EnforcerBlockerType::Extruder1); state_idx < data.used_states.size(); ++state_idx)
+            if (data.used_states[state_idx])
+                return true;
+    }
+
+    const ModelObject *object = m_c->selection_info()->model_object();
+    if (object == nullptr)
+        return false;
+
+    for (const ModelVolume *volume : object->volumes) {
+        if (volume != nullptr && volume->is_model_part() && !volume->mmu_segmentation_facets.empty())
+            return true;
+    }
+    return false;
+}
+
+void GLGizmoMmuSegmentation::open_obj_vertex_color_mapping_dialog()
+{
+    ModelObject *object = m_c->selection_info()->model_object();
+    if (object == nullptr)
+        return;
+
+    ModelVolume *target_volume = nullptr;
+    for (ModelVolume *volume : object->volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+        if (!volume->imported_vertex_colors_rgba.empty()) {
+            target_volume = volume;
+            break;
+        }
+    }
+    if (target_volume == nullptr)
+        return;
+
+    if (target_volume->mesh().its.vertices.size() != target_volume->imported_vertex_colors_rgba.size())
+        return;
+
+    ObjDialogInOut in_out;
+    in_out.input_colors.reserve(target_volume->imported_vertex_colors_rgba.size());
+    for (const uint32_t packed : target_volume->imported_vertex_colors_rgba) {
+        const float r = float((packed >> 24) & 0xFF) / 255.f;
+        const float g = float((packed >> 16) & 0xFF) / 255.f;
+        const float b = float((packed >> 8) & 0xFF) / 255.f;
+        const float a = float(packed & 0xFF) / 255.f;
+        in_out.input_colors.emplace_back(RGBA{r, g, b, a});
+    }
+
+    if (in_out.input_colors.empty())
+        return;
+
+    in_out.is_single_color = true;
+    const RGBA first_color = in_out.input_colors.front();
+    for (const RGBA &color : in_out.input_colors) {
+        if (color != first_color) {
+            in_out.is_single_color = false;
+            break;
+        }
+    }
+    in_out.first_extruder_id = 1;
+    in_out.deal_vertex_color = true;
+    Model preview_model;
+    preview_model.add_object(*object);
+    in_out.model = &preview_model;
+
+    const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config(nullptr, false);
+    ObjColorDialog color_dlg(nullptr, in_out, extruder_colours);
+    if (color_dlg.ShowModal() != wxID_OK)
+        return;
+    if (in_out.filament_ids.empty())
+        return;
+
+    Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Convert vertex colors to regions", UndoRedo::SnapshotType::GizmoAction);
+    if (!Model::obj_import_vertex_color_deal_for_object(in_out.filament_ids, in_out.first_extruder_id, object))
+        return;
+
+    update_from_model_object();
+    m_parent.set_as_dirty();
+
+    const ModelObjectPtrs &objects = wxGetApp().model().objects;
+    const size_t object_idx = size_t(std::find(objects.begin(), objects.end(), object) - objects.begin());
+    if (object_idx < objects.size()) {
+        wxGetApp().obj_list()->update_info_items(object_idx);
+        wxGetApp().plater()->get_partplate_list().notify_instance_update(object_idx, 0);
+    }
+    m_parent.post_event(SimpleEvent(EVT_GLCANVAS_SCHEDULE_BACKGROUND_PROCESS));
+}
+
+void GLGizmoMmuSegmentation::bake_selected_object_image_texture_to_vertex_colors()
+{
+    ModelObject *object = m_c->selection_info()->model_object();
+    if (object == nullptr)
+        return;
+
+    bool baked = false;
+    Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Bake image texture to vertex colors", UndoRedo::SnapshotType::GizmoAction);
+
+    for (ModelVolume *volume : object->volumes) {
+        if (volume == nullptr || !volume->is_model_part() || !model_volume_has_bakeable_image_texture_data(volume))
+            continue;
+
+        const indexed_triangle_set &its = volume->mesh().its;
+
+        struct VertexColorAccumulator
+        {
+            double r = 0.0;
+            double g = 0.0;
+            double b = 0.0;
+            double a = 0.0;
+            double weight = 0.0;
+        };
+
+        std::vector<VertexColorAccumulator> accumulators(its.vertices.size());
+        for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+            if (volume->imported_texture_uv_valid[tri_idx] == 0)
+                continue;
+
+            const auto &tri = its.indices[tri_idx];
+            if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
+                continue;
+            if (size_t(tri[0]) >= its.vertices.size() ||
+                size_t(tri[1]) >= its.vertices.size() ||
+                size_t(tri[2]) >= its.vertices.size())
+                continue;
+
+            const size_t uv_offset = tri_idx * 6;
+            const std::array<Vec2f, 3> uvs = {
+                Vec2f(volume->imported_texture_uvs_per_face[uv_offset + 0], volume->imported_texture_uvs_per_face[uv_offset + 1]),
+                Vec2f(volume->imported_texture_uvs_per_face[uv_offset + 2], volume->imported_texture_uvs_per_face[uv_offset + 3]),
+                Vec2f(volume->imported_texture_uvs_per_face[uv_offset + 4], volume->imported_texture_uvs_per_face[uv_offset + 5])
+            };
+
+            const Vec3f p0 = its.vertices[size_t(tri[0])].cast<float>();
+            const Vec3f p1 = its.vertices[size_t(tri[1])].cast<float>();
+            const Vec3f p2 = its.vertices[size_t(tri[2])].cast<float>();
+            const float area = 0.5f * (p1 - p0).cross(p2 - p0).norm();
+            const double weight = std::isfinite(area) && area > EPSILON ? double(area) : 1.0;
+            const std::array<int, 3> vertex_indices = {tri[0], tri[1], tri[2]};
+
+            for (size_t corner = 0; corner < 3; ++corner) {
+                const ColorRGBA color = sample_texture_rgba_for_vertex_bake(volume->imported_texture_rgba,
+                                                                            volume->imported_texture_width,
+                                                                            volume->imported_texture_height,
+                                                                            uvs[corner]);
+                VertexColorAccumulator &acc = accumulators[size_t(vertex_indices[corner])];
+                acc.r += double(color.r()) * weight;
+                acc.g += double(color.g()) * weight;
+                acc.b += double(color.b()) * weight;
+                acc.a += double(color.a()) * weight;
+                acc.weight += weight;
+            }
+        }
+
+        std::vector<uint32_t> vertex_colors;
+        vertex_colors.reserve(its.vertices.size());
+        for (size_t vertex_idx = 0; vertex_idx < its.vertices.size(); ++vertex_idx) {
+            const VertexColorAccumulator &acc = accumulators[vertex_idx];
+            if (acc.weight > 0.0) {
+                vertex_colors.emplace_back(pack_vertex_color_rgba(ColorRGBA(float(acc.r / acc.weight),
+                                                                            float(acc.g / acc.weight),
+                                                                            float(acc.b / acc.weight),
+                                                                            float(acc.a / acc.weight))));
+            } else if (vertex_idx < volume->imported_vertex_colors_rgba.size()) {
+                vertex_colors.emplace_back(volume->imported_vertex_colors_rgba[vertex_idx]);
+            } else {
+                vertex_colors.emplace_back(pack_vertex_color_rgba(ColorRGBA(1.f, 1.f, 1.f, 1.f)));
+            }
+        }
+
+        if (vertex_colors.size() != its.vertices.size())
+            continue;
+
+        volume->imported_vertex_colors_rgba = std::move(vertex_colors);
+        volume->imported_texture_uvs_per_face.clear();
+        volume->imported_texture_uv_valid.clear();
+        volume->imported_texture_rgba.clear();
+        volume->imported_texture_width = 0;
+        volume->imported_texture_height = 0;
+        baked = true;
+    }
+
+    if (!baked)
+        return;
+
+    for (auto &selector : m_triangle_selectors)
+        if (selector != nullptr)
+            selector->request_update_render_data(true);
+
+    m_parent.set_as_dirty();
+    const ModelObjectPtrs &objects = wxGetApp().model().objects;
+    const size_t object_idx = size_t(std::find(objects.begin(), objects.end(), object) - objects.begin());
+    if (object_idx < objects.size()) {
+        wxGetApp().obj_list()->update_info_items(object_idx);
+        wxGetApp().plater()->get_partplate_list().notify_instance_update(object_idx, 0);
+    }
+    m_parent.post_event(SimpleEvent(EVT_GLCANVAS_SCHEDULE_BACKGROUND_PROCESS));
+}
+
+void GLGizmoMmuSegmentation::convert_selected_regions_to_vertex_colors()
+{
+    ModelObject *object = m_c->selection_info()->model_object();
+    if (object == nullptr || m_triangle_selectors.empty())
+        return;
+
+    std::vector<std::string> color_strings;
+    if (wxGetApp().plater() != nullptr)
+        color_strings = wxGetApp().plater()->get_extruder_colors_from_plater_config();
+
+    std::vector<ColorRGBA> filament_colors;
+    filament_colors.reserve(color_strings.size());
+    for (const std::string &color_string : color_strings) {
+        unsigned char rgba[4] = {38, 166, 154, 255};
+        BitmapCache::parse_color4(color_string, rgba);
+        filament_colors.emplace_back(float(rgba[0]) / 255.f,
+                                     float(rgba[1]) / 255.f,
+                                     float(rgba[2]) / 255.f,
+                                     float(rgba[3]) / 255.f);
+    }
+    if (filament_colors.empty())
+        filament_colors.emplace_back(0.15f, 0.65f, 0.6f, 1.f);
+
+    auto color_for_filament_id = [&filament_colors](unsigned int filament_id) {
+        if (filament_id >= 1 && filament_id <= filament_colors.size())
+            return filament_colors[filament_id - 1];
+        return filament_colors.front();
+    };
+
+    Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Convert regions to vertex colors", UndoRedo::SnapshotType::GizmoAction);
+
+    bool converted = false;
+    int selector_idx = -1;
+    for (ModelVolume *volume : object->volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+        ++selector_idx;
+        if (selector_idx < 0 || size_t(selector_idx) >= m_triangle_selectors.size() || m_triangle_selectors[size_t(selector_idx)] == nullptr)
+            continue;
+
+        const auto &its = volume->mesh().its;
+        if (its.vertices.empty() || its.indices.empty())
+            continue;
+
+        std::vector<std::vector<TriangleSelector::FacetStateTriangle>> triangles_per_type;
+        m_triangle_selectors[size_t(selector_idx)]->get_facet_triangles(triangles_per_type);
+        if (triangles_per_type.empty())
+            continue;
+
+        struct VertexColorAccumulator
+        {
+            double r = 0.0;
+            double g = 0.0;
+            double b = 0.0;
+            double a = 0.0;
+            double weight = 0.0;
+        };
+
+        std::vector<VertexColorAccumulator> accumulators(its.vertices.size());
+        bool accumulated_any = false;
+        const unsigned int base_filament_id = volume->extruder_id() > 0 ? unsigned(volume->extruder_id()) : 1u;
+
+        for (size_t state_idx = 0; state_idx < triangles_per_type.size(); ++state_idx) {
+            const unsigned int filament_id = state_idx == 0 ? base_filament_id : unsigned(state_idx);
+            ColorRGBA state_color = color_for_filament_id(filament_id);
+            state_color.a(1.f);
+
+            for (const TriangleSelector::FacetStateTriangle &triangle : triangles_per_type[state_idx]) {
+                if (triangle.source_triangle < 0)
+                    continue;
+                const size_t source_triangle = size_t(triangle.source_triangle);
+                if (source_triangle >= its.indices.size())
+                    continue;
+
+                const auto &source_indices = its.indices[source_triangle];
+                if (source_indices[0] < 0 || source_indices[1] < 0 || source_indices[2] < 0)
+                    continue;
+                if (size_t(source_indices[0]) >= its.vertices.size() ||
+                    size_t(source_indices[1]) >= its.vertices.size() ||
+                    size_t(source_indices[2]) >= its.vertices.size())
+                    continue;
+
+                const Vec3f source_p0 = its.vertices[size_t(source_indices[0])].cast<float>();
+                const Vec3f source_p1 = its.vertices[size_t(source_indices[1])].cast<float>();
+                const Vec3f source_p2 = its.vertices[size_t(source_indices[2])].cast<float>();
+                const Vec3f centroid = (triangle.vertices[0] + triangle.vertices[1] + triangle.vertices[2]) / 3.f;
+                Vec3f weights(1.f / 3.f, 1.f / 3.f, 1.f / 3.f);
+                if (!barycentric_weights_for_region_vertex_colors(centroid, source_p0, source_p1, source_p2, weights))
+                    weights = Vec3f(1.f / 3.f, 1.f / 3.f, 1.f / 3.f);
+
+                weights.x() = std::max(0.f, weights.x());
+                weights.y() = std::max(0.f, weights.y());
+                weights.z() = std::max(0.f, weights.z());
+                const float weights_sum = weights.x() + weights.y() + weights.z();
+                if (weights_sum > EPSILON)
+                    weights /= weights_sum;
+                else
+                    weights = Vec3f(1.f / 3.f, 1.f / 3.f, 1.f / 3.f);
+
+                const float area = 0.5f * (triangle.vertices[1] - triangle.vertices[0]).cross(triangle.vertices[2] - triangle.vertices[0]).norm();
+                const double area_weight = std::max(double(area), 1e-6);
+                const std::array<float, 3> bary = {weights.x(), weights.y(), weights.z()};
+
+                for (size_t corner = 0; corner < 3; ++corner) {
+                    VertexColorAccumulator &acc = accumulators[size_t(source_indices[corner])];
+                    const double weight = area_weight * double(bary[corner]);
+                    acc.r += double(state_color.r()) * weight;
+                    acc.g += double(state_color.g()) * weight;
+                    acc.b += double(state_color.b()) * weight;
+                    acc.a += double(state_color.a()) * weight;
+                    acc.weight += weight;
+                }
+                accumulated_any = true;
+            }
+        }
+
+        if (!accumulated_any)
+            continue;
+
+        const ColorRGBA fallback_color = color_for_filament_id(base_filament_id);
+        std::vector<uint32_t> vertex_colors;
+        vertex_colors.reserve(its.vertices.size());
+        for (const VertexColorAccumulator &acc : accumulators) {
+            if (acc.weight > 0.0) {
+                vertex_colors.emplace_back(pack_vertex_color_rgba(ColorRGBA(float(acc.r / acc.weight),
+                                                                            float(acc.g / acc.weight),
+                                                                            float(acc.b / acc.weight),
+                                                                            float(acc.a / acc.weight))));
+            } else {
+                vertex_colors.emplace_back(pack_vertex_color_rgba(fallback_color));
+            }
+        }
+
+        volume->imported_vertex_colors_rgba = std::move(vertex_colors);
+        volume->mmu_segmentation_facets.reset();
+        m_triangle_selectors[size_t(selector_idx)]->reset();
+        m_triangle_selectors[size_t(selector_idx)]->request_update_render_data(true);
+        converted = true;
+    }
+
+    if (!converted)
+        return;
+
+    const unsigned int texture_mapping_filament_id = ensure_texture_mapping_zone();
+    if (texture_mapping_filament_id != 0) {
+        object->config.set("extruder", int(texture_mapping_filament_id));
+        for (ModelVolume *volume : object->volumes)
+            if (volume != nullptr && volume->is_model_part())
+                volume->config.set("extruder", int(texture_mapping_filament_id));
+    }
+
+    update_from_model_object();
+    m_parent.update_volumes_colors_by_extruder();
+    m_parent.set_as_dirty();
+
+    const ModelObjectPtrs &objects = wxGetApp().model().objects;
+    const size_t object_idx = size_t(std::find(objects.begin(), objects.end(), object) - objects.begin());
+    if (object_idx < objects.size()) {
+        wxGetApp().obj_list()->update_info_items(object_idx);
+        wxGetApp().plater()->get_partplate_list().notify_instance_update(object_idx, 0);
+    }
+    m_parent.post_event(SimpleEvent(EVT_GLCANVAS_SCHEDULE_BACKGROUND_PROCESS));
+}
+
+void GLGizmoMmuSegmentation::clear_selected_object_image_texture_data()
+{
+    ModelObject *object = m_c->selection_info()->model_object();
+    if (object == nullptr)
+        return;
+
+    bool cleared = false;
+    Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Clear image texture data", UndoRedo::SnapshotType::GizmoAction);
+    for (ModelVolume *volume : object->volumes) {
+        if (volume == nullptr || !volume->is_model_part() || !model_volume_has_imported_image_texture_data(volume))
+            continue;
+
+        volume->imported_texture_uvs_per_face.clear();
+        volume->imported_texture_uv_valid.clear();
+        volume->imported_texture_rgba.clear();
+        volume->imported_texture_width = 0;
+        volume->imported_texture_height = 0;
+        cleared = true;
+    }
+
+    if (!cleared)
+        return;
+
+    for (auto &selector : m_triangle_selectors)
+        if (selector != nullptr)
+            selector->request_update_render_data(true);
+
+    m_parent.set_as_dirty();
+    const ModelObjectPtrs &objects = wxGetApp().model().objects;
+    const size_t object_idx = size_t(std::find(objects.begin(), objects.end(), object) - objects.begin());
+    if (object_idx < objects.size()) {
+        wxGetApp().obj_list()->update_info_items(object_idx);
+        wxGetApp().plater()->get_partplate_list().notify_instance_update(object_idx, 0);
+    }
+    m_parent.post_event(SimpleEvent(EVT_GLCANVAS_SCHEDULE_BACKGROUND_PROCESS));
 }
 
 PainterGizmoType GLGizmoMmuSegmentation::get_painter_type() const

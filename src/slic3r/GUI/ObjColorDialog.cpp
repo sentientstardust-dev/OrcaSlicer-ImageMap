@@ -396,7 +396,11 @@ ObjColorPanel::ObjColorPanel(wxWindow *parent, Slic3r::ObjDialogInOut &in_out, c
     this->Layout();
 }
 
-ObjColorPanel::~ObjColorPanel() {
+ObjColorPanel::~ObjColorPanel()
+{
+    for (ButtonState *item : m_result_icon_list)
+        delete item;
+    m_result_icon_list.clear();
 }
 
 void ObjColorPanel::msw_rescale()

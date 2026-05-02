@@ -313,16 +313,34 @@ wxWindow* BitmapChoiceRenderer::CreateEditorCtrl(wxWindow* parent, wxRect labelR
         0, nullptr, wxCB_READONLY | CB_NO_DROP_ICON | CB_NO_TEXT);
     c_editor->GetDropDown().SetUseContentWidth(true);
        
-    if (has_default_extruder && has_default_extruder())
+    int selection_to_set = wxNOT_FOUND;
+    if (has_default_extruder && has_default_extruder()) {
         c_editor->Append(_L("default"), *get_default_extruder_color_icon());
+        selection_to_set = 0;
+    }
 
-    for (size_t i = 0; i < icons.size(); i++)
-        c_editor->Append(wxString::Format("%d", i+1), *icons[i]);
+    std::vector<unsigned int> ordered_filament_ids;
+    if (Slic3r::GUI::wxGetApp().plater() != nullptr)
+        ordered_filament_ids = Slic3r::GUI::wxGetApp().plater()->sidebar().get_ui_ordered_filament_ids();
+    if (ordered_filament_ids.empty()) {
+        ordered_filament_ids.reserve(icons.size());
+        for (size_t i = 0; i < icons.size(); ++i)
+            ordered_filament_ids.emplace_back(unsigned(i + 1));
+    }
 
-    if (has_default_extruder && has_default_extruder())
-        c_editor->SetSelection(atoi(data.GetText().c_str()));
-    else
-        c_editor->SetSelection(atoi(data.GetText().c_str()) - 1);
+    const int current_extruder = atoi(data.GetText().c_str());
+    for (const unsigned int filament_id : ordered_filament_ids) {
+        if (filament_id == 0 || filament_id > icons.size())
+            continue;
+        const int item_idx = c_editor->GetCount();
+        c_editor->Append(wxString::Format("%u", filament_id), *icons[size_t(filament_id - 1)]);
+        if (current_extruder == int(filament_id))
+            selection_to_set = item_idx;
+    }
+
+    if (selection_to_set == wxNOT_FOUND)
+        selection_to_set = 0;
+    c_editor->SetSelection(selection_to_set);
 
     // Open the dropdown immediately when the editor is focused.
     c_editor->Bind(wxEVT_SET_FOCUS, [c_editor](wxFocusEvent& evt) {
@@ -388,5 +406,4 @@ wxSize TextRenderer::GetSize() const
 {
     return GetTextExtent(m_value);
 }
-
 

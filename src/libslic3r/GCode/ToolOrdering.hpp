@@ -19,6 +19,7 @@ class PrintObject;
 class LayerTools;
 namespace CustomGCode { struct Item; }
 class PrintRegion;
+class TextureMappingManager;
 
 // Object of this class holds information about whether an extrusion is printed immediately
 // after a toolchange (as part of infill/perimeter wiping) or not. One extrusion can be a part
@@ -144,8 +145,12 @@ public:
     unsigned int solid_infill_filament(const PrintRegion &region) const;
 	// Returns a zero based extruder this eec should be printed with, according to PrintRegion config or extruder_override if overriden.
 	unsigned int extruder(const ExtrusionEntityCollection &extrusions, const PrintRegion &region) const;
+    unsigned int resolve_filament_id(unsigned int filament_id_1based) const;
 
     coordf_t 					print_z	= 0.;
+    int                         layer_index = 0;
+    size_t                      num_physical_filaments = 0;
+    const TextureMappingManager *texture_mapping_manager = nullptr;
     bool 						has_object = false;
     bool						has_support = false;
     // Zero based extruder IDs, ordered to minimize tool switches.

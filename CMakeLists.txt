@@ -427,8 +427,8 @@ if (NOT MSVC AND ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU" OR "${CMAKE_CXX_COMP
 
     if((${CMAKE_CXX_COMPILER_ID} STREQUAL "Clang" OR ${CMAKE_CXX_COMPILER_ID} STREQUAL "AppleClang") AND ${CMAKE_CXX_COMPILER_VERSION} VERSION_GREATER 15)
         include(CheckCXXCompilerFlag)
-        check_cxx_compiler_flag(-Wno-error=enum-constexpr-conversion HAS_WNO_ERROR_ENUM_CONSTEXPR_CONV)
-        if(HAS_WNO_ERROR_ENUM_CONSTEXPR_CONV)
+        check_cxx_compiler_flag("-Werror=unknown-warning-option -Wno-error=enum-constexpr-conversion" HAS_WNO_ERROR_ENUM_CONSTEXPR_CONV_STRICT)
+        if(HAS_WNO_ERROR_ENUM_CONSTEXPR_CONV_STRICT)
             add_compile_options(-Wno-error=enum-constexpr-conversion)
         endif()
     endif()

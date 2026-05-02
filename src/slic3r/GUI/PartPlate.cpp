@@ -1607,9 +1607,17 @@ std::vector<int> PartPlate::get_extruders(bool conside_custom_gcode) const
         int nums_extruders = 0;
         if (const ConfigOptionStrings *color_option = dynamic_cast<const ConfigOptionStrings *>(wxGetApp().preset_bundle->project_config.option("filament_colour"))) {
             nums_extruders = color_option->values.size();
+            size_t total_filaments = size_t(nums_extruders);
+            if (wxGetApp().preset_bundle != nullptr) {
+                const std::string serialized = wxGetApp().preset_bundle->project_config.has("texture_mapping_definitions") ?
+                    wxGetApp().preset_bundle->project_config.opt_string("texture_mapping_definitions") :
+                    std::string();
+                wxGetApp().preset_bundle->texture_mapping_zones.load_entries(serialized, color_option->values);
+                total_filaments = wxGetApp().preset_bundle->texture_mapping_zones.total_filaments(size_t(nums_extruders));
+            }
 			if (m_model->plates_custom_gcodes.find(m_plate_index) != m_model->plates_custom_gcodes.end()) {
 				for (auto item : m_model->plates_custom_gcodes.at(m_plate_index).gcodes) {
-					if (item.type == CustomGCode::Type::ToolChange && item.extruder <= nums_extruders)
+					if (item.type == CustomGCode::Type::ToolChange && item.extruder <= int(total_filaments))
 						plate_extruders.push_back(item.extruder);
 				}
 			}
@@ -1729,9 +1737,17 @@ std::vector<int> PartPlate::get_extruders_under_cli(bool conside_custom_gcode, D
         int nums_extruders = 0;
         if (const ConfigOptionStrings *color_option = dynamic_cast<const ConfigOptionStrings *>(full_config.option("filament_colour"))) {
             nums_extruders = color_option->values.size();
+            size_t total_filaments = size_t(nums_extruders);
+            if (wxGetApp().preset_bundle != nullptr) {
+                const std::string serialized = full_config.has("texture_mapping_definitions") ?
+                    full_config.opt_string("texture_mapping_definitions") :
+                    std::string();
+                wxGetApp().preset_bundle->texture_mapping_zones.load_entries(serialized, color_option->values);
+                total_filaments = wxGetApp().preset_bundle->texture_mapping_zones.total_filaments(size_t(nums_extruders));
+            }
             if (m_model->plates_custom_gcodes.find(m_plate_index) != m_model->plates_custom_gcodes.end()) {
                 for (auto item : m_model->plates_custom_gcodes.at(m_plate_index).gcodes) {
-                    if (item.type == CustomGCode::Type::ToolChange && item.extruder <= nums_extruders)
+                    if (item.type == CustomGCode::Type::ToolChange && item.extruder <= int(total_filaments))
                         plate_extruders.push_back(item.extruder);
                 }
             }
@@ -1782,9 +1798,17 @@ std::vector<int> PartPlate::get_extruders_without_support(bool conside_custom_gc
 		int nums_extruders = 0;
 		if (const ConfigOptionStrings* color_option = dynamic_cast<const ConfigOptionStrings*>(wxGetApp().preset_bundle->project_config.option("filament_colour"))) {
 			nums_extruders = color_option->values.size();
+            size_t total_filaments = size_t(nums_extruders);
+            if (wxGetApp().preset_bundle != nullptr) {
+                const std::string serialized = wxGetApp().preset_bundle->project_config.has("texture_mapping_definitions") ?
+                    wxGetApp().preset_bundle->project_config.opt_string("texture_mapping_definitions") :
+                    std::string();
+                wxGetApp().preset_bundle->texture_mapping_zones.load_entries(serialized, color_option->values);
+                total_filaments = wxGetApp().preset_bundle->texture_mapping_zones.total_filaments(size_t(nums_extruders));
+            }
 			if (m_model->plates_custom_gcodes.find(m_plate_index) != m_model->plates_custom_gcodes.end()) {
 				for (auto item : m_model->plates_custom_gcodes.at(m_plate_index).gcodes) {
-					if (item.type == CustomGCode::Type::ToolChange && item.extruder <= nums_extruders)
+					if (item.type == CustomGCode::Type::ToolChange && item.extruder <= int(total_filaments))
 						plate_extruders.push_back(item.extruder);
 				}
 			}

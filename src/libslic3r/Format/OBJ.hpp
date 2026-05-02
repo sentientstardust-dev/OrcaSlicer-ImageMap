@@ -1,12 +1,37 @@
 #ifndef slic3r_Format_OBJ_hpp_
 #define slic3r_Format_OBJ_hpp_
 #include "libslic3r/Color.hpp"
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <string>
 #include <unordered_map>
+#include <vector>
 namespace Slic3r {
 
 class TriangleMesh;
 class Model;
 class ModelObject;
+
+enum class ObjImportMode {
+    UseDefault = 0,
+    ImportPaintedRegions,
+    ImportTextures,
+    ImportNeither
+};
+
+struct ObjImportCapabilities {
+    bool   has_vertex_colors{false};
+    bool   has_face_colors{false};
+    bool   is_single_color{false};
+    size_t texture_count{0};
+    bool   has_valid_texture_uvs{false};
+};
+
+typedef std::function<ObjImportMode(const ObjImportCapabilities &capabilities)> ObjImportModeFn;
+
 // Load an OBJ file into a provided model.
 struct ObjInfo {
     std::vector<RGBA> vertex_colors;
@@ -14,10 +39,13 @@ struct ObjInfo {
     bool              is_single_mtl{false};
     std::string       lost_material_name{""};
     std::vector<std::array<Vec2f,3>> uvs;
+    std::vector<std::array<Vec2f, 3>> triangle_uvs;
+    std::vector<uint8_t>              triangle_uvs_valid;
     std::string        obj_dircetory;
     std::map<std::string,bool>  pngs;
     std::unordered_map<int, std::string> uv_map_pngs;
     bool              has_uv_png{false};
+    std::string       single_texture_image;
 
 };
 struct ObjDialogInOut

@@ -4,8 +4,12 @@
 
 #include <cstddef>
 #include <algorithm>
+#include <array>
+#include <iomanip>
 #include <numeric>
 #include <limits>
+#include <sstream>
+#include <unordered_set>
 #include <vector>
 #include <string>
 #include <regex>
@@ -25,7 +29,9 @@
 #include <wx/stattext.h>
 #include <wx/button.h>
 #include <wx/bmpcbox.h>
+#include <wx/choice.h>
 #include <wx/display.h>
+#include <wx/dcbuffer.h>
 #include <wx/statbox.h>
 #include <wx/statbmp.h>
 #include <wx/filedlg.h>
@@ -38,6 +44,9 @@
 #include <wx/busyinfo.h>
 #include <wx/event.h>
 #include <wx/wrapsizer.h>
+#include <wx/simplebook.h>
+#include <wx/slider.h>
+#include <wx/spinctrl.h>
 #ifdef _WIN32
 #include <wx/richtooltip.h>
 #include <wx/custombgwin.h>
@@ -65,6 +74,7 @@
 #include "libslic3r/SLAPrint.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/TextureMapping.hpp"
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/ObjColorUtils.hpp"
 // For stl export
@@ -399,6 +409,802 @@ wxString sanitize_window_layout_for_wayland(const wxString& layout, bool* remove
 }
 #endif
 
+static bool model_volume_has_imported_texture_mapping_data(const ModelVolume *volume)
+{
+    return volume != nullptr &&
+           (!volume->imported_vertex_colors_rgba.empty() ||
+            (!volume->imported_texture_rgba.empty() &&
+             volume->imported_texture_width > 0 &&
+             volume->imported_texture_height > 0));
+}
+
+static bool model_object_has_imported_texture_mapping_data(const ModelObject *object)
+{
+    return object != nullptr && std::any_of(object->volumes.begin(), object->volumes.end(), [](const ModelVolume *volume) {
+        return model_volume_has_imported_texture_mapping_data(volume);
+    });
+}
+
+static bool assign_imported_texture_mapping_zone(Model &model)
+{
+    bool has_imported_data = false;
+    for (const ModelObject *object : model.objects) {
+        if (model_object_has_imported_texture_mapping_data(object)) {
+            has_imported_data = true;
+            break;
+        }
+    }
+    if (!has_imported_data)
+        return false;
+
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    if (bundle == nullptr)
+        return false;
+
+    DynamicPrintConfig &project_config = bundle->project_config;
+    const ConfigOptionStrings *color_opt = project_config.option<ConfigOptionStrings>("filament_colour", false);
+    if (color_opt == nullptr || color_opt->values.size() < 2)
+        return false;
+
+    project_config.option<ConfigOptionString>("texture_mapping_definitions", true);
+    bundle->texture_mapping_zones.load_entries(project_config.opt_string("texture_mapping_definitions"), color_opt->values);
+    const unsigned int zone_id = bundle->texture_mapping_zones.ensure_image_texture_zone(color_opt->values.size(), color_opt->values);
+    if (zone_id == 0)
+        return false;
+
+    const std::string serialized = bundle->texture_mapping_zones.serialize_entries();
+    if (ConfigOptionString *opt = project_config.option<ConfigOptionString>("texture_mapping_definitions"))
+        opt->value = serialized;
+    else
+        project_config.set_key_value("texture_mapping_definitions", new ConfigOptionString(serialized));
+    DynamicPrintConfig &print_config = bundle->prints.get_edited_preset().config;
+    if (ConfigOptionString *opt = print_config.option<ConfigOptionString>("texture_mapping_definitions"))
+        opt->value = serialized;
+    else
+        print_config.set_key_value("texture_mapping_definitions", new ConfigOptionString(serialized));
+
+    for (ModelObject *object : model.objects) {
+        if (!model_object_has_imported_texture_mapping_data(object))
+            continue;
+        object->config.set("extruder", int(zone_id));
+        for (ModelVolume *volume : object->volumes)
+            if (model_volume_has_imported_texture_mapping_data(volume))
+                volume->config.set("extruder", int(zone_id));
+    }
+    return true;
+}
+
+static wxColour parse_texture_mapping_color(const std::string &hex)
+{
+    unsigned char rgba[4] = {38, 166, 154, 255};
+    Slic3r::GUI::BitmapCache::parse_color4(hex, rgba);
+    return wxColour(rgba[0], rgba[1], rgba[2], rgba[3]);
+}
+
+static std::string encode_texture_mapping_component_ids(const std::vector<unsigned int> &ids)
+{
+    std::string out;
+    bool seen[10] = {false};
+    for (const unsigned int id : ids) {
+        if (id == 0 || id > 9 || seen[id])
+            continue;
+        seen[id] = true;
+        out.push_back(char('0' + id));
+    }
+    return out;
+}
+
+static std::vector<unsigned int> texture_mapping_selected_ids(const TextureMappingZone &zone, size_t num_physical)
+{
+    std::vector<unsigned int> ids = TextureMappingManager::selected_component_ids(zone, num_physical);
+    ids.erase(std::remove_if(ids.begin(), ids.end(), [num_physical](unsigned int id) {
+        return id == 0 || id > num_physical || id > 9;
+    }), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    if (ids.size() < 2) {
+        ids.clear();
+        for (size_t i = 1; i <= std::min<size_t>(num_physical, 9); ++i)
+            ids.emplace_back(unsigned(i));
+    }
+    if (ids.size() < 2)
+        ids = {1, 2};
+    return ids;
+}
+
+static std::string encode_texture_mapping_float_values(const std::vector<float> &values)
+{
+    std::ostringstream ss;
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i > 0)
+            ss << '/';
+        ss << std::fixed << std::setprecision(4) << values[i];
+    }
+    return ss.str();
+}
+
+static wxArrayString texture_mapping_color_mode_choices()
+{
+    wxArrayString choices;
+    choices.Add(_L("Generic Solver"));
+    choices.Add(_L("RGB"));
+    choices.Add(_L("CMY"));
+    choices.Add(_L("CMYK"));
+    choices.Add(_L("CMYW"));
+    choices.Add(_L("RGBK"));
+    choices.Add(_L("RGBW"));
+    choices.Add(_L("BW"));
+    return choices;
+}
+
+static std::vector<wxString> texture_mapping_channel_labels(int filament_color_mode)
+{
+    switch (std::clamp(filament_color_mode, int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorBW))) {
+    case int(TextureMappingZone::FilamentColorRGB):
+        return {_L("Red"), _L("Green"), _L("Blue")};
+    case int(TextureMappingZone::FilamentColorCMY):
+        return {_L("Cyan"), _L("Magenta"), _L("Yellow")};
+    case int(TextureMappingZone::FilamentColorCMYK):
+        return {_L("Cyan"), _L("Magenta"), _L("Yellow"), _L("Black")};
+    case int(TextureMappingZone::FilamentColorCMYW):
+        return {_L("Cyan"), _L("Magenta"), _L("Yellow"), _L("White")};
+    case int(TextureMappingZone::FilamentColorRGBK):
+        return {_L("Red"), _L("Green"), _L("Blue"), _L("Black")};
+    case int(TextureMappingZone::FilamentColorRGBW):
+        return {_L("Red"), _L("Green"), _L("Blue"), _L("White")};
+    case int(TextureMappingZone::FilamentColorBW):
+        return {_L("Black"), _L("White")};
+    default:
+        return {};
+    }
+}
+
+static wxString texture_mapping_summary(const TextureMappingZone &zone, size_t num_physical)
+{
+    wxString summary = zone.is_2d_gradient() ? _L("2D Gradient") : from_u8(TextureMappingManager::filament_color_mode_name(zone.filament_color_mode));
+    if (!zone.is_2d_gradient() && summary == "any")
+        summary = _L("Texture");
+    else
+        summary.MakeUpper();
+
+    const std::vector<unsigned int> ids = texture_mapping_selected_ids(zone, num_physical);
+    summary += "  ";
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (i > 0)
+            summary += "/";
+        summary += wxString::Format("F%u", ids[i]);
+    }
+    return summary;
+}
+
+static wxString texture_mapping_menu_label(const TextureMappingZone &zone)
+{
+    if (zone.is_2d_gradient())
+        return _L("Texture Mapping 2D Gradient");
+    const std::string color_model = TextureMappingManager::filament_color_mode_name(zone.filament_color_mode);
+    if (color_model == "any")
+        return _L("Texture Mapping");
+    wxString color_model_text = from_u8(color_model);
+    color_model_text.MakeUpper();
+    return _L("Texture Mapping ") + color_model_text;
+}
+
+static wxSize from_dip_for_parent(wxWindow *parent, const wxSize &size)
+{
+    return wxWindow::FromDIP(size, parent);
+}
+
+class TextureMappingPatternPreview : public wxPanel
+{
+public:
+    explicit TextureMappingPatternPreview(wxWindow *parent)
+        : wxPanel(parent, wxID_ANY, wxDefaultPosition, from_dip_for_parent(parent, wxSize(28, 54)), wxBORDER_NONE)
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetMinSize(wxSize(FromDIP(28), FromDIP(54)));
+        Bind(wxEVT_PAINT, &TextureMappingPatternPreview::on_paint, this);
+    }
+
+    void set_data(const std::vector<wxColour> &palette, const std::vector<unsigned int> &component_ids, const wxColour &fallback)
+    {
+        m_palette = palette;
+        m_component_ids = component_ids;
+        m_fallback = fallback.IsOk() ? fallback : wxColour("#26A69A");
+        Refresh();
+    }
+
+private:
+    wxColour color_for(unsigned int id) const
+    {
+        if (id >= 1 && id <= m_palette.size())
+            return m_palette[id - 1];
+        return m_fallback;
+    }
+
+    void on_paint(wxPaintEvent &)
+    {
+        wxAutoBufferedPaintDC dc(this);
+        dc.SetBackground(wxBrush(GetBackgroundColour()));
+        dc.Clear();
+        const wxSize size = GetClientSize();
+        const int pad = FromDIP(2);
+        const wxRect rect(pad, pad, std::max(1, size.x - 2 * pad), std::max(1, size.y - 2 * pad));
+        dc.SetPen(*wxTRANSPARENT_PEN);
+        dc.SetBrush(wxBrush(m_fallback));
+        dc.DrawRectangle(rect);
+        if (!m_component_ids.empty()) {
+            const int slots = int(m_component_ids.size());
+            for (int slot = 0; slot < slots; ++slot) {
+                const int visual_slot = slots - 1 - slot;
+                const int y0 = rect.GetTop() + int(std::lround(double(visual_slot) * double(rect.GetHeight()) / double(slots)));
+                const int y1 = rect.GetTop() + int(std::lround(double(visual_slot + 1) * double(rect.GetHeight()) / double(slots)));
+                dc.SetBrush(wxBrush(color_for(m_component_ids[size_t(slot)])));
+                dc.DrawRectangle(rect.GetLeft(), y0, rect.GetWidth(), std::max(1, y1 - y0));
+            }
+        }
+        dc.SetPen(wxPen(wxGetApp().dark_mode() ? wxColour(118, 118, 118) : wxColour(164, 164, 164), 1));
+        dc.SetBrush(*wxTRANSPARENT_BRUSH);
+        dc.DrawRectangle(rect);
+    }
+
+    std::vector<wxColour>     m_palette;
+    std::vector<unsigned int> m_component_ids;
+    wxColour                  m_fallback {wxColour("#26A69A")};
+};
+
+class TextureMappingNumberSwatch : public wxPanel
+{
+public:
+    explicit TextureMappingNumberSwatch(wxWindow *parent)
+        : wxPanel(parent, wxID_ANY, wxDefaultPosition, from_dip_for_parent(parent, wxSize(28, 22)), wxBORDER_NONE)
+    {
+        SetMinSize(wxSize(FromDIP(28), FromDIP(22)));
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        Bind(wxEVT_PAINT, &TextureMappingNumberSwatch::on_paint, this);
+    }
+
+    void set_data(const wxColour &color, unsigned int filament_id)
+    {
+        m_color = color.IsOk() ? color : wxColour("#26A69A");
+        m_filament_id = filament_id;
+        Refresh();
+    }
+
+private:
+    void on_paint(wxPaintEvent &)
+    {
+        wxAutoBufferedPaintDC dc(this);
+        dc.SetBackground(wxBrush(GetBackgroundColour()));
+        dc.Clear();
+        const wxSize size = GetClientSize();
+        const wxRect rect(0, 0, std::max(1, size.x), std::max(1, size.y));
+        dc.SetPen(wxPen(wxGetApp().dark_mode() ? wxColour(118, 118, 118) : wxColour(164, 164, 164), 1));
+        dc.SetBrush(wxBrush(m_color));
+        wxRect swatch_rect = rect;
+        swatch_rect.Deflate(1, 1);
+        dc.DrawRoundedRectangle(swatch_rect, FromDIP(3));
+        const wxString label = wxString::Format("%u", m_filament_id);
+        wxFont font = ::Label::Body_12;
+        font.SetWeight(wxFONTWEIGHT_BOLD);
+        dc.SetFont(font);
+        dc.SetTextForeground(m_color.GetLuminance() < 0.51 ? *wxWHITE : *wxBLACK);
+        const wxSize text_size = dc.GetTextExtent(label);
+        dc.DrawText(label, (rect.GetWidth() - text_size.x) / 2, (rect.GetHeight() - text_size.y) / 2);
+    }
+
+    wxColour    m_color {wxColour("#26A69A")};
+    unsigned int m_filament_id = 0;
+};
+
+class TextureMappingOffsetGradientDialog : public wxDialog
+{
+public:
+    TextureMappingOffsetGradientDialog(wxWindow *parent,
+                                       const TextureMappingZone &zone,
+                                       size_t num_physical,
+                                       const std::vector<double> &nozzle_diameters,
+                                       const std::vector<wxColour> &palette)
+        : wxDialog(parent, wxID_ANY, _L("Offset Gradient"), wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
+        , m_zone(zone)
+    {
+        const int gap = FromDIP(8);
+        const int compact_gap = std::max(FromDIP(3), gap / 2);
+        m_component_ids = texture_mapping_selected_ids(zone, num_physical);
+        const float reference_nozzle = float(nozzle_diameters.empty() ? 0.4 : std::max(0.05, nozzle_diameters.front()));
+        m_max_distance_mm = TextureMappingManager::max_component_surface_offset_mm(reference_nozzle);
+        const std::vector<float> initial_distances =
+            TextureMappingManager::effective_offset_distances(zone, m_component_ids.size(), reference_nozzle);
+        const std::vector<float> initial_angles =
+            TextureMappingManager::effective_offset_angles(zone, m_component_ids.size());
+        float overall_strength_pct = 100.f;
+        if (!initial_distances.empty()) {
+            float max_ratio = 0.f;
+            for (const float distance : initial_distances)
+                max_ratio = std::max(max_ratio, std::clamp(distance, 0.f, m_max_distance_mm) / std::max(m_max_distance_mm, float(EPSILON)));
+            overall_strength_pct = std::clamp(max_ratio * 100.f, 0.f, 100.f);
+        }
+
+        auto *root = new wxBoxSizer(wxVERTICAL);
+        auto *mode_row = new wxBoxSizer(wxHORIZONTAL);
+        mode_row->Add(new wxStaticText(this, wxID_ANY, _L("Mode")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, compact_gap);
+        wxArrayString mode_choices;
+        mode_choices.Add(_L("Basic"));
+        mode_choices.Add(_L("Advanced"));
+        m_mode_choice = new wxChoice(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, mode_choices);
+        m_mode_choice->SetSelection(std::clamp(zone.offset_mode, int(TextureMappingZone::OffsetBasic), int(TextureMappingZone::OffsetAdvanced)));
+        mode_row->Add(m_mode_choice, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        mode_row->Add(new wxStaticText(this, wxID_ANY, _L("Overall strength")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, compact_gap);
+        m_basic_distance_spin = new wxSpinCtrlDouble(this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(84), -1),
+                                                     wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER, 0.0, 100.0,
+                                                     std::clamp(double(overall_strength_pct), 0.0, 100.0), 1.0);
+        m_basic_distance_spin->SetDigits(1);
+        mode_row->Add(m_basic_distance_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, compact_gap);
+        mode_row->Add(new wxStaticText(this, wxID_ANY, _L("%")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        m_basic_angle_label = new wxStaticText(this, wxID_ANY, _L("Offset angle"));
+        mode_row->Add(m_basic_angle_label, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, compact_gap);
+        m_basic_angle_spin = new wxSpinCtrlDouble(this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(84), -1),
+                                                  wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER, 0.0, 360.0,
+                                                  initial_angles.empty() ? 0.0 : std::clamp(double(initial_angles.front()), 0.0, 360.0), 1.0);
+        m_basic_angle_spin->SetDigits(1);
+        mode_row->Add(m_basic_angle_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, compact_gap);
+        m_basic_angle_units = new wxStaticText(this, wxID_ANY, _L("deg"));
+        mode_row->Add(m_basic_angle_units, 0, wxALIGN_CENTER_VERTICAL);
+        root->Add(mode_row, 0, wxEXPAND | wxALL, gap);
+
+        auto *rotation_box = new wxStaticBoxSizer(wxVERTICAL, this, _L("Rotation over model height"));
+        m_rotation_enabled = new wxCheckBox(this, wxID_ANY, _L("Enable rotation"));
+        m_rotation_enabled->SetValue(zone.offset_rotation_enabled);
+        rotation_box->Add(m_rotation_enabled, 0, wxBOTTOM, compact_gap);
+        auto *rotation_row = new wxBoxSizer(wxHORIZONTAL);
+        rotation_row->Add(new wxStaticText(this, wxID_ANY, _L("Rotation count")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, compact_gap);
+        m_rotations_spin = new wxSpinCtrlDouble(this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(80), -1),
+                                                wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER, -64.0, 64.0,
+                                                std::clamp(double(zone.offset_rotations), -64.0, 64.0), 0.1);
+        m_rotations_spin->SetDigits(2);
+        rotation_row->Add(m_rotations_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        rotation_row->Add(new wxStaticText(this, wxID_ANY, _L("Repeats")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, compact_gap);
+        m_repeats_spin = new wxSpinCtrlDouble(this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(80), -1),
+                                              wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER, 1.0, 64.0,
+                                              std::max(1.0, double(zone.offset_repeats)), 0.1);
+        m_repeats_spin->SetDigits(2);
+        rotation_row->Add(m_repeats_spin, 0, wxALIGN_CENTER_VERTICAL);
+        rotation_box->Add(rotation_row, 0, wxEXPAND | wxBOTTOM, compact_gap);
+        auto *rotation_flags_row = new wxBoxSizer(wxHORIZONTAL);
+        m_reverse_repeats = new wxCheckBox(this, wxID_ANY, _L("Reverse repeats"));
+        m_reverse_repeats->SetValue(zone.offset_reverse_repeats);
+        rotation_flags_row->Add(m_reverse_repeats, 0, wxRIGHT, gap);
+        m_clockwise = new wxCheckBox(this, wxID_ANY, _L("Clockwise"));
+        m_clockwise->SetValue(zone.offset_clockwise);
+        rotation_flags_row->Add(m_clockwise, 0);
+        rotation_box->Add(rotation_flags_row, 0, wxEXPAND);
+        root->Add(rotation_box, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
+        auto *fade_row = new wxBoxSizer(wxHORIZONTAL);
+        fade_row->Add(new wxStaticText(this, wxID_ANY, _L("Fade")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, compact_gap);
+        wxArrayString fade_choices;
+        fade_choices.Add(_L("None"));
+        fade_choices.Add(_L("Fade in (going up)"));
+        fade_choices.Add(_L("Fade out (going up)"));
+        fade_choices.Add(_L("Fade in and out"));
+        fade_choices.Add(_L("Fade out and in"));
+        fade_choices.Add(_L("Fade out and in (mirrored)"));
+        m_fade_choice = new wxChoice(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, fade_choices);
+        m_fade_choice->SetSelection(std::clamp(zone.offset_fade_mode, int(TextureMappingZone::OffsetFadeNone), int(TextureMappingZone::OffsetFadeOutInReversed)));
+        fade_row->Add(m_fade_choice, 1, wxALIGN_CENTER_VERTICAL);
+        root->Add(fade_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
+        auto *angle_mode_row = new wxBoxSizer(wxHORIZONTAL);
+        angle_mode_row->Add(new wxStaticText(this, wxID_ANY, _L("Gradient calculated from")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, compact_gap);
+        wxArrayString angle_mode_choices;
+        angle_mode_choices.Add(_L("Surface normal"));
+        angle_mode_choices.Add(_L("Angle from object center"));
+        m_angle_mode_choice = new wxChoice(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, angle_mode_choices);
+        m_angle_mode_choice->SetSelection(zone.offset_angle_mode == int(TextureMappingZone::OffsetAngleSurfaceNormal) ? 0 : 1);
+        angle_mode_row->Add(m_angle_mode_choice, 1, wxALIGN_CENTER_VERTICAL);
+        root->Add(angle_mode_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
+        auto *components_box = new wxStaticBoxSizer(wxVERTICAL, this, _L("Per-color strengths"));
+        const float overall_factor = std::clamp(overall_strength_pct / 100.f, 0.f, 1.f);
+        for (size_t i = 0; i < m_component_ids.size(); ++i) {
+            auto *row = new wxBoxSizer(wxHORIZONTAL);
+            wxStaticText *label = new wxStaticText(this, wxID_ANY, wxString::Format("F%d", int(m_component_ids[i])));
+            if (m_component_ids[i] >= 1 && m_component_ids[i] <= palette.size())
+                label->SetForegroundColour(palette[m_component_ids[i] - 1]);
+            row->Add(label, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, compact_gap);
+            float initial_strength = 100.f;
+            if (i < initial_distances.size() && overall_factor > EPSILON && m_max_distance_mm > EPSILON)
+                initial_strength = std::clamp(100.f * initial_distances[i] / (m_max_distance_mm * overall_factor), 0.f, 100.f);
+            wxSpinCtrlDouble *distance_spin = new wxSpinCtrlDouble(this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(84), -1),
+                                                                   wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER, 0.0, 100.0,
+                                                                   std::clamp(double(initial_strength), 0.0, 100.0), 1.0);
+            distance_spin->SetDigits(1);
+            row->Add(distance_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, compact_gap);
+            row->Add(new wxStaticText(this, wxID_ANY, _L("%")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+            wxSpinCtrlDouble *angle_spin = new wxSpinCtrlDouble(this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(84), -1),
+                                                                wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER, 0.0, 360.0,
+                                                                i < initial_angles.size() ? std::clamp(double(initial_angles[i]), 0.0, 360.0) : 0.0, 1.0);
+            angle_spin->SetDigits(1);
+            row->Add(angle_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, compact_gap);
+            row->Add(new wxStaticText(this, wxID_ANY, _L("deg")), 0, wxALIGN_CENTER_VERTICAL);
+            components_box->Add(row, 0, wxEXPAND | wxTOP, i == 0 ? 0 : compact_gap);
+            m_distance_spins.emplace_back(distance_spin);
+            m_angle_spins.emplace_back(angle_spin);
+            m_component_rows.emplace_back(row);
+        }
+        root->Add(components_box, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
+        auto *buttons_row = new wxBoxSizer(wxHORIZONTAL);
+        auto *remove_btn = new wxButton(this, wxID_ANY, _L("Remove"));
+        buttons_row->Add(remove_btn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        buttons_row->AddStretchSpacer(1);
+        buttons_row->Add(new wxButton(this, wxID_CANCEL), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, compact_gap);
+        buttons_row->Add(new wxButton(this, wxID_OK), 0, wxALIGN_CENTER_VERTICAL);
+        root->Add(buttons_row, 0, wxEXPAND | wxALL, gap);
+        remove_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+            m_remove_requested = true;
+            EndModal(wxID_OK);
+        });
+
+        m_mode_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) { update_advanced_visibility(); });
+        SetSizerAndFit(root);
+        SetMinSize(wxSize(FromDIP(560), std::max(GetSize().GetHeight(), FromDIP(420))));
+        update_advanced_visibility();
+    }
+
+    bool apply_to(TextureMappingZone &out)
+    {
+        out = m_zone;
+        if (m_remove_requested) {
+            out.reset_offset_settings();
+            return true;
+        }
+        out.offset_mode = std::clamp(m_mode_choice ? m_mode_choice->GetSelection() : int(TextureMappingZone::OffsetBasic),
+                                     int(TextureMappingZone::OffsetBasic), int(TextureMappingZone::OffsetAdvanced));
+        out.offset_rotation_enabled = m_rotation_enabled && m_rotation_enabled->GetValue();
+        out.offset_rotations = m_rotations_spin ? float(m_rotations_spin->GetValue()) : 1.f;
+        out.offset_repeats = m_repeats_spin ? std::max(1.f, float(m_repeats_spin->GetValue())) : 1.f;
+        out.offset_reverse_repeats = m_reverse_repeats && m_reverse_repeats->GetValue();
+        out.offset_clockwise = m_clockwise && m_clockwise->GetValue();
+        out.offset_fade_mode = m_fade_choice ? std::clamp(m_fade_choice->GetSelection(), int(TextureMappingZone::OffsetFadeNone), int(TextureMappingZone::OffsetFadeOutInReversed)) :
+                                               int(TextureMappingZone::OffsetFadeNone);
+        out.offset_angle_mode = (m_angle_mode_choice && m_angle_mode_choice->GetSelection() == 0) ?
+            int(TextureMappingZone::OffsetAngleSurfaceNormal) : int(TextureMappingZone::OffsetAngleObjectCenter);
+        const float overall_factor = std::clamp(float(m_basic_distance_spin ? m_basic_distance_spin->GetValue() : 100.0) / 100.f, 0.f, 1.f);
+        float basic_angle = m_basic_angle_spin ? float(m_basic_angle_spin->GetValue()) : 0.f;
+        basic_angle = std::fmod(basic_angle, 360.f);
+        if (basic_angle < 0.f)
+            basic_angle += 360.f;
+        std::vector<float> distances(m_component_ids.size(), 0.f);
+        std::vector<float> angles(m_component_ids.size(), 0.f);
+        for (size_t i = 0; i < m_component_ids.size(); ++i) {
+            float component_strength = 100.f;
+            if (out.offset_mode == int(TextureMappingZone::OffsetAdvanced) && i < m_distance_spins.size() && m_distance_spins[i])
+                component_strength = float(m_distance_spins[i]->GetValue());
+            distances[i] = std::clamp(m_max_distance_mm * overall_factor * std::clamp(component_strength / 100.f, 0.f, 1.f), 0.f, m_max_distance_mm);
+            if (out.offset_mode == int(TextureMappingZone::OffsetAdvanced) && i < m_angle_spins.size() && m_angle_spins[i])
+                angles[i] = float(m_angle_spins[i]->GetValue());
+            else
+                angles[i] = basic_angle + (360.f * float(i)) / std::max<float>(1.f, float(m_component_ids.size()));
+            angles[i] = std::fmod(angles[i], 360.f);
+            if (angles[i] < 0.f)
+                angles[i] += 360.f;
+        }
+        out.component_ids = encode_texture_mapping_component_ids(m_component_ids);
+        out.component_a = m_component_ids.empty() ? 1 : m_component_ids.front();
+        out.component_b = m_component_ids.size() > 1 ? m_component_ids[1] : out.component_a;
+        out.offset_distances = encode_texture_mapping_float_values(distances);
+        out.offset_angles = encode_texture_mapping_float_values(angles);
+        return true;
+    }
+
+private:
+    void update_advanced_visibility()
+    {
+        const bool show_advanced = m_mode_choice && m_mode_choice->GetSelection() == int(TextureMappingZone::OffsetAdvanced);
+        if (m_basic_angle_label)
+            m_basic_angle_label->Show(!show_advanced);
+        if (m_basic_angle_spin)
+            m_basic_angle_spin->Show(!show_advanced);
+        if (m_basic_angle_units)
+            m_basic_angle_units->Show(!show_advanced);
+        for (wxSizer *row : m_component_rows)
+            if (row)
+                row->ShowItems(show_advanced);
+        Layout();
+        Fit();
+    }
+
+    TextureMappingZone m_zone;
+    std::vector<unsigned int> m_component_ids;
+    wxChoice *m_mode_choice {nullptr};
+    wxSpinCtrlDouble *m_basic_distance_spin {nullptr};
+    wxStaticText *m_basic_angle_label {nullptr};
+    wxSpinCtrlDouble *m_basic_angle_spin {nullptr};
+    wxStaticText *m_basic_angle_units {nullptr};
+    wxCheckBox *m_rotation_enabled {nullptr};
+    wxSpinCtrlDouble *m_rotations_spin {nullptr};
+    wxSpinCtrlDouble *m_repeats_spin {nullptr};
+    wxCheckBox *m_reverse_repeats {nullptr};
+    wxCheckBox *m_clockwise {nullptr};
+    wxChoice *m_fade_choice {nullptr};
+    wxChoice *m_angle_mode_choice {nullptr};
+    std::vector<wxSpinCtrlDouble*> m_distance_spins;
+    std::vector<wxSpinCtrlDouble*> m_angle_spins;
+    std::vector<wxSizer*> m_component_rows;
+    float m_max_distance_mm {0.2f};
+    bool m_remove_requested {false};
+};
+
+class TextureMappingAdvancedOptionsDialog : public wxDialog
+{
+public:
+    TextureMappingAdvancedOptionsDialog(wxWindow *parent,
+                                        int texture_mapping_mode,
+                                        int filament_color_mode,
+                                        const std::vector<unsigned int> &component_ids,
+                                        const std::vector<float> &component_strengths_pct,
+                                        const std::vector<float> &component_minimum_offsets_pct,
+                                        float tone_gamma,
+                                        float sagging_ratio,
+                                        float preview_opacity_pct,
+                                        bool force_sequential_filaments,
+                                        bool auto_adjust_filament_selection,
+                                        bool preview_limit_resolution,
+                                        bool reduce_outer_surface_texture,
+                                        bool seam_hiding,
+                                        bool nonlinear_offset_adjustment,
+                                        bool compact_offset_mode,
+                                        int initial_options_tab)
+        : wxDialog(parent, wxID_ANY, _L("Texture Mapping Options"), wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
+    {
+        const int gap = FromDIP(8);
+        auto *root = new wxBoxSizer(wxVERTICAL);
+        auto *tab_row = new wxBoxSizer(wxHORIZONTAL);
+        tab_row->Add(new wxStaticText(this, wxID_ANY, _L("Options")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        wxArrayString tab_choices;
+        tab_choices.Add(_L("Image Options"));
+        tab_choices.Add(_L("Filament Calibration"));
+        tab_choices.Add(_L("Preview Options"));
+        tab_choices.Add(_L("Experimental Options"));
+        m_options_tab_choice = new wxChoice(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, tab_choices);
+        m_options_tab_choice->SetSelection(std::clamp(initial_options_tab, 0, 3));
+        tab_row->Add(m_options_tab_choice, 1, wxALIGN_CENTER_VERTICAL);
+        root->Add(tab_row, 0, wxEXPAND | wxALL, gap);
+
+        m_options_book = new wxSimplebook(this, wxID_ANY);
+        auto *image_page = new wxPanel(m_options_book, wxID_ANY);
+        auto *image_root = new wxBoxSizer(wxVERTICAL);
+        image_page->SetSizer(image_root);
+        auto *filament_page = new wxPanel(m_options_book, wxID_ANY);
+        auto *filament_root = new wxBoxSizer(wxVERTICAL);
+        filament_page->SetSizer(filament_root);
+        auto *preview_page = new wxPanel(m_options_book, wxID_ANY);
+        auto *preview_root = new wxBoxSizer(wxVERTICAL);
+        preview_page->SetSizer(preview_root);
+        auto *experimental_page = new wxPanel(m_options_book, wxID_ANY);
+        auto *experimental_root = new wxBoxSizer(wxVERTICAL);
+        experimental_page->SetSizer(experimental_root);
+
+        auto *mapping_row = new wxBoxSizer(wxHORIZONTAL);
+        mapping_row->Add(new wxStaticText(image_page, wxID_ANY, _L("Interpret texture color as")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        wxArrayString mapping_choices;
+        mapping_choices.Add(_L("Target color"));
+        mapping_choices.Add(_L("Raw filament offset"));
+        m_texture_mapping_mode_choice = new wxChoice(image_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, mapping_choices);
+        m_texture_mapping_mode_choice->SetSelection(std::clamp(texture_mapping_mode, int(TextureMappingZone::TextureMappingFilamentBlending), int(TextureMappingZone::TextureMappingRawValues)));
+        mapping_row->Add(m_texture_mapping_mode_choice, 1, wxALIGN_CENTER_VERTICAL);
+        image_root->Add(mapping_row, 0, wxEXPAND | wxALL, gap);
+
+        auto *tone_gamma_row = new wxBoxSizer(wxHORIZONTAL);
+        tone_gamma_row->Add(new wxStaticText(image_page, wxID_ANY, _L("Tone gamma")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        m_tone_gamma_spin = new wxSpinCtrlDouble(image_page, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(84), -1),
+                                                 wxSP_ARROW_KEYS | wxALIGN_RIGHT, 0.5, 3.0, std::clamp(double(tone_gamma), 0.5, 3.0), 0.05);
+        m_tone_gamma_spin->SetDigits(2);
+        tone_gamma_row->Add(m_tone_gamma_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+        tone_gamma_row->Add(new wxStaticText(image_page, wxID_ANY, _L("x")), 0, wxALIGN_CENTER_VERTICAL);
+        image_root->Add(tone_gamma_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
+        auto *sagging_row = new wxBoxSizer(wxHORIZONTAL);
+        sagging_row->Add(new wxStaticText(filament_page, wxID_ANY, _L("Sagging ratio limit")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        m_sagging_ratio_spin = new wxSpinCtrlDouble(filament_page, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(84), -1),
+                                                    wxSP_ARROW_KEYS | wxALIGN_RIGHT, 0.0, 6.0, std::clamp(double(sagging_ratio), 0.0, 6.0), 0.1);
+        m_sagging_ratio_spin->SetDigits(2);
+        sagging_row->Add(m_sagging_ratio_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+        sagging_row->Add(new wxStaticText(filament_page, wxID_ANY, _L("x h")), 0, wxALIGN_CENTER_VERTICAL);
+        filament_root->Add(sagging_row, 0, wxEXPAND | wxALL, gap);
+
+        m_force_sequential_filaments_checkbox = new wxCheckBox(filament_page, wxID_ANY, _L("Force sequential order for filaments"));
+        m_force_sequential_filaments_checkbox->SetValue(force_sequential_filaments);
+        filament_root->Add(m_force_sequential_filaments_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
+        auto *minimum_offsets_box = new wxStaticBoxSizer(wxVERTICAL, filament_page, _L("Per-filament minimum offset"));
+        auto *strengths_box = new wxStaticBoxSizer(wxVERTICAL, filament_page, _L("Per-filament strength"));
+        const std::vector<wxString> channel_labels = texture_mapping_channel_labels(filament_color_mode);
+        auto component_label = [&component_ids, &channel_labels](size_t i) {
+            wxString text = wxString::Format("F%d", int(component_ids[i]));
+            if (i < channel_labels.size() && !channel_labels[i].empty())
+                text += wxString::Format(" (%s)", channel_labels[i]);
+            return text;
+        };
+        auto add_percent_row = [this, gap, filament_page, component_label](wxStaticBoxSizer *box,
+                                                                           size_t idx,
+                                                                           int value,
+                                                                           std::vector<wxSlider*> &sliders,
+                                                                           std::vector<wxSpinCtrl*> &spins) {
+            auto *row = new wxBoxSizer(wxHORIZONTAL);
+            row->Add(new wxStaticText(filament_page, wxID_ANY, component_label(idx)), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+            auto *slider = new wxSlider(filament_page, wxID_ANY, value, 0, 100, wxDefaultPosition, wxSize(FromDIP(180), -1), wxSL_HORIZONTAL | wxSL_AUTOTICKS);
+            auto *spin = new wxSpinCtrl(filament_page, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(70), -1),
+                                        wxSP_ARROW_KEYS | wxALIGN_RIGHT, 0, 100, value);
+            slider->Bind(wxEVT_SLIDER, [spin](wxCommandEvent &evt) {
+                if (spin)
+                    spin->SetValue(evt.GetInt());
+            });
+            spin->Bind(wxEVT_SPINCTRL, [slider](wxSpinEvent &evt) {
+                if (slider)
+                    slider->SetValue(evt.GetInt());
+            });
+            row->Add(slider, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+            row->Add(spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+            row->Add(new wxStaticText(filament_page, wxID_ANY, _L("%")), 0, wxALIGN_CENTER_VERTICAL);
+            sliders.emplace_back(slider);
+            spins.emplace_back(spin);
+            box->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+        };
+        for (size_t i = 0; i < component_ids.size(); ++i) {
+            const int offset_value = i < component_minimum_offsets_pct.size() ? std::clamp(int(std::lround(component_minimum_offsets_pct[i])), 0, 100) : 0;
+            add_percent_row(minimum_offsets_box, i, offset_value, m_minimum_offset_sliders, m_minimum_offset_spins);
+        }
+        for (size_t i = 0; i < component_ids.size(); ++i) {
+            const int strength_value = i < component_strengths_pct.size() ? std::clamp(int(std::lround(component_strengths_pct[i])), 0, 100) : 100;
+            add_percent_row(strengths_box, i, strength_value, m_strength_sliders, m_strength_spins);
+        }
+        filament_root->Add(minimum_offsets_box, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        filament_root->Add(strengths_box, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        auto *reset_btn = new wxButton(filament_page, wxID_ANY, _L("Reset strengths and offsets"));
+        reset_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { reset_strengths_and_offsets(); });
+        filament_root->Add(reset_btn, 0, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
+        auto *preview_box = new wxStaticBoxSizer(wxVERTICAL, preview_page, _L("3D Preview"));
+        auto *preview_opacity_row = new wxBoxSizer(wxHORIZONTAL);
+        preview_opacity_row->Add(new wxStaticText(preview_page, wxID_ANY, _L("Texture opacity")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        const int opacity = std::clamp(int(std::lround(preview_opacity_pct)), 0, 100);
+        m_preview_opacity_slider = new wxSlider(preview_page, wxID_ANY, opacity, 0, 100, wxDefaultPosition, wxSize(FromDIP(180), -1), wxSL_HORIZONTAL | wxSL_AUTOTICKS);
+        m_preview_opacity_spin = new wxSpinCtrl(preview_page, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(70), -1),
+                                                wxSP_ARROW_KEYS | wxALIGN_RIGHT, 0, 100, opacity);
+        m_preview_opacity_slider->Bind(wxEVT_SLIDER, [this](wxCommandEvent &evt) {
+            if (m_preview_opacity_spin)
+                m_preview_opacity_spin->SetValue(evt.GetInt());
+        });
+        m_preview_opacity_spin->Bind(wxEVT_SPINCTRL, [this](wxSpinEvent &evt) {
+            if (m_preview_opacity_slider)
+                m_preview_opacity_slider->SetValue(evt.GetInt());
+        });
+        preview_opacity_row->Add(m_preview_opacity_slider, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        preview_opacity_row->Add(m_preview_opacity_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+        preview_opacity_row->Add(new wxStaticText(preview_page, wxID_ANY, _L("%")), 0, wxALIGN_CENTER_VERTICAL);
+        preview_box->Add(preview_opacity_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+        m_auto_adjust_filament_selection_checkbox = new wxCheckBox(preview_page, wxID_ANY, _L("Auto adjust filament selection when changing color mode"));
+        m_auto_adjust_filament_selection_checkbox->SetValue(auto_adjust_filament_selection);
+        preview_box->Add(m_auto_adjust_filament_selection_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+        m_preview_limit_resolution_checkbox = new wxCheckBox(preview_page, wxID_ANY, _L("Limit color simulation texture resolution"));
+        m_preview_limit_resolution_checkbox->SetValue(preview_limit_resolution);
+        preview_box->Add(m_preview_limit_resolution_checkbox, 0, wxEXPAND | wxALL, gap);
+        preview_root->Add(preview_box, 0, wxEXPAND | wxALL, gap);
+
+        auto *experimental_box = new wxStaticBoxSizer(wxVERTICAL, experimental_page, _L("Surface Texture"));
+        m_reduce_outer_surface_texture_checkbox = new wxCheckBox(experimental_page, wxID_ANY, _L("Reduce outer surface texture"));
+        m_reduce_outer_surface_texture_checkbox->SetValue(reduce_outer_surface_texture);
+        experimental_box->Add(m_reduce_outer_surface_texture_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+        m_seam_hiding_checkbox = new wxCheckBox(experimental_page, wxID_ANY, _L("Seam Hiding"));
+        m_seam_hiding_checkbox->SetValue(seam_hiding);
+        experimental_box->Add(m_seam_hiding_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        m_nonlinear_offset_adjustment_checkbox = new wxCheckBox(experimental_page, wxID_ANY, _L("Non-linear offset adjustment"));
+        m_nonlinear_offset_adjustment_checkbox->SetValue(nonlinear_offset_adjustment);
+        m_nonlinear_offset_adjustment_checkbox->SetToolTip(
+            _L("Adjusts line-width offsets using a surface-visibility model derived from Kuipers et al. 2018."));
+        experimental_box->Add(m_nonlinear_offset_adjustment_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        m_compact_offset_mode_checkbox = new wxCheckBox(experimental_page, wxID_ANY, _L("Compact Offset Mode"));
+        m_compact_offset_mode_checkbox->SetValue(compact_offset_mode);
+        m_compact_offset_mode_checkbox->SetToolTip(
+            _L("Normalizes sampled filament offsets so the strongest active color uses the full maximum line width."));
+        experimental_box->Add(m_compact_offset_mode_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        experimental_root->Add(experimental_box, 0, wxEXPAND | wxALL, gap);
+
+        m_options_book->AddPage(image_page, _L("Image Options"), true);
+        m_options_book->AddPage(filament_page, _L("Filament Calibration"));
+        m_options_book->AddPage(preview_page, _L("Preview Options"));
+        m_options_book->AddPage(experimental_page, _L("Experimental Options"));
+        m_options_book->SetMinSize(wxSize(FromDIP(420), std::max({image_page->GetBestSize().y, filament_page->GetBestSize().y, preview_page->GetBestSize().y, experimental_page->GetBestSize().y})));
+        m_options_tab_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &evt) {
+            if (m_options_book)
+                m_options_book->SetSelection(std::clamp(evt.GetSelection(), 0, 3));
+        });
+        if (m_options_book)
+            m_options_book->SetSelection(std::clamp(initial_options_tab, 0, 3));
+        root->Add(m_options_book, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        if (wxSizer *buttons = CreateStdDialogButtonSizer(wxOK | wxCANCEL))
+            root->Add(buttons, 0, wxEXPAND | wxALL, gap);
+        SetSizerAndFit(root);
+        SetMinSize(wxSize(FromDIP(420), GetBestSize().GetHeight()));
+        CentreOnParent();
+    }
+
+    int texture_mapping_mode() const
+    {
+        return m_texture_mapping_mode_choice ?
+            std::clamp(m_texture_mapping_mode_choice->GetSelection(),
+                       int(TextureMappingZone::TextureMappingFilamentBlending),
+                       int(TextureMappingZone::TextureMappingRawValues)) :
+            int(TextureMappingZone::TextureMappingFilamentBlending);
+    }
+
+    float tone_gamma() const { return float(std::clamp(m_tone_gamma_spin ? m_tone_gamma_spin->GetValue() : 1.0, 0.5, 3.0)); }
+    float sagging_ratio() const { return float(std::clamp(m_sagging_ratio_spin ? m_sagging_ratio_spin->GetValue() : 0.0, 0.0, 6.0)); }
+    float preview_opacity_pct() const { return float(std::clamp(m_preview_opacity_spin ? m_preview_opacity_spin->GetValue() : 100, 0, 100)); }
+    bool force_sequential_filaments() const { return m_force_sequential_filaments_checkbox && m_force_sequential_filaments_checkbox->GetValue(); }
+    bool auto_adjust_filament_selection() const { return m_auto_adjust_filament_selection_checkbox == nullptr || m_auto_adjust_filament_selection_checkbox->GetValue(); }
+    bool preview_limit_resolution() const { return m_preview_limit_resolution_checkbox == nullptr || m_preview_limit_resolution_checkbox->GetValue(); }
+    bool reduce_outer_surface_texture() const { return m_reduce_outer_surface_texture_checkbox && m_reduce_outer_surface_texture_checkbox->GetValue(); }
+    bool seam_hiding() const { return m_seam_hiding_checkbox && m_seam_hiding_checkbox->GetValue(); }
+    bool nonlinear_offset_adjustment() const { return m_nonlinear_offset_adjustment_checkbox && m_nonlinear_offset_adjustment_checkbox->GetValue(); }
+    bool compact_offset_mode() const { return m_compact_offset_mode_checkbox && m_compact_offset_mode_checkbox->GetValue(); }
+    int selected_options_tab() const { return std::clamp(m_options_tab_choice ? m_options_tab_choice->GetSelection() : 0, 0, 3); }
+
+    std::vector<float> component_strengths_pct() const
+    {
+        std::vector<float> out;
+        out.reserve(m_strength_spins.size());
+        for (wxSpinCtrl *spin : m_strength_spins)
+            out.emplace_back(float(std::clamp(spin ? spin->GetValue() : 100, 0, 100)));
+        return out;
+    }
+
+    std::vector<float> component_minimum_offsets_pct() const
+    {
+        std::vector<float> out;
+        out.reserve(m_minimum_offset_spins.size());
+        for (wxSpinCtrl *spin : m_minimum_offset_spins)
+            out.emplace_back(float(std::clamp(spin ? spin->GetValue() : 0, 0, 100)));
+        return out;
+    }
+
+private:
+    void reset_strengths_and_offsets()
+    {
+        for (wxSlider *slider : m_minimum_offset_sliders)
+            if (slider)
+                slider->SetValue(0);
+        for (wxSpinCtrl *spin : m_minimum_offset_spins)
+            if (spin)
+                spin->SetValue(0);
+        for (wxSlider *slider : m_strength_sliders)
+            if (slider)
+                slider->SetValue(100);
+        for (wxSpinCtrl *spin : m_strength_spins)
+            if (spin)
+                spin->SetValue(100);
+    }
+
+    wxChoice *m_options_tab_choice {nullptr};
+    wxSimplebook *m_options_book {nullptr};
+    wxChoice *m_texture_mapping_mode_choice {nullptr};
+    wxSpinCtrlDouble *m_tone_gamma_spin {nullptr};
+    wxSpinCtrlDouble *m_sagging_ratio_spin {nullptr};
+    wxSlider *m_preview_opacity_slider {nullptr};
+    wxSpinCtrl *m_preview_opacity_spin {nullptr};
+    wxCheckBox *m_force_sequential_filaments_checkbox {nullptr};
+    wxCheckBox *m_auto_adjust_filament_selection_checkbox {nullptr};
+    wxCheckBox *m_preview_limit_resolution_checkbox {nullptr};
+    wxCheckBox *m_reduce_outer_surface_texture_checkbox {nullptr};
+    wxCheckBox *m_seam_hiding_checkbox {nullptr};
+    wxCheckBox *m_nonlinear_offset_adjustment_checkbox {nullptr};
+    wxCheckBox *m_compact_offset_mode_checkbox {nullptr};
+    std::vector<wxSlider*> m_minimum_offset_sliders;
+    std::vector<wxSpinCtrl*> m_minimum_offset_spins;
+    std::vector<wxSlider*> m_strength_sliders;
+    std::vector<wxSpinCtrl*> m_strength_spins;
+};
+
 } // namespace
 
 // Sidebar / private
@@ -525,6 +1331,14 @@ struct Sidebar::priv
     wxScrolledWindow* m_panel_filament_content;
     wxScrolledWindow* m_scrolledWindow_filament_content;
     wxStaticLine* m_staticline2;
+    StaticBox* m_panel_texture_mapping_title = nullptr;
+    wxPanel* m_panel_texture_mapping_content = nullptr;
+    wxBoxSizer* m_sizer_texture_mapping_content = nullptr;
+    ScalableButton* m_texture_mapping_icon = nullptr;
+    wxStaticText* m_staticText_texture_mapping = nullptr;
+    Button* m_btn_add_texture_map = nullptr;
+    std::unordered_set<size_t> m_expanded_texture_mapping_rows;
+    int m_texture_mapping_advanced_options_tab = 0;
     wxPanel* m_panel_project_title;
     ScalableButton* m_filament_icon = nullptr;
     Button * m_flushing_volume_btn = nullptr;
@@ -813,12 +1627,15 @@ std::vector<int> get_min_flush_volumes(const DynamicPrintConfig &full_config, si
 struct DynamicFilamentList : DynamicList
 {
     std::vector<std::pair<wxString, wxBitmap *>> items;
+    std::vector<int> values;
 
     void apply_on(Choice *c) override
     {
+        if (c == nullptr || c->window == nullptr)
+            return;
         if (items.empty())
             update(true);
-        auto cb = dynamic_cast<ComboBox *>(c->window);
+        auto cb = static_cast<ComboBox *>(c->window);
         wxString old_selection = cb->GetStringSelection();
         int old_index  = cb->GetSelection();
         cb->Clear();
@@ -844,27 +1661,55 @@ struct DynamicFilamentList : DynamicList
     wxString get_value(int index) override
     {
         wxString str;
-        str << index;
+        if (index >= 0 && size_t(index) < values.size())
+            str << values[size_t(index)];
+        else
+            str << index;
         return str;
     }
     int index_of(wxString value) override
     {
         long n = 0;
-        return (value.ToLong(&n) && n <= items.size()) ? int(n) : -1;
+        if (!value.ToLong(&n))
+            return -1;
+        for (size_t idx = 0; idx < values.size(); ++idx)
+            if (values[idx] == int(n))
+                return int(idx);
+        return -1;
     }
     void update(bool force = false)
     {
         items.clear();
+        values.clear();
         if (!force && m_choices.empty())
             return;
         auto icons = get_extruder_color_icons(true);
         auto presets = wxGetApp().preset_bundle->filament_presets;
+        values.emplace_back(0);
         for (int i = 0; i < presets.size(); ++i) {
             wxString str;
             std::string type;
             wxGetApp().preset_bundle->filaments.find_preset(presets[i])->get_filament_type(type);
             str << type;
             items.push_back({str, i < icons.size() ? icons[i] : nullptr});
+            values.emplace_back(i + 1);
+        }
+        if (wxGetApp().preset_bundle != nullptr) {
+            PresetBundle *bundle = wxGetApp().preset_bundle;
+            if (const ConfigOptionStrings *colors = bundle->project_config.option<ConfigOptionStrings>("filament_colour")) {
+                const std::string serialized = bundle->project_config.has("texture_mapping_definitions") ?
+                    bundle->project_config.opt_string("texture_mapping_definitions") :
+                    std::string();
+                bundle->texture_mapping_zones.load_entries(serialized, colors->values);
+            }
+            for (const unsigned int zone_id : bundle->texture_mapping_zones.zone_ids_by_index()) {
+                if (zone_id == 0)
+                    continue;
+                const TextureMappingZone *zone = bundle->texture_mapping_zones.zone_from_id(zone_id);
+                items.push_back({zone != nullptr ? texture_mapping_menu_label(*zone) : wxString::Format(_L("Texture Mapping %u"), zone_id),
+                                 zone_id >= 1 && zone_id <= icons.size() ? icons[size_t(zone_id - 1)] : nullptr});
+                values.emplace_back(int(zone_id));
+            }
         }
         DynamicList::update();
     }
@@ -874,13 +1719,15 @@ struct DynamicFilamentList1Based : DynamicFilamentList
 {
     void apply_on(Choice *c) override
     {
+        if (c == nullptr || c->window == nullptr)
+            return;
         if (items.empty())
             update(true);
-        auto cb = dynamic_cast<ComboBox *>(c->window);
+        auto cb = static_cast<ComboBox *>(c->window);
         auto n  = cb->GetSelection();
         cb->Clear();
         for (auto i : items) {
-            cb->Append(i.first, *i.second);
+            cb->Append(i.first, i.second ? *i.second : wxNullBitmap);
         }
         if (n < cb->GetCount())
             cb->SetSelection(n);
@@ -888,7 +1735,10 @@ struct DynamicFilamentList1Based : DynamicFilamentList
     wxString get_value(int index) override
     {
         wxString str;
-        str << index+1;
+        if (index >= 0 && size_t(index) < values.size())
+            str << values[size_t(index)];
+        else
+            str << index + 1;
         return str;
     }
     int index_of(wxString value) override
@@ -896,12 +1746,15 @@ struct DynamicFilamentList1Based : DynamicFilamentList
         long n = 0;
         if(!value.ToLong(&n))
             return -1;
-        --n;
-        return (n >= 0 && n <= items.size()) ? int(n) : -1;
+        for (size_t idx = 0; idx < values.size(); ++idx)
+            if (values[idx] == int(n))
+                return int(idx);
+        return -1;
     }
     void update(bool force = false)
     {
         items.clear();
+        values.clear();
         if (!force && m_choices.empty())
             return;
         auto icons = get_extruder_color_icons(true);
@@ -912,6 +1765,24 @@ struct DynamicFilamentList1Based : DynamicFilamentList
             wxGetApp().preset_bundle->filaments.find_preset(presets[i])->get_filament_type(type);
             str << type;
             items.push_back({str, i < icons.size() ? icons[i] : nullptr});
+            values.emplace_back(i + 1);
+        }
+        if (wxGetApp().preset_bundle != nullptr) {
+            PresetBundle *bundle = wxGetApp().preset_bundle;
+            if (const ConfigOptionStrings *colors = bundle->project_config.option<ConfigOptionStrings>("filament_colour")) {
+                const std::string serialized = bundle->project_config.has("texture_mapping_definitions") ?
+                    bundle->project_config.opt_string("texture_mapping_definitions") :
+                    std::string();
+                bundle->texture_mapping_zones.load_entries(serialized, colors->values);
+            }
+            for (const unsigned int zone_id : bundle->texture_mapping_zones.zone_ids_by_index()) {
+                if (zone_id == 0)
+                    continue;
+                const TextureMappingZone *zone = bundle->texture_mapping_zones.zone_from_id(zone_id);
+                items.push_back({zone != nullptr ? texture_mapping_menu_label(*zone) : wxString::Format(_L("Texture Mapping %u"), zone_id),
+                                 zone_id >= 1 && zone_id <= icons.size() ? icons[size_t(zone_id - 1)] : nullptr});
+                values.emplace_back(int(zone_id));
+            }
         }
         DynamicList::update();
     }
@@ -2202,6 +3073,105 @@ Sidebar::Sidebar(Plater *parent)
     }
 
     {
+    p->m_panel_texture_mapping_title = new StaticBox(p->scrolled, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxTAB_TRAVERSAL | wxBORDER_NONE);
+    p->m_panel_texture_mapping_title->SetBackgroundColor(title_bg);
+    p->m_panel_texture_mapping_title->SetBackgroundColor2(0xF1F1F1);
+
+    p->m_texture_mapping_icon = new ScalableButton(p->m_panel_texture_mapping_title, wxID_ANY, "param_flush");
+    p->m_staticText_texture_mapping = new Label(p->m_panel_texture_mapping_title, _L("Texture Mapping Zones"), LB_PROPAGATE_MOUSE_EVENT);
+
+    auto persist_texture_mapping = [this]() {
+        PresetBundle *bundle = wxGetApp().preset_bundle;
+        if (bundle == nullptr)
+            return;
+        const std::string serialized = bundle->texture_mapping_zones.serialize_entries();
+        DynamicPrintConfig *print_cfg = &bundle->prints.get_edited_preset().config;
+        if (ConfigOptionString *opt = print_cfg->option<ConfigOptionString>("texture_mapping_definitions"))
+            opt->value = serialized;
+        else
+            print_cfg->set_key_value("texture_mapping_definitions", new ConfigOptionString(serialized));
+        if (ConfigOptionString *opt = bundle->project_config.option<ConfigOptionString>("texture_mapping_definitions"))
+            opt->value = serialized;
+        else
+            bundle->project_config.set_key_value("texture_mapping_definitions", new ConfigOptionString(serialized));
+        if (auto *print_tab = wxGetApp().get_tab(Preset::TYPE_PRINT))
+            print_tab->update_dirty();
+        if (wxGetApp().mainframe != nullptr)
+            wxGetApp().mainframe->on_config_changed(print_cfg);
+        if (wxGetApp().plater() != nullptr)
+            wxGetApp().plater()->update_project_dirty_from_presets();
+        update_texture_mapping_panel(false);
+        update_dynamic_filament_list();
+    };
+    auto add_texture_map_action = [this, persist_texture_mapping]() {
+        PresetBundle *bundle = wxGetApp().preset_bundle;
+        if (bundle == nullptr)
+            return;
+        ConfigOptionStrings *colors_opt = bundle->project_config.option<ConfigOptionStrings>("filament_colour");
+        std::vector<std::string> colors = colors_opt ? colors_opt->values : std::vector<std::string>();
+        if (colors.size() < 2)
+            return;
+        const std::string serialized = bundle->project_config.has("texture_mapping_definitions") ?
+            bundle->project_config.opt_string("texture_mapping_definitions") :
+            std::string();
+        bundle->texture_mapping_zones.load_entries(serialized, colors);
+        bundle->texture_mapping_zones.add_zone(colors.size(), colors);
+        persist_texture_mapping();
+    };
+
+    p->m_btn_add_texture_map = new Button(p->m_panel_texture_mapping_title, _L("Add Texture Mapping Zone"));
+    p->m_btn_add_texture_map->SetStyle(ButtonStyle::Confirm, ButtonType::Compact);
+    auto stop_texture_map_button_mouse = [](wxMouseEvent &evt) {
+        evt.StopPropagation();
+        evt.Skip();
+    };
+    p->m_btn_add_texture_map->Bind(wxEVT_LEFT_DOWN, stop_texture_map_button_mouse);
+    p->m_btn_add_texture_map->Bind(wxEVT_LEFT_UP, stop_texture_map_button_mouse);
+    p->m_btn_add_texture_map->Bind(wxEVT_BUTTON, [add_texture_map_action](wxCommandEvent &) {
+        add_texture_map_action();
+    });
+
+    wxBoxSizer* h_sizer_texture_title = new wxBoxSizer(wxHORIZONTAL);
+    h_sizer_texture_title->Add(p->m_texture_mapping_icon, 0, wxALIGN_CENTER | wxLEFT, FromDIP(SidebarProps::TitlebarMargin()));
+    h_sizer_texture_title->AddSpacer(FromDIP(SidebarProps::ElementSpacing()));
+    h_sizer_texture_title->Add(p->m_staticText_texture_mapping, 0, wxALIGN_CENTER);
+    h_sizer_texture_title->AddStretchSpacer();
+    h_sizer_texture_title->Add(p->m_btn_add_texture_map, 0, wxALIGN_CENTER | wxRIGHT, FromDIP(SidebarProps::TitlebarMargin()));
+    h_sizer_texture_title->SetMinSize(-1, FromDIP(30));
+    p->m_panel_texture_mapping_title->SetSizer(h_sizer_texture_title);
+    p->m_panel_texture_mapping_title->Layout();
+
+    auto spliter_texture_1 = new ::StaticLine(p->scrolled);
+    spliter_texture_1->SetLineColour("#A6A9AA");
+    scrolled_sizer->Add(spliter_texture_1, 0, wxEXPAND);
+    scrolled_sizer->Add(p->m_panel_texture_mapping_title, 0, wxEXPAND | wxALL, 0);
+    auto spliter_texture_2 = new ::StaticLine(p->scrolled);
+    spliter_texture_2->SetLineColour("#CECECE");
+    scrolled_sizer->Add(spliter_texture_2, 0, wxEXPAND);
+
+    p->m_panel_texture_mapping_content = new wxPanel(p->scrolled, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxTAB_TRAVERSAL);
+    p->m_panel_texture_mapping_content->SetBackgroundColour(wxGetApp().dark_mode() ? wxColour(45, 45, 49) : wxColour(255, 255, 255));
+    p->m_sizer_texture_mapping_content = new wxBoxSizer(wxVERTICAL);
+    p->m_sizer_texture_mapping_content->AddSpacer(FromDIP(SidebarProps::ContentMargin()));
+    p->m_panel_texture_mapping_content->SetSizer(p->m_sizer_texture_mapping_content);
+    p->m_panel_texture_mapping_content->Layout();
+    scrolled_sizer->Add(p->m_panel_texture_mapping_content, 0, wxEXPAND, 0);
+
+    p->m_panel_texture_mapping_title->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent& e) {
+        int button_left = p->m_panel_texture_mapping_title->GetClientSize().x;
+        if (p->m_btn_add_texture_map && p->m_btn_add_texture_map->IsShown())
+            button_left = std::min(button_left, p->m_btn_add_texture_map->GetPosition().x);
+        if (e.GetPosition().x > button_left - FromDIP(12))
+            return;
+        p->m_panel_texture_mapping_content->Show(!p->m_panel_texture_mapping_content->IsShown());
+        m_scrolled_sizer->Layout();
+    });
+
+    p->m_panel_texture_mapping_title->Hide();
+    p->m_panel_texture_mapping_content->Hide();
+    }
+
+    {
     //add project title
     auto params_panel = ((MainFrame*)parent->GetParent())->m_param_panel;
     if (params_panel) {
@@ -2292,6 +3262,7 @@ Sidebar::Sidebar(Plater *parent)
     auto *sizer = new wxBoxSizer(wxVERTICAL);
     sizer->Add(p->scrolled, 1, wxEXPAND);
     SetSizer(sizer);
+    update_texture_mapping_panel();
 }
 
 Sidebar::~Sidebar() {}
@@ -2586,6 +3557,7 @@ void Sidebar::update_presets(Preset::Type preset_type)
             p->combos_filament[i]->update();
 
         update_dynamic_filament_list();
+        update_texture_mapping_panel();
         break;
     }
 
@@ -3109,6 +4081,7 @@ void Sidebar::on_filament_count_change(size_t num_filaments)
     p->m_panel_filament_title->Refresh();
     update_ui_from_settings();
     update_dynamic_filament_list();
+    update_texture_mapping_panel();
 }
 
 void Sidebar::on_filaments_delete(size_t filament_id)
@@ -3168,7 +4141,8 @@ void Sidebar::on_filaments_delete(size_t filament_id)
     Layout();
     p->m_panel_filament_title->Refresh();
     update_ui_from_settings();
-    dynamic_filament_list.update();
+    update_dynamic_filament_list();
+    update_texture_mapping_panel();
 }
 
 void Sidebar::add_filament() {
@@ -3733,6 +4707,524 @@ void Sidebar::update_dynamic_filament_list()
     dynamic_filament_list_1_based.update();
 }
 
+void Sidebar::update_texture_mapping_panel(bool sync_manager)
+{
+    if (p->m_panel_texture_mapping_title == nullptr || p->m_panel_texture_mapping_content == nullptr)
+        return;
+
+    wxWindowUpdateLocker no_updates_sidebar(this);
+    wxWindowUpdateLocker no_updates_panel(p->m_panel_texture_mapping_content);
+
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    if (bundle == nullptr)
+        return;
+
+    DynamicPrintConfig *print_cfg = &bundle->prints.get_edited_preset().config;
+    ConfigOptionStrings *color_opt = bundle->project_config.option<ConfigOptionStrings>("filament_colour");
+    const size_t num_physical = color_opt ? color_opt->values.size() : p->combos_filament.size();
+    std::vector<std::string> physical_colors = color_opt ? color_opt->values : std::vector<std::string>();
+    physical_colors.resize(num_physical, "#26A69A");
+
+    std::vector<double> nozzle_diameters(num_physical, 0.4);
+    if (const ConfigOptionFloats *opt = bundle->printers.get_edited_preset().config.option<ConfigOptionFloats>("nozzle_diameter")) {
+        const size_t opt_count = opt->values.size();
+        if (opt_count > 0) {
+            for (size_t i = 0; i < num_physical; ++i)
+                nozzle_diameters[i] = std::max(0.05, opt->get_at(unsigned(std::min(i, opt_count - 1))));
+        }
+    }
+
+    auto get_config_string = [bundle, print_cfg](const std::string &key) {
+        if (bundle->project_config.has(key)) {
+            const std::string value = bundle->project_config.opt_string(key);
+            if (!value.empty())
+                return value;
+        }
+        if (print_cfg != nullptr && print_cfg->has(key))
+            return print_cfg->opt_string(key);
+        return std::string();
+    };
+
+    auto set_config_string = [bundle, print_cfg](const std::string &key, const std::string &value) {
+        if (print_cfg != nullptr) {
+            if (ConfigOptionString *opt = print_cfg->option<ConfigOptionString>(key))
+                opt->value = value;
+            else
+                print_cfg->set_key_value(key, new ConfigOptionString(value));
+        }
+        if (ConfigOptionString *opt = bundle->project_config.option<ConfigOptionString>(key))
+            opt->value = value;
+        else
+            bundle->project_config.set_key_value(key, new ConfigOptionString(value));
+    };
+
+    auto notify_change = [this, print_cfg]() {
+        if (auto *print_tab = wxGetApp().get_tab(Preset::TYPE_PRINT))
+            print_tab->update_dirty();
+        if (wxGetApp().mainframe != nullptr && print_cfg != nullptr)
+            wxGetApp().mainframe->on_config_changed(print_cfg);
+        if (wxGetApp().plater() != nullptr) {
+            wxGetApp().plater()->update_project_dirty_from_presets();
+            if (wxGetApp().plater()->get_view3D_canvas3D() != nullptr)
+                wxGetApp().plater()->get_view3D_canvas3D()->reload_scene(false);
+        }
+        update_dynamic_filament_list();
+        if (obj_list() != nullptr)
+            obj_list()->update_filament_colors();
+    };
+
+    TextureMappingManager &mgr = bundle->texture_mapping_zones;
+    TextureMappingManager *mgr_ptr = &mgr;
+    if (sync_manager)
+        mgr.load_entries(get_config_string("texture_mapping_definitions"), physical_colors);
+    for (TextureMappingZone &zone : mgr.zones())
+        if (!zone.deleted)
+            zone.enabled = true;
+    mgr.normalize_zone_ids(num_physical);
+    set_config_string("texture_mapping_definitions", mgr.serialize_entries());
+
+    wxSizer *content_sizer = p->m_panel_texture_mapping_content->GetSizer();
+    if (content_sizer == nullptr)
+        return;
+    content_sizer->Clear(true);
+    content_sizer->AddSpacer(FromDIP(SidebarProps::ContentMargin()));
+
+    if (p->m_btn_add_texture_map != nullptr)
+        p->m_btn_add_texture_map->Enable(num_physical >= 2);
+
+    if (num_physical < 2) {
+        p->m_panel_texture_mapping_title->Hide();
+        p->m_panel_texture_mapping_content->Hide();
+        m_scrolled_sizer->Layout();
+        Layout();
+        return;
+    }
+
+    p->m_panel_texture_mapping_title->Show();
+    p->m_panel_texture_mapping_content->Show();
+
+    const bool is_dark = wxGetApp().dark_mode();
+    const wxColour rows_bg = is_dark ? wxColour(45, 45, 49) : wxColour(246, 248, 251);
+    const wxColour row_bg = is_dark ? wxColour(52, 52, 56) : wxColour(255, 255, 255);
+    const wxColour text_fg = is_dark ? wxColour(232, 232, 232) : wxColour(20, 20, 20);
+    const wxColour summary_fg = is_dark ? wxColour(182, 182, 182) : wxColour(96, 96, 96);
+    const int gap = FromDIP(6);
+    p->m_panel_texture_mapping_content->SetBackgroundColour(rows_bg);
+
+    std::vector<wxColour> palette;
+    palette.reserve(physical_colors.size());
+    for (const std::string &color : physical_colors)
+        palette.emplace_back(parse_texture_mapping_color(color));
+
+    std::vector<size_t> visible_zone_indices;
+    std::vector<unsigned int> zone_id_by_index = mgr.zone_ids_by_index();
+    auto &zones = mgr.zones();
+    for (size_t idx = 0; idx < zones.size(); ++idx)
+        if (!zones[idx].deleted)
+            visible_zone_indices.emplace_back(idx);
+
+    if (visible_zone_indices.empty()) {
+        auto *empty_label = new wxStaticText(p->m_panel_texture_mapping_content, wxID_ANY, _L("No texture maps yet."));
+        empty_label->SetForegroundColour(summary_fg);
+        empty_label->Wrap(FromDIP(360));
+        content_sizer->Add(empty_label, 0, wxALL | wxEXPAND, FromDIP(12));
+        p->m_panel_texture_mapping_content->Layout();
+        m_scrolled_sizer->Layout();
+        Layout();
+        return;
+    }
+
+    auto persist_rows = [mgr_ptr, set_config_string, notify_change]() {
+        set_config_string("texture_mapping_definitions", mgr_ptr->serialize_entries());
+        notify_change();
+    };
+
+    for (const size_t zone_index : visible_zone_indices) {
+        if (zone_index >= zones.size())
+            continue;
+        TextureMappingZone &entry = zones[zone_index];
+        if (entry.display_color.empty() || entry.display_color[0] != '#')
+            entry.display_color = wxString::Format("#%06X", unsigned((entry.stable_id * 2654435761u) & 0xFFFFFFu)).ToStdString();
+
+        auto *row = new wxPanel(p->m_panel_texture_mapping_content, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE);
+        row->SetBackgroundColour(row_bg);
+        auto *row_sizer = new wxBoxSizer(wxVERTICAL);
+        row->SetSizer(row_sizer);
+
+        auto *header = new wxPanel(row, wxID_ANY);
+        header->SetBackgroundColour(row_bg);
+        auto *header_sizer = new wxBoxSizer(wxHORIZONTAL);
+        header->SetSizer(header_sizer);
+
+        const unsigned int zone_id = zone_index < zone_id_by_index.size() && zone_id_by_index[zone_index] != 0 ?
+            zone_id_by_index[zone_index] : unsigned(num_physical + 1);
+
+        auto *swatch = new TextureMappingNumberSwatch(header);
+        swatch->SetBackgroundColour(row_bg);
+        swatch->set_data(parse_texture_mapping_color(entry.display_color), zone_id);
+        header_sizer->Add(swatch, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, gap);
+
+        auto *title = new wxStaticText(header, wxID_ANY, _L("Texture Mapping"));
+        title->SetForegroundColour(text_fg);
+        header_sizer->Add(title, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, gap);
+
+        auto *summary = new wxStaticText(header, wxID_ANY, texture_mapping_summary(entry, num_physical));
+        summary->SetForegroundColour(summary_fg);
+        header_sizer->Add(summary, 1, wxALIGN_CENTER_VERTICAL | wxLEFT, gap);
+
+        auto *preview = new TextureMappingPatternPreview(header);
+        preview->SetBackgroundColour(row_bg);
+        preview->set_data(palette,
+                          entry.is_image_texture() ?
+                              TextureMappingManager::effective_texture_component_ids(entry, num_physical, physical_colors) :
+                              texture_mapping_selected_ids(entry, num_physical),
+                          parse_texture_mapping_color(entry.display_color));
+        header_sizer->Add(preview, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+
+        auto *menu_btn = new ScalableButton(header, wxID_ANY, "menu_filament");
+        menu_btn->SetToolTip(_L("Texture map actions"));
+        header_sizer->Add(menu_btn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        row_sizer->Add(header, 0, wxEXPAND | wxTOP | wxBOTTOM, gap);
+
+        auto *editor = new wxPanel(row, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE);
+        editor->SetBackgroundColour(row_bg);
+        auto *editor_sizer = new wxBoxSizer(wxVERTICAL);
+        editor->SetSizer(editor_sizer);
+        row_sizer->Add(editor, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
+        const bool expanded = p->m_expanded_texture_mapping_rows.count(zone_index) != 0;
+        editor->Show(expanded);
+
+        auto refresh_summary_preview = [summary, preview, swatch, zone_id, num_physical, physical_colors, palette](const TextureMappingZone &zone) {
+            if (summary != nullptr)
+                summary->SetLabel(texture_mapping_summary(zone, num_physical));
+            if (preview != nullptr) {
+                preview->set_data(palette,
+                                  zone.is_image_texture() ?
+                                      TextureMappingManager::effective_texture_component_ids(zone, num_physical, physical_colors) :
+                                      texture_mapping_selected_ids(zone, num_physical),
+                                  parse_texture_mapping_color(zone.display_color));
+            }
+            if (swatch != nullptr)
+                swatch->set_data(parse_texture_mapping_color(zone.display_color), zone_id);
+        };
+
+        auto apply_zone = [zone_index, mgr_ptr, num_physical, persist_rows, refresh_summary_preview](TextureMappingZone updated) {
+            auto &rows = mgr_ptr->zones();
+            if (zone_index >= rows.size())
+                return;
+            rows[zone_index] = std::move(updated);
+            mgr_ptr->normalize_zone_ids(num_physical);
+            refresh_summary_preview(rows[zone_index]);
+            persist_rows();
+        };
+
+        auto *surface_row = new wxBoxSizer(wxHORIZONTAL);
+        surface_row->Add(new wxStaticText(editor, wxID_ANY, _L("Surface Pattern")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        wxArrayString surface_choices;
+        surface_choices.Add(_L("Image Texture"));
+        surface_choices.Add(_L("2D Gradient"));
+        auto *surface_choice = new wxChoice(editor, wxID_ANY, wxDefaultPosition, wxDefaultSize, surface_choices);
+        surface_choice->SetSelection(entry.is_2d_gradient() ? 1 : 0);
+        surface_row->Add(surface_choice, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        editor_sizer->Add(surface_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+
+        auto *filaments_row = new wxWrapSizer(wxHORIZONTAL, wxWRAPSIZER_DEFAULT_FLAGS);
+        filaments_row->Add(new wxStaticText(editor, wxID_ANY, _L("Filaments")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        std::vector<wxCheckBox*> filament_checks;
+        const std::vector<unsigned int> selected_ids = texture_mapping_selected_ids(entry, num_physical);
+        for (size_t i = 1; i <= std::min<size_t>(num_physical, 9); ++i) {
+            auto *chk = new wxCheckBox(editor, wxID_ANY, wxString::Format("F%d", int(i)));
+            chk->SetForegroundColour(text_fg);
+            chk->SetValue(std::find(selected_ids.begin(), selected_ids.end(), unsigned(i)) != selected_ids.end());
+            filament_checks.emplace_back(chk);
+            filaments_row->Add(chk, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, std::max(FromDIP(2), gap / 2));
+        }
+        editor_sizer->Add(filaments_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+
+        auto *mode_row = new wxWrapSizer(wxHORIZONTAL, wxWRAPSIZER_DEFAULT_FLAGS);
+        mode_row->Add(new wxStaticText(editor, wxID_ANY, _L("Filament colors")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        auto *mode_choice = new wxChoice(editor, wxID_ANY, wxDefaultPosition, wxDefaultSize, texture_mapping_color_mode_choices());
+        mode_choice->SetSelection(std::clamp(entry.filament_color_mode, int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorBW)));
+        mode_row->Add(mode_choice, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        auto *preview_colors_chk = new wxCheckBox(editor, wxID_ANY, _L("Preview Result Colors"));
+        preview_colors_chk->SetValue(entry.preview_simulate_colors);
+        mode_row->Add(preview_colors_chk, 0, wxALIGN_CENTER_VERTICAL);
+        editor_sizer->Add(mode_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+
+        auto *contrast_row = new wxWrapSizer(wxHORIZONTAL, wxWRAPSIZER_DEFAULT_FLAGS);
+        contrast_row->Add(new wxStaticText(editor, wxID_ANY, _L("Texture contrast")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        auto *contrast_spin = new wxSpinCtrl(editor, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(72), -1),
+                                             wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER,
+                                             25, 300, std::clamp(int(std::lround(entry.contrast_pct)), 25, 300));
+        contrast_row->Add(contrast_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+        contrast_row->Add(new wxStaticText(editor, wxID_ANY, _L("%")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        auto *high_res_chk = new wxCheckBox(editor, wxID_ANY, _L("High-resolution texture sampling"));
+        high_res_chk->SetValue(entry.high_resolution_sampling);
+        contrast_row->Add(high_res_chk, 0, wxALIGN_CENTER_VERTICAL);
+        editor_sizer->Add(contrast_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+
+        auto *button_row = new wxBoxSizer(wxHORIZONTAL);
+        auto *offset_btn = new wxButton(editor, wxID_ANY, _L("Offset Gradient Settings"));
+        auto *advanced_btn = new wxButton(editor, wxID_ANY, _L("Advanced Options"));
+        button_row->Add(offset_btn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        button_row->Add(advanced_btn, 0, wxALIGN_CENTER_VERTICAL);
+        button_row->AddStretchSpacer(1);
+        editor_sizer->Add(button_row, 0, wxEXPAND | wxALL, gap);
+
+        auto apply_controls = [zone_index, mgr_ptr, num_physical, filament_checks, surface_choice,
+                               mode_choice, preview_colors_chk, contrast_spin, high_res_chk, apply_zone]() {
+            auto &rows = mgr_ptr->zones();
+            if (zone_index >= rows.size())
+                return;
+            TextureMappingZone updated = rows[zone_index];
+            std::vector<unsigned int> ids;
+            for (size_t idx = 0; idx < filament_checks.size(); ++idx)
+                if (filament_checks[idx] != nullptr && filament_checks[idx]->GetValue())
+                    ids.emplace_back(unsigned(idx + 1));
+            if (ids.size() < 2)
+                ids = texture_mapping_selected_ids(updated, num_physical);
+            updated.enabled = true;
+            updated.surface_pattern = surface_choice != nullptr && surface_choice->GetSelection() == 1 ?
+                int(TextureMappingZone::Gradient2D) : int(TextureMappingZone::ImageTexture);
+            updated.component_ids = encode_texture_mapping_component_ids(ids);
+            updated.component_a = ids.empty() ? 1 : ids.front();
+            updated.component_b = ids.size() > 1 ? ids[1] : updated.component_a;
+            updated.filament_color_mode = mode_choice != nullptr ?
+                std::clamp(mode_choice->GetSelection(), int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorBW)) :
+                updated.filament_color_mode;
+            updated.preview_simulate_colors = preview_colors_chk != nullptr && preview_colors_chk->GetValue();
+            updated.contrast_pct = contrast_spin != nullptr ? std::clamp(float(contrast_spin->GetValue()), 25.f, 300.f) : updated.contrast_pct;
+            updated.high_resolution_sampling = high_res_chk == nullptr || high_res_chk->GetValue();
+            apply_zone(std::move(updated));
+        };
+
+        contrast_spin->Bind(wxEVT_CHAR_HOOK, [contrast_spin, apply_controls](wxKeyEvent &evt) {
+            const int key = evt.GetKeyCode();
+            if (key == WXK_UP || key == WXK_NUMPAD_UP || key == WXK_DOWN || key == WXK_NUMPAD_DOWN) {
+                const int direction = (key == WXK_UP || key == WXK_NUMPAD_UP) ? 1 : -1;
+                contrast_spin->SetValue(std::clamp(contrast_spin->GetValue() + direction * 5, 25, 300));
+                apply_controls();
+                return;
+            }
+            evt.Skip();
+        });
+        auto update_pattern_visibility = [this, editor_sizer, mode_row, contrast_row, offset_btn, advanced_btn, surface_choice, row, editor]() {
+            const bool image_texture = surface_choice == nullptr || surface_choice->GetSelection() == 0;
+            editor_sizer->Show(mode_row, image_texture, true);
+            editor_sizer->Show(contrast_row, image_texture, true);
+            if (offset_btn != nullptr)
+                offset_btn->Show(!image_texture);
+            if (advanced_btn != nullptr)
+                advanced_btn->Show(image_texture);
+            editor->Layout();
+            row->Layout();
+            p->m_panel_texture_mapping_content->Layout();
+            m_scrolled_sizer->Layout();
+            Layout();
+        };
+        update_pattern_visibility();
+
+        surface_choice->Bind(wxEVT_CHOICE, [update_pattern_visibility, apply_controls](wxCommandEvent &) {
+            update_pattern_visibility();
+            apply_controls();
+        });
+        for (wxCheckBox *chk : filament_checks)
+            if (chk != nullptr)
+                chk->Bind(wxEVT_CHECKBOX, [apply_controls](wxCommandEvent &) { apply_controls(); });
+        mode_choice->Bind(wxEVT_CHOICE, [this, zone_index, mgr_ptr, num_physical, physical_colors, filament_checks, mode_choice, apply_controls](wxCommandEvent &) {
+            if (zone_index < mgr_ptr->zones().size()) {
+                TextureMappingZone &zone = mgr_ptr->zones()[zone_index];
+                if (zone.auto_adjust_filament_selection) {
+                    TextureMappingZone adjusted = zone;
+                    adjusted.filament_color_mode = std::clamp(mode_choice != nullptr ? mode_choice->GetSelection() : zone.filament_color_mode,
+                                                              int(TextureMappingZone::FilamentColorAny),
+                                                              int(TextureMappingZone::FilamentColorBW));
+                    TextureMappingManager::auto_adjust_texture_component_ids(adjusted, num_physical, physical_colors);
+                    const std::vector<unsigned int> adjusted_ids = texture_mapping_selected_ids(adjusted, num_physical);
+                    for (size_t idx = 0; idx < filament_checks.size(); ++idx)
+                        if (filament_checks[idx] != nullptr)
+                            filament_checks[idx]->SetValue(std::find(adjusted_ids.begin(), adjusted_ids.end(), unsigned(idx + 1)) != adjusted_ids.end());
+                }
+            }
+            apply_controls();
+            update_texture_mapping_panel(false);
+        });
+        preview_colors_chk->Bind(wxEVT_CHECKBOX, [apply_controls](wxCommandEvent &) { apply_controls(); });
+        high_res_chk->Bind(wxEVT_CHECKBOX, [apply_controls](wxCommandEvent &) { apply_controls(); });
+        contrast_spin->Bind(wxEVT_SPINCTRL, [apply_controls](wxSpinEvent &) { apply_controls(); });
+        contrast_spin->Bind(wxEVT_TEXT_ENTER, [apply_controls](wxCommandEvent &) { apply_controls(); });
+        contrast_spin->Bind(wxEVT_KILL_FOCUS, [apply_controls](wxFocusEvent &evt) {
+            apply_controls();
+            evt.Skip();
+        });
+        offset_btn->Bind(wxEVT_BUTTON, [this, zone_index, mgr_ptr, palette, nozzle_diameters, apply_zone](wxCommandEvent &) {
+            if (zone_index >= mgr_ptr->zones().size())
+                return;
+            TextureMappingZone updated = mgr_ptr->zones()[zone_index];
+            TextureMappingOffsetGradientDialog dlg(this, updated, palette.size(), nozzle_diameters, palette);
+            if (dlg.ShowModal() != wxID_OK || !dlg.apply_to(updated))
+                return;
+            updated.surface_pattern = int(TextureMappingZone::Gradient2D);
+            apply_zone(std::move(updated));
+            update_texture_mapping_panel(false);
+        });
+        advanced_btn->Bind(wxEVT_BUTTON, [this, zone_index, mgr_ptr, palette, apply_zone](wxCommandEvent &) {
+            if (zone_index >= mgr_ptr->zones().size())
+                return;
+            TextureMappingZone updated = mgr_ptr->zones()[zone_index];
+            const std::vector<unsigned int> ids = texture_mapping_selected_ids(updated, palette.size());
+            std::vector<float> strengths;
+            std::vector<float> offsets;
+            strengths.reserve(ids.size());
+            offsets.reserve(ids.size());
+            for (const unsigned int id : ids) {
+                const size_t idx = id > 0 ? size_t(id - 1) : size_t(0);
+                strengths.emplace_back(idx < updated.filament_strengths_pct.size() ? updated.filament_strengths_pct[idx] : 100.f);
+                offsets.emplace_back(idx < updated.filament_minimum_offsets_pct.size() ? updated.filament_minimum_offsets_pct[idx] : 0.f);
+            }
+            TextureMappingAdvancedOptionsDialog dlg(this,
+                                                    updated.texture_mapping_mode,
+                                                    updated.filament_color_mode,
+                                                    ids,
+                                                    strengths,
+                                                    offsets,
+                                                    updated.tone_gamma,
+                                                    updated.sagging_ratio,
+                                                    updated.preview_opacity_pct,
+                                                    updated.force_sequential_filaments,
+                                                    updated.auto_adjust_filament_selection,
+                                                    updated.preview_limit_resolution,
+                                                    updated.reduce_outer_surface_texture,
+                                                    updated.seam_hiding,
+                                                    updated.nonlinear_offset_adjustment,
+                                                    updated.compact_offset_mode,
+                                                    p->m_texture_mapping_advanced_options_tab);
+            const int result = dlg.ShowModal();
+            p->m_texture_mapping_advanced_options_tab = dlg.selected_options_tab();
+            if (result != wxID_OK)
+                return;
+            updated.texture_mapping_mode = dlg.texture_mapping_mode();
+            updated.tone_gamma = dlg.tone_gamma();
+            updated.sagging_ratio = dlg.sagging_ratio();
+            updated.preview_opacity_pct = dlg.preview_opacity_pct();
+            updated.force_sequential_filaments = dlg.force_sequential_filaments();
+            updated.auto_adjust_filament_selection = dlg.auto_adjust_filament_selection();
+            updated.preview_limit_resolution = dlg.preview_limit_resolution();
+            updated.reduce_outer_surface_texture = dlg.reduce_outer_surface_texture();
+            updated.seam_hiding = dlg.seam_hiding();
+            updated.nonlinear_offset_adjustment = dlg.nonlinear_offset_adjustment();
+            updated.compact_offset_mode = dlg.compact_offset_mode();
+            if (updated.filament_strengths_pct.size() < palette.size())
+                updated.filament_strengths_pct.resize(palette.size(), 100.f);
+            const std::vector<float> dlg_strengths = dlg.component_strengths_pct();
+            for (size_t i = 0; i < ids.size() && i < dlg_strengths.size(); ++i)
+                if (ids[i] > 0 && size_t(ids[i] - 1) < updated.filament_strengths_pct.size())
+                    updated.filament_strengths_pct[size_t(ids[i] - 1)] = dlg_strengths[i];
+            while (!updated.filament_strengths_pct.empty() && std::abs(updated.filament_strengths_pct.back() - 100.f) <= 1e-6f)
+                updated.filament_strengths_pct.pop_back();
+            if (updated.filament_minimum_offsets_pct.size() < palette.size())
+                updated.filament_minimum_offsets_pct.resize(palette.size(), 0.f);
+            const std::vector<float> dlg_offsets = dlg.component_minimum_offsets_pct();
+            for (size_t i = 0; i < ids.size() && i < dlg_offsets.size(); ++i)
+                if (ids[i] > 0 && size_t(ids[i] - 1) < updated.filament_minimum_offsets_pct.size())
+                    updated.filament_minimum_offsets_pct[size_t(ids[i] - 1)] = dlg_offsets[i];
+            while (!updated.filament_minimum_offsets_pct.empty() && std::abs(updated.filament_minimum_offsets_pct.back()) <= 1e-6f)
+                updated.filament_minimum_offsets_pct.pop_back();
+            apply_zone(std::move(updated));
+            update_texture_mapping_panel(false);
+        });
+
+        auto toggle_editor = [this, zone_index, editor, row]() {
+            if (editor == nullptr)
+                return;
+            if (editor->IsShown()) {
+                editor->Hide();
+                p->m_expanded_texture_mapping_rows.erase(zone_index);
+            } else {
+                editor->Show();
+                p->m_expanded_texture_mapping_rows.insert(zone_index);
+            }
+            row->Layout();
+            p->m_panel_texture_mapping_content->Layout();
+            m_scrolled_sizer->Layout();
+            Layout();
+        };
+        auto bind_toggle = [toggle_editor](wxWindow *win) {
+            if (win == nullptr)
+                return;
+            win->SetCursor(wxCursor(wxCURSOR_HAND));
+            win->Bind(wxEVT_LEFT_UP, [toggle_editor](wxMouseEvent &) { toggle_editor(); });
+        };
+        bind_toggle(header);
+        bind_toggle(title);
+        bind_toggle(summary);
+        bind_toggle(swatch);
+        bind_toggle(preview);
+
+        menu_btn->Bind(wxEVT_LEFT_UP, [](wxMouseEvent &evt) {
+            evt.StopPropagation();
+            evt.Skip();
+        });
+        menu_btn->Bind(wxEVT_BUTTON, [this, zone_index, num_physical, physical_colors, mgr_ptr, persist_rows, menu_btn](wxCommandEvent &) {
+            if (menu_btn == nullptr)
+                return;
+            wxMenu menu;
+            const int duplicate_id = wxWindow::NewControlId();
+            const int delete_id = wxWindow::NewControlId();
+            menu.Append(duplicate_id, _L("Duplicate"));
+            menu.Append(delete_id, _L("Delete"));
+            menu.Bind(wxEVT_COMMAND_MENU_SELECTED, [this, zone_index, num_physical, physical_colors, mgr_ptr, persist_rows, duplicate_id, delete_id](wxCommandEvent &evt) {
+                auto &rows = mgr_ptr->zones();
+                if (zone_index >= rows.size())
+                    return;
+                if (evt.GetId() == duplicate_id) {
+                    mgr_ptr->duplicate_zone(zone_index, num_physical, physical_colors);
+                    persist_rows();
+                    update_texture_mapping_panel(false);
+                    return;
+                }
+                if (evt.GetId() == delete_id) {
+                    rows.erase(rows.begin() + ptrdiff_t(zone_index));
+                    p->m_expanded_texture_mapping_rows.clear();
+                    persist_rows();
+                    update_texture_mapping_panel(false);
+                }
+            });
+            menu_btn->PopupMenu(&menu, wxPoint(0, menu_btn->GetSize().GetHeight()));
+        });
+
+        content_sizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(2));
+    }
+
+    content_sizer->AddSpacer(FromDIP(2));
+    p->m_panel_texture_mapping_content->Layout();
+    m_scrolled_sizer->Layout();
+    Layout();
+}
+
+std::vector<unsigned int> Sidebar::get_ui_ordered_filament_ids() const
+{
+    std::vector<unsigned int> ordered_filament_ids;
+    const size_t num_physical = p->combos_filament.size();
+    ordered_filament_ids.reserve(num_physical + 8);
+    for (size_t i = 0; i < num_physical; ++i)
+        ordered_filament_ids.emplace_back(unsigned(i + 1));
+    if (wxGetApp().preset_bundle != nullptr) {
+        PresetBundle *bundle = wxGetApp().preset_bundle;
+        if (const ConfigOptionStrings *colors = bundle->project_config.option<ConfigOptionStrings>("filament_colour")) {
+            const std::string serialized = bundle->project_config.has("texture_mapping_definitions") ?
+                bundle->project_config.opt_string("texture_mapping_definitions") :
+                std::string();
+            bundle->texture_mapping_zones.load_entries(serialized, colors->values);
+        }
+        for (const unsigned int zone_id : wxGetApp().preset_bundle->texture_mapping_zones.zone_ids_by_index())
+            if (zone_id != 0)
+                ordered_filament_ids.emplace_back(zone_id);
+    }
+    return ordered_filament_ids;
+}
+
 PlaterPresetComboBox* Sidebar::printer_combox()
 {
     return p->combo_printer;
@@ -4124,7 +5616,7 @@ void Sidebar::auto_calc_flushing_volumes_internal(const int modify_id, const int
     int m_max_flush_volume = Slic3r::g_max_flush_volume;
     unsigned int m_number_of_extruders = (int)(sqrt(init_matrix.size()) + 0.001);
 
-    const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config();
+    const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config(nullptr, false);
     std::vector<std::vector<wxColour>> multi_colours;
 
     // Support for multi-color filament
@@ -6476,11 +7968,18 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                 auto obj_color_fun = [this, &path](ObjDialogInOut &in_out) {
 
                     if (!boost::iends_with(path.string(), ".obj")) { return; }
-                    const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config();
+                    const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config(nullptr, false);
                     ObjColorDialog                 color_dlg(nullptr, in_out, extruder_colours);
                     if (color_dlg.ShowModal() != wxID_OK) {
                         in_out.filament_ids.clear();
                     }
+                };
+                auto obj_import_mode_fun = [&path](const ObjImportCapabilities &capabilities) -> ObjImportMode {
+                    if (!boost::iends_with(path.string(), ".obj"))
+                        return ObjImportMode::UseDefault;
+                    if (capabilities.texture_count > 0 && capabilities.has_valid_texture_uvs)
+                        return ObjImportMode::ImportTextures;
+                    return ObjImportMode::UseDefault;
                 };
                 if (boost::iends_with(path.string(), ".stp") ||
                     boost::iends_with(path.string(), ".step")) {
@@ -6548,7 +8047,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                             cont          = dlg.Update(progress_percent, msg);
                             cancel        = !cont;
                     },
-                    nullptr, 0, obj_color_fun);
+                    nullptr, 0, obj_color_fun, obj_import_mode_fun);
                 }
 
                 if (designer_model_id.empty() && boost::algorithm::iends_with(path.string(), ".stl")) {
@@ -6556,6 +8055,11 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                 }
 
                 if (type_any_amf && is_xxx) imperial_units = true;
+
+                if (assign_imported_texture_mapping_zone(model)) {
+                    sidebar->update_texture_mapping_panel(false);
+                    sidebar->update_dynamic_filament_list();
+                }
 
                 for (auto obj : model.objects) {
                     if (obj->name.empty()) {
@@ -8670,11 +10174,18 @@ void Plater::priv::reload_from_disk()
         const auto& path = input_paths[i].string();
         auto        obj_color_fun = [this, &path](ObjDialogInOut &in_out) {
             if (!boost::iends_with(path, ".obj")) { return; }
-            const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config();
+            const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config(nullptr, false);
             ObjColorDialog                 color_dlg(nullptr, in_out, extruder_colours);
             if (color_dlg.ShowModal() != wxID_OK) {
                 in_out.filament_ids.clear();
             }
+        };
+        auto obj_import_mode_fun = [&path](const ObjImportCapabilities &capabilities) -> ObjImportMode {
+            if (!boost::iends_with(path, ".obj"))
+                return ObjImportMode::UseDefault;
+            if (capabilities.texture_count > 0 && capabilities.has_valid_texture_uvs)
+                return ObjImportMode::ImportTextures;
+            return ObjImportMode::UseDefault;
         };
         wxBusyCursor wait;
         wxBusyInfo info(_L("Reload from:") + " " + from_u8(path), q->get_current_canvas3D()->get_wxglcanvas());
@@ -8695,9 +10206,13 @@ void Plater::priv::reload_from_disk()
                 bool   is_split = wxGetApp().app_config->get_bool("is_split_compound");
                 new_model       = Model::read_from_step(path, LoadStrategy::AddDefaultInstances | LoadStrategy::LoadModel, nullptr, nullptr, nullptr, linear, angle, is_split);
             }else {
-                new_model = Model::read_from_file(path, nullptr, nullptr, LoadStrategy::AddDefaultInstances | LoadStrategy::LoadModel, &plate_data, &project_presets, nullptr, nullptr, nullptr, nullptr, nullptr, 0, obj_color_fun);
+                new_model = Model::read_from_file(path, nullptr, nullptr, LoadStrategy::AddDefaultInstances | LoadStrategy::LoadModel, &plate_data, &project_presets, nullptr, nullptr, nullptr, nullptr, nullptr, 0, obj_color_fun, obj_import_mode_fun);
             }
 
+            if (assign_imported_texture_mapping_zone(new_model)) {
+                sidebar->update_texture_mapping_panel(false);
+                sidebar->update_dynamic_filament_list();
+            }
 
             for (ModelObject* model_object : new_model.objects)
             {
@@ -16284,6 +17799,56 @@ void Plater::on_filaments_delete(size_t num_filaments, size_t filament_id, int r
 {
     // only update elements in plater
     update_filament_colors_in_full_config();
+    PresetBundle *preset_bundle = wxGetApp().preset_bundle;
+    auto is_texture_mapping_zone = [preset_bundle](int filament_id_1based) {
+        return filament_id_1based > 0 &&
+               preset_bundle != nullptr &&
+               preset_bundle->texture_mapping_zones.is_texture_mapping_zone_id(unsigned(filament_id_1based));
+    };
+    auto remap_optional_physical_filament = [filament_id, is_texture_mapping_zone](int filament_id_1based) {
+        if (filament_id_1based <= 0 || is_texture_mapping_zone(filament_id_1based))
+            return filament_id_1based;
+        if (size_t(filament_id_1based) == filament_id + 1)
+            return 0;
+        if (size_t(filament_id_1based) > filament_id + 1)
+            return filament_id_1based - 1;
+        return filament_id_1based;
+    };
+    auto remap_custom_gcode_filament = [filament_id, replace_filament_id, is_texture_mapping_zone](int filament_id_1based) {
+        if (filament_id_1based <= 0 || is_texture_mapping_zone(filament_id_1based))
+            return filament_id_1based;
+        if (size_t(filament_id_1based) == filament_id + 1)
+            return replace_filament_id == -1 ? 0 : replace_filament_id + 1;
+        if (size_t(filament_id_1based) > filament_id + 1)
+            return filament_id_1based - 1;
+        return filament_id_1based;
+    };
+
+    if (preset_bundle != nullptr) {
+        DynamicPrintConfig &project_config = preset_bundle->project_config;
+        ConfigOptionStrings *color_opt = project_config.option<ConfigOptionStrings>("filament_colour");
+        if (color_opt != nullptr) {
+            std::vector<std::string> old_colors = color_opt->values;
+            const size_t insert_pos = std::min(filament_id, old_colors.size());
+            old_colors.insert(old_colors.begin() + ptrdiff_t(insert_pos), "#26A69A");
+            const std::string serialized = project_config.has("texture_mapping_definitions") ?
+                project_config.opt_string("texture_mapping_definitions") :
+                std::string();
+            preset_bundle->texture_mapping_zones.load_entries(serialized, old_colors);
+            preset_bundle->texture_mapping_zones.remove_physical_filament(unsigned(filament_id + 1));
+            preset_bundle->texture_mapping_zones.refresh(color_opt->values);
+            const std::string remapped = preset_bundle->texture_mapping_zones.serialize_entries();
+            if (ConfigOptionString *opt = project_config.option<ConfigOptionString>("texture_mapping_definitions"))
+                opt->value = remapped;
+            else
+                project_config.set_key_value("texture_mapping_definitions", new ConfigOptionString(remapped));
+            DynamicPrintConfig &print_config = preset_bundle->prints.get_edited_preset().config;
+            if (ConfigOptionString *opt = print_config.option<ConfigOptionString>("texture_mapping_definitions"))
+                opt->value = remapped;
+            else
+                print_config.set_key_value("texture_mapping_definitions", new ConfigOptionString(remapped));
+        }
+    }
 
     // update fisrt print sequence and other layer sequence
     //move to partplate->on_filament_deleted
@@ -16307,12 +17872,11 @@ void Plater::on_filaments_delete(size_t num_filaments, size_t filament_id, int r
     static const char *keys[] = {"support_filament", "support_interface_filament"};
     for (auto key : keys)
         if (p->config->has(key)) {
-            if(p->config->opt_int(key) == filament_id + 1)
+            const int new_value = remap_optional_physical_filament(p->config->opt_int(key));
+            if (new_value == 0)
                 (*(p->config)).erase(key);
-            else {
-                int new_value = p->config->opt_int(key) > filament_id ? p->config->opt_int(key) - 1 : p->config->opt_int(key);
+            else
                 (*(p->config)).set_key_value(key, new ConfigOptionInt(new_value));
-            }
         }
 
     // update object/volume/support(object and volume) filament id
@@ -16320,8 +17884,8 @@ void Plater::on_filaments_delete(size_t num_filaments, size_t filament_id, int r
 
     // update customize gcode
     for (auto item = p->model.plates_custom_gcodes.begin(); item != p->model.plates_custom_gcodes.end(); ++item) {
-        auto iter = std::remove_if(item->second.gcodes.begin(), item->second.gcodes.end(), [filament_id](const Item& gcode_item) {
-            return (gcode_item.type == CustomGCode::Type::ToolChange && gcode_item.extruder == filament_id + 1);
+        auto iter = std::remove_if(item->second.gcodes.begin(), item->second.gcodes.end(), [remap_custom_gcode_filament](const Item& gcode_item) {
+            return gcode_item.type == CustomGCode::Type::ToolChange && remap_custom_gcode_filament(gcode_item.extruder) == 0;
         });
         if (replace_filament_id == -1)
             item->second.gcodes.erase(iter, item->second.gcodes.end());
@@ -16330,10 +17894,11 @@ void Plater::on_filaments_delete(size_t num_filaments, size_t filament_id, int r
         }
 
         for (auto& item : item->second.gcodes) {
-            if (item.type == CustomGCode::Type::ToolChange && item.extruder > filament_id)
-                item.extruder--;
+            if (item.type == CustomGCode::Type::ToolChange)
+                item.extruder = remap_custom_gcode_filament(item.extruder);
         }
     }
+    sidebar().update_texture_mapping_panel(false);
 }
 
 std::vector<Slic3r::ColorRGBA> Plater::get_extruders_colors()
@@ -16618,7 +18183,7 @@ void Plater::on_activate()
 }
 
 // Get vector of extruder colors considering filament color, if extruder color is undefined.
-std::vector<std::string> Plater::get_extruder_colors_from_plater_config(const GCodeProcessorResult* const result) const
+std::vector<std::string> Plater::get_extruder_colors_from_plater_config(const GCodeProcessorResult* const result, bool include_texture_mapping_zones) const
 {
     if (wxGetApp().is_gcode_viewer() && result != nullptr)
         return result->extruder_colors;
@@ -16629,6 +18194,15 @@ std::vector<std::string> Plater::get_extruder_colors_from_plater_config(const GC
             return filament_colors;
 
         filament_colors = (config->option<ConfigOptionStrings>("filament_colour"))->values;
+        if (!include_texture_mapping_zones)
+            return filament_colors;
+        const size_t num_physical = filament_colors.size();
+        if (PresetBundle *bundle = wxGetApp().preset_bundle; bundle != nullptr) {
+            const std::string texture_mapping_definitions = config->has("texture_mapping_definitions") ? config->opt_string("texture_mapping_definitions") : std::string();
+            bundle->texture_mapping_zones.load_entries(texture_mapping_definitions, filament_colors);
+            const std::vector<std::string> zone_colors = bundle->texture_mapping_zones.display_colors(num_physical);
+            filament_colors.insert(filament_colors.end(), zone_colors.begin(), zone_colors.end());
+        }
         return filament_colors;
     }
 }

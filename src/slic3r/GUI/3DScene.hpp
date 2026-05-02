@@ -13,6 +13,7 @@
 #include "libslic3r/ObjectID.hpp"
 
 #include "GLModel.hpp"
+#include "GLTexture.hpp"
 #include "GLShader.hpp"
 #include "MeshUtils.hpp"
 
@@ -231,6 +232,15 @@ public:
     // BBS
     mutable std::vector<GUI::GLModel> mmuseg_models;
     mutable ObjectBase::Timestamp       mmuseg_ts;
+    mutable std::vector<GUI::GLModel> mmuseg_texture_preview_models;
+    mutable std::vector<ColorRGBA>    mmuseg_texture_preview_colors;
+    mutable std::vector<unsigned int> mmuseg_texture_preview_filament_ids;
+    mutable std::vector<GUI::GLModel> mmuseg_vertex_color_preview_models;
+    mutable std::vector<ColorRGBA>    mmuseg_vertex_color_preview_colors;
+    mutable std::vector<unsigned int> mmuseg_vertex_color_preview_filament_ids;
+    mutable GUI::GLTexture            mmuseg_texture_preview;
+    mutable size_t                    mmuseg_texture_preview_signature { 0 };
+    mutable size_t                    mmuseg_texture_preview_visual_signature { 0 };
 
     // Ranges of triangle and quad indices to be rendered.
     std::pair<size_t, size_t>   tverts_range;
@@ -391,6 +401,8 @@ typedef std::vector<GLVolume*> GLVolumePtrs;
 typedef std::pair<GLVolume*, std::pair<unsigned int, double>> GLVolumeWithIdAndZ;
 typedef std::vector<GLVolumeWithIdAndZ> GLVolumeWithIdAndZList;
 
+void clear_texture_preview_simulation_cache();
+
 class GLVolumeCollection
 {
 public:
@@ -501,7 +513,7 @@ public:
            ) const;
 
     // Clear the geometry
-    void clear() { for (auto *v : volumes) delete v; volumes.clear(); }
+    void clear() { clear_texture_preview_simulation_cache(); for (auto *v : volumes) delete v; volumes.clear(); }
 
     bool empty() const { return volumes.empty(); }
     void set_range(double low, double high) { for (GLVolume *vol : this->volumes) vol->set_range(low, high); }

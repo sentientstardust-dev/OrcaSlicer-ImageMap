@@ -27,6 +27,7 @@
 #include "GUI_App.hpp"
 #include "GUI_ObjectList.hpp"
 #include "GUI_Colors.hpp"
+#include "MMUPaintedTexturePreview.hpp"
 #include "Mouse3DController.hpp"
 #include "I18N.hpp"
 #include "NotificationManager.hpp"
@@ -3166,6 +3167,8 @@ void GLCanvas3D::on_idle(wxIdleEvent& evt)
     m_dirty |= wxGetApp().plater()->get_notification_manager()->update_notifications(*this);
     auto gizmo = wxGetApp().plater()->get_view3D_canvas3D()->get_gizmos_manager().get_current();
     if (gizmo != nullptr) m_dirty |= gizmo->update_items_state();
+    const bool texture_preview_generation_pending = Slic3r::texture_preview_simulation_is_pending();
+    m_dirty |= texture_preview_generation_pending;
 #if ENABLE_ENHANCED_IMGUI_SLIDER_FLOAT
     // ImGuiWrapper::m_requires_extra_frame may have been set by a render made outside of the OnIdle mechanism
     bool imgui_requires_extra_frame = wxGetApp().imgui()->requires_extra_frame();
@@ -3185,9 +3188,10 @@ void GLCanvas3D::on_idle(wxIdleEvent& evt)
     _refresh_if_shown_on_screen();
 
 #if ENABLE_ENHANCED_IMGUI_SLIDER_FLOAT
-    if (m_extra_frame_requested || mouse3d_controller_applied || imgui_requires_extra_frame || wxGetApp().imgui()->requires_extra_frame()) {
+    if (m_extra_frame_requested || mouse3d_controller_applied || imgui_requires_extra_frame ||
+        wxGetApp().imgui()->requires_extra_frame() || texture_preview_generation_pending) {
 #else
-    if (m_extra_frame_requested || mouse3d_controller_applied) {
+    if (m_extra_frame_requested || mouse3d_controller_applied || texture_preview_generation_pending) {
         m_dirty = true;
 #endif // ENABLE_ENHANCED_IMGUI_SLIDER_FLOAT
         m_extra_frame_requested = false;
@@ -7855,6 +7859,29 @@ void GLCanvas3D::_render_overlays()
             }*/
     }
     m_labels.render(sorted_instances);
+
+    if (Slic3r::texture_preview_simulation_is_pending()) {
+        ImGuiWrapper &imgui = *wxGetApp().imgui();
+        const Size cnv_size = get_canvas_size();
+        const float scale = imgui.get_style_scaling();
+        const float margin = 16.0f * scale;
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 4.0f * scale);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 8.0f) * scale);
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.08f, 0.09f, 0.10f, 0.88f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+        imgui.set_next_window_pos(margin, float(cnv_size.get_height()) - margin, ImGuiCond_Always, 0.0f, 1.0f);
+        imgui.begin(wxString("texture_preview_generation_status"),
+                    ImGuiWindowFlags_AlwaysAutoResize |
+                    ImGuiWindowFlags_NoMouseInputs |
+                    ImGuiWindowFlags_NoMove |
+                    ImGuiWindowFlags_NoDecoration |
+                    ImGuiWindowFlags_NoFocusOnAppearing);
+        ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());
+        imgui.text(_L("Generating simulated color preview..."));
+        imgui.end();
+        ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar(2);
+    }
 
     _render_3d_navigator();
 

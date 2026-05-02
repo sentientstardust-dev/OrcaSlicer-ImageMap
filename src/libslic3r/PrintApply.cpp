@@ -1116,6 +1116,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 	new_full_config.option("print_settings_id",            true);
 	new_full_config.option("filament_settings_id",         true);
 	new_full_config.option("printer_settings_id",          true);
+    new_full_config.option("texture_mapping_definitions", true);
 
     // BBS
     std::vector <unsigned int> used_filaments = this->extruders(true);
@@ -1227,7 +1228,9 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     }
 
     // Grab the lock for the Print / PrintObject milestones.
-	std::scoped_lock<std::mutex> lock(this->state_mutex());
+    std::scoped_lock<std::mutex> lock(this->state_mutex());
+    if (const ConfigOptionStrings *color_opt = new_full_config.option<ConfigOptionStrings>("filament_colour", false); color_opt != nullptr)
+        m_texture_mapping_mgr.load_entries(new_full_config.opt_string("texture_mapping_definitions"), color_opt->values);
 
     // The following call may stop the background processing.
     if (! print_diff.empty())

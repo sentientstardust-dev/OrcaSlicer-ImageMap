@@ -1892,6 +1892,18 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
         }
     }
 
+    if (m_type == Preset::TYPE_PRINT &&
+        (opt_key == "texture_mapping_outer_wall_gradient_global_strength" ||
+         opt_key == "texture_mapping_outer_wall_gradient_max_line_width" ||
+         opt_key == "texture_mapping_outer_wall_gradient_min_line_width" ||
+         opt_key == "texture_mapping_definitions")) {
+        DynamicPrintConfig &project_cfg = wxGetApp().preset_bundle->project_config;
+        if (const ConfigOption *opt = m_config->option(opt_key))
+            project_cfg.set_key_value(opt_key, opt->clone());
+        if (wxGetApp().plater() != nullptr)
+            wxGetApp().sidebar().update_texture_mapping_panel(opt_key == "texture_mapping_definitions");
+    }
+
     if (m_postpone_update_ui) {
         // It means that not all values are rolled to the system/last saved values jet.
         // And call of the update() can causes a redundant check of the config values,
@@ -2582,6 +2594,11 @@ void TabPrint::build()
         optgroup->append_single_option_line("wipe_tower_fillet_wall", "multimaterial_settings_prime_tower#fillet-wall");
         optgroup->append_single_option_line("wipe_tower_no_sparse_layers", "multimaterial_settings_prime_tower#no-sparse-layers");
         optgroup->append_single_option_line("single_extruder_multi_material_priming", "multimaterial_settings_prime_tower");
+
+        optgroup = page->new_optgroup(L("Texture Mapping"), L"param_flush");
+        optgroup->append_single_option_line("texture_mapping_outer_wall_gradient_global_strength");
+        optgroup->append_single_option_line("texture_mapping_outer_wall_gradient_max_line_width");
+        optgroup->append_single_option_line("texture_mapping_outer_wall_gradient_min_line_width");
 
         optgroup = page->new_optgroup(L("Filament for Features"), L"param_filament_for_features");
         optgroup->append_single_option_line("wall_filament", "multimaterial_settings_filament_for_features#walls");

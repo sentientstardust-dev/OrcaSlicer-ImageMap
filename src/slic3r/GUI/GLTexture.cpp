@@ -173,6 +173,8 @@ bool GLTexture::load_from_svg_file(const std::string& filename, bool use_mipmaps
 
 bool GLTexture::load_from_raw_data(std::vector<unsigned char> data, unsigned int w, unsigned int h, bool apply_anisotropy)
 {
+    reset();
+
     m_width = w;
     m_height = h;
     int n_pixels = m_width * m_height;

@@ -1,6 +1,7 @@
 #include "libslic3r/Config.hpp"
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/TextureMapping.hpp"
 #include "libslic3r/Model.hpp"
 
 #include "GUI_Factories.hpp"
@@ -37,7 +38,61 @@ static PrinterTechnology printer_technology()
 
 static int filaments_count()
 {
-    return wxGetApp().filaments_cnt();
+    int count = wxGetApp().filaments_cnt();
+    if (PresetBundle *bundle = wxGetApp().preset_bundle; bundle != nullptr) {
+        const ConfigOptionStrings *colors = bundle->project_config.option<ConfigOptionStrings>("filament_colour", false);
+        if (colors != nullptr) {
+            const std::string serialized = bundle->project_config.has("texture_mapping_definitions") ?
+                bundle->project_config.opt_string("texture_mapping_definitions") :
+                std::string();
+            bundle->texture_mapping_zones.load_entries(serialized, colors->values);
+            count = int(std::max<size_t>(size_t(count), bundle->texture_mapping_zones.total_filaments(colors->values.size())));
+        }
+    }
+    return count;
+}
+
+static wxString texture_mapping_menu_label(const TextureMappingZone &zone)
+{
+    if (zone.is_2d_gradient())
+        return _L("Texture Mapping 2D Gradient");
+    const std::string color_model = TextureMappingManager::filament_color_mode_name(zone.filament_color_mode);
+    if (color_model == "any")
+        return _L("Texture Mapping");
+    wxString color_model_text = from_u8(color_model);
+    color_model_text.MakeUpper();
+    return _L("Texture Mapping ") + color_model_text;
+}
+
+static wxString filament_menu_item_name(int filament_id_1based)
+{
+    if (filament_id_1based <= 0)
+        return _L("Default");
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    if (bundle == nullptr)
+        return wxString::Format(_L("Filament %d"), filament_id_1based);
+    if (filament_id_1based <= int(bundle->filament_presets.size())) {
+        auto preset = bundle->filaments.find_preset(bundle->filament_presets[size_t(filament_id_1based - 1)]);
+        if (preset != nullptr)
+            return from_u8(preset->label(false));
+    }
+    const TextureMappingZone *texture_zone = bundle->texture_mapping_zones.zone_from_id(unsigned(filament_id_1based));
+    if (texture_zone != nullptr)
+        return texture_mapping_menu_label(*texture_zone);
+    return wxString::Format(_L("Filament %d"), filament_id_1based);
+}
+
+static std::vector<unsigned int> ui_ordered_filament_ids(int fallback_count)
+{
+    std::vector<unsigned int> ids;
+    if (wxGetApp().plater() != nullptr)
+        ids = wxGetApp().plater()->sidebar().get_ui_ordered_filament_ids();
+    if (ids.empty()) {
+        ids.reserve(size_t(std::max(0, fallback_count)));
+        for (int i = 1; i <= fallback_count; ++i)
+            ids.emplace_back(unsigned(i));
+    }
+    return ids;
 }
 
 static bool is_improper_category(const std::string& category, const int filaments_cnt, const bool is_object_settings = true)
@@ -981,21 +1036,23 @@ void MenuFactory::append_menu_item_change_extruder(wxMenu* menu)
         initial_extruder = config.has("extruder") ? config.extruder() : 1;
     }
 
-    for (int i = 0; i <= filaments_cnt; i++)
+    std::vector<unsigned int> ordered_ids = ui_ordered_filament_ids(filaments_cnt);
+    std::vector<int> menu_ids;
+    menu_ids.reserve(ordered_ids.size() + 1);
+    menu_ids.emplace_back(0);
+    for (unsigned int id : ordered_ids)
+        if (id <= unsigned(filaments_cnt))
+            menu_ids.emplace_back(int(id));
+
+    for (int i : menu_ids)
     {
         bool is_active_extruder = i == initial_extruder;
         int icon_idx = i == 0 ? 0 : i - 1;
 
         wxString item_name = _L("Default");
 
-        if (i > 0) {
-            auto preset = wxGetApp().preset_bundle->filaments.find_preset(wxGetApp().preset_bundle->filament_presets[i - 1]);
-            if (preset == nullptr) {
-                item_name = wxString::Format(_L("Filament %d"), i);
-            } else {
-                item_name = from_u8(preset->label(false));
-            }
-        }
+        if (i > 0)
+            item_name = filament_menu_item_name(i);
 
         if (is_active_extruder) {
             item_name << " (" + _L("current") + ")";
@@ -2175,7 +2232,16 @@ void MenuFactory::append_menu_item_change_filament(wxMenu* menu)
         }
     }
 
-    for (int i = has_modifier ? 0 : 1; i <= filaments_cnt; i++)
+    std::vector<unsigned int> ordered_ids = ui_ordered_filament_ids(filaments_cnt);
+    std::vector<int> menu_ids;
+    menu_ids.reserve(ordered_ids.size() + (has_modifier ? 1 : 0));
+    if (has_modifier)
+        menu_ids.emplace_back(0);
+    for (unsigned int id : ordered_ids)
+        if (id <= unsigned(filaments_cnt))
+            menu_ids.emplace_back(int(id));
+
+    for (int i : menu_ids)
     {
         // BBS
         //bool is_active_extruder = i == initial_extruder;
@@ -2183,14 +2249,8 @@ void MenuFactory::append_menu_item_change_filament(wxMenu* menu)
 
         wxString item_name = _L("Default");
 
-        if (i > 0) {
-            auto preset = wxGetApp().preset_bundle->filaments.find_preset(wxGetApp().preset_bundle->filament_presets[i - 1]);
-            if (preset == nullptr) {
-                item_name = wxString::Format(_L("Filament %d"), i);
-            } else {
-                item_name = from_u8(preset->label(false));
-            }
-        }
+        if (i > 0)
+            item_name = filament_menu_item_name(i);
 
         if (is_active_extruder) {
             item_name << " (" + _L("current") + ")";

@@ -3304,9 +3304,14 @@ void PrintObject::bridge_over_infill()
 
 } // void PrintObject::bridge_over_infill()
 
-static void clamp_exturder_to_default(ConfigOptionInt &opt, size_t num_extruders)
+static bool is_texture_mapping_virtual_filament_id(int filament_id)
 {
-    if (opt.value > (int)num_extruders)
+    return filament_id >= 99 && filament_id <= 255;
+}
+
+static void clamp_exturder_to_default(ConfigOptionInt &opt, size_t num_extruders, bool allow_texture_mapping_virtual_id = false)
+{
+    if (opt.value > (int)num_extruders && !(allow_texture_mapping_virtual_id && is_texture_mapping_virtual_filament_id(opt.value)))
         // assign the default extruder
         opt.value = 1;
 }
@@ -3372,9 +3377,9 @@ PrintRegionConfig region_config_from_model_volume(const PrintRegionConfig &defau
     	apply_to_print_region_config(config, *layer_range_config);
     }
     // Clamp invalid extruders to the default extruder (with index 1).
-    clamp_exturder_to_default(config.sparse_infill_filament,       num_extruders);
-    clamp_exturder_to_default(config.wall_filament,    num_extruders);
-    clamp_exturder_to_default(config.solid_infill_filament, num_extruders);
+    clamp_exturder_to_default(config.sparse_infill_filament,       num_extruders, true);
+    clamp_exturder_to_default(config.wall_filament,    num_extruders, true);
+    clamp_exturder_to_default(config.solid_infill_filament, num_extruders, true);
     if (config.sparse_infill_density.value < 0.00011f)
         // Switch of infill for very low infill rates, also avoid division by zero in infill generator for these very low rates.
         // See GH issue #5910.

@@ -7,7 +7,9 @@
 #include "../GCode.hpp"
 #include "../Geometry.hpp"
 #include "../GCode/ThumbnailData.hpp"
+#include "../PNGReadWrite.hpp"
 #include "../Semver.hpp"
+#include "../TextureMapping.hpp"
 #include "../Time.hpp"
 
 #include "../I18N.hpp"
@@ -17,6 +19,10 @@
 #include <limits>
 #include <stdexcept>
 #include <iomanip>
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <csetjmp>
 
 #include <boost/assign.hpp>
 #include <boost/bimap.hpp>
@@ -56,6 +62,7 @@ namespace pt = boost::property_tree;
 #include "NSVGUtils.hpp"
 
 #include <fast_float/fast_float.h>
+#include <jpeglib.h>
 
 // Slightly faster than sprintf("%.9g"), but there is an issue with the karma floating point formatter,
 // https://github.com/boostorg/spirit/pull/586
@@ -137,6 +144,27 @@ static bool is_path_within_root(const std::string& file_path, const boost::files
     }
 
     return true;
+}
+
+static bool is_texture_mapping_virtual_filament_id(const Slic3r::DynamicPrintConfig &config, int filament_id, size_t physical_count)
+{
+    if (filament_id < 99 || filament_id > 255)
+        return false;
+
+    const auto *texture_defs_opt = config.option<Slic3r::ConfigOptionString>("texture_mapping_definitions");
+    if (texture_defs_opt == nullptr || texture_defs_opt->value.empty())
+        return false;
+
+    std::vector<std::string> physical_colors;
+    if (const auto *colors_opt = config.option<Slic3r::ConfigOptionStrings>("filament_colour");
+        colors_opt != nullptr && !colors_opt->values.empty())
+        physical_colors = colors_opt->values;
+    else
+        physical_colors.assign(physical_count, "#FFFFFF");
+
+    Slic3r::TextureMappingManager texture_mgr;
+    texture_mgr.load_entries(texture_defs_opt->value, physical_colors);
+    return texture_mgr.is_texture_mapping_zone_id(unsigned(filament_id));
 }
 
 // VERSION NUMBERS
@@ -231,6 +259,11 @@ static constexpr const char* MODEL_TAG = "model";
 static constexpr const char* RESOURCES_TAG = "resources";
 static constexpr const char* COLOR_GROUP_TAG = "m:colorgroup";
 static constexpr const char* COLOR_TAG = "m:color";
+static constexpr const char* TEXTURE_2D_TAG = "m:texture2d";
+static constexpr const char* TEXTURE_2D_GROUP_TAG = "m:texture2dgroup";
+static constexpr const char* TEX2COORD_TAG = "m:tex2coord";
+static constexpr const char* MULTI_PROPERTIES_TAG = "m:multiproperties";
+static constexpr const char* MULTI_TAG = "m:multi";
 static constexpr const char* OBJECT_TAG = "object";
 static constexpr const char* MESH_TAG = "mesh";
 static constexpr const char* MESH_STAT_TAG = "mesh_stat";
@@ -308,6 +341,8 @@ static constexpr const char* ID_ATTR = "id";
 static constexpr const char* X_ATTR = "x";
 static constexpr const char* Y_ATTR = "y";
 static constexpr const char* Z_ATTR = "z";
+static constexpr const char* U_ATTR = "u";
+static constexpr const char* V_ATTR = "v";
 static constexpr const char* V1_ATTR = "v1";
 static constexpr const char* V2_ATTR = "v2";
 static constexpr const char* V3_ATTR = "v3";
@@ -327,8 +362,16 @@ static constexpr const char* FACE_PROPERTY_ATTR = "face_property";
 
 static constexpr const char* KEY_ATTR = "key";
 static constexpr const char* VALUE_ATTR = "value";
+static constexpr const char* TEXID_ATTR = "texid";
+static constexpr const char* PATH_ATTR = "path";
+static constexpr const char* CONTENTTYPE_ATTR = "contenttype";
+static constexpr const char* PIDS_ATTR = "pids";
+static constexpr const char* PINDICES_ATTR = "pindices";
 static constexpr const char* FIRST_TRIANGLE_ID_ATTR = "firstid";
 static constexpr const char* LAST_TRIANGLE_ID_ATTR = "lastid";
+static constexpr const char* P1_ATTR = "p1";
+static constexpr const char* P2_ATTR = "p2";
+static constexpr const char* P3_ATTR = "p3";
 static constexpr const char* SUBTYPE_ATTR = "subtype";
 static constexpr const char* LOCK_ATTR = "locked";
 static constexpr const char* BED_TYPE_ATTR = "bed_type";
@@ -383,6 +426,10 @@ static constexpr const char* SOURCE_OFFSET_Y_KEY = "source_offset_y";
 static constexpr const char* SOURCE_OFFSET_Z_KEY = "source_offset_z";
 static constexpr const char* SOURCE_IN_INCHES    = "source_in_inches";
 static constexpr const char* SOURCE_IN_METERS    = "source_in_meters";
+
+static constexpr const char *MATERIALS_NAMESPACE = "http://schemas.microsoft.com/3dmanufacturing/material/2015/02";
+static constexpr const char *MODEL_TEXTURE_REL_TYPE = "http://schemas.microsoft.com/3dmanufacturing/2013/01/3dtexture";
+static constexpr const char *MODEL_TEXTURE_CONTENT_TYPE = "application/vnd.ms-package.3dmanufacturing-3dmodeltexture";
 
 static constexpr const char* MESH_SHARED_KEY = "mesh_shared";
 
@@ -673,6 +720,511 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
 #define L(s) (s)
 #define _(s) Slic3r::I18N::translate(s)
 
+struct ThreeMfTexture2DResource
+{
+    std::string path;
+    std::string content_type;
+};
+
+struct ThreeMfTexture2DGroupResource
+{
+    int tex_id{-1};
+    std::vector<std::pair<float, float>> coords;
+};
+
+struct ThreeMfColorGroupResource
+{
+    std::vector<uint32_t> colors;
+};
+
+struct ThreeMfMultiPropertiesResource
+{
+    std::vector<int> pids;
+    std::vector<std::vector<int>> pindices;
+};
+
+struct PendingThreeMfImportedTexture
+{
+    std::string          image_file;
+    std::string          image_content_type;
+    std::vector<float>   uvs_per_face;
+    std::vector<uint8_t> uv_valid;
+};
+
+struct ThreeMfExportTextureResource
+{
+    int                   color_group_id{-1};
+    int                   texture_id{-1};
+    int                   texture_group_id{-1};
+    int                   multi_properties_id{-1};
+    std::string           texture_part_path;
+    std::vector<uint32_t> triangle_texcoord_starts;
+};
+
+using VolumeToThreeMfExportTextureMap = std::map<const ModelVolume *, ThreeMfExportTextureResource>;
+
+static bool has_imported_vertex_color_payload(const ModelVolume &volume)
+{
+    const size_t vertex_count = volume.mesh().its.vertices.size();
+    return vertex_count > 0 && volume.imported_vertex_colors_rgba.size() == vertex_count;
+}
+
+static bool has_imported_obj_texture_payload(const ModelVolume &volume)
+{
+    const size_t triangle_count = volume.mesh().its.indices.size();
+    return volume.imported_texture_width > 0 &&
+           volume.imported_texture_height > 0 &&
+           !volume.imported_texture_rgba.empty() &&
+           volume.imported_texture_rgba.size() >=
+               size_t(volume.imported_texture_width) * size_t(volume.imported_texture_height) * 4 &&
+           volume.imported_texture_uv_valid.size() == triangle_count &&
+           volume.imported_texture_uvs_per_face.size() >= triangle_count * 6;
+}
+
+static bool has_imported_obj_material_payload(const ModelVolume &volume)
+{
+    return has_imported_vertex_color_payload(volume) || has_imported_obj_texture_payload(volume);
+}
+
+static std::string imported_obj_texture_part_path(const Model &model, const ModelObject &object, const size_t volume_index)
+{
+    size_t object_index = 0;
+    for (; object_index < model.objects.size(); ++object_index) {
+        if (model.objects[object_index] == &object)
+            break;
+    }
+
+    return (boost::format("3D/Texture/obj_texture_%1%_%2%.png") % (object_index + 1) % (volume_index + 1)).str();
+}
+
+static std::string model_relationships_part_path(const std::string &model_part_path)
+{
+    const boost::filesystem::path model_path(model_part_path);
+    const boost::filesystem::path rels_path = model_path.parent_path() / "_rels" /
+                                              boost::filesystem::path(model_path.filename().string() + ".rels");
+    return rels_path.generic_string();
+}
+
+static int hex_digit_to_int(const char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return 10 + c - 'a';
+    if (c >= 'A' && c <= 'F')
+        return 10 + c - 'A';
+    return -1;
+}
+
+static bool parse_3mf_color(const std::string &color, uint32_t &rgba)
+{
+    if (color.size() != 7 && color.size() != 9)
+        return false;
+    if (color.front() != '#')
+        return false;
+
+    auto parse_byte = [&color](const size_t offset, uint32_t &out) {
+        const int hi = hex_digit_to_int(color[offset]);
+        const int lo = hex_digit_to_int(color[offset + 1]);
+        if (hi < 0 || lo < 0)
+            return false;
+        out = uint32_t((hi << 4) | lo);
+        return true;
+    };
+
+    uint32_t r = 0;
+    uint32_t g = 0;
+    uint32_t b = 0;
+    uint32_t a = 255;
+    if (!parse_byte(1, r) || !parse_byte(3, g) || !parse_byte(5, b))
+        return false;
+    if (color.size() == 9 && !parse_byte(7, a))
+        return false;
+
+    rgba = (r << 24) | (g << 16) | (b << 8) | a;
+    return true;
+}
+
+static std::string format_3mf_color(const uint32_t rgba)
+{
+    char buf[10];
+    ::snprintf(buf, sizeof(buf), "#%02X%02X%02X%02X",
+               unsigned((rgba >> 24) & 0xFFu),
+               unsigned((rgba >> 16) & 0xFFu),
+               unsigned((rgba >> 8) & 0xFFu),
+               unsigned(rgba & 0xFFu));
+    return buf;
+}
+
+static std::vector<int> parse_3mf_int_list(const std::string &text)
+{
+    std::vector<int> values;
+    std::vector<std::string> tokens;
+    boost::split(tokens, text, boost::is_any_of(" \t\r\n"), boost::token_compress_on);
+    values.reserve(tokens.size());
+    for (const std::string &token : tokens) {
+        if (token.empty())
+            continue;
+
+        int value = 0;
+        const char *begin = token.c_str();
+        const char *end = begin + token.size();
+        if (boost::spirit::qi::parse(begin, end, boost::spirit::qi::int_, value) && begin == end)
+            values.emplace_back(value);
+    }
+    return values;
+}
+
+struct JpegDecodeErrorManagerMemory
+{
+    jpeg_error_mgr pub;
+    jmp_buf        setjmp_buffer;
+};
+
+static void jpeg_decode_error_exit_memory(j_common_ptr cinfo)
+{
+    auto *err = reinterpret_cast<JpegDecodeErrorManagerMemory *>(cinfo->err);
+    longjmp(err->setjmp_buffer, 1);
+}
+
+static bool decode_jpeg_rgba_from_memory(const std::vector<uint8_t> &encoded,
+                                         std::vector<uint8_t> &out_rgba,
+                                         uint32_t &out_width,
+                                         uint32_t &out_height)
+{
+    out_rgba.clear();
+    out_width  = 0;
+    out_height = 0;
+
+    if (encoded.empty())
+        return false;
+
+    jpeg_decompress_struct cinfo;
+    JpegDecodeErrorManagerMemory jerr;
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = jpeg_decode_error_exit_memory;
+
+    if (setjmp(jerr.setjmp_buffer)) {
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
+
+    jpeg_create_decompress(&cinfo);
+    jpeg_mem_src(&cinfo,
+                 reinterpret_cast<const unsigned char *>(encoded.data()),
+                 static_cast<unsigned long>(encoded.size()));
+
+    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
+
+    jpeg_start_decompress(&cinfo);
+
+    const uint32_t width      = cinfo.output_width;
+    const uint32_t height     = cinfo.output_height;
+    const int      components = cinfo.output_components;
+    if (width == 0 || height == 0 || components <= 0) {
+        jpeg_finish_decompress(&cinfo);
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
+
+    out_rgba.assign(size_t(width) * size_t(height) * 4, uint8_t(255));
+    JSAMPARRAY scanline = (*cinfo.mem->alloc_sarray)((j_common_ptr) &cinfo,
+                                                     JPOOL_IMAGE,
+                                                     width * components,
+                                                     1);
+
+    uint32_t y = 0;
+    while (cinfo.output_scanline < cinfo.output_height) {
+        jpeg_read_scanlines(&cinfo, scanline, 1);
+        const unsigned char *src = scanline[0];
+        for (uint32_t x = 0; x < width; ++x) {
+            const size_t dst = (size_t(y) * size_t(width) + size_t(x)) * 4;
+            if (components >= 3) {
+                const size_t s = size_t(x) * size_t(components);
+                out_rgba[dst + 0] = src[s + 0];
+                out_rgba[dst + 1] = src[s + 1];
+                out_rgba[dst + 2] = src[s + 2];
+            } else {
+                const unsigned char g = src[x];
+                out_rgba[dst + 0] = g;
+                out_rgba[dst + 1] = g;
+                out_rgba[dst + 2] = g;
+            }
+            out_rgba[dst + 3] = 255;
+        }
+        ++y;
+    }
+
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+
+    out_width  = width;
+    out_height = height;
+    return true;
+}
+
+static bool decode_png_rgba_from_memory(const std::vector<uint8_t> &encoded,
+                                        std::vector<uint8_t> &out_rgba,
+                                        uint32_t &out_width,
+                                        uint32_t &out_height)
+{
+    out_rgba.clear();
+    out_width  = 0;
+    out_height = 0;
+
+    if (encoded.empty())
+        return false;
+
+    png::ReadBuf rb{encoded.data(), encoded.size()};
+    png::ImageColorscale img;
+    if (!png::decode_colored_png(rb, img))
+        return false;
+    if (img.cols == 0 || img.rows == 0 || (img.bytes_per_pixel != 3 && img.bytes_per_pixel != 4))
+        return false;
+
+    const size_t row_stride = img.cols * size_t(img.bytes_per_pixel);
+    if (img.buf.size() < img.rows * row_stride)
+        return false;
+
+    out_rgba.assign(img.rows * img.cols * 4, uint8_t(255));
+    for (size_t y = 0; y < img.rows; ++y) {
+        const size_t src_row_off = y * row_stride;
+        const size_t dst_row_off = y * img.cols * 4;
+        for (size_t x = 0; x < img.cols; ++x) {
+            const size_t src = src_row_off + x * size_t(img.bytes_per_pixel);
+            const size_t dst = dst_row_off + x * 4;
+            out_rgba[dst + 0] = img.buf[src + 0];
+            out_rgba[dst + 1] = img.buf[src + 1];
+            out_rgba[dst + 2] = img.buf[src + 2];
+            out_rgba[dst + 3] = (img.bytes_per_pixel == 4) ? img.buf[src + 3] : uint8_t(255);
+        }
+    }
+
+    out_width  = uint32_t(img.cols);
+    out_height = uint32_t(img.rows);
+    return true;
+}
+
+static bool decode_texture_rgba_from_memory(const std::vector<uint8_t> &encoded,
+                                            const std::string &content_type,
+                                            const std::string &path,
+                                            std::vector<uint8_t> &out_rgba,
+                                            uint32_t &out_width,
+                                            uint32_t &out_height)
+{
+    const bool prefer_jpeg = boost::algorithm::iequals(content_type, "image/jpeg") ||
+                             boost::algorithm::iends_with(path, ".jpg") ||
+                             boost::algorithm::iends_with(path, ".jpeg");
+    if (prefer_jpeg)
+        return decode_jpeg_rgba_from_memory(encoded, out_rgba, out_width, out_height);
+
+    if (decode_png_rgba_from_memory(encoded, out_rgba, out_width, out_height))
+        return true;
+
+    return decode_jpeg_rgba_from_memory(encoded, out_rgba, out_width, out_height);
+}
+
+static bool try_extract_file_from_archive(mz_zip_archive &archive, std::string path_in_zip, std::vector<uint8_t> &out_data)
+{
+    out_data.clear();
+    if (path_in_zip.empty())
+        return false;
+    if (path_in_zip.front() == '/')
+        path_in_zip.erase(path_in_zip.begin());
+
+    int index = mz_zip_reader_locate_file(&archive, path_in_zip.c_str(), nullptr, 0);
+    if (index < 0) {
+        const std::string native_path = encode_path(path_in_zip.c_str());
+        index = mz_zip_reader_locate_file(&archive, native_path.c_str(), nullptr, 0);
+    }
+    if (index < 0)
+        return false;
+
+    mz_zip_archive_file_stat stat;
+    if (!mz_zip_reader_file_stat(&archive, index, &stat) || stat.m_uncomp_size == 0)
+        return false;
+
+    out_data.resize(stat.m_uncomp_size);
+    return mz_zip_reader_extract_to_mem(&archive, stat.m_file_index, out_data.data(), out_data.size(), 0) != 0;
+}
+
+static void append_default_triangle_texture_data(std::vector<uint8_t> &uv_valid,
+                                                 std::vector<float> &uvs_per_face)
+{
+    uv_valid.emplace_back(uint8_t(0));
+    uvs_per_face.insert(uvs_per_face.end(), 6, 0.f);
+}
+
+struct ThreeMfTriangleProperties
+{
+    bool has_color{false};
+    std::array<uint32_t, 3> colors{{0, 0, 0}};
+    bool has_texture{false};
+    std::string texture_image_path;
+    std::string texture_image_content_type;
+    std::array<float, 6> uvs{{0.f, 0.f, 0.f, 0.f, 0.f, 0.f}};
+};
+
+static int multi_property_index_or_default(const std::vector<int> &pindices, const size_t pid_index)
+{
+    return pid_index < pindices.size() ? pindices[pid_index] : 0;
+}
+
+static bool set_triangle_color_properties(ThreeMfTriangleProperties &properties,
+                                          const ThreeMfColorGroupResource &color_group,
+                                          const std::array<int, 3> &indices)
+{
+    for (const int index : indices)
+        if (index < 0 || size_t(index) >= color_group.colors.size())
+            return false;
+
+    properties.has_color = true;
+    properties.colors[0] = color_group.colors[size_t(indices[0])];
+    properties.colors[1] = color_group.colors[size_t(indices[1])];
+    properties.colors[2] = color_group.colors[size_t(indices[2])];
+    return true;
+}
+
+static bool set_triangle_texture_properties(ThreeMfTriangleProperties &properties,
+                                            const ThreeMfTexture2DGroupResource &texture_group,
+                                            const ThreeMfTexture2DResource &texture,
+                                            const std::array<int, 3> &indices)
+{
+    for (const int index : indices)
+        if (index < 0 || size_t(index) >= texture_group.coords.size())
+            return false;
+
+    properties.has_texture = true;
+    properties.texture_image_path = texture.path;
+    properties.texture_image_content_type = texture.content_type;
+    properties.uvs[0] = texture_group.coords[size_t(indices[0])].first;
+    properties.uvs[1] = texture_group.coords[size_t(indices[0])].second;
+    properties.uvs[2] = texture_group.coords[size_t(indices[1])].first;
+    properties.uvs[3] = texture_group.coords[size_t(indices[1])].second;
+    properties.uvs[4] = texture_group.coords[size_t(indices[2])].first;
+    properties.uvs[5] = texture_group.coords[size_t(indices[2])].second;
+    return true;
+}
+
+static ThreeMfTriangleProperties extract_triangle_material_properties(
+    const std::map<int, ThreeMfColorGroupResource> &color_groups,
+    const std::map<int, ThreeMfTexture2DGroupResource> &texture_groups,
+    const std::map<int, ThreeMfTexture2DResource> &textures,
+    const std::map<int, ThreeMfMultiPropertiesResource> &multi_properties,
+    const char **attributes,
+    const unsigned int num_attributes)
+{
+    ThreeMfTriangleProperties properties;
+
+    const char *pid_text = bbs_get_attribute_value_charptr(attributes, num_attributes, PID_ATTR);
+    if (pid_text == nullptr)
+        return properties;
+
+    const int pid = bbs_get_attribute_value_int(attributes, num_attributes, PID_ATTR);
+    const char *p1_text = bbs_get_attribute_value_charptr(attributes, num_attributes, P1_ATTR);
+    const char *p2_text = bbs_get_attribute_value_charptr(attributes, num_attributes, P2_ATTR);
+    const char *p3_text = bbs_get_attribute_value_charptr(attributes, num_attributes, P3_ATTR);
+    const int p1 = p1_text != nullptr ? bbs_get_attribute_value_int(attributes, num_attributes, P1_ATTR) : 0;
+    const int p2 = p2_text != nullptr ? bbs_get_attribute_value_int(attributes, num_attributes, P2_ATTR) : p1;
+    const int p3 = p3_text != nullptr ? bbs_get_attribute_value_int(attributes, num_attributes, P3_ATTR) : p1;
+    if (p1 < 0 || p2 < 0 || p3 < 0)
+        return properties;
+
+    if (const auto color_group_it = color_groups.find(pid); color_group_it != color_groups.end()) {
+        set_triangle_color_properties(properties, color_group_it->second, {{p1, p2, p3}});
+        return properties;
+    }
+
+    if (const auto texture_group_it = texture_groups.find(pid); texture_group_it != texture_groups.end()) {
+        if (const auto texture_it = textures.find(texture_group_it->second.tex_id); texture_it != textures.end())
+            set_triangle_texture_properties(properties, texture_group_it->second, texture_it->second, {{p1, p2, p3}});
+        return properties;
+    }
+
+    const auto multi_properties_it = multi_properties.find(pid);
+    if (multi_properties_it == multi_properties.end())
+        return properties;
+
+    const ThreeMfMultiPropertiesResource &multi = multi_properties_it->second;
+    const std::array<int, 3> multi_indices{{p1, p2, p3}};
+    for (const int multi_index : multi_indices)
+        if (multi_index < 0 || size_t(multi_index) >= multi.pindices.size())
+            return properties;
+
+    for (size_t pid_index = 0; pid_index < multi.pids.size(); ++pid_index) {
+        const int property_group_id = multi.pids[pid_index];
+        std::array<int, 3> property_indices{{
+            multi_property_index_or_default(multi.pindices[size_t(p1)], pid_index),
+            multi_property_index_or_default(multi.pindices[size_t(p2)], pid_index),
+            multi_property_index_or_default(multi.pindices[size_t(p3)], pid_index)
+        }};
+
+        if (const auto color_group_it = color_groups.find(property_group_id); color_group_it != color_groups.end()) {
+            set_triangle_color_properties(properties, color_group_it->second, property_indices);
+        } else if (const auto texture_group_it = texture_groups.find(property_group_id); texture_group_it != texture_groups.end()) {
+            if (const auto texture_it = textures.find(texture_group_it->second.tex_id); texture_it != textures.end())
+                set_triangle_texture_properties(properties, texture_group_it->second, texture_it->second, property_indices);
+        }
+    }
+
+    return properties;
+}
+
+static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
+                                          std::vector<float> &uvs_per_face,
+                                          std::string &image_path,
+                                          std::string &image_content_type,
+                                          bool &multiple_texture_images,
+                                          std::vector<uint32_t> &vertex_colors,
+                                          std::vector<uint8_t> &vertex_color_valid,
+                                          const size_t vertex_count,
+                                          const Vec3i32 &triangle,
+                                          const std::map<int, ThreeMfColorGroupResource> &color_groups,
+                                          const std::map<int, ThreeMfTexture2DGroupResource> &texture_groups,
+                                          const std::map<int, ThreeMfTexture2DResource> &textures,
+                                          const std::map<int, ThreeMfMultiPropertiesResource> &multi_properties,
+                                          const char **attributes,
+                                          const unsigned int num_attributes)
+{
+    append_default_triangle_texture_data(uv_valid, uvs_per_face);
+
+    const ThreeMfTriangleProperties properties = extract_triangle_material_properties(
+        color_groups, texture_groups, textures, multi_properties, attributes, num_attributes);
+
+    if (properties.has_texture) {
+        if (!image_path.empty() && image_path != properties.texture_image_path)
+            multiple_texture_images = true;
+
+        if (image_path.empty()) {
+            image_path = properties.texture_image_path;
+            image_content_type = properties.texture_image_content_type;
+        }
+
+        uv_valid.back() = uint8_t(1);
+        const size_t base = uvs_per_face.size() - 6;
+        for (size_t i = 0; i < properties.uvs.size(); ++i)
+            uvs_per_face[base + i] = properties.uvs[i];
+    }
+
+    if (properties.has_color && vertex_count > 0) {
+        if (vertex_colors.size() != vertex_count)
+            vertex_colors.assign(vertex_count, 0u);
+        if (vertex_color_valid.size() != vertex_count)
+            vertex_color_valid.assign(vertex_count, uint8_t(0));
+
+        for (size_t corner = 0; corner < 3; ++corner) {
+            const int vertex_index = triangle[int(corner)];
+            if (vertex_index < 0 || size_t(vertex_index) >= vertex_count)
+                continue;
+            vertex_colors[size_t(vertex_index)] = properties.colors[corner];
+            vertex_color_valid[size_t(vertex_index)] = uint8_t(1);
+        }
+    }
+}
+
     // Base class with error messages management
     class _BBS_3MF_Base
     {
@@ -725,6 +1277,13 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             std::vector<std::string> fuzzy_skin;
             // BBS
             std::vector<std::string> face_properties;
+            std::vector<float> texture_uvs_per_face;
+            std::vector<uint8_t> texture_uv_valid;
+            std::string texture_image_path;
+            std::string texture_image_content_type;
+            bool texture_uses_multiple_images{false};
+            std::vector<uint32_t> vertex_colors_rgba;
+            std::vector<uint8_t> vertex_color_valid;
 
             bool empty() { return vertices.empty() || triangles.empty(); }
 
@@ -734,6 +1293,14 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 std::swap(triangles, o.triangles);
                 std::swap(custom_supports, o.custom_supports);
                 std::swap(custom_seam, o.custom_seam);
+                std::swap(face_properties, o.face_properties);
+                std::swap(texture_uvs_per_face, o.texture_uvs_per_face);
+                std::swap(texture_uv_valid, o.texture_uv_valid);
+                std::swap(texture_image_path, o.texture_image_path);
+                std::swap(texture_image_content_type, o.texture_image_content_type);
+                std::swap(texture_uses_multiple_images, o.texture_uses_multiple_images);
+                std::swap(vertex_colors_rgba, o.vertex_colors_rgba);
+                std::swap(vertex_color_valid, o.vertex_color_valid);
             }
 
             void reset() {
@@ -743,6 +1310,14 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 custom_seam.clear();
                 mmu_segmentation.clear();
                 fuzzy_skin.clear();
+                face_properties.clear();
+                texture_uvs_per_face.clear();
+                texture_uv_valid.clear();
+                texture_image_path.clear();
+                texture_image_content_type.clear();
+                texture_uses_multiple_images = false;
+                vertex_colors_rgba.clear();
+                vertex_color_valid.clear();
             }
         };
 
@@ -898,7 +1473,13 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             std::string obj_curr_characters;
             float object_unit_factor;
             int object_current_color_group{-1};
+            int object_current_texture_group{-1};
+            int object_current_multi_properties{-1};
             std::map<int, std::string> object_group_id_to_color;
+            std::map<int, ThreeMfColorGroupResource> object_color_groups;
+            std::map<int, ThreeMfTexture2DResource> object_texture_resources;
+            std::map<int, ThreeMfTexture2DGroupResource> object_texture_groups;
+            std::map<int, ThreeMfMultiPropertiesResource> object_multi_properties;
             bool is_bbl_3mf { false };
 
             ObjectImporter(_BBS_3MF_Importer *importer, std::string file_path, std::string obj_path)
@@ -987,6 +1568,21 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
 
             bool _handle_object_start_color(const char **attributes, unsigned int num_attributes);
             bool _handle_object_end_color();
+
+            bool _handle_object_start_texture_2d(const char **attributes, unsigned int num_attributes);
+            bool _handle_object_end_texture_2d();
+
+            bool _handle_object_start_texture_2d_group(const char **attributes, unsigned int num_attributes);
+            bool _handle_object_end_texture_2d_group();
+
+            bool _handle_object_start_tex2coord(const char **attributes, unsigned int num_attributes);
+            bool _handle_object_end_tex2coord();
+
+            bool _handle_object_start_multi_properties(const char **attributes, unsigned int num_attributes);
+            bool _handle_object_end_multi_properties();
+
+            bool _handle_object_start_multi(const char **attributes, unsigned int num_attributes);
+            bool _handle_object_end_multi();
 
             bool _handle_object_start_mesh(const char** attributes, unsigned int num_attributes);
             bool _handle_object_end_mesh();
@@ -1089,6 +1685,14 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         std::vector<ObjectImporter*> m_object_importers;
 
         std::map<int, ModelVolume*> m_shared_meshes;
+        std::map<const ModelVolume *, int> m_volume_subobject_ids;
+        std::map<ModelVolume *, PendingThreeMfImportedTexture> m_standard_texture_sources;
+        int m_current_texture_group{-1};
+        int m_current_multi_properties{-1};
+        std::map<int, ThreeMfColorGroupResource> m_color_groups;
+        std::map<int, ThreeMfTexture2DResource> m_texture_resources;
+        std::map<int, ThreeMfTexture2DGroupResource> m_texture_groups;
+        std::map<int, ThreeMfMultiPropertiesResource> m_multi_properties;
 
         //BBS: plater related structures
         bool m_is_bbl_3mf { false };
@@ -1177,6 +1781,21 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         bool _handle_start_color(const char **attributes, unsigned int num_attributes);
         bool _handle_end_color();
 
+        bool _handle_start_texture_2d(const char **attributes, unsigned int num_attributes);
+        bool _handle_end_texture_2d();
+
+        bool _handle_start_texture_2d_group(const char **attributes, unsigned int num_attributes);
+        bool _handle_end_texture_2d_group();
+
+        bool _handle_start_tex2coord(const char **attributes, unsigned int num_attributes);
+        bool _handle_end_tex2coord();
+
+        bool _handle_start_multi_properties(const char **attributes, unsigned int num_attributes);
+        bool _handle_end_multi_properties();
+
+        bool _handle_start_multi(const char **attributes, unsigned int num_attributes);
+        bool _handle_end_multi();
+
         bool _handle_start_mesh(const char** attributes, unsigned int num_attributes);
         bool _handle_end_mesh();
 
@@ -1261,6 +1880,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
 
         void _generate_current_object_list(std::vector<Component> &sub_objects, Id object_id, IdToCurrentObjectMap& current_objects);
         bool _generate_volumes_new(ModelObject& object, const std::vector<Component> &sub_objects, const ObjectMetadata::VolumeMetadataList& volumes, ConfigSubstitutionContext& config_substitutions);
+        void _restore_imported_obj_textures_from_archive(mz_zip_archive &archive);
         //bool _generate_volumes(ModelObject& object, const Geometry& geometry, const ObjectMetadata::VolumeMetadataList& volumes, ConfigSubstitutionContext& config_substitutions);
 
         // callbacks to parse the .model file
@@ -1299,6 +1919,14 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         m_index_paths.clear();
         m_objects.clear();
         m_instances.clear();
+        m_volume_subobject_ids.clear();
+        m_standard_texture_sources.clear();
+        m_color_groups.clear();
+        m_texture_resources.clear();
+        m_texture_groups.clear();
+        m_multi_properties.clear();
+        m_current_texture_group = -1;
+        m_current_multi_properties = -1;
         m_objects_metadata.clear();
         m_curr_metadata_name.clear();
         m_curr_characters.clear();
@@ -1336,6 +1964,14 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         //m_objects_aliases.clear();
         m_instances.clear();
         //m_geometries.clear();
+        m_volume_subobject_ids.clear();
+        m_standard_texture_sources.clear();
+        m_color_groups.clear();
+        m_texture_resources.clear();
+        m_texture_groups.clear();
+        m_multi_properties.clear();
+        m_current_texture_group = -1;
+        m_current_multi_properties = -1;
         m_curr_config.object_id = -1;
         m_curr_config.volume_id = -1;
         m_objects_metadata.clear();
@@ -1475,6 +2111,14 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
 
         //extract model files
         m_model = &model;
+        m_volume_subobject_ids.clear();
+        m_standard_texture_sources.clear();
+        m_color_groups.clear();
+        m_texture_resources.clear();
+        m_texture_groups.clear();
+        m_multi_properties.clear();
+        m_current_texture_group = -1;
+        m_current_multi_properties = -1;
         if (!_extract_from_archive(archive, m_start_part_path, [this] (mz_zip_archive& archive, const mz_zip_archive_file_stat& stat) {
                     return _extract_model_from_archive(archive, stat);
             })) {
@@ -1592,6 +2236,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             it++;
         }
 
+        _restore_imported_obj_textures_from_archive(archive);
         lock.close();
 
         return true;
@@ -1754,6 +2399,14 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     m_current_objects.insert({ std::move(obj.first), std::move(obj.second)});
                 for (auto group_color : obj_importer->object_group_id_to_color)
                     m_group_id_to_color.insert(std::move(group_color));
+                for (auto color_group : obj_importer->object_color_groups)
+                    m_color_groups.insert(std::move(color_group));
+                for (auto texture_resource : obj_importer->object_texture_resources)
+                    m_texture_resources.insert(std::move(texture_resource));
+                for (auto texture_group : obj_importer->object_texture_groups)
+                    m_texture_groups.insert(std::move(texture_group));
+                for (auto multi_properties : obj_importer->object_multi_properties)
+                    m_multi_properties.insert(std::move(multi_properties));
 
                 delete obj_importer;
             }
@@ -1934,6 +2587,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             }
         }
 
+        _restore_imported_obj_textures_from_archive(archive);
         lock.close();
 
         if (!m_is_bbl_3mf) {
@@ -2172,7 +2826,9 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             if (extruder_opt != nullptr)
                 extruder_id = extruder_opt->getInt();
 
-            if (extruder_id == 0 || extruder_id > max_filament_id)
+            if (extruder_id == 0 ||
+                (extruder_id > max_filament_id &&
+                 !is_texture_mapping_virtual_filament_id(config, extruder_id, size_t(max_filament_id))))
                 mo->config.set_key_value("extruder", new ConfigOptionInt(1));
 
             if (mo->volumes.size() == 1) {
@@ -2186,7 +2842,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
 
                     if (vol_extruder_opt->getInt() == 0)
                         mv->config.erase("extruder");
-                    else if (vol_extruder_opt->getInt() > max_filament_id)
+                    else if (vol_extruder_opt->getInt() > max_filament_id &&
+                             !is_texture_mapping_virtual_filament_id(config, vol_extruder_opt->getInt(), size_t(max_filament_id)))
                         mv->config.set_key_value("extruder", new ConfigOptionInt(1));
                 }
             }
@@ -3244,6 +3901,16 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             res = _handle_start_color_group(attributes, num_attributes);
         else if (::strcmp(COLOR_TAG, name) == 0)
             res = _handle_start_color(attributes, num_attributes);
+        else if (::strcmp(TEXTURE_2D_TAG, name) == 0)
+            res = _handle_start_texture_2d(attributes, num_attributes);
+        else if (::strcmp(TEXTURE_2D_GROUP_TAG, name) == 0)
+            res = _handle_start_texture_2d_group(attributes, num_attributes);
+        else if (::strcmp(TEX2COORD_TAG, name) == 0)
+            res = _handle_start_tex2coord(attributes, num_attributes);
+        else if (::strcmp(MULTI_PROPERTIES_TAG, name) == 0)
+            res = _handle_start_multi_properties(attributes, num_attributes);
+        else if (::strcmp(MULTI_TAG, name) == 0)
+            res = _handle_start_multi(attributes, num_attributes);
         else if (::strcmp(MESH_TAG, name) == 0)
             res = _handle_start_mesh(attributes, num_attributes);
         else if (::strcmp(VERTICES_TAG, name) == 0)
@@ -3286,6 +3953,16 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             res = _handle_end_color_group();
         else if (::strcmp(COLOR_TAG, name) == 0)
             res = _handle_end_color();
+        else if (::strcmp(TEXTURE_2D_TAG, name) == 0)
+            res = _handle_end_texture_2d();
+        else if (::strcmp(TEXTURE_2D_GROUP_TAG, name) == 0)
+            res = _handle_end_texture_2d_group();
+        else if (::strcmp(TEX2COORD_TAG, name) == 0)
+            res = _handle_end_tex2coord();
+        else if (::strcmp(MULTI_PROPERTIES_TAG, name) == 0)
+            res = _handle_end_multi_properties();
+        else if (::strcmp(MULTI_TAG, name) == 0)
+            res = _handle_end_multi();
         else if (::strcmp(MESH_TAG, name) == 0)
             res = _handle_end_mesh();
         else if (::strcmp(VERTICES_TAG, name) == 0)
@@ -3598,12 +4275,14 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
     bool _BBS_3MF_Importer::_handle_start_color_group(const char **attributes, unsigned int num_attributes)
     {
         m_current_color_group = bbs_get_attribute_value_int(attributes, num_attributes, ID_ATTR);
+        if (m_current_color_group > 0)
+            m_color_groups[m_current_color_group] = ThreeMfColorGroupResource();
         return true;
     }
 
     bool _BBS_3MF_Importer::_handle_end_color_group()
     {
-        // do nothing
+        m_current_color_group = -1;
         return true;
     }
 
@@ -3611,12 +4290,105 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
     {
         std::string color = bbs_get_attribute_value_string(attributes, num_attributes, COLOR_ATTR);
         m_group_id_to_color[m_current_color_group] = color;
+
+        uint32_t rgba = 0;
+        if (m_current_color_group > 0 && parse_3mf_color(color, rgba))
+            m_color_groups[m_current_color_group].colors.emplace_back(rgba);
         return true;
     }
 
     bool _BBS_3MF_Importer::_handle_end_color()
     {
         // do nothing
+        return true;
+    }
+
+    bool _BBS_3MF_Importer::_handle_start_texture_2d(const char **attributes, unsigned int num_attributes)
+    {
+        const int id = bbs_get_attribute_value_int(attributes, num_attributes, ID_ATTR);
+        if (id <= 0)
+            return true;
+
+        ThreeMfTexture2DResource resource;
+        resource.path         = xml_unescape(bbs_get_attribute_value_string(attributes, num_attributes, PATH_ATTR));
+        resource.content_type = bbs_get_attribute_value_string(attributes, num_attributes, CONTENTTYPE_ATTR);
+        m_texture_resources[id] = std::move(resource);
+        return true;
+    }
+
+    bool _BBS_3MF_Importer::_handle_end_texture_2d()
+    {
+        return true;
+    }
+
+    bool _BBS_3MF_Importer::_handle_start_texture_2d_group(const char **attributes, unsigned int num_attributes)
+    {
+        const int id = bbs_get_attribute_value_int(attributes, num_attributes, ID_ATTR);
+        if (id <= 0)
+            return true;
+
+        ThreeMfTexture2DGroupResource group;
+        group.tex_id = bbs_get_attribute_value_int(attributes, num_attributes, TEXID_ATTR);
+        m_texture_groups[id] = std::move(group);
+        m_current_texture_group = id;
+        return true;
+    }
+
+    bool _BBS_3MF_Importer::_handle_end_texture_2d_group()
+    {
+        m_current_texture_group = -1;
+        return true;
+    }
+
+    bool _BBS_3MF_Importer::_handle_start_tex2coord(const char **attributes, unsigned int num_attributes)
+    {
+        const auto group_it = m_texture_groups.find(m_current_texture_group);
+        if (group_it == m_texture_groups.end())
+            return true;
+
+        group_it->second.coords.emplace_back(
+            bbs_get_attribute_value_float(attributes, num_attributes, U_ATTR),
+            bbs_get_attribute_value_float(attributes, num_attributes, V_ATTR));
+        return true;
+    }
+
+    bool _BBS_3MF_Importer::_handle_end_tex2coord()
+    {
+        return true;
+    }
+
+    bool _BBS_3MF_Importer::_handle_start_multi_properties(const char **attributes, unsigned int num_attributes)
+    {
+        const int id = bbs_get_attribute_value_int(attributes, num_attributes, ID_ATTR);
+        if (id <= 0)
+            return true;
+
+        ThreeMfMultiPropertiesResource resource;
+        resource.pids = parse_3mf_int_list(bbs_get_attribute_value_string(attributes, num_attributes, PIDS_ATTR));
+        m_multi_properties[id] = std::move(resource);
+        m_current_multi_properties = id;
+        return true;
+    }
+
+    bool _BBS_3MF_Importer::_handle_end_multi_properties()
+    {
+        m_current_multi_properties = -1;
+        return true;
+    }
+
+    bool _BBS_3MF_Importer::_handle_start_multi(const char **attributes, unsigned int num_attributes)
+    {
+        const auto multi_it = m_multi_properties.find(m_current_multi_properties);
+        if (multi_it == m_multi_properties.end())
+            return true;
+
+        multi_it->second.pindices.emplace_back(
+            parse_3mf_int_list(bbs_get_attribute_value_string(attributes, num_attributes, PINDICES_ATTR)));
+        return true;
+    }
+
+    bool _BBS_3MF_Importer::_handle_end_multi()
+    {
         return true;
     }
 
@@ -3703,6 +4475,21 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             m_curr_object->geometry.fuzzy_skin.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_FUZZY_SKIN_ATTR));
             // BBS
             m_curr_object->geometry.face_properties.push_back(bbs_get_attribute_value_string(attributes, num_attributes, FACE_PROPERTY_ATTR));
+            append_triangle_material_data(m_curr_object->geometry.texture_uv_valid,
+                                          m_curr_object->geometry.texture_uvs_per_face,
+                                          m_curr_object->geometry.texture_image_path,
+                                          m_curr_object->geometry.texture_image_content_type,
+                                          m_curr_object->geometry.texture_uses_multiple_images,
+                                          m_curr_object->geometry.vertex_colors_rgba,
+                                          m_curr_object->geometry.vertex_color_valid,
+                                          m_curr_object->geometry.vertices.size(),
+                                          m_curr_object->geometry.triangles.back(),
+                                          m_color_groups,
+                                          m_texture_groups,
+                                          m_texture_resources,
+                                          m_multi_properties,
+                                          attributes,
+                                          num_attributes);
         }
         return true;
     }
@@ -4901,6 +5688,30 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     volume->translate(shift);
             }
 
+            m_volume_subobject_ids[volume] = sub_object->id;
+
+            if (!sub_object->geometry.texture_image_path.empty() &&
+                !sub_object->geometry.texture_uses_multiple_images &&
+                sub_object->geometry.texture_uv_valid.size() == triangles_count &&
+                sub_object->geometry.texture_uvs_per_face.size() >= triangles_count * 6) {
+                PendingThreeMfImportedTexture texture_source;
+                texture_source.image_file         = sub_object->geometry.texture_image_path;
+                texture_source.image_content_type = sub_object->geometry.texture_image_content_type;
+                texture_source.uv_valid           = sub_object->geometry.texture_uv_valid;
+                texture_source.uvs_per_face.assign(sub_object->geometry.texture_uvs_per_face.begin(),
+                                                   sub_object->geometry.texture_uvs_per_face.begin() + triangles_count * 6);
+                m_standard_texture_sources[volume] = std::move(texture_source);
+            }
+
+            const size_t vertices_count = volume->mesh().its.vertices.size();
+            if (sub_object->geometry.vertex_colors_rgba.size() == vertices_count &&
+                sub_object->geometry.vertex_color_valid.size() == vertices_count &&
+                std::all_of(sub_object->geometry.vertex_color_valid.begin(),
+                            sub_object->geometry.vertex_color_valid.end(),
+                            [](const uint8_t valid) { return valid != 0; })) {
+                volume->imported_vertex_colors_rgba = sub_object->geometry.vertex_colors_rgba;
+            }
+
             // recreate custom supports, seam and mmu segmentation from previously loaded attribute
             {
                 volume->supported_facets.reserve(triangles_count);
@@ -4977,6 +5788,54 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         }
 
         return true;
+    }
+
+    void _BBS_3MF_Importer::_restore_imported_obj_textures_from_archive(mz_zip_archive &archive)
+    {
+        if (m_model == nullptr)
+            return;
+
+        for (auto &standard_texture_entry : m_standard_texture_sources) {
+            ModelVolume *volume = standard_texture_entry.first;
+            if (volume == nullptr)
+                continue;
+
+            PendingThreeMfImportedTexture &source = standard_texture_entry.second;
+            if (source.image_file.empty() || source.uv_valid.empty() || source.uvs_per_face.empty())
+                continue;
+
+            std::vector<uint8_t> image_payload;
+            if (!try_extract_file_from_archive(archive, source.image_file, image_payload)) {
+                BOOST_LOG_TRIVIAL(warning) << "3MF texture2d payload missing for image='" << source.image_file << "'";
+                continue;
+            }
+
+            std::vector<uint8_t> imported_rgba;
+            uint32_t imported_width = 0;
+            uint32_t imported_height = 0;
+            if (!decode_texture_rgba_from_memory(image_payload,
+                                                 source.image_content_type,
+                                                 source.image_file,
+                                                 imported_rgba,
+                                                 imported_width,
+                                                 imported_height)) {
+                BOOST_LOG_TRIVIAL(warning) << "3MF texture2d image decode failed for image='" << source.image_file << "'";
+                continue;
+            }
+
+            const size_t triangle_count = volume->mesh().its.indices.size();
+            if (source.uv_valid.size() != triangle_count || source.uvs_per_face.size() < triangle_count * 6) {
+                BOOST_LOG_TRIVIAL(warning) << "3MF texture2d UV payload triangle mismatch for image='" << source.image_file << "'";
+                continue;
+            }
+
+            volume->imported_texture_uv_valid = source.uv_valid;
+            volume->imported_texture_uvs_per_face.assign(source.uvs_per_face.begin(),
+                                                         source.uvs_per_face.begin() + triangle_count * 6);
+            volume->imported_texture_rgba = std::move(imported_rgba);
+            volume->imported_texture_width = imported_width;
+            volume->imported_texture_height = imported_height;
+        }
     }
     /*
     bool _BBS_3MF_Importer::_generate_volumes(ModelObject& object, const Geometry& geometry, const ObjectMetadata::VolumeMetadataList& volumes, ConfigSubstitutionContext& config_substitutions)
@@ -5283,12 +6142,14 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
     bool _BBS_3MF_Importer::ObjectImporter::_handle_object_start_color_group(const char **attributes, unsigned int num_attributes)
     {
         object_current_color_group = bbs_get_attribute_value_int(attributes, num_attributes, ID_ATTR);
+        if (object_current_color_group > 0)
+            object_color_groups[object_current_color_group] = ThreeMfColorGroupResource();
         return true;
     }
 
     bool _BBS_3MF_Importer::ObjectImporter::_handle_object_end_color_group()
     {
-        // do nothing
+        object_current_color_group = -1;
         return true;
     }
 
@@ -5296,12 +6157,105 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
     {
         std::string color = bbs_get_attribute_value_string(attributes, num_attributes, COLOR_ATTR);
         object_group_id_to_color[object_current_color_group] = color;
+
+        uint32_t rgba = 0;
+        if (object_current_color_group > 0 && parse_3mf_color(color, rgba))
+            object_color_groups[object_current_color_group].colors.emplace_back(rgba);
         return true;
     }
 
     bool _BBS_3MF_Importer::ObjectImporter::_handle_object_end_color()
     {
         // do nothing
+        return true;
+    }
+
+    bool _BBS_3MF_Importer::ObjectImporter::_handle_object_start_texture_2d(const char **attributes, unsigned int num_attributes)
+    {
+        const int id = bbs_get_attribute_value_int(attributes, num_attributes, ID_ATTR);
+        if (id <= 0)
+            return true;
+
+        ThreeMfTexture2DResource resource;
+        resource.path         = xml_unescape(bbs_get_attribute_value_string(attributes, num_attributes, PATH_ATTR));
+        resource.content_type = bbs_get_attribute_value_string(attributes, num_attributes, CONTENTTYPE_ATTR);
+        object_texture_resources[id] = std::move(resource);
+        return true;
+    }
+
+    bool _BBS_3MF_Importer::ObjectImporter::_handle_object_end_texture_2d()
+    {
+        return true;
+    }
+
+    bool _BBS_3MF_Importer::ObjectImporter::_handle_object_start_texture_2d_group(const char **attributes, unsigned int num_attributes)
+    {
+        const int id = bbs_get_attribute_value_int(attributes, num_attributes, ID_ATTR);
+        if (id <= 0)
+            return true;
+
+        ThreeMfTexture2DGroupResource group;
+        group.tex_id = bbs_get_attribute_value_int(attributes, num_attributes, TEXID_ATTR);
+        object_texture_groups[id] = std::move(group);
+        object_current_texture_group = id;
+        return true;
+    }
+
+    bool _BBS_3MF_Importer::ObjectImporter::_handle_object_end_texture_2d_group()
+    {
+        object_current_texture_group = -1;
+        return true;
+    }
+
+    bool _BBS_3MF_Importer::ObjectImporter::_handle_object_start_tex2coord(const char **attributes, unsigned int num_attributes)
+    {
+        const auto group_it = object_texture_groups.find(object_current_texture_group);
+        if (group_it == object_texture_groups.end())
+            return true;
+
+        group_it->second.coords.emplace_back(
+            bbs_get_attribute_value_float(attributes, num_attributes, U_ATTR),
+            bbs_get_attribute_value_float(attributes, num_attributes, V_ATTR));
+        return true;
+    }
+
+    bool _BBS_3MF_Importer::ObjectImporter::_handle_object_end_tex2coord()
+    {
+        return true;
+    }
+
+    bool _BBS_3MF_Importer::ObjectImporter::_handle_object_start_multi_properties(const char **attributes, unsigned int num_attributes)
+    {
+        const int id = bbs_get_attribute_value_int(attributes, num_attributes, ID_ATTR);
+        if (id <= 0)
+            return true;
+
+        ThreeMfMultiPropertiesResource resource;
+        resource.pids = parse_3mf_int_list(bbs_get_attribute_value_string(attributes, num_attributes, PIDS_ATTR));
+        object_multi_properties[id] = std::move(resource);
+        object_current_multi_properties = id;
+        return true;
+    }
+
+    bool _BBS_3MF_Importer::ObjectImporter::_handle_object_end_multi_properties()
+    {
+        object_current_multi_properties = -1;
+        return true;
+    }
+
+    bool _BBS_3MF_Importer::ObjectImporter::_handle_object_start_multi(const char **attributes, unsigned int num_attributes)
+    {
+        const auto multi_it = object_multi_properties.find(object_current_multi_properties);
+        if (multi_it == object_multi_properties.end())
+            return true;
+
+        multi_it->second.pindices.emplace_back(
+            parse_3mf_int_list(bbs_get_attribute_value_string(attributes, num_attributes, PINDICES_ATTR)));
+        return true;
+    }
+
+    bool _BBS_3MF_Importer::ObjectImporter::_handle_object_end_multi()
+    {
         return true;
     }
 
@@ -5388,6 +6342,21 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             current_object->geometry.fuzzy_skin.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_FUZZY_SKIN_ATTR));
             // BBS
             current_object->geometry.face_properties.push_back(bbs_get_attribute_value_string(attributes, num_attributes, FACE_PROPERTY_ATTR));
+            append_triangle_material_data(current_object->geometry.texture_uv_valid,
+                                          current_object->geometry.texture_uvs_per_face,
+                                          current_object->geometry.texture_image_path,
+                                          current_object->geometry.texture_image_content_type,
+                                          current_object->geometry.texture_uses_multiple_images,
+                                          current_object->geometry.vertex_colors_rgba,
+                                          current_object->geometry.vertex_color_valid,
+                                          current_object->geometry.vertices.size(),
+                                          current_object->geometry.triangles.back(),
+                                          object_color_groups,
+                                          object_texture_groups,
+                                          object_texture_resources,
+                                          object_multi_properties,
+                                          attributes,
+                                          num_attributes);
         }
         return true;
     }
@@ -5478,6 +6447,16 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             res = _handle_object_start_color_group(attributes, num_attributes);
         else if (::strcmp(COLOR_TAG, name) == 0)
             res = _handle_object_start_color(attributes, num_attributes);
+        else if (::strcmp(TEXTURE_2D_TAG, name) == 0)
+            res = _handle_object_start_texture_2d(attributes, num_attributes);
+        else if (::strcmp(TEXTURE_2D_GROUP_TAG, name) == 0)
+            res = _handle_object_start_texture_2d_group(attributes, num_attributes);
+        else if (::strcmp(TEX2COORD_TAG, name) == 0)
+            res = _handle_object_start_tex2coord(attributes, num_attributes);
+        else if (::strcmp(MULTI_PROPERTIES_TAG, name) == 0)
+            res = _handle_object_start_multi_properties(attributes, num_attributes);
+        else if (::strcmp(MULTI_TAG, name) == 0)
+            res = _handle_object_start_multi(attributes, num_attributes);
         else if (::strcmp(MESH_TAG, name) == 0)
             res = _handle_object_start_mesh(attributes, num_attributes);
         else if (::strcmp(VERTICES_TAG, name) == 0)
@@ -5516,6 +6495,16 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             res = _handle_object_end_color_group();
         else if (::strcmp(COLOR_TAG, name) == 0)
             res = _handle_object_end_color();
+        else if (::strcmp(TEXTURE_2D_TAG, name) == 0)
+            res = _handle_object_end_texture_2d();
+        else if (::strcmp(TEXTURE_2D_GROUP_TAG, name) == 0)
+            res = _handle_object_end_texture_2d_group();
+        else if (::strcmp(TEX2COORD_TAG, name) == 0)
+            res = _handle_object_end_tex2coord();
+        else if (::strcmp(MULTI_PROPERTIES_TAG, name) == 0)
+            res = _handle_object_end_multi_properties();
+        else if (::strcmp(MULTI_TAG, name) == 0)
+            res = _handle_object_end_multi();
         else if (::strcmp(MESH_TAG, name) == 0)
             res = _handle_object_end_mesh();
         else if (::strcmp(VERTICES_TAG, name) == 0)
@@ -5677,6 +6666,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             std::string sub_path;
             bool share_mesh = false;
             VolumeToObjectIDMap volumes_objectID;
+            VolumeToThreeMfExportTextureMap volume_texture_resources;
         };
 
         typedef std::vector<BuildItem> BuildItemsList;
@@ -5726,7 +6716,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
 
         bool _add_file_to_archive(mz_zip_archive& archive, const std::string & path_in_zip, const std::string & file_path);
 
-        bool _add_content_types_file_to_archive(mz_zip_archive& archive);
+        bool _add_content_types_file_to_archive(mz_zip_archive& archive, const Model& model);
 
         bool _add_thumbnail_file_to_archive(mz_zip_archive& archive, const ThumbnailData& thumbnail_data, const char* local_path, int index, bool generate_small_thumbnail = false);
         bool _add_calibration_file_to_archive(mz_zip_archive& archive, const ThumbnailData& thumbnail_data, int index);
@@ -5934,7 +6924,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
 
         // Adds content types file ("[Content_Types].xml";).
         // The content of this file is the same for each OrcaSlicer 3mf.
-        if (!_add_content_types_file_to_archive(archive)) {
+        if (!_add_content_types_file_to_archive(archive, model)) {
             return false;
         }
 
@@ -6364,7 +7354,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         return result;
     }
 
-    bool _BBS_3MF_Exporter::_add_content_types_file_to_archive(mz_zip_archive& archive)
+    bool _BBS_3MF_Exporter::_add_content_types_file_to_archive(mz_zip_archive& archive, const Model& model)
     {
         std::stringstream stream;
         stream << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
@@ -6372,7 +7362,27 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         stream << " <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\n";
         stream << " <Default Extension=\"model\" ContentType=\"application/vnd.ms-package.3dmanufacturing-3dmodel+xml\"/>\n";
         stream << " <Default Extension=\"png\" ContentType=\"image/png\"/>\n";
+        stream << " <Default Extension=\"bin\" ContentType=\"application/octet-stream\"/>\n";
         stream << " <Default Extension=\"gcode\" ContentType=\"text/x.gcode\"/>\n";
+
+        if (!m_skip_model) {
+            std::map<std::string, bool> texture_parts;
+            for (const ModelObject *object : model.objects) {
+                if (object == nullptr)
+                    continue;
+                for (size_t volume_index = 0; volume_index < object->volumes.size(); ++volume_index) {
+                    const ModelVolume *volume = object->volumes[volume_index];
+                    if (volume == nullptr || !has_imported_obj_texture_payload(*volume))
+                        continue;
+                    texture_parts[imported_obj_texture_part_path(model, *object, volume_index)] = true;
+                }
+            }
+
+            for (const auto &texture_part : texture_parts)
+                stream << " <Override PartName=\"/" << xml_escape(texture_part.first)
+                       << "\" ContentType=\"" << MODEL_TEXTURE_CONTENT_TYPE << "\"/>\n";
+        }
+
         stream << "</Types>";
 
         std::string out = stream.str();
@@ -6583,6 +7593,23 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
     {
         bool sub_model = !objects_data.empty();
         bool write_object = sub_model || !m_split_model;
+        bool has_materials_extension = false;
+        if (!m_skip_model && write_object) {
+            for (ModelObject *obj : model.objects) {
+                if (sub_model && obj != objects_data.begin()->second.object)
+                    continue;
+                if (obj == nullptr)
+                    continue;
+                for (ModelVolume *volume : obj->volumes) {
+                    if (volume != nullptr && has_imported_obj_material_payload(*volume)) {
+                        has_materials_extension = true;
+                        break;
+                    }
+                }
+                if (has_materials_extension)
+                    break;
+            }
+        }
 
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ":" << __LINE__ << boost::format(", filename %1%, m_split_model %2%,  sub_model %3%")%filename % m_split_model % sub_model;
 
@@ -6617,8 +7644,20 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             reset_stream(stream);
             stream << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
             stream << "<" << MODEL_TAG << " unit=\"millimeter\" xml:lang=\"en-US\" xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\" xmlns:BambuStudio=\"http://schemas.bambulab.com/package/2021\"";
+            if (has_materials_extension)
+                stream << " xmlns:m=\"" << MATERIALS_NAMESPACE << "\"";
             if (m_production_ext)
-                stream << " xmlns:p=\"http://schemas.microsoft.com/3dmanufacturing/production/2015/06\" requiredextensions=\"p\"";
+                stream << " xmlns:p=\"http://schemas.microsoft.com/3dmanufacturing/production/2015/06\"";
+            if (m_production_ext || has_materials_extension) {
+                stream << " requiredextensions=\"";
+                if (m_production_ext)
+                    stream << "p";
+                if (m_production_ext && has_materials_extension)
+                    stream << " ";
+                if (has_materials_extension)
+                    stream << "m";
+                stream << "\"";
+            }
             stream << ">\n";
 
             std::string origin;
@@ -6728,6 +7767,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         // Therefore the list of object_ids here may not be continuous.
         unsigned int object_id = 1;
         unsigned int object_index = 0;
+        unsigned int next_texture_resource_id = 1000000000u;
 
         bool cb_cancel = false;
         std::vector<std::string> object_paths;
@@ -6774,7 +7814,13 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                                 if ((shared_volume->supported_facets.equals(volume->supported_facets))
                                     && (shared_volume->seam_facets.equals(volume->seam_facets))
                                     && (shared_volume->mmu_segmentation_facets.equals(volume->mmu_segmentation_facets))
-                                    && (shared_volume->fuzzy_skin_facets.equals(volume->fuzzy_skin_facets)))
+                                    && (shared_volume->fuzzy_skin_facets.equals(volume->fuzzy_skin_facets))
+                                    && (shared_volume->imported_vertex_colors_rgba == volume->imported_vertex_colors_rgba)
+                                    && (shared_volume->imported_texture_uvs_per_face == volume->imported_texture_uvs_per_face)
+                                    && (shared_volume->imported_texture_uv_valid == volume->imported_texture_uv_valid)
+                                    && (shared_volume->imported_texture_rgba == volume->imported_texture_rgba)
+                                    && (shared_volume->imported_texture_width == volume->imported_texture_width)
+                                    && (shared_volume->imported_texture_height == volume->imported_texture_height))
                                 {
                                     auto data = iter->second.first;
                                     const_cast<_BBS_3MF_Exporter *>(this)->m_volume_paths.insert({volume, {data->sub_path, data->volumes_objectID.find(iter->second.second)->second}});
@@ -6795,9 +7841,144 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     object_data.object_id = object_id;
                 }
 
+                if (write_object) {
+                    auto &texture_resources = object_it->second.volume_texture_resources;
+                    texture_resources.clear();
+                    for (size_t volume_index = 0; volume_index < obj->volumes.size(); ++volume_index) {
+                        ModelVolume *volume = obj->volumes[volume_index];
+                        if (volume == nullptr || !has_imported_obj_material_payload(*volume))
+                            continue;
+
+                        const auto volume_id_it = object_it->second.volumes_objectID.find(volume);
+                        if (volume_id_it != object_it->second.volumes_objectID.end() && m_share_mesh && volume_id_it->second == 0)
+                            continue;
+
+                        const bool has_vertex_colors = has_imported_vertex_color_payload(*volume);
+                        const bool has_texture = has_imported_obj_texture_payload(*volume);
+                        ThreeMfExportTextureResource texture_resource;
+                        if (has_vertex_colors)
+                            texture_resource.color_group_id = int(next_texture_resource_id++);
+                        if (has_texture) {
+                            texture_resource.texture_id = int(next_texture_resource_id++);
+                            texture_resource.texture_group_id = int(next_texture_resource_id++);
+                            texture_resource.texture_part_path = imported_obj_texture_part_path(model, *obj, volume_index);
+                        }
+                        if (has_vertex_colors && has_texture)
+                            texture_resource.multi_properties_id = int(next_texture_resource_id++);
+
+                        const size_t triangle_count = volume->mesh().its.indices.size();
+                        if (has_texture) {
+                            texture_resource.triangle_texcoord_starts.assign(triangle_count, std::numeric_limits<uint32_t>::max());
+                            uint32_t next_texcoord_index = 0;
+                            for (size_t triangle_index = 0; triangle_index < triangle_count; ++triangle_index) {
+                                if (triangle_index >= volume->imported_texture_uv_valid.size() || !volume->imported_texture_uv_valid[triangle_index])
+                                    continue;
+                                texture_resource.triangle_texcoord_starts[triangle_index] = next_texcoord_index;
+                                next_texcoord_index += 3;
+                            }
+                        }
+
+                        texture_resources[volume] = std::move(texture_resource);
+                    }
+                }
+
                 if (m_skip_model) continue;
 
                 if (write_object) {
+                    if (!object_it->second.volume_texture_resources.empty()) {
+                        std::stringstream resource_stream;
+                        reset_stream(resource_stream);
+                        for (size_t volume_index = 0; volume_index < obj->volumes.size(); ++volume_index) {
+                            const ModelVolume *volume = obj->volumes[volume_index];
+                            if (volume == nullptr)
+                                continue;
+
+                            const auto texture_it = object_it->second.volume_texture_resources.find(volume);
+                            if (texture_it == object_it->second.volume_texture_resources.end())
+                                continue;
+
+                            const ThreeMfExportTextureResource &texture_resource = texture_it->second;
+                            const indexed_triangle_set &its = volume->mesh().its;
+                            const bool has_vertex_colors = texture_resource.color_group_id > 0;
+                            const bool has_texture = texture_resource.texture_id > 0 && texture_resource.texture_group_id > 0;
+                            const bool has_multi_properties = texture_resource.multi_properties_id > 0;
+
+                            if (has_vertex_colors) {
+                                resource_stream << "  <" << COLOR_GROUP_TAG
+                                                << " " << ID_ATTR << "=\"" << texture_resource.color_group_id << "\">\n";
+                                for (const uint32_t color : volume->imported_vertex_colors_rgba)
+                                    resource_stream << "   <" << COLOR_TAG << " " << COLOR_ATTR << "=\""
+                                                    << format_3mf_color(color) << "\"/>\n";
+                                resource_stream << "  </" << COLOR_GROUP_TAG << ">\n";
+                            }
+
+                            if (has_texture) {
+                                resource_stream << "  <" << TEXTURE_2D_TAG
+                                                << " " << ID_ATTR << "=\"" << texture_resource.texture_id << "\""
+                                                << " " << PATH_ATTR << "=\"/" << xml_escape(texture_resource.texture_part_path) << "\""
+                                                << " " << CONTENTTYPE_ATTR << "=\"image/png\"/>\n";
+
+                                resource_stream << "  <" << TEXTURE_2D_GROUP_TAG
+                                                << " " << ID_ATTR << "=\"" << texture_resource.texture_group_id << "\""
+                                                << " " << TEXID_ATTR << "=\"" << texture_resource.texture_id << "\">\n";
+
+                                const size_t triangle_count = its.indices.size();
+                                for (size_t triangle_index = 0; triangle_index < triangle_count; ++triangle_index) {
+                                    if (triangle_index >= volume->imported_texture_uv_valid.size() || !volume->imported_texture_uv_valid[triangle_index])
+                                        continue;
+                                    const size_t uv_base = triangle_index * 6;
+                                    if (uv_base + 5 >= volume->imported_texture_uvs_per_face.size())
+                                        continue;
+
+                                    resource_stream << "   <" << TEX2COORD_TAG << " " << U_ATTR << "=\""
+                                                    << volume->imported_texture_uvs_per_face[uv_base + 0] << "\" "
+                                                    << V_ATTR << "=\"" << volume->imported_texture_uvs_per_face[uv_base + 1] << "\"/>\n";
+                                    resource_stream << "   <" << TEX2COORD_TAG << " " << U_ATTR << "=\""
+                                                    << volume->imported_texture_uvs_per_face[uv_base + 2] << "\" "
+                                                    << V_ATTR << "=\"" << volume->imported_texture_uvs_per_face[uv_base + 3] << "\"/>\n";
+                                    resource_stream << "   <" << TEX2COORD_TAG << " " << U_ATTR << "=\""
+                                                    << volume->imported_texture_uvs_per_face[uv_base + 4] << "\" "
+                                                    << V_ATTR << "=\"" << volume->imported_texture_uvs_per_face[uv_base + 5] << "\"/>\n";
+                                }
+
+                                resource_stream << "  </" << TEXTURE_2D_GROUP_TAG << ">\n";
+                            }
+
+                            if (has_multi_properties) {
+                                resource_stream << "  <" << MULTI_PROPERTIES_TAG
+                                                << " " << ID_ATTR << "=\"" << texture_resource.multi_properties_id << "\""
+                                                << " " << PIDS_ATTR << "=\"" << texture_resource.color_group_id << " "
+                                                << texture_resource.texture_group_id << "\">\n";
+
+                                const size_t triangle_count = its.indices.size();
+                                for (size_t triangle_index = 0; triangle_index < triangle_count; ++triangle_index) {
+                                    if (triangle_index >= texture_resource.triangle_texcoord_starts.size())
+                                        continue;
+                                    const uint32_t texcoord_start = texture_resource.triangle_texcoord_starts[triangle_index];
+                                    if (texcoord_start == std::numeric_limits<uint32_t>::max())
+                                        continue;
+
+                                    const Vec3i32 &idx = its.indices[triangle_index];
+                                    resource_stream << "   <" << MULTI_TAG << " " << PINDICES_ATTR << "=\""
+                                                    << idx[0] << " " << texcoord_start + 0 << "\"/>\n";
+                                    resource_stream << "   <" << MULTI_TAG << " " << PINDICES_ATTR << "=\""
+                                                    << idx[1] << " " << texcoord_start + 1 << "\"/>\n";
+                                    resource_stream << "   <" << MULTI_TAG << " " << PINDICES_ATTR << "=\""
+                                                    << idx[2] << " " << texcoord_start + 2 << "\"/>\n";
+                                }
+
+                                resource_stream << "  </" << MULTI_PROPERTIES_TAG << ">\n";
+                            }
+                        }
+
+                        const std::string resource_buf = resource_stream.str();
+                        if (!resource_buf.empty() && !mz_zip_writer_add_staged_data(&context, resource_buf.data(), resource_buf.size())) {
+                            add_error("Unable to add texture resources to model file");
+                            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ":" << __LINE__ << boost::format(", Unable to add texture resources to model file\n");
+                            return false;
+                        }
+                    }
+
                     // Store geometry of all ModelVolumes contained in a single ModelObject into a single 3MF indexed triangle set object.
                     // object_it->second.volumes_objectID will contain the offsets of the ModelVolumes in that single indexed triangle set.
                     // object_id will be increased to point to the 1st instance of the next ModelObject.
@@ -6856,6 +8037,65 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             }
         }
 
+        if (!m_skip_model && write_object) {
+            std::map<std::string, bool> texture_targets;
+            for (const auto &object_entry : objects_data) {
+                const ObjectData &object_data = object_entry.second;
+                if (sub_model && object_data.object != objects_data.begin()->second.object)
+                    continue;
+                for (const auto &texture_entry : object_data.volume_texture_resources) {
+                    const ModelVolume *volume = texture_entry.first;
+                    const ThreeMfExportTextureResource &texture_resource = texture_entry.second;
+                    if (volume == nullptr || texture_resource.texture_part_path.empty())
+                        continue;
+                    if (texture_targets.find(texture_resource.texture_part_path) != texture_targets.end())
+                        continue;
+
+                    size_t png_size = 0;
+                    void *png_data = tdefl_write_image_to_png_file_in_memory_ex(
+                        static_cast<const void *>(volume->imported_texture_rgba.data()),
+                        int(volume->imported_texture_width),
+                        int(volume->imported_texture_height),
+                        4,
+                        &png_size,
+                        MZ_DEFAULT_COMPRESSION,
+                        1);
+                    if (png_data == nullptr) {
+                        add_error("Unable to encode standard 3MF texture image");
+                        return false;
+                    }
+
+                    const bool added_png = mz_zip_writer_add_mem(&archive,
+                                                                  texture_resource.texture_part_path.c_str(),
+                                                                  png_data,
+                                                                  png_size,
+                                                                  MZ_NO_COMPRESSION);
+                    mz_free(png_data);
+                    if (!added_png) {
+                        add_error("Unable to add standard 3MF texture image file to archive");
+                        return false;
+                    }
+
+                    texture_targets[texture_resource.texture_part_path] = true;
+                }
+            }
+
+            if (!texture_targets.empty()) {
+                std::vector<std::string> texture_target_paths;
+                texture_target_paths.reserve(texture_targets.size());
+                for (const auto &texture_target : texture_targets)
+                    texture_target_paths.emplace_back(texture_target.first);
+
+                const std::string model_part_path = sub_model ? filename : MODEL_FILE;
+                if (!_add_relationships_file_to_archive(archive,
+                                                        model_relationships_part_path(model_part_path),
+                                                        texture_target_paths,
+                                                        { MODEL_TEXTURE_REL_TYPE })) {
+                    return false;
+                }
+            }
+        }
+
         if (m_skip_model || write_object) return true;
 
         // write model rels
@@ -6863,30 +8103,64 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
 
         if (!m_from_backup_save) {
             boost::mutex mutex;
-            tbb::parallel_for(tbb::blocked_range<size_t>(0, objects_data.size(), 1), [this, &mutex, &model, objects = model.objects, &objects_data, &object_paths, main = &archive, project](const tbb::blocked_range<size_t>& range) {
+            bool sub_models_added = true;
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, objects_data.size(), 1),
+                [this, &mutex, &model, objects = model.objects, &objects_data, &object_paths, main = &archive, project, &sub_models_added]
+                (const tbb::blocked_range<size_t>& range) {
                 for (size_t i = range.begin(); i < range.end(); ++i) {
                     auto iter = objects_data.find(objects[i]);
                     ObjectToObjectDataMap objects_data2;
                     objects_data2.insert(*iter);
-                    auto & object = *iter->second.object;
-                    mz_zip_archive archive;
-                    mz_zip_zero_struct(&archive);
-                    mz_zip_writer_init_heap(&archive, 0, 1024 * 1024);
+                    mz_zip_archive sub_archive;
+                    mz_zip_zero_struct(&sub_archive);
+                    if (!mz_zip_writer_init_heap(&sub_archive, 0, 1024 * 1024)) {
+                        boost::unique_lock l(mutex);
+                        sub_models_added = false;
+                        continue;
+                    }
+
                     CNumericLocalesSetter locales_setter;
-                    _add_model_file_to_archive(object_paths[i], archive, model, objects_data2, nullptr, project);
+                    if (!_add_model_file_to_archive(object_paths[i], sub_archive, model, objects_data2, nullptr, project)) {
+                        mz_zip_writer_end(&sub_archive);
+                        boost::unique_lock l(mutex);
+                        sub_models_added = false;
+                        continue;
+                    }
                     iter->second = objects_data2.begin()->second;
-                    void *ppBuf; size_t pSize;
-                    mz_zip_writer_finalize_heap_archive(&archive, &ppBuf, &pSize);
-                    mz_zip_writer_end(&archive);
-                    mz_zip_zero_struct(&archive);
-                    mz_zip_reader_init_mem(&archive, ppBuf, pSize, 0);
+
+                    void *ppBuf = nullptr;
+                    size_t pSize = 0;
+                    if (!mz_zip_writer_finalize_heap_archive(&sub_archive, &ppBuf, &pSize)) {
+                        mz_zip_writer_end(&sub_archive);
+                        boost::unique_lock l(mutex);
+                        sub_models_added = false;
+                        continue;
+                    }
+                    mz_zip_writer_end(&sub_archive);
+                    mz_zip_zero_struct(&sub_archive);
+                    if (!mz_zip_reader_init_mem(&sub_archive, ppBuf, pSize, 0)) {
+                        mz_free(ppBuf);
+                        boost::unique_lock l(mutex);
+                        sub_models_added = false;
+                        continue;
+                    }
                     {
                         boost::unique_lock l(mutex);
-                        mz_zip_writer_add_from_zip_reader(main, &archive, 0);
+                        const mz_uint num_sub_entries = mz_zip_reader_get_num_files(&sub_archive);
+                        for (mz_uint entry = 0; entry < num_sub_entries; ++entry) {
+                            if (!mz_zip_writer_add_from_zip_reader(main, &sub_archive, entry))
+                                sub_models_added = false;
+                        }
                     }
-                    mz_zip_reader_end(&archive);
+                    mz_zip_reader_end(&sub_archive);
+                    mz_free(ppBuf);
                 }
             });
+
+            if (!sub_models_added) {
+                add_error("Unable to add split model files to archive");
+                return false;
+            }
         }
 
         return true;
@@ -7139,6 +8413,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             //triangles_count += (int)its.indices.size();
             //unsigned int last_triangle_id = triangles_count - 1;
 
+            const auto texture_resource_it = object_data.volume_texture_resources.find(volume);
+
             for (int i = 0; i < int(its.indices.size()); ++ i) {
                 {
                     const Vec3i32 &idx = its.indices[i];
@@ -7198,6 +8474,57 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                         output_buffer += FACE_PROPERTY_ATTR;
                         output_buffer += "=\"";
                         output_buffer += prop_str;
+                        output_buffer += "\"";
+                    }
+                }
+
+                if (texture_resource_it != object_data.volume_texture_resources.end()) {
+                    const ThreeMfExportTextureResource &texture_resource = texture_resource_it->second;
+                    const bool has_texture_for_triangle =
+                        size_t(i) < texture_resource.triangle_texcoord_starts.size() &&
+                        texture_resource.triangle_texcoord_starts[size_t(i)] != std::numeric_limits<uint32_t>::max();
+                    const uint32_t texcoord_start = has_texture_for_triangle ?
+                        texture_resource.triangle_texcoord_starts[size_t(i)] : 0;
+
+                    int pid = -1;
+                    int p1 = -1;
+                    int p2 = -1;
+                    int p3 = -1;
+                    if (has_texture_for_triangle && texture_resource.multi_properties_id > 0) {
+                        pid = texture_resource.multi_properties_id;
+                        p1 = int(texcoord_start + 0);
+                        p2 = int(texcoord_start + 1);
+                        p3 = int(texcoord_start + 2);
+                    } else if (has_texture_for_triangle && texture_resource.texture_group_id > 0) {
+                        pid = texture_resource.texture_group_id;
+                        p1 = int(texcoord_start + 0);
+                        p2 = int(texcoord_start + 1);
+                        p3 = int(texcoord_start + 2);
+                    } else if (texture_resource.color_group_id > 0) {
+                        const Vec3i32 &idx = its.indices[i];
+                        pid = texture_resource.color_group_id;
+                        p1 = idx[is_left_handed ? 2 : 0];
+                        p2 = idx[1];
+                        p3 = idx[is_left_handed ? 0 : 2];
+                    }
+
+                    if (pid > 0 && p1 >= 0 && p2 >= 0 && p3 >= 0) {
+                        output_buffer += " ";
+                        output_buffer += PID_ATTR;
+                        output_buffer += "=\"";
+                        output_buffer += std::to_string(pid);
+                        output_buffer += "\" ";
+                        output_buffer += P1_ATTR;
+                        output_buffer += "=\"";
+                        output_buffer += std::to_string(p1);
+                        output_buffer += "\" ";
+                        output_buffer += P2_ATTR;
+                        output_buffer += "=\"";
+                        output_buffer += std::to_string(p2);
+                        output_buffer += "\" ";
+                        output_buffer += P3_ATTR;
+                        output_buffer += "=\"";
+                        output_buffer += std::to_string(p3);
                         output_buffer += "\"";
                     }
                 }

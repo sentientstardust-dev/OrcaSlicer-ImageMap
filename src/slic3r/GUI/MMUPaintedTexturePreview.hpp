@@ -1,0 +1,97 @@
+#ifndef slic3r_MMUPaintedTexturePreview_hpp_
+#define slic3r_MMUPaintedTexturePreview_hpp_
+
+#include "GLModel.hpp"
+#include "GLTexture.hpp"
+
+#include "libslic3r/Color.hpp"
+#include "libslic3r/Model.hpp"
+#include "libslic3r/TriangleSelector.hpp"
+
+#include <array>
+#include <vector>
+
+namespace Slic3r {
+
+class TextureMappingManager;
+
+bool build_mmu_texture_preview_models(
+    const ModelVolume                                                    &model_volume,
+    const std::vector<std::vector<TriangleSelector::FacetStateTriangle>> &triangles_per_type,
+    const std::vector<ColorRGBA>                                         &state_colors,
+    unsigned int                                                          base_filament_id,
+    size_t                                                                num_physical,
+    const TextureMappingManager                                          *texture_mgr,
+    std::vector<GUI::GLModel>                                            &out_models,
+    std::vector<ColorRGBA>                                               &out_colors,
+    std::vector<unsigned int>                                            &out_filament_ids);
+
+bool build_mmu_vertex_color_preview_models(
+    const ModelVolume                                                    &model_volume,
+    const std::vector<std::vector<TriangleSelector::FacetStateTriangle>> &triangles_per_type,
+    const std::vector<ColorRGBA>                                         &state_colors,
+    unsigned int                                                          base_filament_id,
+    size_t                                                                num_physical,
+    const TextureMappingManager                                          *texture_mgr,
+    const Transform3d                                                    &world_matrix,
+    std::vector<GUI::GLModel>                                            &out_models,
+    std::vector<ColorRGBA>                                               &out_colors,
+    std::vector<unsigned int>                                            &out_filament_ids);
+
+bool build_mmu_vertex_color_preview_models(
+    const ModelVolume                                                    &model_volume,
+    const std::vector<std::vector<TriangleSelector::FacetStateTriangle>> &triangles_per_type,
+    const std::vector<ColorRGBA>                                         &state_colors,
+    unsigned int                                                          base_filament_id,
+    size_t                                                                num_physical,
+    const TextureMappingManager                                          *texture_mgr,
+    std::vector<GUI::GLModel>                                            &out_models,
+    std::vector<ColorRGBA>                                               &out_colors,
+    std::vector<unsigned int>                                            &out_filament_ids);
+
+size_t model_volume_texture_preview_signature(const ModelVolume &model_volume);
+
+bool ensure_model_volume_texture_preview(const ModelVolume &model_volume,
+                                         GUI::GLTexture    &texture,
+                                         size_t            &texture_signature);
+
+bool texture_preview_simulation_is_pending();
+void clear_texture_preview_simulation_cache();
+
+size_t texture_preview_settings_signature(size_t num_physical, const TextureMappingManager *texture_mgr);
+
+void render_model_texture_preview_models(
+    std::vector<GUI::GLModel>       &models,
+    const std::vector<ColorRGBA>    &colors,
+    const std::vector<unsigned int> &filament_ids,
+    size_t                           num_physical,
+    const TextureMappingManager     *texture_mgr,
+    const ModelVolume               &model_volume,
+    const GUI::GLTexture            &texture,
+    const Transform3d               &model_matrix,
+    const Transform3d               &view_matrix,
+    const Transform3d               &projection_matrix,
+    const std::array<float, 2>      &z_range,
+    const std::array<float, 4>      &clipping_plane,
+    int                              print_volume_type = -1,
+    const std::array<float, 4>      &print_volume_xy = std::array<float, 4>{ 0.f, 0.f, 0.f, 0.f },
+    const std::array<float, 2>      &print_volume_z = std::array<float, 2>{ 0.f, 0.f });
+
+void render_model_vertex_color_preview_models(
+    std::vector<GUI::GLModel>       &models,
+    const std::vector<ColorRGBA>    &colors,
+    const std::vector<unsigned int> &filament_ids,
+    size_t                           num_physical,
+    const TextureMappingManager     *texture_mgr,
+    const Transform3d               &model_matrix,
+    const Transform3d               &view_matrix,
+    const Transform3d               &projection_matrix,
+    const std::array<float, 2>      &z_range,
+    const std::array<float, 4>      &clipping_plane,
+    int                              print_volume_type = -1,
+    const std::array<float, 4>      &print_volume_xy = std::array<float, 4>{ 0.f, 0.f, 0.f, 0.f },
+    const std::array<float, 2>      &print_volume_z = std::array<float, 2>{ 0.f, 0.f });
+
+} // namespace Slic3r
+
+#endif // slic3r_MMUPaintedTexturePreview_hpp_

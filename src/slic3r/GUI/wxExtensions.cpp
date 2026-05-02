@@ -806,19 +806,26 @@ void apply_extruder_selector(Slic3r::GUI::BitmapComboBox** ctrl,
     // For ObjectList we use short extruder name (just a number)
     const bool use_full_item_name = dynamic_cast<Slic3r::GUI::ObjectList*>(parent) == nullptr;
 
-    int i = 0;
-    wxString str = _(L("Extruder"));
-    for (wxBitmap* bmp : icons) {
-        if (i == 0) {
-            if (!first_item.empty())
-                (*ctrl)->Append(_(first_item), *bmp);
-            ++i;
-        }
+    if (!first_item.empty())
+        (*ctrl)->Append(_(first_item), *icons.front());
 
+    std::vector<unsigned int> ordered_filament_ids;
+    if (Slic3r::GUI::wxGetApp().plater() != nullptr)
+        ordered_filament_ids = Slic3r::GUI::wxGetApp().plater()->sidebar().get_ui_ordered_filament_ids();
+    if (ordered_filament_ids.empty()) {
+        ordered_filament_ids.reserve(icons.size());
+        for (size_t idx = 0; idx < icons.size(); ++idx)
+            ordered_filament_ids.emplace_back(unsigned(idx + 1));
+    }
+
+    wxString str = _(L("Extruder"));
+    for (const unsigned int filament_id : ordered_filament_ids) {
+        if (filament_id == 0 || filament_id > icons.size())
+            continue;
+        wxBitmap *bmp = icons[size_t(filament_id - 1)];
         (*ctrl)->Append(use_full_item_name
-                        ? Slic3r::GUI::from_u8((boost::format("%1% %2%") % str % i).str())
-                        : wxString::Format("%d", i), *bmp);
-        ++i;
+                        ? Slic3r::GUI::from_u8((boost::format("%1% %2%") % str % filament_id).str())
+                        : wxString::Format("%u", filament_id), *bmp);
     }
     (*ctrl)->SetSelection(0);
 }
@@ -1250,7 +1257,6 @@ void ImageTransientPopup::OnMouse(wxMouseEvent &event)
 {
     event.Skip();
 }
-
 
 
 

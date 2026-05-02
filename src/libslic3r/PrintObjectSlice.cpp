@@ -1,5 +1,10 @@
 #include <boost/log/trivial.hpp>
 
+#include <algorithm>
+#include <limits>
+#include <memory>
+#include <set>
+
 #include <tbb/parallel_for.h>
 
 #include "ClipperUtils.hpp"
@@ -54,7 +59,8 @@ static std::vector<ExPolygons> slice_volume(
 {
     std::vector<ExPolygons> layers;
     if (! zs.empty()) {
-        indexed_triangle_set its = volume.mesh().its;
+        const std::shared_ptr<const TriangleMesh> mesh_ptr = volume.mesh_ptr();
+        indexed_triangle_set its = mesh_ptr ? mesh_ptr->its : indexed_triangle_set();
         if (its.indices.size() > 0) {
             MeshSlicingParamsEx params2 { params };
             params2.trafo = params2.trafo * volume.get_matrix();
@@ -111,6 +117,224 @@ static inline bool model_volume_needs_slicing(const ModelVolume &mv)
 {
     ModelVolumeType type = mv.type();
     return type == ModelVolumeType::MODEL_PART || type == ModelVolumeType::NEGATIVE_VOLUME || type == ModelVolumeType::PARAMETER_MODIFIER;
+}
+
+static std::vector<std::string> collect_texture_mapping_outer_wall_gradient_line_width_warnings(const PrintObject &print_object)
+{
+    const Print *print = print_object.print();
+    if (print == nullptr)
+        return {};
+
+    bool has_offset_profiles = false;
+    for (const TextureMappingZone &zone : print->texture_mapping_manager().zones()) {
+        if (!zone.enabled || zone.deleted)
+            continue;
+        if (zone.is_2d_gradient() || zone.is_image_texture() || zone.has_custom_offset_settings()) {
+            has_offset_profiles = true;
+            break;
+        }
+    }
+    if (!has_offset_profiles)
+        return {};
+
+    if (print_object.num_printing_regions() == 0)
+        return {};
+
+    float max_gradient_line_width_mm = 0.f;
+    float min_gradient_line_width_mm = std::numeric_limits<float>::max();
+    for (size_t region_id = 0; region_id < print_object.num_printing_regions(); ++region_id) {
+        const PrintRegionConfig &region_cfg = print_object.printing_region(region_id).config();
+        max_gradient_line_width_mm = std::max(max_gradient_line_width_mm,
+                                              float(region_cfg.texture_mapping_outer_wall_gradient_max_line_width.value));
+        min_gradient_line_width_mm = std::min(min_gradient_line_width_mm,
+                                              float(region_cfg.texture_mapping_outer_wall_gradient_min_line_width.value));
+    }
+    max_gradient_line_width_mm = std::max(0.f, max_gradient_line_width_mm);
+    min_gradient_line_width_mm = std::max(0.f, min_gradient_line_width_mm);
+    std::vector<std::string> warnings;
+    warnings.reserve(2);
+
+    bool warned_min_line_width = false;
+    bool warned_gradient_width_range = false;
+    const float gradient_line_width_range_mm = std::max(0.f, max_gradient_line_width_mm - min_gradient_line_width_mm);
+    for (double nozzle_diameter_mm : print->config().nozzle_diameter.values) {
+        const float nozzle_mm = std::max(0.01f, float(nozzle_diameter_mm));
+
+        if (!warned_min_line_width && min_gradient_line_width_mm + EPSILON < 0.5f * nozzle_mm) {
+            warnings.emplace_back(
+                L("Minimum outer wall line width is below 50% of nozzle diameter. "
+                  "Increase it to improve extrusion stability."));
+            warned_min_line_width = true;
+        }
+
+        if (!warned_gradient_width_range && gradient_line_width_range_mm + EPSILON < 0.2f) {
+            warnings.emplace_back(
+                L("Texture mapping outer wall line width range is below 0.2mm. Increase the difference between minimum and "
+                  "maximum outer wall line width in multimaterial options for stronger gradient effects."));
+            warned_gradient_width_range = true;
+        }
+
+        if (warned_min_line_width && warned_gradient_width_range)
+            break;
+    }
+
+    return warnings;
+}
+
+static std::vector<std::string> collect_texture_mapping_vertex_color_match_warnings(const PrintObject &print_object)
+{
+    const Print *print = print_object.print();
+    if (print == nullptr)
+        return {};
+
+    const ModelObject *model_object = print_object.model_object();
+    if (model_object == nullptr)
+        return {};
+
+    bool object_uses_vertex_match_mode = false;
+    for (const ModelVolume *volume : model_object->volumes) {
+        if (volume == nullptr)
+            continue;
+
+        const std::vector<int> used_extruders = volume->get_extruders();
+        for (const int filament_id : used_extruders) {
+            if (filament_id <= 0)
+                continue;
+            const unsigned int filament_id_u = unsigned(filament_id);
+            const TextureMappingZone *zone = print->texture_mapping_manager().zone_from_id(filament_id_u);
+            if (zone != nullptr && zone->enabled && !zone->deleted && zone->is_image_texture()) {
+                object_uses_vertex_match_mode = true;
+                break;
+            }
+        }
+        if (object_uses_vertex_match_mode)
+            break;
+    }
+
+    if (!object_uses_vertex_match_mode)
+        return {};
+
+    bool has_imported_vertex_color_data = false;
+    bool has_imported_texture_data = false;
+    bool has_uv_texture_reference_but_no_image = false;
+    for (const ModelVolume *volume : model_object->volumes) {
+        if (volume != nullptr && !volume->imported_vertex_colors_rgba.empty())
+            has_imported_vertex_color_data = true;
+        if (volume != nullptr &&
+            !volume->imported_texture_uv_valid.empty() &&
+            !volume->imported_texture_uvs_per_face.empty() &&
+            (volume->imported_texture_rgba.empty() ||
+             volume->imported_texture_width == 0 ||
+             volume->imported_texture_height == 0)) {
+            has_uv_texture_reference_but_no_image = true;
+        }
+        if (volume != nullptr &&
+            !volume->imported_texture_rgba.empty() &&
+            volume->imported_texture_width > 0 &&
+            volume->imported_texture_height > 0 &&
+            !volume->imported_texture_uv_valid.empty() &&
+            !volume->imported_texture_uvs_per_face.empty()) {
+            has_imported_texture_data = true;
+        }
+        if (has_imported_vertex_color_data || has_imported_texture_data)
+            break;
+    }
+
+    if (has_imported_vertex_color_data || has_imported_texture_data)
+        return {};
+
+    if (has_uv_texture_reference_but_no_image)
+        return {
+            L("Image Texture Mapping is used on this object and OBJ UVs were found, but the texture image could not be loaded. "
+              "Texture color matching will be skipped for this object. "
+              "(This importer path currently expects a PNG image texture.)")
+        };
+
+    return {
+        L("Image Texture Mapping is used on this object, but no imported vertex colors or OBJ UV texture data were found. "
+          "Texture color matching will be skipped for this object. "
+          "(This importer path currently expects a PNG image texture.)")
+    };
+}
+
+static const char *vertex_color_mode_name_for_error(int filament_color_mode)
+{
+    switch (filament_color_mode) {
+    case int(TextureMappingZone::FilamentColorRGB):
+        return "RGB";
+    case int(TextureMappingZone::FilamentColorCMY):
+        return "CMY";
+    case int(TextureMappingZone::FilamentColorCMYK):
+        return "CMYK";
+    case int(TextureMappingZone::FilamentColorCMYW):
+        return "CMYW";
+    case int(TextureMappingZone::FilamentColorRGBK):
+        return "RGBK";
+    case int(TextureMappingZone::FilamentColorRGBW):
+        return "RGBW";
+    case int(TextureMappingZone::FilamentColorBW):
+        return "BW";
+    default:
+        return "Generic Solver (slow)";
+    }
+}
+
+static std::vector<std::string> collect_texture_mapping_vertex_color_mode_mismatch_errors(const PrintObject &print_object)
+{
+    const Print *print = print_object.print();
+    if (print == nullptr)
+        return {};
+
+    const ModelObject *model_object = print_object.model_object();
+    if (model_object == nullptr)
+        return {};
+
+    const size_t num_physical = print->config().filament_colour.size();
+
+    std::vector<std::string> errors;
+    std::set<unsigned int> seen_zone_ids;
+    for (const ModelVolume *volume : model_object->volumes) {
+        if (volume == nullptr)
+            continue;
+
+        const std::vector<int> used_extruders = volume->get_extruders();
+        for (const int filament_id : used_extruders) {
+            if (filament_id <= 0)
+                continue;
+
+            const unsigned int filament_id_u = unsigned(filament_id);
+            if (seen_zone_ids.find(filament_id_u) != seen_zone_ids.end())
+                continue;
+            seen_zone_ids.insert(filament_id_u);
+
+            const TextureMappingZone *zone = print->texture_mapping_manager().zone_from_id(filament_id_u);
+            if (zone == nullptr || !zone->enabled || zone->deleted || !zone->is_image_texture())
+                continue;
+
+            const int filament_color_mode = std::clamp(zone->filament_color_mode,
+                                                       int(TextureMappingZone::FilamentColorAny),
+                                                       int(TextureMappingZone::FilamentColorBW));
+            const size_t expected_count = TextureMappingManager::expected_component_count(zone->texture_mapping_mode,
+                                                                                         filament_color_mode);
+            if (expected_count == 0)
+                continue;
+
+            const std::vector<unsigned int> selected_ids = TextureMappingManager::selected_component_ids(*zone, num_physical);
+            if (selected_ids.size() == expected_count)
+                continue;
+
+            errors.emplace_back(
+                L("Image Texture Mapping is used with an incompatible 'Filament colors' mode. ") +
+                L("Texture mapping zone ID ") + std::to_string(filament_id_u) +
+                L(" uses mode '") + vertex_color_mode_name_for_error(filament_color_mode) +
+                L("' which requires ") + std::to_string(expected_count) +
+                L(" selected horizontal filaments, but ") + std::to_string(selected_ids.size()) +
+                L(" are selected.")
+            );
+        }
+    }
+
+    return errors;
 }
 
 // Slice printable volumes, negative volumes and modifier volumes, sorted by ModelVolume::id().
@@ -1176,6 +1400,12 @@ void PrintObject::slice_volumes()
     m_print->throw_if_canceled();
 
     this->apply_conical_overhang();
+    for (const std::string &warning_msg : collect_texture_mapping_outer_wall_gradient_line_width_warnings(*this))
+        this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, warning_msg);
+    for (const std::string &warning_msg : collect_texture_mapping_vertex_color_match_warnings(*this))
+        this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, warning_msg);
+    for (const std::string &error_msg : collect_texture_mapping_vertex_color_mode_mismatch_errors(*this))
+        this->active_step_add_warning(PrintStateBase::WarningLevel::CRITICAL, error_msg);
 
     // Is any ModelVolume multi-material painted?
     if (const auto& volumes = this->model_object()->volumes;

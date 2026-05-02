@@ -77,7 +77,18 @@ static DynamicPrintConfig& printer_config()
 
 static int filaments_count()
 {
-    return wxGetApp().filaments_cnt();
+    int count = wxGetApp().filaments_cnt();
+    if (PresetBundle *bundle = wxGetApp().preset_bundle; bundle != nullptr) {
+        const ConfigOptionStrings *colors = bundle->project_config.option<ConfigOptionStrings>("filament_colour", false);
+        if (colors != nullptr) {
+            const std::string serialized = bundle->project_config.has("texture_mapping_definitions") ?
+                bundle->project_config.opt_string("texture_mapping_definitions") :
+                std::string();
+            bundle->texture_mapping_zones.load_entries(serialized, colors->values);
+            count = int(std::max<size_t>(size_t(count), bundle->texture_mapping_zones.total_filaments(colors->values.size())));
+        }
+    }
+    return count;
 }
 
 static void take_snapshot(const std::string& snapshot_name)
@@ -741,6 +752,29 @@ void ObjectList::update_filament_values_for_items(const size_t filaments_count)
 void ObjectList::update_filament_values_for_items_when_delete_filament(const size_t filament_id, const int replace_id)
 {
     int replace_filament_id = replace_id == -1 ? 1 : (replace_id + 1);
+    auto is_texture_mapping_zone = [](int filament_id_1based) {
+        return filament_id_1based > 0 &&
+               wxGetApp().preset_bundle != nullptr &&
+               wxGetApp().preset_bundle->texture_mapping_zones.is_texture_mapping_zone_id(unsigned(filament_id_1based));
+    };
+    auto remap_extruder = [filament_id, replace_filament_id, is_texture_mapping_zone](int extruder_id) {
+        if (extruder_id <= 0 || is_texture_mapping_zone(extruder_id))
+            return extruder_id;
+        if (size_t(extruder_id) == filament_id + 1)
+            return replace_filament_id;
+        if (size_t(extruder_id) > filament_id + 1)
+            return extruder_id - 1;
+        return extruder_id;
+    };
+    auto remap_optional_filament = [filament_id, is_texture_mapping_zone](int extruder_id) {
+        if (extruder_id <= 0 || is_texture_mapping_zone(extruder_id))
+            return extruder_id;
+        if (size_t(extruder_id) == filament_id + 1)
+            return 0;
+        if (size_t(extruder_id) > filament_id + 1)
+            return extruder_id - 1;
+        return extruder_id;
+    };
     for (size_t i = 0; i < m_objects->size(); ++i) {
         wxDataViewItem item = m_objects_model->GetItemById(i);
         if (!item)
@@ -751,12 +785,8 @@ void ObjectList::update_filament_values_for_items_when_delete_filament(const siz
         if (!object->config.has("extruder")) {
             extruder = std::to_string(1);
             object->config.set_key_value("extruder", new ConfigOptionInt(1));
-        }
-        else if (size_t(object->config.extruder()) == filament_id + 1) {
-            extruder = std::to_string(replace_filament_id);
-            object->config.set_key_value("extruder", new ConfigOptionInt(replace_filament_id));
         } else {
-            int new_extruder = object->config.extruder() > filament_id ? object->config.extruder() - 1 : object->config.extruder();
+            int new_extruder = remap_extruder(object->config.extruder());
             extruder = wxString::Format("%d", new_extruder);
             object->config.set_key_value("extruder", new ConfigOptionInt(new_extruder));
         }
@@ -765,12 +795,11 @@ void ObjectList::update_filament_values_for_items_when_delete_filament(const siz
         static const char *keys[] = {"support_filament", "support_interface_filament"};
         for (auto key : keys) {
             if (object->config.has(key)) {
-                if(object->config.opt_int(key) == filament_id + 1)
+                int new_value = remap_optional_filament(object->config.opt_int(key));
+                if (new_value == 0)
                     object->config.erase(key);
-                else {
-                    int new_value = object->config.opt_int(key) > filament_id ? object->config.opt_int(key) - 1 : object->config.opt_int(key);
+                else
                     object->config.set_key_value(key, new ConfigOptionInt(new_value));
-                }
             }
         }
 
@@ -782,23 +811,18 @@ void ObjectList::update_filament_values_for_items_when_delete_filament(const siz
 
                 for (auto key : keys) {
                     if (object->volumes[id]->config.has(key)) {
-                        if (object->volumes[id]->config.opt_int(key) == filament_id + 1)
+                        int new_value = remap_optional_filament(object->volumes[id]->config.opt_int(key));
+                        if (new_value == 0)
                             object->volumes[id]->config.erase(key);
-                        else {
-                            int new_value = object->volumes[id]->config.opt_int(key) > filament_id ? object->volumes[id]->config.opt_int(key) - 1 :
-                                                                                                     object->volumes[id]->config.opt_int(key);
-                            object->config.set_key_value(key, new ConfigOptionInt(new_value));
-                        }
+                        else
+                            object->volumes[id]->config.set_key_value(key, new ConfigOptionInt(new_value));
                     }
                 }
 
                 if (!object->volumes[id]->config.has("extruder")) {
                     continue;
-                }
-                else if (size_t(object->volumes[id]->config.extruder()) == filament_id + 1) {
-                    object->volumes[id]->config.set_key_value("extruder", new ConfigOptionInt(replace_filament_id));
                 } else {
-                    int new_extruder = object->volumes[id]->config.extruder() > filament_id ? object->volumes[id]->config.extruder() - 1 : object->volumes[id]->config.extruder();
+                    int new_extruder = remap_extruder(object->volumes[id]->config.extruder());
                     extruder = wxString::Format("%d", new_extruder);
                     object->volumes[id]->config.set_key_value("extruder", new ConfigOptionInt(new_extruder));
                 }

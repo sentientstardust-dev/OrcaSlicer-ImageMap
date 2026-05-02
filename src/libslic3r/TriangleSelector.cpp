@@ -1470,6 +1470,32 @@ void TriangleSelector::get_facets(std::vector<indexed_triangle_set>& facets_per_
     }
 }
 
+void TriangleSelector::get_facet_triangles(std::vector<std::vector<FacetStateTriangle>> &facets_per_type) const
+{
+    facets_per_type.clear();
+
+    int max_state = int(EnforcerBlockerType::NONE);
+    for (const Triangle &tr : m_triangles)
+        if (tr.valid() && !tr.is_split())
+            max_state = std::max(max_state, int(tr.get_state()));
+
+    facets_per_type.resize(size_t(max_state + 1));
+    for (const Triangle &tr : m_triangles) {
+        if (!tr.valid() || tr.is_split())
+            continue;
+
+        const int state = int(tr.get_state());
+        if (state < 0 || state >= int(facets_per_type.size()))
+            continue;
+
+        FacetStateTriangle facet;
+        facet.source_triangle = tr.source_triangle;
+        for (size_t idx = 0; idx < facet.vertices.size(); ++idx)
+            facet.vertices[idx] = m_vertices[size_t(tr.verts_idxs[idx])].v;
+        facets_per_type[size_t(state)].emplace_back(std::move(facet));
+    }
+}
+
 indexed_triangle_set TriangleSelector::get_facets_strict(EnforcerBlockerType state) const
 {
     indexed_triangle_set out;

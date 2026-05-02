@@ -11,6 +11,7 @@
 #include "TriangleMeshSlicer.hpp"
 #include "TriangleSelector.hpp"
 #include "MaterialType.hpp"
+#include "PNGReadWrite.hpp"
 
 #include "Format/AMF.hpp"
 #include "Format/svg.hpp"
@@ -22,12 +23,21 @@
 #include "libslic3r/Geometry/ConvexHull.hpp"
 
 #include <float.h>
+#include <cctype>
+#include <cmath>
+#include <csetjmp>
+#include <iterator>
+#include <limits>
+#include <unordered_map>
 
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/log/trivial.hpp>
+#include <boost/nowide/fstream.hpp>
 #include <boost/nowide/iostream.hpp>
+
+#include <jpeglib.h>
 
 #include "SVG.hpp"
 #include <Eigen/Dense>
@@ -56,6 +66,470 @@ const std::vector<std::string> CONST_FILAMENTS = {
     // BBS initialization of static variables
     std::map<size_t, ExtruderParams> Model::extruderParamsMap = { {0,{"",0,0}}};
     GlobalSpeedMap Model::printSpeedMap{};
+
+namespace {
+
+static bool checked_rgba_buffer_size(size_t width, size_t height, size_t &buffer_size)
+{
+    buffer_size = 0;
+    if (width == 0 || height == 0)
+        return false;
+    if (width > std::numeric_limits<size_t>::max() / height)
+        return false;
+    const size_t pixel_count = width * height;
+    if (pixel_count > std::numeric_limits<size_t>::max() / 4)
+        return false;
+    buffer_size = pixel_count * 4;
+    return true;
+}
+
+static std::vector<std::string> split_obj_mtl_tokens(const std::string &line)
+{
+    std::vector<std::string> tokens;
+    std::string              current;
+    char                     quote_char = '\0';
+    for (const char c : line) {
+        if ((c == '"' || c == '\'') && (quote_char == '\0' || quote_char == c)) {
+            quote_char = quote_char == '\0' ? c : '\0';
+            continue;
+        }
+        if (quote_char == '\0' && std::isspace(static_cast<unsigned char>(c))) {
+            if (!current.empty()) {
+                tokens.emplace_back(std::move(current));
+                current.clear();
+            }
+            continue;
+        }
+        current.push_back(c);
+    }
+    if (!current.empty())
+        tokens.emplace_back(std::move(current));
+    return tokens;
+}
+
+static std::string extract_obj_texture_reference(const std::string &map_kd_value)
+{
+    const std::vector<std::string> tokens = split_obj_mtl_tokens(map_kd_value);
+    if (tokens.empty())
+        return {};
+    return tokens.back();
+}
+
+static std::vector<std::string> resolve_obj_texture_path_candidates(const std::string &obj_path, const std::string &texture_reference)
+{
+    std::vector<std::string> candidates;
+    if (texture_reference.empty())
+        return candidates;
+
+    auto push_unique = [&candidates](const boost::filesystem::path &path) {
+        if (path.empty())
+            return;
+        const std::string normalized = path.lexically_normal().string();
+        if (normalized.empty())
+            return;
+        if (std::find(candidates.begin(), candidates.end(), normalized) == candidates.end())
+            candidates.emplace_back(normalized);
+    };
+
+    const boost::filesystem::path texture_path(texture_reference);
+    const boost::filesystem::path obj_dir = boost::filesystem::path(obj_path).parent_path();
+
+    if (texture_path.is_absolute()) {
+        push_unique(texture_path);
+        if (!texture_path.filename().empty())
+            push_unique(obj_dir / texture_path.filename());
+    } else {
+        push_unique(obj_dir / texture_path);
+        if (!texture_path.filename().empty())
+            push_unique(obj_dir / texture_path.filename());
+    }
+
+    return candidates;
+}
+
+static bool decode_png_texture_rgba(const std::string &texture_path,
+                                    std::vector<uint8_t> &out_rgba,
+                                    uint32_t &out_width,
+                                    uint32_t &out_height)
+{
+    out_rgba.clear();
+    out_width  = 0;
+    out_height = 0;
+
+    boost::nowide::ifstream ifs(texture_path, std::ios::binary);
+    if (!ifs.is_open())
+        return false;
+
+    std::string encoded_data((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    if (encoded_data.empty())
+        return false;
+
+    png::ReadBuf      rb{encoded_data.data(), encoded_data.size()};
+    png::ImageColorscale img;
+    if (!png::decode_colored_png(rb, img))
+        return false;
+
+    if (img.cols == 0 || img.rows == 0 || (img.bytes_per_pixel != 3 && img.bytes_per_pixel != 4))
+        return false;
+
+    size_t rgba_size = 0;
+    if (!checked_rgba_buffer_size(img.cols, img.rows, rgba_size))
+        return false;
+
+    const size_t row_stride = img.cols * size_t(img.bytes_per_pixel);
+    if (img.buf.size() < img.rows * row_stride)
+        return false;
+
+    out_rgba.assign(rgba_size, 255);
+    for (size_t y = 0; y < img.rows; ++y) {
+        const size_t src_row_off = y * row_stride;
+        const size_t dst_row_off = y * img.cols * 4;
+        for (size_t x = 0; x < img.cols; ++x) {
+            const size_t src = src_row_off + x * size_t(img.bytes_per_pixel);
+            const size_t dst = dst_row_off + x * 4;
+            out_rgba[dst + 0] = img.buf[src + 0];
+            out_rgba[dst + 1] = img.buf[src + 1];
+            out_rgba[dst + 2] = img.buf[src + 2];
+            out_rgba[dst + 3] = (img.bytes_per_pixel == 4) ? img.buf[src + 3] : uint8_t(255);
+        }
+    }
+
+    out_width  = uint32_t(img.cols);
+    out_height = uint32_t(img.rows);
+    return true;
+}
+
+struct JpegDecodeErrorManager
+{
+    jpeg_error_mgr pub;
+    jmp_buf        setjmp_buffer;
+};
+
+static void jpeg_decode_error_exit(j_common_ptr cinfo)
+{
+    auto *err = reinterpret_cast<JpegDecodeErrorManager *>(cinfo->err);
+    longjmp(err->setjmp_buffer, 1);
+}
+
+static bool decode_jpeg_texture_rgba(const std::string &texture_path,
+                                     std::vector<uint8_t> &out_rgba,
+                                     uint32_t &out_width,
+                                     uint32_t &out_height)
+{
+    out_rgba.clear();
+    out_width  = 0;
+    out_height = 0;
+
+    boost::nowide::ifstream ifs(texture_path, std::ios::binary);
+    if (!ifs.is_open())
+        return false;
+
+    std::string encoded_data((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    if (encoded_data.empty())
+        return false;
+
+    jpeg_decompress_struct cinfo{};
+    JpegDecodeErrorManager jerr{};
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = jpeg_decode_error_exit;
+    bool jpeg_created = false;
+    auto destroy_jpeg = [&cinfo, &jpeg_created]() {
+        if (jpeg_created) {
+            jpeg_destroy_decompress(&cinfo);
+            jpeg_created = false;
+        }
+    };
+
+    if (setjmp(jerr.setjmp_buffer)) {
+        destroy_jpeg();
+        return false;
+    }
+
+    jpeg_create_decompress(&cinfo);
+    jpeg_created = true;
+    jpeg_mem_src(&cinfo,
+                 reinterpret_cast<const unsigned char *>(encoded_data.data()),
+                 static_cast<unsigned long>(encoded_data.size()));
+
+    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+        destroy_jpeg();
+        return false;
+    }
+
+    if (!jpeg_start_decompress(&cinfo)) {
+        destroy_jpeg();
+        return false;
+    }
+
+    const uint32_t width = cinfo.output_width;
+    const uint32_t height = cinfo.output_height;
+    const int components = cinfo.output_components;
+    size_t rgba_size = 0;
+    const size_t scanline_stride = size_t(width) * size_t(std::max(components, 0));
+    if (!checked_rgba_buffer_size(width, height, rgba_size) ||
+        components <= 0 ||
+        scanline_stride > std::numeric_limits<JDIMENSION>::max()) {
+        jpeg_finish_decompress(&cinfo);
+        destroy_jpeg();
+        return false;
+    }
+
+    out_rgba.assign(rgba_size, uint8_t(255));
+    JSAMPARRAY scanline = (*cinfo.mem->alloc_sarray)((j_common_ptr) &cinfo,
+                                                     JPOOL_IMAGE,
+                                                     JDIMENSION(scanline_stride),
+                                                     1);
+
+    uint32_t y = 0;
+    while (cinfo.output_scanline < cinfo.output_height) {
+        jpeg_read_scanlines(&cinfo, scanline, 1);
+        const unsigned char *src = scanline[0];
+        for (uint32_t x = 0; x < width; ++x) {
+            const size_t dst = (size_t(y) * size_t(width) + size_t(x)) * 4;
+            if (components >= 3) {
+                const size_t s = size_t(x) * size_t(components);
+                out_rgba[dst + 0] = src[s + 0];
+                out_rgba[dst + 1] = src[s + 1];
+                out_rgba[dst + 2] = src[s + 2];
+            } else {
+                const unsigned char g = src[x];
+                out_rgba[dst + 0] = g;
+                out_rgba[dst + 1] = g;
+                out_rgba[dst + 2] = g;
+            }
+            out_rgba[dst + 3] = 255;
+        }
+        ++y;
+    }
+
+    if (!jpeg_finish_decompress(&cinfo)) {
+        destroy_jpeg();
+        return false;
+    }
+    destroy_jpeg();
+
+    out_width  = width;
+    out_height = height;
+    return true;
+}
+
+static bool decode_image_texture_rgba(const std::string &texture_path,
+                                      std::vector<uint8_t> &out_rgba,
+                                      uint32_t &out_width,
+                                      uint32_t &out_height)
+{
+    out_rgba.clear();
+    out_width  = 0;
+    out_height = 0;
+
+    if (boost::algorithm::iends_with(texture_path, ".png"))
+        return decode_png_texture_rgba(texture_path, out_rgba, out_width, out_height);
+
+    if (boost::algorithm::iends_with(texture_path, ".jpg") || boost::algorithm::iends_with(texture_path, ".jpeg"))
+        return decode_jpeg_texture_rgba(texture_path, out_rgba, out_width, out_height);
+
+    return false;
+}
+
+struct ObjTextureImage
+{
+    std::string          resolved_path;
+    std::vector<uint8_t> rgba;
+    uint32_t             width{0};
+    uint32_t             height{0};
+};
+
+struct ObjTextureImportData
+{
+    std::vector<ObjTextureImage>              textures;
+    std::unordered_map<std::string, size_t> map_kd_to_texture_idx;
+};
+
+static ObjTextureImportData load_obj_albedo_textures(const std::string &obj_path, const ObjInfo &obj_info)
+{
+    ObjTextureImportData result;
+    std::unordered_map<std::string, size_t> loaded_texture_path_to_idx;
+
+    auto register_map = [&](const std::string &map_kd_raw) {
+        if (map_kd_raw.empty())
+            return;
+        if (result.map_kd_to_texture_idx.find(map_kd_raw) != result.map_kd_to_texture_idx.end())
+            return;
+
+        const std::string texture_ref = extract_obj_texture_reference(map_kd_raw);
+        const auto        candidates  = resolve_obj_texture_path_candidates(obj_path, texture_ref);
+
+        bool had_decode_failure = false;
+        std::string last_failed_path;
+        for (const std::string &candidate : candidates) {
+            if (!boost::filesystem::exists(candidate))
+                continue;
+
+            if (const auto existing = loaded_texture_path_to_idx.find(candidate);
+                existing != loaded_texture_path_to_idx.end()) {
+                result.map_kd_to_texture_idx[map_kd_raw] = existing->second;
+                return;
+            }
+
+            ObjTextureImage image;
+            image.resolved_path = candidate;
+            if (!decode_image_texture_rgba(candidate, image.rgba, image.width, image.height)) {
+                had_decode_failure = true;
+                last_failed_path = candidate;
+                continue;
+            }
+
+            const size_t texture_idx = result.textures.size();
+            loaded_texture_path_to_idx[candidate] = texture_idx;
+            result.textures.emplace_back(std::move(image));
+            result.map_kd_to_texture_idx[map_kd_raw] = texture_idx;
+            return;
+        }
+
+        if (had_decode_failure) {
+            BOOST_LOG_TRIVIAL(error) << "OBJ albedo texture map found but failed to decode image"
+                                     << " map_Kd='" << map_kd_raw
+                                     << "' last_path='" << last_failed_path
+                                     << "' (supported: PNG, JPEG).";
+        } else if (!candidates.empty()) {
+            BOOST_LOG_TRIVIAL(error) << "OBJ albedo texture map file not found"
+                                     << " map_Kd='" << map_kd_raw
+                                     << "' (checked OBJ-relative and filename fallback paths).";
+        } else {
+            BOOST_LOG_TRIVIAL(error) << "OBJ albedo texture map reference is empty or invalid"
+                                     << " map_Kd='" << map_kd_raw << "'.";
+        }
+    };
+
+    for (const auto &face_to_map : obj_info.uv_map_pngs)
+        register_map(face_to_map.second);
+
+    if (result.textures.empty() && !obj_info.single_texture_image.empty())
+        register_map(obj_info.single_texture_image);
+
+    return result;
+}
+
+struct ObjTextureAtlasEntry
+{
+    uint32_t x_offset{0};
+    uint32_t width{0};
+    uint32_t height{0};
+};
+
+static bool build_obj_texture_atlas(const ObjInfo &obj_info,
+                                    const ObjTextureImportData &texture_data,
+                                    std::vector<std::array<Vec2f, 3>> &triangle_uvs,
+                                    std::vector<uint8_t> &triangle_uv_valid,
+                                    std::vector<uint8_t> &atlas_rgba,
+                                    uint32_t &atlas_width,
+                                    uint32_t &atlas_height)
+{
+    atlas_rgba.clear();
+    atlas_width  = 0;
+    atlas_height = 0;
+
+    if (texture_data.textures.empty())
+        return false;
+    if (triangle_uvs.size() != obj_info.triangle_uvs.size() || triangle_uv_valid.size() != obj_info.triangle_uvs_valid.size())
+        return false;
+
+    std::vector<ObjTextureAtlasEntry> placements(texture_data.textures.size());
+    for (size_t i = 0; i < texture_data.textures.size(); ++i) {
+        const ObjTextureImage &texture = texture_data.textures[i];
+        if (texture.width == 0 || texture.height == 0 || texture.rgba.empty())
+            return false;
+        size_t texture_rgba_size = 0;
+        if (!checked_rgba_buffer_size(texture.width, texture.height, texture_rgba_size) ||
+            texture.rgba.size() < texture_rgba_size ||
+            texture.width > std::numeric_limits<uint32_t>::max() - atlas_width)
+            return false;
+
+        placements[i].x_offset = atlas_width;
+        placements[i].width    = texture.width;
+        placements[i].height   = texture.height;
+        atlas_width += texture.width;
+        atlas_height = std::max(atlas_height, texture.height);
+    }
+
+    if (atlas_width == 0 || atlas_height == 0)
+        return false;
+
+    size_t atlas_rgba_size = 0;
+    if (!checked_rgba_buffer_size(atlas_width, atlas_height, atlas_rgba_size))
+        return false;
+
+    atlas_rgba.assign(atlas_rgba_size, uint8_t(0));
+    for (size_t i = 0; i < texture_data.textures.size(); ++i) {
+        const ObjTextureImage      &texture = texture_data.textures[i];
+        const ObjTextureAtlasEntry &entry   = placements[i];
+        for (uint32_t y = 0; y < texture.height; ++y) {
+            const size_t src_off = size_t(y) * size_t(texture.width) * 4;
+            const size_t dst_off = (size_t(y) * size_t(atlas_width) + size_t(entry.x_offset)) * 4;
+            std::copy(texture.rgba.begin() + src_off,
+                      texture.rgba.begin() + src_off + size_t(texture.width) * 4,
+                      atlas_rgba.begin() + dst_off);
+        }
+    }
+
+    auto wrap_uv = [](float value) {
+        if (!std::isfinite(value))
+            return 0.f;
+
+        constexpr float k_uv_epsilon = 1e-6f;
+        if (value >= -k_uv_epsilon && value <= 1.f + k_uv_epsilon)
+            return std::clamp(value, 0.f, 1.f);
+
+        const float wrapped = value - std::floor(value);
+        return wrapped < 0.f ? wrapped + 1.f : wrapped;
+    };
+
+    auto remap_uv = [&wrap_uv, &atlas_width, &atlas_height](const Vec2f &uv, const ObjTextureAtlasEntry &entry) {
+        const float u = wrap_uv(uv.x());
+        const float v = wrap_uv(uv.y());
+        return Vec2f((float(entry.x_offset) + u * float(entry.width)) / float(atlas_width),
+                     v * float(entry.height) / float(atlas_height));
+    };
+
+    bool has_any_textured_triangle = false;
+    for (size_t tri_idx = 0; tri_idx < triangle_uvs.size(); ++tri_idx) {
+        triangle_uv_valid[tri_idx] = 0;
+        if (obj_info.triangle_uvs_valid[tri_idx] == 0)
+            continue;
+
+        size_t texture_idx = size_t(-1);
+        const auto face_to_texture = obj_info.uv_map_pngs.find(int(tri_idx));
+        if (face_to_texture != obj_info.uv_map_pngs.end() && !face_to_texture->second.empty()) {
+            const auto texture_it = texture_data.map_kd_to_texture_idx.find(face_to_texture->second);
+            if (texture_it != texture_data.map_kd_to_texture_idx.end())
+                texture_idx = texture_it->second;
+        }
+
+        if (texture_idx == size_t(-1) && texture_data.textures.size() == 1)
+            texture_idx = 0;
+        if (texture_idx == size_t(-1))
+            continue;
+
+        const ObjTextureAtlasEntry &entry = placements[texture_idx];
+        triangle_uvs[tri_idx][0]          = remap_uv(triangle_uvs[tri_idx][0], entry);
+        triangle_uvs[tri_idx][1]          = remap_uv(triangle_uvs[tri_idx][1], entry);
+        triangle_uvs[tri_idx][2]          = remap_uv(triangle_uvs[tri_idx][2], entry);
+        triangle_uv_valid[tri_idx]        = 1;
+        has_any_textured_triangle         = true;
+    }
+
+    if (!has_any_textured_triangle) {
+        atlas_rgba.clear();
+        atlas_width  = 0;
+        atlas_height = 0;
+        return false;
+    }
+
+    return true;
+}
+
+}
+
 Model& Model::assign_copy(const Model &rhs)
 {
     this->copy_id(rhs);
@@ -251,7 +725,8 @@ Model Model::read_from_file(const std::string&                                  
                             ImportstlProgressFn                                 stlFn,
                             BBLProject *                                        project,
                             int                                                 plate_id,
-                            ObjImportColorFn                                    objFn)
+                            ObjImportColorFn                                    objFn,
+                            ObjImportModeFn                                     objModeFn)
 {
     Model model;
 
@@ -283,30 +758,115 @@ Model Model::read_from_file(const std::string&                                  
         ObjInfo                 obj_info;
         result = load_obj(input_file.c_str(), &model, obj_info, message);
         if (result){
-            ObjDialogInOut in_out;
-            in_out.model = &model;
-            in_out.lost_material_name = obj_info.lost_material_name;
-            if (obj_info.vertex_colors.size() > 0) {
-                if (objFn) { // 1.result is ok and pop up a dialog
-                    in_out.input_colors      = std::move(obj_info.vertex_colors);
+            if (!message.empty())
+                BOOST_LOG_TRIVIAL(error) << message;
+
+            const ObjTextureImportData texture_import_data = load_obj_albedo_textures(input_file, obj_info);
+            const bool has_valid_texture_uvs = std::any_of(obj_info.triangle_uvs_valid.begin(), obj_info.triangle_uvs_valid.end(), [](uint8_t uv_valid) {
+                return uv_valid != 0;
+            });
+            const ObjImportCapabilities capabilities{
+                !obj_info.vertex_colors.empty(),
+                !obj_info.face_colors.empty(),
+                obj_info.is_single_mtl,
+                texture_import_data.textures.size(),
+                has_valid_texture_uvs
+            };
+            const bool has_mode_selection = bool(objModeFn);
+            ObjImportMode import_mode = ObjImportMode::UseDefault;
+            const bool has_usable_uv_texture_data = capabilities.texture_count > 0 && capabilities.has_valid_texture_uvs;
+            if (has_mode_selection) {
+                import_mode = objModeFn(capabilities);
+                if (import_mode == ObjImportMode::UseDefault)
+                    import_mode = has_usable_uv_texture_data ? ObjImportMode::ImportTextures : ObjImportMode::ImportPaintedRegions;
+            }
+
+            if (model.objects.size() == 1) {
+                ModelObject *obj = model.objects.front();
+                if (obj != nullptr && obj->volumes.size() == 1 && obj->volumes.front() != nullptr) {
+                    ModelVolume *volume = obj->volumes.front();
+
+                    volume->imported_vertex_colors_rgba.clear();
+                    volume->imported_texture_uvs_per_face.clear();
+                    volume->imported_texture_uv_valid.clear();
+                    volume->imported_texture_rgba.clear();
+                    volume->imported_texture_width = 0;
+                    volume->imported_texture_height = 0;
+                    bool has_imported_usable_uv_texture_data = false;
+
+                    const size_t triangle_count = volume->mesh().its.indices.size();
+                    if (triangle_count == obj_info.triangle_uvs.size() && triangle_count == obj_info.triangle_uvs_valid.size()) {
+                        std::vector<std::array<Vec2f, 3>> triangle_uvs = obj_info.triangle_uvs;
+                        std::vector<uint8_t> triangle_uv_valid = obj_info.triangle_uvs_valid;
+
+                        const bool import_textures = has_mode_selection ?
+                            (import_mode == ObjImportMode::ImportTextures) :
+                            true;
+
+                        if (import_textures) {
+                            std::vector<uint8_t> atlas_rgba;
+                            uint32_t atlas_width = 0;
+                            uint32_t atlas_height = 0;
+                            if (build_obj_texture_atlas(obj_info, texture_import_data, triangle_uvs, triangle_uv_valid, atlas_rgba, atlas_width, atlas_height)) {
+                                volume->imported_texture_uvs_per_face.reserve(triangle_count * 6);
+                                volume->imported_texture_uv_valid.reserve(triangle_count);
+                                bool has_any_valid_uv_face = false;
+                                for (size_t face_idx = 0; face_idx < triangle_count; ++face_idx) {
+                                    const std::array<Vec2f, 3> &uv = triangle_uvs[face_idx];
+                                    volume->imported_texture_uvs_per_face.emplace_back(uv[0].x());
+                                    volume->imported_texture_uvs_per_face.emplace_back(uv[0].y());
+                                    volume->imported_texture_uvs_per_face.emplace_back(uv[1].x());
+                                    volume->imported_texture_uvs_per_face.emplace_back(uv[1].y());
+                                    volume->imported_texture_uvs_per_face.emplace_back(uv[2].x());
+                                    volume->imported_texture_uvs_per_face.emplace_back(uv[2].y());
+                                    volume->imported_texture_uv_valid.emplace_back(triangle_uv_valid[face_idx]);
+                                    has_any_valid_uv_face = has_any_valid_uv_face || (triangle_uv_valid[face_idx] != 0);
+                                }
+                                volume->imported_texture_width = atlas_width;
+                                volume->imported_texture_height = atlas_height;
+                                volume->imported_texture_rgba = std::move(atlas_rgba);
+                                has_imported_usable_uv_texture_data = has_any_valid_uv_face;
+                            }
+                        }
+                    }
+
+                    const bool import_vertex_colors = has_mode_selection ?
+                        (import_mode == ObjImportMode::ImportPaintedRegions ||
+                         (import_mode == ObjImportMode::ImportTextures && !has_imported_usable_uv_texture_data)) :
+                        true;
+                    if (import_vertex_colors && volume->mesh().its.vertices.size() == obj_info.vertex_colors.size()) {
+                        volume->imported_vertex_colors_rgba.reserve(obj_info.vertex_colors.size());
+                        for (const RGBA &color : obj_info.vertex_colors) {
+                            const uint32_t r = uint32_t(std::lround(std::clamp(color[0], 0.f, 1.f) * 255.f)) & 0xFFu;
+                            const uint32_t g = uint32_t(std::lround(std::clamp(color[1], 0.f, 1.f) * 255.f)) & 0xFFu;
+                            const uint32_t b = uint32_t(std::lround(std::clamp(color[2], 0.f, 1.f) * 255.f)) & 0xFFu;
+                            const uint32_t a = uint32_t(std::lround(std::clamp(color[3], 0.f, 1.f) * 255.f)) & 0xFFu;
+                            volume->imported_vertex_colors_rgba.emplace_back((r << 24) | (g << 16) | (b << 8) | a);
+                        }
+                    }
+                }
+            }
+
+            const bool import_painted_regions = has_mode_selection ?
+                (import_mode == ObjImportMode::ImportPaintedRegions) :
+                true;
+
+            if (import_painted_regions && objFn) {
+                ObjDialogInOut in_out;
+                in_out.model = &model;
+                in_out.lost_material_name = obj_info.lost_material_name;
+                if (obj_info.vertex_colors.size() > 0) {
+                    in_out.input_colors      = obj_info.vertex_colors;
                     in_out.is_single_color   = false;
                     in_out.deal_vertex_color = true;
                     objFn(in_out);
-                }
-            } else if (obj_info.face_colors.size() > 0 && obj_info.has_uv_png == false) { // mtl file
-                if (objFn) { // 1.result is ok and pop up a dialog
-                    in_out.input_colors      = std::move(obj_info.face_colors);
+                } else if (obj_info.face_colors.size() > 0) {
+                    in_out.input_colors      = obj_info.face_colors;
                     in_out.is_single_color   = obj_info.is_single_mtl;
                     in_out.deal_vertex_color = false;
                     objFn(in_out);
                 }
-            } /*else if (obj_info.has_uv_png && obj_info.uvs.size() > 0) {
-                boost::filesystem::path full_path(input_file);
-                std::string             obj_directory = full_path.parent_path().string();
-                obj_info.obj_dircetory = obj_directory;
-                result = false;
-                message = _L("Importing obj with png function is developing.");
-            }*/
+            }
         }
     }
     else if (boost::algorithm::iends_with(input_file, ".svg"))
@@ -2999,122 +3559,133 @@ static void get_real_filament_id(const unsigned char &id, std::string &result) {
 
 bool Model::obj_import_vertex_color_deal(const std::vector<unsigned char> &vertex_filament_ids, const unsigned char &first_extruder_id, Model *model)
 {
-    if (vertex_filament_ids.size() == 0) {
+    if (model == nullptr || model->objects.size() != 1) {
         return false;
     }
-    // 2.generate mmu_segmentation_facets
-    if (model->objects.size() == 1 ) {
-        auto obj = model->objects[0];
-        obj->config.set("extruder", first_extruder_id);
-        if (obj->volumes.size() == 1) {
-            enum VertexColorCase {
-                _3_SAME_COLOR,
-                _3_DIFF_COLOR,
-                _2_SAME_1_DIFF_COLOR,
-            };
-            auto calc_vertex_color_case = [](const unsigned char &c0, const unsigned char &c1, const unsigned char &c2, VertexColorCase &vertex_color_case,
-                                             unsigned char &iso_index) {
-                if (c0 == c1 && c1 == c2) {
-                    vertex_color_case = VertexColorCase::_3_SAME_COLOR;
-                } else if (c0 != c1 && c1 != c2 && c0 != c2) {
-                    vertex_color_case = VertexColorCase::_3_DIFF_COLOR;
-                } else if (c0 == c1) {
-                    vertex_color_case = _2_SAME_1_DIFF_COLOR;
-                    iso_index         = 2;
-                } else if (c1 == c2) {
-                    vertex_color_case = _2_SAME_1_DIFF_COLOR;
-                    iso_index         = 0;
-                } else if (c0 == c2) {
-                    vertex_color_case = _2_SAME_1_DIFF_COLOR;
-                    iso_index         = 1;
-                } else {
-                    std::cout << "error";
-                }
-            };
-            auto calc_tri_area = [](const Vec3f &v0, const Vec3f &v1, const Vec3f &v2) {
-                return std::abs((v0 - v1).cross(v0 - v2).norm()) / 2;
-            };
-            auto volume = obj->volumes[0];
-            volume->config.set("extruder", first_extruder_id);
-            auto face_count = volume->mesh().its.indices.size();
-            volume->mmu_segmentation_facets.reset();
-            volume->mmu_segmentation_facets.reserve(face_count);
-            if (volume->mesh().its.vertices.size() != vertex_filament_ids.size()) {
-                return false;
-            }
-            for (size_t i = 0; i < volume->mesh().its.indices.size(); i++) {
-                auto face   = volume->mesh().its.indices[i];
-                auto filament_id0 = vertex_filament_ids[face[0]];
-                auto filament_id1 = vertex_filament_ids[face[1]];
-                auto filament_id2 = vertex_filament_ids[face[2]];
-                if (filament_id0 <= 1 && filament_id1 <= 1 && filament_id2 <= 2) {
-                    continue;
-                }
-                VertexColorCase vertex_color_case;
-                unsigned char iso_index;
-                calc_vertex_color_case(filament_id0, filament_id1, filament_id2, vertex_color_case, iso_index);
-                switch (vertex_color_case) {
-                case _3_SAME_COLOR: {
-                    std::string result;
-                    get_real_filament_id(filament_id0, result);
-                    volume->mmu_segmentation_facets.set_triangle_from_string(i, result);
-                    break;
-                }
-                case _3_DIFF_COLOR: {
-                    std::string result0, result1, result2;
-                    get_real_filament_id(filament_id0, result0);
-                    get_real_filament_id(filament_id1, result1);
-                    get_real_filament_id(filament_id2, result2);
+    return obj_import_vertex_color_deal_for_object(vertex_filament_ids, first_extruder_id, model->objects[0]);
+}
 
-                    auto v0 = volume->mesh().its.vertices[face[0]];
-                    auto v1 = volume->mesh().its.vertices[face[1]];
-                    auto v2 = volume->mesh().its.vertices[face[2]];
-                    auto                 dir_0_1  = (v1 - v0).normalized().eval();
-                    auto                 dir_0_2  = (v2 - v0).normalized().eval();
-                    float                sita0    = acos(dir_0_1.dot(dir_0_2));
-                    auto                 dir_1_0  = (-dir_0_1).eval();
-                    auto                 dir_1_2  = (v2 - v1).normalized().eval();
-                    float                sita1    = acos(dir_1_0.dot(dir_1_2));
-                    float                sita2    = PI - sita0 - sita1;
-                    std::array<float, 3> sitas    = {sita0, sita1, sita2};
-                    float                max_sita = sitas[0];
-                    int                  max_sita_vertex_index = 0;
-                    for (size_t j = 1; j < sitas.size(); j++) {
-                        if (sitas[j] > max_sita) {
-                            max_sita_vertex_index = j;
-                            max_sita = sitas[j];
-                        }
-                    }
-                    if (max_sita_vertex_index == 0) {
-                        volume->mmu_segmentation_facets.set_triangle_from_string(i, result0 + result1 + result2 + (result1 + result2 + "5" )+ "3"); //"1C0C2C0C1C13"
-                    } else if (max_sita_vertex_index == 1) {
-                        volume->mmu_segmentation_facets.set_triangle_from_string(i, result0 + result1 + result2 + (result0 + result2 + "9") + "3");
-                    } else{// if (max_sita_vertex_index == 2)
-                        volume->mmu_segmentation_facets.set_triangle_from_string(i, result0 + result1 + result2 + (result1 + result0 + "1") + "3");
-                    }
-                    break;
-                }
-                case _2_SAME_1_DIFF_COLOR: {
-                    std::string result0, result1, result2;
-                    get_real_filament_id(filament_id0, result0);
-                    get_real_filament_id(filament_id1, result1);
-                    get_real_filament_id(filament_id2, result2);
-                    if (iso_index == 0) {
-                        volume->mmu_segmentation_facets.set_triangle_from_string(i, result0 + result1 + result1 + "2");
-                    } else if (iso_index == 1) {
-                        volume->mmu_segmentation_facets.set_triangle_from_string(i, result1 + result0 + result0 + "6");
-                    } else if (iso_index == 2) {
-                        volume->mmu_segmentation_facets.set_triangle_from_string(i, result2 + result0 + result0 + "A");
-                    }
-                    break;
-                }
-                default: break;
+bool Model::obj_import_vertex_color_deal_for_object(const std::vector<unsigned char> &vertex_filament_ids,
+                                                    const unsigned char &first_extruder_id,
+                                                    ModelObject *object)
+{
+    if (vertex_filament_ids.size() == 0 || object == nullptr) {
+        return false;
+    }
+
+    auto obj = object;
+    obj->config.set("extruder", first_extruder_id);
+    if (obj->volumes.size() != 1)
+        return false;
+
+    auto volume = obj->volumes[0];
+    if (volume == nullptr)
+        return false;
+
+    enum VertexColorCase {
+        _3_SAME_COLOR,
+        _3_DIFF_COLOR,
+        _2_SAME_1_DIFF_COLOR,
+    };
+    auto calc_vertex_color_case = [](const unsigned char &c0, const unsigned char &c1, const unsigned char &c2, VertexColorCase &vertex_color_case,
+                                     unsigned char &iso_index) {
+        if (c0 == c1 && c1 == c2) {
+            vertex_color_case = VertexColorCase::_3_SAME_COLOR;
+        } else if (c0 != c1 && c1 != c2 && c0 != c2) {
+            vertex_color_case = VertexColorCase::_3_DIFF_COLOR;
+        } else if (c0 == c1) {
+            vertex_color_case = _2_SAME_1_DIFF_COLOR;
+            iso_index         = 2;
+        } else if (c1 == c2) {
+            vertex_color_case = _2_SAME_1_DIFF_COLOR;
+            iso_index         = 0;
+        } else if (c0 == c2) {
+            vertex_color_case = _2_SAME_1_DIFF_COLOR;
+            iso_index         = 1;
+        } else {
+            std::cout << "error";
+        }
+    };
+    auto calc_tri_area = [](const Vec3f &v0, const Vec3f &v1, const Vec3f &v2) {
+        return std::abs((v0 - v1).cross(v0 - v2).norm()) / 2;
+    };
+    volume->config.set("extruder", first_extruder_id);
+    auto face_count = volume->mesh().its.indices.size();
+    volume->mmu_segmentation_facets.reset();
+    volume->mmu_segmentation_facets.reserve(face_count);
+    if (volume->mesh().its.vertices.size() != vertex_filament_ids.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < volume->mesh().its.indices.size(); i++) {
+        auto face         = volume->mesh().its.indices[i];
+        auto filament_id0 = vertex_filament_ids[face[0]];
+        auto filament_id1 = vertex_filament_ids[face[1]];
+        auto filament_id2 = vertex_filament_ids[face[2]];
+        if (filament_id0 <= 1 && filament_id1 <= 1 && filament_id2 <= 2) {
+            continue;
+        }
+        VertexColorCase vertex_color_case;
+        unsigned char iso_index;
+        calc_vertex_color_case(filament_id0, filament_id1, filament_id2, vertex_color_case, iso_index);
+        switch (vertex_color_case) {
+        case _3_SAME_COLOR: {
+            std::string result;
+            get_real_filament_id(filament_id0, result);
+            volume->mmu_segmentation_facets.set_triangle_from_string(i, result);
+            break;
+        }
+        case _3_DIFF_COLOR: {
+            std::string result0, result1, result2;
+            get_real_filament_id(filament_id0, result0);
+            get_real_filament_id(filament_id1, result1);
+            get_real_filament_id(filament_id2, result2);
+
+            auto v0 = volume->mesh().its.vertices[face[0]];
+            auto v1 = volume->mesh().its.vertices[face[1]];
+            auto v2 = volume->mesh().its.vertices[face[2]];
+            auto                 dir_0_1  = (v1 - v0).normalized().eval();
+            auto                 dir_0_2  = (v2 - v0).normalized().eval();
+            float                sita0    = acos(dir_0_1.dot(dir_0_2));
+            auto                 dir_1_0  = (-dir_0_1).eval();
+            auto                 dir_1_2  = (v2 - v1).normalized().eval();
+            float                sita1    = acos(dir_1_0.dot(dir_1_2));
+            float                sita2    = PI - sita0 - sita1;
+            std::array<float, 3> sitas    = {sita0, sita1, sita2};
+            float                max_sita = sitas[0];
+            int                  max_sita_vertex_index = 0;
+            for (size_t j = 1; j < sitas.size(); j++) {
+                if (sitas[j] > max_sita) {
+                    max_sita_vertex_index = j;
+                    max_sita = sitas[j];
                 }
             }
-            return true;
+            if (max_sita_vertex_index == 0) {
+                volume->mmu_segmentation_facets.set_triangle_from_string(i, result0 + result1 + result2 + (result1 + result2 + "5" )+ "3"); //"1C0C2C0C1C13"
+            } else if (max_sita_vertex_index == 1) {
+                volume->mmu_segmentation_facets.set_triangle_from_string(i, result0 + result1 + result2 + (result0 + result2 + "9") + "3");
+            } else{// if (max_sita_vertex_index == 2)
+                volume->mmu_segmentation_facets.set_triangle_from_string(i, result0 + result1 + result2 + (result1 + result0 + "1") + "3");
+            }
+            break;
+        }
+        case _2_SAME_1_DIFF_COLOR: {
+            std::string result0, result1, result2;
+            get_real_filament_id(filament_id0, result0);
+            get_real_filament_id(filament_id1, result1);
+            get_real_filament_id(filament_id2, result2);
+            if (iso_index == 0) {
+                volume->mmu_segmentation_facets.set_triangle_from_string(i, result0 + result1 + result1 + "2");
+            } else if (iso_index == 1) {
+                volume->mmu_segmentation_facets.set_triangle_from_string(i, result1 + result0 + result0 + "6");
+            } else if (iso_index == 2) {
+                volume->mmu_segmentation_facets.set_triangle_from_string(i, result2 + result0 + result0 + "A");
+            }
+            break;
+        }
+        default: break;
         }
     }
-    return false;
+    return true;
 }
 
 bool Model::obj_import_face_color_deal(const std::vector<unsigned char> &face_filament_ids, const unsigned char &first_extruder_id, Model *model)
@@ -3427,6 +3998,14 @@ void FacetsAnnotation::get_facets(const ModelVolume& mv, std::vector<indexed_tri
     TriangleSelector selector(mv.mesh());
     selector.deserialize(m_data, false);
     selector.get_facets(facets_per_type);
+}
+
+void FacetsAnnotation::get_facet_triangles(const ModelVolume& mv,
+                                           std::vector<std::vector<TriangleSelector::FacetStateTriangle>>& facets_per_type) const
+{
+    TriangleSelector selector(mv.mesh());
+    selector.deserialize(m_data, false);
+    selector.get_facet_triangles(facets_per_type);
 }
 
 void FacetsAnnotation::set_enforcer_block_type_limit(const ModelVolume  &mv,

@@ -142,6 +142,10 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
         "filament_density",
         "filament_cost",
         "filament_notes",
+        "texture_mapping_outer_wall_gradient_global_strength",
+        "texture_mapping_outer_wall_gradient_max_line_width",
+        "texture_mapping_outer_wall_gradient_min_line_width",
+        "texture_mapping_definitions",
         "outer_wall_acceleration",
         "inner_wall_acceleration",
         "initial_layer_acceleration",
@@ -455,9 +459,16 @@ std::vector<unsigned int> Print::object_extruders() const
 
     for (const PrintObject* object : m_objects) {
         const ModelObject* mo = object->model_object();
+        const size_t num_physical = m_config.filament_colour.size();
+        auto resolve_filament_id = [this, num_physical](int filament_id) {
+            if (filament_id > 0 && m_texture_mapping_mgr.is_texture_mapping_zone_id(unsigned(filament_id)))
+                return int(m_texture_mapping_mgr.resolve_zone_component(unsigned(filament_id), num_physical, 0));
+            return filament_id;
+        };
         for (const ModelVolume* mv : mo->volumes) {
             std::vector<int> volume_extruders = mv->get_extruders();
             for (int extruder : volume_extruders) {
+                extruder = resolve_filament_id(extruder);
                 assert(extruder > 0);
                 extruders.push_back(extruder - 1);
             }
@@ -470,6 +481,7 @@ std::vector<unsigned int> Print::object_extruders() const
                 //Don't know why height range always save key "extruder" because of no change(should only save difference)...
                 //Add protection here to avoid overflow
                 auto value = layer_range.second.option("extruder")->getInt();
+                value = resolve_filament_id(value);
                 if (value > 0)
                     extruders.push_back(value - 1);
             }
@@ -522,11 +534,16 @@ std::vector<unsigned int> Print::extruders(bool conside_custom_gcode) const
 
     if (conside_custom_gcode) {
         //BBS
-        int num_extruders = m_config.filament_colour.size();
+        const size_t num_physical = m_config.filament_colour.size();
         if (m_model.plates_custom_gcodes.find(m_model.curr_plate_index) != m_model.plates_custom_gcodes.end()) {
             for (auto item : m_model.plates_custom_gcodes.at(m_model.curr_plate_index).gcodes) {
-                if (item.type == CustomGCode::Type::ToolChange && item.extruder <= num_extruders)
-                    extruders.push_back((unsigned int)(item.extruder - 1));
+                if (item.type != CustomGCode::Type::ToolChange || item.extruder <= 0)
+                    continue;
+                int extruder_id = item.extruder;
+                if (m_texture_mapping_mgr.is_texture_mapping_zone_id(unsigned(extruder_id)))
+                    extruder_id = int(m_texture_mapping_mgr.resolve_zone_component(unsigned(extruder_id), num_physical, 0));
+                if (extruder_id > 0 && extruder_id <= int(num_physical))
+                    extruders.push_back((unsigned int)(extruder_id - 1));
             }
         }
     }

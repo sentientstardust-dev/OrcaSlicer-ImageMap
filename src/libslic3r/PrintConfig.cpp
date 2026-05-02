@@ -2331,6 +2331,13 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionStrings{ "#F2754E" });
 
+    def = this->add("texture_mapping_definitions", coString);
+    def->label = L("Texture mapping definitions");
+    def->tooltip = L("Serialized texture mapping rows.");
+    def->gui_flags = "serialized";
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionString(""));
+
     // PS
     def = this->add("filament_notes", coStrings);
     def->label = L("Filament notes");
@@ -4634,6 +4641,36 @@ void PrintConfigDef::init_fff_params()
     def->min = 1;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionInt(1));
+
+    def = this->add("texture_mapping_outer_wall_gradient_global_strength", coFloat);
+    def->label = L("Outer wall offset gradient global strength");
+    def->category = L("Multimaterial");
+    def->tooltip = L("Global strength multiplier for texture mapping outer wall offset gradients.");
+    def->sidetext = "%";
+    def->min = 0.0;
+    def->max = 100.0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(100.0));
+
+    def = this->add("texture_mapping_outer_wall_gradient_max_line_width", coFloat);
+    def->label = L("Maximum outer wall line width");
+    def->category = L("Multimaterial");
+    def->tooltip = L("Upper bound for external perimeter line width used by texture mapping.");
+    def->sidetext = "mm";
+    def->min = 0.05;
+    def->max = 3.0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.95));
+
+    def = this->add("texture_mapping_outer_wall_gradient_min_line_width", coFloat);
+    def->label = L("Minimum outer wall line width");
+    def->category = L("Multimaterial");
+    def->tooltip = L("Lower bound for external perimeter line width used by texture mapping outer wall gradient effects.");
+    def->sidetext = "mm";
+    def->min = 0.05;
+    def->max = 2.0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.32));
 
     def = this->add("inner_wall_line_width", coFloatOrPercent);
     def->label = L("Inner wall");

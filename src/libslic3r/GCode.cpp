@@ -14,18 +14,24 @@
 #include "GCode/WipeTower.hpp"
 #include "ShortestPath.hpp"
 #include "Print.hpp"
+#include "TextureMapping.hpp"
 #include "Utils.hpp"
 #include "ClipperUtils.hpp"
 #include "libslic3r.h"
 #include "LocalesUtils.hpp"
 #include "libslic3r/format.hpp"
 #include "Time.hpp"
+#include "Color.hpp"
 #include "GCode/ExtrusionProcessor.hpp"
+#include "filament_mixer.h"
+#include <array>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <chrono>
+#include <functional>
 #include <iostream>
+#include <limits>
 #include <math.h>
 #include <stdlib.h>
 #include <string>
@@ -2004,6 +2010,7 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
 
     // BBS
     m_curr_print = print;
+    m_warned_texture_mapping_filament_count_mismatch = false;
 
     GCodeWriter::full_gcode_comment = print->config().gcode_comments;
     CNumericLocalesSetter locales_setter;
@@ -4349,6 +4356,11 @@ LayerResult GCode::process_layer(
     // Either printing all copies of all objects, or just a single copy of a single object.
     assert(single_object_instance_idx == size_t(-1) || layers.size() == 1);
 
+    m_vertex_color_overhang_weight_field_cache.clear();
+    ScopeGuard clear_vertex_color_weight_field_cache([this]() {
+        m_vertex_color_overhang_weight_field_cache.clear();
+    });
+
     // First object, support and raft layer, if available.
     const Layer         *object_layer  = nullptr;
     const SupportLayer  *support_layer = nullptr;
@@ -5603,6 +5615,1462 @@ static std::unique_ptr<EdgeGrid::Grid> calculate_layer_edge_grid(const Layer& la
     return out;
 }
 
+static std::vector<unsigned int> decode_offset_component_ids_for_gcode(const TextureMappingZone &zone, size_t num_physical)
+{
+    std::vector<unsigned int> out;
+    for (const char c : zone.component_ids) {
+        if (c < '1' || c > '9')
+            continue;
+        const unsigned int id = unsigned(c - '0');
+        if (id == 0 || id > num_physical)
+            continue;
+        if (std::find(out.begin(), out.end(), id) == out.end())
+            out.emplace_back(id);
+    }
+
+    if (out.empty()) {
+        if (zone.component_a >= 1 && zone.component_a <= num_physical)
+            out.emplace_back(zone.component_a);
+        if (zone.component_b >= 1 && zone.component_b <= num_physical &&
+            std::find(out.begin(), out.end(), zone.component_b) == out.end()) {
+            out.emplace_back(zone.component_b);
+        }
+    }
+    return out;
+}
+
+static float normalize_angle_deg_for_gcode(float angle)
+{
+    float normalized = std::fmod(angle, 360.f);
+    if (normalized < 0.f)
+        normalized += 360.f;
+    return normalized;
+}
+
+static float angular_distance_deg_for_gcode(float a, float b)
+{
+    const float d = std::abs(normalize_angle_deg_for_gcode(a) - normalize_angle_deg_for_gcode(b));
+    return std::min(d, 360.f - d);
+}
+
+static float angular_distance_cw_deg_for_gcode(float from_deg, float to_deg)
+{
+    float d = normalize_angle_deg_for_gcode(to_deg) - normalize_angle_deg_for_gcode(from_deg);
+    if (d < 0.f)
+        d += 360.f;
+    return d;
+}
+
+static float clamp01f_for_gcode(float v)
+{
+    if (!std::isfinite(v))
+        return 0.f;
+    return std::clamp(v, 0.f, 1.f);
+}
+
+static float extrusion_area_for_width_height_for_gcode(float width_mm, float height_mm)
+{
+    if (!std::isfinite(width_mm) || !std::isfinite(height_mm))
+        return 1e-6f;
+
+    const float safe_width = std::max(0.01f, width_mm);
+    const float safe_height = std::max(0.01f, height_mm);
+    const float area = safe_height * (safe_width - safe_height * (1.f - float(0.25 * PI)));
+    return std::max(1e-6f, area);
+}
+
+static double flow_scale_for_target_width_for_gcode(float base_width_mm, float target_width_mm, float height_mm)
+{
+    if (!std::isfinite(base_width_mm) || !std::isfinite(target_width_mm) || !std::isfinite(height_mm))
+        return 1.0;
+
+    const float base_area = extrusion_area_for_width_height_for_gcode(base_width_mm, height_mm);
+    const float target_area = extrusion_area_for_width_height_for_gcode(target_width_mm, height_mm);
+    if (!std::isfinite(base_area) || base_area <= 0.f || !std::isfinite(target_area))
+        return 1.0;
+
+    return std::clamp(double(target_area / base_area), 0.01, 10.0);
+}
+
+static double bbox_distance_sq_to_point_for_gcode(const BoundingBox &bbox, const Point &point)
+{
+    if (!bbox.defined)
+        return 0.0;
+
+    double dx = 0.0;
+    if (point.x() < bbox.min.x())
+        dx = double(bbox.min.x() - point.x());
+    else if (point.x() > bbox.max.x())
+        dx = double(point.x() - bbox.max.x());
+
+    double dy = 0.0;
+    if (point.y() < bbox.min.y())
+        dy = double(bbox.min.y() - point.y());
+    else if (point.y() > bbox.max.y())
+        dy = double(point.y() - bbox.max.y());
+
+    return dx * dx + dy * dy;
+}
+
+static bool find_nearest_layer_slice_boundary_point_for_gcode(const Layer *layer, const Point &query_point, Point &nearest_point)
+{
+    if (layer == nullptr || layer->lslices.empty())
+        return false;
+
+    const bool has_slice_bboxes = layer->lslices_bboxes.size() == layer->lslices.size();
+    double best_distance_sq = std::numeric_limits<double>::max();
+    bool found = false;
+
+    for (size_t slice_idx = 0; slice_idx < layer->lslices.size(); ++slice_idx) {
+        const ExPolygon &slice = layer->lslices[slice_idx];
+        if (slice.empty())
+            continue;
+
+        if (has_slice_bboxes && layer->lslices_bboxes[slice_idx].defined) {
+            const double bbox_distance_sq = bbox_distance_sq_to_point_for_gcode(layer->lslices_bboxes[slice_idx], query_point);
+            if (bbox_distance_sq > best_distance_sq)
+                continue;
+        }
+
+        const Point projected = slice.point_projection(query_point);
+        const double projected_distance_sq = (projected - query_point).cast<double>().squaredNorm();
+        if (projected_distance_sq < best_distance_sq) {
+            best_distance_sq = projected_distance_sq;
+            nearest_point = projected;
+            found = true;
+        }
+    }
+
+    return found;
+}
+
+static void choose_segment_outward_normal_from_reference_for_gcode(double reference_x,
+                                                                   double reference_y,
+                                                                   double n0x,
+                                                                   double n0y,
+                                                                   double n1x,
+                                                                   double n1y,
+                                                                   double &outward_x,
+                                                                   double &outward_y)
+{
+    const double dot0 = n0x * reference_x + n0y * reference_y;
+    const double dot1 = n1x * reference_x + n1y * reference_y;
+    if (dot1 > dot0) {
+        outward_x = n1x;
+        outward_y = n1y;
+    } else {
+        outward_x = n0x;
+        outward_y = n0y;
+    }
+}
+
+static void resolve_segment_shift_outward_normal_for_gcode(const Layer *layer,
+                                                           const Point &mid_point,
+                                                           double       dx,
+                                                           double       dy,
+                                                           double       len,
+                                                           double       fallback_reference_x,
+                                                           double       fallback_reference_y,
+                                                           double      &outward_x,
+                                                           double      &outward_y)
+{
+    const double n0x = dy / len;
+    const double n0y = -dx / len;
+    const double n1x = -n0x;
+    const double n1y = -n0y;
+
+    Point nearest_boundary_point;
+    if (find_nearest_layer_slice_boundary_point_for_gcode(layer, mid_point, nearest_boundary_point)) {
+        const double boundary_x = double(nearest_boundary_point.x()) - double(mid_point.x());
+        const double boundary_y = double(nearest_boundary_point.y()) - double(mid_point.y());
+        const double boundary_len2 = boundary_x * boundary_x + boundary_y * boundary_y;
+        if (boundary_len2 > 1e-6) {
+            const double boundary_len = std::sqrt(boundary_len2);
+            const double normal_alignment = std::abs(n0x * boundary_x + n0y * boundary_y) / std::max(boundary_len, 1e-9);
+            if (normal_alignment >= 0.25) {
+                choose_segment_outward_normal_from_reference_for_gcode(boundary_x, boundary_y, n0x, n0y, n1x, n1y, outward_x, outward_y);
+                return;
+            }
+        }
+    }
+
+    const double fallback_len2 = fallback_reference_x * fallback_reference_x + fallback_reference_y * fallback_reference_y;
+    if (fallback_len2 > 1e-6) {
+        choose_segment_outward_normal_from_reference_for_gcode(fallback_reference_x, fallback_reference_y, n0x, n0y, n1x, n1y, outward_x, outward_y);
+        return;
+    }
+
+    outward_x = n0x;
+    outward_y = n0y;
+}
+
+static bool clamped_shift_coord_for_gcode(double direction_component, double shift_scaled, coord_t max_abs_shift, coord_t &out)
+{
+    if (!std::isfinite(direction_component) || !std::isfinite(shift_scaled))
+        return false;
+
+    const double raw = direction_component * shift_scaled;
+    if (!std::isfinite(raw))
+        return false;
+
+    const double max_shift = std::max(0.0, double(max_abs_shift));
+    double clamped = std::clamp(raw, -max_shift, max_shift);
+    clamped = std::clamp(clamped, double(std::numeric_limits<coord_t>::lowest()), double(std::numeric_limits<coord_t>::max()));
+
+    out = coord_t(std::llround(clamped));
+    return true;
+}
+
+static bool is_reasonable_quantized_gcode_point_for_gcode(const Vec2d &p)
+{
+    constexpr double k_abs_coord_limit_mm = 10000.0;
+    return std::isfinite(p(0)) && std::isfinite(p(1)) &&
+           std::abs(p(0)) <= k_abs_coord_limit_mm &&
+           std::abs(p(1)) <= k_abs_coord_limit_mm;
+}
+
+static float repeated_rotation_progress_for_gcode(float progress01, float repeats, bool reverse_repeats)
+{
+    const float p = clamp01f_for_gcode(progress01);
+    const float r = std::max(1.f, repeats);
+    if (r <= 1.f + EPSILON)
+        return p;
+
+    float repeated_pos = p * r;
+    int segment_idx = int(std::floor(repeated_pos));
+    float local = repeated_pos - float(segment_idx);
+
+    if (p >= 1.f - EPSILON) {
+        segment_idx = std::max(0, int(std::ceil(r)) - 1);
+        local = 1.f;
+    }
+
+    if (reverse_repeats && (segment_idx % 2 == 1))
+        local = 1.f - local;
+    return clamp01f_for_gcode(local);
+}
+
+static float offset_fade_factor_for_gcode(int fade_mode, float progress01)
+{
+    const float p = clamp01f_for_gcode(progress01);
+    switch (fade_mode) {
+    case int(TextureMappingZone::OffsetFadeInUp):
+        return p;
+    case int(TextureMappingZone::OffsetFadeOutUp):
+        return 1.f - p;
+    case int(TextureMappingZone::OffsetFadeInOut):
+        return 1.f - std::abs(2.f * p - 1.f);
+    case int(TextureMappingZone::OffsetFadeOutIn):
+        return std::abs(2.f * p - 1.f);
+    case int(TextureMappingZone::OffsetFadeOutInReversed):
+        return 2.f * p - 1.f;
+    default:
+        return 1.f;
+    }
+}
+
+static bool has_explicit_offset_gradient_profile_for_gcode(const TextureMappingZone &zone)
+{
+    return zone.has_custom_offset_settings();
+}
+
+static float overhang_filament_strength_factor_for_gcode(const TextureMappingZone &zone, unsigned int physical_filament_id)
+{
+    if (physical_filament_id == 0)
+        return 1.f;
+
+    const size_t idx = size_t(physical_filament_id - 1);
+    if (idx >= zone.filament_strengths_pct.size())
+        return 1.f;
+
+    const float strength_pct = zone.filament_strengths_pct[idx];
+    if (!std::isfinite(strength_pct))
+        return 1.f;
+
+    return std::clamp(strength_pct / 100.f, 0.f, 1.f);
+}
+
+static float overhang_filament_minimum_offset_factor_for_gcode(const TextureMappingZone &zone, unsigned int physical_filament_id)
+{
+    if (physical_filament_id == 0)
+        return 0.f;
+
+    const size_t idx = size_t(physical_filament_id - 1);
+    if (idx >= zone.filament_minimum_offsets_pct.size())
+        return 0.f;
+
+    const float minimum_offset_pct = zone.filament_minimum_offsets_pct[idx];
+    if (!std::isfinite(minimum_offset_pct))
+        return 0.f;
+
+    return std::clamp(minimum_offset_pct / 100.f, 0.f, 1.f);
+}
+
+static float variable_width_delta_for_overhang_range_for_gcode(float inset_strength,
+                                                               float max_width_delta_limit_mm,
+                                                               float minimum_offset_factor,
+                                                               float strength_factor)
+{
+    if (!std::isfinite(max_width_delta_limit_mm) || max_width_delta_limit_mm <= 0.f)
+        return 0.f;
+
+    const float desired_width_factor = 1.f - std::clamp(inset_strength, 0.f, 1.f);
+    const float min_width_factor = std::clamp(minimum_offset_factor, 0.f, 1.f);
+    const float adjusted_width_factor =
+        min_width_factor + desired_width_factor * std::clamp(strength_factor, 0.f, 1.f) * (1.f - min_width_factor);
+
+    return std::clamp(max_width_delta_limit_mm * (1.f - adjusted_width_factor), 0.f, max_width_delta_limit_mm);
+}
+
+static float nonlinear_visibility_width_factor_for_gcode(float desired_width_factor,
+                                                         float layer_height_mm,
+                                                         float stair_step_mm,
+                                                         float max_width_delta_limit_mm,
+                                                         float sagging_ratio)
+{
+    const float r = clamp01f_for_gcode(desired_width_factor);
+    if (!std::isfinite(layer_height_mm) ||
+        !std::isfinite(stair_step_mm) ||
+        !std::isfinite(max_width_delta_limit_mm) ||
+        layer_height_mm <= EPSILON ||
+        max_width_delta_limit_mm <= EPSILON)
+        return r;
+
+    if (r <= EPSILON || r >= 1.f - EPSILON)
+        return r;
+    if (std::abs(r - 0.5f) <= 1e-5f)
+        return 0.5f;
+
+    const float h = std::max(0.01f, layer_height_mm);
+    const float d = std::max(0.f, stair_step_mm);
+    const float diag = std::hypot(h, d);
+    if (!std::isfinite(diag) || diag <= EPSILON)
+        return r;
+
+    const float symmetric_r = std::min(r, 1.f - r);
+    const float direction = r >= 0.5f ? 1.f : -1.f;
+    const float sin_n = std::clamp(d / diag, 0.f, 1.f);
+    const float cos_n = std::clamp(h / diag, 1e-4f, 1.f);
+    const float sin_cos = sin_n * cos_n;
+    float offset_mm = 0.f;
+
+    if (sin_cos > 1e-5f) {
+        offset_mm = (0.5f - symmetric_r) * h / sin_cos;
+        if (2.f * std::abs(offset_mm) <= d + EPSILON)
+            return std::clamp(0.5f + direction * offset_mm / max_width_delta_limit_mm, 0.f, 1.f);
+    }
+
+    const float effective_sagging_ratio =
+        std::max(2.f, std::isfinite(sagging_ratio) && sagging_ratio > EPSILON ? sagging_ratio : 2.f);
+    const float cx = std::clamp(1.f - std::sqrt(2.f) / effective_sagging_ratio, 0.f, 0.95f);
+    const float c = (1.f - cx) * (1.f - cx);
+    const float safe_cos = std::max(cos_n, 1e-4f);
+    const float tan_n = sin_n / safe_cos;
+    const float a = -0.5f * c * (1.f + sin_n) / std::max(h * diag, 1e-6f);
+    const float b = 0.5f * (c * tan_n * (1.f + sin_n) + 2.f * cos_n * (cx - 1.f)) / std::max(diag, 1e-6f);
+    const float q = c * 0.25f * tan_n * (1.f + sin_n) - cx * cos_n;
+    const float cc = 0.5f - 0.5f * cos_n * q - symmetric_r;
+    const float det = std::max(0.f, b * b - 4.f * a * cc);
+    if (std::abs(a) > 1e-8f) {
+        offset_mm = (-b - std::sqrt(det)) / (2.f * a);
+        if (!std::isfinite(offset_mm) || offset_mm < 0.f)
+            offset_mm = (-b + std::sqrt(det)) / (2.f * a);
+    }
+    if (!std::isfinite(offset_mm) || offset_mm < 0.f) {
+        if (sin_cos > 1e-5f)
+            offset_mm = (0.5f - symmetric_r) * h / sin_cos;
+        else
+            offset_mm = max_width_delta_limit_mm;
+    }
+
+    return std::clamp(0.5f + direction * offset_mm / max_width_delta_limit_mm, 0.f, 1.f);
+}
+
+static float variable_width_delta_for_visibility_range_for_gcode(float inset_strength,
+                                                                 float max_width_delta_limit_mm,
+                                                                 float minimum_offset_factor,
+                                                                 float strength_factor,
+                                                                 bool  nonlinear_offset_adjustment,
+                                                                 float layer_height_mm,
+                                                                 float stair_step_mm,
+                                                                 float sagging_ratio)
+{
+    if (!std::isfinite(max_width_delta_limit_mm) || max_width_delta_limit_mm <= 0.f)
+        return 0.f;
+
+    float desired_width_factor = 1.f - std::clamp(inset_strength, 0.f, 1.f);
+    if (nonlinear_offset_adjustment)
+        desired_width_factor = nonlinear_visibility_width_factor_for_gcode(desired_width_factor,
+                                                                           layer_height_mm,
+                                                                           stair_step_mm,
+                                                                           max_width_delta_limit_mm,
+                                                                           sagging_ratio);
+
+    const float min_width_factor = std::clamp(minimum_offset_factor, 0.f, 1.f);
+    const float adjusted_width_factor =
+        min_width_factor + desired_width_factor * std::clamp(strength_factor, 0.f, 1.f) * (1.f - min_width_factor);
+
+    return std::clamp(max_width_delta_limit_mm * (1.f - adjusted_width_factor), 0.f, max_width_delta_limit_mm);
+}
+
+static float local_surface_stair_step_distance_for_gcode(const Layer *layer,
+                                                         const Point &mid_point,
+                                                         double       outward_x,
+                                                         double       outward_y,
+                                                         float        base_outer_width_mm,
+                                                         float        max_allowed_distance_mm)
+{
+    if (layer == nullptr || !std::isfinite(outward_x) || !std::isfinite(outward_y))
+        return std::numeric_limits<float>::quiet_NaN();
+
+    const double half_width_scaled = scale_(0.5 * double(std::max(0.01f, base_outer_width_mm)));
+    const Point current_base_edge(
+        coord_t(std::llround(double(mid_point.x()) + outward_x * half_width_scaled)),
+        coord_t(std::llround(double(mid_point.y()) + outward_y * half_width_scaled)));
+    const float max_local_edge_tangent_delta_mm = std::max(1.0f, base_outer_width_mm * 2.f);
+    const float max_local_edge_normal_delta_mm =
+        std::max(2.0f, base_outer_width_mm * 4.f + 2.f * std::max(0.f, max_allowed_distance_mm));
+    float best_distance_mm = std::numeric_limits<float>::quiet_NaN();
+
+    auto consider_adjacent_layer = [&](const Layer *adjacent_layer) {
+        if (adjacent_layer == nullptr)
+            return;
+
+        Point adjacent_base_edge;
+        if (!find_nearest_layer_slice_boundary_point_for_gcode(adjacent_layer, current_base_edge, adjacent_base_edge))
+            return;
+
+        const double edge_delta_x = double(adjacent_base_edge.x()) - double(current_base_edge.x());
+        const double edge_delta_y = double(adjacent_base_edge.y()) - double(current_base_edge.y());
+        const double edge_distance_scaled = std::hypot(edge_delta_x, edge_delta_y);
+        const double edge_normal_delta_scaled = edge_delta_x * outward_x + edge_delta_y * outward_y;
+        const double edge_tangent_delta_scaled_sq =
+            std::max(0.0, edge_distance_scaled * edge_distance_scaled - edge_normal_delta_scaled * edge_normal_delta_scaled);
+        const float edge_tangent_delta_mm = unscale<float>(std::sqrt(edge_tangent_delta_scaled_sq));
+        if (!std::isfinite(edge_tangent_delta_mm) || edge_tangent_delta_mm > max_local_edge_tangent_delta_mm)
+            return;
+
+        const float edge_normal_delta_mm = std::abs(unscale<float>(edge_normal_delta_scaled));
+        if (!std::isfinite(edge_normal_delta_mm) || edge_normal_delta_mm > max_local_edge_normal_delta_mm)
+            return;
+
+        if (!std::isfinite(best_distance_mm) || edge_normal_delta_mm < best_distance_mm)
+            best_distance_mm = edge_normal_delta_mm;
+    };
+
+    consider_adjacent_layer(layer->upper_layer);
+    consider_adjacent_layer(layer->lower_layer);
+    return best_distance_mm;
+}
+
+static bool is_horizontal_overhang_gradient_row_for_gcode(const TextureMappingZone &zone)
+{
+    return zone.enabled && !zone.deleted && (zone.is_2d_gradient() || zone.is_image_texture());
+}
+
+static bool is_vertex_color_match_overhang_row_for_gcode(const TextureMappingZone &zone)
+{
+    return zone.enabled && !zone.deleted && zone.is_image_texture();
+}
+
+static bool is_2d_offset_gradient_row_for_gcode(const TextureMappingZone &zone)
+{
+    return zone.enabled && !zone.deleted && zone.is_2d_gradient();
+}
+
+static std::array<float, 4> unpack_rgba_u32(uint32_t packed_rgba)
+{
+    const float r = float((packed_rgba >> 24) & 0xFFu) / 255.f;
+    const float g = float((packed_rgba >> 16) & 0xFFu) / 255.f;
+    const float b = float((packed_rgba >> 8) & 0xFFu) / 255.f;
+    const float a = float(packed_rgba & 0xFFu) / 255.f;
+    return { clamp01f_for_gcode(r), clamp01f_for_gcode(g), clamp01f_for_gcode(b), clamp01f_for_gcode(a) };
+}
+
+static std::array<float, 3> mix_component_colors_with_filament_mixer_for_gcode(const std::vector<std::array<float, 3>> &component_colors,
+                                                                               const std::vector<int>                  &weights)
+{
+    if (component_colors.empty() || component_colors.size() != weights.size())
+        return { 0.f, 0.f, 0.f };
+
+    bool  has_base = false;
+    float out_r = 0.f;
+    float out_g = 0.f;
+    float out_b = 0.f;
+    int   accumulated = 0;
+    for (size_t i = 0; i < component_colors.size(); ++i) {
+        const int weight = std::max(0, weights[i]);
+        if (weight == 0)
+            continue;
+
+        if (!has_base) {
+            out_r = component_colors[i][0];
+            out_g = component_colors[i][1];
+            out_b = component_colors[i][2];
+            accumulated = weight;
+            has_base = true;
+            continue;
+        }
+
+        const float t = float(weight) / float(std::max(1, accumulated + weight));
+        float mixed_r = out_r;
+        float mixed_g = out_g;
+        float mixed_b = out_b;
+        filament_mixer_lerp_float(out_r, out_g, out_b,
+                                  component_colors[i][0], component_colors[i][1], component_colors[i][2],
+                                  t,
+                                  &mixed_r, &mixed_g, &mixed_b);
+        out_r = clamp01f_for_gcode(mixed_r);
+        out_g = clamp01f_for_gcode(mixed_g);
+        out_b = clamp01f_for_gcode(mixed_b);
+        accumulated += weight;
+    }
+
+    if (!has_base)
+        return component_colors.front();
+    return { out_r, out_g, out_b };
+}
+
+static std::vector<float> best_component_mix_weights_for_target_for_gcode(const std::vector<std::array<float, 3>> &component_colors,
+                                                                          const std::array<float, 3>              &target_rgb)
+{
+    if (component_colors.empty())
+        return {};
+    if (component_colors.size() == 1)
+        return { 1.f };
+
+    const size_t component_count = component_colors.size();
+    const int total_units = component_count <= 4 ? 20 : (component_count <= 6 ? 10 : 6);
+    std::vector<int> units(component_count, 0);
+    std::vector<int> best_units(component_count, 0);
+    float            best_error = std::numeric_limits<float>::max();
+
+    std::function<void(size_t, int)> recurse = [&](size_t idx, int remaining_units) {
+        if (idx + 1 == component_count) {
+            units[idx] = remaining_units;
+            const std::array<float, 3> mixed = mix_component_colors_with_filament_mixer_for_gcode(component_colors, units);
+            const float dr = mixed[0] - target_rgb[0];
+            const float dg = mixed[1] - target_rgb[1];
+            const float db = mixed[2] - target_rgb[2];
+            const float error = dr * dr + dg * dg + db * db;
+            if (error < best_error) {
+                best_error = error;
+                best_units = units;
+            }
+            return;
+        }
+
+        for (int u = 0; u <= remaining_units; ++u) {
+            units[idx] = u;
+            recurse(idx + 1, remaining_units - u);
+        }
+    };
+    recurse(0, total_units);
+
+    std::vector<float> weights(component_count, 0.f);
+    for (size_t i = 0; i < component_count; ++i)
+        weights[i] = float(best_units[i]) / float(std::max(1, total_units));
+    return weights;
+}
+
+static float apply_texture_tone_gamma_for_gcode(float channel, float tone_gamma)
+{
+    const float safe_channel = clamp01f_for_gcode(channel);
+    const float safe_gamma =
+        (!std::isfinite(tone_gamma) || tone_gamma <= 0.f) ? 1.f : std::clamp(tone_gamma, 0.5f, 3.f);
+    if (std::abs(safe_gamma - 1.f) <= 1e-5f)
+        return safe_channel;
+    return clamp01f_for_gcode(std::pow(safe_channel, 1.f / safe_gamma));
+}
+
+static void apply_texture_contrast_to_mapped_components_for_gcode(std::vector<float> &component_weights,
+                                                                  float               contrast_factor,
+                                                                  size_t              mapped_component_count)
+{
+    const size_t count = std::min(mapped_component_count, component_weights.size());
+    if (count == 0)
+        return;
+
+    float mean_weight = 0.f;
+    for (size_t idx = 0; idx < count; ++idx)
+        mean_weight += clamp01f_for_gcode(component_weights[idx]);
+    mean_weight /= float(count);
+
+    for (size_t idx = 0; idx < count; ++idx) {
+        const float safe_weight = clamp01f_for_gcode(component_weights[idx]);
+        component_weights[idx] = clamp01f_for_gcode(mean_weight + (safe_weight - mean_weight) * contrast_factor);
+    }
+}
+
+static float wrap_repeat01_for_gcode(float uv)
+{
+    if (!std::isfinite(uv))
+        return 0.f;
+
+    constexpr float k_uv_epsilon = 1e-6f;
+    if (uv >= -k_uv_epsilon && uv <= 1.f + k_uv_epsilon)
+        return std::clamp(uv, 0.f, 1.f);
+
+    float wrapped = uv - std::floor(uv);
+    if (wrapped < 0.f)
+        wrapped += 1.f;
+    return wrapped;
+}
+
+static std::array<float, 4> sample_texture_rgba_bilinear_for_gcode(const std::vector<uint8_t> &rgba,
+                                                                    uint32_t                     width,
+                                                                    uint32_t                     height,
+                                                                    float                        u,
+                                                                    float                        v)
+{
+    if (width == 0 || height == 0 || rgba.size() < size_t(width) * size_t(height) * 4)
+        return { 0.f, 0.f, 0.f, 1.f };
+
+    const float uu = wrap_repeat01_for_gcode(u);
+    const float vv = wrap_repeat01_for_gcode(v);
+
+    const float x = uu * float(width > 1 ? width - 1 : 0);
+    const float y = vv * float(height > 1 ? height - 1 : 0);
+    const size_t x0 = std::min<size_t>(size_t(std::floor(x)), size_t(width - 1));
+    const size_t y0 = std::min<size_t>(size_t(std::floor(y)), size_t(height - 1));
+    const size_t x1 = std::min<size_t>(x0 + 1, size_t(width - 1));
+    const size_t y1 = std::min<size_t>(y0 + 1, size_t(height - 1));
+    const float tx = x - float(x0);
+    const float ty = y - float(y0);
+
+    auto sample_channel = [&rgba, width](size_t sx, size_t sy, size_t channel) {
+        const size_t idx = (sy * size_t(width) + sx) * 4 + channel;
+        return float(rgba[idx]) / 255.f;
+    };
+
+    std::array<float, 4> out{};
+    for (size_t c = 0; c < 4; ++c) {
+        const float c00 = sample_channel(x0, y0, c);
+        const float c10 = sample_channel(x1, y0, c);
+        const float c01 = sample_channel(x0, y1, c);
+        const float c11 = sample_channel(x1, y1, c);
+        const float cx0 = c00 + (c10 - c00) * tx;
+        const float cx1 = c01 + (c11 - c01) * tx;
+        out[c] = clamp01f_for_gcode(cx0 + (cx1 - cx0) * ty);
+    }
+    return out;
+}
+
+static std::array<Vec2f, 3> unwrap_triangle_uvs_for_sampling_for_gcode(const Vec2f &uv0,
+                                                                        const Vec2f &uv1,
+                                                                        const Vec2f &uv2)
+{
+    std::array<Vec2f, 3> out { uv0, uv1, uv2 };
+
+    auto unwrap_axis = [&out](bool use_u_axis) {
+        float values[3] = {
+            use_u_axis ? out[0].x() : out[0].y(),
+            use_u_axis ? out[1].x() : out[1].y(),
+            use_u_axis ? out[2].x() : out[2].y()
+        };
+        const float v_min = std::min({ values[0], values[1], values[2] });
+        const float v_max = std::max({ values[0], values[1], values[2] });
+        if (v_max - v_min <= 0.5f)
+            return;
+
+        for (size_t i = 0; i < 3; ++i) {
+            if (values[i] < 0.5f)
+                values[i] += 1.f;
+        }
+
+        if (use_u_axis) {
+            out[0].x() = values[0];
+            out[1].x() = values[1];
+            out[2].x() = values[2];
+        } else {
+            out[0].y() = values[0];
+            out[1].y() = values[1];
+            out[2].y() = values[2];
+        }
+    };
+
+    unwrap_axis(true);
+    unwrap_axis(false);
+    return out;
+}
+
+static float color_distance_sq_for_gcode(const std::array<float, 3> &lhs, const std::array<float, 3> &rhs)
+{
+    const float dr = lhs[0] - rhs[0];
+    const float dg = lhs[1] - rhs[1];
+    const float db = lhs[2] - rhs[2];
+    return dr * dr + dg * dg + db * db;
+}
+
+static std::vector<size_t> best_matching_component_indices_for_semantic_colors_for_gcode(
+    const std::vector<std::array<float, 3>> &component_colors,
+    const std::vector<std::array<float, 3>> &semantic_colors)
+{
+    if (component_colors.empty() || component_colors.size() != semantic_colors.size())
+        return {};
+
+    std::vector<size_t> permutation(component_colors.size(), 0);
+    std::iota(permutation.begin(), permutation.end(), size_t(0));
+
+    std::vector<size_t> best_permutation = permutation;
+    float best_error = std::numeric_limits<float>::max();
+    do {
+        float error = 0.f;
+        for (size_t role_idx = 0; role_idx < semantic_colors.size(); ++role_idx)
+            error += color_distance_sq_for_gcode(component_colors[permutation[role_idx]], semantic_colors[role_idx]);
+
+        if (error < best_error) {
+            best_error = error;
+            best_permutation = permutation;
+        }
+    } while (std::next_permutation(permutation.begin(), permutation.end()));
+
+    return best_permutation;
+}
+
+static std::vector<size_t> semantic_component_indices_for_gcode(const std::vector<std::array<float, 3>> &component_colors,
+                                                                int                                       filament_color_mode,
+                                                                bool                                      force_sequential_filaments)
+{
+    if (force_sequential_filaments)
+        return {};
+
+    std::vector<std::array<float, 3>> semantic_colors;
+    switch (filament_color_mode) {
+    case int(TextureMappingZone::FilamentColorRGB):
+        semantic_colors = { { { 1.f, 0.f, 0.f } }, { { 0.f, 1.f, 0.f } }, { { 0.f, 0.f, 1.f } } };
+        break;
+    case int(TextureMappingZone::FilamentColorCMY):
+        semantic_colors = { { { 0.f, 1.f, 1.f } }, { { 1.f, 0.f, 1.f } }, { { 1.f, 1.f, 0.f } } };
+        break;
+    case int(TextureMappingZone::FilamentColorCMYK):
+        semantic_colors = { { { 0.f, 1.f, 1.f } }, { { 1.f, 0.f, 1.f } }, { { 1.f, 1.f, 0.f } }, { { 0.f, 0.f, 0.f } } };
+        break;
+    case int(TextureMappingZone::FilamentColorCMYW):
+        semantic_colors = { { { 0.f, 1.f, 1.f } }, { { 1.f, 0.f, 1.f } }, { { 1.f, 1.f, 0.f } }, { { 1.f, 1.f, 1.f } } };
+        break;
+    case int(TextureMappingZone::FilamentColorRGBK):
+        semantic_colors = { { { 1.f, 0.f, 0.f } }, { { 0.f, 1.f, 0.f } }, { { 0.f, 0.f, 1.f } }, { { 0.f, 0.f, 0.f } } };
+        break;
+    case int(TextureMappingZone::FilamentColorRGBW):
+        semantic_colors = { { { 1.f, 0.f, 0.f } }, { { 0.f, 1.f, 0.f } }, { { 0.f, 0.f, 1.f } }, { { 1.f, 1.f, 1.f } } };
+        break;
+    default:
+        return {};
+    }
+
+    return best_matching_component_indices_for_semantic_colors_for_gcode(component_colors, semantic_colors);
+}
+
+static std::vector<float> optimized_primary_component_weights_for_target_for_gcode(const std::array<float, 3> &target_rgb,
+                                                                                   size_t                      component_count,
+                                                                                   int                         filament_color_mode,
+                                                                                   const std::vector<std::array<float, 3>> &component_colors,
+                                                                                   bool                        force_sequential_filaments)
+{
+    const int clamped_mode = std::clamp(filament_color_mode,
+                                        int(TextureMappingZone::FilamentColorAny),
+                                        int(TextureMappingZone::FilamentColorBW));
+    if (clamped_mode == int(TextureMappingZone::FilamentColorAny))
+        return {};
+
+    auto print_visibility_strength = [](float value) {
+        return clamp01f_for_gcode(std::pow(std::max(0.f, value), 0.85f));
+    };
+
+    const float r = clamp01f_for_gcode(target_rgb[0]);
+    const float g = clamp01f_for_gcode(target_rgb[1]);
+    const float b = clamp01f_for_gcode(target_rgb[2]);
+    const float whiteness = std::min({ r, g, b });
+    const float darkness = 1.f - std::max({ r, g, b });
+
+    auto safe_div = [](float numerator, float denominator) {
+        if (denominator <= EPSILON)
+            return 0.f;
+        return clamp01f_for_gcode(numerator / denominator);
+    };
+
+    const std::vector<size_t> semantic_component_indices =
+        semantic_component_indices_for_gcode(component_colors, clamped_mode, force_sequential_filaments);
+    const auto component_index_for_role = [&semantic_component_indices](size_t role_idx) {
+        if (role_idx < semantic_component_indices.size())
+            return semantic_component_indices[role_idx];
+        return role_idx;
+    };
+
+    std::vector<float> weights(component_count, 0.f);
+    if (clamped_mode == int(TextureMappingZone::FilamentColorRGB)) {
+        if (component_count != 3)
+            return {};
+        weights[component_index_for_role(0)] = print_visibility_strength(target_rgb[0]);
+        weights[component_index_for_role(1)] = print_visibility_strength(target_rgb[1]);
+        weights[component_index_for_role(2)] = print_visibility_strength(target_rgb[2]);
+        return weights;
+    }
+
+    if (clamped_mode == int(TextureMappingZone::FilamentColorCMY)) {
+        if (component_count != 3)
+            return {};
+        weights[component_index_for_role(0)] = print_visibility_strength(1.f - r);
+        weights[component_index_for_role(1)] = print_visibility_strength(1.f - g);
+        weights[component_index_for_role(2)] = print_visibility_strength(1.f - b);
+        return weights;
+    }
+
+    if (clamped_mode == int(TextureMappingZone::FilamentColorBW)) {
+        if (component_count != 2)
+            return {};
+
+        const float gray = clamp01f_for_gcode(0.2126f * r + 0.7152f * g + 0.0722f * b);
+        const float black_strength = gray >= 0.5f ? (2.f * (1.f - gray)) : 1.f;
+        const float white_strength = gray <= 0.5f ? (2.f * gray) : 1.f;
+        size_t black_component_idx = 0;
+        size_t white_component_idx = 1;
+        if (!force_sequential_filaments && component_colors.size() >= 2) {
+            const float lum0 = 0.2126f * component_colors[0][0] + 0.7152f * component_colors[0][1] + 0.0722f * component_colors[0][2];
+            const float lum1 = 0.2126f * component_colors[1][0] + 0.7152f * component_colors[1][1] + 0.0722f * component_colors[1][2];
+            if (lum0 > lum1) {
+                black_component_idx = 1;
+                white_component_idx = 0;
+            }
+        }
+
+        weights[black_component_idx] = print_visibility_strength(black_strength);
+        weights[white_component_idx] = print_visibility_strength(white_strength);
+        return weights;
+    }
+
+    if (component_count != 4)
+        return {};
+
+    if (clamped_mode == int(TextureMappingZone::FilamentColorCMYK)) {
+        const float k = clamp01f_for_gcode(darkness);
+        const float inv = 1.f - k;
+        weights[component_index_for_role(0)] = print_visibility_strength(safe_div(1.f - r - k, inv));
+        weights[component_index_for_role(1)] = print_visibility_strength(safe_div(1.f - g - k, inv));
+        weights[component_index_for_role(2)] = print_visibility_strength(safe_div(1.f - b - k, inv));
+        weights[component_index_for_role(3)] = print_visibility_strength(k);
+        return weights;
+    }
+
+    if (clamped_mode == int(TextureMappingZone::FilamentColorCMYW)) {
+        const float inv = 1.f - whiteness;
+        const float r_no_w = safe_div(r - whiteness, inv);
+        const float g_no_w = safe_div(g - whiteness, inv);
+        const float b_no_w = safe_div(b - whiteness, inv);
+        weights[component_index_for_role(0)] = print_visibility_strength(clamp01f_for_gcode((1.f - r_no_w) * inv));
+        weights[component_index_for_role(1)] = print_visibility_strength(clamp01f_for_gcode((1.f - g_no_w) * inv));
+        weights[component_index_for_role(2)] = print_visibility_strength(clamp01f_for_gcode((1.f - b_no_w) * inv));
+        weights[component_index_for_role(3)] = clamp01f_for_gcode(std::pow(whiteness, 1.35f));
+        return weights;
+    }
+
+    if (clamped_mode == int(TextureMappingZone::FilamentColorRGBK)) {
+        const float k = clamp01f_for_gcode(darkness);
+        const float inv = 1.f - k;
+        weights[component_index_for_role(0)] = print_visibility_strength(safe_div(r - k, inv));
+        weights[component_index_for_role(1)] = print_visibility_strength(safe_div(g - k, inv));
+        weights[component_index_for_role(2)] = print_visibility_strength(safe_div(b - k, inv));
+        weights[component_index_for_role(3)] = print_visibility_strength(k);
+        return weights;
+    }
+
+    if (clamped_mode == int(TextureMappingZone::FilamentColorRGBW)) {
+        const float inv = 1.f - whiteness;
+        weights[component_index_for_role(0)] = print_visibility_strength(safe_div(r - whiteness, inv));
+        weights[component_index_for_role(1)] = print_visibility_strength(safe_div(g - whiteness, inv));
+        weights[component_index_for_role(2)] = print_visibility_strength(safe_div(b - whiteness, inv));
+        weights[component_index_for_role(3)] = print_visibility_strength(whiteness);
+        return weights;
+    }
+
+    return {};
+}
+
+static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(const PrintObject                        &print_object,
+                                                                                const std::vector<std::array<float, 3>> &component_colors,
+                                                                                bool                                      raw_values_mode,
+                                                                                int                                       filament_color_mode,
+                                                                                bool                                      force_sequential_filaments,
+                                                                                float                                     texture_contrast_pct,
+                                                                                float                                     texture_tone_gamma,
+                                                                                bool                                      layer_aware_weighting,
+                                                                                float                                     layer_z_mm,
+                                                                                float                                     layer_z_falloff_mm,
+                                                                                bool                                      high_resolution_texture_sampling)
+{
+    VertexColorOverhangWeightField weight_field;
+    if (component_colors.empty())
+        return weight_field;
+
+    const ModelObject *model_object = print_object.model_object();
+    if (model_object == nullptr)
+        return weight_field;
+
+    const BoundingBox object_bbox = print_object.bounding_box();
+    const float min_x_mm = unscale<float>(object_bbox.min.x());
+    const float min_y_mm = unscale<float>(object_bbox.min.y());
+    const float max_x_mm = unscale<float>(object_bbox.max.x());
+    const float max_y_mm = unscale<float>(object_bbox.max.y());
+    const float span_x_mm = std::max(max_x_mm - min_x_mm, 1e-3f);
+    const float span_y_mm = std::max(max_y_mm - min_y_mm, 1e-3f);
+    if (!std::isfinite(min_x_mm) || !std::isfinite(min_y_mm) ||
+        !std::isfinite(max_x_mm) || !std::isfinite(max_y_mm) ||
+        !std::isfinite(span_x_mm) || !std::isfinite(span_y_mm))
+        return VertexColorOverhangWeightField{};
+
+    const bool use_layer_weighting = layer_aware_weighting && std::isfinite(layer_z_mm);
+    const float safe_layer_z_falloff_mm = std::max(layer_z_falloff_mm, 1e-3f);
+    const float contrast_factor = std::clamp(texture_contrast_pct, 25.f, 300.f) / 100.f;
+    const float tone_gamma =
+        (!std::isfinite(texture_tone_gamma) || texture_tone_gamma <= 0.f) ? 1.f : std::clamp(texture_tone_gamma, 0.5f, 3.f);
+
+    struct WeightedTextureSample {
+        float               x_mm { 0.f };
+        float               y_mm { 0.f };
+        std::array<float, 4> rgba { { 0.f, 0.f, 0.f, 1.f } };
+        float               weight { 0.f };
+    };
+    std::vector<WeightedTextureSample> samples;
+    samples.reserve(8192);
+
+    auto accumulate_sample = [&samples](float x_mm, float y_mm, const std::array<float, 4> &rgba, float sample_weight) {
+        if (!std::isfinite(x_mm) || !std::isfinite(y_mm) || sample_weight <= EPSILON)
+            return;
+        if (!std::isfinite(sample_weight) ||
+            !std::isfinite(rgba[0]) ||
+            !std::isfinite(rgba[1]) ||
+            !std::isfinite(rgba[2]) ||
+            !std::isfinite(rgba[3]))
+            return;
+
+        samples.push_back({ x_mm, y_mm, rgba, sample_weight });
+    };
+
+    const Transform3d object_trafo = print_object.trafo_centered();
+    for (const ModelVolume *volume : model_object->volumes) {
+        if (volume == nullptr)
+            continue;
+
+        const std::shared_ptr<const TriangleMesh> mesh_ptr = volume->mesh_ptr();
+        if (!mesh_ptr)
+            continue;
+
+        const indexed_triangle_set &its = mesh_ptr->its;
+        const Transform3d volume_trafo = object_trafo * volume->get_matrix();
+
+        bool sampled_from_uv_texture = false;
+        const bool has_uv_texture =
+            !volume->imported_texture_rgba.empty() &&
+            volume->imported_texture_width > 0 &&
+            volume->imported_texture_height > 0 &&
+            volume->imported_texture_uv_valid.size() == its.indices.size() &&
+            volume->imported_texture_uvs_per_face.size() >= its.indices.size() * 6 &&
+            volume->imported_texture_rgba.size() >= size_t(volume->imported_texture_width) * size_t(volume->imported_texture_height) * 4;
+
+        if (has_uv_texture) {
+            const auto uv_edge_texel_length = [volume](const Vec2f &a, const Vec2f &b) {
+                const float du = (a.x() - b.x()) * float(volume->imported_texture_width);
+                const float dv = (a.y() - b.y()) * float(volume->imported_texture_height);
+                return std::hypot(du, dv);
+            };
+
+            for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+                if (volume->imported_texture_uv_valid[tri_idx] == 0)
+                    continue;
+
+                const auto &tri = its.indices[tri_idx];
+                if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
+                    continue;
+                if (size_t(tri[0]) >= its.vertices.size() ||
+                    size_t(tri[1]) >= its.vertices.size() ||
+                    size_t(tri[2]) >= its.vertices.size())
+                    continue;
+
+                const Vec3d p0 = volume_trafo * its.vertices[size_t(tri[0])].cast<double>();
+                const Vec3d p1 = volume_trafo * its.vertices[size_t(tri[1])].cast<double>();
+                const Vec3d p2 = volume_trafo * its.vertices[size_t(tri[2])].cast<double>();
+                if (!p0.allFinite() || !p1.allFinite() || !p2.allFinite())
+                    continue;
+
+                const size_t uv_off = tri_idx * 6;
+                const Vec2f uv0(volume->imported_texture_uvs_per_face[uv_off + 0], volume->imported_texture_uvs_per_face[uv_off + 1]);
+                const Vec2f uv1(volume->imported_texture_uvs_per_face[uv_off + 2], volume->imported_texture_uvs_per_face[uv_off + 3]);
+                const Vec2f uv2(volume->imported_texture_uvs_per_face[uv_off + 4], volume->imported_texture_uvs_per_face[uv_off + 5]);
+                if (!uv0.allFinite() || !uv1.allFinite() || !uv2.allFinite())
+                    continue;
+                const std::array<Vec2f, 3> tri_uv = unwrap_triangle_uvs_for_sampling_for_gcode(uv0, uv1, uv2);
+
+                const float max_uv_edge_texel = std::max({
+                    uv_edge_texel_length(tri_uv[0], tri_uv[1]),
+                    uv_edge_texel_length(tri_uv[1], tri_uv[2]),
+                    uv_edge_texel_length(tri_uv[2], tri_uv[0])
+                });
+                const float max_world_edge_mm = std::max({
+                    float((p1 - p0).norm()),
+                    float((p2 - p1).norm()),
+                    float((p0 - p2).norm())
+                });
+                if (!std::isfinite(max_uv_edge_texel) || !std::isfinite(max_world_edge_mm))
+                    continue;
+
+                const float uv_texels_per_step = high_resolution_texture_sampling ? 8.f : 18.f;
+                const float world_sample_pitch_mm = high_resolution_texture_sampling ? 0.08f : 0.16f;
+                const int max_bary_steps = high_resolution_texture_sampling ? 80 : 40;
+                const int uv_steps = std::clamp(int(std::ceil(max_uv_edge_texel / uv_texels_per_step)), 1, max_bary_steps);
+                const int world_steps = std::clamp(int(std::ceil(max_world_edge_mm / world_sample_pitch_mm)), 1, max_bary_steps);
+                const int bary_steps = std::max(uv_steps, world_steps);
+                const int sample_count = bary_steps * (bary_steps + 1) / 2;
+                if (sample_count <= 0)
+                    continue;
+
+                const double tri_area_mm2 = 0.5 * ((p1 - p0).cross(p2 - p0)).norm();
+                if (!std::isfinite(tri_area_mm2))
+                    continue;
+                const float area_weight = std::max(0.05f, float(tri_area_mm2)) / float(sample_count);
+                if (!std::isfinite(area_weight))
+                    continue;
+                const float inv_steps = 1.f / float(bary_steps);
+
+                for (int i = 0; i < bary_steps; ++i) {
+                    for (int j = 0; j < (bary_steps - i); ++j) {
+                        const float b1 = (float(i) + 0.33333334f) * inv_steps;
+                        const float b2 = (float(j) + 0.33333334f) * inv_steps;
+                        const float b0 = 1.f - b1 - b2;
+                        if (b0 < 0.f)
+                            continue;
+
+                        const Vec3d world_pos = p0 * double(b0) + p1 * double(b1) + p2 * double(b2);
+                        const Vec2f uv = tri_uv[0] * b0 + tri_uv[1] * b1 + tri_uv[2] * b2;
+                        std::array<float, 4> rgba = sample_texture_rgba_bilinear_for_gcode(volume->imported_texture_rgba,
+                                                                                            volume->imported_texture_width,
+                                                                                            volume->imported_texture_height,
+                                                                                            uv.x(),
+                                                                                            uv.y());
+                        rgba[3] = 1.f;
+
+                        float sample_weight = area_weight;
+                        if (use_layer_weighting) {
+                            const float dz = std::abs(float(world_pos.z()) - layer_z_mm);
+                            const float z_norm = dz / safe_layer_z_falloff_mm;
+                            const float z_weight = std::exp(-0.5f * z_norm * z_norm);
+                            if (!std::isfinite(z_weight))
+                                continue;
+                            sample_weight *= z_weight;
+                        }
+                        if (sample_weight <= EPSILON)
+                            continue;
+
+                        accumulate_sample(float(world_pos.x()), float(world_pos.y()), rgba, sample_weight);
+                        sampled_from_uv_texture = true;
+                    }
+                }
+            }
+        }
+
+        if (sampled_from_uv_texture)
+            continue;
+
+        if (volume->imported_vertex_colors_rgba.empty())
+            continue;
+        if (its.vertices.size() != volume->imported_vertex_colors_rgba.size())
+            continue;
+
+        for (size_t i = 0; i < its.vertices.size(); ++i) {
+            const Vec3d world_pos = volume_trafo * its.vertices[i].cast<double>();
+            std::array<float, 4> rgba = unpack_rgba_u32(volume->imported_vertex_colors_rgba[i]);
+            rgba[3] = 1.f;
+            float sample_weight = 1.f;
+            if (use_layer_weighting) {
+                const float dz = std::abs(float(world_pos.z()) - layer_z_mm);
+                const float z_norm = dz / safe_layer_z_falloff_mm;
+                const float z_weight = std::exp(-0.5f * z_norm * z_norm);
+                if (!std::isfinite(z_weight))
+                    continue;
+                sample_weight *= z_weight;
+            }
+            if (sample_weight <= EPSILON)
+                continue;
+
+            accumulate_sample(float(world_pos.x()), float(world_pos.y()), rgba, sample_weight);
+        }
+    }
+
+    if (samples.empty())
+        return VertexColorOverhangWeightField{};
+
+    const size_t component_count = component_colors.size();
+    const size_t sample_count = samples.size();
+
+    weight_field.component_count = component_count;
+    weight_field.sample_x_mm.resize(sample_count);
+    weight_field.sample_y_mm.resize(sample_count);
+    weight_field.sample_weight.resize(sample_count);
+    weight_field.sample_component_weights.assign(sample_count * component_count, 0.f);
+
+    std::vector<float> fallback_acc(component_count, 0.f);
+    float fallback_weight = 0.f;
+    for (size_t sample_idx = 0; sample_idx < sample_count; ++sample_idx) {
+        const WeightedTextureSample &sample = samples[sample_idx];
+        if (sample.weight <= EPSILON)
+            continue;
+
+        weight_field.sample_x_mm[sample_idx] = sample.x_mm;
+        weight_field.sample_y_mm[sample_idx] = sample.y_mm;
+        weight_field.sample_weight[sample_idx] = sample.weight;
+
+        std::array<float, 3> target = {
+            clamp01f_for_gcode(sample.rgba[0]),
+            clamp01f_for_gcode(sample.rgba[1]),
+            clamp01f_for_gcode(sample.rgba[2])
+        };
+        if (std::abs(tone_gamma - 1.f) > 1e-5f) {
+            target[0] = apply_texture_tone_gamma_for_gcode(target[0], tone_gamma);
+            target[1] = apply_texture_tone_gamma_for_gcode(target[1], tone_gamma);
+            target[2] = apply_texture_tone_gamma_for_gcode(target[2], tone_gamma);
+        }
+
+        std::vector<float> desired(component_count, 0.f);
+        size_t mapped_component_count = component_count;
+        if (raw_values_mode) {
+            const float channels[3] = { target[0], target[1], target[2] };
+            const size_t channel_count = std::min(component_count, size_t(3));
+            for (size_t channel_idx = 0; channel_idx < channel_count; ++channel_idx)
+                desired[channel_idx] = clamp01f_for_gcode(channels[channel_idx]);
+            mapped_component_count = channel_count;
+        } else {
+            std::vector<float> optimized = optimized_primary_component_weights_for_target_for_gcode(target,
+                                                                                                    component_count,
+                                                                                                    filament_color_mode,
+                                                                                                    component_colors,
+                                                                                                    force_sequential_filaments);
+            if (optimized.size() == component_count)
+                desired = std::move(optimized);
+            else {
+                std::vector<float> best = best_component_mix_weights_for_target_for_gcode(component_colors, target);
+                if (best.size() == component_count)
+                    desired = std::move(best);
+            }
+        }
+
+        if (std::abs(contrast_factor - 1.f) > 1e-5f)
+            apply_texture_contrast_to_mapped_components_for_gcode(desired, contrast_factor, mapped_component_count);
+
+        for (size_t component_idx = 0; component_idx < component_count; ++component_idx) {
+            const float v = clamp01f_for_gcode(desired[component_idx]);
+            weight_field.sample_component_weights[sample_idx * component_count + component_idx] = v;
+            fallback_acc[component_idx] += v * sample.weight;
+        }
+        fallback_weight += sample.weight;
+    }
+
+    weight_field.fallback_weights.assign(component_count, 1.f / float(component_count));
+    if (fallback_weight > EPSILON) {
+        for (size_t component_idx = 0; component_idx < component_count; ++component_idx)
+            weight_field.fallback_weights[component_idx] =
+                clamp01f_for_gcode(fallback_acc[component_idx] / fallback_weight);
+    }
+
+    const float k_target_bucket_mm = high_resolution_texture_sampling ? 0.12f : 0.22f;
+    constexpr int k_min_bucket_dim = 16;
+    constexpr int k_max_bucket_dim = 320;
+    constexpr int k_max_buckets = 72000;
+    int bucket_width = std::clamp(int(std::ceil(span_x_mm / k_target_bucket_mm)) + 1, k_min_bucket_dim, k_max_bucket_dim);
+    int bucket_height = std::clamp(int(std::ceil(span_y_mm / k_target_bucket_mm)) + 1, k_min_bucket_dim, k_max_bucket_dim);
+    const int initial_buckets = bucket_width * bucket_height;
+    if (initial_buckets > k_max_buckets) {
+        const float scale_factor = std::sqrt(float(initial_buckets) / float(k_max_buckets));
+        bucket_width = std::max(k_min_bucket_dim, int(std::ceil(float(bucket_width) / scale_factor)));
+        bucket_height = std::max(k_min_bucket_dim, int(std::ceil(float(bucket_height) / scale_factor)));
+    }
+
+    weight_field.min_x_mm = min_x_mm;
+    weight_field.min_y_mm = min_y_mm;
+    weight_field.bucket_width = bucket_width;
+    weight_field.bucket_height = bucket_height;
+    weight_field.bucket_width_mm = std::max(1e-3f, span_x_mm / std::max(1, bucket_width - 1));
+    weight_field.bucket_height_mm = std::max(1e-3f, span_y_mm / std::max(1, bucket_height - 1));
+    weight_field.buckets.assign(size_t(bucket_width) * size_t(bucket_height), {});
+
+    for (size_t sample_idx = 0; sample_idx < sample_count; ++sample_idx) {
+        const float gx_unclamped = (weight_field.sample_x_mm[sample_idx] - min_x_mm) / weight_field.bucket_width_mm;
+        const float gy_unclamped = (weight_field.sample_y_mm[sample_idx] - min_y_mm) / weight_field.bucket_height_mm;
+        const int bx = std::clamp(int(std::floor(gx_unclamped)), 0, bucket_width - 1);
+        const int by = std::clamp(int(std::floor(gy_unclamped)), 0, bucket_height - 1);
+        const size_t bidx = size_t(by) * size_t(bucket_width) + size_t(bx);
+        weight_field.buckets[bidx].push_back(uint32_t(sample_idx));
+    }
+
+    return weight_field;
+}
+
+static float sample_vertex_color_weight_field_for_gcode(const VertexColorOverhangWeightField &weight_field,
+                                                        float                                  x_mm,
+                                                        float                                  y_mm,
+                                                        size_t                                 component_idx,
+                                                        bool                                   high_resolution_texture_sampling,
+                                                        bool                                   compact_offset_mode = false)
+{
+    if (compact_offset_mode && !weight_field.empty() && component_idx < weight_field.component_count) {
+        std::vector<float> values(weight_field.component_count, 0.f);
+        float max_value = 0.f;
+        for (size_t idx = 0; idx < weight_field.component_count; ++idx) {
+            values[idx] = sample_vertex_color_weight_field_for_gcode(weight_field,
+                                                                     x_mm,
+                                                                     y_mm,
+                                                                     idx,
+                                                                     high_resolution_texture_sampling,
+                                                                     false);
+            max_value = std::max(max_value, clamp01f_for_gcode(values[idx]));
+        }
+        if (max_value > EPSILON)
+            return clamp01f_for_gcode(values[component_idx] / max_value);
+    }
+
+    const float fallback = component_idx < weight_field.fallback_weights.size() ?
+        weight_field.fallback_weights[component_idx] : 0.f;
+    if (weight_field.empty() || component_idx >= weight_field.component_count)
+        return fallback;
+    if (!std::isfinite(x_mm) || !std::isfinite(y_mm))
+        return fallback;
+
+    const float gx_unclamped = (x_mm - weight_field.min_x_mm) / std::max(weight_field.bucket_width_mm, 1e-6f);
+    const float gy_unclamped = (y_mm - weight_field.min_y_mm) / std::max(weight_field.bucket_height_mm, 1e-6f);
+    const int cx = std::clamp(int(std::floor(gx_unclamped)), 0, weight_field.bucket_width - 1);
+    const int cy = std::clamp(int(std::floor(gy_unclamped)), 0, weight_field.bucket_height - 1);
+
+    const float sigma_scale = high_resolution_texture_sampling ? 0.45f : 0.7f;
+    const float min_sigma_mm = high_resolution_texture_sampling ? 0.04f : 0.06f;
+    const float sigma_x_mm = std::max(min_sigma_mm, weight_field.bucket_width_mm * sigma_scale);
+    const float sigma_y_mm = std::max(min_sigma_mm, weight_field.bucket_height_mm * sigma_scale);
+    const float inv_two_sigma_x2 = 1.f / std::max(2.f * sigma_x_mm * sigma_x_mm, 1e-8f);
+    const float inv_two_sigma_y2 = 1.f / std::max(2.f * sigma_y_mm * sigma_y_mm, 1e-8f);
+
+    const float min_radius_mm = high_resolution_texture_sampling ? 0.16f : 0.30f;
+    const float radius_scale = high_resolution_texture_sampling ? 1.75f : 3.f;
+    const float max_radius_mm = std::max(min_radius_mm, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * radius_scale);
+    const float max_radius2 = max_radius_mm * max_radius_mm;
+    const float min_bucket_span_mm = std::max(1e-3f, std::min(weight_field.bucket_width_mm, weight_field.bucket_height_mm));
+    const int max_ring = std::max(1, int(std::ceil(max_radius_mm / min_bucket_span_mm)));
+
+    float weighted_sum = 0.f;
+    float total_weight = 0.f;
+    size_t contributing_samples = 0;
+
+    auto process_bucket = [&weight_field,
+                           component_idx,
+                           x_mm,
+                           y_mm,
+                           max_radius2,
+                           inv_two_sigma_x2,
+                           inv_two_sigma_y2,
+                           &weighted_sum,
+                           &total_weight,
+                           &contributing_samples](int bx, int by) {
+        if (bx < 0 || by < 0 || bx >= weight_field.bucket_width || by >= weight_field.bucket_height)
+            return;
+
+        const size_t bucket_idx = size_t(by) * size_t(weight_field.bucket_width) + size_t(bx);
+        if (bucket_idx >= weight_field.buckets.size())
+            return;
+
+        for (const uint32_t sample_idx_u32 : weight_field.buckets[bucket_idx]) {
+            const size_t sample_idx = size_t(sample_idx_u32);
+            if (sample_idx >= weight_field.sample_x_mm.size() ||
+                sample_idx >= weight_field.sample_y_mm.size() ||
+                sample_idx >= weight_field.sample_weight.size())
+                continue;
+
+            const float dx = x_mm - weight_field.sample_x_mm[sample_idx];
+            const float dy = y_mm - weight_field.sample_y_mm[sample_idx];
+            const float d2 = dx * dx + dy * dy;
+            if (d2 > max_radius2)
+                continue;
+
+            const float kernel = std::exp(-(dx * dx) * inv_two_sigma_x2 - (dy * dy) * inv_two_sigma_y2);
+            const float sample_w = weight_field.sample_weight[sample_idx] * kernel;
+            if (!std::isfinite(sample_w) || sample_w <= EPSILON)
+                continue;
+
+            const size_t value_idx = sample_idx * weight_field.component_count + component_idx;
+            if (value_idx >= weight_field.sample_component_weights.size())
+                continue;
+
+            weighted_sum += weight_field.sample_component_weights[value_idx] * sample_w;
+            total_weight += sample_w;
+            ++contributing_samples;
+        }
+    };
+
+    for (int ring = 0; ring <= max_ring; ++ring) {
+        const int min_x = std::max(0, cx - ring);
+        const int max_x = std::min(weight_field.bucket_width - 1, cx + ring);
+        const int min_y = std::max(0, cy - ring);
+        const int max_y = std::min(weight_field.bucket_height - 1, cy + ring);
+
+        if (ring == 0) {
+            process_bucket(cx, cy);
+        } else {
+            for (int x = min_x; x <= max_x; ++x) {
+                process_bucket(x, min_y);
+                if (max_y != min_y)
+                    process_bucket(x, max_y);
+            }
+            for (int y = min_y + 1; y <= max_y - 1; ++y) {
+                process_bucket(min_x, y);
+                if (max_x != min_x)
+                    process_bucket(max_x, y);
+            }
+        }
+
+        if (total_weight > EPSILON && contributing_samples >= 12)
+            break;
+    }
+
+    if (total_weight > EPSILON)
+        return clamp01f_for_gcode(weighted_sum / total_weight);
+
+    float nearest_d2 = std::numeric_limits<float>::max();
+    float nearest_value = fallback;
+    const int nearest_ring_limit = std::min(std::max(max_ring + 2, 4), std::max(weight_field.bucket_width, weight_field.bucket_height));
+
+    for (int ring = 0; ring <= nearest_ring_limit; ++ring) {
+        const int min_x = std::max(0, cx - ring);
+        const int max_x = std::min(weight_field.bucket_width - 1, cx + ring);
+        const int min_y = std::max(0, cy - ring);
+        const int max_y = std::min(weight_field.bucket_height - 1, cy + ring);
+
+        auto visit_bucket = [&weight_field, component_idx, x_mm, y_mm, &nearest_d2, &nearest_value](int bx, int by) {
+            if (bx < 0 || by < 0 || bx >= weight_field.bucket_width || by >= weight_field.bucket_height)
+                return;
+
+            const size_t bucket_idx = size_t(by) * size_t(weight_field.bucket_width) + size_t(bx);
+            if (bucket_idx >= weight_field.buckets.size())
+                return;
+
+            for (const uint32_t sample_idx_u32 : weight_field.buckets[bucket_idx]) {
+                const size_t sample_idx = size_t(sample_idx_u32);
+                if (sample_idx >= weight_field.sample_x_mm.size() || sample_idx >= weight_field.sample_y_mm.size())
+                    continue;
+
+                const float dx = x_mm - weight_field.sample_x_mm[sample_idx];
+                const float dy = y_mm - weight_field.sample_y_mm[sample_idx];
+                const float d2 = dx * dx + dy * dy;
+                if (d2 >= nearest_d2)
+                    continue;
+
+                const size_t value_idx = sample_idx * weight_field.component_count + component_idx;
+                if (value_idx >= weight_field.sample_component_weights.size())
+                    continue;
+
+                nearest_d2 = d2;
+                nearest_value = weight_field.sample_component_weights[value_idx];
+            }
+        };
+
+        if (ring == 0) {
+            visit_bucket(cx, cy);
+        } else {
+            for (int x = min_x; x <= max_x; ++x) {
+                visit_bucket(x, min_y);
+                if (max_y != min_y)
+                    visit_bucket(x, max_y);
+            }
+            for (int y = min_y + 1; y <= max_y - 1; ++y) {
+                visit_bucket(min_x, y);
+                if (max_x != min_x)
+                    visit_bucket(max_x, y);
+            }
+        }
+
+        if (nearest_d2 < std::numeric_limits<float>::max() && ring >= 2)
+            break;
+    }
+
+    if (nearest_d2 < std::numeric_limits<float>::max())
+        return clamp01f_for_gcode(nearest_value);
+
+    return fallback;
+}
+
+static float component_angular_influence_for_gcode(unsigned int                     active_component_id,
+                                                   float                            theta_deg,
+                                                   const std::vector<unsigned int> &component_ids,
+                                                   const std::vector<float>        &component_angles_deg)
+{
+    if (component_ids.empty() || component_ids.size() != component_angles_deg.size())
+        return 0.f;
+
+    const auto active_it = std::find(component_ids.begin(), component_ids.end(), active_component_id);
+    if (active_it == component_ids.end())
+        return 0.f;
+
+    if (component_ids.size() == 1)
+        return 1.f;
+
+    struct SortedComponentAngle {
+        float  angle_deg { 0.f };
+        size_t component_idx { 0 };
+    };
+
+    std::vector<SortedComponentAngle> sorted_angles;
+    sorted_angles.reserve(component_ids.size());
+    for (size_t i = 0; i < component_ids.size(); ++i)
+        sorted_angles.push_back({ normalize_angle_deg_for_gcode(component_angles_deg[i]), i });
+
+    std::sort(sorted_angles.begin(), sorted_angles.end(), [](const SortedComponentAngle &lhs, const SortedComponentAngle &rhs) {
+        return lhs.angle_deg < rhs.angle_deg;
+    });
+
+    const size_t active_component_idx = size_t(active_it - component_ids.begin());
+    const auto sorted_active_it = std::find_if(sorted_angles.begin(), sorted_angles.end(),
+                                               [active_component_idx](const SortedComponentAngle &entry) {
+                                                   return entry.component_idx == active_component_idx;
+                                               });
+    if (sorted_active_it == sorted_angles.end())
+        return 0.f;
+
+    const size_t sorted_pos = size_t(sorted_active_it - sorted_angles.begin());
+    const size_t count = sorted_angles.size();
+    const float prev_angle = sorted_angles[(sorted_pos + count - 1) % count].angle_deg;
+    const float self_angle = sorted_angles[sorted_pos].angle_deg;
+    const float next_angle = sorted_angles[(sorted_pos + 1) % count].angle_deg;
+    const float prev_to_self_deg = angular_distance_cw_deg_for_gcode(prev_angle, self_angle);
+    const float self_to_next_deg = angular_distance_cw_deg_for_gcode(self_angle, next_angle);
+
+    if (prev_to_self_deg <= 1e-3f || self_to_next_deg <= 1e-3f) {
+        float total_weight = 0.f;
+        float active_weight = 0.f;
+        for (size_t i = 0; i < component_ids.size(); ++i) {
+            const float dist = angular_distance_deg_for_gcode(theta_deg, component_angles_deg[i]);
+            const float weight = std::max(0.f, 1.f - dist / 180.f);
+            total_weight += weight;
+            if (component_ids[i] == active_component_id)
+                active_weight += weight;
+        }
+
+        if (total_weight <= EPSILON)
+            return 0.f;
+        return std::clamp(active_weight / total_weight, 0.f, 1.f);
+    }
+
+    const float theta_norm = normalize_angle_deg_for_gcode(theta_deg);
+    const float prev_to_theta_deg = angular_distance_cw_deg_for_gcode(prev_angle, theta_norm);
+    if (prev_to_theta_deg <= prev_to_self_deg + 1e-4f)
+        return std::clamp(prev_to_theta_deg / prev_to_self_deg, 0.f, 1.f);
+
+    const float self_to_theta_deg = angular_distance_cw_deg_for_gcode(self_angle, theta_norm);
+    if (self_to_theta_deg <= self_to_next_deg + 1e-4f)
+        return std::clamp(1.f - self_to_theta_deg / self_to_next_deg, 0.f, 1.f);
+
+    return 0.f;
+}
+
+std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoop &)
+{
+    return std::nullopt;
+}
+
 std::string GCode::extrude_loop(ExtrusionLoop loop, std::string description, double speed, const ExtrusionEntitiesPtr& region_perimeters, const Point* start_point)
 {
     
@@ -6182,6 +7650,46 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
 {
     std::string gcode;
 
+    struct OuterWallGradientSegmentMod {
+        double flow_scale { 1.0 };
+        coord_t shift_dx { 0 };
+        coord_t shift_dy { 0 };
+        double shift_unit_x { 0.0 };
+        double shift_unit_y { 0.0 };
+        double length_mm { 0.0 };
+        float  centerline_shift_mm { 0.f };
+        float  balance_weight { 0.f };
+    };
+
+    struct OuterWallGradientDynamicContext {
+        bool                      enabled { false };
+        bool                      vertex_color_match_mode { false };
+        bool                      high_resolution_texture_sampling { false };
+        bool                      nonlinear_offset_adjustment { false };
+        bool                      compact_offset_mode { false };
+        bool                      object_center_mode { false };
+        Point                     object_center;
+        unsigned int              active_component_id { 0 };
+        size_t                    active_component_idx { size_t(-1) };
+        const VertexColorOverhangWeightField *vertex_color_weight_field { nullptr };
+        std::vector<unsigned int> component_ids;
+        std::vector<float>        component_distances_mm;
+        std::vector<float>        rotated_angles;
+        float                     inset_strength_reference_mm { 0.f };
+        float                     fade_factor { 0.f };
+        float                     signed_fade_factor { 1.f };
+        float                     max_width_delta_mm { 0.f };
+        float                     active_component_strength_factor { 1.f };
+        float                     active_component_minimum_offset_factor { 0.f };
+        float                     base_outer_width_mm { 0.4f };
+        float                     flow_reference_width_mm { 0.4f };
+        float                     base_centerline_shift_mm { 0.f };
+        float                     centerline_shift_balance_mm { 0.f };
+        float                     centerline_shift_balance_weight_scale { 0.f };
+        float                     layer_height_mm { 0.2f };
+        float                     sagging_ratio { 0.f };
+    };
+
     if (is_bridge(path.role()))
         description += " (bridge)";
 
@@ -6192,6 +7700,432 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         return lerp(m_nominal_z - height, m_nominal_z, z_ratio);
     };
 
+    auto make_shifted_point = [](const Point &p, coord_t dx, coord_t dy) {
+        return Point(coord_t(p.x() + dx), coord_t(p.y() + dy));
+    };
+    auto can_emit_extrusion_delta = [](double dE) {
+        return std::isfinite(dE);
+    };
+    auto can_emit_sloped_extrusion = [](const Vec3d &dest, double dE) {
+        return dest.allFinite() && std::isfinite(dE);
+    };
+
+    std::vector<OuterWallGradientSegmentMod> outer_wall_gradient_segment_mods;
+    OuterWallGradientDynamicContext outer_wall_gradient_dynamic_ctx;
+    bool outer_wall_gradient_modulated_path = false;
+    Point outer_wall_gradient_start_point = path.first_point();
+
+    if (!path.is_force_no_extrusion() &&
+        is_external_perimeter(path.role()) &&
+        m_curr_print != nullptr &&
+        m_writer.filament() != nullptr &&
+        path.polyline.points.size() >= 2) {
+        const size_t num_physical = m_config.filament_colour.values.size();
+        const unsigned int texture_zone_id = unsigned(std::max(0, m_config.wall_filament.value));
+        const TextureMappingManager &texture_mgr = m_curr_print->texture_mapping_manager();
+        if (num_physical > 0 && texture_zone_id > 0 && texture_mgr.is_texture_mapping_zone_id(texture_zone_id)) {
+            const TextureMappingZone *zone = texture_mgr.zone_from_id(texture_zone_id);
+            const bool vertex_color_match_mode = zone != nullptr && is_vertex_color_match_overhang_row_for_gcode(*zone);
+            if (zone != nullptr &&
+                is_horizontal_overhang_gradient_row_for_gcode(*zone) &&
+                (vertex_color_match_mode ||
+                 is_2d_offset_gradient_row_for_gcode(*zone) ||
+                 has_explicit_offset_gradient_profile_for_gcode(*zone))) {
+                std::vector<unsigned int> component_ids = decode_offset_component_ids_for_gcode(*zone, num_physical);
+                if (vertex_color_match_mode) {
+                    if (!m_warned_texture_mapping_filament_count_mismatch &&
+                        TextureMappingManager::component_count_mismatch(*zone, num_physical)) {
+                        m_warned_texture_mapping_filament_count_mismatch = true;
+                        m_curr_print->active_step_add_warning(
+                            PrintStateBase::WarningLevel::NON_CRITICAL,
+                            _(L("A texture mapping zone has a filament count that does not match its selected color mode. Slicing will choose fallback filaments for the missing or extra color channels.")));
+                    }
+
+                    const std::vector<unsigned int> effective_component_ids =
+                        TextureMappingManager::effective_texture_component_ids(*zone, num_physical, m_config.filament_colour.values);
+                    if (!effective_component_ids.empty())
+                        component_ids = effective_component_ids;
+                }
+                if (!component_ids.empty()) {
+                    const unsigned int active_component_id = unsigned(m_writer.filament()->id() + 1);
+                    const auto active_component_it = std::find(component_ids.begin(), component_ids.end(), active_component_id);
+                    if (active_component_it != component_ids.end()) {
+                        std::vector<float> reference_nozzles;
+                        reference_nozzles.reserve(component_ids.size() + 2);
+                        auto append_nozzle = [&reference_nozzles, this](unsigned int component_id) {
+                            if (component_id == 0)
+                                return;
+                            const size_t idx = size_t(component_id - 1);
+                            if (idx < m_config.nozzle_diameter.values.size())
+                                reference_nozzles.emplace_back(float(m_config.nozzle_diameter.get_at(idx)));
+                        };
+                        for (unsigned int id : component_ids)
+                            append_nozzle(id);
+                        append_nozzle(zone->component_a);
+                        append_nozzle(zone->component_b);
+
+                        const float reference_nozzle = reference_nozzles.empty() ?
+                            float(m_config.nozzle_diameter.values.empty() ? 0.4 : m_config.nozzle_diameter.values.front()) :
+                            std::accumulate(reference_nozzles.begin(), reference_nozzles.end(), 0.f) / float(reference_nozzles.size());
+                        const float max_allowed_distance_mm = TextureMappingManager::max_component_surface_offset_mm(reference_nozzle);
+
+                        std::vector<float> distances_mm = TextureMappingManager::effective_offset_distances(*zone, component_ids.size(), reference_nozzle);
+                        std::vector<float> angles_deg = TextureMappingManager::effective_offset_angles(*zone, component_ids.size());
+                        if (distances_mm.size() != component_ids.size())
+                            distances_mm.assign(component_ids.size(), 0.f);
+                        if (angles_deg.size() != component_ids.size())
+                            angles_deg = TextureMappingManager::default_offset_angles(component_ids.size());
+                        for (float &a : angles_deg)
+                            a = normalize_angle_deg_for_gcode(a);
+
+                        bool has_nonzero_distance = false;
+                        if (vertex_color_match_mode) {
+                            distances_mm.assign(component_ids.size(), max_allowed_distance_mm);
+                            has_nonzero_distance = max_allowed_distance_mm > EPSILON;
+                        } else {
+                            for (float &d : distances_mm) {
+                                d = std::clamp(d, 0.f, max_allowed_distance_mm);
+                                has_nonzero_distance = has_nonzero_distance || (d > EPSILON);
+                            }
+                        }
+
+                        if (has_nonzero_distance) {
+                            const PrintObject *layer_object = m_layer ? m_layer->object() : nullptr;
+                            const int object_layer_count = layer_object ? int(layer_object->layer_count()) : 0;
+                            const int current_layer_index = m_layer ? int(m_layer->id()) : 0;
+                            const float z_progress = object_layer_count > 1 ?
+                                std::clamp(float(current_layer_index) / float(object_layer_count - 1), 0.f, 1.f) : 0.f;
+
+                            float rotation_deg = 0.f;
+                            if (zone->offset_rotation_enabled) {
+                                const float repeated = repeated_rotation_progress_for_gcode(z_progress, std::max(1.f, zone->offset_repeats), zone->offset_reverse_repeats);
+                                const float direction = zone->offset_clockwise ? -1.f : 1.f;
+                                rotation_deg = direction * 360.f * zone->offset_rotations * repeated;
+                            }
+
+                            const float signed_fade_factor = offset_fade_factor_for_gcode(zone->offset_fade_mode, z_progress);
+                            const float fade_factor = std::abs(signed_fade_factor);
+
+                            std::vector<float> rotated_angles = angles_deg;
+                            for (float &a : rotated_angles)
+                                a = normalize_angle_deg_for_gcode(a + rotation_deg);
+
+                            const size_t active_component_idx = size_t(active_component_it - component_ids.begin());
+                            const float active_component_strength_factor = overhang_filament_strength_factor_for_gcode(*zone, active_component_id);
+                            const float active_component_minimum_offset_factor = overhang_filament_minimum_offset_factor_for_gcode(*zone, active_component_id);
+                            const float max_component_distance_mm = *std::max_element(distances_mm.begin(), distances_mm.end());
+                            const float path_outer_width_mm = std::max(
+                                0.01f,
+                                path.width > EPSILON ? path.width : float(m_config.outer_wall_line_width.get_abs_value(reference_nozzle)));
+                            const float texture_mapping_max_outer_width_mm = std::max(
+                                0.05f,
+                                float(m_config.texture_mapping_outer_wall_gradient_max_line_width.value));
+                            const float base_outer_width_mm = vertex_color_match_mode ? texture_mapping_max_outer_width_mm : path_outer_width_mm;
+                            const float flow_reference_width_mm = path_outer_width_mm;
+                            const float base_centerline_shift_mm = vertex_color_match_mode ? 0.5f * (base_outer_width_mm - flow_reference_width_mm) : 0.f;
+                            const float config_min_gradient_width_mm = std::clamp(
+                                float(m_config.texture_mapping_outer_wall_gradient_min_line_width.value),
+                                0.05f,
+                                base_outer_width_mm);
+                            const float layer_height_mm = std::max(
+                                0.01f,
+                                path.height > EPSILON ? path.height : float(m_layer == nullptr ? m_last_height : m_layer->height));
+                            const float min_width_for_positive_spacing_mm = layer_height_mm * float(1. - 0.25 * PI) + 1e-4f;
+                            const float safe_min_gradient_width_mm = std::clamp(
+                                std::max(config_min_gradient_width_mm, min_width_for_positive_spacing_mm),
+                                0.05f,
+                                base_outer_width_mm);
+                            const float max_width_delta_mm = std::max(0.f, base_outer_width_mm - safe_min_gradient_width_mm);
+                            const float global_strength_factor = std::clamp(
+                                float(m_config.texture_mapping_outer_wall_gradient_global_strength.value) / 100.f,
+                                0.f,
+                                1.f);
+                            const float effective_max_width_delta_mm = max_width_delta_mm * global_strength_factor;
+                            const bool object_center_mode =
+                                !vertex_color_match_mode &&
+                                zone->offset_angle_mode != int(TextureMappingZone::OffsetAngleSurfaceNormal);
+                            const bool use_layer_aware_weighting = m_layer != nullptr;
+                            const bool high_resolution_texture_sampling = zone->high_resolution_sampling;
+                            const bool nonlinear_offset_adjustment = zone->nonlinear_offset_adjustment;
+                            const bool compact_offset_mode = zone->compact_offset_mode;
+                            const float layer_sample_z_mm = use_layer_aware_weighting ? float(m_layer->print_z) : 0.f;
+                            const float layer_sample_falloff_mm = high_resolution_texture_sampling ?
+                                std::max(0.03f, layer_height_mm * 0.5f) :
+                                std::max(0.12f, layer_height_mm * 1.5f);
+                            const int texture_filament_color_mode = std::clamp(
+                                zone->filament_color_mode,
+                                int(TextureMappingZone::FilamentColorAny),
+                                int(TextureMappingZone::FilamentColorBW));
+                            const bool texture_force_sequential_filaments = zone->force_sequential_filaments;
+                            const float texture_contrast_pct = std::clamp(zone->contrast_pct, 25.f, 300.f);
+                            const float texture_tone_gamma =
+                                (!std::isfinite(zone->tone_gamma) || zone->tone_gamma <= 0.f) ?
+                                    1.f :
+                                    std::clamp(zone->tone_gamma, 0.5f, 3.f);
+                            const float texture_sagging_ratio =
+                                std::isfinite(zone->sagging_ratio) ? std::clamp(zone->sagging_ratio, 0.f, 6.f) : 0.f;
+
+                            const VertexColorOverhangWeightField *vertex_color_weight_field = nullptr;
+                            if (vertex_color_match_mode && layer_object != nullptr) {
+                                const bool raw_texture_mapping_mode =
+                                    zone->texture_mapping_mode == int(TextureMappingZone::TextureMappingRawValues);
+                                std::vector<std::array<float, 3>> component_colors;
+                                component_colors.reserve(component_ids.size());
+                                bool missing_component_color = false;
+                                for (const unsigned int id : component_ids) {
+                                    if (id < 1 || id > m_config.filament_colour.values.size()) {
+                                        if (raw_texture_mapping_mode)
+                                            component_colors.push_back({ 0.f, 0.f, 0.f });
+                                        else
+                                            missing_component_color = true;
+                                        continue;
+                                    }
+                                    ColorRGB decoded;
+                                    if (!decode_color(m_config.filament_colour.get_at(size_t(id - 1)), decoded)) {
+                                        if (raw_texture_mapping_mode)
+                                            component_colors.push_back({ 0.f, 0.f, 0.f });
+                                        else
+                                            missing_component_color = true;
+                                        continue;
+                                    }
+                                    component_colors.push_back({ decoded.r(), decoded.g(), decoded.b() });
+                                }
+                                if (!missing_component_color && component_colors.size() == component_ids.size() && !component_colors.empty()) {
+                                    std::ostringstream component_key_stream;
+                                    for (size_t idx = 0; idx < component_ids.size(); ++idx) {
+                                        if (idx > 0)
+                                            component_key_stream << '/';
+                                        component_key_stream << component_ids[idx];
+                                    }
+                                    component_key_stream << (raw_texture_mapping_mode ? "|raw" : "|blend");
+                                    component_key_stream << "|fc" << texture_filament_color_mode;
+                                    component_key_stream << "|fs" << (texture_force_sequential_filaments ? 1 : 0);
+                                    component_key_stream << "|ct" << int(std::lround(texture_contrast_pct));
+                                    component_key_stream << "|tg" << int(std::lround(texture_tone_gamma * 100.f));
+                                    component_key_stream << "|hr" << (high_resolution_texture_sampling ? 1 : 0);
+                                    if (m_layer != nullptr)
+                                        component_key_stream << "|L" << m_layer->id();
+                                    const auto cache_key = std::make_tuple(layer_object, texture_zone_id, component_key_stream.str());
+                                    auto cache_it = m_vertex_color_overhang_weight_field_cache.find(cache_key);
+                                    if (cache_it == m_vertex_color_overhang_weight_field_cache.end()) {
+                                        cache_it = m_vertex_color_overhang_weight_field_cache
+                                                       .emplace(cache_key,
+                                                                build_vertex_color_weight_field_for_gcode(*layer_object,
+                                                                                                         component_colors,
+                                                                                                         raw_texture_mapping_mode,
+                                                                                                         texture_filament_color_mode,
+                                                                                                         texture_force_sequential_filaments,
+                                                                                                         texture_contrast_pct,
+                                                                                                         texture_tone_gamma,
+                                                                                                         use_layer_aware_weighting,
+                                                                                                         layer_sample_z_mm,
+                                                                                                         layer_sample_falloff_mm,
+                                                                                                         high_resolution_texture_sampling))
+                                                       .first;
+                                    }
+                                    if (!cache_it->second.empty())
+                                        vertex_color_weight_field = &cache_it->second;
+                                }
+                            }
+
+                            const bool has_vertex_color_weight_field =
+                                vertex_color_weight_field != nullptr && !vertex_color_weight_field->empty();
+
+                            if (fade_factor > EPSILON && max_component_distance_mm > EPSILON && effective_max_width_delta_mm > EPSILON &&
+                                (!vertex_color_match_mode || has_vertex_color_weight_field)) {
+                                Point object_center = layer_object ? layer_object->bounding_box().center() :
+                                    Point(coord_t((int64_t(path.first_point().x()) + int64_t(path.last_point().x())) / 2),
+                                          coord_t((int64_t(path.first_point().y()) + int64_t(path.last_point().y())) / 2));
+
+                                outer_wall_gradient_dynamic_ctx.enabled = true;
+                                outer_wall_gradient_dynamic_ctx.vertex_color_match_mode = vertex_color_match_mode;
+                                outer_wall_gradient_dynamic_ctx.high_resolution_texture_sampling = high_resolution_texture_sampling;
+                                outer_wall_gradient_dynamic_ctx.nonlinear_offset_adjustment = nonlinear_offset_adjustment;
+                                outer_wall_gradient_dynamic_ctx.compact_offset_mode = compact_offset_mode;
+                                outer_wall_gradient_dynamic_ctx.object_center_mode = object_center_mode;
+                                outer_wall_gradient_dynamic_ctx.object_center = object_center;
+                                outer_wall_gradient_dynamic_ctx.active_component_id = active_component_id;
+                                outer_wall_gradient_dynamic_ctx.active_component_idx = active_component_idx;
+                                outer_wall_gradient_dynamic_ctx.vertex_color_weight_field = vertex_color_weight_field;
+                                outer_wall_gradient_dynamic_ctx.component_ids = component_ids;
+                                outer_wall_gradient_dynamic_ctx.component_distances_mm = distances_mm;
+                                outer_wall_gradient_dynamic_ctx.rotated_angles = rotated_angles;
+                                outer_wall_gradient_dynamic_ctx.inset_strength_reference_mm = max_allowed_distance_mm;
+                                outer_wall_gradient_dynamic_ctx.fade_factor = fade_factor;
+                                outer_wall_gradient_dynamic_ctx.signed_fade_factor = signed_fade_factor;
+                                outer_wall_gradient_dynamic_ctx.max_width_delta_mm = effective_max_width_delta_mm;
+                                outer_wall_gradient_dynamic_ctx.active_component_strength_factor = active_component_strength_factor;
+                                outer_wall_gradient_dynamic_ctx.active_component_minimum_offset_factor = active_component_minimum_offset_factor;
+                                outer_wall_gradient_dynamic_ctx.base_outer_width_mm = base_outer_width_mm;
+                                outer_wall_gradient_dynamic_ctx.flow_reference_width_mm = flow_reference_width_mm;
+                                outer_wall_gradient_dynamic_ctx.base_centerline_shift_mm = base_centerline_shift_mm;
+                                outer_wall_gradient_dynamic_ctx.layer_height_mm = layer_height_mm;
+                                outer_wall_gradient_dynamic_ctx.sagging_ratio = texture_sagging_ratio;
+
+                                outer_wall_gradient_segment_mods.reserve(path.polyline.points.size() - 1);
+
+                                float max_width_delta_limit_mm = std::min(effective_max_width_delta_mm, 2.f * max_allowed_distance_mm);
+                                if (texture_sagging_ratio > EPSILON)
+                                    max_width_delta_limit_mm = std::min(max_width_delta_limit_mm, layer_height_mm * texture_sagging_ratio);
+                                if (!std::isfinite(max_width_delta_limit_mm) || max_width_delta_limit_mm <= EPSILON)
+                                    outer_wall_gradient_dynamic_ctx.enabled = false;
+
+                                auto apply_centerline_shift_to_mod = [&](OuterWallGradientSegmentMod &mod, float centerline_shift_mm) {
+                                    mod.shift_dx = 0;
+                                    mod.shift_dy = 0;
+                                    mod.centerline_shift_mm = centerline_shift_mm;
+                                    if (std::abs(centerline_shift_mm) <= EPSILON)
+                                        return true;
+
+                                    const bool reverse_shift = (signed_fade_factor < 0.f) != (centerline_shift_mm < 0.f);
+                                    const double shift_x = reverse_shift ? -mod.shift_unit_x : mod.shift_unit_x;
+                                    const double shift_y = reverse_shift ? -mod.shift_unit_y : mod.shift_unit_y;
+                                    const double shift_scaled = scale_(double(std::abs(centerline_shift_mm)));
+                                    if (!std::isfinite(shift_x) || !std::isfinite(shift_y) || !std::isfinite(shift_scaled))
+                                        return false;
+                                    const coord_t max_shift_coord = scale_(std::max(0.5f, base_outer_width_mm));
+                                    return clamped_shift_coord_for_gcode(shift_x, shift_scaled, max_shift_coord, mod.shift_dx) &&
+                                           clamped_shift_coord_for_gcode(shift_y, shift_scaled, max_shift_coord, mod.shift_dy);
+                                };
+
+                                for (const Line &line : path.polyline.lines()) {
+                                    if (!outer_wall_gradient_dynamic_ctx.enabled)
+                                        break;
+
+                                    OuterWallGradientSegmentMod mod;
+                                    const double ax = double(line.a.x());
+                                    const double ay = double(line.a.y());
+                                    const double bx = double(line.b.x());
+                                    const double by = double(line.b.y());
+                                    const double dx = bx - ax;
+                                    const double dy = by - ay;
+                                    const double len = std::hypot(dx, dy);
+                                    mod.length_mm = unscale<double>(len);
+                                    if (len <= EPSILON) {
+                                        outer_wall_gradient_segment_mods.emplace_back(mod);
+                                        continue;
+                                    }
+
+                                    const double mid_x = 0.5 * (ax + bx);
+                                    const double mid_y = 0.5 * (ay + by);
+                                    const double radial_x = mid_x - double(object_center.x());
+                                    const double radial_y = mid_y - double(object_center.y());
+
+                                    const Point mid_point(coord_t(std::llround(mid_x)), coord_t(std::llround(mid_y)));
+                                    double outward_x = 0.0;
+                                    double outward_y = 0.0;
+                                    resolve_segment_shift_outward_normal_for_gcode(m_layer, mid_point, dx, dy, len, radial_x, radial_y, outward_x, outward_y);
+
+                                    double theta_direction_x = outward_x;
+                                    double theta_direction_y = outward_y;
+                                    if (object_center_mode) {
+                                        const double radial_len = std::hypot(radial_x, radial_y);
+                                        if (radial_len > EPSILON) {
+                                            theta_direction_x = radial_x / radial_len;
+                                            theta_direction_y = radial_y / radial_len;
+                                        }
+                                    }
+
+                                    const float theta_deg = normalize_angle_deg_for_gcode(float(Geometry::rad2deg(std::atan2(theta_direction_y, theta_direction_x))));
+                                    float inset_strength = 0.f;
+                                    if (vertex_color_match_mode) {
+                                        if (vertex_color_weight_field != nullptr &&
+                                            active_component_idx < component_ids.size() &&
+                                            !vertex_color_weight_field->empty()) {
+                                            const float mid_x_mm = 0.5f * (unscale<float>(line.a.x()) + unscale<float>(line.b.x()));
+                                            const float mid_y_mm = 0.5f * (unscale<float>(line.a.y()) + unscale<float>(line.b.y()));
+                                            const float desired_strength = sample_vertex_color_weight_field_for_gcode(
+                                                *vertex_color_weight_field,
+                                                mid_x_mm,
+                                                mid_y_mm,
+                                                active_component_idx,
+                                                high_resolution_texture_sampling,
+                                                compact_offset_mode);
+                                            inset_strength = std::clamp(1.f - desired_strength, 0.f, 1.f);
+                                        }
+                                    } else {
+                                        float raw_inset_mm = 0.f;
+                                        for (size_t i = 0; i < component_ids.size(); ++i) {
+                                            if (i == active_component_idx)
+                                                continue;
+                                            const float influence = component_angular_influence_for_gcode(component_ids[i],
+                                                                                                            theta_deg,
+                                                                                                            component_ids,
+                                                                                                            rotated_angles);
+                                            raw_inset_mm += distances_mm[i] * influence;
+                                        }
+                                        inset_strength = std::clamp(raw_inset_mm / std::max(max_allowed_distance_mm, float(EPSILON)), 0.f, 1.f);
+                                    }
+                                    inset_strength = std::clamp(inset_strength * fade_factor, 0.f, 1.f);
+                                    const float stair_step_mm = nonlinear_offset_adjustment ?
+                                        local_surface_stair_step_distance_for_gcode(m_layer,
+                                                                                   mid_point,
+                                                                                   outward_x,
+                                                                                   outward_y,
+                                                                                   base_outer_width_mm,
+                                                                                   max_allowed_distance_mm) :
+                                        std::numeric_limits<float>::quiet_NaN();
+                                    const float variable_width_delta_mm = variable_width_delta_for_visibility_range_for_gcode(
+                                        inset_strength,
+                                        max_width_delta_limit_mm,
+                                        active_component_minimum_offset_factor,
+                                        active_component_strength_factor,
+                                        nonlinear_offset_adjustment,
+                                        layer_height_mm,
+                                        stair_step_mm,
+                                        texture_sagging_ratio);
+                                    const float width_delta_mm = std::clamp(variable_width_delta_mm, 0.f, max_width_delta_limit_mm);
+                                    if (!std::isfinite(width_delta_mm) || !std::isfinite(base_outer_width_mm) || !std::isfinite(layer_height_mm)) {
+                                        outer_wall_gradient_segment_mods.emplace_back(mod);
+                                        continue;
+                                    }
+
+                                    const float target_width_mm = base_outer_width_mm - width_delta_mm;
+                                    if (!std::isfinite(target_width_mm) || target_width_mm <= 0.f) {
+                                        outer_wall_gradient_segment_mods.emplace_back(mod);
+                                        continue;
+                                    }
+
+                                    mod.flow_scale = flow_scale_for_target_width_for_gcode(flow_reference_width_mm, target_width_mm, layer_height_mm);
+                                    if (!std::isfinite(mod.flow_scale) || mod.flow_scale <= 0.) {
+                                        outer_wall_gradient_segment_mods.emplace_back(OuterWallGradientSegmentMod{});
+                                        continue;
+                                    }
+
+                                    const float centerline_shift_mm = base_centerline_shift_mm + 0.5f * width_delta_mm;
+                                    mod.shift_unit_x = -outward_x;
+                                    mod.shift_unit_y = -outward_y;
+                                    mod.balance_weight = max_width_delta_limit_mm > EPSILON ?
+                                        std::clamp(width_delta_mm / max_width_delta_limit_mm, 0.f, 1.f) :
+                                        0.f;
+                                    if (!apply_centerline_shift_to_mod(mod, centerline_shift_mm)) {
+                                        outer_wall_gradient_segment_mods.emplace_back(OuterWallGradientSegmentMod{});
+                                        continue;
+                                    }
+                                    outer_wall_gradient_segment_mods.emplace_back(mod);
+                                }
+
+                                outer_wall_gradient_modulated_path = std::any_of(
+                                    outer_wall_gradient_segment_mods.begin(),
+                                    outer_wall_gradient_segment_mods.end(),
+                                    [](const OuterWallGradientSegmentMod &mod) {
+                                        return mod.shift_dx != 0 || mod.shift_dy != 0 || std::abs(mod.flow_scale - 1.0) > 1e-6;
+                                    });
+
+                                if (outer_wall_gradient_modulated_path && !outer_wall_gradient_segment_mods.empty()) {
+                                    const OuterWallGradientSegmentMod &start_mod = outer_wall_gradient_segment_mods.front();
+                                    outer_wall_gradient_start_point = make_shifted_point(path.first_point(), start_mod.shift_dx, start_mod.shift_dy);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    const Point extrusion_start_point = outer_wall_gradient_modulated_path ? outer_wall_gradient_start_point : path.first_point();
+
     bool slope_need_z_travel = false;
     if (sloped != nullptr && !sloped->is_flat()) {
         auto target_z = get_sloped_z(sloped->slope_begin.z_ratio);
@@ -6200,10 +8134,10 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
     // Move to first point of extrusion path
     // path is 2D. But in slope lift case, lift z is done in travel_to function.
     // Add m_need_change_layer_lift_z when change_layer in case of no lift if m_last_pos is equal to path.first_point() by chance
-    if (!m_last_pos_defined || m_last_pos != path.first_point() || m_need_change_layer_lift_z || slope_need_z_travel) {
+    if (!m_last_pos_defined || m_last_pos != extrusion_start_point || m_need_change_layer_lift_z || slope_need_z_travel) {
         const bool _last_pos_undefined = !m_last_pos_defined;
         gcode += this->travel_to(
-            path.first_point(),
+            extrusion_start_point,
             path.role(),
             "move to first " + description + " point",
             sloped == nullptr ? DBL_MAX : get_sloped_z(sloped->slope_begin.z_ratio)
@@ -6735,6 +8669,171 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                      ironing_fan_speed >= 0 && path.role() == erIroning);
     };
 
+    auto segment_modulation_at = [&outer_wall_gradient_segment_mods, outer_wall_gradient_modulated_path](size_t idx) {
+        if (!outer_wall_gradient_modulated_path || idx >= outer_wall_gradient_segment_mods.size())
+            return OuterWallGradientSegmentMod{};
+        return outer_wall_gradient_segment_mods[idx];
+    };
+
+    const Layer *surface_layer = m_layer;
+
+    auto dynamic_modulation_for_line = [&outer_wall_gradient_dynamic_ctx, surface_layer](const Line &line) {
+        OuterWallGradientSegmentMod mod;
+        if (!outer_wall_gradient_dynamic_ctx.enabled)
+            return mod;
+
+        const double ax = double(line.a.x());
+        const double ay = double(line.a.y());
+        const double bx = double(line.b.x());
+        const double by = double(line.b.y());
+        const double dx = bx - ax;
+        const double dy = by - ay;
+        const double len = std::hypot(dx, dy);
+        if (len <= EPSILON)
+            return mod;
+
+        const double mid_x = 0.5 * (ax + bx);
+        const double mid_y = 0.5 * (ay + by);
+        const double radial_x = mid_x - double(outer_wall_gradient_dynamic_ctx.object_center.x());
+        const double radial_y = mid_y - double(outer_wall_gradient_dynamic_ctx.object_center.y());
+
+        const Point mid_point(coord_t(std::llround(mid_x)), coord_t(std::llround(mid_y)));
+        double outward_x = 0.0;
+        double outward_y = 0.0;
+        resolve_segment_shift_outward_normal_for_gcode(surface_layer,
+                                                       mid_point,
+                                                       dx,
+                                                       dy,
+                                                       len,
+                                                       radial_x,
+                                                       radial_y,
+                                                       outward_x,
+                                                       outward_y);
+
+        double theta_direction_x = outward_x;
+        double theta_direction_y = outward_y;
+        if (outer_wall_gradient_dynamic_ctx.object_center_mode) {
+            const double radial_len = std::hypot(radial_x, radial_y);
+            if (radial_len > EPSILON) {
+                theta_direction_x = radial_x / radial_len;
+                theta_direction_y = radial_y / radial_len;
+            }
+        }
+
+        const float theta_deg = normalize_angle_deg_for_gcode(float(Geometry::rad2deg(std::atan2(theta_direction_y, theta_direction_x))));
+        float inset_strength = 0.f;
+        if (outer_wall_gradient_dynamic_ctx.vertex_color_match_mode) {
+            if (outer_wall_gradient_dynamic_ctx.vertex_color_weight_field != nullptr &&
+                !outer_wall_gradient_dynamic_ctx.vertex_color_weight_field->empty() &&
+                outer_wall_gradient_dynamic_ctx.active_component_idx <
+                    outer_wall_gradient_dynamic_ctx.vertex_color_weight_field->component_count) {
+                const float mid_x_mm = 0.5f * (unscale<float>(line.a.x()) + unscale<float>(line.b.x()));
+                const float mid_y_mm = 0.5f * (unscale<float>(line.a.y()) + unscale<float>(line.b.y()));
+                const float desired_strength = sample_vertex_color_weight_field_for_gcode(
+                    *outer_wall_gradient_dynamic_ctx.vertex_color_weight_field,
+                    mid_x_mm,
+                    mid_y_mm,
+                    outer_wall_gradient_dynamic_ctx.active_component_idx,
+                    outer_wall_gradient_dynamic_ctx.high_resolution_texture_sampling,
+                    outer_wall_gradient_dynamic_ctx.compact_offset_mode);
+                inset_strength = std::clamp(1.f - desired_strength, 0.f, 1.f);
+            }
+        } else {
+            float raw_inset_mm = 0.f;
+            const size_t component_count = std::min(outer_wall_gradient_dynamic_ctx.component_ids.size(),
+                                                    outer_wall_gradient_dynamic_ctx.component_distances_mm.size());
+            for (size_t i = 0; i < component_count; ++i) {
+                if (i == outer_wall_gradient_dynamic_ctx.active_component_idx)
+                    continue;
+                const float influence = component_angular_influence_for_gcode(outer_wall_gradient_dynamic_ctx.component_ids[i],
+                                                                               theta_deg,
+                                                                               outer_wall_gradient_dynamic_ctx.component_ids,
+                                                                               outer_wall_gradient_dynamic_ctx.rotated_angles);
+                raw_inset_mm += outer_wall_gradient_dynamic_ctx.component_distances_mm[i] * influence;
+            }
+            inset_strength = std::clamp(
+                raw_inset_mm / std::max(outer_wall_gradient_dynamic_ctx.inset_strength_reference_mm, float(EPSILON)),
+                0.f,
+                1.f);
+        }
+        inset_strength = std::clamp(inset_strength * outer_wall_gradient_dynamic_ctx.fade_factor, 0.f, 1.f);
+        float max_width_delta_limit_mm = std::min(
+            outer_wall_gradient_dynamic_ctx.max_width_delta_mm,
+            2.f * outer_wall_gradient_dynamic_ctx.inset_strength_reference_mm);
+        if (outer_wall_gradient_dynamic_ctx.sagging_ratio > EPSILON)
+            max_width_delta_limit_mm = std::min(max_width_delta_limit_mm,
+                                                outer_wall_gradient_dynamic_ctx.layer_height_mm *
+                                                    outer_wall_gradient_dynamic_ctx.sagging_ratio);
+        if (!std::isfinite(max_width_delta_limit_mm) || max_width_delta_limit_mm <= EPSILON)
+            return OuterWallGradientSegmentMod{};
+        const float stair_step_mm = outer_wall_gradient_dynamic_ctx.nonlinear_offset_adjustment ?
+            local_surface_stair_step_distance_for_gcode(surface_layer,
+                                                       mid_point,
+                                                       outward_x,
+                                                       outward_y,
+                                                       outer_wall_gradient_dynamic_ctx.base_outer_width_mm,
+                                                       outer_wall_gradient_dynamic_ctx.inset_strength_reference_mm) :
+            std::numeric_limits<float>::quiet_NaN();
+        const float variable_width_delta_mm = variable_width_delta_for_visibility_range_for_gcode(
+            inset_strength,
+            max_width_delta_limit_mm,
+            outer_wall_gradient_dynamic_ctx.active_component_minimum_offset_factor,
+            outer_wall_gradient_dynamic_ctx.active_component_strength_factor,
+            outer_wall_gradient_dynamic_ctx.nonlinear_offset_adjustment,
+            outer_wall_gradient_dynamic_ctx.layer_height_mm,
+            stair_step_mm,
+            outer_wall_gradient_dynamic_ctx.sagging_ratio);
+        const float width_delta_mm = std::clamp(variable_width_delta_mm, 0.f, max_width_delta_limit_mm);
+        if (!std::isfinite(width_delta_mm) ||
+            !std::isfinite(outer_wall_gradient_dynamic_ctx.base_outer_width_mm) ||
+            !std::isfinite(outer_wall_gradient_dynamic_ctx.layer_height_mm))
+            return OuterWallGradientSegmentMod{};
+
+        const float target_width_mm = outer_wall_gradient_dynamic_ctx.base_outer_width_mm - width_delta_mm;
+        if (!std::isfinite(target_width_mm) || target_width_mm <= 0.f)
+            return OuterWallGradientSegmentMod{};
+
+        mod.flow_scale = flow_scale_for_target_width_for_gcode(outer_wall_gradient_dynamic_ctx.flow_reference_width_mm,
+                                                               target_width_mm,
+                                                               outer_wall_gradient_dynamic_ctx.layer_height_mm);
+        if (!std::isfinite(mod.flow_scale) || mod.flow_scale <= 0.)
+            return OuterWallGradientSegmentMod{};
+
+        const float balance_weight =
+            max_width_delta_limit_mm > EPSILON ? std::clamp(width_delta_mm / max_width_delta_limit_mm, 0.f, 1.f) : 0.f;
+        const float raw_centerline_shift_mm =
+            outer_wall_gradient_dynamic_ctx.base_centerline_shift_mm +
+            0.5f * width_delta_mm +
+            outer_wall_gradient_dynamic_ctx.centerline_shift_balance_mm *
+                balance_weight *
+                outer_wall_gradient_dynamic_ctx.centerline_shift_balance_weight_scale;
+        const float centerline_shift_mm =
+            outer_wall_gradient_dynamic_ctx.centerline_shift_balance_mm == 0.f ?
+                raw_centerline_shift_mm :
+                std::clamp(raw_centerline_shift_mm,
+                           0.f,
+                           outer_wall_gradient_dynamic_ctx.base_centerline_shift_mm + 0.5f * max_width_delta_limit_mm);
+        if (std::abs(centerline_shift_mm) > EPSILON) {
+            const double inward_x = -outward_x;
+            const double inward_y = -outward_y;
+            const bool reverse_shift =
+                (outer_wall_gradient_dynamic_ctx.signed_fade_factor < 0.f) != (centerline_shift_mm < 0.f);
+            const double shift_x = reverse_shift ? -inward_x : inward_x;
+            const double shift_y = reverse_shift ? -inward_y : inward_y;
+            const double shift_scaled = scale_(double(std::abs(centerline_shift_mm)));
+            if (!std::isfinite(shift_x) || !std::isfinite(shift_y) || !std::isfinite(shift_scaled))
+                return OuterWallGradientSegmentMod{};
+            const coord_t max_shift_coord = scale_(std::max(0.5f, outer_wall_gradient_dynamic_ctx.base_outer_width_mm));
+            if (!clamped_shift_coord_for_gcode(shift_x, shift_scaled, max_shift_coord, mod.shift_dx) ||
+                !clamped_shift_coord_for_gcode(shift_y, shift_scaled, max_shift_coord, mod.shift_dy))
+                return OuterWallGradientSegmentMod{};
+        }
+
+        return mod;
+    };
+
+    Point emitted_last_point = extrusion_start_point;
+
     if (!variable_speed) {
         // F is mm per minute.
         if( (std::abs(writer().get_current_speed() - F) > EPSILON) || (std::abs(_mm3_per_mm - m_last_mm3_mm) > EPSILON) ){
@@ -6803,39 +8902,138 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             }
             // BBS: use G1 if not enable arc fitting or has no arc fitting result or in spiral_mode mode or we are doing sloped extrusion
             // Attention: G2 and G3 is not supported in spiral_mode mode
-            if (!m_config.enable_arc_fitting || path.polyline.fitting_result.empty() || m_config.spiral_mode || sloped != nullptr) {
+            if (!m_config.enable_arc_fitting || path.polyline.fitting_result.empty() || m_config.spiral_mode || sloped != nullptr || outer_wall_gradient_modulated_path) {
+                constexpr double k_max_reasonable_segment_mm = 2000.0;
                 double path_length = 0.;
                 double total_length = sloped == nullptr ? 0. : path.polyline.length() * SCALING_FACTOR;
+                size_t line_idx = 0;
                 for (const Line& line : path.polyline.lines()) {
+                    const size_t segment_idx = line_idx++;
                     std::string tempDescription = description;
                     const double line_length = line.length() * SCALING_FACTOR;
+                    if (!std::isfinite(line_length) || line_length > k_max_reasonable_segment_mm)
+                        continue;
                     if (line_length < EPSILON)
                         continue;
-                    path_length += line_length;
-                    auto dE = e_per_mm * line_length;
-                    if (_needSAFC(path)) {
-                        auto oldE = dE;
-                        dE = m_small_area_infill_flow_compensator->modify_flow(line_length, dE, path.role());
 
-                        if (m_config.gcode_comments && oldE > 0 && oldE != dE) {
-                            tempDescription += Slic3r::format(" | Old Flow Value: %0.5f Length: %0.5f",oldE, line_length);
+                    const bool dynamic_line_modulation =
+                        outer_wall_gradient_dynamic_ctx.enabled &&
+                        (outer_wall_gradient_dynamic_ctx.object_center_mode ||
+                         outer_wall_gradient_dynamic_ctx.vertex_color_match_mode);
+                    if (dynamic_line_modulation) {
+                        const double modulation_step_mm = outer_wall_gradient_dynamic_ctx.vertex_color_match_mode ?
+                            (outer_wall_gradient_dynamic_ctx.high_resolution_texture_sampling ?
+                                std::clamp(double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm) * 0.20, 0.04, 0.12) :
+                                std::clamp(double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm) * 0.35, 0.05, 0.25)) :
+                            std::clamp(double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm) * 2.0, 0.40, 1.20);
+                        const double modulation_step_scaled = scale_(modulation_step_mm);
+                        const int subsegment_count = std::clamp(
+                            int(std::ceil(line.length() / std::max(modulation_step_scaled, EPSILON))),
+                            1,
+                            10000);
+
+                        Point sub_a = line.a;
+                        for (int sub_idx = 1; sub_idx <= subsegment_count; ++sub_idx) {
+                            std::string subDescription = tempDescription;
+                            const double t = double(sub_idx) / double(subsegment_count);
+                            const Point sub_b = (sub_idx == subsegment_count) ?
+                                line.b :
+                                Point(coord_t(std::llround(double(line.a.x()) + (double(line.b.x()) - double(line.a.x())) * t)),
+                                      coord_t(std::llround(double(line.a.y()) + (double(line.b.y()) - double(line.a.y())) * t)));
+                            const Line sub_line(sub_a, sub_b);
+                            const double sub_line_length = sub_line.length() * SCALING_FACTOR;
+                            if (!std::isfinite(sub_line_length) || sub_line_length > k_max_reasonable_segment_mm) {
+                                sub_a = sub_b;
+                                continue;
+                            }
+                            if (sub_line_length < EPSILON) {
+                                sub_a = sub_b;
+                                continue;
+                            }
+
+                            path_length += sub_line_length;
+                            const OuterWallGradientSegmentMod sub_mod = dynamic_modulation_for_line(sub_line);
+                            auto dE = e_per_mm * sub_line_length * sub_mod.flow_scale;
+                            if (_needSAFC(path)) {
+                                auto oldE = dE;
+                                dE = m_small_area_infill_flow_compensator->modify_flow(sub_line_length, dE, path.role());
+                                if (m_config.gcode_comments && oldE > 0 && oldE != dE) {
+                                    subDescription += Slic3r::format(" | Old Flow Value: %0.5f Length: %0.5f", oldE, sub_line_length);
+                                }
+                            }
+
+                            const Point target_point = make_shifted_point(sub_line.b, sub_mod.shift_dx, sub_mod.shift_dy);
+                            const Vec2d target_xy = this->point_to_gcode(target_point);
+                            if (!is_reasonable_quantized_gcode_point_for_gcode(target_xy)) {
+                                sub_a = sub_b;
+                                continue;
+                            }
+                            if (!can_emit_extrusion_delta(dE)) {
+                                sub_a = sub_b;
+                                continue;
+                            }
+                            if (sloped == nullptr) {
+                                gcode += m_writer.extrude_to_xy(target_xy, dE,
+                                                                GCodeWriter::full_gcode_comment ? subDescription : "",
+                                                                path.is_force_no_extrusion());
+                            } else {
+                                if (!std::isfinite(total_length) || total_length <= EPSILON) {
+                                    sub_a = sub_b;
+                                    continue;
+                                }
+                                const auto [z_ratio, e_ratio] = sloped->interpolate(path_length / total_length);
+                                Vec3d dest3d(target_xy(0), target_xy(1), get_sloped_z(z_ratio));
+                                if (!can_emit_sloped_extrusion(dest3d, dE * e_ratio)) {
+                                    sub_a = sub_b;
+                                    continue;
+                                }
+                                gcode += m_writer.extrude_to_xyz(dest3d, dE * e_ratio,
+                                                                 GCodeWriter::full_gcode_comment ? subDescription : "",
+                                                                 path.is_force_no_extrusion());
+                            }
+
+                            emitted_last_point = target_point;
+                            sub_a = sub_b;
                         }
-                    }
-                    if (sloped == nullptr) {
-                        // Normal extrusion
-                        gcode += m_writer.extrude_to_xy(
-                            this->point_to_gcode(line.b),
-                            dE,
-                            GCodeWriter::full_gcode_comment ? tempDescription : "", path.is_force_no_extrusion());
                     } else {
-                        // Sloped extrusion
-                        const auto [z_ratio, e_ratio] = sloped->interpolate(path_length / total_length);
-                        Vec2d dest2d = this->point_to_gcode(line.b);
-                        Vec3d dest3d(dest2d(0), dest2d(1), get_sloped_z(z_ratio));
-                        gcode += m_writer.extrude_to_xyz(
-                            dest3d,
-                            dE * e_ratio,
-                            GCodeWriter::full_gcode_comment ? tempDescription : "", path.is_force_no_extrusion());
+                        path_length += line_length;
+
+                        const OuterWallGradientSegmentMod segment_mod = segment_modulation_at(segment_idx);
+                        auto dE = e_per_mm * line_length * segment_mod.flow_scale;
+                        if (_needSAFC(path)) {
+                            auto oldE = dE;
+                            dE = m_small_area_infill_flow_compensator->modify_flow(line_length, dE, path.role());
+
+                            if (m_config.gcode_comments && oldE > 0 && oldE != dE) {
+                                tempDescription += Slic3r::format(" | Old Flow Value: %0.5f Length: %0.5f",oldE, line_length);
+                            }
+                        }
+
+                        const Point target_point = make_shifted_point(line.b, segment_mod.shift_dx, segment_mod.shift_dy);
+                        const Vec2d target_xy = this->point_to_gcode(target_point);
+                        if (!is_reasonable_quantized_gcode_point_for_gcode(target_xy))
+                            continue;
+                        if (!can_emit_extrusion_delta(dE))
+                            continue;
+                        if (sloped == nullptr) {
+                            gcode += m_writer.extrude_to_xy(
+                                target_xy,
+                                dE,
+                                GCodeWriter::full_gcode_comment ? tempDescription : "", path.is_force_no_extrusion());
+                        } else {
+                            if (!std::isfinite(total_length) || total_length <= EPSILON)
+                                continue;
+                            const auto [z_ratio, e_ratio] = sloped->interpolate(path_length / total_length);
+                            Vec3d dest3d(target_xy(0), target_xy(1), get_sloped_z(z_ratio));
+                            if (!can_emit_sloped_extrusion(dest3d, dE * e_ratio))
+                                continue;
+                            gcode += m_writer.extrude_to_xyz(
+                                dest3d,
+                                dE * e_ratio,
+                                GCodeWriter::full_gcode_comment ? tempDescription : "", path.is_force_no_extrusion());
+                        }
+
+                        emitted_last_point = target_point;
                     }
                 }
             } else {
@@ -6866,6 +9064,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                 this->point_to_gcode(line.b),
                                 dE,
                                 GCodeWriter::full_gcode_comment ? tempDescription : "", path.is_force_no_extrusion());
+                            emitted_last_point = line.b;
                         }
                         break;
                     }
@@ -6891,6 +9090,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                             dE,
                             arc.direction == ArcDirection::Arc_Dir_CCW,
                             GCodeWriter::full_gcode_comment ? tempDescription : "", path.is_force_no_extrusion());
+                        emitted_last_point = arc.end_point;
                         break;
                     }
                     default:
@@ -6914,7 +9114,19 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             total_length = l.length() * SCALING_FACTOR;
         }
         gcode += m_writer.set_speed(last_set_speed, "", comment);
-        Vec2d prev = this->point_to_gcode_quantized(new_points[0].p);
+        Point prev_point_model = new_points[0].p;
+        if (outer_wall_gradient_modulated_path && new_points.size() > 1) {
+            const OuterWallGradientSegmentMod first_mod =
+                (outer_wall_gradient_dynamic_ctx.enabled &&
+                 (outer_wall_gradient_dynamic_ctx.object_center_mode ||
+                  outer_wall_gradient_dynamic_ctx.vertex_color_match_mode)) ?
+                    dynamic_modulation_for_line(Line(new_points[0].p, new_points[1].p)) :
+                    segment_modulation_at(0);
+            prev_point_model = make_shifted_point(prev_point_model, first_mod.shift_dx, first_mod.shift_dy);
+        }
+        Vec2d prev = this->point_to_gcode_quantized(prev_point_model);
+        bool has_valid_prev = is_reasonable_quantized_gcode_point_for_gcode(prev);
+        emitted_last_point = has_valid_prev ? prev_point_model : path.first_point();
         bool pre_fan_enabled = false;
         bool cur_fan_enabled = false;
         if( m_enable_cooling_markers && enable_overhang_bridge_fan)
@@ -6928,7 +9140,18 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             std::string tempDescription = description;
             const ProcessedPoint &processed_point = new_points[i];
             const ProcessedPoint &pre_processed_point = new_points[i-1];
-            Vec2d p = this->point_to_gcode_quantized(processed_point.p);
+            const bool dynamic_line_modulation =
+                outer_wall_gradient_dynamic_ctx.enabled &&
+                (outer_wall_gradient_dynamic_ctx.object_center_mode ||
+                 outer_wall_gradient_dynamic_ctx.vertex_color_match_mode);
+            const OuterWallGradientSegmentMod segment_mod =
+                dynamic_line_modulation ?
+                    dynamic_modulation_for_line(Line(pre_processed_point.p, processed_point.p)) :
+                    segment_modulation_at(i - 1);
+            const Point processed_target_point = make_shifted_point(processed_point.p, segment_mod.shift_dx, segment_mod.shift_dy);
+            Vec2d p = this->point_to_gcode_quantized(processed_target_point);
+            if (!is_reasonable_quantized_gcode_point_for_gcode(p))
+                continue;
             if (m_enable_cooling_markers) {
                 if (enable_overhang_bridge_fan) {
                     cur_fan_enabled = check_overhang_fan(processed_point.overlap, path.role());
@@ -6940,6 +9163,13 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                 }
 
                 apply_role_based_fan_speed();
+            }
+
+            if (!has_valid_prev) {
+                prev = p;
+                emitted_last_point = processed_target_point;
+                has_valid_prev = true;
+                continue;
             }
 
             const double line_length = (p - prev).norm();
@@ -7001,7 +9231,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                 gcode += m_writer.set_speed(F, "", comment);
                 last_set_speed = F;
             }
-            auto dE = e_per_mm * line_length;
+            auto dE = e_per_mm * line_length * segment_mod.flow_scale;
             if (_needSAFC(path)) {
                 auto oldE = dE;
                 dE = m_small_area_infill_flow_compensator->modify_flow(line_length, dE, path.role());
@@ -7010,6 +9240,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                     tempDescription += Slic3r::format(" | Old Flow Value: %0.5f Length: %0.5f",oldE, line_length);
                 }
             }
+            if (!can_emit_extrusion_delta(dE))
+                continue;
             if (sloped == nullptr) {
                 // Normal extrusion
                 gcode += m_writer.extrude_to_xy(p, dE, GCodeWriter::full_gcode_comment ? tempDescription : "");
@@ -7017,9 +9249,12 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                 // Sloped extrusion
                 const auto [z_ratio, e_ratio] = sloped->interpolate(path_length / total_length);
                 Vec3d dest3d(p(0), p(1), get_sloped_z(z_ratio));
+                if (!can_emit_sloped_extrusion(dest3d, dE * e_ratio))
+                    continue;
                 gcode += m_writer.extrude_to_xyz(dest3d, dE * e_ratio, GCodeWriter::full_gcode_comment ? tempDescription : "");
             }
 
+            emitted_last_point = processed_target_point;
             prev = p;
 
         }
@@ -7032,7 +9267,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
       m_last_notgapfill_extrusion_role = path.role();
     }
 
-    this->set_last_pos(path.last_point());
+    this->set_last_pos(emitted_last_point);
     return gcode;
 }
 

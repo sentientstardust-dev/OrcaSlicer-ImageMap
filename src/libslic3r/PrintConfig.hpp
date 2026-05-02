@@ -1118,6 +1118,9 @@ PRINT_CONFIG_CLASS_DEFINE(
     // Detect bridging perimeters
     ((ConfigOptionBool, detect_overhang_wall))
     ((ConfigOptionInt, wall_filament))
+    ((ConfigOptionFloat, texture_mapping_outer_wall_gradient_global_strength))
+    ((ConfigOptionFloat, texture_mapping_outer_wall_gradient_max_line_width))
+    ((ConfigOptionFloat, texture_mapping_outer_wall_gradient_min_line_width))
     ((ConfigOptionFloatOrPercent, inner_wall_line_width))
     ((ConfigOptionFloat, inner_wall_speed))
     // Total number of perimeters.
@@ -1290,6 +1293,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionIntsNullable,        nozzle_flush_dataset))
     ((ConfigOptionFloatsNullable,      filament_flush_volumetric_speed))
     ((ConfigOptionIntsNullable,        filament_flush_temp))
+    ((ConfigOptionString,              texture_mapping_definitions))
     // BBS
     ((ConfigOptionBool,                scan_first_layer))
     ((ConfigOptionEnum<PowerLossRecoveryMode>, enable_power_loss_recovery))

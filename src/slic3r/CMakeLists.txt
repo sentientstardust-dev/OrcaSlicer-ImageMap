@@ -178,6 +178,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/GLCanvas3D.hpp
     GUI/GLModel.cpp
     GUI/GLModel.hpp
+    GUI/MMUPaintedTexturePreview.cpp
+    GUI/MMUPaintedTexturePreview.hpp
     GUI/GLSelectionRectangle.cpp
     GUI/GLSelectionRectangle.hpp
     GUI/GLShader.cpp

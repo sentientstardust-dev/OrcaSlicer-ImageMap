@@ -6,6 +6,7 @@
 
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/TextureMapping.hpp"
 //#include "libslic3r/Model.hpp"
 //#include "Plater.hpp"
 #include "Widgets/Label.hpp"
@@ -28,6 +29,18 @@ namespace GUI {
 static const int grid_cell_border_width = 2;
 static const int grid_cell_border_height = 2;
 static const int grid_cell_checkbox_size = 16;
+
+static wxString texture_mapping_table_label(const TextureMappingZone &zone)
+{
+    if (zone.is_2d_gradient())
+        return _L("Texture Mapping 2D Gradient");
+    const std::string color_model = TextureMappingManager::filament_color_mode_name(zone.filament_color_mode);
+    if (color_model == "any")
+        return _L("Texture Mapping");
+    wxString color_model_text = from_u8(color_model);
+    color_model_text.MakeUpper();
+    return _L("Texture Mapping ") + color_model_text;
+}
 
 //min row count
 static const int g_min_row_count = 16;
@@ -2803,7 +2816,8 @@ int ObjectTablePanel::init_filaments_and_colors()
     //DynamicPrintConfig&  global_config   = wxGetApp().preset_bundle->prints.get_edited_preset().config;
     const DynamicPrintConfig* global_config = m_plater->config();
     const std::vector<std::string> filament_presets = wxGetApp().preset_bundle->filament_presets;
-    m_filaments_count = filament_presets.size();
+    const size_t physical_filaments_count = filament_presets.size();
+    m_filaments_count = physical_filaments_count;
     if (m_filaments_count <= 0) {
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(", can not get filaments, count: %1%, set to default") %m_filaments_count;
         set_default_filaments_and_colors();
@@ -2815,18 +2829,27 @@ int ObjectTablePanel::init_filaments_and_colors()
         set_default_filaments_and_colors();
         return -1;
     }
+    if (wxGetApp().preset_bundle != nullptr) {
+        std::vector<std::string> colors = filament_opt->values;
+        colors.resize(physical_filaments_count, "#26A69A");
+        const std::string serialized = wxGetApp().preset_bundle->project_config.has("texture_mapping_definitions") ?
+            wxGetApp().preset_bundle->project_config.opt_string("texture_mapping_definitions") :
+            std::string();
+        wxGetApp().preset_bundle->texture_mapping_zones.load_entries(serialized, colors);
+        m_filaments_count = std::max(m_filaments_count, int(wxGetApp().preset_bundle->texture_mapping_zones.total_filaments(physical_filaments_count)));
+    }
     m_filaments_colors.resize(m_filaments_count);
     m_filaments_name.resize(m_filaments_count);
     unsigned int color_count = filament_opt->values.size();
-    if (color_count != m_filaments_count) {
-        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(", invalid color count:%1%, extruder count: %2%") %color_count %m_filaments_count;
+    if (color_count != physical_filaments_count) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(", invalid color count:%1%, extruder count: %2%") %color_count %physical_filaments_count;
     }
 
     unsigned int i = 0;
     ColorRGB rgb;
     while (i < m_filaments_count) {
-        const std::string& txt_color = global_config->opt_string("filament_colour", i);
-        if (i < color_count) {
+        if (i < physical_filaments_count) {
+            const std::string& txt_color = global_config->opt_string("filament_colour", i);
             if (decode_color(txt_color, rgb))
             {
                 m_filaments_colors[i] = wxColour(rgb.r_uchar(), rgb.g_uchar(), rgb.b_uchar());
@@ -2835,13 +2858,23 @@ int ObjectTablePanel::init_filaments_and_colors()
             {
                 m_filaments_colors[i] = *wxGREEN;
             }
+            m_filaments_name[i] = wxString(std::to_string(i+1) + ": " + filament_presets[i]);
         }
         else {
-            m_filaments_colors[i] = *wxGREEN;
+            const TextureMappingZone *zone = wxGetApp().preset_bundle != nullptr ?
+                wxGetApp().preset_bundle->texture_mapping_zones.zone_from_id(unsigned(i + 1)) :
+                nullptr;
+            if (zone != nullptr) {
+                if (decode_color(zone->display_color, rgb))
+                    m_filaments_colors[i] = wxColour(rgb.r_uchar(), rgb.g_uchar(), rgb.b_uchar());
+                else
+                    m_filaments_colors[i] = wxColour("#8C8C8C");
+                m_filaments_name[i] = wxString::Format("%d: %s", int(i + 1), texture_mapping_table_label(*zone));
+            } else {
+                m_filaments_colors[i] = wxColour("#8C8C8C");
+                m_filaments_name[i] = wxString::Format("%d: %s", int(i + 1), _L("Filament"));
+            }
         }
-
-        //parse the filaments
-        m_filaments_name[i] = wxString(std::to_string(i+1) + ": " + filament_presets[i]);
 
         i++;
     }

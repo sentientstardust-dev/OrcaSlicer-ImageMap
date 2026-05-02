@@ -43,6 +43,19 @@ static inline Point mk_point(const Vec2d &point) { return {coord_t(std::round(po
 
 static inline Vec2d mk_vec2(const voronoi_diagram<double>::vertex_type *point) { return {point->x(), point->y()}; }
 
+static bool filament_id_uses_texture_mapping(const Print &print, unsigned int filament_id)
+{
+    if (filament_id == 0)
+        return false;
+
+    const size_t num_physical = print.config().filament_diameter.size();
+    if (num_physical == 0)
+        return false;
+
+    const TextureMappingZone *zone = print.texture_mapping_manager().zone_from_id(filament_id);
+    return zone != nullptr && zone->enabled && !zone->deleted && zone->is_image_texture();
+}
+
 static bool vertex_equal_to_point(const Voronoi::VD::vertex_type &vertex, const Vec2d &ipt)
 {
     // Convert ipt to doubles, force the 80bit FPU temporary to 64bit and then compare.
@@ -1347,8 +1360,14 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                 // As this region may split existing regions, we collect statistics over all regions for color_idx == 0.
                 color_idx == 0 || config.wall_filament == int(color_idx)) {
                 //BBS: the extrusion line width is outer wall rather than inner wall
-                const double nozzle_diameter = print_object.print()->config().nozzle_diameter.get_at(0);
+                const Print &print = *print_object.print();
+                const double nozzle_diameter = print.config().nozzle_diameter.get_at(0);
                 double outer_wall_line_width = config.get_abs_value("outer_wall_line_width", nozzle_diameter);
+                const unsigned int queried_filament_id = color_idx == 0 ?
+                    unsigned(std::max(0, config.wall_filament.value)) :
+                    unsigned(color_idx);
+                if (filament_id_uses_texture_mapping(print, queried_filament_id))
+                    outer_wall_line_width = std::max(0.05, config.texture_mapping_outer_wall_gradient_max_line_width.value);
                 out.extrusion_width     = std::max<float>(out.extrusion_width, outer_wall_line_width);
                 out.top_shell_layers    = std::max<int>(out.top_shell_layers, config.top_shell_layers);
                 out.bottom_shell_layers = std::max<int>(out.bottom_shell_layers, config.bottom_shell_layers);
@@ -2195,7 +2214,9 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
 
 // Returns multi-material segmentation based on painting in multi-material segmentation gizmo
 std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(const PrintObject &print_object, const std::function<void()> &throw_on_cancel_callback) {
-    const size_t num_facets_states  = print_object.print()->config().filament_colour.size() + 1;
+    const size_t num_physical_filaments = print_object.print()->config().filament_colour.size();
+    const size_t num_total_filaments    = print_object.print()->texture_mapping_manager().total_filaments(num_physical_filaments);
+    const size_t num_facets_states      = num_total_filaments + 1;
     const float  max_width          = float(print_object.config().mmu_segmented_region_max_width.value);
     const float  interlocking_depth = float(print_object.config().mmu_segmented_region_interlocking_depth.value);
     const bool   interlocking_beam  = print_object.config().interlocking_beam.value;

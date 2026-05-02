@@ -1,5 +1,6 @@
 #include "GLGizmoPainterBase.hpp"
 #include "slic3r/GUI/GLCanvas3D.hpp"
+#include "slic3r/GUI/MMUPaintedTexturePreview.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmosCommon.hpp"
 
 #include <glad/gl.h>
@@ -17,6 +18,21 @@
 #include <optional>
 
 namespace Slic3r::GUI {
+
+namespace {
+
+bool model_volume_has_texture_preview_data_for_painting(const ModelVolume &model_volume)
+{
+    return !model_volume.imported_texture_rgba.empty() &&
+           model_volume.imported_texture_width > 0 &&
+           model_volume.imported_texture_height > 0 &&
+           model_volume.imported_texture_uv_valid.size() == model_volume.mesh().its.indices.size() &&
+           model_volume.imported_texture_uvs_per_face.size() >= model_volume.mesh().its.indices.size() * 6 &&
+           model_volume.imported_texture_rgba.size() >=
+               size_t(model_volume.imported_texture_width) * size_t(model_volume.imported_texture_height) * 4;
+}
+
+} // namespace
 
 std::shared_ptr<GLModel> GLGizmoPainterBase::s_sphere = nullptr;
 
@@ -125,6 +141,12 @@ void GLGizmoPainterBase::render_triangles(const Selection& selection) const
         shader->set_uniform("slope.volume_world_normal_matrix", normal_matrix);
         shader->set_uniform("slope.normal_z", normal_z);
         m_triangle_selectors[mesh_id]->render(m_imgui, trafo_matrix);
+        m_triangle_selectors[mesh_id]->render_texture_preview(trafo_matrix,
+                                                              view_matrix,
+                                                              camera.get_projection_matrix(),
+                                                              clp_data.z_range,
+                                                              clp_data.clp_dataf);
+        shader->start_using();
 
         if (is_left_handed)
             glsafe(::glFrontFace(GL_CCW));
@@ -1586,6 +1608,41 @@ void TriangleSelectorPatch::update_render_data()
             update_triangles_per_type();
         this->finalize_triangle_indices();
 
+        m_texture_preview_models.clear();
+        m_texture_preview_colors.clear();
+        m_texture_preview_filament_ids.clear();
+        m_vertex_color_preview_models.clear();
+        m_vertex_color_preview_colors.clear();
+        m_vertex_color_preview_filament_ids.clear();
+        if (m_model_volume != nullptr) {
+            std::vector<std::vector<TriangleSelector::FacetStateTriangle>> triangles_per_type;
+            get_facet_triangles(triangles_per_type);
+            const size_t num_physical = std::max(0, wxGetApp().filaments_cnt());
+            const TextureMappingManager *texture_mgr = wxGetApp().preset_bundle != nullptr ?
+                &wxGetApp().preset_bundle->texture_mapping_zones : nullptr;
+            m_texture_preview_visual_signature = texture_preview_settings_signature(num_physical, texture_mgr);
+            if (model_volume_has_texture_preview_data_for_painting(*m_model_volume)) {
+                build_mmu_texture_preview_models(*m_model_volume,
+                                                 triangles_per_type,
+                                                 m_ebt_colors,
+                                                 m_model_volume->extruder_id() > 0 ? unsigned(m_model_volume->extruder_id()) : 0u,
+                                                 num_physical,
+                                                 texture_mgr,
+                                                 m_texture_preview_models,
+                                                 m_texture_preview_colors,
+                                                 m_texture_preview_filament_ids);
+            }
+            build_mmu_vertex_color_preview_models(*m_model_volume,
+                                                  triangles_per_type,
+                                                  m_ebt_colors,
+                                                  m_model_volume->extruder_id() > 0 ? unsigned(m_model_volume->extruder_id()) : 0u,
+                                                  num_physical,
+                                                  texture_mgr,
+                                                  m_vertex_color_preview_models,
+                                                  m_vertex_color_preview_colors,
+                                                  m_vertex_color_preview_filament_ids);
+        }
+
         m_paint_changed = false;
     }
 
@@ -1683,8 +1740,76 @@ void TriangleSelectorPatch::release_geometry()
         triangle_indices_VBO_id = 0;
     }
     this->clear();
+    m_texture_preview_models.clear();
+    m_texture_preview_colors.clear();
+    m_texture_preview_filament_ids.clear();
+    m_texture_preview.reset();
+    m_texture_preview_signature = 0;
+    m_texture_preview_visual_signature = 0;
+    m_vertex_color_preview_models.clear();
+    m_vertex_color_preview_colors.clear();
+    m_vertex_color_preview_filament_ids.clear();
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", Line %1%: released geometry")%__LINE__;
+}
+
+void TriangleSelectorPatch::render_texture_preview(const Transform3d&          matrix,
+                                                   const Transform3d&          view_matrix,
+                                                   const Transform3d&          projection_matrix,
+                                                   const std::array<float, 2>& z_range,
+                                                   const std::array<float, 4>& clipping_plane) const
+{
+    if (m_model_volume == nullptr)
+        return;
+
+    const size_t num_physical = std::max(0, wxGetApp().filaments_cnt());
+    const TextureMappingManager *texture_mgr = wxGetApp().preset_bundle != nullptr ?
+        &wxGetApp().preset_bundle->texture_mapping_zones : nullptr;
+    const size_t current_visual_signature = texture_preview_settings_signature(num_physical, texture_mgr);
+    if (current_visual_signature != m_texture_preview_visual_signature) {
+        TriangleSelectorPatch *self = const_cast<TriangleSelectorPatch *>(this);
+        self->request_update_render_data(true);
+        self->update_render_data();
+    }
+
+    if (m_texture_preview_models.empty() && m_vertex_color_preview_models.empty())
+        return;
+
+    auto adjusted_preview_colors = [](const std::vector<ColorRGBA> &colors) {
+        std::vector<ColorRGBA> preview_colors = colors;
+        for (ColorRGBA &preview_color : preview_colors)
+            preview_color = adjust_color_for_rendering(preview_color);
+        return preview_colors;
+    };
+
+    if (!m_texture_preview_models.empty() &&
+        ensure_model_volume_texture_preview(*m_model_volume, m_texture_preview, m_texture_preview_signature)) {
+        render_model_texture_preview_models(m_texture_preview_models,
+                                            adjusted_preview_colors(m_texture_preview_colors),
+                                            m_texture_preview_filament_ids,
+                                            num_physical,
+                                            texture_mgr,
+                                            *m_model_volume,
+                                            m_texture_preview,
+                                            matrix,
+                                            view_matrix,
+                                            projection_matrix,
+                                            z_range,
+                                            clipping_plane);
+    }
+
+    if (!m_vertex_color_preview_models.empty()) {
+        render_model_vertex_color_preview_models(m_vertex_color_preview_models,
+                                                 adjusted_preview_colors(m_vertex_color_preview_colors),
+                                                 m_vertex_color_preview_filament_ids,
+                                                 num_physical,
+                                                 texture_mgr,
+                                                 matrix,
+                                                 view_matrix,
+                                                 projection_matrix,
+                                                 z_range,
+                                                 clipping_plane);
+    }
 }
 
 void TriangleSelectorPatch::finalize_vertices()

@@ -2,6 +2,7 @@
 
 #include "3DScene.hpp"
 #include "GLShader.hpp"
+#include "MMUPaintedTexturePreview.hpp"
 #include "GUI_App.hpp"
 #include "GUI_Colors.hpp"
 #include "Plater.hpp"
@@ -22,11 +23,13 @@
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/Tesselate.hpp"
 #include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/TextureMapping.hpp"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <limits>
 
 #include <boost/log/trivial.hpp>
 
@@ -84,6 +87,42 @@ Slic3r::ColorRGBA adjust_color_for_rendering(const Slic3r::ColorRGBA &colors)
 }
 
 namespace Slic3r {
+
+namespace {
+
+std::vector<TriangleSelector::FacetStateTriangle> build_full_mesh_texture_preview_triangles(const ModelVolume &model_volume)
+{
+    std::vector<TriangleSelector::FacetStateTriangle> out;
+    const indexed_triangle_set &its = model_volume.mesh().its;
+    out.reserve(its.indices.size());
+    for (size_t triangle_idx = 0; triangle_idx < its.indices.size(); ++triangle_idx) {
+        const stl_triangle_vertex_indices &triangle = its.indices[triangle_idx];
+        if (triangle[0] < 0 || triangle[1] < 0 || triangle[2] < 0)
+            continue;
+        if (size_t(triangle[0]) >= its.vertices.size() ||
+            size_t(triangle[1]) >= its.vertices.size() ||
+            size_t(triangle[2]) >= its.vertices.size())
+            continue;
+
+        TriangleSelector::FacetStateTriangle facet;
+        facet.source_triangle = int(triangle_idx);
+        facet.vertices[0] = its.vertices[size_t(triangle[0])].cast<float>();
+        facet.vertices[1] = its.vertices[size_t(triangle[1])].cast<float>();
+        facet.vertices[2] = its.vertices[size_t(triangle[2])].cast<float>();
+        out.emplace_back(std::move(facet));
+    }
+    return out;
+}
+
+bool model_volume_has_any_texture_preview_data(const ModelVolume &model_volume)
+{
+    return !model_volume.imported_vertex_colors_rgba.empty() ||
+           (!model_volume.imported_texture_rgba.empty() &&
+            model_volume.imported_texture_width > 0 &&
+            model_volume.imported_texture_height > 0);
+}
+
+} // namespace
 
 
 const float GLVolume::SinkingContours::HalfWidth = 0.25f;
@@ -582,20 +621,85 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
         if (volume_idx() >=  model_object->volumes.size())
             break;
         model_volume = model_object->volumes[volume_idx()];
-        if (model_volume->mmu_segmentation_facets.empty())
+        const size_t num_physical = std::max(0, GUI::wxGetApp().filaments_cnt());
+        const TextureMappingManager *texture_mgr = GUI::wxGetApp().preset_bundle != nullptr ?
+            &GUI::wxGetApp().preset_bundle->texture_mapping_zones : nullptr;
+        const unsigned int base_filament_id = model_volume->extruder_id() > 0 ? unsigned(model_volume->extruder_id()) : 0u;
+        const TextureMappingZone *base_zone = texture_mgr != nullptr ? texture_mgr->zone_from_id(base_filament_id) : nullptr;
+        const bool has_mmu_segmentation = !model_volume->mmu_segmentation_facets.empty();
+        const bool has_texture_preview =
+            base_zone != nullptr &&
+            base_zone->enabled &&
+            !base_zone->deleted &&
+            (base_zone->is_2d_gradient() || (base_zone->is_image_texture() && model_volume_has_any_texture_preview_data(*model_volume)));
+        if (!has_mmu_segmentation && !has_texture_preview)
+        {
+            mmuseg_texture_preview.reset();
+            mmuseg_texture_preview_signature = 0;
             break;
+        }
 
         color_volume = true;
-        if (model_volume->mmu_segmentation_facets.timestamp() != mmuseg_ts) {
+        size_t preview_visual_signature = texture_preview_settings_signature(num_physical, texture_mgr);
+        preview_visual_signature ^= model_volume_texture_preview_signature(*model_volume) + 0x9e3779b97f4a7c15ull +
+                                    (preview_visual_signature << 6) + (preview_visual_signature >> 2);
+        preview_visual_signature ^= model_volume->imported_vertex_colors_rgba.size() + 0x9e3779b97f4a7c15ull +
+                                    (preview_visual_signature << 6) + (preview_visual_signature >> 2);
+        preview_visual_signature ^= reinterpret_cast<size_t>(model_volume->imported_vertex_colors_rgba.data()) + 0x9e3779b97f4a7c15ull +
+                                    (preview_visual_signature << 6) + (preview_visual_signature >> 2);
+        if (model_volume->mmu_segmentation_facets.timestamp() != mmuseg_ts ||
+            preview_visual_signature != mmuseg_texture_preview_visual_signature) {
             mmuseg_models.clear();
-            std::vector<indexed_triangle_set> its_per_color;
-            model_volume->mmu_segmentation_facets.get_facets(*model_volume, its_per_color);
-            mmuseg_models.resize(its_per_color.size());
-            for (int idx = 0; idx < its_per_color.size(); idx++) {
-                mmuseg_models[idx].init_from(its_per_color[idx]);
+            mmuseg_texture_preview_models.clear();
+            mmuseg_texture_preview_colors.clear();
+            mmuseg_texture_preview_filament_ids.clear();
+            mmuseg_vertex_color_preview_models.clear();
+            mmuseg_vertex_color_preview_colors.clear();
+            mmuseg_vertex_color_preview_filament_ids.clear();
+
+            std::vector<std::vector<TriangleSelector::FacetStateTriangle>> triangles_per_type;
+            if (has_mmu_segmentation) {
+                std::vector<indexed_triangle_set> its_per_color;
+                model_volume->mmu_segmentation_facets.get_facets(*model_volume, its_per_color);
+                mmuseg_models.resize(its_per_color.size());
+                for (int idx = 0; idx < its_per_color.size(); idx++) {
+                    mmuseg_models[idx].init_from(its_per_color[idx]);
+                }
+                model_volume->mmu_segmentation_facets.get_facet_triangles(*model_volume, triangles_per_type);
+            } else {
+                triangles_per_type.resize(1);
+                triangles_per_type[0] = build_full_mesh_texture_preview_triangles(*model_volume);
             }
 
+            std::vector<ColorRGBA> state_colors;
+            const int extruder_id = model_volume->extruder_id();
+            const ColorRGBA fallback_color = extruder_colors.empty() ? ColorRGBA(0.15f, 0.65f, 0.6f, 1.f) : extruder_colors.front();
+            state_colors.emplace_back(extruder_id > 0 && size_t(extruder_id - 1) < extruder_colors.size() ?
+                                      extruder_colors[size_t(extruder_id - 1)] :
+                                      fallback_color);
+            state_colors.insert(state_colors.end(), extruder_colors.begin(), extruder_colors.end());
+
+            build_mmu_texture_preview_models(*model_volume,
+                                             triangles_per_type,
+                                             state_colors,
+                                             base_filament_id,
+                                             num_physical,
+                                             texture_mgr,
+                                             mmuseg_texture_preview_models,
+                                             mmuseg_texture_preview_colors,
+                                             mmuseg_texture_preview_filament_ids);
+            build_mmu_vertex_color_preview_models(*model_volume,
+                                                  triangles_per_type,
+                                                  state_colors,
+                                                  base_filament_id,
+                                                  num_physical,
+                                                  texture_mgr,
+                                                  this->world_matrix(),
+                                                  mmuseg_vertex_color_preview_models,
+                                                  mmuseg_vertex_color_preview_colors,
+                                                  mmuseg_vertex_color_preview_filament_ids);
             mmuseg_ts = model_volume->mmu_segmentation_facets.timestamp();
+            mmuseg_texture_preview_visual_signature = preview_visual_signature;
         }
     } while (0);
 
@@ -606,47 +710,96 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
                 extruder_color.a(render_color.a());
         }
 
-        for (int idx = 0; idx < mmuseg_models.size(); idx++) {
-            GUI::GLModel &m = mmuseg_models[idx];
-            if (!m.is_initialized())
-                continue;
+        if (mmuseg_models.empty()) {
+            if (tverts_range == std::make_pair<size_t, size_t>(0, -1))
+                model.render(shader);
+            else
+                model.render(this->tverts_range, shader);
+        } else {
+            for (int idx = 0; idx < mmuseg_models.size(); idx++) {
+                GUI::GLModel &m = mmuseg_models[idx];
+                if (!m.is_initialized())
+                    continue;
 
-            if (shader) {
-                if (idx == 0) {
-                    int extruder_id = model_volume->extruder_id();
-                    //to make black not too hard too see
-                    ColorRGBA new_color = adjust_color_for_rendering(extruder_colors[extruder_id - 1]);
-                    if (ban_light) {
-                        new_color[3] = (255 - (extruder_id - 1))/255.0f;
-                    }
-                    m.set_color(new_color);
-                    // shader->set_uniform("uniform_color", new_color);
-                }
-                else {
-                    if (idx <= extruder_colors.size()) {
-                        //to make black not too hard too see
-                        ColorRGBA new_color = adjust_color_for_rendering(extruder_colors[idx - 1]);
+                if (shader) {
+                    if (idx == 0) {
+                        int extruder_id = model_volume->extruder_id();
+                        ColorRGBA new_color = extruder_id > 0 && size_t(extruder_id - 1) < extruder_colors.size() ?
+                            adjust_color_for_rendering(extruder_colors[size_t(extruder_id - 1)]) :
+                            (extruder_colors.empty() ? ColorRGBA(0.15f, 0.65f, 0.6f, 1.f) : adjust_color_for_rendering(extruder_colors.front()));
                         if (ban_light) {
-                            new_color[3] = (255 - (idx - 1))/255.0f;
+                            new_color[3] = (255 - std::max(0, extruder_id - 1))/255.0f;
                         }
                         m.set_color(new_color);
-                        // shader->set_uniform("uniform_color", new_color);
                     }
                     else {
-                        //to make black not too hard too see
-                        ColorRGBA new_color = adjust_color_for_rendering(extruder_colors[0]);
-                        if (ban_light) {
-                            new_color[3] = (255 - 0) / 255.0f;
+                        if (idx <= extruder_colors.size()) {
+                            ColorRGBA new_color = adjust_color_for_rendering(extruder_colors[idx - 1]);
+                            if (ban_light) {
+                                new_color[3] = (255 - (idx - 1))/255.0f;
+                            }
+                            m.set_color(new_color);
                         }
-                        m.set_color(new_color);
-                        // shader->set_uniform("uniform_color", new_color);
+                        else {
+                            ColorRGBA new_color = extruder_colors.empty() ? ColorRGBA(0.15f, 0.65f, 0.6f, 1.f) : adjust_color_for_rendering(extruder_colors[0]);
+                            if (ban_light) {
+                                new_color[3] = (255 - 0) / 255.0f;
+                            }
+                            m.set_color(new_color);
+                        }
                     }
                 }
+                if (tverts_range == std::make_pair<size_t, size_t>(0, -1))
+                    m.render(shader);
+                else
+                    m.render(this->tverts_range, shader);
             }
-            if (tverts_range == std::make_pair<size_t, size_t>(0, -1))
-                m.render(shader);
-            else
-                m.render(this->tverts_range, shader);
+        }
+
+        if (!mmuseg_texture_preview_models.empty() || !mmuseg_vertex_color_preview_models.empty()) {
+            auto adjusted_preview_colors = [](const std::vector<ColorRGBA> &colors) {
+                std::vector<ColorRGBA> preview_colors = colors;
+                for (ColorRGBA &preview_color : preview_colors)
+                    preview_color = adjust_color_for_rendering(preview_color);
+                return preview_colors;
+            };
+            const size_t num_physical = std::max(0, GUI::wxGetApp().filaments_cnt());
+            const TextureMappingManager *texture_mgr = GUI::wxGetApp().preset_bundle != nullptr ?
+                &GUI::wxGetApp().preset_bundle->texture_mapping_zones : nullptr;
+            const Transform3d model_matrix = this->world_matrix();
+            const GUI::Camera& camera = GUI::wxGetApp().plater()->get_camera();
+            const std::array<float, 2> z_range = { -std::numeric_limits<float>::max(), std::numeric_limits<float>::max() };
+            const std::array<float, 4> clipping_plane = { 0.f, 0.f, 1.f, std::numeric_limits<float>::max() };
+
+            if (!mmuseg_texture_preview_models.empty() &&
+                ensure_model_volume_texture_preview(*model_volume, mmuseg_texture_preview, mmuseg_texture_preview_signature)) {
+                render_model_texture_preview_models(mmuseg_texture_preview_models,
+                                                    adjusted_preview_colors(mmuseg_texture_preview_colors),
+                                                    mmuseg_texture_preview_filament_ids,
+                                                    num_physical,
+                                                    texture_mgr,
+                                                    *model_volume,
+                                                    mmuseg_texture_preview,
+                                                    model_matrix,
+                                                    camera.get_view_matrix(),
+                                                    camera.get_projection_matrix(),
+                                                    z_range,
+                                                    clipping_plane);
+            }
+            if (!mmuseg_vertex_color_preview_models.empty()) {
+                render_model_vertex_color_preview_models(mmuseg_vertex_color_preview_models,
+                                                         adjusted_preview_colors(mmuseg_vertex_color_preview_colors),
+                                                         mmuseg_vertex_color_preview_filament_ids,
+                                                         num_physical,
+                                                         texture_mgr,
+                                                         model_matrix,
+                                                         camera.get_view_matrix(),
+                                                         camera.get_projection_matrix(),
+                                                         z_range,
+                                                         clipping_plane);
+            }
+            if (shader != nullptr)
+                shader->start_using();
         }
     } else {
         if (tverts_range == std::make_pair<size_t, size_t>(0, -1))

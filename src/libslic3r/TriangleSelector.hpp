@@ -287,6 +287,11 @@ public:
         template<class Archive> void serialize(Archive &ar) { ar(triangles_to_split, bitstream, used_states); }
     };
 
+    struct FacetStateTriangle {
+        std::array<Vec3f, 3> vertices;
+        int                  source_triangle = -1;
+    };
+
     std::pair<std::vector<Vec3i32>, std::vector<Vec3i32>> precompute_all_neighbors() const;
     void precompute_all_neighbors_recursive(int facet_idx, const Vec3i32 &neighbors, const Vec3i32 &neighbors_propagated, std::vector<Vec3i32> &neighbors_out, std::vector<Vec3i32> &neighbors_normal_out) const;
 
@@ -337,6 +342,7 @@ public:
 
     // BBS
     void get_facets(std::vector<indexed_triangle_set>& facets_per_type) const;
+    void get_facet_triangles(std::vector<std::vector<FacetStateTriangle>> &facets_per_type) const;
 
     // Set facet of the mesh to a given state. Only works for original triangles.
     void set_facet(int facet_idx, EnforcerBlockerType state);

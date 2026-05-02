@@ -17,6 +17,7 @@
 #include "GCode/ThumbnailData.hpp"
 #include "GCode/GCodeProcessor.hpp"
 #include "MultiMaterialSegmentation.hpp"
+#include "TextureMapping.hpp"
 #include "libslic3r.h"
 
 #include <Eigen/Geometry>
@@ -943,6 +944,8 @@ public:
     void                auto_assign_extruders(ModelObject* model_object) const;
 
     const PrintConfig&          config() const { return m_config; }
+    const TextureMappingManager& texture_mapping_manager() const { return m_texture_mapping_mgr; }
+    TextureMappingManager&      texture_mapping_manager() { return m_texture_mapping_mgr; }
     const PrintObjectConfig&    default_object_config() const { return m_default_object_config; }
     const PrintRegionConfig& default_region_config() const { return m_default_region_config; }
     ConstPrintObjectPtrsAdaptor objects() const { return ConstPrintObjectPtrsAdaptor(&m_objects); }
@@ -1127,6 +1130,7 @@ private:
     Polygons            first_layer_islands() const;
 
     PrintConfig                             m_config;
+    TextureMappingManager                   m_texture_mapping_mgr;
     PrintObjectConfig                       m_default_object_config;
     PrintRegionConfig                       m_default_region_config;
     PrintObjectPtrs                         m_objects;

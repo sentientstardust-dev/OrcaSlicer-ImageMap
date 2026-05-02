@@ -1,7 +1,21 @@
 #include "Exception.hpp"
 #include "Print.hpp"
+#include "TextureMapping.hpp"
 
 namespace Slic3r {
+
+static bool filament_id_uses_texture_mapping(const Print &print, unsigned int filament_id)
+{
+    if (filament_id == 0)
+        return false;
+
+    const size_t num_physical = print.config().filament_diameter.size();
+    if (num_physical == 0)
+        return false;
+
+    const TextureMappingZone *zone = print.texture_mapping_manager().zone_from_id(filament_id);
+    return zone != nullptr && zone->enabled && !zone->deleted && zone->is_image_texture();
+}
 
 // 1-based extruder identifier for this region and role.
 unsigned int PrintRegion::extruder(FlowRole role) const
@@ -24,7 +38,12 @@ Flow PrintRegion::flow(const PrintObject &object, FlowRole role, double layer_he
     ConfigOptionFloatOrPercent config_width;
     // Get extrusion width from configuration.
     // (might be an absolute value, or a percent value, or zero for auto)
-    if (first_layer && print_config.initial_layer_line_width.value > 0) {
+    if (role == frExternalPerimeter &&
+        filament_id_uses_texture_mapping(*object.print(), unsigned(std::max(0, m_config.wall_filament.value)))) {
+        config_width = ConfigOptionFloatOrPercent(
+            std::max(0.05, m_config.texture_mapping_outer_wall_gradient_max_line_width.value),
+            false);
+    } else if (first_layer && print_config.initial_layer_line_width.value > 0) {
         config_width = print_config.initial_layer_line_width;
     } else if (role == frExternalPerimeter) {
         config_width = m_config.outer_wall_line_width;
@@ -85,11 +104,21 @@ void PrintRegion::collect_object_printing_extruders(const Print &print, std::vec
 #ifndef NDEBUG
     // BBS
     auto num_extruders = int(print.config().filament_diameter.size());
-    assert(this->config().wall_filament    <= num_extruders);
-    assert(this->config().sparse_infill_filament       <= num_extruders);
-    assert(this->config().solid_infill_filament <= num_extruders);
+    assert(this->config().wall_filament <= num_extruders || print.texture_mapping_manager().is_texture_mapping_zone_id(this->config().wall_filament));
+    assert(this->config().sparse_infill_filament <= num_extruders || print.texture_mapping_manager().is_texture_mapping_zone_id(this->config().sparse_infill_filament));
+    assert(this->config().solid_infill_filament <= num_extruders || print.texture_mapping_manager().is_texture_mapping_zone_id(this->config().solid_infill_filament));
 #endif
-    collect_object_printing_extruders(print.config(), this->config(), print.has_brim(), object_extruders);
+    PrintRegionConfig config = this->config();
+    const size_t num_physical = print.config().filament_colour.size();
+    auto resolve_filament_id = [&print, num_physical](int filament_id) {
+        if (filament_id > 0 && print.texture_mapping_manager().is_texture_mapping_zone_id(unsigned(filament_id)))
+            return int(print.texture_mapping_manager().resolve_zone_component(unsigned(filament_id), num_physical, 0));
+        return filament_id;
+    };
+    config.wall_filament.value = resolve_filament_id(config.wall_filament.value);
+    config.sparse_infill_filament.value = resolve_filament_id(config.sparse_infill_filament.value);
+    config.solid_infill_filament.value = resolve_filament_id(config.solid_infill_filament.value);
+    collect_object_printing_extruders(print.config(), config, print.has_brim(), object_extruders);
 }
 
 }
