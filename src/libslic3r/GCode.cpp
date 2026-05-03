@@ -8769,6 +8769,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
     std::vector<OuterWallGradientSegmentMod> outer_wall_gradient_segment_mods;
     OuterWallGradientDynamicContext outer_wall_gradient_dynamic_ctx;
     bool outer_wall_gradient_modulated_path = false;
+    bool outer_wall_gradient_texture_path = false;
     Point outer_wall_gradient_start_point = path.first_point();
 
     if (!path.is_force_no_extrusion() &&
@@ -9182,6 +9183,12 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                     [](const OuterWallGradientSegmentMod &mod) {
                                         return mod.shift_dx != 0 || mod.shift_dy != 0 || std::abs(mod.flow_scale - 1.0) > 1e-6;
                                     });
+                                const bool outer_wall_gradient_dynamic_sampled_path =
+                                    outer_wall_gradient_dynamic_ctx.enabled &&
+                                    (outer_wall_gradient_dynamic_ctx.object_center_mode ||
+                                     outer_wall_gradient_dynamic_ctx.vertex_color_match_mode);
+                                outer_wall_gradient_texture_path =
+                                    outer_wall_gradient_modulated_path || outer_wall_gradient_dynamic_sampled_path;
 
                                 if (outer_wall_gradient_modulated_path && !outer_wall_gradient_segment_mods.empty()) {
                                     const OuterWallGradientSegmentMod &start_mod = outer_wall_gradient_segment_mods.front();
@@ -9614,8 +9621,9 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         gcode += buf;
     }
 
-    if (last_was_wipe_tower || m_last_width != path.width) {
-        m_last_width = path.width;
+    const float preview_width = outer_wall_gradient_texture_path ? 0.f : path.width;
+    if (last_was_wipe_tower || m_last_width != preview_width) {
+        m_last_width = preview_width;
         sprintf(buf, ";%s%g\n", GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Width).c_str(), m_last_width);
         gcode += buf;
     }
@@ -9973,7 +9981,11 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             }
             // BBS: use G1 if not enable arc fitting or has no arc fitting result or in spiral_mode mode or we are doing sloped extrusion
             // Attention: G2 and G3 is not supported in spiral_mode mode
-            if (!m_config.enable_arc_fitting || path.polyline.fitting_result.empty() || m_config.spiral_mode || sloped != nullptr || outer_wall_gradient_modulated_path) {
+            if (!m_config.enable_arc_fitting ||
+                path.polyline.fitting_result.empty() ||
+                m_config.spiral_mode ||
+                sloped != nullptr ||
+                outer_wall_gradient_texture_path) {
                 constexpr double k_max_reasonable_segment_mm = 2000.0;
                 double path_length = 0.;
                 double total_length = sloped == nullptr ? 0. : path.polyline.length() * SCALING_FACTOR;
@@ -10244,9 +10256,11 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             }
 
             const double line_length = (p - prev).norm();
+            constexpr double k_max_reasonable_segment_mm = 2000.0;
+            if (!std::isfinite(line_length) || line_length > k_max_reasonable_segment_mm)
+                continue;
             if(line_length < EPSILON)
                 continue;
-            path_length += line_length;
             double new_speed = pre_processed_point.speed * 60.0;
             
             if ((std::abs(last_set_speed - new_speed) > EPSILON) || (std::abs(_mm3_per_mm - m_last_mm3_mm) > EPSILON)) {
@@ -10302,31 +10316,115 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                 gcode += m_writer.set_speed(F, "", comment);
                 last_set_speed = F;
             }
-            auto dE = e_per_mm * line_length * segment_mod.flow_scale;
-            if (_needSAFC(path)) {
-                auto oldE = dE;
-                dE = m_small_area_infill_flow_compensator->modify_flow(line_length, dE, path.role());
 
-                if (m_config.gcode_comments && oldE > 0 && oldE != dE) {
-                    tempDescription += Slic3r::format(" | Old Flow Value: %0.5f Length: %0.5f",oldE, line_length);
+            const bool high_res_dynamic_subsegments =
+                dynamic_line_modulation &&
+                outer_wall_gradient_dynamic_ctx.vertex_color_match_mode &&
+                outer_wall_gradient_dynamic_ctx.high_resolution_texture_sampling;
+            if (high_res_dynamic_subsegments) {
+                const Line parent_line(pre_processed_point.p, processed_point.p);
+                const double modulation_step_mm =
+                    std::clamp(double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm) * 0.20, 0.04, 0.12);
+                const double modulation_step_scaled = scale_(modulation_step_mm);
+                const int subsegment_count =
+                    std::clamp(int(std::ceil(parent_line.length() / std::max(modulation_step_scaled, EPSILON))), 1, 10000);
+
+                Point sub_a = parent_line.a;
+                for (int sub_idx = 1; sub_idx <= subsegment_count; ++sub_idx) {
+                    std::string subDescription = tempDescription;
+                    const double t = double(sub_idx) / double(subsegment_count);
+                    const Point sub_b = (sub_idx == subsegment_count) ?
+                        parent_line.b :
+                        Point(coord_t(std::llround(double(parent_line.a.x()) + (double(parent_line.b.x()) - double(parent_line.a.x())) * t)),
+                              coord_t(std::llround(double(parent_line.a.y()) + (double(parent_line.b.y()) - double(parent_line.a.y())) * t)));
+                    const Line sub_line(sub_a, sub_b);
+                    const OuterWallGradientSegmentMod sub_mod = dynamic_modulation_for_line(sub_line);
+                    const Point sub_target_point = make_shifted_point(sub_line.b, sub_mod.shift_dx, sub_mod.shift_dy);
+                    Vec2d sub_p = this->point_to_gcode_quantized(sub_target_point);
+                    if (!is_reasonable_quantized_gcode_point_for_gcode(sub_p)) {
+                        sub_a = sub_b;
+                        continue;
+                    }
+
+                    const double sub_line_length = (sub_p - prev).norm();
+                    if (!std::isfinite(sub_line_length)) {
+                        sub_a = sub_b;
+                        continue;
+                    }
+                    if (sub_line_length > k_max_reasonable_segment_mm) {
+                        sub_a = sub_b;
+                        continue;
+                    }
+                    if (sub_line_length < EPSILON) {
+                        sub_a = sub_b;
+                        continue;
+                    }
+                    path_length += sub_line_length;
+
+                    auto dE = e_per_mm * sub_line_length * sub_mod.flow_scale;
+                    if (_needSAFC(path)) {
+                        auto oldE = dE;
+                        dE = m_small_area_infill_flow_compensator->modify_flow(sub_line_length, dE, path.role());
+
+                        if (m_config.gcode_comments && oldE > 0 && oldE != dE) {
+                            subDescription += Slic3r::format(" | Old Flow Value: %0.5f Length: %0.5f",oldE, sub_line_length);
+                        }
+                    }
+                    if (!can_emit_extrusion_delta(dE)) {
+                        sub_a = sub_b;
+                        continue;
+                    }
+                    if (sloped == nullptr) {
+                        gcode += m_writer.extrude_to_xy(sub_p, dE, GCodeWriter::full_gcode_comment ? subDescription : "");
+                    } else {
+                        if (!std::isfinite(total_length) || total_length <= EPSILON) {
+                            sub_a = sub_b;
+                            continue;
+                        }
+                        const auto [z_ratio, e_ratio] = sloped->interpolate(path_length / total_length);
+                        Vec3d dest3d(sub_p(0), sub_p(1), get_sloped_z(z_ratio));
+                        if (!can_emit_sloped_extrusion(dest3d, dE * e_ratio)) {
+                            sub_a = sub_b;
+                            continue;
+                        }
+                        gcode += m_writer.extrude_to_xyz(dest3d, dE * e_ratio, GCodeWriter::full_gcode_comment ? subDescription : "");
+                    }
+
+                    emitted_last_point = sub_target_point;
+                    prev = sub_p;
+                    sub_a = sub_b;
                 }
-            }
-            if (!can_emit_extrusion_delta(dE))
-                continue;
-            if (sloped == nullptr) {
-                // Normal extrusion
-                gcode += m_writer.extrude_to_xy(p, dE, GCodeWriter::full_gcode_comment ? tempDescription : "");
             } else {
-                // Sloped extrusion
-                const auto [z_ratio, e_ratio] = sloped->interpolate(path_length / total_length);
-                Vec3d dest3d(p(0), p(1), get_sloped_z(z_ratio));
-                if (!can_emit_sloped_extrusion(dest3d, dE * e_ratio))
-                    continue;
-                gcode += m_writer.extrude_to_xyz(dest3d, dE * e_ratio, GCodeWriter::full_gcode_comment ? tempDescription : "");
-            }
+                path_length += line_length;
 
-            emitted_last_point = processed_target_point;
-            prev = p;
+                auto dE = e_per_mm * line_length * segment_mod.flow_scale;
+                if (_needSAFC(path)) {
+                    auto oldE = dE;
+                    dE = m_small_area_infill_flow_compensator->modify_flow(line_length, dE, path.role());
+
+                    if (m_config.gcode_comments && oldE > 0 && oldE != dE) {
+                        tempDescription += Slic3r::format(" | Old Flow Value: %0.5f Length: %0.5f",oldE, line_length);
+                    }
+                }
+                if (!can_emit_extrusion_delta(dE))
+                    continue;
+                if (sloped == nullptr) {
+                    // Normal extrusion
+                    gcode += m_writer.extrude_to_xy(p, dE, GCodeWriter::full_gcode_comment ? tempDescription : "");
+                } else {
+                    // Sloped extrusion
+                    if (!std::isfinite(total_length) || total_length <= EPSILON)
+                        continue;
+                    const auto [z_ratio, e_ratio] = sloped->interpolate(path_length / total_length);
+                    Vec3d dest3d(p(0), p(1), get_sloped_z(z_ratio));
+                    if (!can_emit_sloped_extrusion(dest3d, dE * e_ratio))
+                        continue;
+                    gcode += m_writer.extrude_to_xyz(dest3d, dE * e_ratio, GCodeWriter::full_gcode_comment ? tempDescription : "");
+                }
+
+                emitted_last_point = processed_target_point;
+                prev = p;
+            }
 
         }
     }

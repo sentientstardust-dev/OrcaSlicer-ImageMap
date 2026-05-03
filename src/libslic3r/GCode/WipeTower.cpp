@@ -1450,8 +1450,7 @@ static void prime_tower_textured_path(WipeTowerWriter &writer,
     float travelled = 0.f;
     bool have_shifted_pos = false;
     Vec2f shifted_pos = writer.pos();
-    float last_analyzer_width = reference_width;
-    bool analyzer_width_changed = false;
+    writer.change_analyzer_line_width(0.f);
     for (size_t i = 0; i < segment_count; ++i) {
         const size_t next_i = i + 1 == texture_points.size() ? 0 : i + 1;
         const Vec2f a = texture_points[i];
@@ -1484,18 +1483,12 @@ static void prime_tower_textured_path(WipeTowerWriter &writer,
                 shifted_pos = p0;
                 have_shifted_pos = true;
             }
-            if (std::abs(target_width - last_analyzer_width) > 0.001f) {
-                writer.change_analyzer_line_width(target_width);
-                last_analyzer_width = target_width;
-                analyzer_width_changed = true;
-            }
             writer.extrude_explicit(p1, (p1 - p0).norm() * extrusion_flow * flow_scale, feedrate, true);
             shifted_pos = p1;
         }
         travelled += sample_len;
     }
-    if (analyzer_width_changed && std::abs(last_analyzer_width - reference_width) > 0.001f)
-        writer.change_analyzer_line_width(reference_width);
+    writer.change_analyzer_line_width(reference_width);
 }
 
 static void prime_tower_textured_closed_path(WipeTowerWriter &writer,
