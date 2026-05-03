@@ -4893,6 +4893,7 @@ void Sidebar::sync_ams_list(bool is_from_big_sync_btn)
             c->update();
         obj_list()->update_filament_colors();
         update_dynamic_filament_list();
+        update_texture_mapping_panel();
     }
 
     auto badge_combox_filament = [sync_color_only](PlaterPresetComboBox *c) {
@@ -18327,6 +18328,7 @@ void Plater::on_config_change(const DynamicPrintConfig &config)
 {
     bool update_scheduled = false;
     bool bed_shape_changed = false;
+    bool update_texture_mapping_colors = false;
     //bool print_sequence_changed = false;
     t_config_option_keys diff_keys = p->config->diff(config);
 
@@ -18345,6 +18347,7 @@ void Plater::on_config_change(const DynamicPrintConfig &config)
             if (update_filament_colors_in_full_config()) {
                 p->sidebar->obj_list()->update_filament_colors();
                 p->sidebar->update_dynamic_filament_list();
+                update_texture_mapping_colors = true;
                 continue;
             }
         }
@@ -18419,6 +18422,9 @@ void Plater::on_config_change(const DynamicPrintConfig &config)
 
     if (bed_shape_changed)
         set_bed_shape();
+
+    if (update_texture_mapping_colors)
+        p->sidebar->update_texture_mapping_panel();
 
     config_change_notification(config, std::string("print_sequence"));
 
