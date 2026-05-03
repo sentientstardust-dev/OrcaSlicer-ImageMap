@@ -699,11 +699,14 @@ int TriangleSelector::triangle_midpoint(const Triangle &tr, int vertexi, int ver
 // If itriangle == -1 or if the side sharing (vertexi, vertexj) is not split, return -1.
 int TriangleSelector::triangle_midpoint(int itriangle, int vertexi, int vertexj) const
 {
-    return itriangle == -1 ? -1 : this->triangle_midpoint(m_triangles[itriangle], vertexi, vertexj);
+    return itriangle < 0 || itriangle >= int(m_triangles.size()) ? -1 : this->triangle_midpoint(m_triangles[itriangle], vertexi, vertexj);
 }
 
 int TriangleSelector::triangle_midpoint_or_allocate(int itriangle, int vertexi, int vertexj)
 {
+    if (vertexi < 0 || vertexj < 0 || vertexi >= int(m_vertices.size()) || vertexj >= int(m_vertices.size()))
+        return -1;
+
     int midpoint = this->triangle_midpoint(itriangle, vertexi, vertexj);
     if (midpoint == -1) {
         Vec3f c = 0.5f * (m_vertices[vertexi].v + m_vertices[vertexj].v);
@@ -1361,14 +1364,22 @@ void TriangleSelector::perform_split(int facet_idx, const Vec3i32 &neighbors, En
     for (int j=0, idx = tr.special_side(); j<3; ++j, idx = next_idx_modulo(idx, 3))
         verts_idxs.push_back(tr.verts_idxs[idx]);
 
-    auto get_alloc_vertex = [this, &neighbors, &verts_idxs](int edge, int i1, int i2) -> int {
-        return this->triangle_midpoint_or_allocate(neighbors(edge), verts_idxs[i1], verts_idxs[i2]);
+    bool split_failed = false;
+    auto get_alloc_vertex = [this, &neighbors, &verts_idxs, &split_failed](int edge, int i1, int i2) -> int {
+        const int vertex = this->triangle_midpoint_or_allocate(neighbors(edge), verts_idxs[i1], verts_idxs[i2]);
+        if (vertex < 0)
+            split_failed = true;
+        return vertex;
     };
 
     int ichild = 0;
     switch (tr.number_of_split_sides()) {
     case 1:
         verts_idxs.insert(verts_idxs.begin()+2, get_alloc_vertex(next_idx_modulo(tr.special_side(), 3), 2, 1));
+        if (split_failed) {
+            tr.set_division(0, 0);
+            return;
+        }
         tr.children[ichild ++] = push_triangle(verts_idxs[0], verts_idxs[1], verts_idxs[2], tr.source_triangle, old_state);
         tr.children[ichild   ] = push_triangle(verts_idxs[2], verts_idxs[3], verts_idxs[0], tr.source_triangle, old_state);
         break;
@@ -1376,6 +1387,10 @@ void TriangleSelector::perform_split(int facet_idx, const Vec3i32 &neighbors, En
     case 2:
         verts_idxs.insert(verts_idxs.begin()+1, get_alloc_vertex(tr.special_side(), 1, 0));
         verts_idxs.insert(verts_idxs.begin()+4, get_alloc_vertex(prev_idx_modulo(tr.special_side(), 3), 0, 3));
+        if (split_failed) {
+            tr.set_division(0, 0);
+            return;
+        }
         tr.children[ichild ++] = push_triangle(verts_idxs[0], verts_idxs[1], verts_idxs[4], tr.source_triangle, old_state);
         tr.children[ichild ++] = push_triangle(verts_idxs[1], verts_idxs[2], verts_idxs[4], tr.source_triangle, old_state);
         tr.children[ichild   ] = push_triangle(verts_idxs[2], verts_idxs[3], verts_idxs[4], tr.source_triangle, old_state);
@@ -1386,6 +1401,10 @@ void TriangleSelector::perform_split(int facet_idx, const Vec3i32 &neighbors, En
         verts_idxs.insert(verts_idxs.begin()+1, get_alloc_vertex(0, 1, 0));
         verts_idxs.insert(verts_idxs.begin()+3, get_alloc_vertex(1, 3, 2));
         verts_idxs.insert(verts_idxs.begin()+5, get_alloc_vertex(2, 0, 4));
+        if (split_failed) {
+            tr.set_division(0, 0);
+            return;
+        }
         tr.children[ichild ++] = push_triangle(verts_idxs[0], verts_idxs[1], verts_idxs[5], tr.source_triangle, old_state);
         tr.children[ichild ++] = push_triangle(verts_idxs[1], verts_idxs[2], verts_idxs[3], tr.source_triangle, old_state);
         tr.children[ichild ++] = push_triangle(verts_idxs[3], verts_idxs[4], verts_idxs[5], tr.source_triangle, old_state);
@@ -1448,7 +1467,12 @@ void TriangleSelector::get_facets(std::vector<indexed_triangle_set>& facets_per_
 {
     facets_per_type.clear();
 
-    for (int type = (int)EnforcerBlockerType::NONE; type <= (int)EnforcerBlockerType::ExtruderMax; type++) {
+    int max_state = int(EnforcerBlockerType::NONE);
+    for (const Triangle &tr : m_triangles)
+        if (tr.valid() && !tr.is_split())
+            max_state = std::max(max_state, int(tr.get_state()));
+
+    for (int type = int(EnforcerBlockerType::NONE); type <= max_state; ++type) {
         facets_per_type.emplace_back();
         indexed_triangle_set& its = facets_per_type.back();
         std::vector<int> vertex_map(m_vertices.size(), -1);
@@ -1668,9 +1692,10 @@ void TriangleSelector::get_seed_fill_contour_recursive(const int facet_idx, cons
 
 TriangleSelector::TriangleSplittingData TriangleSelector::serialize() const {
     // Each original triangle of the mesh is assigned a number encoding its state
-    // or how it is split. Each triangle is encoded by 4 bits (xxyy) or 8 bits (zzzzxxyy):
+    // or how it is split. Each triangle is encoded by 4 bits (xxyy) or by
+    // 4 bits plus one or more extension nibbles:
     // leaf triangle: xx = EnforcerBlockerType (Only values 0, 1, and 2. Value 3 is used as an indicator for additional 4 bits.), yy = 0
-    // leaf triangle: xx = 0b11, yy = 0b00, zzzz = EnforcerBlockerType (subtracted by 3)
+    // leaf triangle: xx = 0b11, yy = 0b00, zzzz... = EnforcerBlockerType (subtracted by 3) in base-15 chunks
     // non-leaf:      xx = special side, yy = number of split sides
     // These are bitwise appended and formed into one 64-bit integer.
 
@@ -1713,14 +1738,18 @@ TriangleSelector::TriangleSplittingData TriangleSelector::serialize() const {
                     data.used_states[n] = true;
 
                 if (n >= 3) {
-                    assert(n <= 16);
-                    if (n <= 16) {
-                        // Store "11" plus 4 bits of (n-3).
-                        data.bitstream.insert(data.bitstream.end(), { true, true });
-                        n -= 3;
-                        for (size_t bit_idx = 0; bit_idx < 4; ++bit_idx)
-                            data.bitstream.push_back(n & (uint64_t(0b0001) << bit_idx));
+                    // Store "11" plus one or more 4-bit chunks of (n - 3), where
+                    // 0b1111 indicates that another chunk follows.
+                    data.bitstream.insert(data.bitstream.end(), { true, true });
+                    n -= 3;
+                    while (n >= 15) {
+                        for (size_t bit_idx = 0; bit_idx < 4; ++bit_idx) {
+                            data.bitstream.push_back(uint64_t(0b1111) & (uint64_t(0b0001) << bit_idx));
+                        }
+                        n -= 15;
                     }
+                    for (size_t bit_idx = 0; bit_idx < 4; ++bit_idx)
+                        data.bitstream.push_back(n & (uint64_t(0b0001) << bit_idx));
                 } else {
                     // Simple case, compatible with PrusaSlicer 2.3.1 and older for storing paint on supports and seams.
                     // Store 2 bits of n.
@@ -1746,17 +1775,18 @@ TriangleSelector::TriangleSplittingData TriangleSelector::serialize() const {
     return out.data;
 }
 
-void TriangleSelector::deserialize(const TriangleSplittingData &data,
+void TriangleSelector::deserialize(const TriangleSplittingData& data,
                                    bool                         needs_reset,
                                    EnforcerBlockerType          max_ebt,
                                    EnforcerBlockerType          to_delete_filament,
-                                   EnforcerBlockerType          replace_filament)
+                                   EnforcerBlockerType          replace_filament,
+                                   const EnforcerBlockerStateMap* state_map)
 {
     if (needs_reset)
         reset(); // dump any current state
     for (auto [triangle_id, ibit] : data.triangles_to_split) {
-        if (triangle_id >= int(m_triangles.size())) {
-            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "array bound:error:triangle_id >= int(m_triangles.size())";
+        if (triangle_id < 0 || triangle_id >= int(m_triangles.size()) || ibit < 0 || ibit >= int(data.bitstream.size())) {
+            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "array bound:error:triangle_id or bitstream index is out of range";
             return;
         }
     }
@@ -1781,7 +1811,12 @@ void TriangleSelector::deserialize(const TriangleSplittingData &data,
     for (auto [triangle_id, ibit] : data.triangles_to_split) {
         assert(triangle_id < int(m_triangles.size()));
         assert(ibit < int(data.bitstream.size()));
-        auto next_nibble = [&data, &ibit = ibit]() {
+        bool bitstream_valid = true;
+        auto next_nibble = [&data, &ibit = ibit, &bitstream_valid]() {
+            if (ibit < 0 || ibit + 4 > int(data.bitstream.size())) {
+                bitstream_valid = false;
+                return 0;
+            }
             int n = 0;
             for (int i = 0; i < 4; ++ i)
                 n |= data.bitstream[ibit ++] << i;
@@ -1792,17 +1827,39 @@ void TriangleSelector::deserialize(const TriangleSplittingData &data,
         while (true) {
             // Read next triangle info.
             int code = next_nibble();
+            if (!bitstream_valid)
+                return;
             int num_of_split_sides = code & 0b11;
             int num_of_children = num_of_split_sides == 0 ? 0 : num_of_split_sides + 1;
             bool is_split = num_of_children != 0;
-            // Only valid if not is_split. Value of the second nibble was subtracted by 3, so it is added back.
-            auto state = is_split ? EnforcerBlockerType::NONE : EnforcerBlockerType((code & 0b1100) == 0b1100 ? next_nibble() + 3 : code >> 2);
+            auto state = EnforcerBlockerType::NONE;
+            if (!is_split) {
+                if ((code & 0b1100) == 0b1100) {
+                    int next_code = next_nibble();
+                    if (!bitstream_valid)
+                        return;
+                    int extension_count = 0;
+                    while (next_code == 0b1111) {
+                        ++extension_count;
+                        next_code = next_nibble();
+                        if (!bitstream_valid)
+                            return;
+                    }
+                    state = EnforcerBlockerType(next_code + 15 * extension_count + 3);
+                } else {
+                    state = EnforcerBlockerType(code >> 2);
+                }
+            }
 
-            // BBS
-            if (state == to_delete_filament)
-                state = replace_filament;
-            else if (to_delete_filament != EnforcerBlockerType::NONE && state != EnforcerBlockerType::NONE) {
-                state = state > to_delete_filament ? EnforcerBlockerType((int)state - 1) : state;
+            if (state_map != nullptr && state != EnforcerBlockerType::NONE) {
+                const size_t state_idx = static_cast<size_t>(state);
+                state = state_idx < state_map->size() ? (*state_map)[state_idx] : EnforcerBlockerType::NONE;
+            } else {
+                if (state == to_delete_filament)
+                    state = replace_filament;
+                else if (to_delete_filament != EnforcerBlockerType::NONE && state != EnforcerBlockerType::NONE) {
+                    state = state > to_delete_filament ? EnforcerBlockerType((int)state - 1) : state;
+                }
             }
 
             if (state > max_ebt) {
@@ -1812,6 +1869,10 @@ void TriangleSelector::deserialize(const TriangleSplittingData &data,
 
             // Only valid if is_split.
             int special_side = code >> 2;
+            if (is_split &&
+                (special_side < 0 || special_side >= 3 ||
+                 (num_of_split_sides != 1 && num_of_split_sides != 2 && special_side != 0)))
+                return;
 
             // Take care of the first iteration separately, so handling of the others is simpler.
             if (parents.empty()) {
@@ -1822,6 +1883,8 @@ void TriangleSelector::deserialize(const TriangleSplittingData &data,
                     parents.push_back({triangle_id, neighbors, 0, num_of_children});
                     m_triangles[triangle_id].set_division(num_of_split_sides, special_side);
                     perform_split(triangle_id, neighbors, EnforcerBlockerType::NONE);
+                    if (!m_triangles[triangle_id].is_split())
+                        return;
                     continue;
                 } else {
                     // root is not split. just set the state and that's it.
@@ -1840,13 +1903,20 @@ void TriangleSelector::deserialize(const TriangleSplittingData &data,
                 int   child_idx = last.total_children - last.processed_children - 1;
                 Vec3i32 neighbors = this->child_neighbors(tr, last.neighbors, child_idx);
                 int this_idx = tr.children[child_idx];
+                if (this_idx < 0 || this_idx >= int(m_triangles.size()))
+                    return;
                 m_triangles[this_idx].set_division(num_of_split_sides, special_side);
                 perform_split(this_idx, neighbors, EnforcerBlockerType::NONE);
+                if (!m_triangles[this_idx].is_split())
+                    return;
                 parents.push_back({this_idx, neighbors, 0, num_of_children});
             } else {
                 // this triangle belongs to last split one
                 int child_idx = last.total_children - last.processed_children - 1;
-                m_triangles[m_triangles[last.facet_id].children[child_idx]].set_state(state);
+                const int this_idx = m_triangles[last.facet_id].children[child_idx];
+                if (this_idx < 0 || this_idx >= int(m_triangles.size()))
+                    return;
+                m_triangles[this_idx].set_state(state);
                 ++last.processed_children;
             }
 
@@ -1893,7 +1963,16 @@ void TriangleSelector::TriangleSplittingData::update_used_states(const size_t bi
         if (const bool is_split = (code & 0b11) != 0; is_split)
             continue;
 
-        const uint8_t facet_state = (code & 0b1100) == 0b1100 ? read_next_nibble() + 3 : code >> 2;
+        size_t facet_state = code >> 2;
+        if ((code & 0b1100) == 0b1100) {
+            size_t extension_count = 0;
+            size_t next_code = read_next_nibble();
+            while (next_code == 0b1111) {
+                ++extension_count;
+                next_code = read_next_nibble();
+            }
+            facet_state = next_code + 15 * extension_count + 3;
+        }
         assert(facet_state < this->used_states.size());
         if (facet_state >= this->used_states.size())
             continue;
@@ -1923,9 +2002,19 @@ bool TriangleSelector::has_facets(const TriangleSplittingData &data, const Enfor
         auto num_children_or_state = [&next_nibble]() -> int {
             int code               = next_nibble();
             int num_of_split_sides = code & 0b11;
-            return num_of_split_sides == 0 ?
-                ((code & 0b1100) == 0b1100 ? next_nibble() + 3 : code >> 2) :
-                - num_of_split_sides - 1;
+            if (num_of_split_sides != 0)
+                return - num_of_split_sides - 1;
+
+            if ((code & 0b1100) != 0b1100)
+                return code >> 2;
+
+            int extension_count = 0;
+            int next_code = next_nibble();
+            while (next_code == 0b1111) {
+                ++extension_count;
+                next_code = next_nibble();
+            }
+            return next_code + 15 * extension_count + 3;
         };
 
         int state = num_children_or_state();
