@@ -1696,26 +1696,28 @@ void TriangleSelectorPatch::update_render_data()
                                                       m_vertex_color_preview_colors,
                                                       m_vertex_color_preview_filament_ids,
                                                       m_texture_mapping_color_preview);
-            } else if (model_volume_has_texture_preview_data_for_painting(*m_model_volume)) {
-                build_mmu_texture_preview_models(*m_model_volume,
-                                                 triangles_per_type,
-                                                 m_ebt_colors,
-                                                 m_model_volume->extruder_id() > 0 ? unsigned(m_model_volume->extruder_id()) : 0u,
-                                                 num_physical,
-                                                 texture_mgr,
-                                                 m_texture_preview_models,
-                                                 m_texture_preview_colors,
-                                                 m_texture_preview_filament_ids);
+            } else {
+                if (model_volume_has_texture_preview_data_for_painting(*m_model_volume)) {
+                    build_mmu_texture_preview_models(*m_model_volume,
+                                                     triangles_per_type,
+                                                     m_ebt_colors,
+                                                     m_model_volume->extruder_id() > 0 ? unsigned(m_model_volume->extruder_id()) : 0u,
+                                                     num_physical,
+                                                     texture_mgr,
+                                                     m_texture_preview_models,
+                                                     m_texture_preview_colors,
+                                                     m_texture_preview_filament_ids);
+                }
+                build_mmu_vertex_color_preview_models(*m_model_volume,
+                                                      triangles_per_type,
+                                                      m_ebt_colors,
+                                                      m_model_volume->extruder_id() > 0 ? unsigned(m_model_volume->extruder_id()) : 0u,
+                                                      num_physical,
+                                                      texture_mgr,
+                                                      m_vertex_color_preview_models,
+                                                      m_vertex_color_preview_colors,
+                                                      m_vertex_color_preview_filament_ids);
             }
-            build_mmu_vertex_color_preview_models(*m_model_volume,
-                                                  triangles_per_type,
-                                                  m_ebt_colors,
-                                                  m_model_volume->extruder_id() > 0 ? unsigned(m_model_volume->extruder_id()) : 0u,
-                                                  num_physical,
-                                                  texture_mgr,
-                                                  m_vertex_color_preview_models,
-                                                  m_vertex_color_preview_colors,
-                                                  m_vertex_color_preview_filament_ids);
         }
 
         m_paint_changed = false;

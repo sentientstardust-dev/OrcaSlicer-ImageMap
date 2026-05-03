@@ -7348,6 +7348,13 @@ bool GLGizmoImageProjection::ensure_overlay_texture()
         m_image_error = _u8L("Unable to display the selected image.");
         return false;
     }
+    glsafe(::glBindTexture(GL_TEXTURE_2D, m_overlay_texture.get_id()));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR));
+    glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0));
+    glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
     m_overlay_texture_dirty = false;
     return true;
 }
