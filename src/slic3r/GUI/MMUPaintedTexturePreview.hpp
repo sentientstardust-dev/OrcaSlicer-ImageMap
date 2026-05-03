@@ -9,6 +9,7 @@
 #include "libslic3r/TriangleSelector.hpp"
 
 #include <array>
+#include <utility>
 #include <vector>
 
 namespace Slic3r {
@@ -54,6 +55,7 @@ bool build_mmu_vertex_color_preview_models(
 size_t model_volume_texture_preview_signature(const ModelVolume &model_volume);
 size_t model_volume_texture_mapping_color_preview_signature(const ModelVolume &model_volume);
 bool model_volume_has_texture_preview_data(const ModelVolume &model_volume);
+bool model_volume_has_complete_texture_preview_data(const ModelVolume &model_volume);
 bool model_volume_has_vertex_color_preview_data(const ModelVolume &model_volume);
 bool model_volume_has_texture_mapping_color_preview_data(const ModelVolume &model_volume);
 
@@ -79,6 +81,25 @@ void render_model_texture_preview_models(
     const Transform3d               &projection_matrix,
     const std::array<float, 2>      &z_range,
     const std::array<float, 4>      &clipping_plane,
+    int                              print_volume_type = -1,
+    const std::array<float, 4>      &print_volume_xy = std::array<float, 4>{ 0.f, 0.f, 0.f, 0.f },
+    const std::array<float, 2>      &print_volume_z = std::array<float, 2>{ 0.f, 0.f },
+    bool                             opaque = false);
+
+void render_model_texture_preview_model(
+    GUI::GLModel                    &model,
+    const ColorRGBA                 &color,
+    unsigned int                     filament_id,
+    size_t                           num_physical,
+    const TextureMappingManager     *texture_mgr,
+    const ModelVolume               &model_volume,
+    const GUI::GLTexture            &texture,
+    const Transform3d               &model_matrix,
+    const Transform3d               &view_matrix,
+    const Transform3d               &projection_matrix,
+    const std::array<float, 2>      &z_range,
+    const std::array<float, 4>      &clipping_plane,
+    const std::pair<size_t, size_t> &render_range,
     int                              print_volume_type = -1,
     const std::array<float, 4>      &print_volume_xy = std::array<float, 4>{ 0.f, 0.f, 0.f, 0.f },
     const std::array<float, 2>      &print_volume_z = std::array<float, 2>{ 0.f, 0.f },

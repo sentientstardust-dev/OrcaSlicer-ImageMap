@@ -40,7 +40,7 @@ static void update_ui(wxWindow* window)
 }
 
 static const char g_min_cluster_color = 1;
-static const char g_max_color = (int) EnforcerBlockerType::ExtruderMax;
+static const char g_max_color = 16;
 
 wxBoxSizer* ObjColorDialog::create_btn_sizer(long flags,bool exist_error)
 {

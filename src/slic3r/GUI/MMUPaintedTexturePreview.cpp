@@ -127,6 +127,14 @@ bool model_volume_has_texture_preview_data_impl(const ModelVolume &model_volume)
                size_t(model_volume.imported_texture_width) * size_t(model_volume.imported_texture_height) * 4;
 }
 
+bool model_volume_has_complete_texture_preview_data_impl(const ModelVolume &model_volume)
+{
+    return model_volume_has_texture_preview_data_impl(model_volume) &&
+           std::all_of(model_volume.imported_texture_uv_valid.begin(), model_volume.imported_texture_uv_valid.end(), [](uint8_t valid) {
+               return valid != 0;
+           });
+}
+
 bool model_volume_has_vertex_color_preview_data_impl(const ModelVolume &model_volume)
 {
     return !model_volume.imported_vertex_colors_rgba.empty() &&
@@ -2430,6 +2438,11 @@ bool model_volume_has_texture_preview_data(const ModelVolume &model_volume)
     return model_volume_has_texture_preview_data_impl(model_volume);
 }
 
+bool model_volume_has_complete_texture_preview_data(const ModelVolume &model_volume)
+{
+    return model_volume_has_complete_texture_preview_data_impl(model_volume);
+}
+
 bool model_volume_has_vertex_color_preview_data(const ModelVolume &model_volume)
 {
     return model_volume_has_vertex_color_preview_data_impl(model_volume);
@@ -2753,7 +2766,15 @@ void render_model_texture_preview_models(
 
     const TexturePreviewRenderState render_state = begin_render_state(opaque);
     shader->start_using();
-    set_common_uniforms(*shader, model_matrix, view_matrix, projection_matrix, z_range, clipping_plane, print_volume_type, print_volume_xy, print_volume_z);
+    set_common_uniforms(*shader,
+                        model_matrix,
+                        view_matrix,
+                        projection_matrix,
+                        z_range,
+                        clipping_plane,
+                        print_volume_type,
+                        print_volume_xy,
+                        print_volume_z);
     glsafe(::glActiveTexture(GL_TEXTURE0));
     shader->set_uniform("uniform_texture", 0);
 
@@ -2795,6 +2816,75 @@ void render_model_texture_preview_models(
     restore_render_state(render_state);
 }
 
+void render_model_texture_preview_model(
+    GUI::GLModel                    &model,
+    const ColorRGBA                 &color,
+    unsigned int                     filament_id,
+    size_t                           num_physical,
+    const TextureMappingManager     *texture_mgr,
+    const ModelVolume               &model_volume,
+    const GUI::GLTexture            &texture,
+    const Transform3d               &model_matrix,
+    const Transform3d               &view_matrix,
+    const Transform3d               &projection_matrix,
+    const std::array<float, 2>      &z_range,
+    const std::array<float, 4>      &clipping_plane,
+    const std::pair<size_t, size_t> &render_range,
+    int                              print_volume_type,
+    const std::array<float, 4>      &print_volume_xy,
+    const std::array<float, 2>      &print_volume_z,
+    bool                             opaque)
+{
+    if (texture.get_id() == 0 || !GUI::GLModel::Geometry::has_tex_coord(model.get_geometry().format))
+        return;
+
+    GLShaderProgram *shader = GUI::wxGetApp().get_shader("painted_texture_preview");
+    if (shader == nullptr)
+        return;
+
+    const float mix = texture_preview_mix_for_filament(filament_id, num_physical, texture_mgr);
+    const bool invalid = texture_preview_settings_invalid_for_filament(filament_id, num_physical, texture_mgr);
+    if (mix <= 0.f && !invalid)
+        return;
+
+    const size_t texture_signature = model_volume_texture_preview_signature(model_volume);
+    const GUI::GLTexture *preview_texture = simulated_texture_preview_texture_for_filament(model_volume,
+                                                                                           filament_id,
+                                                                                           num_physical,
+                                                                                           texture_mgr,
+                                                                                           texture_signature,
+                                                                                           texture);
+    if (preview_texture == nullptr || preview_texture->get_id() == 0)
+        return;
+
+    const TexturePreviewRenderState render_state = begin_render_state(opaque);
+    shader->start_using();
+    set_common_uniforms(*shader,
+                        model_matrix,
+                        view_matrix,
+                        projection_matrix,
+                        z_range,
+                        clipping_plane,
+                        print_volume_type,
+                        print_volume_xy,
+                        print_volume_z);
+
+    glsafe(::glActiveTexture(GL_TEXTURE0));
+    glsafe(::glBindTexture(GL_TEXTURE_2D, preview_texture->get_id()));
+    shader->set_uniform("uniform_texture", 0);
+    shader->set_uniform("texture_preview_mix", mix);
+    shader->set_uniform("invalid_texture_mapping", invalid);
+    model.set_color(color);
+    if (render_range == std::make_pair<size_t, size_t>(0, -1))
+        model.render();
+    else
+        model.render(render_range);
+
+    glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
+    shader->stop_using();
+    restore_render_state(render_state);
+}
+
 void render_model_vertex_color_preview_models(
     std::vector<GUI::GLModel>       &models,
     const std::vector<ColorRGBA>    &colors,
@@ -2820,7 +2910,15 @@ void render_model_vertex_color_preview_models(
 
     const TexturePreviewRenderState render_state = begin_render_state(opaque);
     shader->start_using();
-    set_common_uniforms(*shader, model_matrix, view_matrix, projection_matrix, z_range, clipping_plane, print_volume_type, print_volume_xy, print_volume_z);
+    set_common_uniforms(*shader,
+                        model_matrix,
+                        view_matrix,
+                        projection_matrix,
+                        z_range,
+                        clipping_plane,
+                        print_volume_type,
+                        print_volume_xy,
+                        print_volume_z);
 
     for (size_t idx = 0; idx < models.size(); ++idx) {
         const float mix = texture_preview_mix_for_filament(filament_ids[idx], num_physical, texture_mgr);

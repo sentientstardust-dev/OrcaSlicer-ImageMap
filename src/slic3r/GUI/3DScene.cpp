@@ -632,6 +632,8 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
     bool color_volume = false;
     ModelObject* model_object = nullptr;
     ModelVolume* model_volume = nullptr;
+    unsigned int base_filament_id = 0;
+    bool use_original_mesh_texture_preview = false;
     do {
         if ((!printable) || object_idx() >= model_objects.size())
             break;
@@ -643,7 +645,7 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
         const size_t num_physical = std::max(0, GUI::wxGetApp().filaments_cnt());
         const TextureMappingManager *texture_mgr = GUI::wxGetApp().preset_bundle != nullptr ?
             &GUI::wxGetApp().preset_bundle->texture_mapping_zones : nullptr;
-        const unsigned int base_filament_id = model_volume->extruder_id() > 0 ? unsigned(model_volume->extruder_id()) : 0u;
+        base_filament_id = model_volume->extruder_id() > 0 ? unsigned(model_volume->extruder_id()) : 0u;
         const TextureMappingZone *base_zone = texture_mgr != nullptr ? texture_mgr->zone_from_id(base_filament_id) : nullptr;
         const bool has_mmu_segmentation = !model_volume->mmu_segmentation_facets.empty();
         const bool has_texture_mapping_color_preview_data = model_volume_has_texture_mapping_color_preview_data(*model_volume);
@@ -653,6 +655,15 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
             base_zone->enabled &&
             !base_zone->deleted &&
             (base_zone->is_2d_gradient() || (base_zone->is_image_texture() && model_volume_has_any_texture_preview_data(*model_volume)));
+        use_original_mesh_texture_preview =
+            !has_mmu_segmentation &&
+            !has_texture_mapping_color_preview_data &&
+            base_zone != nullptr &&
+            base_zone->enabled &&
+            !base_zone->deleted &&
+            base_zone->is_image_texture() &&
+            model_volume_has_complete_texture_preview_data(*model_volume) &&
+            GUI::GLModel::Geometry::has_tex_coord(model.get_geometry().format);
         if (!has_mmu_segmentation && !has_texture_preview)
         {
             mmuseg_texture_preview.reset();
@@ -702,7 +713,7 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
                                       fallback_color);
             state_colors.insert(state_colors.end(), extruder_colors.begin(), extruder_colors.end());
 
-            if (!has_texture_mapping_color_preview_data && has_texture_preview_data) {
+            if (!use_original_mesh_texture_preview && !has_texture_mapping_color_preview_data && has_texture_preview_data) {
                 build_mmu_texture_preview_models(*model_volume,
                                                  triangles_per_type,
                                                  state_colors,
@@ -785,7 +796,7 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
             }
         }
 
-        if (!mmuseg_texture_preview_models.empty() || !mmuseg_vertex_color_preview_models.empty()) {
+        if (use_original_mesh_texture_preview || !mmuseg_texture_preview_models.empty() || !mmuseg_vertex_color_preview_models.empty()) {
             auto adjusted_preview_colors = [](const std::vector<ColorRGBA> &colors) {
                 std::vector<ColorRGBA> preview_colors = colors;
                 for (ColorRGBA &preview_color : preview_colors)
@@ -800,20 +811,44 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
             const std::array<float, 2> z_range = { -std::numeric_limits<float>::max(), std::numeric_limits<float>::max() };
             const std::array<float, 4> clipping_plane = { 0.f, 0.f, 1.f, std::numeric_limits<float>::max() };
 
-            if (!mmuseg_texture_preview_models.empty() &&
+            if ((use_original_mesh_texture_preview || !mmuseg_texture_preview_models.empty()) &&
                 ensure_model_volume_texture_preview(*model_volume, mmuseg_texture_preview, mmuseg_texture_preview_signature)) {
-                render_model_texture_preview_models(mmuseg_texture_preview_models,
-                                                    adjusted_preview_colors(mmuseg_texture_preview_colors),
-                                                    mmuseg_texture_preview_filament_ids,
-                                                    num_physical,
-                                                    texture_mgr,
-                                                    *model_volume,
-                                                    mmuseg_texture_preview,
-                                                    model_matrix,
-                                                    camera.get_view_matrix(),
-                                                    camera.get_projection_matrix(),
-                                                    z_range,
-                                                    clipping_plane);
+                if (use_original_mesh_texture_preview) {
+                    const int extruder_id = model_volume->extruder_id();
+                    const ColorRGBA fallback_color = extruder_colors.empty() ? ColorRGBA(0.15f, 0.65f, 0.6f, 1.f) : extruder_colors.front();
+                    ColorRGBA original_mesh_preview_color = extruder_id > 0 && size_t(extruder_id - 1) < extruder_colors.size() ?
+                        extruder_colors[size_t(extruder_id - 1)] :
+                        fallback_color;
+                    original_mesh_preview_color = adjust_color_for_rendering(original_mesh_preview_color);
+                    if (force_native_color && render_color.is_transparent())
+                        original_mesh_preview_color.a(render_color.a());
+                    render_model_texture_preview_model(model,
+                                                       original_mesh_preview_color,
+                                                       base_filament_id,
+                                                       num_physical,
+                                                       texture_mgr,
+                                                       *model_volume,
+                                                       mmuseg_texture_preview,
+                                                       model_matrix,
+                                                       camera.get_view_matrix(),
+                                                       camera.get_projection_matrix(),
+                                                       z_range,
+                                                       clipping_plane,
+                                                       this->tverts_range);
+                } else {
+                    render_model_texture_preview_models(mmuseg_texture_preview_models,
+                                                        adjusted_preview_colors(mmuseg_texture_preview_colors),
+                                                        mmuseg_texture_preview_filament_ids,
+                                                        num_physical,
+                                                        texture_mgr,
+                                                        *model_volume,
+                                                        mmuseg_texture_preview,
+                                                        model_matrix,
+                                                        camera.get_view_matrix(),
+                                                        camera.get_projection_matrix(),
+                                                        z_range,
+                                                        clipping_plane);
+                }
             }
             if (!mmuseg_vertex_color_preview_models.empty()) {
                 render_model_vertex_color_preview_models(mmuseg_vertex_color_preview_models,

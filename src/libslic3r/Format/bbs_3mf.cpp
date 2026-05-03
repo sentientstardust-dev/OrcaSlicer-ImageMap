@@ -28,6 +28,7 @@
 #include <boost/bimap.hpp>
 
 #include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string/case_conv.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string/replace.hpp>
@@ -1031,19 +1032,65 @@ static bool decode_texture_rgba_from_memory(const std::vector<uint8_t> &encoded,
     return decode_jpeg_rgba_from_memory(encoded, out_rgba, out_width, out_height);
 }
 
+static std::string normalize_archive_lookup_path(std::string path)
+{
+    std::replace(path.begin(), path.end(), '\\', '/');
+    while (!path.empty() && path.front() == '/')
+        path.erase(path.begin());
+    while (boost::algorithm::starts_with(path, "./"))
+        path.erase(0, 2);
+    return path;
+}
+
+static int locate_file_in_archive(mz_zip_archive &archive, const std::string &path_in_zip)
+{
+    if (path_in_zip.empty())
+        return -1;
+
+    int index = mz_zip_reader_locate_file(&archive, path_in_zip.c_str(), nullptr, 0);
+    if (index >= 0)
+        return index;
+
+    const std::string native_path = encode_path(path_in_zip.c_str());
+    index = mz_zip_reader_locate_file(&archive, native_path.c_str(), nullptr, 0);
+    if (index >= 0)
+        return index;
+
+    const std::string lookup_path = boost::algorithm::to_lower_copy(normalize_archive_lookup_path(path_in_zip));
+    const mz_uint file_count = mz_zip_reader_get_num_files(&archive);
+    for (mz_uint i = 0; i < file_count; ++i) {
+        mz_zip_archive_file_stat stat;
+        if (!mz_zip_reader_file_stat(&archive, i, &stat))
+            continue;
+        if (boost::algorithm::to_lower_copy(normalize_archive_lookup_path(stat.m_filename)) == lookup_path)
+            return int(i);
+    }
+
+    return -1;
+}
+
 static bool try_extract_file_from_archive(mz_zip_archive &archive, std::string path_in_zip, std::vector<uint8_t> &out_data)
 {
     out_data.clear();
     if (path_in_zip.empty())
         return false;
-    if (path_in_zip.front() == '/')
-        path_in_zip.erase(path_in_zip.begin());
 
-    int index = mz_zip_reader_locate_file(&archive, path_in_zip.c_str(), nullptr, 0);
-    if (index < 0) {
-        const std::string native_path = encode_path(path_in_zip.c_str());
-        index = mz_zip_reader_locate_file(&archive, native_path.c_str(), nullptr, 0);
+    std::vector<std::string> candidate_paths;
+    candidate_paths.emplace_back(normalize_archive_lookup_path(std::move(path_in_zip)));
+    const boost::filesystem::path texture_path(candidate_paths.front());
+    const std::string filename = texture_path.filename().generic_string();
+    if (!filename.empty()) {
+        candidate_paths.emplace_back((boost::filesystem::path("3D/Texture") / filename).generic_string());
+        candidate_paths.emplace_back((boost::filesystem::path("3d/Texture") / filename).generic_string());
     }
+
+    int index = -1;
+    for (const std::string &candidate_path : candidate_paths) {
+        index = locate_file_in_archive(archive, candidate_path);
+        if (index >= 0)
+            break;
+    }
+
     if (index < 0)
         return false;
 
@@ -2598,7 +2645,6 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
             }
         }
 
-        _restore_imported_obj_textures_from_archive(archive);
         _restore_prime_tower_texture_from_archive(archive, config, model);
         lock.close();
 
@@ -2790,6 +2836,8 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
                 }
             }
         }
+
+        _restore_imported_obj_textures_from_archive(archive);
 
         // If instances contain a single volume, the volume offset should be 0,0,0
         // This equals to say that instance world position and volume world position should match
