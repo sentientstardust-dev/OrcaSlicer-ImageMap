@@ -2283,6 +2283,10 @@ void GLCanvas3D::remove_curr_plate_all()
 
 void GLCanvas3D::update_plate_thumbnails()
 {
+    if (!_set_current())
+        return;
+
+    m_sel_plate_toolbar.is_render_finish = false;
     _update_imgui_select_plate_toolbar();
 }
 
@@ -4804,7 +4808,7 @@ void GLCanvas3D::on_set_focus(wxFocusEvent& evt)
     if (m_canvas_type == ECanvasType::CanvasPreview) {
         // update thumbnails and update plate toolbar
         wxGetApp().plater()->update_all_plate_thumbnails();
-        _update_imgui_select_plate_toolbar();
+        update_plate_thumbnails();
     }
     _refresh_if_shown_on_screen();
     m_tooltip_enabled = true;
@@ -8434,7 +8438,8 @@ void GLCanvas3D::_render_imgui_select_plate_toolbar()
         auto button_pos = ImGui::GetCursorPos();
         ImGui::SetCursorPos(button_pos + margin);
 
-        ImGui::Image(item->texture_id, size, uv0, uv1, tint_col);
+        if (item->texture_id != 0)
+            ImGui::Image(item->texture_id, size, uv0, uv1, tint_col);
 
         ImGui::SetCursorPos(button_pos);
 

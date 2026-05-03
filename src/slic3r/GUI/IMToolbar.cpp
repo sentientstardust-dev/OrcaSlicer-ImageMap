@@ -22,6 +22,9 @@ IMToolbarItem::~IMToolbarItem()
 
 bool IMToolbarItem::generate_texture()
 {
+    if (image_data.empty() || image_width == 0 || image_height == 0)
+        return false;
+
     GLint last_texture;
     unsigned m_image_texture{ 0 };
     unsigned char* pixels = (unsigned char*)(&image_data[0]);

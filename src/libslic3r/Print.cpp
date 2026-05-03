@@ -327,11 +327,6 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
         "filament_density",
         "filament_cost",
         "filament_notes",
-        "texture_mapping_outer_wall_gradient_global_strength",
-        "texture_mapping_outer_wall_gradient_max_line_width",
-        "texture_mapping_outer_wall_gradient_min_line_width",
-        "texture_mapping_definitions",
-        "texture_mapping_global_settings",
         "outer_wall_acceleration",
         "inner_wall_acceleration",
         "initial_layer_acceleration",
@@ -456,6 +451,14 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
             || opt_key == "wipe_tower_x"
             || opt_key == "wipe_tower_y"
             || opt_key == "wipe_tower_rotation_angle") {
+            steps.emplace_back(psSkirtBrim);
+        } else if (
+               opt_key == "texture_mapping_outer_wall_gradient_global_strength"
+            || opt_key == "texture_mapping_outer_wall_gradient_max_line_width"
+            || opt_key == "texture_mapping_outer_wall_gradient_min_line_width"
+            || opt_key == "texture_mapping_definitions"
+            || opt_key == "texture_mapping_global_settings") {
+            steps.emplace_back(psWipeTower);
             steps.emplace_back(psSkirtBrim);
         } else if (
                opt_key == "initial_layer_print_height"

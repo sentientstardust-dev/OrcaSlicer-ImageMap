@@ -237,6 +237,14 @@ static inline bool config_options_equal(const ConfigOption *lhs, const ConfigOpt
     return *lhs == *rhs;
 }
 
+static bool texture_mapping_prime_tower_images_equal(const TextureMappingPrimeTowerImage &lhs, const TextureMappingPrimeTowerImage &rhs)
+{
+    return lhs.width == rhs.width &&
+           lhs.height == rhs.height &&
+           lhs.image_name == rhs.image_name &&
+           lhs.rgba == rhs.rgba;
+}
+
 static void remove_texture_mapping_preview_options(nlohmann::json &root)
 {
     if (!root.is_array())
@@ -1417,15 +1425,21 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 
     // Grab the lock for the Print / PrintObject milestones.
     std::scoped_lock<std::mutex> lock(this->state_mutex());
-    if (const ConfigOptionStrings *color_opt = new_full_config.option<ConfigOptionStrings>("filament_colour", false); color_opt != nullptr)
-        m_texture_mapping_mgr.load_entries(new_full_config.opt_string("texture_mapping_definitions"), color_opt->values);
-    m_texture_mapping_global_settings.load(new_full_config.opt_string("texture_mapping_global_settings"));
-    m_texture_mapping_prime_tower_image = model.texture_mapping_prime_tower_image;
-    m_texture_mapping_prime_tower_image_back = model.texture_mapping_prime_tower_image_back;
+    TextureMappingGlobalSettings next_texture_mapping_global_settings;
+    next_texture_mapping_global_settings.load(new_full_config.opt_string("texture_mapping_global_settings"));
+    const bool prime_tower_texture_image_changed =
+        !texture_mapping_prime_tower_images_equal(m_texture_mapping_prime_tower_image, model.texture_mapping_prime_tower_image) ||
+        !texture_mapping_prime_tower_images_equal(m_texture_mapping_prime_tower_image_back, model.texture_mapping_prime_tower_image_back);
+    if (prime_tower_texture_image_changed)
+        update_apply_status(this->invalidate_steps({ psWipeTower, psSkirtBrim }));
 
     // The following call may stop the background processing.
     if (! print_diff.empty())
         update_apply_status(this->invalidate_state_by_config_options(new_full_config, print_diff));
+
+    m_texture_mapping_global_settings = next_texture_mapping_global_settings;
+    m_texture_mapping_prime_tower_image = model.texture_mapping_prime_tower_image;
+    m_texture_mapping_prime_tower_image_back = model.texture_mapping_prime_tower_image_back;
 
     // Apply variables to placeholder parser. The placeholder parser is used by G-code export,
     // which should be stopped if print_diff is not empty.
