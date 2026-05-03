@@ -755,6 +755,39 @@ struct PendingThreeMfImportedTexture
     std::vector<uint8_t> uv_valid;
 };
 
+static bool build_single_texture_source_from_resources(
+    PendingThreeMfImportedTexture &out,
+    const size_t triangles_count,
+    const std::map<int, ThreeMfTexture2DGroupResource> &texture_groups,
+    const std::map<int, ThreeMfTexture2DResource> &texture_resources)
+{
+    if (triangles_count == 0 || texture_groups.size() != 1)
+        return false;
+
+    const ThreeMfTexture2DGroupResource &group = texture_groups.begin()->second;
+    const auto texture_it = texture_resources.find(group.tex_id);
+    if (texture_it == texture_resources.end() || texture_it->second.path.empty())
+        return false;
+    if (group.coords.size() < triangles_count * 3)
+        return false;
+
+    out.image_file = texture_it->second.path;
+    out.image_content_type = texture_it->second.content_type;
+    out.uv_valid.assign(triangles_count, uint8_t(1));
+    out.uvs_per_face.resize(triangles_count * 6);
+    for (size_t triangle_idx = 0; triangle_idx < triangles_count; ++triangle_idx) {
+        const size_t coord_idx = triangle_idx * 3;
+        const size_t uv_idx = triangle_idx * 6;
+        out.uvs_per_face[uv_idx + 0] = group.coords[coord_idx + 0].first;
+        out.uvs_per_face[uv_idx + 1] = group.coords[coord_idx + 0].second;
+        out.uvs_per_face[uv_idx + 2] = group.coords[coord_idx + 1].first;
+        out.uvs_per_face[uv_idx + 3] = group.coords[coord_idx + 1].second;
+        out.uvs_per_face[uv_idx + 4] = group.coords[coord_idx + 2].first;
+        out.uvs_per_face[uv_idx + 5] = group.coords[coord_idx + 2].second;
+    }
+    return true;
+}
+
 struct ThreeMfExportTextureResource
 {
     int                   color_group_id{-1};
@@ -5799,18 +5832,26 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
 
             m_volume_subobject_ids[volume] = sub_object->id;
 
+            PendingThreeMfImportedTexture texture_source;
+            bool has_texture_source = false;
             if (!sub_object->geometry.texture_image_path.empty() &&
                 !sub_object->geometry.texture_uses_multiple_images &&
                 sub_object->geometry.texture_uv_valid.size() == triangles_count &&
                 sub_object->geometry.texture_uvs_per_face.size() >= triangles_count * 6) {
-                PendingThreeMfImportedTexture texture_source;
                 texture_source.image_file         = sub_object->geometry.texture_image_path;
                 texture_source.image_content_type = sub_object->geometry.texture_image_content_type;
                 texture_source.uv_valid           = sub_object->geometry.texture_uv_valid;
                 texture_source.uvs_per_face.assign(sub_object->geometry.texture_uvs_per_face.begin(),
                                                    sub_object->geometry.texture_uvs_per_face.begin() + triangles_count * 6);
-                m_standard_texture_sources[volume] = std::move(texture_source);
+                has_texture_source = true;
+            } else if (build_single_texture_source_from_resources(texture_source,
+                                                                  triangles_count,
+                                                                  m_texture_groups,
+                                                                  m_texture_resources)) {
+                has_texture_source = true;
             }
+            if (has_texture_source)
+                m_standard_texture_sources[volume] = std::move(texture_source);
 
             const size_t vertices_count = volume->mesh().its.vertices.size();
             if (sub_object->geometry.vertex_colors_rgba.size() == vertices_count &&
@@ -5910,6 +5951,47 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
         if (m_model == nullptr)
             return;
 
+        for (ModelObject *object : m_model->objects) {
+            if (object == nullptr)
+                continue;
+            for (ModelVolume *volume : object->volumes) {
+                if (volume == nullptr || m_standard_texture_sources.find(volume) != m_standard_texture_sources.end())
+                    continue;
+                const auto subobject_id = m_volume_subobject_ids.find(volume);
+                if (subobject_id == m_volume_subobject_ids.end())
+                    continue;
+                const size_t triangle_count = volume->mesh().its.indices.size();
+                if (triangle_count == 0)
+                    continue;
+                auto current_object = std::find_if(m_current_objects.begin(), m_current_objects.end(), [subobject_id, triangle_count](const auto &item) {
+                    const Geometry &geometry = item.second.geometry;
+                    return item.second.id == subobject_id->second &&
+                           !geometry.texture_image_path.empty() &&
+                           !geometry.texture_uses_multiple_images &&
+                           geometry.texture_uv_valid.size() >= triangle_count &&
+                           geometry.texture_uvs_per_face.size() >= triangle_count * 6;
+                });
+                PendingThreeMfImportedTexture texture_source;
+                bool has_texture_source = false;
+                if (current_object != m_current_objects.end()) {
+                    texture_source.image_file         = current_object->second.geometry.texture_image_path;
+                    texture_source.image_content_type = current_object->second.geometry.texture_image_content_type;
+                    texture_source.uv_valid.assign(current_object->second.geometry.texture_uv_valid.begin(),
+                                                   current_object->second.geometry.texture_uv_valid.begin() + triangle_count);
+                    texture_source.uvs_per_face.assign(current_object->second.geometry.texture_uvs_per_face.begin(),
+                                                       current_object->second.geometry.texture_uvs_per_face.begin() + triangle_count * 6);
+                    has_texture_source = true;
+                } else if (build_single_texture_source_from_resources(texture_source,
+                                                                      triangle_count,
+                                                                      m_texture_groups,
+                                                                      m_texture_resources)) {
+                    has_texture_source = true;
+                }
+                if (has_texture_source)
+                    m_standard_texture_sources[volume] = std::move(texture_source);
+            }
+        }
+
         for (auto &standard_texture_entry : m_standard_texture_sources) {
             ModelVolume *volume = standard_texture_entry.first;
             if (volume == nullptr)
@@ -5939,17 +6021,21 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
             }
 
             const size_t triangle_count = volume->mesh().its.indices.size();
-            if (source.uv_valid.size() != triangle_count || source.uvs_per_face.size() < triangle_count * 6) {
+            if (source.uv_valid.size() < triangle_count || source.uvs_per_face.size() < triangle_count * 6) {
                 BOOST_LOG_TRIVIAL(warning) << "3MF texture2d UV payload triangle mismatch for image='" << source.image_file << "'";
                 continue;
             }
 
-            volume->imported_texture_uv_valid = source.uv_valid;
+            volume->imported_texture_uv_valid.assign(source.uv_valid.begin(),
+                                                     source.uv_valid.begin() + triangle_count);
             volume->imported_texture_uvs_per_face.assign(source.uvs_per_face.begin(),
                                                          source.uvs_per_face.begin() + triangle_count * 6);
             volume->imported_texture_rgba = std::move(imported_rgba);
             volume->imported_texture_width = imported_width;
             volume->imported_texture_height = imported_height;
+            volume->imported_texture_uv_valid.set_new_unique_id();
+            volume->imported_texture_uvs_per_face.set_new_unique_id();
+            volume->imported_texture_rgba.set_new_unique_id();
         }
     }
     /*

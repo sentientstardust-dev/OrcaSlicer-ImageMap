@@ -945,6 +945,8 @@ public:
         return *this;
     }
 
+    void set_new_unique_id() { ObjectBase::set_new_unique_id(); }
+
 private:
     explicit ModelVolumeImportedVector(int) : ObjectBase(-1) {}
 

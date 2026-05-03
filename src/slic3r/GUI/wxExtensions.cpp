@@ -562,6 +562,11 @@ std::vector<wxBitmap*> get_extruder_color_icons(bool thin_icon/* = false*/)
                 bmps.push_back(get_extruder_color_icon(colors, is_gradient, label, icon_width, icon_height));
             }
         }
+        const std::vector<std::string> display_colors = Slic3r::GUI::wxGetApp().plater()->get_extruder_colors_from_plater_config();
+        for (size_t idx = bmps.size(); idx < display_colors.size(); ++idx) {
+            const std::string label = std::to_string(idx + 1);
+            bmps.push_back(get_extruder_color_icon(display_colors[idx], label, icon_width, icon_height));
+        }
     } else {
         std::vector<std::string> colors = Slic3r::GUI::wxGetApp().plater()->get_extruder_colors_from_plater_config();
         if (colors.empty()) return bmps;
@@ -1257,6 +1262,5 @@ void ImageTransientPopup::OnMouse(wxMouseEvent &event)
 {
     event.Skip();
 }
-
 
 

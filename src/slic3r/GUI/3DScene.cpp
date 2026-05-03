@@ -114,13 +114,29 @@ std::vector<TriangleSelector::FacetStateTriangle> build_full_mesh_texture_previe
     return out;
 }
 
-bool model_volume_has_any_texture_preview_data(const ModelVolume &model_volume)
+const TextureMappingZone *texture_preview_zone_for_filament(unsigned int filament_id,
+                                                            size_t num_physical,
+                                                            const TextureMappingManager *texture_mgr)
 {
-    return !model_volume.texture_mapping_color_facets.empty() ||
-           !model_volume.imported_vertex_colors_rgba.empty() ||
-           (!model_volume.imported_texture_rgba.empty() &&
-            model_volume.imported_texture_width > 0 &&
-            model_volume.imported_texture_height > 0);
+    const TextureMappingZone *zone = texture_mgr != nullptr && filament_id > num_physical ?
+        texture_mgr->zone_from_id(filament_id) : nullptr;
+    return zone != nullptr && zone->enabled && !zone->deleted && (zone->is_image_texture() || zone->is_2d_gradient()) ?
+        zone : nullptr;
+}
+
+bool filament_state_uses_texture_preview(unsigned int filament_id,
+                                         size_t num_physical,
+                                         const TextureMappingManager *texture_mgr)
+{
+    return texture_preview_zone_for_filament(filament_id, num_physical, texture_mgr) != nullptr;
+}
+
+bool filament_state_uses_surface_gradient_preview(unsigned int filament_id,
+                                                  size_t num_physical,
+                                                  const TextureMappingManager *texture_mgr)
+{
+    const TextureMappingZone *zone = texture_preview_zone_for_filament(filament_id, num_physical, texture_mgr);
+    return zone != nullptr && zone->is_2d_gradient();
 }
 
 bool texture_preview_has_surface_gradient_state(size_t states_count,
@@ -128,13 +144,9 @@ bool texture_preview_has_surface_gradient_state(size_t states_count,
                                                 size_t num_physical,
                                                 const TextureMappingManager *texture_mgr)
 {
-    if (texture_mgr == nullptr)
-        return false;
-
     for (size_t state_id = 0; state_id < states_count; ++state_id) {
         const unsigned int filament_id = state_id == 0 ? base_filament_id : unsigned(state_id);
-        const TextureMappingZone *zone = texture_mgr->zone_from_id(filament_id);
-        if (zone != nullptr && zone->enabled && !zone->deleted && zone->is_2d_gradient())
+        if (filament_state_uses_surface_gradient_preview(filament_id, num_physical, texture_mgr))
             return true;
     }
 
@@ -646,32 +658,37 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
         const TextureMappingManager *texture_mgr = GUI::wxGetApp().preset_bundle != nullptr ?
             &GUI::wxGetApp().preset_bundle->texture_mapping_zones : nullptr;
         base_filament_id = model_volume->extruder_id() > 0 ? unsigned(model_volume->extruder_id()) : 0u;
-        const TextureMappingZone *base_zone = texture_mgr != nullptr ? texture_mgr->zone_from_id(base_filament_id) : nullptr;
         const bool has_mmu_segmentation = !model_volume->mmu_segmentation_facets.empty();
-        const bool has_texture_mapping_color_preview_data = model_volume_has_texture_mapping_color_preview_data(*model_volume);
+        const bool base_uses_texture_preview = filament_state_uses_texture_preview(base_filament_id, num_physical, texture_mgr);
+        const bool base_uses_surface_gradient_preview =
+            filament_state_uses_surface_gradient_preview(base_filament_id, num_physical, texture_mgr);
+        const bool base_uses_image_texture_preview = base_uses_texture_preview && !base_uses_surface_gradient_preview;
+        const bool has_texture_mapping_color_preview_data =
+            base_uses_texture_preview && model_volume_has_texture_mapping_color_preview_data(*model_volume);
         const bool has_texture_preview_data = model_volume_has_texture_preview_data(*model_volume);
-        const bool has_texture_preview =
-            base_zone != nullptr &&
-            base_zone->enabled &&
-            !base_zone->deleted &&
-            (base_zone->is_2d_gradient() || (base_zone->is_image_texture() && model_volume_has_any_texture_preview_data(*model_volume)));
         use_original_mesh_texture_preview =
             !has_mmu_segmentation &&
             !has_texture_mapping_color_preview_data &&
-            base_zone != nullptr &&
-            base_zone->enabled &&
-            !base_zone->deleted &&
-            base_zone->is_image_texture() &&
+            base_uses_image_texture_preview &&
             model_volume_has_complete_texture_preview_data(*model_volume) &&
             GUI::GLModel::Geometry::has_tex_coord(model.get_geometry().format);
-        if (!has_mmu_segmentation && !has_texture_preview)
+        if (!has_mmu_segmentation && !base_uses_texture_preview)
         {
+            mmuseg_models.clear();
+            mmuseg_texture_preview_models.clear();
+            mmuseg_texture_preview_colors.clear();
+            mmuseg_texture_preview_filament_ids.clear();
+            mmuseg_vertex_color_preview_models.clear();
+            mmuseg_vertex_color_preview_colors.clear();
+            mmuseg_vertex_color_preview_filament_ids.clear();
             mmuseg_texture_preview.reset();
             mmuseg_texture_preview_signature = 0;
+            mmuseg_texture_preview_visual_signature = 0;
+            mmuseg_ts = model_volume->mmu_segmentation_facets.timestamp();
             break;
         }
 
-        color_volume = true;
+        color_volume = has_mmu_segmentation;
         size_t preview_visual_signature = texture_preview_settings_signature(num_physical, texture_mgr);
         preview_visual_signature ^= model_volume_texture_preview_signature(*model_volume) + 0x9e3779b97f4a7c15ull +
                                     (preview_visual_signature << 6) + (preview_visual_signature >> 2);
@@ -692,12 +709,16 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
             mmuseg_vertex_color_preview_filament_ids.clear();
 
             std::vector<std::vector<TriangleSelector::FacetStateTriangle>> triangles_per_type;
+            bool has_texture_preview_state = base_uses_texture_preview;
             if (has_mmu_segmentation) {
                 std::vector<indexed_triangle_set> its_per_color;
                 model_volume->mmu_segmentation_facets.get_facets(*model_volume, its_per_color);
                 mmuseg_models.resize(its_per_color.size());
                 for (int idx = 0; idx < its_per_color.size(); idx++) {
                     mmuseg_models[idx].init_from(its_per_color[idx]);
+                    if (!its_per_color[idx].indices.empty())
+                        has_texture_preview_state = has_texture_preview_state ||
+                            filament_state_uses_texture_preview(unsigned(idx), num_physical, texture_mgr);
                 }
                 model_volume->mmu_segmentation_facets.get_facet_triangles(*model_volume, triangles_per_type);
             } else {
@@ -713,7 +734,9 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
                                       fallback_color);
             state_colors.insert(state_colors.end(), extruder_colors.begin(), extruder_colors.end());
 
-            if (!use_original_mesh_texture_preview && !has_texture_mapping_color_preview_data && has_texture_preview_data) {
+            const bool has_active_texture_mapping_color_preview_data =
+                has_texture_preview_state && model_volume_has_texture_mapping_color_preview_data(*model_volume);
+            if (has_texture_preview_state && !use_original_mesh_texture_preview && !has_active_texture_mapping_color_preview_data && has_texture_preview_data) {
                 build_mmu_texture_preview_models(*model_volume,
                                                  triangles_per_type,
                                                  state_colors,
@@ -724,9 +747,10 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
                                                  mmuseg_texture_preview_colors,
                                                  mmuseg_texture_preview_filament_ids);
             }
-            if (has_texture_mapping_color_preview_data ||
+            if (has_texture_preview_state &&
+                (has_active_texture_mapping_color_preview_data ||
                 !has_texture_preview_data ||
-                texture_preview_has_surface_gradient_state(triangles_per_type.size(), base_filament_id, num_physical, texture_mgr)) {
+                texture_preview_has_surface_gradient_state(triangles_per_type.size(), base_filament_id, num_physical, texture_mgr))) {
                 build_mmu_vertex_color_preview_models(*model_volume,
                                                       triangles_per_type,
                                                       state_colors,
@@ -795,82 +819,143 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
                     m.render(this->tverts_range, shader);
             }
         }
-
-        if (use_original_mesh_texture_preview || !mmuseg_texture_preview_models.empty() || !mmuseg_vertex_color_preview_models.empty()) {
-            auto adjusted_preview_colors = [](const std::vector<ColorRGBA> &colors) {
-                std::vector<ColorRGBA> preview_colors = colors;
-                for (ColorRGBA &preview_color : preview_colors)
-                    preview_color = adjust_color_for_rendering(preview_color);
-                return preview_colors;
-            };
-            const size_t num_physical = std::max(0, GUI::wxGetApp().filaments_cnt());
-            const TextureMappingManager *texture_mgr = GUI::wxGetApp().preset_bundle != nullptr ?
-                &GUI::wxGetApp().preset_bundle->texture_mapping_zones : nullptr;
-            const Transform3d model_matrix = this->world_matrix();
-            const GUI::Camera& camera = GUI::wxGetApp().plater()->get_camera();
-            const std::array<float, 2> z_range = { -std::numeric_limits<float>::max(), std::numeric_limits<float>::max() };
-            const std::array<float, 4> clipping_plane = { 0.f, 0.f, 1.f, std::numeric_limits<float>::max() };
-
-            if ((use_original_mesh_texture_preview || !mmuseg_texture_preview_models.empty()) &&
-                ensure_model_volume_texture_preview(*model_volume, mmuseg_texture_preview, mmuseg_texture_preview_signature)) {
-                if (use_original_mesh_texture_preview) {
-                    const int extruder_id = model_volume->extruder_id();
-                    const ColorRGBA fallback_color = extruder_colors.empty() ? ColorRGBA(0.15f, 0.65f, 0.6f, 1.f) : extruder_colors.front();
-                    ColorRGBA original_mesh_preview_color = extruder_id > 0 && size_t(extruder_id - 1) < extruder_colors.size() ?
-                        extruder_colors[size_t(extruder_id - 1)] :
-                        fallback_color;
-                    original_mesh_preview_color = adjust_color_for_rendering(original_mesh_preview_color);
-                    if (force_native_color && render_color.is_transparent())
-                        original_mesh_preview_color.a(render_color.a());
-                    render_model_texture_preview_model(model,
-                                                       original_mesh_preview_color,
-                                                       base_filament_id,
-                                                       num_physical,
-                                                       texture_mgr,
-                                                       *model_volume,
-                                                       mmuseg_texture_preview,
-                                                       model_matrix,
-                                                       camera.get_view_matrix(),
-                                                       camera.get_projection_matrix(),
-                                                       z_range,
-                                                       clipping_plane,
-                                                       this->tverts_range);
-                } else {
-                    render_model_texture_preview_models(mmuseg_texture_preview_models,
-                                                        adjusted_preview_colors(mmuseg_texture_preview_colors),
-                                                        mmuseg_texture_preview_filament_ids,
-                                                        num_physical,
-                                                        texture_mgr,
-                                                        *model_volume,
-                                                        mmuseg_texture_preview,
-                                                        model_matrix,
-                                                        camera.get_view_matrix(),
-                                                        camera.get_projection_matrix(),
-                                                        z_range,
-                                                        clipping_plane);
-                }
-            }
-            if (!mmuseg_vertex_color_preview_models.empty()) {
-                render_model_vertex_color_preview_models(mmuseg_vertex_color_preview_models,
-                                                         adjusted_preview_colors(mmuseg_vertex_color_preview_colors),
-                                                         mmuseg_vertex_color_preview_filament_ids,
-                                                         num_physical,
-                                                         texture_mgr,
-                                                         model_matrix,
-                                                         camera.get_view_matrix(),
-                                                         camera.get_projection_matrix(),
-                                                         z_range,
-                                                         clipping_plane);
-            }
-            if (shader != nullptr)
-                shader->start_using();
-        }
     } else {
         if (tverts_range == std::make_pair<size_t, size_t>(0, -1))
             model.render(shader);
         else
             model.render(this->tverts_range, shader);
     }
+    if (this->is_left_handed())
+        glFrontFace(GL_CCW);
+}
+
+void GLVolume::render_mmu_texture_preview(const Transform3d &view_matrix,
+                                          const Transform3d &projection_matrix,
+                                          const std::array<float, 2> &z_range,
+                                          const std::array<float, 4> &clipping_plane,
+                                          int print_volume_type,
+                                          const std::array<float, 4> &print_volume_xy,
+                                          const std::array<float, 2> &print_volume_z)
+{
+    if (picking || !printable || object_idx() < 0 || volume_idx() < 0)
+        return;
+
+    ModelObjectPtrs &model_objects = GUI::wxGetApp().model().objects;
+    if (size_t(object_idx()) >= model_objects.size())
+        return;
+
+    const ModelObject *model_object = model_objects[size_t(object_idx())];
+    if (model_object == nullptr || size_t(volume_idx()) >= model_object->volumes.size())
+        return;
+
+    const ModelVolume *model_volume = model_object->volumes[size_t(volume_idx())];
+    if (model_volume == nullptr)
+        return;
+
+    const size_t num_physical = std::max(0, GUI::wxGetApp().filaments_cnt());
+    const TextureMappingManager *texture_mgr = GUI::wxGetApp().preset_bundle != nullptr ?
+        &GUI::wxGetApp().preset_bundle->texture_mapping_zones : nullptr;
+    const unsigned int base_filament_id = model_volume->extruder_id() > 0 ? unsigned(model_volume->extruder_id()) : 0u;
+    const bool base_uses_texture_preview = filament_state_uses_texture_preview(base_filament_id, num_physical, texture_mgr);
+    const bool base_uses_surface_gradient_preview =
+        filament_state_uses_surface_gradient_preview(base_filament_id, num_physical, texture_mgr);
+    const bool base_uses_image_texture_preview = base_uses_texture_preview && !base_uses_surface_gradient_preview;
+
+    const bool has_mmu_segmentation = !model_volume->mmu_segmentation_facets.empty();
+    const bool has_texture_mapping_color_preview_data = model_volume_has_texture_mapping_color_preview_data(*model_volume);
+    const bool use_original_mesh_texture_preview =
+        !has_mmu_segmentation &&
+        !has_texture_mapping_color_preview_data &&
+        base_uses_image_texture_preview &&
+        model_volume_has_complete_texture_preview_data(*model_volume) &&
+        GUI::GLModel::Geometry::has_tex_coord(model.get_geometry().format);
+
+    if (!use_original_mesh_texture_preview && mmuseg_texture_preview_models.empty()) {
+        mmuseg_texture_preview.reset();
+        mmuseg_texture_preview_signature = 0;
+    }
+
+    if (!use_original_mesh_texture_preview && mmuseg_texture_preview_models.empty() && mmuseg_vertex_color_preview_models.empty())
+        return;
+
+    if (this->is_left_handed())
+        glFrontFace(GL_CW);
+    glsafe(::glCullFace(GL_BACK));
+
+    const Transform3d model_matrix = this->world_matrix();
+    const std::vector<ColorRGBA> extruder_colors = GUI::wxGetApp().plater()->get_extruders_colors();
+    auto adjusted_preview_colors = [this](const std::vector<ColorRGBA> &colors) {
+        std::vector<ColorRGBA> preview_colors = colors;
+        for (ColorRGBA &preview_color : preview_colors) {
+            preview_color = adjust_color_for_rendering(preview_color);
+            if (force_native_color && render_color.is_transparent())
+                preview_color.a(render_color.a());
+        }
+        return preview_colors;
+    };
+
+    if ((use_original_mesh_texture_preview || !mmuseg_texture_preview_models.empty()) &&
+        ensure_model_volume_texture_preview(*model_volume, mmuseg_texture_preview, mmuseg_texture_preview_signature)) {
+        if (use_original_mesh_texture_preview) {
+            const int extruder_id = model_volume->extruder_id();
+            const ColorRGBA fallback_color = extruder_colors.empty() ? ColorRGBA(0.15f, 0.65f, 0.6f, 1.f) : extruder_colors.front();
+            ColorRGBA original_mesh_preview_color = extruder_id > 0 && size_t(extruder_id - 1) < extruder_colors.size() ?
+                extruder_colors[size_t(extruder_id - 1)] :
+                fallback_color;
+            original_mesh_preview_color = adjust_color_for_rendering(original_mesh_preview_color);
+            if (force_native_color && render_color.is_transparent())
+                original_mesh_preview_color.a(render_color.a());
+            render_model_texture_preview_model(model,
+                                               original_mesh_preview_color,
+                                               base_filament_id,
+                                               num_physical,
+                                               texture_mgr,
+                                               *model_volume,
+                                               mmuseg_texture_preview,
+                                               model_matrix,
+                                               view_matrix,
+                                               projection_matrix,
+                                               z_range,
+                                               clipping_plane,
+                                               this->tverts_range,
+                                               print_volume_type,
+                                               print_volume_xy,
+                                               print_volume_z);
+        } else {
+            render_model_texture_preview_models(mmuseg_texture_preview_models,
+                                                adjusted_preview_colors(mmuseg_texture_preview_colors),
+                                                mmuseg_texture_preview_filament_ids,
+                                                num_physical,
+                                                texture_mgr,
+                                                *model_volume,
+                                                mmuseg_texture_preview,
+                                                model_matrix,
+                                                view_matrix,
+                                                projection_matrix,
+                                                z_range,
+                                                clipping_plane,
+                                                print_volume_type,
+                                                print_volume_xy,
+                                                print_volume_z);
+        }
+    }
+
+    if (!mmuseg_vertex_color_preview_models.empty()) {
+        render_model_vertex_color_preview_models(mmuseg_vertex_color_preview_models,
+                                                 adjusted_preview_colors(mmuseg_vertex_color_preview_colors),
+                                                 mmuseg_vertex_color_preview_filament_ids,
+                                                 num_physical,
+                                                 texture_mgr,
+                                                 model_matrix,
+                                                 view_matrix,
+                                                 projection_matrix,
+                                                 z_range,
+                                                 clipping_plane,
+                                                 print_volume_type,
+                                                 print_volume_xy,
+                                                 print_volume_z);
+    }
+
     if (this->is_left_handed())
         glFrontFace(GL_CCW);
 }
@@ -1760,10 +1845,23 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType       type,
         else
             volume.first->render();
 
+        const int texture_preview_print_volume_type =
+            volume.first->partly_inside && partly_inside_enable ? static_cast<int>(m_print_volume.type) : -1;
+        const std::array<float, 4> texture_preview_clipping_plane = {
+            float(m_clipping_plane[0]),
+            float(m_clipping_plane[1]),
+            float(m_clipping_plane[2]),
+            float(m_clipping_plane[3])
+        };
+        shader->stop_using();
+        volume.first->render_mmu_texture_preview(view_matrix,
+                                                 projection_matrix,
+                                                 m_z_range,
+                                                 texture_preview_clipping_plane,
+                                                 texture_preview_print_volume_type,
+                                                 m_print_volume.data,
+                                                 m_print_volume.zs);
         if (GLWipeTowerVolume *wipe_tower_volume = dynamic_cast<GLWipeTowerVolume *>(volume.first)) {
-            const int texture_preview_print_volume_type =
-                volume.first->partly_inside && partly_inside_enable ? static_cast<int>(m_print_volume.type) : -1;
-            shader->stop_using();
             wipe_tower_volume->render_prime_tower_image_preview(view_matrix,
                                                                 projection_matrix,
                                                                 m_z_range,
@@ -1771,8 +1869,8 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType       type,
                                                                 texture_preview_print_volume_type,
                                                                 m_print_volume.data,
                                                                 m_print_volume.zs);
-            shader->start_using();
         }
+        shader->start_using();
 
 #if ENABLE_ENVIRONMENT_MAP
         if (use_environment_texture)
@@ -2153,14 +2251,26 @@ void GLVolumeCollection::update_colors_by_extruder(const DynamicPrintConfig *con
         if (filamemts_opt == nullptr)
             return;
 
-        size_t colors_count = (size_t)filamemts_opt->values.size();
-        if (colors_count == 0)
+        std::vector<std::string> filament_colors = filamemts_opt->values;
+        if (filament_colors.empty())
             return;
-        colors.resize(colors_count);
 
-        for (unsigned int i = 0; i < colors_count; ++i) {
+        if (GUI::wxGetApp().preset_bundle != nullptr) {
+            const size_t physical_count = filament_colors.size();
+            const TextureMappingManager &texture_mgr = GUI::wxGetApp().preset_bundle->texture_mapping_zones;
+            const size_t total_count = texture_mgr.total_filaments(physical_count);
+            filament_colors.resize(total_count, "#8C8C8C");
+            for (const TextureMappingZone &zone : texture_mgr.zones()) {
+                if (zone.enabled && !zone.deleted && zone.zone_id >= 1 && zone.zone_id <= filament_colors.size() && !zone.display_color.empty())
+                    filament_colors[zone.zone_id - 1] = zone.display_color;
+            }
+        }
+
+        colors.resize(filament_colors.size());
+
+        for (size_t i = 0; i < filament_colors.size(); ++i) {
             ColorRGBA rgba;
-            const std::string& fil_color = config->opt_string("filament_colour", i);
+            const std::string& fil_color = filament_colors[i];
             if (decode_color(fil_color, rgba))
                 colors[i] = { fil_color, rgba };
         }

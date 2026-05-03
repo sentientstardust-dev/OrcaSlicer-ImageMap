@@ -157,18 +157,33 @@ static double calc_max_layer_height(const PrintConfig &config, double max_object
 static FilamentChangeStats calc_filament_change_info_by_toolorder(const PrintConfig* config, const std::vector<int>& filament_map, const std::vector<FlushMatrix>& flush_matrix, const std::vector<std::vector<unsigned int>>& layer_sequences)
 {
     FilamentChangeStats ret;
+    if (config == nullptr || filament_map.empty() || flush_matrix.empty())
+        return ret;
+
     std::unordered_map<int, int> flush_volume_per_filament;
-    int max_extruder_id = *std::max_element(filament_map.begin(), filament_map.end());
-    assert(max_extruder_id >= 0);
-    std::vector<unsigned int>last_filament_per_extruder(max_extruder_id + 1, -1);
+    int max_extruder_id = -1;
+    for (int extruder_id : filament_map)
+        max_extruder_id = std::max(max_extruder_id, extruder_id);
+    if (max_extruder_id < 0)
+        return ret;
+    const unsigned int invalid_filament_id = static_cast<unsigned int>(-1);
+    std::vector<unsigned int>last_filament_per_extruder(max_extruder_id + 1, invalid_filament_id);
 
     int total_filament_change_count = 0;
     float total_filament_flush_weight = 0;
     for (const auto& ls : layer_sequences) {
         for (const auto& item : ls) {
+            if (static_cast<size_t>(item) >= filament_map.size())
+                continue;
             int extruder_id = filament_map[item];
-            int last_filament = last_filament_per_extruder[extruder_id];
-            if (last_filament != -1 && last_filament != item) {
+            if (extruder_id < 0 || static_cast<size_t>(extruder_id) >= last_filament_per_extruder.size())
+                continue;
+            unsigned int last_filament = last_filament_per_extruder[extruder_id];
+            if (last_filament != invalid_filament_id && last_filament != item) {
+                if (static_cast<size_t>(extruder_id) >= flush_matrix.size() ||
+                    static_cast<size_t>(last_filament) >= flush_matrix[extruder_id].size() ||
+                    static_cast<size_t>(item) >= flush_matrix[extruder_id][last_filament].size())
+                    continue;
                 int flush_volume = flush_matrix[extruder_id][last_filament][item];
                 flush_volume_per_filament[item] += flush_volume;
                 total_filament_change_count += 1;
@@ -178,6 +193,8 @@ static FilamentChangeStats calc_filament_change_info_by_toolorder(const PrintCon
     }
 
     for (auto& fv : flush_volume_per_filament) {
+        if (fv.first < 0 || static_cast<size_t>(fv.first) >= config->filament_density.values.size())
+            continue;
         float weight = config->filament_density.get_at(fv.first) * 0.001 * fv.second;
         total_filament_flush_weight += weight;
     }
