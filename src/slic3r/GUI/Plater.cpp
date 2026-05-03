@@ -641,9 +641,6 @@ private:
                 dc.DrawRectangle(rect.GetLeft(), y0, rect.GetWidth(), std::max(1, y1 - y0));
             }
         }
-        dc.SetPen(wxPen(wxGetApp().dark_mode() ? wxColour(118, 118, 118) : wxColour(164, 164, 164), 1));
-        dc.SetBrush(*wxTRANSPARENT_BRUSH);
-        dc.DrawRectangle(rect);
     }
 
     std::vector<wxColour>     m_palette;
@@ -5190,6 +5187,10 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         summary->SetForegroundColour(summary_fg);
         header_sizer->Add(summary, 1, wxALIGN_CENTER_VERTICAL | wxLEFT, gap);
 
+        auto *menu_btn = new ScalableButton(header, wxID_ANY, "menu_filament");
+        menu_btn->SetToolTip(_L("Texture map actions"));
+        header_sizer->Add(menu_btn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+
         auto *preview = new TextureMappingPatternPreview(header);
         preview->SetBackgroundColour(row_bg);
         preview->set_data(palette,
@@ -5198,10 +5199,6 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                               texture_mapping_selected_ids(entry, num_physical),
                           parse_texture_mapping_color(entry.display_color));
         header_sizer->Add(preview, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-
-        auto *menu_btn = new ScalableButton(header, wxID_ANY, "menu_filament");
-        menu_btn->SetToolTip(_L("Texture map actions"));
-        header_sizer->Add(menu_btn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         row_sizer->Add(header, 0, wxEXPAND | wxTOP | wxBOTTOM, gap);
 
         auto *editor = new wxPanel(row, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE);
