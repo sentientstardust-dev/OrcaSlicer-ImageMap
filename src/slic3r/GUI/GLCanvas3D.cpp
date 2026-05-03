@@ -123,7 +123,6 @@ float RetinaHelper::get_scale_factor() { return float(m_window->GetContentScaleF
 #undef Convex
 #endif
 
-
 std::string& get_object_limited_text() {
     static std::string object_limited_text = _u8L("An object is placed in the left/right nozzle-only area or exceeds the printable height of the left nozzle.\n"
             "Please ensure the filaments used by this object are not arranged to other nozzles.");
@@ -2841,10 +2840,11 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
 
                 const Print* print = m_process->fff_print();
                 const Print* current_print = part_plate->fff_print();
-                const std::vector<int> wipe_tower_extruders = part_plate->get_wipe_tower_extruders(true);
+                const size_t texture_mapping_filaments_count =
+                    part_plate->estimate_wipe_tower_filaments_count(&wxGetApp().preset_bundle->project_config);
                 const size_t wipe_tower_filaments_count = need_wipe_tower ?
-                    std::max<size_t>(1, wipe_tower_extruders.size()) :
-                    wipe_tower_extruders.size();
+                    std::max<size_t>(1, texture_mapping_filaments_count) :
+                    texture_mapping_filaments_count;
                 if (!need_wipe_tower && wipe_tower_filaments_count < 2) continue;
                 if (part_plate->get_objects_on_this_plate().empty()) continue;
 
@@ -2874,7 +2874,27 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
 
                     coordf_t plate_bbox_x_min_local_coord = plate_bbox_2d.min(0) - plate_origin(0);
                     coordf_t plate_bbox_x_max_local_coord = plate_bbox_2d.max(0) - plate_origin(0);
+                    coordf_t plate_bbox_y_min_local_coord = plate_bbox_2d.min(1) - plate_origin(1);
                     coordf_t plate_bbox_y_max_local_coord = plate_bbox_2d.max(1) - plate_origin(1);
+
+                    const float old_x = x;
+                    const float old_y = y;
+                    auto clamp_wipe_tower_axis = [](float value, coordf_t min_value, coordf_t max_value, double size, float margin) {
+                        const float axis_min = float(min_value) + margin;
+                        const float axis_max = float(max_value) - margin - float(size);
+                        return axis_max < axis_min ? axis_min : std::min(std::max(value, axis_min), axis_max);
+                    };
+                    x = clamp_wipe_tower_axis(x, plate_bbox_x_min_local_coord, plate_bbox_x_max_local_coord, wipe_tower_size(0), margin);
+                    y = clamp_wipe_tower_axis(y, plate_bbox_y_min_local_coord, plate_bbox_y_max_local_coord, wipe_tower_size(1), margin);
+
+                    if (std::abs(x - old_x) > EPSILON) {
+                        ConfigOptionFloat x_opt(x);
+                        dynamic_cast<ConfigOptionFloats*>(proj_cfg.option("wipe_tower_x"))->set_at(&x_opt, plate_id, 0);
+                    }
+                    if (std::abs(y - old_y) > EPSILON) {
+                        ConfigOptionFloat y_opt(y);
+                        dynamic_cast<ConfigOptionFloats*>(proj_cfg.option("wipe_tower_y"))->set_at(&y_opt, plate_id, 0);
+                    }
 
                     if (!current_print->is_step_done(psWipeTower) || !current_print->wipe_tower_data().wipe_tower_mesh_data) {
                         // update for wipe tower position

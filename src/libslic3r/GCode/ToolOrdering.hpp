@@ -239,7 +239,14 @@ public:
     bool 				empty()       const { return m_layer_tools.empty(); }
     const std::vector<LayerTools>& layer_tools() const { return m_layer_tools; }
     std::vector<LayerTools>& layer_tools() { return m_layer_tools; }
-    bool 				has_wipe_tower() const { return ! m_layer_tools.empty() && m_first_printing_extruder != (unsigned int)-1 && m_layer_tools.front().has_wipe_tower; }
+    bool 				has_wipe_tower() const {
+        if (m_layer_tools.empty() || m_first_printing_extruder == (unsigned int)-1)
+            return false;
+        for (const LayerTools &layer_tools : m_layer_tools)
+            if (layer_tools.has_wipe_tower)
+                return true;
+        return false;
+    }
 
     int                 get_most_used_extruder() const { return most_used_extruder; }
     /*

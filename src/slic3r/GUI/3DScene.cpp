@@ -1569,14 +1569,16 @@ int GLVolumeCollection::load_wipe_tower_preview(
     std::vector<ColorRGBA> extruder_colors = GUI::wxGetApp().plater()->get_extruders_colors();
     std::vector<ColorRGBA> colors;
     GUI::PartPlateList& ppl = GUI::wxGetApp().plater()->get_partplate_list();
-    std::vector<int> plate_extruders = ppl.get_plate(plate_idx)->get_wipe_tower_extruders(true);
+    std::vector<int> plate_extruders = ppl.get_plate(plate_idx)->get_extruders(true);
     TriangleMesh wipe_tower_shell = make_cube(width, depth, height);
     for (int extruder_id : plate_extruders) {
-        if (extruder_id <= extruder_colors.size())
+        if (extruder_id > 0 && extruder_id <= extruder_colors.size())
             colors.push_back(extruder_colors[extruder_id - 1]);
-        else
+        else if (!extruder_colors.empty())
             colors.push_back(extruder_colors[0]);
     }
+    if (colors.empty())
+        colors.emplace_back(ColorRGBA::WHITE());
 
     // Orca: make it transparent
     for(auto& color : colors)

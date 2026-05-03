@@ -170,6 +170,71 @@ std::vector<int> expand_wipe_tower_extruders(const std::vector<int> &extruders, 
     return expanded;
 }
 
+size_t estimate_wipe_tower_filaments_count_for_texture_mapping(const std::vector<int> &extruders, const DynamicPrintConfig *config)
+{
+    if (extruders.empty())
+        return 0;
+
+    const std::vector<std::string> filament_colours = wipe_tower_filament_colours(config);
+    const size_t                   num_physical     = filament_colours.size();
+    if (num_physical == 0)
+        return 0;
+
+    TextureMappingManager texture_mgr;
+    const std::string texture_mapping_definitions = config != nullptr && config->has("texture_mapping_definitions") ?
+        config->opt_string("texture_mapping_definitions") :
+        (wxGetApp().preset_bundle != nullptr && wxGetApp().preset_bundle->project_config.has("texture_mapping_definitions") ?
+             wxGetApp().preset_bundle->project_config.opt_string("texture_mapping_definitions") :
+             std::string());
+    texture_mgr.load_entries(texture_mapping_definitions, filament_colours);
+
+    std::vector<unsigned int> physical_ids;
+    size_t                    texture_slots                      = 0;
+    bool                      texture_changes_physical_component = false;
+
+    for (const int extruder : extruders) {
+        if (extruder <= 0)
+            continue;
+
+        const unsigned int filament_id = static_cast<unsigned int>(extruder);
+        if (filament_id <= num_physical) {
+            physical_ids.emplace_back(filament_id);
+            continue;
+        }
+
+        const TextureMappingZone *zone = texture_mgr.zone_from_id(filament_id);
+        if (zone == nullptr || !zone->enabled || zone->deleted)
+            continue;
+
+        std::vector<unsigned int> component_ids = zone->is_image_texture() ?
+            TextureMappingManager::effective_texture_component_ids(*zone, num_physical, filament_colours) :
+            TextureMappingManager::selected_component_ids(*zone, num_physical);
+        component_ids.erase(std::remove_if(component_ids.begin(),
+                                           component_ids.end(),
+                                           [num_physical](unsigned int id) { return id == 0 || id > num_physical; }),
+                            component_ids.end());
+        std::sort(component_ids.begin(), component_ids.end());
+        component_ids.erase(std::unique(component_ids.begin(), component_ids.end()), component_ids.end());
+        if (component_ids.empty())
+            continue;
+
+        if (component_ids.size() == 1) {
+            physical_ids.emplace_back(component_ids.front());
+        } else {
+            ++texture_slots;
+            texture_changes_physical_component = true;
+        }
+    }
+
+    std::sort(physical_ids.begin(), physical_ids.end());
+    physical_ids.erase(std::unique(physical_ids.begin(), physical_ids.end()), physical_ids.end());
+
+    size_t count = physical_ids.size() + texture_slots;
+    if (count < 2 && texture_changes_physical_component)
+        count = 2;
+    return count;
+}
+
 ColorRGBA PartPlate::SELECT_COLOR		= { 0.2666f, 0.2784f, 0.2784f, 1.0f }; //{ 0.4196f, 0.4235f, 0.4235f, 1.0f };
 ColorRGBA PartPlate::UNSELECT_COLOR		= { 0.82f, 0.82f, 0.82f, 1.0f };
 ColorRGBA PartPlate::UNSELECT_DARK_COLOR		= { 0.384f, 0.384f, 0.412f, 1.0f };
@@ -1730,6 +1795,11 @@ std::vector<int> PartPlate::get_wipe_tower_extruders(bool conside_custom_gcode) 
     return expand_wipe_tower_extruders(get_extruders(conside_custom_gcode), config);
 }
 
+size_t PartPlate::estimate_wipe_tower_filaments_count(const DynamicPrintConfig *config) const
+{
+    return estimate_wipe_tower_filaments_count_for_texture_mapping(get_extruders(true), config);
+}
+
 std::vector<int> PartPlate::get_extruders_under_cli(bool conside_custom_gcode, DynamicPrintConfig& full_config) const
 {
     std::vector<int> plate_extruders;
@@ -2239,8 +2309,7 @@ Vec3d PartPlate::estimate_wipe_tower_size(const DynamicPrintConfig & config, con
     // empty plate
     if (plate_extruder_size == 0)
     {
-        std::vector<int> plate_extruders = get_wipe_tower_extruders(true);
-        plate_extruder_size = plate_extruders.size();
+        plate_extruder_size = int(estimate_wipe_tower_filaments_count(&config));
     }
     if (plate_extruder_size == 0)
         return wipe_tower_size;
