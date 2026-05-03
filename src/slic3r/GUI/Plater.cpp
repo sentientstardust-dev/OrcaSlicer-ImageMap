@@ -1623,7 +1623,7 @@ struct Sidebar::priv
     wxScrolledWindow* m_scrolledWindow_filament_content;
     wxStaticLine* m_staticline2;
     StaticBox* m_panel_texture_mapping_title = nullptr;
-    wxPanel* m_panel_texture_mapping_content = nullptr;
+    wxScrolledWindow* m_panel_texture_mapping_content = nullptr;
     wxBoxSizer* m_sizer_texture_mapping_content = nullptr;
     ScalableButton* m_texture_mapping_icon = nullptr;
     wxStaticText* m_staticText_texture_mapping = nullptr;
@@ -3440,7 +3440,9 @@ Sidebar::Sidebar(Plater *parent)
     spliter_texture_2->SetLineColour("#CECECE");
     scrolled_sizer->Add(spliter_texture_2, 0, wxEXPAND);
 
-    p->m_panel_texture_mapping_content = new wxPanel(p->scrolled, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxTAB_TRAVERSAL);
+    p->m_panel_texture_mapping_content = new wxScrolledWindow(p->scrolled, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxTAB_TRAVERSAL);
+    p->m_panel_texture_mapping_content->SetScrollRate(0, 5);
+    p->m_panel_texture_mapping_content->ShowScrollbars(wxSHOW_SB_NEVER, wxSHOW_SB_DEFAULT);
     p->m_panel_texture_mapping_content->SetBackgroundColour(wxGetApp().dark_mode() ? wxColour(45, 45, 49) : wxColour(255, 255, 255));
     p->m_sizer_texture_mapping_content = new wxBoxSizer(wxVERTICAL);
     p->m_sizer_texture_mapping_content->AddSpacer(FromDIP(SidebarProps::ContentMargin()));
@@ -5082,6 +5084,18 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         return;
     content_sizer->Clear(true);
     content_sizer->AddSpacer(FromDIP(SidebarProps::ContentMargin()));
+    auto update_texture_mapping_area_height = [this]() {
+        if (p->m_panel_texture_mapping_content == nullptr || p->m_panel_texture_mapping_content->GetSizer() == nullptr)
+            return;
+        const int max_height = FromDIP(260);
+        p->m_panel_texture_mapping_content->SetMaxSize(wxSize(-1, max_height));
+        p->m_panel_texture_mapping_content->Layout();
+        p->m_panel_texture_mapping_content->FitInside();
+        wxSize min_size = p->m_panel_texture_mapping_content->GetSizer()->GetMinSize();
+        if (min_size.y > max_height)
+            min_size.y = max_height;
+        p->m_panel_texture_mapping_content->SetMinSize(wxSize(-1, std::max(FromDIP(1), min_size.y)));
+    };
 
     if (p->m_btn_add_texture_map != nullptr)
         p->m_btn_add_texture_map->Enable(num_physical >= 2);
@@ -5122,7 +5136,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         empty_label->SetForegroundColour(summary_fg);
         empty_label->Wrap(FromDIP(360));
         content_sizer->Add(empty_label, 0, wxALL | wxEXPAND, FromDIP(12));
-        p->m_panel_texture_mapping_content->Layout();
+        update_texture_mapping_area_height();
         m_scrolled_sizer->Layout();
         Layout();
         return;
@@ -5330,7 +5344,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             }
             evt.Skip();
         });
-        auto update_pattern_visibility = [this, editor_sizer, mode_row, contrast_row, offset_btn, advanced_btn, surface_choice, row, editor]() {
+        auto update_pattern_visibility = [this, editor_sizer, mode_row, contrast_row, offset_btn, advanced_btn, surface_choice, row, editor, update_texture_mapping_area_height]() {
             const bool image_texture = surface_choice == nullptr || surface_choice->GetSelection() == 0;
             editor_sizer->Show(mode_row, image_texture, true);
             editor_sizer->Show(contrast_row, image_texture, true);
@@ -5340,7 +5354,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 advanced_btn->Show(image_texture);
             editor->Layout();
             row->Layout();
-            p->m_panel_texture_mapping_content->Layout();
+            update_texture_mapping_area_height();
             m_scrolled_sizer->Layout();
             Layout();
         };
@@ -5480,7 +5494,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             update_texture_mapping_panel(false);
         });
 
-        auto toggle_editor = [this, zone_index, editor, row]() {
+        auto toggle_editor = [this, zone_index, editor, row, update_texture_mapping_area_height]() {
             if (editor == nullptr)
                 return;
             if (editor->IsShown()) {
@@ -5491,7 +5505,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 p->m_expanded_texture_mapping_rows.insert(zone_index);
             }
             row->Layout();
-            p->m_panel_texture_mapping_content->Layout();
+            update_texture_mapping_area_height();
             m_scrolled_sizer->Layout();
             Layout();
         };
@@ -5543,7 +5557,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
     }
 
     content_sizer->AddSpacer(FromDIP(2));
-    p->m_panel_texture_mapping_content->Layout();
+    update_texture_mapping_area_height();
     m_scrolled_sizer->Layout();
     Layout();
 }

@@ -878,6 +878,9 @@ void GLVolume::render_mmu_texture_preview(const Transform3d &view_matrix,
     if (!use_original_mesh_texture_preview && mmuseg_texture_preview_models.empty() && mmuseg_vertex_color_preview_models.empty())
         return;
 
+    if (GUI::wxGetApp().plater() == nullptr)
+        return;
+
     if (this->is_left_handed())
         glFrontFace(GL_CW);
     glsafe(::glCullFace(GL_BACK));
@@ -1686,9 +1689,9 @@ GLVolumeWithIdAndZList volumes_to_render(const GLVolumePtrs& volumes, GLVolumeCo
     for (unsigned int i = 0; i < (unsigned int)volumes.size(); ++i) {
         GLVolume* volume = volumes[i];
         bool is_transparent = volume->render_color.is_transparent();
-        auto tempGlwipeTowerVolume = dynamic_cast<GLWipeTowerVolume *>(volume);
-        if (tempGlwipeTowerVolume) { 
-            is_transparent = tempGlwipeTowerVolume->IsTransparent();
+        if (volume->is_wipe_tower) {
+            GLWipeTowerVolume *wipe_tower_volume = static_cast<GLWipeTowerVolume *>(volume);
+            is_transparent = wipe_tower_volume->IsTransparent();
         }
         if (((type == GLVolumeCollection::ERenderType::Opaque && !is_transparent) || 
             (type == GLVolumeCollection::ERenderType::Transparent && is_transparent) ||
@@ -1845,6 +1848,11 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType       type,
         else
             volume.first->render();
 
+#if ENABLE_ENVIRONMENT_MAP
+        if (use_environment_texture)
+            glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
+#endif // ENABLE_ENVIRONMENT_MAP
+
         const int texture_preview_print_volume_type =
             volume.first->partly_inside && partly_inside_enable ? static_cast<int>(m_print_volume.type) : -1;
         const std::array<float, 4> texture_preview_clipping_plane = {
@@ -1853,15 +1861,20 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType       type,
             float(m_clipping_plane[2]),
             float(m_clipping_plane[3])
         };
+        const bool render_model_texture_preview =
+            volume.first->object_idx() >= 0 && volume.first->volume_idx() >= 0 && !volume.first->is_wipe_tower &&
+            !volume.first->is_modifier && !volume.first->is_extrusion_path;
         shader->stop_using();
-        volume.first->render_mmu_texture_preview(view_matrix,
-                                                 projection_matrix,
-                                                 m_z_range,
-                                                 texture_preview_clipping_plane,
-                                                 texture_preview_print_volume_type,
-                                                 m_print_volume.data,
-                                                 m_print_volume.zs);
-        if (GLWipeTowerVolume *wipe_tower_volume = dynamic_cast<GLWipeTowerVolume *>(volume.first)) {
+        if (render_model_texture_preview)
+            volume.first->render_mmu_texture_preview(view_matrix,
+                                                     projection_matrix,
+                                                     m_z_range,
+                                                     texture_preview_clipping_plane,
+                                                     texture_preview_print_volume_type,
+                                                     m_print_volume.data,
+                                                     m_print_volume.zs);
+        if (volume.first->is_wipe_tower) {
+            GLWipeTowerVolume *wipe_tower_volume = static_cast<GLWipeTowerVolume *>(volume.first);
             wipe_tower_volume->render_prime_tower_image_preview(view_matrix,
                                                                 projection_matrix,
                                                                 m_z_range,
@@ -1871,11 +1884,6 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType       type,
                                                                 m_print_volume.zs);
         }
         shader->start_using();
-
-#if ENABLE_ENVIRONMENT_MAP
-        if (use_environment_texture)
-            glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
-#endif // ENABLE_ENVIRONMENT_MAP
 
         glsafe(::glBindBuffer(GL_ARRAY_BUFFER, 0));
         glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
@@ -2231,6 +2239,9 @@ void GLVolumeCollection::reset_outside_state()
 
 void GLVolumeCollection::update_colors_by_extruder(const DynamicPrintConfig *config, bool is_update_alpha)
 {
+    if (config == nullptr)
+        return;
+
     
     using ColorItem = std::pair<std::string, ColorRGBA>;
     std::vector<ColorItem> colors;
