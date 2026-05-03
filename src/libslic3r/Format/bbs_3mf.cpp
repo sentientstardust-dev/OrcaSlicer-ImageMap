@@ -755,39 +755,6 @@ struct PendingThreeMfImportedTexture
     std::vector<uint8_t> uv_valid;
 };
 
-static bool build_single_texture_source_from_resources(
-    PendingThreeMfImportedTexture &out,
-    const size_t triangles_count,
-    const std::map<int, ThreeMfTexture2DGroupResource> &texture_groups,
-    const std::map<int, ThreeMfTexture2DResource> &texture_resources)
-{
-    if (triangles_count == 0 || texture_groups.size() != 1)
-        return false;
-
-    const ThreeMfTexture2DGroupResource &group = texture_groups.begin()->second;
-    const auto texture_it = texture_resources.find(group.tex_id);
-    if (texture_it == texture_resources.end() || texture_it->second.path.empty())
-        return false;
-    if (group.coords.size() < triangles_count * 3)
-        return false;
-
-    out.image_file = texture_it->second.path;
-    out.image_content_type = texture_it->second.content_type;
-    out.uv_valid.assign(triangles_count, uint8_t(1));
-    out.uvs_per_face.resize(triangles_count * 6);
-    for (size_t triangle_idx = 0; triangle_idx < triangles_count; ++triangle_idx) {
-        const size_t coord_idx = triangle_idx * 3;
-        const size_t uv_idx = triangle_idx * 6;
-        out.uvs_per_face[uv_idx + 0] = group.coords[coord_idx + 0].first;
-        out.uvs_per_face[uv_idx + 1] = group.coords[coord_idx + 0].second;
-        out.uvs_per_face[uv_idx + 2] = group.coords[coord_idx + 1].first;
-        out.uvs_per_face[uv_idx + 3] = group.coords[coord_idx + 1].second;
-        out.uvs_per_face[uv_idx + 4] = group.coords[coord_idx + 2].first;
-        out.uvs_per_face[uv_idx + 5] = group.coords[coord_idx + 2].second;
-    }
-    return true;
-}
-
 struct ThreeMfExportTextureResource
 {
     int                   color_group_id{-1};
@@ -1065,65 +1032,19 @@ static bool decode_texture_rgba_from_memory(const std::vector<uint8_t> &encoded,
     return decode_jpeg_rgba_from_memory(encoded, out_rgba, out_width, out_height);
 }
 
-static std::string normalize_archive_lookup_path(std::string path)
-{
-    std::replace(path.begin(), path.end(), '\\', '/');
-    while (!path.empty() && path.front() == '/')
-        path.erase(path.begin());
-    while (boost::algorithm::starts_with(path, "./"))
-        path.erase(0, 2);
-    return path;
-}
-
-static int locate_file_in_archive(mz_zip_archive &archive, const std::string &path_in_zip)
-{
-    if (path_in_zip.empty())
-        return -1;
-
-    int index = mz_zip_reader_locate_file(&archive, path_in_zip.c_str(), nullptr, 0);
-    if (index >= 0)
-        return index;
-
-    const std::string native_path = encode_path(path_in_zip.c_str());
-    index = mz_zip_reader_locate_file(&archive, native_path.c_str(), nullptr, 0);
-    if (index >= 0)
-        return index;
-
-    const std::string lookup_path = boost::algorithm::to_lower_copy(normalize_archive_lookup_path(path_in_zip));
-    const mz_uint file_count = mz_zip_reader_get_num_files(&archive);
-    for (mz_uint i = 0; i < file_count; ++i) {
-        mz_zip_archive_file_stat stat;
-        if (!mz_zip_reader_file_stat(&archive, i, &stat))
-            continue;
-        if (boost::algorithm::to_lower_copy(normalize_archive_lookup_path(stat.m_filename)) == lookup_path)
-            return int(i);
-    }
-
-    return -1;
-}
-
 static bool try_extract_file_from_archive(mz_zip_archive &archive, std::string path_in_zip, std::vector<uint8_t> &out_data)
 {
     out_data.clear();
     if (path_in_zip.empty())
         return false;
+    if (path_in_zip.front() == '/')
+        path_in_zip.erase(path_in_zip.begin());
 
-    std::vector<std::string> candidate_paths;
-    candidate_paths.emplace_back(normalize_archive_lookup_path(std::move(path_in_zip)));
-    const boost::filesystem::path texture_path(candidate_paths.front());
-    const std::string filename = texture_path.filename().generic_string();
-    if (!filename.empty()) {
-        candidate_paths.emplace_back((boost::filesystem::path("3D/Texture") / filename).generic_string());
-        candidate_paths.emplace_back((boost::filesystem::path("3d/Texture") / filename).generic_string());
+    int index = mz_zip_reader_locate_file(&archive, path_in_zip.c_str(), nullptr, 0);
+    if (index < 0) {
+        const std::string native_path = encode_path(path_in_zip.c_str());
+        index = mz_zip_reader_locate_file(&archive, native_path.c_str(), nullptr, 0);
     }
-
-    int index = -1;
-    for (const std::string &candidate_path : candidate_paths) {
-        index = locate_file_in_archive(archive, candidate_path);
-        if (index >= 0)
-            break;
-    }
-
     if (index < 0)
         return false;
 
@@ -2679,7 +2600,6 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
         }
 
         _restore_prime_tower_texture_from_archive(archive, config, model);
-        lock.close();
 
         if (!m_is_bbl_3mf) {
             // if the 3mf was not produced by OrcaSlicer and there is more than one instance,
@@ -2871,6 +2791,7 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
         }
 
         _restore_imported_obj_textures_from_archive(archive);
+        lock.close();
 
         // If instances contain a single volume, the volume offset should be 0,0,0
         // This equals to say that instance world position and volume world position should match
@@ -5832,26 +5753,18 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
 
             m_volume_subobject_ids[volume] = sub_object->id;
 
-            PendingThreeMfImportedTexture texture_source;
-            bool has_texture_source = false;
             if (!sub_object->geometry.texture_image_path.empty() &&
                 !sub_object->geometry.texture_uses_multiple_images &&
                 sub_object->geometry.texture_uv_valid.size() == triangles_count &&
                 sub_object->geometry.texture_uvs_per_face.size() >= triangles_count * 6) {
+                PendingThreeMfImportedTexture texture_source;
                 texture_source.image_file         = sub_object->geometry.texture_image_path;
                 texture_source.image_content_type = sub_object->geometry.texture_image_content_type;
                 texture_source.uv_valid           = sub_object->geometry.texture_uv_valid;
                 texture_source.uvs_per_face.assign(sub_object->geometry.texture_uvs_per_face.begin(),
                                                    sub_object->geometry.texture_uvs_per_face.begin() + triangles_count * 6);
-                has_texture_source = true;
-            } else if (build_single_texture_source_from_resources(texture_source,
-                                                                  triangles_count,
-                                                                  m_texture_groups,
-                                                                  m_texture_resources)) {
-                has_texture_source = true;
-            }
-            if (has_texture_source)
                 m_standard_texture_sources[volume] = std::move(texture_source);
+            }
 
             const size_t vertices_count = volume->mesh().its.vertices.size();
             if (sub_object->geometry.vertex_colors_rgba.size() == vertices_count &&
@@ -5951,47 +5864,6 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
         if (m_model == nullptr)
             return;
 
-        for (ModelObject *object : m_model->objects) {
-            if (object == nullptr)
-                continue;
-            for (ModelVolume *volume : object->volumes) {
-                if (volume == nullptr || m_standard_texture_sources.find(volume) != m_standard_texture_sources.end())
-                    continue;
-                const auto subobject_id = m_volume_subobject_ids.find(volume);
-                if (subobject_id == m_volume_subobject_ids.end())
-                    continue;
-                const size_t triangle_count = volume->mesh().its.indices.size();
-                if (triangle_count == 0)
-                    continue;
-                auto current_object = std::find_if(m_current_objects.begin(), m_current_objects.end(), [subobject_id, triangle_count](const auto &item) {
-                    const Geometry &geometry = item.second.geometry;
-                    return item.second.id == subobject_id->second &&
-                           !geometry.texture_image_path.empty() &&
-                           !geometry.texture_uses_multiple_images &&
-                           geometry.texture_uv_valid.size() >= triangle_count &&
-                           geometry.texture_uvs_per_face.size() >= triangle_count * 6;
-                });
-                PendingThreeMfImportedTexture texture_source;
-                bool has_texture_source = false;
-                if (current_object != m_current_objects.end()) {
-                    texture_source.image_file         = current_object->second.geometry.texture_image_path;
-                    texture_source.image_content_type = current_object->second.geometry.texture_image_content_type;
-                    texture_source.uv_valid.assign(current_object->second.geometry.texture_uv_valid.begin(),
-                                                   current_object->second.geometry.texture_uv_valid.begin() + triangle_count);
-                    texture_source.uvs_per_face.assign(current_object->second.geometry.texture_uvs_per_face.begin(),
-                                                       current_object->second.geometry.texture_uvs_per_face.begin() + triangle_count * 6);
-                    has_texture_source = true;
-                } else if (build_single_texture_source_from_resources(texture_source,
-                                                                      triangle_count,
-                                                                      m_texture_groups,
-                                                                      m_texture_resources)) {
-                    has_texture_source = true;
-                }
-                if (has_texture_source)
-                    m_standard_texture_sources[volume] = std::move(texture_source);
-            }
-        }
-
         for (auto &standard_texture_entry : m_standard_texture_sources) {
             ModelVolume *volume = standard_texture_entry.first;
             if (volume == nullptr)
@@ -6021,21 +5893,17 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
             }
 
             const size_t triangle_count = volume->mesh().its.indices.size();
-            if (source.uv_valid.size() < triangle_count || source.uvs_per_face.size() < triangle_count * 6) {
+            if (source.uv_valid.size() != triangle_count || source.uvs_per_face.size() < triangle_count * 6) {
                 BOOST_LOG_TRIVIAL(warning) << "3MF texture2d UV payload triangle mismatch for image='" << source.image_file << "'";
                 continue;
             }
 
-            volume->imported_texture_uv_valid.assign(source.uv_valid.begin(),
-                                                     source.uv_valid.begin() + triangle_count);
+            volume->imported_texture_uv_valid = source.uv_valid;
             volume->imported_texture_uvs_per_face.assign(source.uvs_per_face.begin(),
                                                          source.uvs_per_face.begin() + triangle_count * 6);
             volume->imported_texture_rgba = std::move(imported_rgba);
             volume->imported_texture_width = imported_width;
             volume->imported_texture_height = imported_height;
-            volume->imported_texture_uv_valid.set_new_unique_id();
-            volume->imported_texture_uvs_per_face.set_new_unique_id();
-            volume->imported_texture_rgba.set_new_unique_id();
         }
     }
     /*
