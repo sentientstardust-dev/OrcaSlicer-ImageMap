@@ -358,14 +358,19 @@ public:
     virtual void render_with_outline(const GUI::Size& cnv_size);
 
     //BBS: add simple render function for thumbnail
-    void simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_objects, std::vector<ColorRGBA>& extruder_colors, bool ban_light =false);
+    void simple_render(GLShaderProgram* shader,
+                       ModelObjectPtrs& model_objects,
+                       std::vector<ColorRGBA>& extruder_colors,
+                       bool ban_light = false,
+                       bool suppress_texture_preview_base = false);
     void render_mmu_texture_preview(const Transform3d &view_matrix,
                                     const Transform3d &projection_matrix,
                                     const std::array<float, 2> &z_range,
                                     const std::array<float, 4> &clipping_plane,
                                     int print_volume_type = -1,
                                     const std::array<float, 4> &print_volume_xy = std::array<float, 4>{ 0.f, 0.f, 0.f, 0.f },
-                                    const std::array<float, 2> &print_volume_z = std::array<float, 2>{ 0.f, 0.f });
+                                    const std::array<float, 2> &print_volume_z = std::array<float, 2>{ 0.f, 0.f },
+                                    bool opaque = false);
     void invalidate_texture_mapping_preview();
 
     void                set_bounding_boxes_as_dirty() {

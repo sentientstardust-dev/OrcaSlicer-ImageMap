@@ -635,7 +635,11 @@ void GLVolume::render_with_outline(const GUI::Size& cnv_size)
 }
 
 //BBS add render for simple case
-void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_objects, std::vector<ColorRGBA>& extruder_colors, bool ban_light)
+void GLVolume::simple_render(GLShaderProgram* shader,
+                             ModelObjectPtrs& model_objects,
+                             std::vector<ColorRGBA>& extruder_colors,
+                             bool ban_light,
+                             bool suppress_texture_preview_base)
 {
     if (this->is_left_handed())
         glFrontFace(GL_CW);
@@ -645,7 +649,9 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
     ModelObject* model_object = nullptr;
     ModelVolume* model_volume = nullptr;
     unsigned int base_filament_id = 0;
+    bool base_uses_texture_preview = false;
     bool use_original_mesh_texture_preview = false;
+    bool texture_preview_base_suppressed = false;
     do {
         if ((!printable) || object_idx() >= model_objects.size())
             break;
@@ -659,7 +665,7 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
             &GUI::wxGetApp().preset_bundle->texture_mapping_zones : nullptr;
         base_filament_id = model_volume->extruder_id() > 0 ? unsigned(model_volume->extruder_id()) : 0u;
         const bool has_mmu_segmentation = !model_volume->mmu_segmentation_facets.empty();
-        const bool base_uses_texture_preview = filament_state_uses_texture_preview(base_filament_id, num_physical, texture_mgr);
+        base_uses_texture_preview = filament_state_uses_texture_preview(base_filament_id, num_physical, texture_mgr);
         const bool base_uses_surface_gradient_preview =
             filament_state_uses_surface_gradient_preview(base_filament_id, num_physical, texture_mgr);
         const bool base_uses_image_texture_preview = base_uses_texture_preview && !base_uses_surface_gradient_preview;
@@ -765,9 +771,17 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
             mmuseg_ts = model_volume->mmu_segmentation_facets.timestamp();
             mmuseg_texture_preview_visual_signature = preview_visual_signature;
         }
+        texture_preview_base_suppressed = suppress_texture_preview_base &&
+            !picking &&
+            base_uses_texture_preview &&
+            (use_original_mesh_texture_preview || !mmuseg_texture_preview_models.empty() || !mmuseg_vertex_color_preview_models.empty());
     } while (0);
 
-    if (color_volume && !picking) {
+    if (texture_preview_base_suppressed) {
+        if (this->is_left_handed())
+            glFrontFace(GL_CCW);
+        return;
+    } else if (color_volume && !picking) {
         // when force_transparent, we need to keep the alpha
         if (force_native_color && render_color.is_transparent()) {
             for (auto &extruder_color : extruder_colors)
@@ -835,7 +849,8 @@ void GLVolume::render_mmu_texture_preview(const Transform3d &view_matrix,
                                           const std::array<float, 4> &clipping_plane,
                                           int print_volume_type,
                                           const std::array<float, 4> &print_volume_xy,
-                                          const std::array<float, 2> &print_volume_z)
+                                          const std::array<float, 2> &print_volume_z,
+                                          bool opaque)
 {
     if (picking || !printable || object_idx() < 0 || volume_idx() < 0)
         return;
@@ -923,7 +938,8 @@ void GLVolume::render_mmu_texture_preview(const Transform3d &view_matrix,
                                                this->tverts_range,
                                                print_volume_type,
                                                print_volume_xy,
-                                               print_volume_z);
+                                               print_volume_z,
+                                               opaque);
         } else {
             render_model_texture_preview_models(mmuseg_texture_preview_models,
                                                 adjusted_preview_colors(mmuseg_texture_preview_colors),
@@ -939,7 +955,8 @@ void GLVolume::render_mmu_texture_preview(const Transform3d &view_matrix,
                                                 clipping_plane,
                                                 print_volume_type,
                                                 print_volume_xy,
-                                                print_volume_z);
+                                                print_volume_z,
+                                                opaque);
         }
     }
 
@@ -956,7 +973,8 @@ void GLVolume::render_mmu_texture_preview(const Transform3d &view_matrix,
                                                  clipping_plane,
                                                  print_volume_type,
                                                  print_volume_xy,
-                                                 print_volume_z);
+                                                 print_volume_z,
+                                                 opaque);
     }
 
     if (this->is_left_handed())

@@ -63,6 +63,27 @@ struct PrimeTowerTextureRenderSettings
 
     float sample_tool_visibility(size_t tool, float u, float v) const
     {
+        return sample_tool_visibility_raw(tool, u, v);
+    }
+
+    float sample_tool_visibility(size_t tool, float u, float v, const std::vector<size_t> &normalization_tools) const
+    {
+        const float raw_visibility = sample_tool_visibility_raw(tool, u, v);
+        if (normalization_tools.empty())
+            return raw_visibility;
+
+        float max_visibility = std::clamp(raw_visibility, 0.f, 1.f);
+        for (const size_t normalization_tool : normalization_tools)
+            max_visibility = std::max(max_visibility, std::clamp(sample_tool_visibility_raw(normalization_tool, u, v), 0.f, 1.f));
+
+        return max_visibility > 1e-6f ?
+            std::clamp(raw_visibility / max_visibility, 0.f, 1.f) :
+            std::clamp(raw_visibility, 0.f, 1.f);
+    }
+
+private:
+    float sample_tool_visibility_raw(size_t tool, float u, float v) const
+    {
         if (!valid())
             return 1.f;
         u -= std::floor(u);
@@ -79,7 +100,6 @@ struct PrimeTowerTextureRenderSettings
         return sample_image_tool_visibility(tool, u, v, use_back);
     }
 
-private:
     bool image_valid(bool back) const
     {
         return back ?
@@ -413,7 +433,13 @@ public:
 
 	// Appends into internal structure m_plan containing info about the future wipe tower
 	// to be used before building begins. The entries must be added ordered in z.
-	void plan_toolchange(float z_par, float layer_height_par, unsigned int old_tool, unsigned int new_tool, float wipe_volume = 0.f, float prime_volume = 0.f);
+	void plan_toolchange(float        z_par,
+                         float        layer_height_par,
+                         unsigned int old_tool,
+                         unsigned int new_tool,
+                         float        wipe_volume = 0.f,
+                         float        prime_volume = 0.f,
+                         bool         texture_mapping_single_component_layer = false);
 
 	// Iterates through prepared m_plan, generates ToolChangeResults and appends them to "result"
 	void generate(std::vector<std::vector<ToolChangeResult>> &result);
@@ -775,6 +801,7 @@ private:
 		float depth;	// depth of the layer based on all layers above
 		float extra_spacing;
         bool  extruder_fill{true};
+        bool  texture_mapping_single_component_layer{false};
 		float toolchanges_depth() const { float sum = 0.f; for (const auto &a : tool_changes) sum += a.required_depth; return sum; }
 
 		std::vector<ToolChange> tool_changes;

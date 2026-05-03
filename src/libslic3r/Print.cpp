@@ -50,6 +50,51 @@ using namespace nlohmann;
 
 namespace Slic3r {
 
+static void append_used_physical_extruders_for_filament_id(const TextureMappingManager        &texture_mapping_manager,
+                                                           int                                 filament_id,
+                                                           size_t                              num_physical,
+                                                           const std::vector<std::string>     &filament_colours,
+                                                           std::vector<unsigned int>          &extruders)
+{
+    if (filament_id <= 0 || num_physical == 0)
+        return;
+
+    auto append_physical = [num_physical, &extruders](unsigned int physical_id) {
+        if (physical_id >= 1 && physical_id <= num_physical)
+            extruders.emplace_back(physical_id - 1);
+    };
+
+    const TextureMappingZone *zone = texture_mapping_manager.zone_from_id(unsigned(filament_id));
+    if (zone != nullptr) {
+        if (!zone->enabled || zone->deleted)
+            return;
+
+        std::vector<std::string> colors = filament_colours;
+        colors.resize(num_physical, "#FFFFFF");
+        std::vector<unsigned int> component_ids = zone->is_image_texture() ?
+            TextureMappingManager::effective_texture_component_ids(*zone, num_physical, colors) :
+            TextureMappingManager::selected_component_ids(*zone, num_physical);
+
+        component_ids.erase(std::remove_if(component_ids.begin(),
+                                           component_ids.end(),
+                                           [num_physical](unsigned int id) { return id == 0 || id > num_physical; }),
+                            component_ids.end());
+        std::sort(component_ids.begin(), component_ids.end());
+        component_ids.erase(std::unique(component_ids.begin(), component_ids.end()), component_ids.end());
+
+        if (component_ids.empty()) {
+            const unsigned int resolved = texture_mapping_manager.resolve_zone_component(unsigned(filament_id), num_physical, 0);
+            append_physical(resolved);
+        } else {
+            for (unsigned int component_id : component_ids)
+                append_physical(component_id);
+        }
+        return;
+    }
+
+    append_physical(unsigned(filament_id));
+}
+
 static std::array<float, 3> prime_tower_parse_hex_color_for_print(const std::string &hex)
 {
     auto hex_byte = [](char hi, char lo) {
@@ -601,17 +646,15 @@ std::vector<unsigned int> Print::object_extruders() const
     for (const PrintObject* object : m_objects) {
         const ModelObject* mo = object->model_object();
         const size_t num_physical = m_config.filament_colour.size();
-        auto resolve_filament_id = [this, num_physical](int filament_id) {
-            if (filament_id > 0 && m_texture_mapping_mgr.is_texture_mapping_zone_id(unsigned(filament_id)))
-                return int(m_texture_mapping_mgr.resolve_zone_component(unsigned(filament_id), num_physical, 0));
-            return filament_id;
-        };
         for (const ModelVolume* mv : mo->volumes) {
             std::vector<int> volume_extruders = mv->get_extruders();
             for (int extruder : volume_extruders) {
-                extruder = resolve_filament_id(extruder);
                 assert(extruder > 0);
-                extruders.push_back(extruder - 1);
+                append_used_physical_extruders_for_filament_id(m_texture_mapping_mgr,
+                                                               extruder,
+                                                               num_physical,
+                                                               m_config.filament_colour.values,
+                                                               extruders);
             }
         }
 
@@ -622,9 +665,11 @@ std::vector<unsigned int> Print::object_extruders() const
                 //Don't know why height range always save key "extruder" because of no change(should only save difference)...
                 //Add protection here to avoid overflow
                 auto value = layer_range.second.option("extruder")->getInt();
-                value = resolve_filament_id(value);
-                if (value > 0)
-                    extruders.push_back(value - 1);
+                append_used_physical_extruders_for_filament_id(m_texture_mapping_mgr,
+                                                               value,
+                                                               num_physical,
+                                                               m_config.filament_colour.values,
+                                                               extruders);
             }
         }
     }
@@ -680,11 +725,11 @@ std::vector<unsigned int> Print::extruders(bool conside_custom_gcode) const
             for (auto item : m_model.plates_custom_gcodes.at(m_model.curr_plate_index).gcodes) {
                 if (item.type != CustomGCode::Type::ToolChange || item.extruder <= 0)
                     continue;
-                int extruder_id = item.extruder;
-                if (m_texture_mapping_mgr.is_texture_mapping_zone_id(unsigned(extruder_id)))
-                    extruder_id = int(m_texture_mapping_mgr.resolve_zone_component(unsigned(extruder_id), num_physical, 0));
-                if (extruder_id > 0 && extruder_id <= int(num_physical))
-                    extruders.push_back((unsigned int)(extruder_id - 1));
+                append_used_physical_extruders_for_filament_id(m_texture_mapping_mgr,
+                                                               item.extruder,
+                                                               num_physical,
+                                                               m_config.filament_colour.values,
+                                                               extruders);
             }
         }
     }
@@ -3376,23 +3421,9 @@ void Print::_make_wipe_tower()
         texture.enabled = true;
         texture.generic_fallback_for_missing_channels = auto_mode;
         texture.angle_offset_deg = m_texture_mapping_global_settings.angle_offset_deg;
-        float texture_global_strength_pct = float(m_default_region_config.texture_mapping_outer_wall_gradient_global_strength.value);
-        float texture_max_line_width = float(m_default_region_config.texture_mapping_outer_wall_gradient_max_line_width.value);
-        float texture_min_line_width = float(m_default_region_config.texture_mapping_outer_wall_gradient_min_line_width.value);
-        for (const PrintRegion *region : m_print_regions) {
-            if (region == nullptr)
-                continue;
-            const PrintRegionConfig &region_config = region->config();
-            texture_global_strength_pct = std::max(texture_global_strength_pct,
-                                                   float(region_config.texture_mapping_outer_wall_gradient_global_strength.value));
-            texture_max_line_width = std::max(texture_max_line_width,
-                                              float(region_config.texture_mapping_outer_wall_gradient_max_line_width.value));
-            texture_min_line_width = std::min(texture_min_line_width,
-                                              float(region_config.texture_mapping_outer_wall_gradient_min_line_width.value));
-        }
-        texture.global_strength = std::clamp(texture_global_strength_pct / 100.f, 0.f, 1.f);
-        texture.max_line_width = std::max(0.05f, texture_max_line_width);
-        texture.min_line_width = std::max(0.05f, texture_min_line_width);
+        texture.global_strength = std::clamp(float(m_config.texture_mapping_outer_wall_gradient_global_strength.value) / 100.f, 0.f, 1.f);
+        texture.max_line_width = std::max(0.05f, float(m_config.texture_mapping_outer_wall_gradient_max_line_width.value));
+        texture.min_line_width = std::max(0.05f, float(m_config.texture_mapping_outer_wall_gradient_min_line_width.value));
         texture.image_rgba = m_texture_mapping_prime_tower_image.rgba;
         texture.image_width = m_texture_mapping_prime_tower_image.width;
         texture.image_height = m_texture_mapping_prime_tower_image.height;
@@ -3462,7 +3493,13 @@ void Print::_make_wipe_tower()
         for (auto& layer_tools : m_wipe_tower_data.tool_ordering.layer_tools()) { // for all layers
             if (!layer_tools.has_wipe_tower) continue;
             bool first_layer = &layer_tools == &m_wipe_tower_data.tool_ordering.front();
-            wipe_tower.plan_toolchange((float)layer_tools.print_z, (float)layer_tools.wipe_tower_layer_height, current_filament_id, current_filament_id);
+            wipe_tower.plan_toolchange((float) layer_tools.print_z,
+                                        (float) layer_tools.wipe_tower_layer_height,
+                                        current_filament_id,
+                                        current_filament_id,
+                                        0.f,
+                                        0.f,
+                                        layer_tools.has_texture_mapping_zone && layer_tools.extruders.size() == 1);
 
             used_filament_ids.insert(layer_tools.extruders.begin(), layer_tools.extruders.end());
 

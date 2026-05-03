@@ -137,20 +137,8 @@ static std::vector<std::string> collect_texture_mapping_outer_wall_gradient_line
     if (!has_offset_profiles)
         return {};
 
-    if (print_object.num_printing_regions() == 0)
-        return {};
-
-    float max_gradient_line_width_mm = 0.f;
-    float min_gradient_line_width_mm = std::numeric_limits<float>::max();
-    for (size_t region_id = 0; region_id < print_object.num_printing_regions(); ++region_id) {
-        const PrintRegionConfig &region_cfg = print_object.printing_region(region_id).config();
-        max_gradient_line_width_mm = std::max(max_gradient_line_width_mm,
-                                              float(region_cfg.texture_mapping_outer_wall_gradient_max_line_width.value));
-        min_gradient_line_width_mm = std::min(min_gradient_line_width_mm,
-                                              float(region_cfg.texture_mapping_outer_wall_gradient_min_line_width.value));
-    }
-    max_gradient_line_width_mm = std::max(0.f, max_gradient_line_width_mm);
-    min_gradient_line_width_mm = std::max(0.f, min_gradient_line_width_mm);
+    const float max_gradient_line_width_mm = std::max(0.f, float(print->config().texture_mapping_outer_wall_gradient_max_line_width.value));
+    const float min_gradient_line_width_mm = std::max(0.f, float(print->config().texture_mapping_outer_wall_gradient_min_line_width.value));
     std::vector<std::string> warnings;
     warnings.reserve(2);
 

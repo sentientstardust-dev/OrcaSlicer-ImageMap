@@ -1367,7 +1367,7 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                     unsigned(std::max(0, config.wall_filament.value)) :
                     unsigned(color_idx);
                 if (filament_id_uses_texture_mapping(print, queried_filament_id))
-                    outer_wall_line_width = std::max(0.05, config.texture_mapping_outer_wall_gradient_max_line_width.value);
+                    outer_wall_line_width = std::max(0.05, print.config().texture_mapping_outer_wall_gradient_max_line_width.value);
                 out.extrusion_width     = std::max<float>(out.extrusion_width, outer_wall_line_width);
                 out.top_shell_layers    = std::max<int>(out.top_shell_layers, config.top_shell_layers);
                 out.bottom_shell_layers = std::max<int>(out.bottom_shell_layers, config.bottom_shell_layers);

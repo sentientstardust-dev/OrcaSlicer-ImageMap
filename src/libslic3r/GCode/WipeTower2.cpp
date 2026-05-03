@@ -1235,6 +1235,14 @@ static float prime_tower_flow_scale_for_width(float reference_width, float targe
     return std::clamp(target_area / reference_area, 0.05f, 4.f);
 }
 
+static void prime_tower_append_texture_tool(std::vector<size_t> &tools, size_t tool, size_t tool_count)
+{
+    if (tool >= tool_count)
+        return;
+    if (std::find(tools.begin(), tools.end(), tool) == tools.end())
+        tools.emplace_back(tool);
+}
+
 static bool prime_tower_path_explicitly_closed(const std::vector<Vec2f>& points)
 {
     return points.size() > 2 && (points.front() - points.back()).norm() <= EPSILON;
@@ -1384,7 +1392,8 @@ static void prime_tower_textured_path(WipeTowerWriter2& writer,
                                       float reference_width,
                                       float layer_height,
                                       float print_z,
-                                      size_t current_tool)
+                                      size_t current_tool,
+                                      const std::vector<size_t>& normalization_tools)
 {
     if (!texture.valid() || points.size() < 2)
         return;
@@ -1420,6 +1429,8 @@ static void prime_tower_textured_path(WipeTowerWriter2& writer,
     float travelled = 0.f;
     bool have_shifted_pos = false;
     Vec2f shifted_pos = writer.pos();
+    float last_analyzer_width = reference_width;
+    bool analyzer_width_changed = false;
     for (size_t i = 0; i < segment_count; ++i) {
         const size_t next_i = i + 1 == texture_points.size() ? 0 : i + 1;
         const Vec2f a = texture_points[i];
@@ -1441,7 +1452,7 @@ static void prime_tower_textured_path(WipeTowerWriter2& writer,
             const float t1 = float(step + 1) / float(steps);
             const float mid_distance = travelled + sample_len * (0.5f * (t0 + t1));
             const float u = (mid_distance - texture_path.anchor_distance) / total_length;
-            const float visibility = texture.sample_tool_visibility(current_tool, u, v);
+            const float visibility = texture.sample_tool_visibility(current_tool, u, v, normalization_tools);
             const float target_width = base_width - (1.f - visibility) * width_range;
             const float flow_scale = prime_tower_flow_scale_for_width(reference_width, target_width, layer_height);
             const float centerline_shift = 0.5f * (base_width - reference_width) + 0.5f * (base_width - target_width);
@@ -1452,11 +1463,18 @@ static void prime_tower_textured_path(WipeTowerWriter2& writer,
                 shifted_pos = p0;
                 have_shifted_pos = true;
             }
+            if (std::abs(target_width - last_analyzer_width) > 0.001f) {
+                writer.change_analyzer_line_width(target_width);
+                last_analyzer_width = target_width;
+                analyzer_width_changed = true;
+            }
             writer.extrude_explicit(p1, (p1 - p0).norm() * extrusion_flow * flow_scale, feedrate, true);
             shifted_pos = p1;
         }
         travelled += sample_len;
     }
+    if (analyzer_width_changed && std::abs(last_analyzer_width - reference_width) > 0.001f)
+        writer.change_analyzer_line_width(reference_width);
 }
 
 static void prime_tower_textured_closed_path(WipeTowerWriter2& writer,
@@ -1468,10 +1486,22 @@ static void prime_tower_textured_closed_path(WipeTowerWriter2& writer,
                                              float reference_width,
                                              float layer_height,
                                              float print_z,
-                                             size_t current_tool)
+                                             size_t current_tool,
+                                             const std::vector<size_t>& normalization_tools)
 {
     prime_tower_textured_path(
-        writer, texture, points, true, texture_center, feedrate, extrusion_flow, reference_width, layer_height, print_z, current_tool);
+        writer,
+        texture,
+        points,
+        true,
+        texture_center,
+        feedrate,
+        extrusion_flow,
+        reference_width,
+        layer_height,
+        print_z,
+        current_tool,
+        normalization_tools);
 }
 
 static void prime_tower_textured_open_path(WipeTowerWriter2& writer,
@@ -1483,10 +1513,22 @@ static void prime_tower_textured_open_path(WipeTowerWriter2& writer,
                                            float reference_width,
                                            float layer_height,
                                            float print_z,
-                                           size_t current_tool)
+                                           size_t current_tool,
+                                           const std::vector<size_t>& normalization_tools)
 {
     prime_tower_textured_path(
-        writer, texture, points, false, texture_center, feedrate, extrusion_flow, reference_width, layer_height, print_z, current_tool);
+        writer,
+        texture,
+        points,
+        false,
+        texture_center,
+        feedrate,
+        extrusion_flow,
+        reference_width,
+        layer_height,
+        print_z,
+        current_tool,
+        normalization_tools);
 }
 
 
@@ -2804,6 +2846,15 @@ Polygon WipeTower2::generate_support_rib_wall(WipeTowerWriter2&                 
     }
     bool textured_path_written = false;
     if (m_prime_tower_texture.valid() && result_wall.size() == 1 && !result_wall.front().points.empty()) {
+        std::vector<size_t> texture_normalization_tools;
+        const size_t texture_tool_count = m_prime_tower_texture.filament_colours.size();
+        prime_tower_append_texture_tool(texture_normalization_tools, m_current_tool, texture_tool_count);
+        if (m_layer_info != m_plan.end()) {
+            for (const WipeTowerInfo::ToolChange &tool_change : m_layer_info->tool_changes) {
+                prime_tower_append_texture_tool(texture_normalization_tools, tool_change.old_tool, texture_tool_count);
+                prime_tower_append_texture_tool(texture_normalization_tools, tool_change.new_tool, texture_tool_count);
+            }
+        }
         const bool closed_texture_path = !rib_wall && !skip_points;
         std::vector<Vec2f> points;
         points.reserve(result_wall.front().points.size());
@@ -2823,7 +2874,8 @@ Polygon WipeTower2::generate_support_rib_wall(WipeTowerWriter2&                 
                                                  m_perimeter_width,
                                                  m_layer_height,
                                                  m_z_pos,
-                                                 m_current_tool);
+                                                 m_current_tool,
+                                                 texture_normalization_tools);
             else
                 prime_tower_textured_open_path(writer,
                                                m_prime_tower_texture,
@@ -2834,7 +2886,8 @@ Polygon WipeTower2::generate_support_rib_wall(WipeTowerWriter2&                 
                                                m_perimeter_width,
                                                m_layer_height,
                                                m_z_pos,
-                                               m_current_tool);
+                                               m_current_tool,
+                                               texture_normalization_tools);
             textured_path_written = true;
         }
     }
@@ -2933,6 +2986,15 @@ Polygon WipeTower2::generate_support_cone_wall(
         }
     }
     if (m_prime_tower_texture.valid() && polylines.empty()) {
+        std::vector<size_t> texture_normalization_tools;
+        const size_t texture_tool_count = m_prime_tower_texture.filament_colours.size();
+        prime_tower_append_texture_tool(texture_normalization_tools, m_current_tool, texture_tool_count);
+        if (m_layer_info != m_plan.end()) {
+            for (const WipeTowerInfo::ToolChange &tool_change : m_layer_info->tool_changes) {
+                prime_tower_append_texture_tool(texture_normalization_tools, tool_change.old_tool, texture_tool_count);
+                prime_tower_append_texture_tool(texture_normalization_tools, tool_change.new_tool, texture_tool_count);
+            }
+        }
         std::vector<Vec2f> ordered;
         ordered.reserve(pts.size());
         for (size_t j = 0; j < pts.size(); ++j)
@@ -2947,7 +3009,8 @@ Polygon WipeTower2::generate_support_cone_wall(
                                          m_perimeter_width,
                                          m_layer_height,
                                          m_z_pos,
-                                         m_current_tool);
+                                         m_current_tool,
+                                         texture_normalization_tools);
         return poly;
     }
 

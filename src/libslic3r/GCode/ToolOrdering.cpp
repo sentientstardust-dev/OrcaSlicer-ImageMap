@@ -352,6 +352,8 @@ bool ToolOrdering::insert_wipe_tower_extruder()
     bool changed = false;
     const unsigned int wipe_extruder = (unsigned int)(m_print_config_ptr->wipe_tower_filament - 1);
     for (LayerTools &lt : m_layer_tools) {
+        if (lt.has_texture_mapping_zone && lt.extruders.size() <= 1)
+            continue;
         if (lt.wipe_tower_partitions > 0) {
             if (std::find(lt.extruders.begin(), lt.extruders.end(), wipe_extruder) == lt.extruders.end()) {
                 lt.extruders.emplace_back(wipe_extruder);
@@ -718,6 +720,11 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
 
         // Store the current extruder override (set to zero if no overriden), so that layer_tools.wiping_extrusions().is_overridable_and_mark() will use it.
         layer_tools.extruder_override = extruder_override;
+        auto append_layer_filament = [&layer_tools](unsigned int filament_id) {
+            if (layer_tools.texture_mapping_manager != nullptr && layer_tools.texture_mapping_manager->is_texture_mapping_zone_id(filament_id))
+                layer_tools.has_texture_mapping_zone = true;
+            layer_tools.extruders.emplace_back(layer_tools.resolve_filament_id(filament_id));
+        };
 
         // What extruders are required to print this object layer?
         for (const LayerRegion *layerm : layer->regions()) {
@@ -735,7 +742,7 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
 
                 if (something_nonoverriddable){
                     const unsigned int filament_id = (extruder_override == 0) ? region.config().wall_filament.value : extruder_override;
-                    layer_tools.extruders.emplace_back(layer_tools.resolve_filament_id(filament_id));
+                    append_layer_filament(filament_id);
                     if (layerCount == 0) {
                         firstLayerExtruders.emplace_back(layer_tools.resolve_filament_id(filament_id));
                     }
@@ -765,11 +772,11 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
             if (something_nonoverriddable || !m_print_config_ptr) {
                 if (extruder_override == 0) {
 	                if (has_solid_infill)
-	                    layer_tools.extruders.emplace_back(layer_tools.resolve_filament_id(region.config().solid_infill_filament));
+	                    append_layer_filament(region.config().solid_infill_filament);
 	                if (has_infill)
-	                    layer_tools.extruders.emplace_back(layer_tools.resolve_filament_id(region.config().sparse_infill_filament));
+	                    append_layer_filament(region.config().sparse_infill_filament);
                 } else if (has_solid_infill || has_infill)
-                    layer_tools.extruders.emplace_back(layer_tools.resolve_filament_id(extruder_override));
+                    append_layer_filament(extruder_override);
             }
             if (has_solid_infill || has_infill)
                 layer_tools.has_object = true;

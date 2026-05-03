@@ -10855,6 +10855,14 @@ void Plater::priv::set_current_panel(wxPanel* panel, bool no_slice)
 
             if (!no_slice && !this->model.objects.empty() && !export_in_progress && model_fits && current_has_print_instances)
             {
+                if (current_plate->is_slice_result_valid() && this->background_process.finished()) {
+                    if (model_fits)
+                        this->preview->reload_print();
+                    else
+                        this->update_fff_scene_only_shells();
+                    preview->set_as_dirty();
+                    return;
+                }
                 //if already running in background, not relice here
                 //BBS: add more judge for slicing
                 if (!this->background_process.running() && !this->m_is_slicing)

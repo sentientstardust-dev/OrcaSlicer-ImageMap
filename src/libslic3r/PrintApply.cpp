@@ -1,9 +1,11 @@
 #include "ClipperUtils.hpp"
 #include "Model.hpp"
 #include "Print.hpp"
+#include "TextureMapping.hpp"
 
 #include <boost/log/trivial.hpp>
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <cfloat>
 
 namespace Slic3r {
@@ -1175,6 +1177,96 @@ static PrintObjectRegions* generate_print_object_regions(
     return out.release();
 }
 
+static inline void append_unique_painted_extruder(std::vector<unsigned int> &painting_extruders,
+                                                  unsigned int                extruder_id,
+                                                  size_t                      num_physical_extruders)
+{
+    if (extruder_id < 1 || extruder_id > num_physical_extruders)
+        return;
+    if (std::find(painting_extruders.begin(), painting_extruders.end(), extruder_id) == painting_extruders.end())
+        painting_extruders.emplace_back(extruder_id);
+}
+
+static void append_texture_mapping_component_extruders(const TextureMappingManager   &texture_mgr,
+                                                       unsigned int                   state_id,
+                                                       size_t                         num_physical_extruders,
+                                                       const std::vector<std::string> &filament_colours,
+                                                       std::vector<unsigned int>     &painting_extruders)
+{
+    const TextureMappingZone *zone = texture_mgr.zone_from_id(state_id);
+    if (zone == nullptr || !zone->enabled || zone->deleted)
+        return;
+
+    const std::vector<unsigned int> component_ids = zone->is_image_texture() ?
+        TextureMappingManager::effective_texture_component_ids(*zone, num_physical_extruders, filament_colours) :
+        TextureMappingManager::selected_component_ids(*zone, num_physical_extruders);
+    for (const unsigned int id : component_ids)
+        append_unique_painted_extruder(painting_extruders, id, num_physical_extruders);
+}
+
+static void append_used_filament_from_config_id(const TextureMappingManager        &texture_mgr,
+                                                int                                 filament_id,
+                                                size_t                              num_physical_extruders,
+                                                const std::vector<std::string>     &filament_colours,
+                                                std::vector<unsigned int>          &used_filaments)
+{
+    if (filament_id <= 0 || num_physical_extruders == 0)
+        return;
+
+    auto append_physical = [num_physical_extruders, &used_filaments](unsigned int physical_id) {
+        if (physical_id >= 1 && physical_id <= num_physical_extruders)
+            used_filaments.emplace_back(physical_id - 1);
+    };
+
+    const TextureMappingZone *zone = texture_mgr.zone_from_id(unsigned(filament_id));
+    if (zone != nullptr) {
+        if (!zone->enabled || zone->deleted)
+            return;
+
+        std::vector<unsigned int> component_ids = zone->is_image_texture() ?
+            TextureMappingManager::effective_texture_component_ids(*zone, num_physical_extruders, filament_colours) :
+            TextureMappingManager::selected_component_ids(*zone, num_physical_extruders);
+        component_ids.erase(std::remove_if(component_ids.begin(),
+                                           component_ids.end(),
+                                           [num_physical_extruders](unsigned int id) { return id == 0 || id > num_physical_extruders; }),
+                            component_ids.end());
+        std::sort(component_ids.begin(), component_ids.end());
+        component_ids.erase(std::unique(component_ids.begin(), component_ids.end()), component_ids.end());
+
+        if (component_ids.empty()) {
+            const unsigned int resolved = texture_mgr.resolve_zone_component(unsigned(filament_id), num_physical_extruders, 0);
+            append_physical(resolved);
+        } else {
+            for (unsigned int component_id : component_ids)
+                append_physical(component_id);
+        }
+        return;
+    }
+
+    append_physical(unsigned(filament_id));
+}
+
+static void append_model_used_filaments_for_normalization(const Model                       &model,
+                                                          const TextureMappingManager       &texture_mgr,
+                                                          size_t                             num_physical_extruders,
+                                                          const std::vector<std::string>    &filament_colours,
+                                                          std::vector<unsigned int>         &used_filaments)
+{
+    for (const ModelObject *object : model.objects) {
+        for (const ModelVolume *volume : object->volumes)
+            for (int extruder : volume->get_extruders())
+                append_used_filament_from_config_id(texture_mgr, extruder, num_physical_extruders, filament_colours, used_filaments);
+
+        for (const auto &layer_range : object->layer_config_ranges)
+            if (layer_range.second.has("extruder"))
+                append_used_filament_from_config_id(texture_mgr,
+                                                    layer_range.second.option("extruder")->getInt(),
+                                                    num_physical_extruders,
+                                                    filament_colours,
+                                                    used_filaments);
+    }
+}
+
 Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_config)
 {
 #ifdef _DEBUG
@@ -1192,6 +1284,23 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 
     // BBS
     std::vector <unsigned int> used_filaments = this->extruders(true);
+    std::vector<std::string> normalization_filament_colours;
+    if (const ConfigOptionStrings *color_opt = new_full_config.option<ConfigOptionStrings>("filament_colour", false); color_opt != nullptr)
+        normalization_filament_colours = color_opt->values;
+    else
+        normalization_filament_colours = m_config.filament_colour.values;
+    if (const ConfigOptionFloats *diameter_opt = new_full_config.option<ConfigOptionFloats>("filament_diameter", false); diameter_opt != nullptr)
+        normalization_filament_colours.resize(std::max(normalization_filament_colours.size(), diameter_opt->values.size()), "#FFFFFF");
+
+    TextureMappingManager normalization_texture_mgr;
+    normalization_texture_mgr.load_entries(new_full_config.opt_string("texture_mapping_definitions"), normalization_filament_colours);
+    append_model_used_filaments_for_normalization(model,
+                                                  normalization_texture_mgr,
+                                                  normalization_filament_colours.size(),
+                                                  normalization_filament_colours,
+                                                  used_filaments);
+    std::sort(used_filaments.begin(), used_filaments.end());
+    used_filaments.erase(std::unique(used_filaments.begin(), used_filaments.end()), used_filaments.end());
     std::unordered_set <unsigned int> used_filament_set(used_filaments.begin(), used_filaments.end());
 
     //new_full_config.normalize_fdm(used_filaments);
@@ -1252,13 +1361,16 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 
     //BBS: process the filament_map related logic
     std::unordered_set<std::string> print_diff_set(print_diff.begin(), print_diff.end());
+    auto erase_full_config_diff = [&full_config_diff](const char *key) {
+        full_config_diff.erase(std::remove(full_config_diff.begin(), full_config_diff.end(), key), full_config_diff.end());
+    };
     if (print_diff_set.find("filament_map_mode") == print_diff_set.end())
     {
         FilamentMapMode map_mode = new_full_config.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode", true)->value;
         if (map_mode < fmmManual) {
             if (print_diff_set.find("filament_map") != print_diff_set.end()) {
                 print_diff_set.erase("filament_map");
-                //full_config_diff.erase("filament_map");
+                erase_full_config_diff("filament_map");
                 ConfigOptionInts* old_opt = m_full_print_config.option<ConfigOptionInts>("filament_map", true);
                 ConfigOptionInts* new_opt = new_full_config.option<ConfigOptionInts>("filament_map", true);
                 old_opt->set(new_opt);
@@ -1283,8 +1395,10 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                         break;
                     }
                 }
-                if (same_map)
+                if (same_map) {
                     print_diff_set.erase("filament_map");
+                    erase_full_config_diff("filament_map");
+                }
             }
         }
         if (print_diff_set.size() != print_diff.size())
@@ -1346,6 +1460,11 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             num_extruders_changed  = true;
         }
     }
+
+    std::vector<std::string> physical_filament_colors = m_config.filament_colour.values;
+    physical_filament_colors.resize(num_extruders, "#FFFFFF");
+    m_texture_mapping_mgr.load_entries(new_full_config.opt_string("texture_mapping_definitions"), physical_filament_colors);
+    const size_t num_total_filaments = m_texture_mapping_mgr.total_filaments(num_extruders);
 
     ModelObjectStatusDB model_object_status_db;
 
@@ -1535,7 +1654,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 			if (object_config_changed)
 				model_object.config.assign_config(model_object_new.config);
             if (! object_diff.empty() || object_config_changed || num_extruders_changed ) {
-                PrintObjectConfig new_config = PrintObject::object_config_from_model_object(m_default_object_config, model_object, num_extruders );
+                PrintObjectConfig new_config = PrintObject::object_config_from_model_object(m_default_object_config, model_object, num_total_filaments);
                 for (const PrintObjectStatus &print_object_status : print_object_status_db.get_range(model_object)) {
                     t_config_option_keys diff = print_object_status.print_object->config().diff(new_config);
                     if (! diff.empty()) {
@@ -1601,10 +1720,10 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             // Generate a list of trafos and XY offsets for instances of a ModelObject
             // Producing the config for PrintObject on demand, caching it at print_object_last.
             const PrintObject *print_object_last = nullptr;
-            auto print_object_apply_config = [this, &print_object_last, model_object, num_extruders ](PrintObject *print_object) {
+            auto print_object_apply_config = [this, &print_object_last, model_object, num_total_filaments](PrintObject *print_object) {
                 print_object->config_apply(print_object_last ?
                     print_object_last->config() :
-                    PrintObject::object_config_from_model_object(m_default_object_config, *model_object, num_extruders ));
+                    PrintObject::object_config_from_model_object(m_default_object_config, *model_object, num_total_filaments));
                 print_object_last = print_object;
             };
             if (old.empty()) {
@@ -1678,7 +1797,15 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     }
 
     //BBS: check the config again
-    int new_used_filaments = this->extruders(true).size();
+    std::vector<unsigned int> new_used_filaments_values = this->extruders(true);
+    append_model_used_filaments_for_normalization(model,
+                                                  normalization_texture_mgr,
+                                                  normalization_filament_colours.size(),
+                                                  normalization_filament_colours,
+                                                  new_used_filaments_values);
+    std::sort(new_used_filaments_values.begin(), new_used_filaments_values.end());
+    new_used_filaments_values.erase(std::unique(new_used_filaments_values.begin(), new_used_filaments_values.end()), new_used_filaments_values.end());
+    int new_used_filaments = int(new_used_filaments_values.size());
     t_config_option_keys new_changed_keys = new_full_config.normalize_fdm_2(objects().size(), new_used_filaments);
     if (new_changed_keys.size() > 0) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", got new_changed_keys, size=%1%")%new_changed_keys.size();
@@ -1735,7 +1862,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
         std::vector<unsigned int> painting_extruders;
         if (const auto &volumes = print_object.model_object()->volumes;
             num_extruders > 1 &&
-            std::find_if(volumes.begin(), volumes.end(), [](const ModelVolume *v) { return ! v->mmu_segmentation_facets.empty(); }) != volumes.end()) {
+            std::find_if(volumes.begin(), volumes.end(), [](const ModelVolume *v) { return !v->mmu_segmentation_facets.empty(); }) != volumes.end()) {
 
             std::array<bool, static_cast<size_t>(EnforcerBlockerType::ExtruderMax) + 1> used_facet_states{};
             for (const ModelVolume *volume : volumes) {
@@ -1747,9 +1874,17 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             }
 
             for (size_t state_idx = static_cast<size_t>(EnforcerBlockerType::Extruder1); state_idx < used_facet_states.size(); ++state_idx) {
-                if (used_facet_states[state_idx])
-                    painting_extruders.emplace_back(state_idx);
+                if (!used_facet_states[state_idx] || state_idx > num_total_filaments)
+                    continue;
+                painting_extruders.emplace_back(state_idx);
+                append_texture_mapping_component_extruders(m_texture_mapping_mgr,
+                                                           static_cast<unsigned int>(state_idx),
+                                                           num_extruders,
+                                                           physical_filament_colors,
+                                                           painting_extruders);
             }
+            std::sort(painting_extruders.begin(), painting_extruders.end());
+            painting_extruders.erase(std::unique(painting_extruders.begin(), painting_extruders.end()), painting_extruders.end());
         }
         if (model_object_status.print_object_regions_status == ModelObjectStatus::PrintObjectRegionsStatus::Valid) {
             // Verify that the trafo for regions & volume bounding boxes thus for regions is still applicable.
@@ -1767,7 +1902,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                 verify_update_print_object_regions(
                     print_object.model_object()->volumes,
                     m_default_region_config,
-                    num_extruders,
+                    num_total_filaments,
                     *print_object_regions,
                     [it_print_object, it_print_object_end, &update_apply_status](const PrintRegionConfig &old_config, const PrintRegionConfig &new_config, const t_config_option_keys &diff_keys) {
                         for (auto it = it_print_object; it != it_print_object_end; ++it)
@@ -1792,7 +1927,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                 LayerRanges(print_object.model_object()->layer_config_ranges),
                 m_default_region_config,
                 model_object_status.print_instances.front().trafo,
-                num_extruders ,
+                num_total_filaments,
                 print_object.is_mm_painted() ? 0.f : float(print_object.config().xy_contour_compensation.value),
                 painting_extruders,
                 print_object.is_fuzzy_skin_painted());

@@ -151,6 +151,7 @@ public:
     int                         layer_index = 0;
     size_t                      num_physical_filaments = 0;
     const TextureMappingManager *texture_mapping_manager = nullptr;
+    bool                        has_texture_mapping_zone = false;
     bool 						has_object = false;
     bool						has_support = false;
     // Zero based extruder IDs, ordered to minimize tool switches.

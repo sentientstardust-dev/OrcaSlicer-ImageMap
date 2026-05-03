@@ -6276,6 +6276,8 @@ void GLCanvas3D::render_thumbnail_internal(ThumbnailData& thumbnail_data, const 
         shader->start_using();
         shader->set_uniform("emission_factor", 0.1f);
         shader->set_uniform("ban_light", ban_light);
+        const bool render_texture_previews = !ban_light && &model_objects == &GUI::wxGetApp().model().objects;
+        std::vector<GLVolume*> texture_preview_volumes;
         for (GLVolume* vol : visible_volumes) {
             //BBS set render color for thumbnails
             curr_color = vol->color;
@@ -6302,10 +6304,28 @@ void GLCanvas3D::render_thumbnail_internal(ThumbnailData& thumbnail_data, const 
             shader->set_uniform("projection_matrix", projection_matrix);
             const Matrix3d view_normal_matrix = view_matrix.matrix().block(0, 0, 3, 3) * model_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
             shader->set_uniform("view_normal_matrix", view_normal_matrix);
-            vol->simple_render(shader,  model_objects, extruder_colors, ban_light);
+            const bool render_model_texture_preview =
+                render_texture_previews && vol->object_idx() >= 0 && vol->volume_idx() >= 0 && !vol->is_wipe_tower &&
+                !vol->is_modifier && !vol->is_extrusion_path;
+            vol->simple_render(shader, model_objects, extruder_colors, ban_light, render_model_texture_preview);
+            if (render_model_texture_preview)
+                texture_preview_volumes.emplace_back(vol);
             vol->is_active = is_active;
         }
         shader->stop_using();
+        if (!texture_preview_volumes.empty()) {
+            const std::array<float, 2> z_range = { -FLT_MAX, FLT_MAX };
+            const std::array<float, 4> clipping_plane = { 0.f, 0.f, 0.f, 0.f };
+            for (GLVolume *vol : texture_preview_volumes)
+                vol->render_mmu_texture_preview(view_matrix,
+                                                projection_matrix,
+                                                z_range,
+                                                clipping_plane,
+                                                -1,
+                                                { 0.f, 0.f, 0.f, 0.f },
+                                                { 0.f, 0.f },
+                                                true);
+        }
     }
 
     glsafe(::glDisable(GL_DEPTH_TEST));

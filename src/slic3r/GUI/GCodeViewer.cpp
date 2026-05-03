@@ -1134,15 +1134,13 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
     // release gpu memory, if used
     reset();
 
-    //BBS: add mutex for protection of gcode result
-    wxGetApp().plater()->suppress_background_process(true);
+    SuppressBackgroundProcessingUpdate background_update_guard;
     gcode_result.lock();
     //BBS: add safe check
     if (gcode_result.moves.size() == 0) {
         //result cleaned before slicing ,should return here
         BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": gcode result reset before, return directly!");
         gcode_result.unlock();
-        wxGetApp().plater()->schedule_background_process();
         return;
     }
 
@@ -1440,7 +1438,6 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
     filament_printable_reuslt = gcode_result.filament_printable_reuslt;
     //BBS: add mutex for protection of gcode result
     gcode_result.unlock();
-    wxGetApp().plater()->schedule_background_process();
 }
 
 void GCodeViewer::load_as_preview(libvgcode::GCodeInputData&& data)
@@ -4515,4 +4512,3 @@ void GCodeViewer::render_slider(int canvas_width, int canvas_height) {
 
 } // namespace GUI
 } // namespace Slic3r
-

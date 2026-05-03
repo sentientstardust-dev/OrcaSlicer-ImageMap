@@ -1118,9 +1118,6 @@ PRINT_CONFIG_CLASS_DEFINE(
     // Detect bridging perimeters
     ((ConfigOptionBool, detect_overhang_wall))
     ((ConfigOptionInt, wall_filament))
-    ((ConfigOptionFloat, texture_mapping_outer_wall_gradient_global_strength))
-    ((ConfigOptionFloat, texture_mapping_outer_wall_gradient_max_line_width))
-    ((ConfigOptionFloat, texture_mapping_outer_wall_gradient_min_line_width))
     ((ConfigOptionFloatOrPercent, inner_wall_line_width))
     ((ConfigOptionFloat, inner_wall_speed))
     // Total number of perimeters.
@@ -1493,6 +1490,9 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     ((ConfigOptionBool,               ooze_prevention))
     ((ConfigOptionString,             filename_format))
     ((ConfigOptionStrings,            post_process))
+    ((ConfigOptionFloat,              texture_mapping_outer_wall_gradient_global_strength))
+    ((ConfigOptionFloat,              texture_mapping_outer_wall_gradient_max_line_width))
+    ((ConfigOptionFloat,              texture_mapping_outer_wall_gradient_min_line_width))
     ((ConfigOptionString,             printer_model))
     ((ConfigOptionFloat,              resolution))
     ((ConfigOptionFloats,             retraction_minimum_travel))

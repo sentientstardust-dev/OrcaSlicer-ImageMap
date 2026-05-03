@@ -2,6 +2,8 @@
 #include "Print.hpp"
 #include "TextureMapping.hpp"
 
+#include <algorithm>
+
 namespace Slic3r {
 
 static bool filament_id_uses_texture_mapping(const Print &print, unsigned int filament_id)
@@ -15,6 +17,53 @@ static bool filament_id_uses_texture_mapping(const Print &print, unsigned int fi
 
     const TextureMappingZone *zone = print.texture_mapping_manager().zone_from_id(filament_id);
     return zone != nullptr && zone->enabled && !zone->deleted && zone->is_image_texture();
+}
+
+static void append_used_physical_extruders_for_filament_id(const Print                  &print,
+                                                           int                           filament_id,
+                                                           std::vector<unsigned int>    &object_extruders)
+{
+    if (filament_id <= 0)
+        return;
+
+    const size_t num_physical = print.config().filament_colour.size();
+    if (num_physical == 0)
+        return;
+
+    auto append_physical = [num_physical, &object_extruders](unsigned int physical_id) {
+        if (physical_id >= 1 && physical_id <= num_physical)
+            object_extruders.emplace_back(physical_id - 1);
+    };
+
+    const TextureMappingZone *zone = print.texture_mapping_manager().zone_from_id(unsigned(filament_id));
+    if (zone != nullptr) {
+        if (!zone->enabled || zone->deleted)
+            return;
+
+        std::vector<std::string> colors = print.config().filament_colour.values;
+        colors.resize(num_physical, "#FFFFFF");
+        std::vector<unsigned int> component_ids = zone->is_image_texture() ?
+            TextureMappingManager::effective_texture_component_ids(*zone, num_physical, colors) :
+            TextureMappingManager::selected_component_ids(*zone, num_physical);
+
+        component_ids.erase(std::remove_if(component_ids.begin(),
+                                           component_ids.end(),
+                                           [num_physical](unsigned int id) { return id == 0 || id > num_physical; }),
+                            component_ids.end());
+        std::sort(component_ids.begin(), component_ids.end());
+        component_ids.erase(std::unique(component_ids.begin(), component_ids.end()), component_ids.end());
+
+        if (component_ids.empty()) {
+            const unsigned int resolved = print.texture_mapping_manager().resolve_zone_component(unsigned(filament_id), num_physical, 0);
+            append_physical(resolved);
+        } else {
+            for (unsigned int component_id : component_ids)
+                append_physical(component_id);
+        }
+        return;
+    }
+
+    append_physical(unsigned(filament_id));
 }
 
 // 1-based extruder identifier for this region and role.
@@ -41,7 +90,7 @@ Flow PrintRegion::flow(const PrintObject &object, FlowRole role, double layer_he
     if (role == frExternalPerimeter &&
         filament_id_uses_texture_mapping(*object.print(), unsigned(std::max(0, m_config.wall_filament.value)))) {
         config_width = ConfigOptionFloatOrPercent(
-            std::max(0.05, m_config.texture_mapping_outer_wall_gradient_max_line_width.value),
+            std::max(0.05, print_config.texture_mapping_outer_wall_gradient_max_line_width.value),
             false);
     } else if (first_layer && print_config.initial_layer_line_width.value > 0) {
         config_width = print_config.initial_layer_line_width;
@@ -108,17 +157,12 @@ void PrintRegion::collect_object_printing_extruders(const Print &print, std::vec
     assert(this->config().sparse_infill_filament <= num_extruders || print.texture_mapping_manager().is_texture_mapping_zone_id(this->config().sparse_infill_filament));
     assert(this->config().solid_infill_filament <= num_extruders || print.texture_mapping_manager().is_texture_mapping_zone_id(this->config().solid_infill_filament));
 #endif
-    PrintRegionConfig config = this->config();
-    const size_t num_physical = print.config().filament_colour.size();
-    auto resolve_filament_id = [&print, num_physical](int filament_id) {
-        if (filament_id > 0 && print.texture_mapping_manager().is_texture_mapping_zone_id(unsigned(filament_id)))
-            return int(print.texture_mapping_manager().resolve_zone_component(unsigned(filament_id), num_physical, 0));
-        return filament_id;
-    };
-    config.wall_filament.value = resolve_filament_id(config.wall_filament.value);
-    config.sparse_infill_filament.value = resolve_filament_id(config.sparse_infill_filament.value);
-    config.solid_infill_filament.value = resolve_filament_id(config.solid_infill_filament.value);
-    collect_object_printing_extruders(print.config(), config, print.has_brim(), object_extruders);
+    if (this->config().wall_loops.value > 0 || print.has_brim())
+        append_used_physical_extruders_for_filament_id(print, this->config().wall_filament.value, object_extruders);
+    if (this->config().sparse_infill_density.value > 0)
+        append_used_physical_extruders_for_filament_id(print, this->config().sparse_infill_filament.value, object_extruders);
+    if (this->config().top_shell_layers.value > 0 || this->config().bottom_shell_layers.value > 0)
+        append_used_physical_extruders_for_filament_id(print, this->config().solid_infill_filament.value, object_extruders);
 }
 
 }
