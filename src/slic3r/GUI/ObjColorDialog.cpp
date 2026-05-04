@@ -189,6 +189,8 @@ ObjColorPanel::ObjColorPanel(wxWindow *parent, Slic3r::ObjDialogInOut &in_out, c
     for (const std::string& color : extruder_colours) {
         m_colours.push_back(wxColor(color));
     }
+    if (m_colours.empty())
+        m_colours.push_back(wxColour("#FFFFFF"));
     //deal input_colors
     m_input_colors_size = in_out.input_colors.size();
     for (size_t i = 0; i < in_out.input_colors.size(); i++) {
@@ -545,7 +547,6 @@ std::string ObjColorPanel::get_color_str(const wxColour &color) {
 
 ComboBox *ObjColorPanel::CreateEditorCtrl(wxWindow *parent, int id) // wxRect labelRect,, const wxVariant &value
 {
-    std::vector<wxBitmap *> icons = get_extruder_color_icons();
     const double            em          = Slic3r::GUI::wxGetApp().em_unit();
     bool                    thin_icon   = false;
     const int               icon_width  = lround((thin_icon ? 2 : 4.4) * em);
@@ -553,7 +554,19 @@ ComboBox *ObjColorPanel::CreateEditorCtrl(wxWindow *parent, int id) // wxRect la
     m_combox_icon_width                 = icon_width;
     m_combox_icon_height                = icon_height;
 
-    icons.insert(icons.begin(), get_extruder_color_icon(g_undefined_color_in_obj.GetAsString(wxC2S_HTML_SYNTAX).ToStdString(), std::to_string(-1), icon_width, icon_height));
+    std::vector<wxBitmap *> icons;
+    icons.reserve(m_colours.size() + 1);
+    icons.insert(icons.begin(),
+                 get_extruder_color_icon(g_undefined_color_in_obj.GetAsString(wxC2S_HTML_SYNTAX).ToStdString(),
+                                         std::to_string(-1),
+                                         icon_width,
+                                         icon_height));
+    for (size_t i = 0; i < m_colours.size(); ++i) {
+        icons.emplace_back(get_extruder_color_icon(m_colours[i].GetAsString(wxC2S_HTML_SYNTAX).ToStdString(),
+                                                   std::to_string(i + 1),
+                                                   icon_width,
+                                                   icon_height));
+    }
     if (icons.empty())
         return nullptr;
 
