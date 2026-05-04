@@ -277,6 +277,8 @@ set(lisbslic3r_sources
     Geometry/VoronoiUtils.cpp
     Geometry/VoronoiUtils.hpp
     Geometry/VoronoiVisualUtils.hpp
+    ImageMapRawFilamentOffsetAtlas.cpp
+    ImageMapRawFilamentOffsetAtlas.hpp
     Int128.hpp
     KDTreeIndirect.hpp
     Layer.cpp

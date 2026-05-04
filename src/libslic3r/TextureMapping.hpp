@@ -265,8 +265,13 @@ public:
                         size_t num_physical,
                         const std::vector<std::string> &filament_colours);
 
-    unsigned int find_image_texture_zone_id(size_t num_physical) const;
-    unsigned int ensure_image_texture_zone(size_t num_physical, const std::vector<std::string> &filament_colours);
+    unsigned int find_image_texture_zone_id(size_t num_physical,
+                                            bool allow_raw_values = false,
+                                            bool prefer_raw_values = false) const;
+    unsigned int ensure_image_texture_zone(size_t num_physical,
+                                           const std::vector<std::string> &filament_colours,
+                                           bool allow_raw_values = false,
+                                           bool prefer_raw_values = false);
 
     std::string serialize_entries();
     void load_entries(const std::string &serialized, const std::vector<std::string> &filament_colours);

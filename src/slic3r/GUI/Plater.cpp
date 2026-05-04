@@ -639,11 +639,15 @@ static std::vector<wxString> texture_mapping_channel_labels(int filament_color_m
 
 static wxString texture_mapping_summary(const TextureMappingZone &zone, size_t num_physical)
 {
+    const bool raw_offset = zone.is_image_texture() && zone.texture_mapping_mode == int(TextureMappingZone::TextureMappingRawValues);
     wxString summary = zone.is_2d_gradient() ? _L("2D Gradient") : from_u8(TextureMappingManager::filament_color_mode_name(zone.filament_color_mode));
     if (!zone.is_2d_gradient() && summary == "any")
-        summary = _L("Texture");
-    else
+        summary = raw_offset ? _L("Raw Offset Texture") : _L("Texture");
+    else {
         summary.MakeUpper();
+        if (raw_offset)
+            summary = _L("Raw Offset ") + summary;
+    }
 
     const std::vector<unsigned int> ids = texture_mapping_selected_ids(zone, num_physical);
     summary += "  ";

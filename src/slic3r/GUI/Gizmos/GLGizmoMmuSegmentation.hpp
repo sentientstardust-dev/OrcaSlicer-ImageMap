@@ -3,6 +3,8 @@
 
 #include "GLGizmoPainterBase.hpp"
 
+#include "libslic3r/ImageMapRawFilamentOffsetAtlas.hpp"
+
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -336,6 +338,7 @@ private:
     bool selected_object_has_image_texture_data() const;
     bool selected_object_has_vertex_color_data() const;
     bool selected_object_has_rgb_data() const;
+    bool selected_object_has_raw_atlas_texture_data() const;
     bool project_image_to_selected_object();
     bool project_to_vertex_colors(ModelObject *object);
     bool project_to_image_texture(ModelObject *object);
@@ -350,6 +353,7 @@ private:
     std::vector<uint8_t> m_image_rgba;
     uint32_t             m_image_width = 0;
     uint32_t             m_image_height = 0;
+    ImageMapRawFilamentOffsetAtlas m_raw_atlas;
     GLTexture            m_overlay_texture;
     bool                 m_overlay_texture_dirty = false;
     bool                 m_show_overlay = true;

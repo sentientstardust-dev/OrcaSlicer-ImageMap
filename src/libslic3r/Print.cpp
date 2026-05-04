@@ -261,6 +261,20 @@ static int prime_tower_texture_mapping_color_mode_for_print(int prime_tower_colo
     }
 }
 
+static bool model_volume_texture_mapping_data_equal_for_print_sharing(const ModelVolume &lhs, const ModelVolume &rhs)
+{
+    return lhs.texture_mapping_color_facets.equals(rhs.texture_mapping_color_facets) &&
+           lhs.imported_vertex_colors_rgba == rhs.imported_vertex_colors_rgba &&
+           lhs.imported_texture_uvs_per_face == rhs.imported_texture_uvs_per_face &&
+           lhs.imported_texture_uv_valid == rhs.imported_texture_uv_valid &&
+           lhs.imported_texture_rgba == rhs.imported_texture_rgba &&
+           lhs.imported_texture_raw_filament_offsets == rhs.imported_texture_raw_filament_offsets &&
+           lhs.imported_texture_width == rhs.imported_texture_width &&
+           lhs.imported_texture_height == rhs.imported_texture_height &&
+           lhs.imported_texture_raw_channels == rhs.imported_texture_raw_channels &&
+           lhs.imported_texture_raw_metadata_json == rhs.imported_texture_raw_metadata_json;
+}
+
 template class PrintState<PrintStep, psCount>;
 template class PrintState<PrintObjectStep, posCount>;
 
@@ -2329,6 +2343,8 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
             if (!model_volume1.seam_facets.equals(model_volume2.seam_facets))
                 return false;
             if (!model_volume1.mmu_segmentation_facets.equals(model_volume2.mmu_segmentation_facets))
+                return false;
+            if (!model_volume_texture_mapping_data_equal_for_print_sharing(model_volume1, model_volume2))
                 return false;
             if (!model_volume1.fuzzy_skin_facets.equals(model_volume2.fuzzy_skin_facets))
                 return false;

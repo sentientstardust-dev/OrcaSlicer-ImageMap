@@ -7,6 +7,7 @@
 #include "../GCode.hpp"
 #include "../Geometry.hpp"
 #include "../GCode/ThumbnailData.hpp"
+#include "../ImageMapRawFilamentOffsetAtlas.hpp"
 #include "../PNGReadWrite.hpp"
 #include "../Semver.hpp"
 #include "../TextureMapping.hpp"
@@ -783,6 +784,64 @@ static bool has_imported_obj_texture_payload(const ModelVolume &volume)
                size_t(volume.imported_texture_width) * size_t(volume.imported_texture_height) * 4 &&
            volume.imported_texture_uv_valid.size() == triangle_count &&
            volume.imported_texture_uvs_per_face.size() >= triangle_count * 6;
+}
+
+static bool has_imported_raw_atlas_texture_payload(const ModelVolume &volume)
+{
+    return volume.imported_texture_width > 0 &&
+           volume.imported_texture_height > 0 &&
+           volume.imported_texture_raw_channels > 0 &&
+           volume.imported_texture_raw_filament_offsets.size() >=
+               size_t(volume.imported_texture_width) *
+                   size_t(volume.imported_texture_height) *
+                   size_t(volume.imported_texture_raw_channels);
+}
+
+static std::vector<ImageMapRawFilament> raw_atlas_filaments_from_metadata(const std::string &metadata_json, uint32_t channels)
+{
+    std::vector<ImageMapRawFilament> filaments;
+    try {
+        const nlohmann::json root = nlohmann::json::parse(metadata_json);
+        const nlohmann::json entries = root.value("filaments", nlohmann::json::array());
+        if (entries.is_array()) {
+            for (const nlohmann::json &entry : entries) {
+                if (!entry.is_object())
+                    continue;
+                ImageMapRawFilament filament;
+                filament.slot = unsigned(std::max(0, entry.value("slot", 0)));
+                filament.color = entry.value("color", std::string());
+                filament.hex = entry.value("hex", std::string());
+                filaments.emplace_back(std::move(filament));
+            }
+        }
+    } catch (...) {
+        filaments.clear();
+    }
+
+    if (filaments.empty()) {
+        filaments.reserve(channels);
+        for (uint32_t channel = 0; channel < channels; ++channel) {
+            ImageMapRawFilament filament;
+            filament.slot = channel + 1;
+            filament.color = "custom";
+            filament.hex = "#FFFFFF";
+            filaments.emplace_back(std::move(filament));
+        }
+    }
+    return filaments;
+}
+
+static ImageMapRawFilamentOffsetAtlas raw_atlas_from_model_volume(const ModelVolume &volume)
+{
+    ImageMapRawFilamentOffsetAtlas atlas;
+    atlas.width = volume.imported_texture_width;
+    atlas.height = volume.imported_texture_height;
+    atlas.channels = volume.imported_texture_raw_channels;
+    atlas.offsets.assign(volume.imported_texture_raw_filament_offsets.begin(), volume.imported_texture_raw_filament_offsets.end());
+    atlas.mask.assign(size_t(atlas.width) * size_t(atlas.height), 255);
+    atlas.metadata_json = volume.imported_texture_raw_metadata_json;
+    atlas.filaments = raw_atlas_filaments_from_metadata(volume.imported_texture_raw_metadata_json, atlas.channels);
+    return atlas;
 }
 
 static bool has_imported_obj_material_payload(const ModelVolume &volume)
@@ -5901,9 +5960,22 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
             volume->imported_texture_uv_valid = source.uv_valid;
             volume->imported_texture_uvs_per_face.assign(source.uvs_per_face.begin(),
                                                          source.uvs_per_face.begin() + triangle_count * 6);
-            volume->imported_texture_rgba = std::move(imported_rgba);
-            volume->imported_texture_width = imported_width;
-            volume->imported_texture_height = imported_height;
+            ImageMapRawFilamentOffsetAtlas raw_atlas;
+            if (decode_image_map_raw_filament_offset_atlas(imported_rgba, imported_width, imported_height, raw_atlas, nullptr)) {
+                volume->imported_texture_rgba = image_map_raw_filament_offset_preview_rgba(raw_atlas);
+                volume->imported_texture_width = raw_atlas.width;
+                volume->imported_texture_height = raw_atlas.height;
+                volume->imported_texture_raw_channels = raw_atlas.channels;
+                volume->imported_texture_raw_filament_offsets = std::move(raw_atlas.offsets);
+                volume->imported_texture_raw_metadata_json = std::move(raw_atlas.metadata_json);
+            } else {
+                volume->imported_texture_rgba = std::move(imported_rgba);
+                volume->imported_texture_width = imported_width;
+                volume->imported_texture_height = imported_height;
+                volume->imported_texture_raw_filament_offsets.clear();
+                volume->imported_texture_raw_channels = 0;
+                volume->imported_texture_raw_metadata_json.clear();
+            }
         }
     }
     /*
@@ -7898,8 +7970,11 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
                                     && (shared_volume->imported_texture_uvs_per_face == volume->imported_texture_uvs_per_face)
                                     && (shared_volume->imported_texture_uv_valid == volume->imported_texture_uv_valid)
                                     && (shared_volume->imported_texture_rgba == volume->imported_texture_rgba)
+                                    && (shared_volume->imported_texture_raw_filament_offsets == volume->imported_texture_raw_filament_offsets)
                                     && (shared_volume->imported_texture_width == volume->imported_texture_width)
-                                    && (shared_volume->imported_texture_height == volume->imported_texture_height))
+                                    && (shared_volume->imported_texture_height == volume->imported_texture_height)
+                                    && (shared_volume->imported_texture_raw_channels == volume->imported_texture_raw_channels)
+                                    && (shared_volume->imported_texture_raw_metadata_json == volume->imported_texture_raw_metadata_json))
                                 {
                                     auto data = iter->second.first;
                                     const_cast<_BBS_3MF_Exporter *>(this)->m_volume_paths.insert({volume, {data->sub_path, data->volumes_objectID.find(iter->second.second)->second}});
@@ -8130,11 +8205,25 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
                     if (texture_targets.find(texture_resource.texture_part_path) != texture_targets.end())
                         continue;
 
+                    std::vector<uint8_t> png_source_rgba;
+                    uint32_t png_width = volume->imported_texture_width;
+                    uint32_t png_height = volume->imported_texture_height;
+                    if (has_imported_raw_atlas_texture_payload(*volume)) {
+                        const ImageMapRawFilamentOffsetAtlas raw_atlas = raw_atlas_from_model_volume(*volume);
+                        std::string encode_error;
+                        if (!encode_image_map_raw_filament_offset_atlas(raw_atlas, png_source_rgba, png_width, png_height, &encode_error)) {
+                            add_error(encode_error.empty() ? "Unable to encode ImageMap raw filament offset atlas texture image" : encode_error);
+                            return false;
+                        }
+                    } else {
+                        png_source_rgba.assign(volume->imported_texture_rgba.begin(), volume->imported_texture_rgba.end());
+                    }
+
                     size_t png_size = 0;
                     void *png_data = tdefl_write_image_to_png_file_in_memory_ex(
-                        static_cast<const void *>(volume->imported_texture_rgba.data()),
-                        int(volume->imported_texture_width),
-                        int(volume->imported_texture_height),
+                        static_cast<const void *>(png_source_rgba.data()),
+                        int(png_width),
+                        int(png_height),
                         4,
                         &png_size,
                         MZ_DEFAULT_COMPRESSION,

@@ -15,6 +15,7 @@
 #include "ShortestPath.hpp"
 #include "Print.hpp"
 #include "TextureMapping.hpp"
+#include "ImageMapRawFilamentOffsetAtlas.hpp"
 #include "Utils.hpp"
 #include "ClipperUtils.hpp"
 #include "libslic3r.h"
@@ -32,6 +33,7 @@
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <math.h>
 #include <stdlib.h>
 #include <string>
@@ -2000,6 +2002,9 @@ namespace DoExport {
     }
 } // namespace DoExport
 
+static bool print_has_raw_offset_texture_data_without_raw_zone_for_gcode(const Print &print);
+static bool print_has_raw_offset_texture_zone_without_raw_data_for_gcode(const Print &print);
+
 bool GCode::is_BBL_Printer()
 {
     if (m_curr_print)
@@ -2038,6 +2043,18 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     GCodeProcessor::s_IsBBLPrinter = print->is_BBL_printer();
     m_writer.set_is_bbl_machine(print->is_BBL_printer());
     print->set_started(psGCodeExport);
+    if (print_has_raw_offset_texture_data_without_raw_zone_for_gcode(*print)) {
+        print->active_step_add_warning(
+            PrintStateBase::WarningLevel::NON_CRITICAL,
+            _(L("An object contains raw filament offset texture data, but it is not assigned to a texture mapping zone "
+                "set to Raw filament offset mode. Slicing will use the preview texture instead of the raw offsets for that object.")));
+    }
+    if (print_has_raw_offset_texture_zone_without_raw_data_for_gcode(*print)) {
+        print->active_step_add_warning(
+            PrintStateBase::WarningLevel::NON_CRITICAL,
+            _(L("An object is assigned to a Raw filament offset texture mapping zone, but it does not contain raw filament "
+                "offset atlas data. Slicing will interpret its regular RGB texture channels as raw offsets.")));
+    }
 
     // check if any custom gcode contains keywords used by the gcode processor to
     // produce time estimation and gcode toolpaths
@@ -6101,6 +6118,107 @@ static std::array<float, 4> unpack_rgba_u32(uint32_t packed_rgba)
     return { clamp01f_for_gcode(r), clamp01f_for_gcode(g), clamp01f_for_gcode(b), clamp01f_for_gcode(a) };
 }
 
+static constexpr const char *TEXTURE_MAPPING_BACKGROUND_COLOR_CONFIG_KEY = "texture_mapping_background_color";
+
+static int texture_mapping_color_hex_digit_for_gcode(char ch)
+{
+    return ch >= '0' && ch <= '9' ? ch - '0' :
+           ch >= 'a' && ch <= 'f' ? ch - 'a' + 10 :
+           ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
+}
+
+static std::optional<std::array<float, 4>> parse_texture_mapping_color_hex_for_gcode(const std::string &text)
+{
+    if (text.empty())
+        return std::nullopt;
+
+    const size_t hash_pos = text.find('#');
+    const size_t start = hash_pos == std::string::npos ? 0 : hash_pos + 1;
+    if (start + 6 > text.size())
+        return std::nullopt;
+
+    uint32_t packed = 0;
+    for (size_t idx = 0; idx < 6; ++idx) {
+        const int value = texture_mapping_color_hex_digit_for_gcode(text[start + idx]);
+        if (value < 0)
+            return std::nullopt;
+        packed = (packed << 4) | uint32_t(value);
+    }
+
+    uint32_t alpha = 255;
+    if (start + 8 <= text.size()) {
+        alpha = 0;
+        for (size_t idx = 6; idx < 8; ++idx) {
+            const int value = texture_mapping_color_hex_digit_for_gcode(text[start + idx]);
+            if (value < 0)
+                return std::nullopt;
+            alpha = (alpha << 4) | uint32_t(value);
+        }
+    }
+
+    return std::array<float, 4> {
+        clamp01f_for_gcode(float((packed >> 16) & 0xFFu) / 255.f),
+        clamp01f_for_gcode(float((packed >> 8) & 0xFFu) / 255.f),
+        clamp01f_for_gcode(float(packed & 0xFFu) / 255.f),
+        clamp01f_for_gcode(float(alpha & 0xFFu) / 255.f)
+    };
+}
+
+static std::optional<std::array<float, 4>> texture_mapping_background_color_from_config_for_gcode(const ModelConfigObject &config)
+{
+    if (!config.has(TEXTURE_MAPPING_BACKGROUND_COLOR_CONFIG_KEY))
+        return std::nullopt;
+
+    const ConfigOptionString *opt = dynamic_cast<const ConfigOptionString *>(config.option(TEXTURE_MAPPING_BACKGROUND_COLOR_CONFIG_KEY));
+    if (opt == nullptr)
+        return std::nullopt;
+
+    std::optional<std::array<float, 4>> color = parse_texture_mapping_color_hex_for_gcode(opt->value);
+    if (color)
+        (*color)[3] = 1.f;
+    return color;
+}
+
+static std::optional<std::array<float, 4>> texture_mapping_background_color_from_metadata_for_gcode(const ColorFacetsAnnotation &annotation)
+{
+    const std::string &metadata = annotation.metadata_json();
+    const std::string key = "\"background_color\":\"#";
+    const size_t start = metadata.find(key);
+    if (start == std::string::npos || start + key.size() + 8 > metadata.size())
+        return std::nullopt;
+
+    std::optional<std::array<float, 4>> color =
+        parse_texture_mapping_color_hex_for_gcode(metadata.substr(start + key.size() - 1, 9));
+    if (color)
+        (*color)[3] = 1.f;
+    return color;
+}
+
+static std::array<float, 4> texture_mapping_background_color_for_gcode(const ModelVolume &volume)
+{
+    if (std::optional<std::array<float, 4>> color = texture_mapping_background_color_from_config_for_gcode(volume.config))
+        return *color;
+    if (volume.get_object() != nullptr) {
+        if (std::optional<std::array<float, 4>> color = texture_mapping_background_color_from_config_for_gcode(volume.get_object()->config))
+            return *color;
+    }
+    if (std::optional<std::array<float, 4>> color = texture_mapping_background_color_from_metadata_for_gcode(volume.texture_mapping_color_facets))
+        return *color;
+    return { 1.f, 1.f, 1.f, 1.f };
+}
+
+static std::array<float, 4> composite_rgba_over_background_for_gcode(const std::array<float, 4> &rgba,
+                                                                     const std::array<float, 4> &background)
+{
+    const float alpha = clamp01f_for_gcode(rgba[3]);
+    return {
+        clamp01f_for_gcode(rgba[0] * alpha + background[0] * (1.f - alpha)),
+        clamp01f_for_gcode(rgba[1] * alpha + background[1] * (1.f - alpha)),
+        clamp01f_for_gcode(rgba[2] * alpha + background[2] * (1.f - alpha)),
+        1.f
+    };
+}
+
 static std::array<float, 3> mix_component_colors_with_filament_mixer_for_gcode(const std::vector<std::array<float, 3>> &component_colors,
                                                                                const std::vector<int>                  &weights)
 {
@@ -6639,6 +6757,225 @@ static std::array<float, 4> sample_texture_rgba_bilinear_for_gcode(const std::ve
     return out;
 }
 
+static std::vector<float> sample_texture_raw_offsets_bilinear_for_gcode(const std::vector<uint8_t> &offsets,
+                                                                        uint32_t width,
+                                                                        uint32_t height,
+                                                                        uint32_t channels,
+                                                                        float u,
+                                                                        float v)
+{
+    std::vector<float> out;
+    if (width == 0 || height == 0 || channels == 0 ||
+        offsets.size() < size_t(width) * size_t(height) * size_t(channels))
+        return out;
+
+    const float uu = wrap_repeat01_for_gcode(u);
+    const float vv = wrap_repeat01_for_gcode(v);
+
+    const float x = uu * float(width > 1 ? width - 1 : 0);
+    const float y = vv * float(height > 1 ? height - 1 : 0);
+    const size_t x0 = std::min<size_t>(size_t(std::floor(x)), size_t(width - 1));
+    const size_t y0 = std::min<size_t>(size_t(std::floor(y)), size_t(height - 1));
+    const size_t x1 = std::min<size_t>(x0 + 1, size_t(width - 1));
+    const size_t y1 = std::min<size_t>(y0 + 1, size_t(height - 1));
+    const float tx = x - float(x0);
+    const float ty = y - float(y0);
+
+    auto sample_channel = [&offsets, width, channels](size_t sx, size_t sy, size_t channel) {
+        const size_t idx = (sy * size_t(width) + sx) * size_t(channels) + channel;
+        return float(offsets[idx]) / 255.f;
+    };
+
+    out.assign(size_t(channels), 0.f);
+    for (size_t c = 0; c < out.size(); ++c) {
+        const float c00 = sample_channel(x0, y0, c);
+        const float c10 = sample_channel(x1, y0, c);
+        const float c01 = sample_channel(x0, y1, c);
+        const float c11 = sample_channel(x1, y1, c);
+        const float cx0 = c00 + (c10 - c00) * tx;
+        const float cx1 = c01 + (c11 - c01) * tx;
+        out[c] = clamp01f_for_gcode(cx0 + (cx1 - cx0) * ty);
+    }
+    return out;
+}
+
+static std::array<float, 4> raw_offset_preview_rgba_for_gcode(const std::vector<float> &offsets)
+{
+    if (offsets.empty())
+        return { 0.f, 0.f, 0.f, 1.f };
+    if (offsets.size() == 1)
+        return { offsets[0], offsets[0], offsets[0], 1.f };
+    return {
+        offsets.size() > 0 ? offsets[0] : 0.f,
+        offsets.size() > 1 ? offsets[1] : 0.f,
+        offsets.size() > 2 ? offsets[2] : 0.f,
+        1.f
+    };
+}
+
+static std::vector<std::string> raw_filament_color_mode_channel_keys_for_gcode(int filament_color_mode, size_t component_count)
+{
+    std::vector<std::string> keys;
+    switch (std::clamp(filament_color_mode, int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorBW))) {
+    case int(TextureMappingZone::FilamentColorRGB):
+        keys = { "R", "G", "B" };
+        break;
+    case int(TextureMappingZone::FilamentColorCMY):
+        keys = { "C", "M", "Y" };
+        break;
+    case int(TextureMappingZone::FilamentColorCMYK):
+        keys = { "C", "M", "Y", "K" };
+        break;
+    case int(TextureMappingZone::FilamentColorCMYW):
+        keys = { "C", "M", "Y", "W" };
+        break;
+    case int(TextureMappingZone::FilamentColorRGBK):
+        keys = { "R", "G", "B", "K" };
+        break;
+    case int(TextureMappingZone::FilamentColorRGBW):
+        keys = { "R", "G", "B", "W" };
+        break;
+    case int(TextureMappingZone::FilamentColorBW):
+        keys = { "K", "W" };
+        break;
+    default:
+        break;
+    }
+    if (keys.size() > component_count)
+        keys.resize(component_count);
+    return keys;
+}
+
+static std::vector<size_t> raw_component_source_channels_for_gcode(const std::string &metadata_json,
+                                                                   uint32_t source_channels,
+                                                                   int filament_color_mode,
+                                                                   size_t component_count)
+{
+    if (source_channels == 0 || component_count == 0)
+        return {};
+
+    const size_t sentinel = std::numeric_limits<size_t>::max();
+    std::vector<size_t> mapping(component_count, sentinel);
+    const std::vector<ImageMapRawFilament> filaments =
+        image_map_raw_filaments_from_metadata_json(metadata_json, source_channels);
+    if (filaments.size() != size_t(source_channels))
+        return {};
+
+    std::vector<std::string> source_keys(static_cast<size_t>(source_channels));
+    std::vector<uint8_t> used(static_cast<size_t>(source_channels), 0);
+    for (size_t channel = 0; channel < filaments.size(); ++channel) {
+        const std::string key = image_map_raw_filament_channel_key(filaments[channel], channel);
+        if (key.size() == 1 && image_map_raw_filament_is_standard_color(key))
+            source_keys[channel] = key;
+    }
+
+    const std::vector<std::string> target_keys =
+        raw_filament_color_mode_channel_keys_for_gcode(filament_color_mode, component_count);
+    if (!target_keys.empty()) {
+        for (size_t component_idx = 0; component_idx < target_keys.size(); ++component_idx) {
+            for (size_t channel = 0; channel < source_keys.size(); ++channel) {
+                if (used[channel] == 0 && source_keys[channel] == target_keys[component_idx]) {
+                    mapping[component_idx] = channel;
+                    used[channel] = 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    size_t next_source = 0;
+    for (size_t component_idx = 0; component_idx < mapping.size(); ++component_idx) {
+        if (mapping[component_idx] != sentinel)
+            continue;
+        while (next_source < source_keys.size() &&
+               (used[next_source] != 0 || (!target_keys.empty() && !source_keys[next_source].empty())))
+            ++next_source;
+        if (next_source >= source_keys.size())
+            continue;
+        mapping[component_idx] = next_source;
+        used[next_source] = 1;
+        ++next_source;
+    }
+
+    const bool has_mapping = std::any_of(mapping.begin(), mapping.end(), [sentinel](size_t value) { return value != sentinel; });
+    return has_mapping ? mapping : std::vector<size_t>{};
+}
+
+static std::vector<float> map_raw_sample_to_components_for_gcode(const std::vector<float> &raw_sample,
+                                                                 const std::vector<size_t> &component_source_channels)
+{
+    if (component_source_channels.empty())
+        return {};
+    const size_t sentinel = std::numeric_limits<size_t>::max();
+    std::vector<float> mapped(component_source_channels.size(), 0.f);
+    for (size_t component_idx = 0; component_idx < component_source_channels.size(); ++component_idx) {
+        const size_t source_channel = component_source_channels[component_idx];
+        if (source_channel != sentinel && source_channel < raw_sample.size())
+            mapped[component_idx] = raw_sample[source_channel];
+    }
+    return mapped;
+}
+
+static bool model_volume_has_raw_offset_texture_data_for_gcode(const ModelVolume *volume)
+{
+    if (volume == nullptr ||
+        volume->imported_texture_width == 0 ||
+        volume->imported_texture_height == 0 ||
+        volume->imported_texture_raw_channels == 0 ||
+        volume->imported_texture_raw_filament_offsets.empty())
+        return false;
+
+    return volume->imported_texture_raw_filament_offsets.size() >=
+           size_t(volume->imported_texture_width) *
+               size_t(volume->imported_texture_height) *
+               size_t(volume->imported_texture_raw_channels);
+}
+
+static bool print_has_raw_offset_texture_data_without_raw_zone_for_gcode(const Print &print)
+{
+    const TextureMappingManager &texture_mgr = print.texture_mapping_manager();
+    for (const PrintObject *print_object : print.objects()) {
+        if (print_object == nullptr || print_object->model_object() == nullptr)
+            continue;
+
+        for (const ModelVolume *volume : print_object->model_object()->volumes) {
+            if (volume == nullptr ||
+                !volume->is_model_part() ||
+                !model_volume_has_raw_offset_texture_data_for_gcode(volume))
+                continue;
+
+            const unsigned int filament_id = unsigned(std::max(0, volume->extruder_id()));
+            const TextureMappingZone *zone = texture_mgr.zone_from_id(filament_id);
+            if (zone == nullptr ||
+                zone->texture_mapping_mode != int(TextureMappingZone::TextureMappingRawValues))
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool print_has_raw_offset_texture_zone_without_raw_data_for_gcode(const Print &print)
+{
+    const TextureMappingManager &texture_mgr = print.texture_mapping_manager();
+    for (const PrintObject *print_object : print.objects()) {
+        if (print_object == nullptr || print_object->model_object() == nullptr)
+            continue;
+
+        for (const ModelVolume *volume : print_object->model_object()->volumes) {
+            if (volume == nullptr || !volume->is_model_part())
+                continue;
+
+            const unsigned int filament_id = unsigned(std::max(0, volume->extruder_id()));
+            const TextureMappingZone *zone = texture_mgr.zone_from_id(filament_id);
+            if (zone != nullptr &&
+                zone->texture_mapping_mode == int(TextureMappingZone::TextureMappingRawValues) &&
+                !model_volume_has_raw_offset_texture_data_for_gcode(volume))
+                return true;
+        }
+    }
+    return false;
+}
+
 static std::array<Vec2f, 3> unwrap_triangle_uvs_for_sampling_for_gcode(const Vec2f &uv0,
                                                                         const Vec2f &uv1,
                                                                         const Vec2f &uv2)
@@ -6934,6 +7271,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
     VertexColorOverhangWeightField weight_field;
     if (component_colors.empty())
         return weight_field;
+    const size_t component_count = component_colors.size();
 
     const ModelObject *model_object = print_object.model_object();
     if (model_object == nullptr)
@@ -6957,16 +7295,26 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
     const float tone_gamma =
         (!std::isfinite(texture_tone_gamma) || texture_tone_gamma <= 0.f) ? 1.f : std::clamp(texture_tone_gamma, 0.5f, 3.f);
 
+    struct TextureSampleData {
+        std::array<float, 4> rgba { { 0.f, 0.f, 0.f, 1.f } };
+        std::vector<float>   raw_component_weights;
+    };
+
     struct WeightedTextureSample {
         float               x_mm { 0.f };
         float               y_mm { 0.f };
         std::array<float, 4> rgba { { 0.f, 0.f, 0.f, 1.f } };
+        std::vector<float>   raw_component_weights;
         float               weight { 0.f };
     };
     std::vector<WeightedTextureSample> samples;
     samples.reserve(8192);
 
-    auto accumulate_sample = [&samples](float x_mm, float y_mm, const std::array<float, 4> &rgba, float sample_weight) {
+    auto accumulate_sample = [&samples](float x_mm,
+                                        float y_mm,
+                                        const std::array<float, 4> &rgba,
+                                        float sample_weight,
+                                        std::vector<float> raw_component_weights = {}) {
         if (!std::isfinite(x_mm) || !std::isfinite(y_mm) || sample_weight <= EPSILON)
             return;
         if (!std::isfinite(sample_weight) ||
@@ -6976,7 +7324,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
             !std::isfinite(rgba[3]))
             return;
 
-        samples.push_back({ x_mm, y_mm, rgba, sample_weight });
+        samples.push_back({ x_mm, y_mm, rgba, std::move(raw_component_weights), sample_weight });
     };
 
     struct LayerPlaneSamplePoint {
@@ -6987,7 +7335,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
     auto accumulate_layer_plane_triangle_samples = [&](const Vec3d &p0,
                                                        const Vec3d &p1,
                                                        const Vec3d &p2,
-                                                       const auto  &sample_rgba_for_barycentric) {
+                                                       const auto  &sample_data_for_barycentric) {
         if (!use_layer_weighting)
             return false;
 
@@ -7087,7 +7435,12 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
             barycentric /= barycentric_sum;
 
             const Vec3d world_pos = p0 * double(barycentric.x()) + p1 * double(barycentric.y()) + p2 * double(barycentric.z());
-            accumulate_sample(float(world_pos.x()), float(world_pos.y()), sample_rgba_for_barycentric(barycentric), sample_weight);
+            TextureSampleData sample_data = sample_data_for_barycentric(barycentric);
+            accumulate_sample(float(world_pos.x()),
+                              float(world_pos.y()),
+                              sample_data.rgba,
+                              sample_weight,
+                              std::move(sample_data.raw_component_weights));
         }
 
         return true;
@@ -7097,7 +7450,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                                                             const Vec3d &p1,
                                                             const Vec3d &p2,
                                                             const std::array<float, 4> &rgba) {
-        if (accumulate_layer_plane_triangle_samples(p0, p1, p2, [&rgba](const Vec3f &) { return rgba; }))
+        if (accumulate_layer_plane_triangle_samples(p0, p1, p2, [&rgba](const Vec3f &) { return TextureSampleData{ rgba, {} }; }))
             return;
 
         const float max_world_edge_mm = std::max({
@@ -7161,6 +7514,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
 
         const indexed_triangle_set &its = mesh_ptr->its;
         const Transform3d volume_trafo = object_trafo * volume->get_matrix();
+        const std::array<float, 4> background_color = texture_mapping_background_color_for_gcode(*volume);
 
         if (!volume->texture_mapping_color_facets.empty()) {
             std::vector<ColorFacetTriangle> color_facets;
@@ -7172,8 +7526,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                 if (!p0.allFinite() || !p1.allFinite() || !p2.allFinite())
                     continue;
 
-                std::array<float, 4> rgba = unpack_rgba_u32(facet.rgba);
-                rgba[3] = 1.f;
+                std::array<float, 4> rgba = composite_rgba_over_background_for_gcode(unpack_rgba_u32(facet.rgba), background_color);
 
                 accumulate_constant_surface_triangle_samples(p0, p1, p2, rgba);
             }
@@ -7190,6 +7543,18 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
             volume->imported_texture_rgba.size() >= size_t(volume->imported_texture_width) * size_t(volume->imported_texture_height) * 4;
 
         if (has_uv_texture) {
+            const std::vector<size_t> raw_component_source_channels =
+                raw_component_source_channels_for_gcode(volume->imported_texture_raw_metadata_json,
+                                                        volume->imported_texture_raw_channels,
+                                                        filament_color_mode,
+                                                        component_count);
+            const bool use_raw_uv_texture =
+                raw_values_mode &&
+                raw_component_source_channels.size() == component_count &&
+                volume->imported_texture_raw_filament_offsets.size() >=
+                    size_t(volume->imported_texture_width) *
+                        size_t(volume->imported_texture_height) *
+                        size_t(volume->imported_texture_raw_channels);
             const auto uv_edge_texel_length = [volume](const Vec2f &a, const Vec2f &b) {
                 const float du = (a.x() - b.x()) * float(volume->imported_texture_width);
                 const float dv = (a.y() - b.y()) * float(volume->imported_texture_height);
@@ -7222,17 +7587,35 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                     continue;
                 const std::array<Vec2f, 3> tri_uv = unwrap_triangle_uvs_for_sampling_for_gcode(uv0, uv1, uv2);
 
-                auto sample_rgba_for_barycentric = [&](const Vec3f &barycentric) {
-                    const Vec2f uv = tri_uv[0] * barycentric.x() + tri_uv[1] * barycentric.y() + tri_uv[2] * barycentric.z();
+                auto sample_data_for_uv = [&](const Vec2f &uv) {
                     std::array<float, 4> rgba = sample_texture_rgba_bilinear_for_gcode(volume->imported_texture_rgba,
                                                                                         volume->imported_texture_width,
                                                                                         volume->imported_texture_height,
                                                                                         uv.x(),
                                                                                         uv.y());
-                    rgba[3] = 1.f;
-                    return rgba;
+                    std::vector<float> raw_component_weights;
+                    if (use_raw_uv_texture) {
+                        const std::vector<float> raw_sample =
+                            sample_texture_raw_offsets_bilinear_for_gcode(volume->imported_texture_raw_filament_offsets,
+                                                                           volume->imported_texture_width,
+                                                                           volume->imported_texture_height,
+                                                                           volume->imported_texture_raw_channels,
+                                                                           uv.x(),
+                                                                           uv.y());
+                        raw_component_weights = map_raw_sample_to_components_for_gcode(raw_sample, raw_component_source_channels);
+                        if (raw_component_weights.size() == component_count)
+                            rgba = raw_offset_preview_rgba_for_gcode(raw_component_weights);
+                    }
+                    if (raw_component_weights.size() != component_count)
+                        rgba = composite_rgba_over_background_for_gcode(rgba, background_color);
+                    return TextureSampleData{ rgba, std::move(raw_component_weights) };
                 };
-                if (accumulate_layer_plane_triangle_samples(p0, p1, p2, sample_rgba_for_barycentric)) {
+
+                auto sample_data_for_barycentric = [&](const Vec3f &barycentric) {
+                    const Vec2f uv = tri_uv[0] * barycentric.x() + tri_uv[1] * barycentric.y() + tri_uv[2] * barycentric.z();
+                    return sample_data_for_uv(uv);
+                };
+                if (accumulate_layer_plane_triangle_samples(p0, p1, p2, sample_data_for_barycentric)) {
                     sampled_from_uv_texture = true;
                     continue;
                 }
@@ -7278,12 +7661,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
 
                         const Vec3d world_pos = p0 * double(b0) + p1 * double(b1) + p2 * double(b2);
                         const Vec2f uv = tri_uv[0] * b0 + tri_uv[1] * b1 + tri_uv[2] * b2;
-                        std::array<float, 4> rgba = sample_texture_rgba_bilinear_for_gcode(volume->imported_texture_rgba,
-                                                                                            volume->imported_texture_width,
-                                                                                            volume->imported_texture_height,
-                                                                                            uv.x(),
-                                                                                            uv.y());
-                        rgba[3] = 1.f;
+                        TextureSampleData sample_data = sample_data_for_uv(uv);
 
                         float sample_weight = area_weight;
                         if (use_layer_weighting) {
@@ -7297,7 +7675,11 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                         if (sample_weight <= EPSILON)
                             continue;
 
-                        accumulate_sample(float(world_pos.x()), float(world_pos.y()), rgba, sample_weight);
+                        accumulate_sample(float(world_pos.x()),
+                                          float(world_pos.y()),
+                                          sample_data.rgba,
+                                          sample_weight,
+                                          std::move(sample_data.raw_component_weights));
                         sampled_from_uv_texture = true;
                     }
                 }
@@ -7314,8 +7696,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
 
         for (size_t i = 0; i < its.vertices.size(); ++i) {
             const Vec3d world_pos = volume_trafo * its.vertices[i].cast<double>();
-            std::array<float, 4> rgba = unpack_rgba_u32(volume->imported_vertex_colors_rgba[i]);
-            rgba[3] = 1.f;
+            std::array<float, 4> rgba = composite_rgba_over_background_for_gcode(unpack_rgba_u32(volume->imported_vertex_colors_rgba[i]), background_color);
             float sample_weight = 1.f;
             if (use_layer_weighting) {
                 const float dz = std::abs(float(world_pos.z()) - layer_z_mm);
@@ -7335,7 +7716,6 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
     if (samples.empty())
         return VertexColorOverhangWeightField{};
 
-    const size_t component_count = component_colors.size();
     const std::vector<std::array<float, 3>> fixed_color_solver_component_colors =
         fixed_color_generic_solver_component_colors_for_gcode(filament_color_mode);
     const bool use_fixed_color_generic_solver =
@@ -7385,48 +7765,54 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
         weight_field.sample_y_mm[sample_idx] = sample.y_mm;
         weight_field.sample_weight[sample_idx] = sample.weight;
 
-        std::array<float, 3> target = {
-            clamp01f_for_gcode(sample.rgba[0]),
-            clamp01f_for_gcode(sample.rgba[1]),
-            clamp01f_for_gcode(sample.rgba[2])
-        };
-        if (std::abs(tone_gamma - 1.f) > 1e-5f) {
-            target[0] = apply_texture_tone_gamma_for_gcode(target[0], tone_gamma);
-            target[1] = apply_texture_tone_gamma_for_gcode(target[1], tone_gamma);
-            target[2] = apply_texture_tone_gamma_for_gcode(target[2], tone_gamma);
-        }
-
         std::vector<float> desired(component_count, 0.f);
         size_t mapped_component_count = component_count;
-        if (raw_values_mode) {
-            const float channels[3] = { target[0], target[1], target[2] };
-            const size_t channel_count = std::min(component_count, size_t(3));
-            for (size_t channel_idx = 0; channel_idx < channel_count; ++channel_idx)
-                desired[channel_idx] = clamp01f_for_gcode(channels[channel_idx]);
-            mapped_component_count = channel_count;
+        const bool has_raw_component_weights = raw_values_mode && sample.raw_component_weights.size() == component_count;
+        if (has_raw_component_weights) {
+            for (size_t component_idx = 0; component_idx < component_count; ++component_idx)
+                desired[component_idx] = clamp01f_for_gcode(sample.raw_component_weights[component_idx]);
         } else {
-            std::vector<float> optimized;
-            if (!use_fixed_color_generic_solver)
-                optimized = optimized_primary_component_weights_for_target_for_gcode(target,
-                                                                                    component_count,
-                                                                                    filament_color_mode,
-                                                                                    component_colors,
-                                                                                    force_sequential_filaments);
-            if (optimized.size() == component_count)
-                desired = std::move(optimized);
-            else {
-                std::vector<float> best = generic_mix_candidates != nullptr ?
-                    best_component_mix_weights_for_target_for_gcode(*generic_mix_candidates,
-                                                                    target,
-                                                                    generic_solver_lookup_mode,
-                                                                    generic_solver_mode) :
-                    std::vector<float>{};
-                if (best.size() == component_count)
-                    desired = std::move(best);
+            std::array<float, 3> target = {
+                clamp01f_for_gcode(sample.rgba[0]),
+                clamp01f_for_gcode(sample.rgba[1]),
+                clamp01f_for_gcode(sample.rgba[2])
+            };
+            if (std::abs(tone_gamma - 1.f) > 1e-5f) {
+                target[0] = apply_texture_tone_gamma_for_gcode(target[0], tone_gamma);
+                target[1] = apply_texture_tone_gamma_for_gcode(target[1], tone_gamma);
+                target[2] = apply_texture_tone_gamma_for_gcode(target[2], tone_gamma);
+            }
+
+            if (raw_values_mode) {
+                const float channels[3] = { target[0], target[1], target[2] };
+                const size_t channel_count = std::min(component_count, size_t(3));
+                for (size_t channel_idx = 0; channel_idx < channel_count; ++channel_idx)
+                    desired[channel_idx] = clamp01f_for_gcode(channels[channel_idx]);
+                mapped_component_count = channel_count;
+            } else {
+                std::vector<float> optimized;
+                if (!use_fixed_color_generic_solver)
+                    optimized = optimized_primary_component_weights_for_target_for_gcode(target,
+                                                                                        component_count,
+                                                                                        filament_color_mode,
+                                                                                        component_colors,
+                                                                                        force_sequential_filaments);
+                if (optimized.size() == component_count)
+                    desired = std::move(optimized);
+                else {
+                    std::vector<float> best = generic_mix_candidates != nullptr ?
+                        best_component_mix_weights_for_target_for_gcode(*generic_mix_candidates,
+                                                                        target,
+                                                                        generic_solver_lookup_mode,
+                                                                        generic_solver_mode) :
+                        std::vector<float>{};
+                    if (best.size() == component_count)
+                        desired = std::move(best);
+                }
             }
         }
 
-        if (std::abs(contrast_factor - 1.f) > 1e-5f)
+        if (!has_raw_component_weights && std::abs(contrast_factor - 1.f) > 1e-5f)
             apply_texture_contrast_to_mapped_components_for_gcode(desired, contrast_factor, mapped_component_count);
 
         for (size_t component_idx = 0; component_idx < component_count; ++component_idx) {

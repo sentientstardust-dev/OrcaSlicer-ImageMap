@@ -840,18 +840,41 @@ bool TextureMappingManager::duplicate_zone(size_t zone_index,
     return true;
 }
 
-unsigned int TextureMappingManager::find_image_texture_zone_id(size_t) const
+unsigned int TextureMappingManager::find_image_texture_zone_id(size_t,
+                                                               bool allow_raw_values,
+                                                               bool prefer_raw_values) const
 {
+    auto selectable = [allow_raw_values](const TextureMappingZone &zone) {
+        const bool raw_values = zone.texture_mapping_mode == int(TextureMappingZone::TextureMappingRawValues);
+        return zone.enabled && !zone.deleted && zone.is_image_texture() && zone.zone_id != 0 && (allow_raw_values || !raw_values);
+    };
+    auto find_raw = [this, selectable](bool raw_values) {
+        for (const TextureMappingZone &zone : m_zones)
+            if (selectable(zone) &&
+                (zone.texture_mapping_mode == int(TextureMappingZone::TextureMappingRawValues)) == raw_values)
+                return zone.zone_id;
+        return 0u;
+    };
+
+    if (allow_raw_values && prefer_raw_values) {
+        const unsigned int raw_id = find_raw(true);
+        if (raw_id != 0)
+            return raw_id;
+    }
+
     for (const TextureMappingZone &zone : m_zones)
-        if (zone.enabled && !zone.deleted && zone.is_image_texture() && zone.zone_id != 0)
+        if (selectable(zone))
             return zone.zone_id;
     return 0;
 }
 
 unsigned int TextureMappingManager::ensure_image_texture_zone(size_t num_physical,
-                                                              const std::vector<std::string> &filament_colours)
+                                                              const std::vector<std::string> &filament_colours,
+                                                              bool allow_raw_values,
+                                                              bool prefer_raw_values)
 {
-    if (unsigned int existing = find_image_texture_zone_id(num_physical); existing != 0)
+    if (unsigned int existing = find_image_texture_zone_id(num_physical, allow_raw_values, prefer_raw_values);
+        existing != 0)
         return existing;
     TextureMappingZone *zone = add_zone(num_physical, filament_colours, int(TextureMappingZone::ImageTexture));
     return zone != nullptr ? zone->zone_id : 0;

@@ -1059,8 +1059,11 @@ public:
     ModelVolumeImportedVector<float>    imported_texture_uvs_per_face;
     ModelVolumeImportedVector<uint8_t>  imported_texture_uv_valid;
     ModelVolumeImportedVector<uint8_t>  imported_texture_rgba;
+    ModelVolumeImportedVector<uint8_t>  imported_texture_raw_filament_offsets;
     uint32_t             imported_texture_width{0};
     uint32_t             imported_texture_height{0};
+    uint32_t             imported_texture_raw_channels{0};
+    std::string          imported_texture_raw_metadata_json;
 
     // List of mesh facets painted for fuzzy skin.
     FacetsAnnotation    fuzzy_skin_facets;
@@ -1193,6 +1196,7 @@ public:
         this->imported_texture_uvs_per_face.set_new_unique_id();
         this->imported_texture_uv_valid.set_new_unique_id();
         this->imported_texture_rgba.set_new_unique_id();
+        this->imported_texture_raw_filament_offsets.set_new_unique_id();
         this->fuzzy_skin_facets.set_new_unique_id();
     }
 
@@ -1307,8 +1311,11 @@ private:
         imported_texture_uvs_per_face(other.imported_texture_uvs_per_face),
         imported_texture_uv_valid(other.imported_texture_uv_valid),
         imported_texture_rgba(other.imported_texture_rgba),
+        imported_texture_raw_filament_offsets(other.imported_texture_raw_filament_offsets),
         imported_texture_width(other.imported_texture_width),
         imported_texture_height(other.imported_texture_height),
+        imported_texture_raw_channels(other.imported_texture_raw_channels),
+        imported_texture_raw_metadata_json(other.imported_texture_raw_metadata_json),
         fuzzy_skin_facets(other.fuzzy_skin_facets), cut_info(other.cut_info), text_configuration(other.text_configuration), emboss_shape(other.emboss_shape)
     {
 		assert(this->id().valid()); 
@@ -1376,7 +1383,7 @@ private:
 	friend class cereal::access;
 	friend class UndoRedo::StackImpl;
 	// Used for deserialization, therefore no IDs are allocated.
-	ModelVolume() : ObjectBase(-1), config(-1), supported_facets(-1), seam_facets(-1), mmu_segmentation_facets(-1), texture_mapping_color_facets(-1), imported_vertex_colors_rgba(-1), imported_texture_uvs_per_face(-1), imported_texture_uv_valid(-1), imported_texture_rgba(-1), fuzzy_skin_facets(-1), object(nullptr) {
+	ModelVolume() : ObjectBase(-1), config(-1), supported_facets(-1), seam_facets(-1), mmu_segmentation_facets(-1), texture_mapping_color_facets(-1), imported_vertex_colors_rgba(-1), imported_texture_uvs_per_face(-1), imported_texture_uv_valid(-1), imported_texture_rgba(-1), imported_texture_raw_filament_offsets(-1), fuzzy_skin_facets(-1), object(nullptr) {
 		assert(this->id().invalid());
         assert(this->config.id().invalid());
         assert(this->supported_facets.id().invalid());
@@ -1408,7 +1415,8 @@ private:
         cereal::load_by_value(ar, imported_texture_uvs_per_face);
         cereal::load_by_value(ar, imported_texture_uv_valid);
         cereal::load_by_value(ar, imported_texture_rgba);
-        ar(imported_texture_width, imported_texture_height);
+        cereal::load_by_value(ar, imported_texture_raw_filament_offsets);
+        ar(imported_texture_width, imported_texture_height, imported_texture_raw_channels, imported_texture_raw_metadata_json);
         cereal::load_by_value(ar, fuzzy_skin_facets);
         mesh_changed |= t != fuzzy_skin_facets.timestamp();
         cereal::load_by_value(ar, config);
@@ -1420,8 +1428,11 @@ private:
             imported_texture_uvs_per_face.clear();
             imported_texture_uv_valid.clear();
             imported_texture_rgba.clear();
+            imported_texture_raw_filament_offsets.clear();
             imported_texture_width = 0;
             imported_texture_height = 0;
+            imported_texture_raw_channels = 0;
+            imported_texture_raw_metadata_json.clear();
             texture_mapping_color_facets.reset();
         }
 		assert(m_mesh);
@@ -1446,7 +1457,8 @@ private:
         cereal::save_by_value(ar, imported_texture_uvs_per_face);
         cereal::save_by_value(ar, imported_texture_uv_valid);
         cereal::save_by_value(ar, imported_texture_rgba);
-        ar(imported_texture_width, imported_texture_height);
+        cereal::save_by_value(ar, imported_texture_raw_filament_offsets);
+        ar(imported_texture_width, imported_texture_height, imported_texture_raw_channels, imported_texture_raw_metadata_json);
         cereal::save_by_value(ar, fuzzy_skin_facets);
         cereal::save_by_value(ar, config);
         cereal::save(ar, text_configuration);

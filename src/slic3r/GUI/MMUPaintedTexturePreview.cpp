@@ -9,6 +9,7 @@
 
 #include "libslic3r/Config.hpp"
 #include "libslic3r/Geometry.hpp"
+#include "libslic3r/ImageMapRawFilamentOffsetAtlas.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/TextureMapping.hpp"
 #include "libslic3r/filament_mixer.h"
@@ -36,6 +37,7 @@ constexpr float k_polygon_offset_units = -1.f;
 constexpr float k_epsilon = 1e-6f;
 constexpr unsigned int k_simulated_texture_preview_max_edge = 1024;
 constexpr size_t k_simulated_texture_preview_max_pixels = 1024ull * 1024ull;
+constexpr const char *TEXTURE_MAPPING_BACKGROUND_COLOR_CONFIG_KEY = "texture_mapping_background_color";
 
 struct TexturePreviewMixCandidate
 {
@@ -322,10 +324,119 @@ unsigned char to_u8(float value)
     return static_cast<unsigned char>(clamp01(value) * 255.f + 0.5f);
 }
 
-void make_texture_preview_rgba_opaque(std::vector<unsigned char> &rgba)
+int texture_mapping_color_hex_digit_for_preview(char ch)
 {
-    for (size_t idx = 3; idx < rgba.size(); idx += 4)
-        rgba[idx] = 255;
+    return ch >= '0' && ch <= '9' ? ch - '0' :
+           ch >= 'a' && ch <= 'f' ? ch - 'a' + 10 :
+           ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
+}
+
+std::optional<ColorRGBA> parse_texture_mapping_color_hex_for_preview(const std::string &text)
+{
+    if (text.empty())
+        return std::nullopt;
+
+    const size_t hash_pos = text.find('#');
+    const size_t start = hash_pos == std::string::npos ? 0 : hash_pos + 1;
+    if (start + 6 > text.size())
+        return std::nullopt;
+
+    uint32_t packed = 0;
+    for (size_t idx = 0; idx < 6; ++idx) {
+        const int value = texture_mapping_color_hex_digit_for_preview(text[start + idx]);
+        if (value < 0)
+            return std::nullopt;
+        packed = (packed << 4) | uint32_t(value);
+    }
+
+    uint32_t alpha = 255;
+    if (start + 8 <= text.size()) {
+        alpha = 0;
+        for (size_t idx = 6; idx < 8; ++idx) {
+            const int value = texture_mapping_color_hex_digit_for_preview(text[start + idx]);
+            if (value < 0)
+                return std::nullopt;
+            alpha = (alpha << 4) | uint32_t(value);
+        }
+    }
+
+    return ColorRGBA(float((packed >> 16) & 0xFFu) / 255.f,
+                     float((packed >> 8) & 0xFFu) / 255.f,
+                     float(packed & 0xFFu) / 255.f,
+                     float(alpha & 0xFFu) / 255.f);
+}
+
+ColorRGBA opaque_texture_mapping_background_color_for_preview(ColorRGBA color)
+{
+    color.a(1.f);
+    return color;
+}
+
+std::optional<ColorRGBA> texture_mapping_background_color_from_config_for_preview(const ModelConfigObject &config)
+{
+    if (!config.has(TEXTURE_MAPPING_BACKGROUND_COLOR_CONFIG_KEY))
+        return std::nullopt;
+
+    const ConfigOptionString *opt = dynamic_cast<const ConfigOptionString *>(config.option(TEXTURE_MAPPING_BACKGROUND_COLOR_CONFIG_KEY));
+    if (opt == nullptr)
+        return std::nullopt;
+
+    const std::optional<ColorRGBA> color = parse_texture_mapping_color_hex_for_preview(opt->value);
+    return color ? std::optional<ColorRGBA>(opaque_texture_mapping_background_color_for_preview(*color)) : std::nullopt;
+}
+
+std::optional<ColorRGBA> texture_mapping_background_color_from_metadata_for_preview(const ColorFacetsAnnotation &annotation)
+{
+    const std::string &metadata = annotation.metadata_json();
+    const std::string key = "\"background_color\":\"#";
+    const size_t start = metadata.find(key);
+    if (start == std::string::npos || start + key.size() + 8 > metadata.size())
+        return std::nullopt;
+
+    const std::optional<ColorRGBA> color = parse_texture_mapping_color_hex_for_preview(metadata.substr(start + key.size() - 1, 9));
+    return color ? std::optional<ColorRGBA>(opaque_texture_mapping_background_color_for_preview(*color)) : std::nullopt;
+}
+
+ColorRGBA texture_mapping_background_color_for_preview(const ModelVolume &model_volume,
+                                                       const ColorFacetsAnnotation *color_source = nullptr)
+{
+    if (std::optional<ColorRGBA> color = texture_mapping_background_color_from_config_for_preview(model_volume.config))
+        return *color;
+    if (model_volume.get_object() != nullptr) {
+        if (std::optional<ColorRGBA> color = texture_mapping_background_color_from_config_for_preview(model_volume.get_object()->config))
+            return *color;
+    }
+    if (color_source != nullptr) {
+        if (std::optional<ColorRGBA> color = texture_mapping_background_color_from_metadata_for_preview(*color_source))
+            return *color;
+    }
+    if (std::optional<ColorRGBA> color = texture_mapping_background_color_from_metadata_for_preview(model_volume.texture_mapping_color_facets))
+        return *color;
+    return ColorRGBA(1.f, 1.f, 1.f, 1.f);
+}
+
+ColorRGBA composite_texture_mapping_color_over_background_for_preview(const ColorRGBA &color, const ColorRGBA &background)
+{
+    const float alpha = clamp01(color.a());
+    return ColorRGBA(clamp01(color.r() * alpha + background.r() * (1.f - alpha)),
+                     clamp01(color.g() * alpha + background.g() * (1.f - alpha)),
+                     clamp01(color.b() * alpha + background.b() * (1.f - alpha)),
+                     1.f);
+}
+
+void composite_texture_preview_rgba_over_background(std::vector<unsigned char> &rgba, const ColorRGBA &background)
+{
+    for (size_t idx = 0; idx + 3 < rgba.size(); idx += 4) {
+        const ColorRGBA color(float(rgba[idx + 0]) / 255.f,
+                              float(rgba[idx + 1]) / 255.f,
+                              float(rgba[idx + 2]) / 255.f,
+                              float(rgba[idx + 3]) / 255.f);
+        const ColorRGBA blended = composite_texture_mapping_color_over_background_for_preview(color, background);
+        rgba[idx + 0] = to_u8(blended.r());
+        rgba[idx + 1] = to_u8(blended.g());
+        rgba[idx + 2] = to_u8(blended.b());
+        rgba[idx + 3] = 255;
+    }
 }
 
 void configure_texture_preview_sampler(const GUI::GLTexture &texture)
@@ -374,13 +485,13 @@ std::array<unsigned int, 2> limited_simulated_texture_preview_size(unsigned int 
     return { limited_width, limited_height };
 }
 
-std::array<unsigned char, 3> sample_texture_preview_rgb_bilinear(const std::vector<unsigned char> &rgba,
-                                                                 unsigned int width,
-                                                                 unsigned int height,
-                                                                 unsigned int preview_x,
-                                                                 unsigned int preview_y,
-                                                                 unsigned int preview_width,
-                                                                 unsigned int preview_height)
+std::array<unsigned char, 4> sample_texture_preview_rgba_bilinear(const std::vector<unsigned char> &rgba,
+                                                                  unsigned int width,
+                                                                  unsigned int height,
+                                                                  unsigned int preview_x,
+                                                                  unsigned int preview_y,
+                                                                  unsigned int preview_width,
+                                                                  unsigned int preview_height)
 {
     const double src_x = std::clamp((double(preview_x) + 0.5) * double(width) / double(std::max(1u, preview_width)) - 0.5,
                                     0.0,
@@ -404,7 +515,150 @@ std::array<unsigned char, 3> sample_texture_preview_rgb_bilinear(const std::vect
         return static_cast<unsigned char>(std::clamp(int(std::lround(top * (1.0 - ty) + bottom * ty)), 0, 255));
     };
 
-    return { sample_channel(0), sample_channel(1), sample_channel(2) };
+    return { sample_channel(0), sample_channel(1), sample_channel(2), sample_channel(3) };
+}
+
+std::vector<float> sample_texture_preview_raw_offsets_bilinear(const std::vector<unsigned char> &offsets,
+                                                               unsigned int width,
+                                                               unsigned int height,
+                                                               unsigned int channels,
+                                                               unsigned int preview_x,
+                                                               unsigned int preview_y,
+                                                               unsigned int preview_width,
+                                                               unsigned int preview_height)
+{
+    std::vector<float> values(channels, 0.f);
+    if (width == 0 || height == 0 || channels == 0 ||
+        offsets.size() < size_t(width) * size_t(height) * size_t(channels))
+        return values;
+
+    const double src_x = std::clamp((double(preview_x) + 0.5) * double(width) / double(std::max(1u, preview_width)) - 0.5,
+                                    0.0,
+                                    double(width - 1));
+    const double src_y = std::clamp((double(preview_y) + 0.5) * double(height) / double(std::max(1u, preview_height)) - 0.5,
+                                    0.0,
+                                    double(height - 1));
+    const unsigned int x0 = std::min(width - 1, unsigned(std::floor(src_x)));
+    const unsigned int y0 = std::min(height - 1, unsigned(std::floor(src_y)));
+    const unsigned int x1 = std::min(width - 1, x0 + 1);
+    const unsigned int y1 = std::min(height - 1, y0 + 1);
+    const double tx = src_x - double(x0);
+    const double ty = src_y - double(y0);
+
+    auto channel_at = [&offsets, width, channels](unsigned int x, unsigned int y, unsigned int channel) {
+        return double(offsets[(size_t(y) * size_t(width) + size_t(x)) * size_t(channels) + size_t(channel)]) / 255.0;
+    };
+    for (unsigned int channel = 0; channel < channels; ++channel) {
+        const double top = channel_at(x0, y0, channel) * (1.0 - tx) + channel_at(x1, y0, channel) * tx;
+        const double bottom = channel_at(x0, y1, channel) * (1.0 - tx) + channel_at(x1, y1, channel) * tx;
+        values[size_t(channel)] = clamp01(float(top * (1.0 - ty) + bottom * ty));
+    }
+    return values;
+}
+
+std::vector<std::string> raw_filament_color_mode_channel_keys_for_texture_preview(int filament_color_mode, size_t component_count)
+{
+    std::vector<std::string> keys;
+    switch (std::clamp(filament_color_mode,
+                       int(TextureMappingZone::FilamentColorAny),
+                       int(TextureMappingZone::FilamentColorBW))) {
+    case int(TextureMappingZone::FilamentColorRGB):
+        keys = { "R", "G", "B" };
+        break;
+    case int(TextureMappingZone::FilamentColorCMY):
+        keys = { "C", "M", "Y" };
+        break;
+    case int(TextureMappingZone::FilamentColorCMYK):
+        keys = { "C", "M", "Y", "K" };
+        break;
+    case int(TextureMappingZone::FilamentColorCMYW):
+        keys = { "C", "M", "Y", "W" };
+        break;
+    case int(TextureMappingZone::FilamentColorRGBK):
+        keys = { "R", "G", "B", "K" };
+        break;
+    case int(TextureMappingZone::FilamentColorRGBW):
+        keys = { "R", "G", "B", "W" };
+        break;
+    case int(TextureMappingZone::FilamentColorBW):
+        keys = { "K", "W" };
+        break;
+    default:
+        break;
+    }
+    if (keys.size() > component_count)
+        keys.resize(component_count);
+    return keys;
+}
+
+std::vector<size_t> raw_component_source_channels_for_texture_preview(const std::string &metadata_json,
+                                                                      unsigned int source_channels,
+                                                                      int filament_color_mode,
+                                                                      size_t component_count)
+{
+    if (source_channels == 0 || component_count == 0)
+        return {};
+
+    const size_t sentinel = std::numeric_limits<size_t>::max();
+    std::vector<size_t> mapping(component_count, sentinel);
+    const std::vector<ImageMapRawFilament> filaments =
+        image_map_raw_filaments_from_metadata_json(metadata_json, source_channels);
+    if (filaments.size() != size_t(source_channels))
+        return {};
+
+    std::vector<std::string> source_keys(static_cast<size_t>(source_channels));
+    std::vector<uint8_t> used(static_cast<size_t>(source_channels), 0);
+    for (size_t channel = 0; channel < filaments.size(); ++channel) {
+        const std::string key = image_map_raw_filament_channel_key(filaments[channel], channel);
+        if (key.size() == 1 && image_map_raw_filament_is_standard_color(key))
+            source_keys[channel] = key;
+    }
+
+    const std::vector<std::string> target_keys =
+        raw_filament_color_mode_channel_keys_for_texture_preview(filament_color_mode, component_count);
+    if (!target_keys.empty()) {
+        for (size_t component_idx = 0; component_idx < target_keys.size(); ++component_idx) {
+            for (size_t channel = 0; channel < source_keys.size(); ++channel) {
+                if (used[channel] == 0 && source_keys[channel] == target_keys[component_idx]) {
+                    mapping[component_idx] = channel;
+                    used[channel] = 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    size_t next_source = 0;
+    for (size_t component_idx = 0; component_idx < mapping.size(); ++component_idx) {
+        if (mapping[component_idx] != sentinel)
+            continue;
+        while (next_source < source_keys.size() &&
+               (used[next_source] != 0 || (!target_keys.empty() && !source_keys[next_source].empty())))
+            ++next_source;
+        if (next_source >= source_keys.size())
+            continue;
+        mapping[component_idx] = next_source;
+        used[next_source] = 1;
+        ++next_source;
+    }
+
+    const bool has_mapping = std::any_of(mapping.begin(), mapping.end(), [sentinel](size_t value) { return value != sentinel; });
+    return has_mapping ? mapping : std::vector<size_t>{};
+}
+
+std::vector<float> map_raw_sample_to_components_for_texture_preview(const std::vector<float> &raw_sample,
+                                                                    const std::vector<size_t> &component_source_channels)
+{
+    if (component_source_channels.empty())
+        return {};
+    const size_t sentinel = std::numeric_limits<size_t>::max();
+    std::vector<float> mapped(component_source_channels.size(), 0.f);
+    for (size_t component_idx = 0; component_idx < component_source_channels.size(); ++component_idx) {
+        const size_t source_channel = component_source_channels[component_idx];
+        if (source_channel != sentinel && source_channel < raw_sample.size())
+            mapped[component_idx] = raw_sample[source_channel];
+    }
+    return mapped;
 }
 
 unsigned int texture_preview_rgb_cache_key(const std::array<unsigned char, 3> &rgb, bool quantize)
@@ -1302,6 +1556,10 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                                                                       unsigned int width,
                                                                       unsigned int height,
                                                                       std::vector<unsigned char> source_rgba,
+                                                                      std::vector<unsigned char> source_raw_offsets,
+                                                                      unsigned int source_raw_channels,
+                                                                      std::vector<size_t> source_raw_component_channels,
+                                                                      ColorRGBA background_color,
                                                                       TexturePreviewSimulationSettings settings)
 {
     TexturePreviewSimulationResult result;
@@ -1320,6 +1578,10 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
 
     prepare_texture_preview_simulation_settings(settings);
     const bool use_generic_solver = !settings.generic_mix_candidates.empty();
+    const bool use_raw_offsets =
+        settings.mapping_mode == int(TextureMappingZone::TextureMappingRawValues) &&
+        source_raw_component_channels.size() == settings.component_colors.size() &&
+        source_raw_offsets.size() >= size_t(width) * size_t(height) * size_t(source_raw_channels);
 
     std::unordered_map<unsigned int, std::array<unsigned char, 4>> simulated_color_cache;
     simulated_color_cache.reserve(std::min(size_t(result.width) * size_t(result.height),
@@ -1327,13 +1589,26 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
 
     for (unsigned int y = 0; y < result.height; ++y) {
         for (unsigned int x = 0; x < result.width; ++x) {
-            const std::array<unsigned char, 3> source_rgb =
-                sample_texture_preview_rgb_bilinear(source_rgba, width, height, x, y, result.width, result.height);
-            const unsigned int cache_key = texture_preview_rgb_cache_key(source_rgb, use_generic_solver);
+            const std::array<unsigned char, 4> source_rgba_sample =
+                sample_texture_preview_rgba_bilinear(source_rgba, width, height, x, y, result.width, result.height);
+            const ColorRGBA blended_source_color =
+                composite_texture_mapping_color_over_background_for_preview(ColorRGBA(float(source_rgba_sample[0]) / 255.f,
+                                                                                      float(source_rgba_sample[1]) / 255.f,
+                                                                                      float(source_rgba_sample[2]) / 255.f,
+                                                                                      float(source_rgba_sample[3]) / 255.f),
+                                                                            background_color);
+            const std::array<unsigned char, 3> source_rgb = {
+                to_u8(blended_source_color.r()),
+                to_u8(blended_source_color.g()),
+                to_u8(blended_source_color.b())
+            };
+            const unsigned int cache_key = use_raw_offsets ?
+                unsigned(std::numeric_limits<unsigned int>::max()) :
+                texture_preview_rgb_cache_key(source_rgb, use_generic_solver);
             const size_t idx = (size_t(y) * size_t(result.width) + size_t(x)) * 4;
 
-            auto cached_color = simulated_color_cache.find(cache_key);
-            if (cached_color != simulated_color_cache.end()) {
+            auto cached_color = !use_raw_offsets ? simulated_color_cache.find(cache_key) : simulated_color_cache.end();
+            if (!use_raw_offsets && cached_color != simulated_color_cache.end()) {
                 result.rgba[idx + 0] = cached_color->second[0];
                 result.rgba[idx + 1] = cached_color->second[1];
                 result.rgba[idx + 2] = cached_color->second[2];
@@ -1342,12 +1617,26 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
             }
 
             const std::array<float, 4> sample_rgba = {
-                float(source_rgb[0]) / 255.f,
-                float(source_rgb[1]) / 255.f,
-                float(source_rgb[2]) / 255.f,
+                blended_source_color.r(),
+                blended_source_color.g(),
+                blended_source_color.b(),
                 1.f
             };
-            const std::vector<float> component_weights = component_weights_for_texture_preview(settings, sample_rgba);
+            std::vector<float> component_weights;
+            if (use_raw_offsets) {
+                const std::vector<float> raw_sample =
+                    sample_texture_preview_raw_offsets_bilinear(source_raw_offsets,
+                                                                width,
+                                                                height,
+                                                                source_raw_channels,
+                                                                x,
+                                                                y,
+                                                                result.width,
+                                                                result.height);
+                component_weights = map_raw_sample_to_components_for_texture_preview(raw_sample, source_raw_component_channels);
+            } else {
+                component_weights = component_weights_for_texture_preview(settings, sample_rgba);
+            }
             float activity = 0.f;
             for (const float weight : component_weights)
                 activity = std::max(activity, clamp01(weight));
@@ -1362,7 +1651,8 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                 to_u8(simulated_rgb[2]),
                 255
             };
-            simulated_color_cache.emplace(cache_key, out_rgba);
+            if (!use_raw_offsets)
+                simulated_color_cache.emplace(cache_key, out_rgba);
             result.rgba[idx + 0] = out_rgba[0];
             result.rgba[idx + 1] = out_rgba[1];
             result.rgba[idx + 2] = out_rgba[2];
@@ -1506,6 +1796,7 @@ const GUI::GLTexture *simulated_texture_preview_texture_for_filament(const Model
     if (!settings.has_value())
         return &fallback_texture;
 
+    const ColorRGBA background_color = texture_mapping_background_color_for_preview(model_volume);
     const size_t simulation_signature = texture_preview_simulation_signature(model_volume, source_texture_signature, *settings);
     auto &cache = texture_preview_simulation_cache();
     const size_t cache_key = texture_preview_simulation_cache_key(model_volume, filament_id);
@@ -1540,17 +1831,33 @@ const GUI::GLTexture *simulated_texture_preview_texture_for_filament(const Model
         const unsigned int width = model_volume.imported_texture_width;
         const unsigned int height = model_volume.imported_texture_height;
         std::vector<unsigned char> source_rgba(model_volume.imported_texture_rgba.begin(), model_volume.imported_texture_rgba.end());
+        std::vector<unsigned char> source_raw_offsets(model_volume.imported_texture_raw_filament_offsets.begin(),
+                                                      model_volume.imported_texture_raw_filament_offsets.end());
+        const unsigned int source_raw_channels = model_volume.imported_texture_raw_channels;
         TexturePreviewSimulationSettings simulation_settings = *settings;
+        std::vector<size_t> source_raw_component_channels =
+            raw_component_source_channels_for_texture_preview(model_volume.imported_texture_raw_metadata_json,
+                                                              source_raw_channels,
+                                                              simulation_settings.filament_color_mode,
+                                                              simulation_settings.component_colors.size());
         entry.pending_future = std::async(std::launch::async,
                                           [simulation_signature,
                                            width,
                                            height,
                                            source_rgba = std::move(source_rgba),
+                                           source_raw_offsets = std::move(source_raw_offsets),
+                                           source_raw_channels,
+                                           source_raw_component_channels = std::move(source_raw_component_channels),
+                                           background_color,
                                            simulation_settings = std::move(simulation_settings)]() mutable {
                                               return build_simulated_texture_preview_result(simulation_signature,
                                                                                            width,
                                                                                            height,
                                                                                            std::move(source_rgba),
+                                                                                           std::move(source_raw_offsets),
+                                                                                           source_raw_channels,
+                                                                                           std::move(source_raw_component_channels),
+                                                                                           background_color,
                                                                                            std::move(simulation_settings));
                                           });
     }
@@ -1652,18 +1959,27 @@ bool build_vertex_color_preview_model_for_state(const ModelVolume               
     std::unordered_map<uint32_t, ColorRGBA> simulated_color_cache;
     if (simulation_settings != nullptr)
         simulated_color_cache.reserve(std::min(model_volume.imported_vertex_colors_rgba.size(), size_t(65536)));
-    auto source_vertex_color = [simulation_settings, &simulated_color_cache](uint32_t packed) {
-        const ColorRGBA source_color = unpack_vertex_color(packed);
+    const ColorRGBA background_color = texture_mapping_background_color_for_preview(model_volume);
+    auto preview_color = [simulation_settings, &simulated_color_cache, background_color](const ColorRGBA &source_color) {
+        const ColorRGBA blended_source =
+            composite_texture_mapping_color_over_background_for_preview(source_color, background_color);
         if (simulation_settings == nullptr)
-            return source_color;
+            return blended_source;
 
-        auto cached = simulated_color_cache.find(packed);
+        const uint32_t key = (uint32_t(std::clamp(blended_source.r(), 0.f, 1.f) * 255.f + 0.5f) << 24) |
+                             (uint32_t(std::clamp(blended_source.g(), 0.f, 1.f) * 255.f + 0.5f) << 16) |
+                             (uint32_t(std::clamp(blended_source.b(), 0.f, 1.f) * 255.f + 0.5f) << 8) |
+                             uint32_t(std::clamp(blended_source.a(), 0.f, 1.f) * 255.f + 0.5f);
+        auto cached = simulated_color_cache.find(key);
         if (cached != simulated_color_cache.end())
             return cached->second;
 
-        const ColorRGBA simulated_color = simulated_texture_preview_color_for_vertex_color(&source_color, simulation_settings);
-        simulated_color_cache.emplace(packed, simulated_color);
+        const ColorRGBA simulated_color = simulated_texture_preview_color_for_vertex_color(&blended_source, simulation_settings);
+        simulated_color_cache.emplace(key, simulated_color);
         return simulated_color;
+    };
+    auto source_vertex_color = [](uint32_t packed) {
+        return unpack_vertex_color(packed);
     };
 
     unsigned int vertex_index = 0;
@@ -1710,7 +2026,7 @@ bool build_vertex_color_preview_model_for_state(const ModelVolume               
                 valid_leaf = false;
                 break;
             }
-            leaf_colors[vertex_idx] = interpolate_color(source_colors, barycentric);
+            leaf_colors[vertex_idx] = preview_color(interpolate_color(source_colors, barycentric));
         }
         if (!valid_leaf)
             continue;
@@ -1842,19 +2158,22 @@ bool build_texture_mapping_color_preview_model_for_state(
     std::unordered_map<uint32_t, ColorRGBA> simulated_color_cache;
     if (simulation_settings != nullptr)
         simulated_color_cache.reserve(std::min(color_facets.size(), size_t(65536)));
-    auto preview_color = [simulation_settings, &simulated_color_cache](const ColorRGBA &source_color) {
+    const ColorRGBA background_color = texture_mapping_background_color_for_preview(model_volume, color_source);
+    auto preview_color = [simulation_settings, &simulated_color_cache, background_color](const ColorRGBA &source_color) {
+        const ColorRGBA blended_source =
+            composite_texture_mapping_color_over_background_for_preview(source_color, background_color);
         if (simulation_settings == nullptr)
-            return source_color;
+            return blended_source;
 
-        const uint32_t key = (uint32_t(std::clamp(source_color.r(), 0.f, 1.f) * 255.f + 0.5f) << 24) |
-                             (uint32_t(std::clamp(source_color.g(), 0.f, 1.f) * 255.f + 0.5f) << 16) |
-                             (uint32_t(std::clamp(source_color.b(), 0.f, 1.f) * 255.f + 0.5f) << 8) |
-                             uint32_t(std::clamp(source_color.a(), 0.f, 1.f) * 255.f + 0.5f);
+        const uint32_t key = (uint32_t(std::clamp(blended_source.r(), 0.f, 1.f) * 255.f + 0.5f) << 24) |
+                             (uint32_t(std::clamp(blended_source.g(), 0.f, 1.f) * 255.f + 0.5f) << 16) |
+                             (uint32_t(std::clamp(blended_source.b(), 0.f, 1.f) * 255.f + 0.5f) << 8) |
+                             uint32_t(std::clamp(blended_source.a(), 0.f, 1.f) * 255.f + 0.5f);
         auto cached = simulated_color_cache.find(key);
         if (cached != simulated_color_cache.end())
             return cached->second;
 
-        const ColorRGBA simulated_color = simulated_texture_preview_color_for_vertex_color(&source_color, simulation_settings);
+        const ColorRGBA simulated_color = simulated_texture_preview_color_for_vertex_color(&blended_source, simulation_settings);
         simulated_color_cache.emplace(key, simulated_color);
         return simulated_color;
     };
@@ -2621,10 +2940,21 @@ size_t model_volume_texture_preview_signature(const ModelVolume &model_volume)
     mix(size_t(model_volume.imported_texture_height));
     mix(model_volume.imported_texture_rgba.size());
     mix(reinterpret_cast<size_t>(model_volume.imported_texture_rgba.data()));
+    mix(size_t(model_volume.imported_texture_raw_channels));
+    mix(std::hash<std::string>{}(model_volume.imported_texture_raw_metadata_json));
+    mix(model_volume.imported_texture_raw_filament_offsets.size());
+    mix(reinterpret_cast<size_t>(model_volume.imported_texture_raw_filament_offsets.data()));
     mix(model_volume.imported_texture_uvs_per_face.size());
     mix(reinterpret_cast<size_t>(model_volume.imported_texture_uvs_per_face.data()));
     mix(model_volume.imported_texture_uv_valid.size());
     mix(reinterpret_cast<size_t>(model_volume.imported_texture_uv_valid.data()));
+    const ColorRGBA background = texture_mapping_background_color_for_preview(model_volume);
+    auto background_signature_component = [](float value) {
+        return size_t(std::clamp(value, 0.f, 1.f) * 255.f + 0.5f);
+    };
+    mix(background_signature_component(background.r()));
+    mix(background_signature_component(background.g()));
+    mix(background_signature_component(background.b()));
     return signature;
 }
 
@@ -2650,6 +2980,13 @@ size_t model_volume_texture_mapping_color_preview_signature(const ModelVolume &m
         mix(size_t(color));
     for (const char ch : data.metadata_json)
         mix(size_t(static_cast<unsigned char>(ch)));
+    const ColorRGBA background = texture_mapping_background_color_for_preview(model_volume);
+    auto background_signature_component = [](float value) {
+        return size_t(std::clamp(value, 0.f, 1.f) * 255.f + 0.5f);
+    };
+    mix(background_signature_component(background.r()));
+    mix(background_signature_component(background.g()));
+    mix(background_signature_component(background.b()));
     return signature;
 }
 
@@ -2666,7 +3003,7 @@ bool ensure_model_volume_texture_preview(const ModelVolume &model_volume,
 
     texture.reset();
     std::vector<unsigned char> texture_data(model_volume.imported_texture_rgba.begin(), model_volume.imported_texture_rgba.end());
-    make_texture_preview_rgba_opaque(texture_data);
+    composite_texture_preview_rgba_over_background(texture_data, texture_mapping_background_color_for_preview(model_volume));
     if (!texture.load_from_raw_data(std::move(texture_data), model_volume.imported_texture_width, model_volume.imported_texture_height)) {
         texture_signature = 0;
         return false;

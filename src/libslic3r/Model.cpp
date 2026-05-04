@@ -795,8 +795,11 @@ Model Model::read_from_file(const std::string&                                  
                     volume->imported_texture_uvs_per_face.clear();
                     volume->imported_texture_uv_valid.clear();
                     volume->imported_texture_rgba.clear();
+                    volume->imported_texture_raw_filament_offsets.clear();
                     volume->imported_texture_width = 0;
                     volume->imported_texture_height = 0;
+                    volume->imported_texture_raw_channels = 0;
+                    volume->imported_texture_raw_metadata_json.clear();
                     bool has_imported_usable_uv_texture_data = false;
 
                     const size_t triangle_count = volume->mesh().its.indices.size();
@@ -830,6 +833,9 @@ Model Model::read_from_file(const std::string&                                  
                                 volume->imported_texture_width = atlas_width;
                                 volume->imported_texture_height = atlas_height;
                                 volume->imported_texture_rgba = std::move(atlas_rgba);
+                                volume->imported_texture_raw_filament_offsets.clear();
+                                volume->imported_texture_raw_channels = 0;
+                                volume->imported_texture_raw_metadata_json.clear();
                                 has_imported_usable_uv_texture_data = has_any_valid_uv_face;
                             }
                         }
@@ -3357,6 +3363,7 @@ void ModelVolume::assign_new_unique_ids_recursive()
     imported_texture_uvs_per_face.set_new_unique_id();
     imported_texture_uv_valid.set_new_unique_id();
     imported_texture_rgba.set_new_unique_id();
+    imported_texture_raw_filament_offsets.set_new_unique_id();
     fuzzy_skin_facets.set_new_unique_id();
 }
 
@@ -4857,8 +4864,11 @@ static bool model_volume_texture_mapping_data_matches(const ModelVolume &mv_old,
            model_volume_imported_vector_matches(mv_old.imported_texture_uvs_per_face, mv_new.imported_texture_uvs_per_face) &&
            model_volume_imported_vector_matches(mv_old.imported_texture_uv_valid, mv_new.imported_texture_uv_valid) &&
            model_volume_imported_vector_matches(mv_old.imported_texture_rgba, mv_new.imported_texture_rgba) &&
+           model_volume_imported_vector_matches(mv_old.imported_texture_raw_filament_offsets, mv_new.imported_texture_raw_filament_offsets) &&
            mv_old.imported_texture_width == mv_new.imported_texture_width &&
-           mv_old.imported_texture_height == mv_new.imported_texture_height;
+           mv_old.imported_texture_height == mv_new.imported_texture_height &&
+           mv_old.imported_texture_raw_channels == mv_new.imported_texture_raw_channels &&
+           mv_old.imported_texture_raw_metadata_json == mv_new.imported_texture_raw_metadata_json;
 }
 
 bool model_texture_mapping_color_data_changed(const ModelObject& mo, const ModelObject& mo_new)

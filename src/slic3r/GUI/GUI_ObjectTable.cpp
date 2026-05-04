@@ -35,11 +35,14 @@ static wxString texture_mapping_table_label(const TextureMappingZone &zone)
     if (zone.is_2d_gradient())
         return _L("Texture Mapping 2D Gradient");
     const std::string color_model = TextureMappingManager::filament_color_mode_name(zone.filament_color_mode);
+    const bool raw_offset = zone.texture_mapping_mode == int(TextureMappingZone::TextureMappingRawValues);
     if (color_model == "any")
-        return _L("Texture Mapping");
+        return raw_offset ? _L("Raw Offset Texture Mapping Zone") : _L("Texture Mapping");
     wxString color_model_text = from_u8(color_model);
     color_model_text.MakeUpper();
-    return _L("Texture Mapping ") + color_model_text;
+    return raw_offset ?
+        _L("Raw Offset Texture Mapping ") + color_model_text :
+        _L("Texture Mapping ") + color_model_text;
 }
 
 //min row count

@@ -2338,6 +2338,13 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionString(""));
 
+    def = this->add("texture_mapping_background_color", coString);
+    def->label = L("Texture mapping background color");
+    def->tooltip = L("Background color used when texture mapping samples translucent color data.");
+    def->gui_flags = "serialized";
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionString("#FFFFFFFF"));
+
     def = this->add("texture_mapping_global_settings", coString);
     def->label = L("Texture mapping global settings");
     def->tooltip = L("Serialized global texture mapping settings.");

@@ -901,6 +901,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionPercent,             elefant_foot_layers_density))
     ((ConfigOptionFloat,               max_bridge_length))
     ((ConfigOptionFloatOrPercent,      line_width))
+    ((ConfigOptionString,              texture_mapping_background_color))
     // Force the generation of solid shells between adjacent materials/volumes.
     ((ConfigOptionBool,                interface_shells))
     ((ConfigOptionFloat,               layer_height))
