@@ -409,6 +409,85 @@ wxString sanitize_window_layout_for_wayland(const wxString& layout, bool* remove
 }
 #endif
 
+static ObjImportMode show_obj_import_choice_dialog(wxWindow *parent, const ObjImportCapabilities &capabilities)
+{
+    wxDialog dialog(parent ? parent : static_cast<wxWindow *>(wxGetApp().mainframe),
+                    wxID_ANY,
+                    _L("OBJ import"),
+                    wxDefaultPosition,
+                    wxDefaultSize,
+                    wxDEFAULT_DIALOG_STYLE);
+    dialog.SetBackgroundColour(*wxWHITE);
+
+    auto *main_sizer = new wxBoxSizer(wxVERTICAL);
+    auto *line_top   = new wxPanel(&dialog, wxID_ANY, wxDefaultPosition, wxSize(-1, 1));
+    line_top->SetBackgroundColour(wxColour(166, 169, 170));
+    main_sizer->Add(line_top, 0, wxEXPAND, 0);
+
+    auto *message = new wxStaticText(&dialog, wxID_ANY, _L("Choose how to import this OBJ file."));
+    message->Wrap(dialog.FromDIP(420));
+    main_sizer->Add(message, 0, wxALL | wxEXPAND, dialog.FromDIP(16));
+
+    const wxSize btn_size(dialog.FromDIP(420), dialog.FromDIP(30));
+    auto        *buttons = new wxBoxSizer(wxVERTICAL);
+
+    const bool     has_usable_texture_data = capabilities.texture_count > 0 && capabilities.has_valid_texture_uvs;
+    const bool     has_painted_region_data = capabilities.has_vertex_colors || capabilities.has_face_colors;
+    const bool     can_import_cmy_colors   = has_usable_texture_data || capabilities.has_vertex_colors;
+    const wxString texture_label           = has_usable_texture_data ?
+                                                 _L("Import with textures (for texture mapping)") :
+                                                 (capabilities.has_vertex_colors ?
+                                                      _L("Import with vertex colors (for texture mapping)") :
+                                                      _L("Import with textures (for texture mapping)"));
+    auto          *texture_btn             = new Button(&dialog, texture_label);
+    texture_btn->SetStyle(ButtonStyle::Confirm, ButtonType::Choice);
+    texture_btn->SetMinSize(btn_size);
+    if (!can_import_cmy_colors)
+        texture_btn->Enable(false);
+    buttons->Add(texture_btn, 0, wxLEFT | wxRIGHT | wxTOP | wxEXPAND, dialog.FromDIP(12));
+
+    const wxString painted_label = capabilities.has_vertex_colors ? _L("Import vertex colors as regions") :
+                                                                    _L("Import material colors as regions");
+    auto          *painted_btn   = new Button(&dialog, painted_label);
+    painted_btn->SetStyle(ButtonStyle::Regular, ButtonType::Choice);
+    painted_btn->SetMinSize(btn_size);
+    if (!has_painted_region_data)
+        painted_btn->Enable(false);
+    buttons->Add(painted_btn, 0, wxLEFT | wxRIGHT | wxTOP | wxEXPAND, dialog.FromDIP(12));
+
+    auto *neither_btn = new Button(&dialog, _L("Neither, import without colors"));
+    neither_btn->SetStyle(ButtonStyle::Regular, ButtonType::Choice);
+    neither_btn->SetMinSize(btn_size);
+    buttons->Add(neither_btn, 0, wxLEFT | wxRIGHT | wxTOP | wxBOTTOM | wxEXPAND, dialog.FromDIP(12));
+
+    main_sizer->Add(buttons, 0, wxEXPAND, 0);
+    dialog.SetSizerAndFit(main_sizer);
+    dialog.SetMinSize(wxSize(dialog.FromDIP(460), -1));
+
+    ObjImportMode selected = ObjImportMode::ImportNeither;
+    painted_btn->Bind(wxEVT_BUTTON, [&dialog, &selected](wxCommandEvent &) {
+        selected = ObjImportMode::ImportPaintedRegions;
+        dialog.EndModal(wxID_OK);
+    });
+    texture_btn->Bind(wxEVT_BUTTON, [&dialog, &selected](wxCommandEvent &) {
+        selected = ObjImportMode::ImportTextures;
+        dialog.EndModal(wxID_OK);
+    });
+    neither_btn->Bind(wxEVT_BUTTON, [&dialog, &selected](wxCommandEvent &) {
+        selected = ObjImportMode::ImportNeither;
+        dialog.EndModal(wxID_CANCEL);
+    });
+    dialog.Bind(wxEVT_CLOSE_WINDOW, [&dialog, &selected](wxCloseEvent &) {
+        selected = ObjImportMode::ImportNeither;
+        dialog.EndModal(wxID_CANCEL);
+    });
+
+    wxGetApp().UpdateDlgDarkUI(&dialog);
+    dialog.CenterOnParent();
+    dialog.ShowModal();
+    return selected;
+}
+
 static bool model_volume_has_imported_texture_mapping_data(const ModelVolume *volume)
 {
     return volume != nullptr &&
@@ -8325,6 +8404,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                 Semver                file_version;
 
                 //ObjImportColorFn obj_color_fun=nullptr;
+                bool obj_imported_for_texture_mapping = false;
                 auto obj_color_fun = [this, &path](ObjDialogInOut &in_out) {
 
                     if (!boost::iends_with(path.string(), ".obj")) { return; }
@@ -8334,12 +8414,12 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         in_out.filament_ids.clear();
                     }
                 };
-                auto obj_import_mode_fun = [&path](const ObjImportCapabilities &capabilities) -> ObjImportMode {
+                auto obj_import_mode_fun = [this, &path, &obj_imported_for_texture_mapping](const ObjImportCapabilities &capabilities) -> ObjImportMode {
                     if (!boost::iends_with(path.string(), ".obj"))
                         return ObjImportMode::UseDefault;
-                    if (capabilities.texture_count > 0 && capabilities.has_valid_texture_uvs)
-                        return ObjImportMode::ImportTextures;
-                    return ObjImportMode::UseDefault;
+                    const ObjImportMode mode        = show_obj_import_choice_dialog(q, capabilities);
+                    obj_imported_for_texture_mapping = mode == ObjImportMode::ImportTextures;
+                    return mode;
                 };
                 if (boost::iends_with(path.string(), ".stp") ||
                     boost::iends_with(path.string(), ".step")) {
@@ -8416,7 +8496,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
 
                 if (type_any_amf && is_xxx) imperial_units = true;
 
-                if (assign_imported_texture_mapping_zone(model)) {
+                if (obj_imported_for_texture_mapping && assign_imported_texture_mapping_zone(model)) {
                     sidebar->update_texture_mapping_panel(false);
                     sidebar->update_dynamic_filament_list();
                 }
@@ -10532,6 +10612,7 @@ void Plater::priv::reload_from_disk()
     // load one file at a time
     for (size_t i = 0; i < input_paths.size(); ++i) {
         const auto& path = input_paths[i].string();
+        bool        obj_imported_for_texture_mapping = false;
         auto        obj_color_fun = [this, &path](ObjDialogInOut &in_out) {
             if (!boost::iends_with(path, ".obj")) { return; }
             const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config(nullptr, false);
@@ -10540,12 +10621,12 @@ void Plater::priv::reload_from_disk()
                 in_out.filament_ids.clear();
             }
         };
-        auto obj_import_mode_fun = [&path](const ObjImportCapabilities &capabilities) -> ObjImportMode {
+        auto obj_import_mode_fun = [this, &path, &obj_imported_for_texture_mapping](const ObjImportCapabilities &capabilities) -> ObjImportMode {
             if (!boost::iends_with(path, ".obj"))
                 return ObjImportMode::UseDefault;
-            if (capabilities.texture_count > 0 && capabilities.has_valid_texture_uvs)
-                return ObjImportMode::ImportTextures;
-            return ObjImportMode::UseDefault;
+            const ObjImportMode mode        = show_obj_import_choice_dialog(q, capabilities);
+            obj_imported_for_texture_mapping = mode == ObjImportMode::ImportTextures;
+            return mode;
         };
         wxBusyCursor wait;
         wxBusyInfo info(_L("Reload from:") + " " + from_u8(path), q->get_current_canvas3D()->get_wxglcanvas());
@@ -10569,7 +10650,7 @@ void Plater::priv::reload_from_disk()
                 new_model = Model::read_from_file(path, nullptr, nullptr, LoadStrategy::AddDefaultInstances | LoadStrategy::LoadModel, &plate_data, &project_presets, nullptr, nullptr, nullptr, nullptr, nullptr, 0, obj_color_fun, obj_import_mode_fun);
             }
 
-            if (assign_imported_texture_mapping_zone(new_model)) {
+            if (obj_imported_for_texture_mapping && assign_imported_texture_mapping_zone(new_model)) {
                 sidebar->update_texture_mapping_panel(false);
                 sidebar->update_dynamic_filament_list();
             }
