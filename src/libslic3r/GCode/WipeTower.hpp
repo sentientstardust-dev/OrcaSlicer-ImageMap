@@ -14,6 +14,7 @@
 
 #include "libslic3r/Point.hpp"
 #include "libslic3r/Polygon.hpp"
+#include "libslic3r/TextureMapping.hpp"
 #include "libslic3r/Polyline.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 #include <unordered_set>
@@ -43,6 +44,13 @@ struct PrimeTowerTextureRenderSettings
     float angle_offset_deg = 0.f;
     int color_mode = Auto;
     bool generic_fallback_for_missing_channels = false;
+    bool compact_offset_mode = true;
+    bool settings_zone_enabled = false;
+    int texture_mapping_mode = int(TextureMappingZone::TextureMappingFilamentBlending);
+    int texture_filament_color_mode = int(TextureMappingZone::FilamentColorAny);
+    float contrast_pct = 100.f;
+    float tone_gamma = 1.f;
+    float sagging_ratio = 0.f;
     float global_strength = 1.f;
     float max_line_width = 0.95f;
     float min_line_width = 0.32f;
@@ -53,6 +61,10 @@ struct PrimeTowerTextureRenderSettings
     unsigned int image_width_back = 0;
     unsigned int image_height_back = 0;
     std::vector<std::string> filament_colours;
+    std::vector<size_t> tool_indices;
+    std::vector<unsigned int> component_ids;
+    std::vector<float> filament_strengths_pct;
+    std::vector<float> filament_minimum_offsets_pct;
     float z_min = 0.f;
     float z_max = 0.f;
 
@@ -63,13 +75,31 @@ struct PrimeTowerTextureRenderSettings
 
     float sample_tool_visibility(size_t tool, float u, float v) const
     {
-        return sample_tool_visibility_raw(tool, u, v);
+        const float raw_visibility = sample_tool_visibility_raw(tool, u, v);
+        if (settings_zone_enabled || !compact_offset_mode)
+            return raw_visibility;
+
+        float max_visibility = std::clamp(raw_visibility, 0.f, 1.f);
+        if (!tool_indices.empty()) {
+            for (const size_t candidate_tool : tool_indices) {
+                if (candidate_tool != tool)
+                    max_visibility = std::max(max_visibility, std::clamp(sample_tool_visibility_raw(candidate_tool, u, v), 0.f, 1.f));
+            }
+        } else {
+            for (size_t candidate_tool = 0; candidate_tool < filament_colours.size(); ++candidate_tool) {
+                if (candidate_tool != tool)
+                    max_visibility = std::max(max_visibility, std::clamp(sample_tool_visibility_raw(candidate_tool, u, v), 0.f, 1.f));
+            }
+        }
+        return max_visibility > 1e-6f ?
+            std::clamp(raw_visibility / max_visibility, 0.f, 1.f) :
+            std::clamp(raw_visibility, 0.f, 1.f);
     }
 
     float sample_tool_visibility(size_t tool, float u, float v, const std::vector<size_t> &normalization_tools) const
     {
         const float raw_visibility = sample_tool_visibility_raw(tool, u, v);
-        if (normalization_tools.empty())
+        if (settings_zone_enabled || !compact_offset_mode || normalization_tools.empty())
             return raw_visibility;
 
         float max_visibility = std::clamp(raw_visibility, 0.f, 1.f);
@@ -97,6 +127,8 @@ private:
         } else {
             use_back = back_valid;
         }
+        if (settings_zone_enabled)
+            return sample_settings_zone_tool_visibility(tool, u, v, use_back);
         return sample_image_tool_visibility(tool, u, v, use_back);
     }
 
@@ -109,13 +141,13 @@ private:
                 image_rgba.size() >= size_t(image_width) * size_t(image_height) * 4;
     }
 
-    float sample_image_tool_visibility(size_t tool, float u, float v, bool back) const
+    std::array<float, 3> sample_image_rgb(float u, float v, bool back) const
     {
         const std::vector<uint8_t> &rgba = back ? image_rgba_back : image_rgba;
         const unsigned int width = back ? image_width_back : image_width;
         const unsigned int height = back ? image_height_back : image_height;
         if (width == 0 || height == 0 || rgba.size() < size_t(width) * size_t(height) * 4)
-            return 1.f;
+            return {1.f, 1.f, 1.f};
 
         const float x = u * float(width);
         const float y = (1.f - v) * float(height - 1);
@@ -125,7 +157,14 @@ private:
         const float r = float(rgba[offset + 0]) / 255.f;
         const float g = float(rgba[offset + 1]) / 255.f;
         const float b = float(rgba[offset + 2]) / 255.f;
-        return color_mode == GenericSolver || color_mode == Auto ? generic_visibility(tool, r, g, b) : fixed_mode_visibility(tool, r, g, b);
+        return {r, g, b};
+    }
+
+    float sample_image_tool_visibility(size_t tool, float u, float v, bool back) const
+    {
+        const std::array<float, 3> rgb = sample_image_rgb(u, v, back);
+        return color_mode == GenericSolver || color_mode == Auto ? generic_visibility(tool, rgb[0], rgb[1], rgb[2]) :
+                                                                   fixed_mode_visibility(tool, rgb[0], rgb[1], rgb[2]);
     }
 
     static std::array<float, 3> parse_color(const std::string &hex)
@@ -172,6 +211,154 @@ private:
         const std::array<float, 3> target{r, g, b};
         const float distance = std::sqrt(color_distance2(tool_color(tool), target));
         return std::clamp(1.f - distance / std::sqrt(3.f), 0.f, 1.f);
+    }
+
+    static float apply_tone_gamma(float channel, float gamma)
+    {
+        const float safe_channel = std::clamp(channel, 0.f, 1.f);
+        const float safe_gamma = (!std::isfinite(gamma) || gamma <= 0.f) ? 1.f : std::clamp(gamma, 0.5f, 3.f);
+        return std::abs(safe_gamma - 1.f) <= 1e-5f ? safe_channel : std::clamp(std::pow(safe_channel, 1.f / safe_gamma), 0.f, 1.f);
+    }
+
+    std::vector<float> generic_component_weights(float r, float g, float b) const
+    {
+        std::vector<float> weights(component_ids.size(), 0.f);
+        for (size_t idx = 0; idx < component_ids.size(); ++idx) {
+            const unsigned int id = component_ids[idx];
+            weights[idx] = id > 0 ? generic_visibility(size_t(id - 1), r, g, b) : 0.f;
+        }
+        return weights;
+    }
+
+    static std::vector<float> fixed_mode_weights(int mode, size_t component_count, float r, float g, float b)
+    {
+        r = std::clamp(r, 0.f, 1.f);
+        g = std::clamp(g, 0.f, 1.f);
+        b = std::clamp(b, 0.f, 1.f);
+        const float whiteness = std::min({r, g, b});
+        const float darkness = 1.f - std::max({r, g, b});
+        switch (mode) {
+        case int(TextureMappingZone::FilamentColorRGB):
+            return component_count == 3 ?
+                std::vector<float>{print_visibility_strength(r), print_visibility_strength(g), print_visibility_strength(b)} :
+                std::vector<float>{};
+        case int(TextureMappingZone::FilamentColorCMY):
+            return component_count == 3 ?
+                std::vector<float>{print_visibility_strength(1.f - r),
+                                   print_visibility_strength(1.f - g),
+                                   print_visibility_strength(1.f - b)} :
+                std::vector<float>{};
+        case int(TextureMappingZone::FilamentColorBW): {
+            if (component_count != 2)
+                return {};
+            const float gray = std::clamp(0.2126f * r + 0.7152f * g + 0.0722f * b, 0.f, 1.f);
+            return {print_visibility_strength(gray >= 0.5f ? 2.f * (1.f - gray) : 1.f),
+                    print_visibility_strength(gray <= 0.5f ? 2.f * gray : 1.f)};
+        }
+        default:
+            break;
+        }
+        if (component_count != 4)
+            return {};
+        if (mode == int(TextureMappingZone::FilamentColorCMYK)) {
+            const float k = std::clamp(darkness, 0.f, 1.f);
+            const float inv = 1.f - k;
+            return {print_visibility_strength(safe_div(1.f - r - k, inv)),
+                    print_visibility_strength(safe_div(1.f - g - k, inv)),
+                    print_visibility_strength(safe_div(1.f - b - k, inv)),
+                    print_visibility_strength(k)};
+        }
+        if (mode == int(TextureMappingZone::FilamentColorCMYW)) {
+            const float inv = 1.f - whiteness;
+            const float r_no_w = safe_div(r - whiteness, inv);
+            const float g_no_w = safe_div(g - whiteness, inv);
+            const float b_no_w = safe_div(b - whiteness, inv);
+            return {print_visibility_strength(std::clamp((1.f - r_no_w) * inv, 0.f, 1.f)),
+                    print_visibility_strength(std::clamp((1.f - g_no_w) * inv, 0.f, 1.f)),
+                    print_visibility_strength(std::clamp((1.f - b_no_w) * inv, 0.f, 1.f)),
+                    std::clamp(std::pow(whiteness, 1.35f), 0.f, 1.f)};
+        }
+        if (mode == int(TextureMappingZone::FilamentColorRGBK)) {
+            const float k = std::clamp(darkness, 0.f, 1.f);
+            const float inv = 1.f - k;
+            return {print_visibility_strength(safe_div(r - k, inv)),
+                    print_visibility_strength(safe_div(g - k, inv)),
+                    print_visibility_strength(safe_div(b - k, inv)),
+                    print_visibility_strength(k)};
+        }
+        if (mode == int(TextureMappingZone::FilamentColorRGBW)) {
+            const float inv = 1.f - whiteness;
+            return {print_visibility_strength(safe_div(r - whiteness, inv)),
+                    print_visibility_strength(safe_div(g - whiteness, inv)),
+                    print_visibility_strength(safe_div(b - whiteness, inv)),
+                    print_visibility_strength(whiteness)};
+        }
+        return {};
+    }
+
+    static void apply_contrast(std::vector<float> &weights, float contrast_factor, size_t mapped_count)
+    {
+        const size_t count = std::min(mapped_count, weights.size());
+        if (count == 0)
+            return;
+        float mean = 0.f;
+        for (size_t idx = 0; idx < count; ++idx)
+            mean += std::clamp(weights[idx], 0.f, 1.f);
+        mean /= float(count);
+        for (size_t idx = 0; idx < count; ++idx)
+            weights[idx] = std::clamp(mean + (std::clamp(weights[idx], 0.f, 1.f) - mean) * contrast_factor, 0.f, 1.f);
+    }
+
+    float adjusted_visibility_factor(unsigned int physical_id, float value) const
+    {
+        const size_t idx = physical_id > 0 ? size_t(physical_id - 1) : size_t(-1);
+        const float strength = idx < filament_strengths_pct.size() && std::isfinite(filament_strengths_pct[idx]) ?
+            std::clamp(filament_strengths_pct[idx] / 100.f, 0.f, 1.f) :
+            1.f;
+        const float minimum = idx < filament_minimum_offsets_pct.size() && std::isfinite(filament_minimum_offsets_pct[idx]) ?
+            std::clamp(filament_minimum_offsets_pct[idx] / 100.f, 0.f, 1.f) :
+            0.f;
+        return std::clamp(minimum + std::clamp(value, 0.f, 1.f) * strength * (1.f - minimum), 0.f, 1.f);
+    }
+
+    float sample_settings_zone_tool_visibility(size_t tool, float u, float v, bool back) const
+    {
+        const unsigned int physical_id = unsigned(tool + 1);
+        const auto component_it = std::find(component_ids.begin(), component_ids.end(), physical_id);
+        if (component_it == component_ids.end())
+            return sample_image_tool_visibility(tool, u, v, back);
+        const size_t component_idx = size_t(component_it - component_ids.begin());
+
+        std::array<float, 3> rgb = sample_image_rgb(u, v, back);
+        rgb[0] = apply_tone_gamma(rgb[0], tone_gamma);
+        rgb[1] = apply_tone_gamma(rgb[1], tone_gamma);
+        rgb[2] = apply_tone_gamma(rgb[2], tone_gamma);
+
+        std::vector<float> weights(component_ids.size(), 0.f);
+        size_t mapped_count = component_ids.size();
+        if (texture_mapping_mode == int(TextureMappingZone::TextureMappingRawValues)) {
+            const float channels[3] = {rgb[0], rgb[1], rgb[2]};
+            mapped_count = std::min(component_ids.size(), size_t(3));
+            for (size_t idx = 0; idx < mapped_count; ++idx)
+                weights[idx] = std::clamp(channels[idx], 0.f, 1.f);
+        } else {
+            weights = fixed_mode_weights(texture_filament_color_mode, component_ids.size(), rgb[0], rgb[1], rgb[2]);
+            if (weights.size() != component_ids.size())
+                weights = generic_component_weights(rgb[0], rgb[1], rgb[2]);
+        }
+        if (weights.size() != component_ids.size() || component_idx >= weights.size())
+            return sample_image_tool_visibility(tool, u, v, back);
+
+        apply_contrast(weights, std::clamp(contrast_pct, 25.f, 300.f) / 100.f, mapped_count);
+        if (compact_offset_mode) {
+            float max_weight = 0.f;
+            for (const float weight : weights)
+                max_weight = std::max(max_weight, std::clamp(weight, 0.f, 1.f));
+            if (max_weight > 1e-6f)
+                for (float &weight : weights)
+                    weight = std::clamp(weight / max_weight, 0.f, 1.f);
+        }
+        return adjusted_visibility_factor(physical_id, weights[component_idx]);
     }
 
     float fixed_mode_visibility(size_t tool, float r, float g, float b) const

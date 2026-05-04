@@ -221,6 +221,7 @@ struct TextureMappingGlobalSettings
     bool enabled = false;
     float angle_offset_deg = 0.f;
     std::string prime_tower_color_mode = "auto";
+    uint64_t prime_tower_settings_zone_uid = 0;
     std::string image_file;
     std::string image_name;
     unsigned int image_width = 0;
@@ -275,6 +276,8 @@ public:
     std::vector<unsigned int> zone_ids_by_index() const;
     unsigned int allocate_zone_id(size_t num_physical) const;
     void normalize_zone_ids(size_t num_physical);
+    const TextureMappingZone *zone_from_stable_id(uint64_t stable_id) const;
+    TextureMappingZone       *zone_from_stable_id(uint64_t stable_id);
     const TextureMappingZone *zone_from_id(unsigned int zone_id) const;
     TextureMappingZone       *zone_from_id(unsigned int zone_id);
     bool is_texture_mapping_zone_id(unsigned int zone_id) const { return zone_from_id(zone_id) != nullptr; }

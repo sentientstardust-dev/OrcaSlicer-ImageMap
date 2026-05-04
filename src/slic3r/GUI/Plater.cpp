@@ -1032,6 +1032,7 @@ public:
                                         bool use_legacy_fixed_color_mode,
                                         int generic_solver_lookup_mode,
                                         int generic_solver_mode,
+                                        const TextureMappingManager &texture_mapping_zones,
                                         const TextureMappingGlobalSettings &global_settings,
                                         const TextureMappingPrimeTowerImage &prime_tower_image,
                                         const TextureMappingPrimeTowerImage &prime_tower_image_back,
@@ -1290,6 +1291,31 @@ public:
         color_mode_row->Add(m_prime_tower_color_mode_choice, 1, wxALIGN_CENTER_VERTICAL);
         global_root->Add(color_mode_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
 
+        auto *settings_zone_row = new wxBoxSizer(wxHORIZONTAL);
+        auto *settings_zone_label = new wxStaticText(global_page, wxID_ANY, _L("Use settings from"));
+        settings_zone_row->Add(settings_zone_label, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        wxArrayString settings_zone_choices;
+        settings_zone_choices.Add(_L("None"));
+        m_prime_tower_settings_zone_choice_uids.clear();
+        m_prime_tower_settings_zone_choice_uids.emplace_back(0);
+        int settings_zone_selection = 0;
+        const uint64_t selected_settings_zone_uid =
+            texture_mapping_zones.zone_from_stable_id(m_global_settings.prime_tower_settings_zone_uid) != nullptr ?
+                m_global_settings.prime_tower_settings_zone_uid :
+                0;
+        for (const TextureMappingZone &zone : texture_mapping_zones.zones()) {
+            if (!zone.enabled || zone.deleted || zone.stable_id == 0)
+                continue;
+            settings_zone_choices.Add(prime_tower_settings_zone_label(zone));
+            m_prime_tower_settings_zone_choice_uids.emplace_back(zone.stable_id);
+            if (zone.stable_id == selected_settings_zone_uid)
+                settings_zone_selection = int(m_prime_tower_settings_zone_choice_uids.size() - 1);
+        }
+        m_prime_tower_settings_zone_choice = new wxChoice(global_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, settings_zone_choices);
+        m_prime_tower_settings_zone_choice->SetSelection(settings_zone_selection);
+        settings_zone_row->Add(m_prime_tower_settings_zone_choice, 1, wxALIGN_CENTER_VERTICAL);
+        global_root->Add(settings_zone_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
         load_prime_image_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { load_prime_tower_image(false); });
         clear_prime_image_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
             m_prime_tower_image.clear();
@@ -1380,6 +1406,12 @@ public:
         settings.angle_offset_deg = float(std::clamp(m_prime_tower_angle_spin ? m_prime_tower_angle_spin->GetValue() : 0.0, 0.0, 360.0));
         settings.prime_tower_color_mode =
             prime_tower_color_mode_name(m_prime_tower_color_mode_choice ? m_prime_tower_color_mode_choice->GetSelection() : 0);
+        settings.prime_tower_settings_zone_uid = 0;
+        if (m_prime_tower_settings_zone_choice != nullptr) {
+            const int selection = m_prime_tower_settings_zone_choice->GetSelection();
+            if (selection >= 0 && size_t(selection) < m_prime_tower_settings_zone_choice_uids.size())
+                settings.prime_tower_settings_zone_uid = m_prime_tower_settings_zone_choice_uids[size_t(selection)];
+        }
         settings.image_file.clear();
         settings.image_name.clear();
         settings.image_width = 0;
@@ -1453,6 +1485,13 @@ private:
         if (normalized == "rgbw") return 7;
         if (normalized == "bw") return 8;
         return 0;
+    }
+
+    static wxString prime_tower_settings_zone_label(const TextureMappingZone &zone)
+    {
+        wxString mode = from_u8(TextureMappingManager::filament_color_mode_name(zone.filament_color_mode));
+        mode.MakeUpper();
+        return wxString::Format(_L("F%u - %s"), zone.zone_id, mode.c_str());
     }
 
     void update_prime_tower_image_label()
@@ -1566,6 +1605,8 @@ private:
     wxStaticText *m_prime_tower_image_back_label {nullptr};
     wxSpinCtrlDouble *m_prime_tower_angle_spin {nullptr};
     wxChoice *m_prime_tower_color_mode_choice {nullptr};
+    wxChoice *m_prime_tower_settings_zone_choice {nullptr};
+    std::vector<uint64_t> m_prime_tower_settings_zone_choice_uids;
     TextureMappingGlobalSettings m_global_settings;
     TextureMappingPrimeTowerImage m_prime_tower_image;
     TextureMappingPrimeTowerImage m_prime_tower_image_back;
@@ -5517,6 +5558,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.use_legacy_fixed_color_mode,
                                                     updated.generic_solver_lookup_mode,
                                                     updated.generic_solver_mode,
+                                                    bundle->texture_mapping_zones,
                                                     bundle->texture_mapping_global_settings,
                                                     wxGetApp().model().texture_mapping_prime_tower_image,
                                                     wxGetApp().model().texture_mapping_prime_tower_image_back,
@@ -5605,7 +5647,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             evt.StopPropagation();
             evt.Skip();
         });
-        menu_btn->Bind(wxEVT_BUTTON, [this, zone_index, num_physical, physical_colors, mgr_ptr, persist_rows, menu_btn](wxCommandEvent &) {
+        menu_btn->Bind(wxEVT_BUTTON, [this, zone_index, num_physical, physical_colors, mgr_ptr, persist_rows, menu_btn, bundle, set_config_string](wxCommandEvent &) {
             if (menu_btn == nullptr)
                 return;
             wxMenu menu;
@@ -5613,7 +5655,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             const int delete_id = wxWindow::NewControlId();
             menu.Append(duplicate_id, _L("Duplicate"));
             menu.Append(delete_id, _L("Delete"));
-            menu.Bind(wxEVT_COMMAND_MENU_SELECTED, [this, zone_index, num_physical, physical_colors, mgr_ptr, persist_rows, duplicate_id, delete_id](wxCommandEvent &evt) {
+            menu.Bind(wxEVT_COMMAND_MENU_SELECTED, [this, zone_index, num_physical, physical_colors, mgr_ptr, persist_rows, duplicate_id, delete_id, bundle, set_config_string](wxCommandEvent &evt) {
                 auto &rows = mgr_ptr->zones();
                 if (zone_index >= rows.size())
                     return;
@@ -5624,7 +5666,15 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                     return;
                 }
                 if (evt.GetId() == delete_id) {
+                    const uint64_t deleted_stable_id = rows[zone_index].stable_id;
                     rows.erase(rows.begin() + ptrdiff_t(zone_index));
+                    if (deleted_stable_id != 0 &&
+                        bundle->texture_mapping_global_settings.prime_tower_settings_zone_uid == deleted_stable_id) {
+                        TextureMappingGlobalSettings settings = bundle->texture_mapping_global_settings;
+                        settings.prime_tower_settings_zone_uid = 0;
+                        bundle->texture_mapping_global_settings = settings;
+                        set_config_string("texture_mapping_global_settings", bundle->texture_mapping_global_settings.serialize());
+                    }
                     p->m_expanded_texture_mapping_rows.clear();
                     persist_rows();
                     update_texture_mapping_panel(false);

@@ -562,6 +562,7 @@ std::string TextureMappingGlobalSettings::serialize() const
     if (!enabled &&
         std::abs((std::isfinite(angle_offset_deg) ? angle_offset_deg : 0.f)) <= 1e-6f &&
         normalized_mode == "auto" &&
+        prime_tower_settings_zone_uid == 0 &&
         image_file.empty() &&
         image_name.empty() &&
         image_width == 0 &&
@@ -578,6 +579,7 @@ std::string TextureMappingGlobalSettings::serialize() const
     prime_tower_texture_mapping["enabled"] = enabled;
     prime_tower_texture_mapping["angle_offset_deg"] = std::clamp(std::isfinite(angle_offset_deg) ? angle_offset_deg : 0.f, 0.f, 360.f);
     prime_tower_texture_mapping["prime_tower_color_mode"] = normalized_mode;
+    prime_tower_texture_mapping["settings_zone_uid"] = prime_tower_settings_zone_uid;
     prime_tower_texture_mapping["image_file"] = image_file;
     prime_tower_texture_mapping["image_name"] = image_name;
     prime_tower_texture_mapping["image_width"] = image_width;
@@ -614,6 +616,7 @@ void TextureMappingGlobalSettings::load(const std::string &serialized)
     enabled = prime_tower_texture_mapping.value("enabled", false);
     angle_offset_deg = std::clamp(prime_tower_texture_mapping.value("angle_offset_deg", 0.f), 0.f, 360.f);
     prime_tower_color_mode = normalize_color_mode_name(prime_tower_texture_mapping.value("prime_tower_color_mode", std::string("auto")));
+    prime_tower_settings_zone_uid = prime_tower_texture_mapping.value("settings_zone_uid", uint64_t(0));
     image_file = prime_tower_texture_mapping.value("image_file", std::string());
     image_name = prime_tower_texture_mapping.value("image_name", std::string());
     image_width = prime_tower_texture_mapping.value("image_width", 0u);
@@ -1148,6 +1151,26 @@ void TextureMappingManager::normalize_zone_ids(size_t num_physical)
         }
         zone.zone_id = reserve(zone.zone_id);
     }
+}
+
+const TextureMappingZone *TextureMappingManager::zone_from_stable_id(uint64_t stable_id) const
+{
+    if (stable_id == 0)
+        return nullptr;
+    for (const TextureMappingZone &zone : m_zones)
+        if (zone.enabled && !zone.deleted && zone.stable_id == stable_id)
+            return &zone;
+    return nullptr;
+}
+
+TextureMappingZone *TextureMappingManager::zone_from_stable_id(uint64_t stable_id)
+{
+    if (stable_id == 0)
+        return nullptr;
+    for (TextureMappingZone &zone : m_zones)
+        if (zone.enabled && !zone.deleted && zone.stable_id == stable_id)
+            return &zone;
+    return nullptr;
 }
 
 const TextureMappingZone *TextureMappingManager::zone_from_id(unsigned int zone_id) const

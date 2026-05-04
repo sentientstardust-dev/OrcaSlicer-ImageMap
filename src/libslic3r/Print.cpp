@@ -233,6 +233,34 @@ static int prime_tower_auto_color_mode_for_print(const ToolOrdering &tool_orderi
     return best_score >= 55.f ? best_mode : PrimeTowerTextureRenderSettings::GenericSolver;
 }
 
+static int prime_tower_texture_zone_color_mode_for_print(int filament_color_mode)
+{
+    switch (std::clamp(filament_color_mode, int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorBW))) {
+    case int(TextureMappingZone::FilamentColorRGB): return PrimeTowerTextureRenderSettings::RGB;
+    case int(TextureMappingZone::FilamentColorCMY): return PrimeTowerTextureRenderSettings::CMY;
+    case int(TextureMappingZone::FilamentColorCMYK): return PrimeTowerTextureRenderSettings::CMYK;
+    case int(TextureMappingZone::FilamentColorCMYW): return PrimeTowerTextureRenderSettings::CMYW;
+    case int(TextureMappingZone::FilamentColorRGBK): return PrimeTowerTextureRenderSettings::RGBK;
+    case int(TextureMappingZone::FilamentColorRGBW): return PrimeTowerTextureRenderSettings::RGBW;
+    case int(TextureMappingZone::FilamentColorBW): return PrimeTowerTextureRenderSettings::BW;
+    default: return PrimeTowerTextureRenderSettings::GenericSolver;
+    }
+}
+
+static int prime_tower_texture_mapping_color_mode_for_print(int prime_tower_color_mode)
+{
+    switch (prime_tower_color_mode) {
+    case PrimeTowerTextureRenderSettings::RGB: return int(TextureMappingZone::FilamentColorRGB);
+    case PrimeTowerTextureRenderSettings::CMY: return int(TextureMappingZone::FilamentColorCMY);
+    case PrimeTowerTextureRenderSettings::CMYK: return int(TextureMappingZone::FilamentColorCMYK);
+    case PrimeTowerTextureRenderSettings::CMYW: return int(TextureMappingZone::FilamentColorCMYW);
+    case PrimeTowerTextureRenderSettings::RGBK: return int(TextureMappingZone::FilamentColorRGBK);
+    case PrimeTowerTextureRenderSettings::RGBW: return int(TextureMappingZone::FilamentColorRGBW);
+    case PrimeTowerTextureRenderSettings::BW: return int(TextureMappingZone::FilamentColorBW);
+    default: return int(TextureMappingZone::FilamentColorAny);
+    }
+}
+
 template class PrintState<PrintStep, psCount>;
 template class PrintState<PrintObjectStep, posCount>;
 
@@ -3402,7 +3430,12 @@ void Print::_make_wipe_tower()
         const std::string mode = TextureMappingGlobalSettings::normalize_color_mode_name(
             m_texture_mapping_global_settings.prime_tower_color_mode);
         const bool auto_mode = mode == "auto";
-        if (auto_mode)
+        const TextureMappingZone *settings_zone =
+            m_texture_mapping_mgr.zone_from_stable_id(m_texture_mapping_global_settings.prime_tower_settings_zone_uid);
+        const bool have_settings_zone = settings_zone != nullptr && settings_zone->enabled && !settings_zone->deleted;
+        if (auto_mode && have_settings_zone)
+            texture.color_mode = prime_tower_texture_zone_color_mode_for_print(settings_zone->filament_color_mode);
+        else if (auto_mode)
             texture.color_mode = prime_tower_auto_color_mode_for_print(m_wipe_tower_data.tool_ordering, m_config.filament_colour.values);
         else if (mode == "generic_solver")
             texture.color_mode = PrimeTowerTextureRenderSettings::GenericSolver;
@@ -3424,6 +3457,38 @@ void Print::_make_wipe_tower()
         texture.enabled = true;
         texture.generic_fallback_for_missing_channels = auto_mode;
         texture.angle_offset_deg = m_texture_mapping_global_settings.angle_offset_deg;
+        if (have_settings_zone) {
+            texture.settings_zone_enabled = true;
+            texture.texture_mapping_mode = settings_zone->texture_mapping_mode;
+            texture.texture_filament_color_mode = auto_mode ?
+                settings_zone->filament_color_mode :
+                prime_tower_texture_mapping_color_mode_for_print(texture.color_mode);
+            texture.compact_offset_mode = settings_zone->compact_offset_mode;
+            texture.contrast_pct = settings_zone->contrast_pct;
+            texture.tone_gamma = settings_zone->tone_gamma;
+            texture.sagging_ratio = settings_zone->sagging_ratio;
+            texture.filament_strengths_pct = settings_zone->filament_strengths_pct;
+            texture.filament_minimum_offsets_pct = settings_zone->filament_minimum_offsets_pct;
+            const size_t num_physical = m_config.filament_diameter.values.size();
+            TextureMappingZone component_zone = *settings_zone;
+            component_zone.texture_mapping_mode = texture.texture_mapping_mode;
+            component_zone.filament_color_mode = texture.texture_filament_color_mode;
+            texture.component_ids =
+                TextureMappingManager::effective_texture_component_ids(component_zone, num_physical, m_config.filament_colour.values);
+            std::vector<char> used_components(num_physical + 1, 0);
+            texture.component_ids.erase(std::remove_if(texture.component_ids.begin(),
+                                                       texture.component_ids.end(),
+                                                       [&used_components, num_physical](unsigned int id) {
+                                                           if (id == 0 || id > num_physical || id >= used_components.size() ||
+                                                               used_components[id])
+                                                               return true;
+                                                           used_components[id] = 1;
+                                                           return false;
+                                                       }),
+                                        texture.component_ids.end());
+            if (texture.component_ids.empty())
+                texture.settings_zone_enabled = false;
+        }
         texture.global_strength = std::clamp(float(m_config.texture_mapping_outer_wall_gradient_global_strength.value) / 100.f, 0.f, 1.f);
         texture.max_line_width = std::max(0.05f, float(m_config.texture_mapping_outer_wall_gradient_max_line_width.value));
         texture.min_line_width = std::max(0.05f, float(m_config.texture_mapping_outer_wall_gradient_min_line_width.value));
@@ -3436,6 +3501,7 @@ void Print::_make_wipe_tower()
         texture.filament_colours = m_config.filament_colour.values;
         texture.filament_colours.resize(m_config.filament_diameter.values.size(), "#FFFFFF");
 
+        std::vector<char> used_texture_tools(texture.filament_colours.size(), 0);
         bool have_z = false;
         for (const LayerTools &lt : m_wipe_tower_data.tool_ordering.layer_tools()) {
             if (!lt.has_wipe_tower)
@@ -3444,6 +3510,12 @@ void Print::_make_wipe_tower()
             texture.z_min = have_z ? std::min(texture.z_min, z) : z;
             texture.z_max = have_z ? std::max(texture.z_max, z) : z;
             have_z = true;
+            for (const unsigned int extruder_id : lt.extruders) {
+                if (extruder_id < used_texture_tools.size() && !used_texture_tools[extruder_id]) {
+                    used_texture_tools[extruder_id] = 1;
+                    texture.tool_indices.emplace_back(size_t(extruder_id));
+                }
+            }
         }
         if (!have_z)
             texture.enabled = false;
