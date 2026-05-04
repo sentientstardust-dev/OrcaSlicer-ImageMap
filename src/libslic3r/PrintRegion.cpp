@@ -16,7 +16,7 @@ static bool filament_id_uses_texture_mapping(const Print &print, unsigned int fi
         return false;
 
     const TextureMappingZone *zone = print.texture_mapping_manager().zone_from_id(filament_id);
-    return zone != nullptr && zone->enabled && !zone->deleted && zone->is_image_texture();
+    return zone != nullptr && zone->enabled && !zone->deleted && (zone->is_2d_gradient() || zone->is_image_texture());
 }
 
 static void append_used_physical_extruders_for_filament_id(const Print                  &print,

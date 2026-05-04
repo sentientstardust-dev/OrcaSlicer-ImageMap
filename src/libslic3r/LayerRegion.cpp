@@ -7,6 +7,7 @@
 #include "Surface.hpp"
 #include "BoundingBox.hpp"
 #include "SVG.hpp"
+#include "TextureMapping.hpp"
 #include "Algorithm/RegionExpansion.hpp"
 
 #include <string>
@@ -16,6 +17,16 @@
 #include <boost/algorithm/clamp.hpp>
 
 namespace Slic3r {
+
+static bool region_uses_overhang_texture_mapping(const Print &print, const PrintRegionConfig &region_config)
+{
+    const int filament_id = region_config.wall_filament.value;
+    if (filament_id <= 0)
+        return false;
+
+    const TextureMappingZone *zone = print.texture_mapping_manager().zone_from_id(unsigned(filament_id));
+    return zone != nullptr && zone->enabled && !zone->deleted && (zone->is_2d_gradient() || zone->is_image_texture());
+}
 
 Flow LayerRegion::flow(FlowRole role) const
 {
@@ -117,7 +128,9 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
     g.overhang_flow         = this->bridging_flow(frPerimeter, object_config.thick_bridges);
     g.solid_infill_flow     = this->flow(frSolidInfill);
 
-    if (this->layer()->object()->config().wall_generator.value == PerimeterGeneratorType::Arachne && !spiral_mode)
+    const bool force_classic_wall_generator = region_uses_overhang_texture_mapping(*this->layer()->object()->print(), region_config);
+    if (this->layer()->object()->config().wall_generator.value == PerimeterGeneratorType::Arachne && !spiral_mode &&
+        !force_classic_wall_generator)
         g.process_arachne();
     else
         g.process_classic();
