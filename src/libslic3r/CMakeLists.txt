@@ -137,6 +137,8 @@ set(lisbslic3r_sources
     Feature/Interlocking/VoxelUtils.cpp
     Feature/Interlocking/VoxelUtils.hpp
     FileParserError.hpp
+    ColorSolver.cpp
+    ColorSolver.hpp
     filament_mixer.cpp
     filament_mixer.h
     filament_mixer_model.h
@@ -587,6 +589,7 @@ target_link_libraries(libslic3r
         libnest2d
         miniz
         opencv_world
+        pigment_painter
     PRIVATE
         ${CMAKE_DL_LIBS}
         ${EXPAT_LIBRARIES}

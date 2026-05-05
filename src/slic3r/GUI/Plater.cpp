@@ -1036,6 +1036,7 @@ public:
                                         bool use_legacy_fixed_color_mode,
                                         int generic_solver_lookup_mode,
                                         int generic_solver_mode,
+                                        int generic_solver_mix_model,
                                         const TextureMappingManager &texture_mapping_zones,
                                         const TextureMappingGlobalSettings &global_settings,
                                         const TextureMappingPrimeTowerImage &prime_tower_image,
@@ -1216,6 +1217,23 @@ public:
                                                               int(TextureMappingZone::GenericSolverV2)));
         generic_solver_mode_row->Add(m_generic_solver_mode_choice, 1, wxALIGN_CENTER_VERTICAL);
         experimental_box->Add(generic_solver_mode_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
+        auto *generic_solver_mix_model_row = new wxBoxSizer(wxHORIZONTAL);
+        generic_solver_mix_model_row->Add(new wxStaticText(experimental_page, wxID_ANY, _L("Generic solver mixer")),
+                                          0,
+                                          wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                                          gap);
+        wxArrayString generic_solver_mix_model_choices;
+        generic_solver_mix_model_choices.Add(_L("Filament mixer"));
+        generic_solver_mix_model_choices.Add(_L("Pigment Painter"));
+        m_generic_solver_mix_model_choice =
+            new wxChoice(experimental_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, generic_solver_mix_model_choices);
+        m_generic_solver_mix_model_choice->SetSelection(std::clamp(generic_solver_mix_model,
+                                                                   int(TextureMappingZone::GenericSolverFilamentMixer),
+                                                                   int(TextureMappingZone::GenericSolverPigmentPainter)));
+        generic_solver_mix_model_row->Add(m_generic_solver_mix_model_choice, 1, wxALIGN_CENTER_VERTICAL);
+        experimental_box->Add(generic_solver_mix_model_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
         auto *generic_solver_row = new wxBoxSizer(wxHORIZONTAL);
         generic_solver_row->Add(new wxStaticText(experimental_page, wxID_ANY, _L("Generic solver lookup")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         wxArrayString generic_solver_choices;
@@ -1401,6 +1419,15 @@ public:
                        int(TextureMappingZone::GenericSolverLegacy),
                        int(TextureMappingZone::GenericSolverV2)) :
             int(TextureMappingZone::GenericSolverV2);
+    }
+
+    int generic_solver_mix_model() const
+    {
+        return m_generic_solver_mix_model_choice ?
+            std::clamp(m_generic_solver_mix_model_choice->GetSelection(),
+                       int(TextureMappingZone::GenericSolverFilamentMixer),
+                       int(TextureMappingZone::GenericSolverPigmentPainter)) :
+            TextureMappingZone::DefaultGenericSolverMixModel;
     }
 
     TextureMappingGlobalSettings global_settings() const
@@ -1604,6 +1631,7 @@ private:
     wxCheckBox *m_use_legacy_fixed_color_mode_checkbox {nullptr};
     wxChoice *m_generic_solver_lookup_choice {nullptr};
     wxChoice *m_generic_solver_mode_choice {nullptr};
+    wxChoice *m_generic_solver_mix_model_choice {nullptr};
     wxCheckBox *m_prime_tower_mapping_enabled_checkbox {nullptr};
     wxStaticText *m_prime_tower_image_label {nullptr};
     wxStaticText *m_prime_tower_image_back_label {nullptr};
@@ -5562,6 +5590,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.use_legacy_fixed_color_mode,
                                                     updated.generic_solver_lookup_mode,
                                                     updated.generic_solver_mode,
+                                                    updated.generic_solver_mix_model,
                                                     bundle->texture_mapping_zones,
                                                     bundle->texture_mapping_global_settings,
                                                     wxGetApp().model().texture_mapping_prime_tower_image,
@@ -5585,6 +5614,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.use_legacy_fixed_color_mode = dlg.use_legacy_fixed_color_mode();
             updated.generic_solver_lookup_mode = dlg.generic_solver_lookup_mode();
             updated.generic_solver_mode = dlg.generic_solver_mode();
+            updated.generic_solver_mix_model = dlg.generic_solver_mix_model();
             const TextureMappingGlobalSettings dlg_global_settings = dlg.global_settings();
             const bool global_settings_changed =
                 dlg_global_settings.serialize() != bundle->texture_mapping_global_settings.serialize();

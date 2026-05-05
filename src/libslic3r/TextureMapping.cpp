@@ -541,6 +541,26 @@ static int generic_solver_mode_from_name(std::string name)
         int(TextureMappingZone::GenericSolverV2);
 }
 
+static std::string generic_solver_mix_model_name(int model)
+{
+    return clamp_int(model,
+                     int(TextureMappingZone::GenericSolverFilamentMixer),
+                     int(TextureMappingZone::GenericSolverPigmentPainter)) ==
+               int(TextureMappingZone::GenericSolverPigmentPainter) ?
+        std::string("pigment_painter") :
+        std::string("filament_mixer");
+}
+
+static int generic_solver_mix_model_from_name(std::string name)
+{
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    if (name == "pigment_painter" || name == "pigment-painter" || name == "pigment")
+        return int(TextureMappingZone::GenericSolverPigmentPainter);
+    if (name == "filament_mixer" || name == "filament-mixer" || name == "filament")
+        return int(TextureMappingZone::GenericSolverFilamentMixer);
+    return TextureMappingZone::DefaultGenericSolverMixModel;
+}
+
 static std::string normalized_prime_tower_color_mode_name(std::string name)
 {
     std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return char(std::tolower(c)); });
@@ -691,6 +711,7 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            use_legacy_fixed_color_mode == rhs.use_legacy_fixed_color_mode &&
            generic_solver_lookup_mode == rhs.generic_solver_lookup_mode &&
            generic_solver_mode == rhs.generic_solver_mode &&
+           generic_solver_mix_model == rhs.generic_solver_mix_model &&
            std::abs(contrast_pct - rhs.contrast_pct) <= eps &&
            high_resolution_sampling == rhs.high_resolution_sampling &&
            std::abs(tone_gamma - rhs.tone_gamma) <= eps &&
@@ -932,6 +953,7 @@ std::string TextureMappingManager::serialize_entries()
         texture["use_legacy_fixed_color_mode"] = zone.use_legacy_fixed_color_mode;
         texture["generic_solver_lookup"] = generic_solver_lookup_mode_name(zone.generic_solver_lookup_mode);
         texture["generic_solver_mode"] = generic_solver_mode_name(zone.generic_solver_mode);
+        texture["generic_solver_mix_model"] = generic_solver_mix_model_name(zone.generic_solver_mix_model);
         texture["contrast_pct"] = std::clamp(finite_or(zone.contrast_pct, 100.f), 25.f, 300.f);
         texture["high_resolution_sampling"] = zone.high_resolution_sampling;
         texture["tone_gamma"] = normalize_tone_gamma(zone.tone_gamma);
@@ -1063,6 +1085,8 @@ void TextureMappingManager::load_entries(const std::string &serialized,
                 (zone.filament_color_mode == int(TextureMappingZone::FilamentColorAny) ?
                      int(TextureMappingZone::GenericSolverLegacy) :
                      int(TextureMappingZone::GenericSolverV2));
+        zone.generic_solver_mix_model =
+            generic_solver_mix_model_from_name(texture.value("generic_solver_mix_model", std::string("pigment_painter")));
         zone.contrast_pct = std::clamp(texture.value("contrast_pct", 100.f), 25.f, 300.f);
         zone.high_resolution_sampling = texture.value("high_resolution_sampling", true);
         zone.tone_gamma = normalize_tone_gamma(texture.value("tone_gamma", 1.f));

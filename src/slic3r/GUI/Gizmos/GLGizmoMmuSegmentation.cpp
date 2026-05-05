@@ -16,7 +16,7 @@
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/TextureMapping.hpp"
-#include "libslic3r/filament_mixer.h"
+#include "libslic3r/ColorSolver.hpp"
 #include "slic3r/Utils/UndoRedo.hpp"
 #include "GLGizmoUtils.hpp"
 
@@ -1031,86 +1031,60 @@ static std::vector<ColorRGBA> raw_filament_colors_for_projection_preview(const s
     return colors;
 }
 
-static ColorRGBA raw_flat_blend_color_from_filaments(const std::vector<ColorRGBA> &filament_colors)
+static std::vector<std::array<float, 3>> raw_projection_solver_component_colors(const std::vector<ColorRGBA> &filament_colors)
 {
-    const std::vector<float> weights(filament_colors.size(), 1.f);
-    return color_mix_from_weights(filament_colors, weights, ColorRGBA(1.f, 1.f, 1.f, 1.f));
+    std::vector<std::array<float, 3>> colors;
+    colors.reserve(filament_colors.size());
+    for (const ColorRGBA &color : filament_colors)
+        colors.push_back({ color.r(), color.g(), color.b() });
+    return colors;
 }
-
-struct RawOffsetColorConversionCandidate
-{
-    std::array<float, 3> rgb { 0.f, 0.f, 0.f };
-    std::vector<uint8_t> values;
-};
-
-struct RawOffsetColorConversionKdNode
-{
-    uint32_t candidate_idx = 0;
-    int      left = -1;
-    int      right = -1;
-    uint8_t  axis = 0;
-};
-
-struct RawOffsetColorConversionNearest
-{
-    size_t best_idx = size_t(-1);
-    float  best_error = std::numeric_limits<float>::max();
-};
 
 struct RawOffsetColorConversionSolver
 {
-    std::vector<RawOffsetColorConversionCandidate> candidates;
-    std::vector<RawOffsetColorConversionKdNode>    nodes;
-    int                                            root = -1;
+    ColorSolverCandidateSet candidates;
     std::unordered_map<unsigned int, std::vector<uint8_t>> cache;
 };
 
+static ColorRGBA raw_projection_color_from_solver_rgb(const std::array<float, 3> &rgb, const ColorRGBA &fallback)
+{
+    return ColorRGBA(std::clamp(rgb[0], 0.f, 1.f),
+                     std::clamp(rgb[1], 0.f, 1.f),
+                     std::clamp(rgb[2], 0.f, 1.f),
+                     fallback.a());
+}
+
+static ColorRGBA mix_raw_offset_projection_solver_color(const std::vector<std::array<float, 3>> &component_colors,
+                                                        const std::vector<float>                &weights,
+                                                        const ColorRGBA                         &fallback,
+                                                        int                                      generic_solver_mix_model)
+{
+    if (component_colors.empty() || weights.empty())
+        return fallback;
+
+    const std::array<float, 3> mixed =
+        mix_color_solver_components(component_colors, weights, color_solver_mix_model_from_index(generic_solver_mix_model));
+    return raw_projection_color_from_solver_rgb(mixed, fallback);
+}
+
 static ColorRGBA mix_raw_offset_projection_color(const std::vector<ColorRGBA> &filament_colors,
                                                  const std::vector<float>     &weights,
-                                                 const ColorRGBA              &fallback)
+                                                 const ColorRGBA              &fallback,
+                                                 int                           generic_solver_mix_model)
 {
     if (filament_colors.empty() || weights.empty())
         return fallback;
 
-    bool has_base = false;
-    float out_r = 0.f;
-    float out_g = 0.f;
-    float out_b = 0.f;
-    float accumulated = 0.f;
-    for (size_t idx = 0; idx < filament_colors.size() && idx < weights.size(); ++idx) {
-        const float weight = std::clamp(weights[idx], 0.f, 1.f);
-        if (weight <= EPSILON)
-            continue;
-        if (!has_base) {
-            out_r = filament_colors[idx].r();
-            out_g = filament_colors[idx].g();
-            out_b = filament_colors[idx].b();
-            accumulated = weight;
-            has_base = true;
-            continue;
-        }
+    return mix_raw_offset_projection_solver_color(raw_projection_solver_component_colors(filament_colors),
+                                                 weights,
+                                                 fallback,
+                                                 generic_solver_mix_model);
+}
 
-        const float t = weight / std::max(float(EPSILON), accumulated + weight);
-        float mixed_r = out_r;
-        float mixed_g = out_g;
-        float mixed_b = out_b;
-        Slic3r::filament_mixer_lerp_float(out_r,
-                                          out_g,
-                                          out_b,
-                                          filament_colors[idx].r(),
-                                          filament_colors[idx].g(),
-                                          filament_colors[idx].b(),
-                                          t,
-                                          &mixed_r,
-                                          &mixed_g,
-                                          &mixed_b);
-        out_r = std::clamp(mixed_r, 0.f, 1.f);
-        out_g = std::clamp(mixed_g, 0.f, 1.f);
-        out_b = std::clamp(mixed_b, 0.f, 1.f);
-        accumulated += weight;
-    }
-
-    return has_base ? ColorRGBA(out_r, out_g, out_b, fallback.a()) : fallback;
+static ColorRGBA raw_flat_blend_color_from_filaments(const std::vector<ColorRGBA> &filament_colors, int generic_solver_mix_model)
+{
+    const std::vector<float> weights(filament_colors.size(), 1.f);
+    return mix_raw_offset_projection_color(filament_colors, weights, ColorRGBA(1.f, 1.f, 1.f, 1.f), generic_solver_mix_model);
 }
 
 static int raw_offset_color_conversion_total_units(size_t component_count)
@@ -1118,163 +1092,14 @@ static int raw_offset_color_conversion_total_units(size_t component_count)
     return component_count <= 4 ? 40 : (component_count == 5 ? 24 : 20);
 }
 
-static size_t raw_offset_color_conversion_candidate_count(size_t component_count, int total_units)
-{
-    if (component_count == 0)
-        return 0;
-
-    const size_t n = size_t(total_units) + component_count - 1;
-    size_t k = component_count - 1;
-    k = std::min(k, n - k);
-
-    size_t result = 1;
-    for (size_t idx = 1; idx <= k; ++idx)
-        result = (result * (n - k + idx)) / idx;
-    return result;
-}
-
-static std::vector<RawOffsetColorConversionCandidate> build_raw_offset_color_conversion_candidates(
-    const std::vector<ColorRGBA> &filament_colors)
-{
-    if (filament_colors.empty())
-        return {};
-
-    const size_t component_count = filament_colors.size();
-    const int total_units = raw_offset_color_conversion_total_units(component_count);
-    std::vector<int> units(component_count, 0);
-    std::vector<RawOffsetColorConversionCandidate> candidates;
-    candidates.reserve(raw_offset_color_conversion_candidate_count(component_count, total_units));
-
-    std::function<void(size_t, int)> recurse = [&](size_t idx, int remaining_units) {
-        if (idx + 1 == component_count) {
-            units[idx] = remaining_units;
-            RawOffsetColorConversionCandidate candidate;
-            std::vector<float> weights(component_count, 0.f);
-            candidate.values.assign(component_count, 0);
-            for (size_t weight_idx = 0; weight_idx < component_count; ++weight_idx) {
-                weights[weight_idx] = float(units[weight_idx]) / float(std::max(1, total_units));
-                candidate.values[weight_idx] = uint8_t(std::clamp(int(std::lround(weights[weight_idx] * 255.f)), 0, 255));
-            }
-            const ColorRGBA mixed =
-                mix_raw_offset_projection_color(filament_colors, weights, ColorRGBA(1.f, 1.f, 1.f, 1.f));
-            candidate.rgb = { mixed.r(), mixed.g(), mixed.b() };
-            candidates.emplace_back(std::move(candidate));
-            return;
-        }
-
-        for (int unit = 0; unit <= remaining_units; ++unit) {
-            units[idx] = unit;
-            recurse(idx + 1, remaining_units - unit);
-        }
-    };
-    recurse(0, total_units);
-    return candidates;
-}
-
-static int build_raw_offset_color_conversion_kd_tree(const std::vector<RawOffsetColorConversionCandidate> &candidates,
-                                                     std::vector<RawOffsetColorConversionKdNode>          &nodes,
-                                                     std::vector<uint32_t>                                &indices,
-                                                     size_t                                                begin,
-                                                     size_t                                                end,
-                                                     uint8_t                                               axis)
-{
-    if (begin >= end)
-        return -1;
-
-    const size_t mid = begin + (end - begin) / 2;
-    auto axis_value = [&candidates, axis](uint32_t candidate_idx) {
-        return candidates[size_t(candidate_idx)].rgb[size_t(axis)];
-    };
-    std::nth_element(indices.begin() + begin,
-                     indices.begin() + mid,
-                     indices.begin() + end,
-                     [&axis_value](uint32_t lhs, uint32_t rhs) {
-                         return axis_value(lhs) < axis_value(rhs);
-                     });
-
-    const int node_idx = int(nodes.size());
-    RawOffsetColorConversionKdNode node;
-    node.candidate_idx = indices[mid];
-    node.axis = axis;
-    nodes.emplace_back(node);
-
-    const uint8_t next_axis = uint8_t((axis + 1) % 3);
-    const int left = build_raw_offset_color_conversion_kd_tree(candidates, nodes, indices, begin, mid, next_axis);
-    const int right = build_raw_offset_color_conversion_kd_tree(candidates, nodes, indices, mid + 1, end, next_axis);
-    nodes[size_t(node_idx)].left = left;
-    nodes[size_t(node_idx)].right = right;
-    return node_idx;
-}
-
-static int build_raw_offset_color_conversion_kd_tree(const std::vector<RawOffsetColorConversionCandidate> &candidates,
-                                                     std::vector<RawOffsetColorConversionKdNode>          &nodes)
-{
-    nodes.clear();
-    if (candidates.empty())
-        return -1;
-
-    std::vector<uint32_t> indices(candidates.size(), 0);
-    for (size_t idx = 0; idx < indices.size(); ++idx)
-        indices[idx] = uint32_t(idx);
-    nodes.reserve(candidates.size());
-    return build_raw_offset_color_conversion_kd_tree(candidates, nodes, indices, 0, candidates.size(), 0);
-}
-
-static float raw_offset_color_conversion_error(const RawOffsetColorConversionCandidate &candidate,
-                                               const std::array<float, 3>             &target)
-{
-    return Slic3r::sqr(candidate.rgb[0] - target[0]) +
-           Slic3r::sqr(candidate.rgb[1] - target[1]) +
-           Slic3r::sqr(candidate.rgb[2] - target[2]);
-}
-
-static void raw_offset_color_conversion_consider_candidate(
-    const std::vector<RawOffsetColorConversionCandidate> &candidates,
-    size_t                                                candidate_idx,
-    const std::array<float, 3>                           &target,
-    RawOffsetColorConversionNearest                      &nearest)
-{
-    if (candidate_idx >= candidates.size())
-        return;
-    const float error = raw_offset_color_conversion_error(candidates[candidate_idx], target);
-    if (error < nearest.best_error) {
-        nearest.best_error = error;
-        nearest.best_idx = candidate_idx;
-    }
-}
-
-static void query_raw_offset_color_conversion_kd_tree(
-    const std::vector<RawOffsetColorConversionCandidate> &candidates,
-    const std::vector<RawOffsetColorConversionKdNode>    &nodes,
-    const std::array<float, 3>                           &target,
-    int                                                   node_idx,
-    RawOffsetColorConversionNearest                      &nearest)
-{
-    if (node_idx < 0 || size_t(node_idx) >= nodes.size())
-        return;
-
-    const RawOffsetColorConversionKdNode &node = nodes[size_t(node_idx)];
-    if (size_t(node.candidate_idx) >= candidates.size()) {
-        query_raw_offset_color_conversion_kd_tree(candidates, nodes, target, node.left, nearest);
-        query_raw_offset_color_conversion_kd_tree(candidates, nodes, target, node.right, nearest);
-        return;
-    }
-
-    raw_offset_color_conversion_consider_candidate(candidates, size_t(node.candidate_idx), target, nearest);
-    const uint8_t axis = node.axis;
-    const float split_delta = target[size_t(axis)] - candidates[size_t(node.candidate_idx)].rgb[size_t(axis)];
-    const int near_node = split_delta < 0.f ? node.left : node.right;
-    const int far_node = split_delta < 0.f ? node.right : node.left;
-    query_raw_offset_color_conversion_kd_tree(candidates, nodes, target, near_node, nearest);
-    if (Slic3r::sqr(split_delta) <= nearest.best_error)
-        query_raw_offset_color_conversion_kd_tree(candidates, nodes, target, far_node, nearest);
-}
-
-static RawOffsetColorConversionSolver build_raw_offset_color_conversion_solver(const std::vector<ColorRGBA> &filament_colors)
+static RawOffsetColorConversionSolver build_raw_offset_color_conversion_solver(const std::vector<ColorRGBA> &filament_colors,
+                                                                               int                           generic_solver_mix_model)
 {
     RawOffsetColorConversionSolver solver;
-    solver.candidates = build_raw_offset_color_conversion_candidates(filament_colors);
-    solver.root = build_raw_offset_color_conversion_kd_tree(solver.candidates, solver.nodes);
+    solver.candidates =
+        build_color_solver_candidates(raw_projection_solver_component_colors(filament_colors),
+                                      color_solver_mix_model_from_index(generic_solver_mix_model),
+                                      raw_offset_color_conversion_total_units(filament_colors.size()));
     solver.cache.reserve(4096);
     return solver;
 }
@@ -1290,6 +1115,7 @@ static unsigned int raw_offset_color_conversion_cache_key(const ColorRGBA &color
 static std::vector<uint8_t> raw_offset_values_from_color(const std::vector<ColorRGBA>   &filament_colors,
                                                          ColorRGBA                       color,
                                                          const std::optional<ColorRGBA> &background_color,
+                                                         int                             generic_solver_mix_model,
                                                          RawOffsetColorConversionSolver *solver)
 {
     std::vector<uint8_t> values(filament_colors.size(), 0);
@@ -1300,7 +1126,8 @@ static std::vector<uint8_t> raw_offset_values_from_color(const std::vector<Color
     if (alpha <= EPSILON && !background_color)
         return values;
     if (alpha < 1.f) {
-        const ColorRGBA background = background_color ? *background_color : raw_flat_blend_color_from_filaments(filament_colors);
+        const ColorRGBA background =
+            background_color ? *background_color : raw_flat_blend_color_from_filaments(filament_colors, generic_solver_mix_model);
         color = ColorRGBA(color.r() * alpha + background.r() * (1.f - alpha),
                           color.g() * alpha + background.g() * (1.f - alpha),
                           color.b() * alpha + background.b() * (1.f - alpha),
@@ -1313,14 +1140,14 @@ static std::vector<uint8_t> raw_offset_values_from_color(const std::vector<Color
         if (cached != solver->cache.end())
             return cached->second;
 
-        RawOffsetColorConversionNearest nearest;
-        query_raw_offset_color_conversion_kd_tree(solver->candidates,
-                                                 solver->nodes,
-                                                 { color.r(), color.g(), color.b() },
-                                                 solver->root,
-                                                 nearest);
-        if (nearest.best_idx < solver->candidates.size()) {
-            values = solver->candidates[nearest.best_idx].values;
+        const std::vector<float> weights =
+            solve_color_solver_weights_for_target(solver->candidates,
+                                                  { color.r(), color.g(), color.b() },
+                                                  ColorSolverLookupMode::ClosestMix,
+                                                  ColorSolverMode::Legacy);
+        if (weights.size() == values.size()) {
+            for (size_t idx = 0; idx < values.size(); ++idx)
+                values[idx] = uint8_t(std::clamp(int(std::lround(std::clamp(weights[idx], 0.f, 1.f) * 255.f)), 0, 255));
             solver->cache.emplace(cache_key, values);
             return values;
         }
@@ -1332,67 +1159,32 @@ static std::vector<uint8_t> raw_offset_values_from_color(const std::vector<Color
     return values;
 }
 
-static ColorRGBA simulated_preview_color_from_raw_offsets(const std::vector<ColorRGBA> &filament_colors,
-                                                          const uint8_t *values,
-                                                          size_t value_count,
-                                                          uint8_t alpha)
+static ColorRGBA simulated_preview_color_from_raw_offsets(const std::vector<std::array<float, 3>> &component_colors,
+                                                          const uint8_t                           *values,
+                                                          size_t                                   value_count,
+                                                          uint8_t                                  alpha,
+                                                          int                                      generic_solver_mix_model)
 {
-    if (values == nullptr || value_count == 0 || filament_colors.empty())
+    if (values == nullptr || value_count == 0 || component_colors.empty())
         return ColorRGBA(0.f, 0.f, 0.f, float(alpha) / 255.f);
 
-    bool has_base = false;
-    float out_r = 0.f;
-    float out_g = 0.f;
-    float out_b = 0.f;
-    float accumulated = 0.f;
-    auto accumulate_color = [&](size_t idx, float weight) {
-        weight = std::clamp(weight, 0.f, 1.f);
-        if (weight <= EPSILON)
-            return;
-
-        if (!has_base) {
-            out_r = filament_colors[idx].r();
-            out_g = filament_colors[idx].g();
-            out_b = filament_colors[idx].b();
-            accumulated = weight;
-            has_base = true;
-            return;
-        }
-
-        const float t = weight / std::max(float(EPSILON), accumulated + weight);
-        float mixed_r = out_r;
-        float mixed_g = out_g;
-        float mixed_b = out_b;
-        Slic3r::filament_mixer_lerp_float(out_r,
-                                          out_g,
-                                          out_b,
-                                          filament_colors[idx].r(),
-                                          filament_colors[idx].g(),
-                                          filament_colors[idx].b(),
-                                          t,
-                                          &mixed_r,
-                                          &mixed_g,
-                                          &mixed_b);
-        out_r = std::clamp(mixed_r, 0.f, 1.f);
-        out_g = std::clamp(mixed_g, 0.f, 1.f);
-        out_b = std::clamp(mixed_b, 0.f, 1.f);
-        accumulated += weight;
-    };
-
-    for (size_t idx = 0; idx < filament_colors.size() && idx < value_count; ++idx)
-        accumulate_color(idx, float(values[idx]) / 255.f);
-
-    if (!has_base) {
-        for (size_t idx = 0; idx < filament_colors.size() && idx < value_count; ++idx)
-            accumulate_color(idx, 1.f);
+    std::vector<float> weights(component_colors.size(), 0.f);
+    bool has_nonzero_weight = false;
+    for (size_t idx = 0; idx < weights.size() && idx < value_count; ++idx) {
+        weights[idx] = std::clamp(float(values[idx]) / 255.f, 0.f, 1.f);
+        has_nonzero_weight = has_nonzero_weight || weights[idx] > EPSILON;
     }
+    if (!has_nonzero_weight)
+        std::fill(weights.begin(), weights.end(), 1.f);
 
-    if (!has_base)
-        return ColorRGBA(0.f, 0.f, 0.f, float(alpha) / 255.f);
-    return ColorRGBA(out_r, out_g, out_b, float(alpha) / 255.f);
+    return mix_raw_offset_projection_solver_color(component_colors,
+                                                 weights,
+                                                 ColorRGBA(0.f, 0.f, 0.f, float(alpha) / 255.f),
+                                                 generic_solver_mix_model);
 }
 
-static std::vector<uint8_t> image_projection_raw_atlas_simulated_preview_rgba(const ImageMapRawFilamentOffsetAtlas &atlas)
+static std::vector<uint8_t> image_projection_raw_atlas_simulated_preview_rgba(const ImageMapRawFilamentOffsetAtlas &atlas,
+                                                                              int                                  generic_solver_mix_model)
 {
     std::vector<uint8_t> preview;
     if (!atlas.valid())
@@ -1401,6 +1193,7 @@ static std::vector<uint8_t> image_projection_raw_atlas_simulated_preview_rgba(co
     const std::vector<ImageMapRawFilament> filaments =
         image_map_raw_filaments_for_channels(atlas.filaments, atlas.channels);
     const std::vector<ColorRGBA> filament_colors = raw_filament_colors_for_projection_preview(filaments);
+    const std::vector<std::array<float, 3>> component_colors = raw_projection_solver_component_colors(filament_colors);
 
     const size_t pixel_count = size_t(atlas.width) * size_t(atlas.height);
     preview.assign(pixel_count * 4, 255);
@@ -1408,10 +1201,11 @@ static std::vector<uint8_t> image_projection_raw_atlas_simulated_preview_rgba(co
         const size_t raw_idx = pixel_idx * size_t(atlas.channels);
         const uint8_t alpha = atlas.mask.size() > pixel_idx ? atlas.mask[pixel_idx] : 255;
         const ColorRGBA color =
-            simulated_preview_color_from_raw_offsets(filament_colors,
+            simulated_preview_color_from_raw_offsets(component_colors,
                                                      raw_idx < atlas.offsets.size() ? atlas.offsets.data() + raw_idx : nullptr,
                                                      size_t(atlas.channels),
-                                                     alpha);
+                                                     alpha,
+                                                     generic_solver_mix_model);
         const size_t rgba_idx = pixel_idx * 4;
         preview[rgba_idx + 0] = uint8_t(std::clamp(color.r(), 0.f, 1.f) * 255.f + 0.5f);
         preview[rgba_idx + 1] = uint8_t(std::clamp(color.g(), 0.f, 1.f) * 255.f + 0.5f);
@@ -1451,7 +1245,10 @@ static std::vector<uint8_t> raw_offset_pixel_values(const ModelVolume &volume, u
     return values;
 }
 
-static bool refresh_imported_texture_preview_from_raw_offsets(ModelVolume &volume)
+static bool refresh_imported_texture_preview_from_raw_offsets(ModelVolume                    &volume,
+                                                              const std::vector<ColorRGBA> *filament_colors = nullptr,
+                                                              int                            generic_solver_mix_model =
+                                                                  TextureMappingZone::DefaultGenericSolverMixModel)
 {
     if (!model_volume_has_raw_atlas_texture_data(&volume))
         return false;
@@ -1462,6 +1259,10 @@ static bool refresh_imported_texture_preview_from_raw_offsets(ModelVolume &volum
         changed = true;
     }
 
+    std::vector<std::array<float, 3>> solver_component_colors;
+    if (filament_colors != nullptr && filament_colors->size() == size_t(volume.imported_texture_raw_channels))
+        solver_component_colors = raw_projection_solver_component_colors(*filament_colors);
+
     std::vector<uint8_t> values(size_t(volume.imported_texture_raw_channels), 0);
     for (size_t pixel_idx = 0; pixel_idx < pixel_count; ++pixel_idx) {
         const size_t raw_idx = pixel_idx * size_t(volume.imported_texture_raw_channels);
@@ -1470,7 +1271,14 @@ static bool refresh_imported_texture_preview_from_raw_offsets(ModelVolume &volum
         std::copy(volume.imported_texture_raw_filament_offsets.begin() + raw_idx,
                   volume.imported_texture_raw_filament_offsets.begin() + raw_idx + values.size(),
                   values.begin());
-        const ColorRGBA preview = preview_color_from_raw_offsets(values, 255);
+        const ColorRGBA preview =
+            !solver_component_colors.empty() ?
+                simulated_preview_color_from_raw_offsets(solver_component_colors,
+                                                         values.data(),
+                                                         values.size(),
+                                                         255,
+                                                         generic_solver_mix_model) :
+                preview_color_from_raw_offsets(values, 255);
         const uint8_t r = uint8_t(std::clamp(preview.r(), 0.f, 1.f) * 255.f + 0.5f);
         const uint8_t g = uint8_t(std::clamp(preview.g(), 0.f, 1.f) * 255.f + 0.5f);
         const uint8_t b = uint8_t(std::clamp(preview.b(), 0.f, 1.f) * 255.f + 0.5f);
@@ -3971,6 +3779,30 @@ static bool object_is_whole_image_texture_mapped_without_regions(const ModelObje
             return false;
     }
     return has_model_part;
+}
+
+static int generic_solver_mix_model_for_projection_object(const ModelObject *object)
+{
+    if (wxGetApp().preset_bundle == nullptr || object == nullptr)
+        return TextureMappingZone::DefaultGenericSolverMixModel;
+
+    const TextureMappingManager &texture_mgr = wxGetApp().preset_bundle->texture_mapping_zones;
+    for (const ModelVolume *volume : object->volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+
+        const int extruder_id = volume->extruder_id();
+        if (extruder_id <= 0)
+            continue;
+
+        const TextureMappingZone *zone = texture_mgr.zone_from_id(unsigned(extruder_id));
+        if (zone != nullptr && zone->enabled && !zone->deleted && zone->is_image_texture())
+            return std::clamp(zone->generic_solver_mix_model,
+                              int(TextureMappingZone::GenericSolverFilamentMixer),
+                              int(TextureMappingZone::GenericSolverPigmentPainter));
+    }
+
+    return TextureMappingZone::DefaultGenericSolverMixModel;
 }
 
 static bool project_texture_mapping_zone_to_regions(ModelObject             &object,
@@ -8472,7 +8304,9 @@ bool GLGizmoImageProjection::load_projection_image()
             return false;
         }
 
-        std::vector<uint8_t> preview = image_projection_raw_atlas_simulated_preview_rgba(raw_atlas);
+        std::vector<uint8_t> preview =
+            image_projection_raw_atlas_simulated_preview_rgba(raw_atlas,
+                                                              generic_solver_mix_model_for_projection_object(selected_model_object()));
         if (preview.empty()) {
             m_image_error = _u8L("Unable to preview the selected raw filament offset atlas.");
             return false;
@@ -9046,6 +8880,10 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
     }
     const std::vector<ColorRGBA> raw_filament_colors =
         raw_atlas_projection ? raw_filament_colors_for_projection_preview(raw_layout.filaments) : std::vector<ColorRGBA>();
+    const std::vector<std::array<float, 3>> raw_projection_component_colors =
+        raw_atlas_projection ? raw_projection_solver_component_colors(raw_filament_colors) : std::vector<std::array<float, 3>>();
+    const int raw_projection_mix_model =
+        raw_atlas_projection ? generic_solver_mix_model_for_projection_object(object) : TextureMappingZone::DefaultGenericSolverMixModel;
     bool object_had_raw_atlas_texture = false;
     if (raw_atlas_projection) {
         for (const ModelVolume *volume : object->volumes) {
@@ -9059,7 +8897,7 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
         m_convert_existing_colors_to_raw_offsets || object_had_raw_atlas_texture;
     RawOffsetColorConversionSolver raw_conversion_solver =
         raw_atlas_projection && convert_existing_colors_for_raw_projection ?
-            build_raw_offset_color_conversion_solver(raw_filament_colors) :
+            build_raw_offset_color_conversion_solver(raw_filament_colors, raw_projection_mix_model) :
             RawOffsetColorConversionSolver();
 
     bool changed = false;
@@ -9209,6 +9047,7 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
                                 raw_offset_values_from_color(raw_filament_colors,
                                                              color,
                                                              raw_conversion_background_color,
+                                                             raw_projection_mix_model,
                                                              &raw_conversion_solver);
                             volume_changed |= write_raw_offset_pixel(volume->imported_texture_raw_filament_offsets,
                                                                      volume->imported_texture_width,
@@ -9260,7 +9099,11 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
                                                                                 wrapped_x,
                                                                                 wrapped_y,
                                                                                 raw_values);
-                                        color = preview_color_from_raw_offsets(raw_values, 255);
+                                        color = simulated_preview_color_from_raw_offsets(raw_projection_component_colors,
+                                                                                        raw_values.data(),
+                                                                                        raw_values.size(),
+                                                                                        255,
+                                                                                        raw_projection_mix_model);
                                     } else {
                                         color = apply_projection_color(color, *projected, context, true);
                                     }
@@ -9279,7 +9122,7 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
             }
         }
         if (raw_atlas_projection)
-            volume_changed |= refresh_imported_texture_preview_from_raw_offsets(*volume);
+            volume_changed |= refresh_imported_texture_preview_from_raw_offsets(*volume, &raw_filament_colors, raw_projection_mix_model);
         if (volume_changed) {
             refresh_imported_texture_storage(*volume);
             if (raw_atlas_projection)

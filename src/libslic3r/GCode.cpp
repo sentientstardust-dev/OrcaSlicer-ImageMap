@@ -15,6 +15,7 @@
 #include "ShortestPath.hpp"
 #include "Print.hpp"
 #include "TextureMapping.hpp"
+#include "ColorSolver.hpp"
 #include "ImageMapRawFilamentOffsetAtlas.hpp"
 #include "Utils.hpp"
 #include "ClipperUtils.hpp"
@@ -6394,56 +6395,23 @@ static void build_generic_mix_candidate_kd_tree_for_gcode(GCodeGenericMixCandida
 }
 
 static GCodeGenericMixCandidateSet build_generic_mix_candidates_for_gcode(
-    const std::vector<std::array<float, 3>> &component_colors)
+    const std::vector<std::array<float, 3>> &component_colors,
+    int                                      generic_solver_mix_model)
 {
-    GCodeGenericMixCandidateSet candidates;
-    if (component_colors.empty())
-        return candidates;
-
-    const size_t component_count = component_colors.size();
-    const int total_units = generic_mix_total_units_for_component_count_for_gcode(component_count);
-    std::vector<int> units(component_count, 0);
-    const size_t estimated_candidate_count = generic_mix_candidate_count_for_gcode(component_count, total_units);
-    candidates.component_count = component_count;
-    candidates.rgbs.reserve(estimated_candidate_count * 3);
-    candidates.perceptual_coords.reserve(estimated_candidate_count * 3);
-    candidates.weights.reserve(estimated_candidate_count * component_count);
-
-    std::function<void(size_t, int)> recurse = [&](size_t idx, int remaining_units) {
-        if (idx + 1 == component_count) {
-            units[idx] = remaining_units;
-            const std::array<float, 3> mixed = mix_component_colors_with_filament_mixer_for_gcode(component_colors, units);
-            const std::array<float, 3> perceptual = oklab_from_srgb_for_gcode(mixed);
-            candidates.rgbs.emplace_back(mixed[0]);
-            candidates.rgbs.emplace_back(mixed[1]);
-            candidates.rgbs.emplace_back(mixed[2]);
-            candidates.perceptual_coords.emplace_back(perceptual[0]);
-            candidates.perceptual_coords.emplace_back(perceptual[1]);
-            candidates.perceptual_coords.emplace_back(perceptual[2]);
-            for (size_t weight_idx = 0; weight_idx < component_count; ++weight_idx)
-                candidates.weights.emplace_back(float(units[weight_idx]) / float(std::max(1, total_units)));
-            return;
-        }
-
-        for (int unit = 0; unit <= remaining_units; ++unit) {
-            units[idx] = unit;
-            recurse(idx + 1, remaining_units - unit);
-        }
-    };
-    recurse(0, total_units);
-    build_generic_mix_candidate_kd_tree_for_gcode(candidates);
-    return candidates;
+    return build_color_solver_candidates(component_colors, color_solver_mix_model_from_index(generic_solver_mix_model));
 }
 
 static const GCodeGenericMixCandidateSet &generic_mix_candidates_for_gcode(
     std::map<std::string, GCodeGenericMixCandidateSet> &cache,
-    const std::vector<std::array<float, 3>>             &component_colors)
+    const std::vector<std::array<float, 3>>             &component_colors,
+    int                                                  generic_solver_mix_model)
 {
-    const std::string key = generic_mix_candidate_cache_key_for_gcode(component_colors);
+    const std::string key =
+        color_solver_candidate_cache_key(component_colors, color_solver_mix_model_from_index(generic_solver_mix_model));
     auto it = cache.find(key);
     if (it != cache.end())
         return it->second;
-    return cache.emplace(key, build_generic_mix_candidates_for_gcode(component_colors)).first->second;
+    return cache.emplace(key, build_generic_mix_candidates_for_gcode(component_colors, generic_solver_mix_model)).first->second;
 }
 
 struct GCodeGenericMixNearestResult {
@@ -7228,6 +7196,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                                                                                 bool                                      force_sequential_filaments,
                                                                                 int                                       generic_solver_lookup_mode,
                                                                                 int                                       generic_solver_mode,
+                                                                                int                                       generic_solver_mix_model,
                                                                                 bool                                      use_legacy_fixed_color_mode,
                                                                                 std::map<std::string, GCodeGenericMixCandidateSet> *generic_mix_candidate_cache,
                                                                                 float                                     texture_contrast_pct,
@@ -7708,9 +7677,13 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
         }
         if (optimized_probe.size() != component_count) {
             if (generic_mix_candidate_cache != nullptr)
-                generic_mix_candidates = &generic_mix_candidates_for_gcode(*generic_mix_candidate_cache, generic_solver_component_colors);
+                generic_mix_candidates =
+                    &generic_mix_candidates_for_gcode(*generic_mix_candidate_cache,
+                                                      generic_solver_component_colors,
+                                                      generic_solver_mix_model);
             else {
-                local_generic_mix_candidates = build_generic_mix_candidates_for_gcode(generic_solver_component_colors);
+                local_generic_mix_candidates =
+                    build_generic_mix_candidates_for_gcode(generic_solver_component_colors, generic_solver_mix_model);
                 generic_mix_candidates = &local_generic_mix_candidates;
             }
         }
@@ -8148,6 +8121,9 @@ std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoo
     const int generic_solver_mode = std::clamp(zone->generic_solver_mode,
                                                int(TextureMappingZone::GenericSolverLegacy),
                                                int(TextureMappingZone::GenericSolverV2));
+    const int generic_solver_mix_model = std::clamp(zone->generic_solver_mix_model,
+                                                    int(TextureMappingZone::GenericSolverFilamentMixer),
+                                                    int(TextureMappingZone::GenericSolverPigmentPainter));
     const bool compact_offset_mode = zone->compact_offset_mode;
     const bool use_legacy_fixed_color_mode = zone->use_legacy_fixed_color_mode;
     const float texture_contrast_pct = std::clamp(zone->contrast_pct, 25.f, 300.f);
@@ -8192,6 +8168,7 @@ std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoo
     component_key_stream << "|fs" << (texture_force_sequential_filaments ? 1 : 0);
     component_key_stream << "|gl" << generic_solver_lookup_mode;
     component_key_stream << "|gm" << generic_solver_mode;
+    component_key_stream << "|gx" << generic_solver_mix_model;
     component_key_stream << "|lf" << (use_legacy_fixed_color_mode ? 1 : 0);
     component_key_stream << "|ct" << int(std::lround(texture_contrast_pct));
     component_key_stream << "|tg" << int(std::lround(texture_tone_gamma * 100.f));
@@ -8244,6 +8221,7 @@ std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoo
                                                                               texture_force_sequential_filaments,
                                                                               generic_solver_lookup_mode,
                                                                               generic_solver_mode,
+                                                                              generic_solver_mix_model,
                                                                               use_legacy_fixed_color_mode,
                                                                               &m_generic_solver_mix_candidate_cache,
                                                                               texture_contrast_pct,
@@ -9279,6 +9257,9 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                             const int generic_solver_mode = std::clamp(zone->generic_solver_mode,
                                                                        int(TextureMappingZone::GenericSolverLegacy),
                                                                        int(TextureMappingZone::GenericSolverV2));
+                            const int generic_solver_mix_model = std::clamp(zone->generic_solver_mix_model,
+                                                                            int(TextureMappingZone::GenericSolverFilamentMixer),
+                                                                            int(TextureMappingZone::GenericSolverPigmentPainter));
                             const bool use_legacy_fixed_color_mode = zone->use_legacy_fixed_color_mode;
                             const float texture_contrast_pct = std::clamp(zone->contrast_pct, 25.f, 300.f);
                             const float texture_tone_gamma =
@@ -9326,6 +9307,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                     component_key_stream << "|fs" << (texture_force_sequential_filaments ? 1 : 0);
                                     component_key_stream << "|gl" << generic_solver_lookup_mode;
                                     component_key_stream << "|gm" << generic_solver_mode;
+                                    component_key_stream << "|gx" << generic_solver_mix_model;
                                     component_key_stream << "|lf" << (use_legacy_fixed_color_mode ? 1 : 0);
                                     component_key_stream << "|ct" << int(std::lround(texture_contrast_pct));
                                     component_key_stream << "|tg" << int(std::lround(texture_tone_gamma * 100.f));
@@ -9344,6 +9326,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                                                                                          texture_force_sequential_filaments,
                                                                                                          generic_solver_lookup_mode,
                                                                                                          generic_solver_mode,
+                                                                                                         generic_solver_mix_model,
                                                                                                          use_legacy_fixed_color_mode,
                                                                                                          generic_mix_candidate_cache,
                                                                                                          texture_contrast_pct,

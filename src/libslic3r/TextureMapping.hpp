@@ -65,6 +65,11 @@ struct TextureMappingZone
         GenericSolverV2 = 1
     };
 
+    enum GenericSolverMixModel : uint8_t {
+        GenericSolverFilamentMixer = 0,
+        GenericSolverPigmentPainter = 1
+    };
+
     static constexpr int   DefaultSurfacePattern = int(ImageTexture);
     static constexpr int   DefaultOffsetMode = int(OffsetBasic);
     static constexpr bool  DefaultOffsetRotationEnabled = true;
@@ -84,6 +89,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultUseLegacyFixedColorMode = false;
     static constexpr int   DefaultGenericSolverLookupMode = int(GenericSolverClosestMix);
     static constexpr int   DefaultGenericSolverMode = int(GenericSolverV2);
+    static constexpr int   DefaultGenericSolverMixModel = int(GenericSolverPigmentPainter);
     static constexpr float DefaultContrastPct = 100.f;
     static constexpr bool  DefaultHighResolutionSampling = true;
     static constexpr float DefaultToneGamma = 1.f;
@@ -124,6 +130,7 @@ struct TextureMappingZone
     bool        use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
     int         generic_solver_lookup_mode = DefaultGenericSolverLookupMode;
     int         generic_solver_mode = DefaultGenericSolverMode;
+    int         generic_solver_mix_model = DefaultGenericSolverMixModel;
     float       contrast_pct = DefaultContrastPct;
     bool        high_resolution_sampling = DefaultHighResolutionSampling;
     float       tone_gamma = DefaultToneGamma;
@@ -164,6 +171,7 @@ struct TextureMappingZone
         use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
         generic_solver_lookup_mode = DefaultGenericSolverLookupMode;
         generic_solver_mode = DefaultGenericSolverMode;
+        generic_solver_mix_model = DefaultGenericSolverMixModel;
         contrast_pct = DefaultContrastPct;
         high_resolution_sampling = DefaultHighResolutionSampling;
         tone_gamma = DefaultToneGamma;

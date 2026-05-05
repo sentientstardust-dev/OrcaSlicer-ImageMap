@@ -21,6 +21,7 @@
 #include "GCode/ThumbnailData.hpp"
 #include "libslic3r/ObjectID.hpp"
 #include "GCode/ExtrusionProcessor.hpp"
+#include "ColorSolver.hpp"
 
 #include "GCode/PressureEqualizer.hpp"
 #include "GCode/SmallAreaInfillFlowCompensator.hpp"
@@ -49,31 +50,7 @@ namespace CustomGCode{ struct Item; }
 struct PrintInstance;
 class ConstPrintObjectPtrsAdaptor;
 
-struct GCodeGenericMixCandidateSet {
-    struct KdNode {
-        uint32_t candidate_idx { 0 };
-        int      left { -1 };
-        int      right { -1 };
-        uint8_t  axis { 0 };
-    };
-
-    size_t component_count { 0 };
-    std::vector<float> rgbs;
-    std::vector<float> perceptual_coords;
-    std::vector<float> weights;
-    std::vector<KdNode> kd_nodes;
-    std::vector<KdNode> perceptual_kd_nodes;
-    int kd_root { -1 };
-    int perceptual_kd_root { -1 };
-
-    bool empty() const
-    {
-        return component_count == 0 ||
-               rgbs.empty() ||
-               rgbs.size() % 3 != 0 ||
-               weights.size() != (rgbs.size() / 3) * component_count;
-    }
-};
+using GCodeGenericMixCandidateSet = ColorSolverCandidateSet;
 
 struct VertexColorOverhangWeightField {
     float min_x_mm { 0.f };

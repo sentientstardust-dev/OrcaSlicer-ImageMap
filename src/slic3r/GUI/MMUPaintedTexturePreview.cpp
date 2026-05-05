@@ -12,6 +12,7 @@
 #include "libslic3r/ImageMapRawFilamentOffsetAtlas.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/TextureMapping.hpp"
+#include "libslic3r/ColorSolver.hpp"
 #include "libslic3r/filament_mixer.h"
 
 #include <algorithm>
@@ -67,15 +68,12 @@ struct TexturePreviewSimulationSettings
     float tone_gamma = 1.f;
     int generic_solver_lookup_mode = int(TextureMappingZone::GenericSolverClosestMix);
     int generic_solver_mode = int(TextureMappingZone::GenericSolverV2);
+    int generic_solver_mix_model = int(TextureMappingZone::GenericSolverFilamentMixer);
     std::vector<unsigned int> component_ids;
     std::vector<std::array<float, 3>> component_colors;
     std::vector<float> component_strength_factors;
     std::vector<size_t> semantic_component_indices;
-    std::vector<TexturePreviewMixCandidate> generic_mix_candidates;
-    std::vector<TexturePreviewMixCandidateKdNode> generic_mix_candidate_kd_nodes;
-    std::vector<TexturePreviewMixCandidateKdNode> generic_mix_candidate_perceptual_kd_nodes;
-    int generic_mix_candidate_kd_root { -1 };
-    int generic_mix_candidate_perceptual_kd_root { -1 };
+    ColorSolverCandidateSet generic_mix_candidates;
 };
 
 struct SurfaceGradientPreviewSettings
@@ -660,10 +658,8 @@ std::vector<float> map_raw_sample_to_components_for_texture_preview(const std::v
     return mapped;
 }
 
-unsigned int texture_preview_rgb_cache_key(const std::array<unsigned char, 3> &rgb, bool quantize)
+unsigned int texture_preview_rgb_cache_key(const std::array<unsigned char, 3> &rgb)
 {
-    if (quantize)
-        return unsigned(rgb[0] >> 3) | (unsigned(rgb[1] >> 3) << 5) | (unsigned(rgb[2] >> 3) << 10);
     return unsigned(rgb[0]) | (unsigned(rgb[1]) << 8) | (unsigned(rgb[2]) << 16);
 }
 
@@ -1388,14 +1384,13 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
         if (optimized.size() == component_count)
             desired = std::move(optimized);
         else {
-            std::vector<float> best = best_component_mix_weights_for_target(settings.generic_mix_candidates,
-                                                                            settings.generic_mix_candidate_kd_nodes,
-                                                                            settings.generic_mix_candidate_kd_root,
-                                                                            settings.generic_mix_candidate_perceptual_kd_nodes,
-                                                                            settings.generic_mix_candidate_perceptual_kd_root,
-                                                                            target,
-                                                                            settings.generic_solver_lookup_mode,
-                                                                            settings.generic_solver_mode);
+            std::vector<float> best = !settings.generic_mix_candidates.empty() ?
+                solve_color_solver_weights_for_target(
+                    settings.generic_mix_candidates,
+                    target,
+                    color_solver_lookup_mode_from_index(settings.generic_solver_lookup_mode),
+                    color_solver_mode_from_index(settings.generic_solver_mode)) :
+                std::vector<float>{};
             if (best.size() == component_count)
                 desired = std::move(best);
         }
@@ -1427,13 +1422,11 @@ void prepare_texture_preview_simulation_settings(TexturePreviewSimulationSetting
                                                        settings.filament_color_mode,
                                                        settings.force_sequential_filaments);
     if (texture_preview_uses_generic_solver(settings))
-        settings.generic_mix_candidates = build_generic_mix_candidates(generic_solver_component_colors(settings));
+        settings.generic_mix_candidates =
+            build_color_solver_candidates(generic_solver_component_colors(settings),
+                                          color_solver_mix_model_from_index(settings.generic_solver_mix_model));
     else
-        settings.generic_mix_candidates.clear();
-    settings.generic_mix_candidate_kd_root =
-        build_generic_mix_candidate_kd_tree(settings.generic_mix_candidates, settings.generic_mix_candidate_kd_nodes);
-    settings.generic_mix_candidate_perceptual_kd_root =
-        build_generic_mix_candidate_kd_tree(settings.generic_mix_candidates, settings.generic_mix_candidate_perceptual_kd_nodes, true);
+        settings.generic_mix_candidates = ColorSolverCandidateSet();
 }
 
 ColorRGBA simulated_texture_preview_color_for_vertex_color(const ColorRGBA *source_color,
@@ -1458,7 +1451,10 @@ ColorRGBA simulated_texture_preview_color_for_vertex_color(const ColorRGBA *sour
     if (activity <= k_epsilon)
         return *source_color;
 
-    const std::array<float, 3> simulated_rgb = mix_component_colors_with_filament_mixer(settings->component_colors, component_weights);
+    const std::array<float, 3> simulated_rgb =
+        mix_color_solver_components(settings->component_colors,
+                                    component_weights,
+                                    color_solver_mix_model_from_index(settings->generic_solver_mix_model));
     return { simulated_rgb[0], simulated_rgb[1], simulated_rgb[2], source_color->a() };
 }
 
@@ -1492,6 +1488,9 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
     settings.generic_solver_mode = std::clamp(zone->generic_solver_mode,
                                               int(TextureMappingZone::GenericSolverLegacy),
                                               int(TextureMappingZone::GenericSolverV2));
+    settings.generic_solver_mix_model = std::clamp(zone->generic_solver_mix_model,
+                                                   int(TextureMappingZone::GenericSolverFilamentMixer),
+                                                   int(TextureMappingZone::GenericSolverPigmentPainter));
     settings.component_ids = TextureMappingManager::effective_texture_component_ids(*zone, num_physical, physical_colors);
     if (settings.component_ids.empty())
         return std::nullopt;
@@ -1537,6 +1536,7 @@ size_t texture_preview_simulation_signature(const ModelVolume &model_volume,
     mix(std::hash<int>{}(settings.use_legacy_fixed_color_mode ? 1 : 0));
     mix(std::hash<int>{}(settings.generic_solver_lookup_mode));
     mix(std::hash<int>{}(settings.generic_solver_mode));
+    mix(std::hash<int>{}(settings.generic_solver_mix_model));
     mix(std::hash<int>{}(int(std::lround(settings.contrast_pct * 100.f))));
     mix(std::hash<int>{}(int(std::lround(settings.tone_gamma * 1000.f))));
     for (const unsigned int id : settings.component_ids)
@@ -1576,14 +1576,12 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
         return result;
 
     prepare_texture_preview_simulation_settings(settings);
-    const bool use_generic_solver = !settings.generic_mix_candidates.empty();
     const bool use_raw_offsets =
         source_raw_component_channels.size() == settings.component_colors.size() &&
         source_raw_offsets.size() >= size_t(width) * size_t(height) * size_t(source_raw_channels);
 
     std::unordered_map<unsigned int, std::array<unsigned char, 4>> simulated_color_cache;
-    simulated_color_cache.reserve(std::min(size_t(result.width) * size_t(result.height),
-                                           use_generic_solver ? size_t(32768) : size_t(65536)));
+    simulated_color_cache.reserve(std::min(size_t(result.width) * size_t(result.height), size_t(65536)));
 
     for (unsigned int y = 0; y < result.height; ++y) {
         for (unsigned int x = 0; x < result.width; ++x) {
@@ -1602,7 +1600,7 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
             };
             const unsigned int cache_key = use_raw_offsets ?
                 unsigned(std::numeric_limits<unsigned int>::max()) :
-                texture_preview_rgb_cache_key(source_rgb, use_generic_solver);
+                texture_preview_rgb_cache_key(source_rgb);
             const size_t idx = (size_t(y) * size_t(result.width) + size_t(x)) * 4;
 
             auto cached_color = !use_raw_offsets ? simulated_color_cache.find(cache_key) : simulated_color_cache.end();
@@ -1644,7 +1642,9 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
             }
 
             const std::array<float, 3> simulated_rgb = activity > k_epsilon ?
-                mix_component_colors_with_filament_mixer(settings.component_colors, component_weights) :
+                mix_color_solver_components(settings.component_colors,
+                                            component_weights,
+                                            color_solver_mix_model_from_index(settings.generic_solver_mix_model)) :
                 std::array<float, 3>{ sample_rgba[0], sample_rgba[1], sample_rgba[2] };
 
             const std::array<unsigned char, 4> out_rgba = {
@@ -3064,6 +3064,7 @@ size_t texture_preview_settings_signature(size_t num_physical, const TextureMapp
         signature_mix(std::hash<int>{}(zone.use_legacy_fixed_color_mode ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.generic_solver_lookup_mode));
         signature_mix(std::hash<int>{}(zone.generic_solver_mode));
+        signature_mix(std::hash<int>{}(zone.generic_solver_mix_model));
         signature_mix(std::hash<int>{}(zone.preview_simulate_colors ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.preview_limit_resolution ? 1 : 0));
         signature_mix_float(zone.sagging_ratio);
