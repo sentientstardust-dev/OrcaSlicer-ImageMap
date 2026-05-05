@@ -696,6 +696,8 @@ void GLVolume::simple_render(GLShaderProgram* shader,
 
         color_volume = has_mmu_segmentation;
         size_t preview_visual_signature = texture_preview_settings_signature(num_physical, texture_mgr);
+        preview_visual_signature ^= texture_preview_simulation_generation_signature() + 0x9e3779b97f4a7c15ull +
+                                    (preview_visual_signature << 6) + (preview_visual_signature >> 2);
         preview_visual_signature ^= model_volume_texture_preview_signature(*model_volume) + 0x9e3779b97f4a7c15ull +
                                     (preview_visual_signature << 6) + (preview_visual_signature >> 2);
         preview_visual_signature ^= model_volume->imported_vertex_colors_rgba.size() + 0x9e3779b97f4a7c15ull +
@@ -912,8 +914,17 @@ void GLVolume::render_mmu_texture_preview(const Transform3d &view_matrix,
         return preview_colors;
     };
 
+    const bool original_mesh_preview_can_defer_source_texture =
+        use_original_mesh_texture_preview &&
+        texture_preview_simulation_enabled_for_filament(base_filament_id, num_physical, texture_mgr);
+    const bool mmuseg_preview_can_defer_source_texture =
+        !use_original_mesh_texture_preview &&
+        !mmuseg_texture_preview_models.empty() &&
+        texture_preview_simulation_enabled_for_all_filaments(mmuseg_texture_preview_filament_ids, num_physical, texture_mgr);
     if ((use_original_mesh_texture_preview || !mmuseg_texture_preview_models.empty()) &&
-        ensure_model_volume_texture_preview(*model_volume, mmuseg_texture_preview, mmuseg_texture_preview_signature)) {
+        (original_mesh_preview_can_defer_source_texture ||
+         mmuseg_preview_can_defer_source_texture ||
+         ensure_model_volume_texture_preview(*model_volume, mmuseg_texture_preview, mmuseg_texture_preview_signature))) {
         if (use_original_mesh_texture_preview) {
             const int extruder_id = model_volume->extruder_id();
             const ColorRGBA fallback_color = extruder_colors.empty() ? ColorRGBA(0.15f, 0.65f, 0.6f, 1.f) : extruder_colors.front();

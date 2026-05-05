@@ -893,6 +893,7 @@ public:
                                    const std::vector<bool> *resample_triangles = nullptr,
                                    const TextureMappingColorLeafResamplePredicate &resample_leaf = {});
     void get_facet_triangles(const ModelVolume &mv, std::vector<ColorFacetTriangle> &facets) const;
+    void get_facet_triangles(const indexed_triangle_set &its, std::vector<ColorFacetTriangle> &facets) const;
 
 private:
     explicit ColorFacetsAnnotation() = default;

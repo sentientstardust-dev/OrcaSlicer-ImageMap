@@ -65,6 +65,13 @@ bool ensure_model_volume_texture_preview(const ModelVolume &model_volume,
 
 bool texture_preview_simulation_is_pending();
 void clear_texture_preview_simulation_cache();
+bool texture_preview_simulation_enabled_for_filament(unsigned int                 filament_id,
+                                                     size_t                       num_physical,
+                                                     const TextureMappingManager *texture_mgr);
+bool texture_preview_simulation_enabled_for_all_filaments(const std::vector<unsigned int> &filament_ids,
+                                                          size_t                          num_physical,
+                                                          const TextureMappingManager    *texture_mgr);
+size_t texture_preview_simulation_generation_signature();
 
 size_t texture_preview_settings_signature(size_t num_physical, const TextureMappingManager *texture_mgr);
 

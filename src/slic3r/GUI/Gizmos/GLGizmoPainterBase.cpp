@@ -1685,6 +1685,8 @@ void TriangleSelectorPatch::update_render_data()
             const TextureMappingManager *texture_mgr = wxGetApp().preset_bundle != nullptr ?
                 &wxGetApp().preset_bundle->texture_mapping_zones : nullptr;
             m_texture_preview_visual_signature = texture_preview_settings_signature(num_physical, texture_mgr);
+            m_texture_preview_visual_signature ^= texture_preview_simulation_generation_signature() + 0x9e3779b97f4a7c15ull +
+                                                  (m_texture_preview_visual_signature << 6) + (m_texture_preview_visual_signature >> 2);
             if (m_texture_mapping_color_preview != nullptr && !m_texture_mapping_color_preview->empty()) {
                 build_mmu_vertex_color_preview_models(*m_model_volume,
                                                       triangles_per_type,
@@ -1842,7 +1844,9 @@ void TriangleSelectorPatch::render_texture_preview(const Transform3d&          m
     const size_t num_physical = std::max(0, wxGetApp().filaments_cnt());
     const TextureMappingManager *texture_mgr = wxGetApp().preset_bundle != nullptr ?
         &wxGetApp().preset_bundle->texture_mapping_zones : nullptr;
-    const size_t current_visual_signature = texture_preview_settings_signature(num_physical, texture_mgr);
+    size_t current_visual_signature = texture_preview_settings_signature(num_physical, texture_mgr);
+    current_visual_signature ^= texture_preview_simulation_generation_signature() + 0x9e3779b97f4a7c15ull +
+                                (current_visual_signature << 6) + (current_visual_signature >> 2);
     if (current_visual_signature != m_texture_preview_visual_signature) {
         TriangleSelectorPatch *self = const_cast<TriangleSelectorPatch *>(this);
         self->request_update_render_data(true);
@@ -1862,8 +1866,12 @@ void TriangleSelectorPatch::render_texture_preview(const Transform3d&          m
         return preview_colors;
     };
 
+    const bool texture_preview_can_defer_source_texture =
+        !m_texture_preview_models.empty() &&
+        texture_preview_simulation_enabled_for_all_filaments(m_texture_preview_filament_ids, num_physical, texture_mgr);
     if (!m_texture_preview_models.empty() &&
-        ensure_model_volume_texture_preview(*m_model_volume, m_texture_preview, m_texture_preview_signature)) {
+        (texture_preview_can_defer_source_texture ||
+         ensure_model_volume_texture_preview(*m_model_volume, m_texture_preview, m_texture_preview_signature))) {
         render_model_texture_preview_models(m_texture_preview_models,
                                             adjusted_preview_colors(m_texture_preview_colors),
                                             m_texture_preview_filament_ids,

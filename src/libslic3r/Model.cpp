@@ -4697,8 +4697,12 @@ bool ColorFacetsAnnotation::set_from_triangle_sampler(const ModelVolume         
 
 void ColorFacetsAnnotation::get_facet_triangles(const ModelVolume &mv, std::vector<ColorFacetTriangle> &facets) const
 {
+    this->get_facet_triangles(mv.mesh().its, facets);
+}
+
+void ColorFacetsAnnotation::get_facet_triangles(const indexed_triangle_set &its, std::vector<ColorFacetTriangle> &facets) const
+{
     facets.clear();
-    const indexed_triangle_set &its = mv.mesh().its;
     if (its.vertices.empty() || its.indices.empty())
         return;
 
