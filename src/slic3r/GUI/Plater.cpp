@@ -1047,6 +1047,7 @@ public:
         , m_prime_tower_image(prime_tower_image)
         , m_prime_tower_image_back(prime_tower_image_back)
     {
+        (void) generic_solver_mix_model;
         const int gap = FromDIP(8);
         auto *root = new wxBoxSizer(wxVERTICAL);
         auto *tab_row = new wxBoxSizer(wxHORIZONTAL);
@@ -1224,13 +1225,10 @@ public:
                                           wxALIGN_CENTER_VERTICAL | wxRIGHT,
                                           gap);
         wxArrayString generic_solver_mix_model_choices;
-        generic_solver_mix_model_choices.Add(_L("Filament mixer"));
         generic_solver_mix_model_choices.Add(_L("Pigment Painter"));
         m_generic_solver_mix_model_choice =
             new wxChoice(experimental_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, generic_solver_mix_model_choices);
-        m_generic_solver_mix_model_choice->SetSelection(std::clamp(generic_solver_mix_model,
-                                                                   int(TextureMappingZone::GenericSolverFilamentMixer),
-                                                                   int(TextureMappingZone::GenericSolverPigmentPainter)));
+        m_generic_solver_mix_model_choice->SetSelection(TextureMappingZone::DefaultGenericSolverMixModel);
         generic_solver_mix_model_row->Add(m_generic_solver_mix_model_choice, 1, wxALIGN_CENTER_VERTICAL);
         experimental_box->Add(generic_solver_mix_model_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
 
@@ -1423,11 +1421,7 @@ public:
 
     int generic_solver_mix_model() const
     {
-        return m_generic_solver_mix_model_choice ?
-            std::clamp(m_generic_solver_mix_model_choice->GetSelection(),
-                       int(TextureMappingZone::GenericSolverFilamentMixer),
-                       int(TextureMappingZone::GenericSolverPigmentPainter)) :
-            TextureMappingZone::DefaultGenericSolverMixModel;
+        return TextureMappingZone::DefaultGenericSolverMixModel;
     }
 
     TextureMappingGlobalSettings global_settings() const

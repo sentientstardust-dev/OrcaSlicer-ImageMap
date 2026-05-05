@@ -1,8 +1,10 @@
 #include "TextureMapping.hpp"
-#include "filament_mixer.h"
+#include "ColorSolver.hpp"
 
+#include <array>
 #include <boost/log/trivial.hpp>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <iomanip>
 #include <limits>
@@ -541,23 +543,13 @@ static int generic_solver_mode_from_name(std::string name)
         int(TextureMappingZone::GenericSolverV2);
 }
 
-static std::string generic_solver_mix_model_name(int model)
+static std::string generic_solver_mix_model_name(int)
 {
-    return clamp_int(model,
-                     int(TextureMappingZone::GenericSolverFilamentMixer),
-                     int(TextureMappingZone::GenericSolverPigmentPainter)) ==
-               int(TextureMappingZone::GenericSolverPigmentPainter) ?
-        std::string("pigment_painter") :
-        std::string("filament_mixer");
+    return "pigment_painter";
 }
 
-static int generic_solver_mix_model_from_name(std::string name)
+static int generic_solver_mix_model_from_name(std::string)
 {
-    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return char(std::tolower(c)); });
-    if (name == "pigment_painter" || name == "pigment-painter" || name == "pigment")
-        return int(TextureMappingZone::GenericSolverPigmentPainter);
-    if (name == "filament_mixer" || name == "filament-mixer" || name == "filament")
-        return int(TextureMappingZone::GenericSolverFilamentMixer);
     return TextureMappingZone::DefaultGenericSolverMixModel;
 }
 
@@ -1495,41 +1487,24 @@ std::string TextureMappingManager::blend_color_multi(const std::vector<std::pair
     if (color_percents.empty())
         return "#000000";
 
-    struct WeightedColor {
-        RGB color;
-        int pct = 0;
-    };
-
-    std::vector<WeightedColor> colors;
+    std::vector<std::array<float, 3>> colors;
+    std::vector<int> weights;
     int total_pct = 0;
     for (const auto &[hex, pct] : color_percents) {
         if (pct <= 0)
             continue;
-        colors.push_back({parse_hex_color(hex), pct});
+        const RGB color = parse_hex_color(hex);
+        colors.push_back({float(color.r) / 255.f, float(color.g) / 255.f, float(color.b) / 255.f});
+        weights.emplace_back(pct);
         total_pct += pct;
     }
     if (colors.empty() || total_pct <= 0)
         return "#000000";
 
-    unsigned char r = static_cast<unsigned char>(colors.front().color.r);
-    unsigned char g = static_cast<unsigned char>(colors.front().color.g);
-    unsigned char b = static_cast<unsigned char>(colors.front().color.b);
-    int accumulated = colors.front().pct;
-
-    for (size_t i = 1; i < colors.size(); ++i) {
-        const int new_total = accumulated + colors[i].pct;
-        if (new_total <= 0)
-            continue;
-        const float t = float(colors[i].pct) / float(new_total);
-        filament_mixer_lerp(r, g, b,
-                            static_cast<unsigned char>(colors[i].color.r),
-                            static_cast<unsigned char>(colors[i].color.g),
-                            static_cast<unsigned char>(colors[i].color.b),
-                            t, &r, &g, &b);
-        accumulated = new_total;
-    }
-
-    return rgb_to_hex({int(r), int(g), int(b)});
+    const std::array<float, 3> rgb = mix_color_solver_components(colors, weights, ColorSolverMixModel::PigmentPainter);
+    return rgb_to_hex({std::clamp(int(std::lround(rgb[0] * 255.f)), 0, 255),
+                       std::clamp(int(std::lround(rgb[1] * 255.f)), 0, 255),
+                       std::clamp(int(std::lround(rgb[2] * 255.f)), 0, 255)});
 }
 
 } // namespace Slic3r

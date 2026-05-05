@@ -17,18 +17,6 @@
 #ifndef slic3r_ColorSolver_hpp_
 #define slic3r_ColorSolver_hpp_
 
-#ifndef COLOR_SOLVER_ENABLE_FILAMENT_MIXER
-#define COLOR_SOLVER_ENABLE_FILAMENT_MIXER 1
-#endif
-
-#ifndef COLOR_SOLVER_ENABLE_PIGMENT_PAINTER
-#define COLOR_SOLVER_ENABLE_PIGMENT_PAINTER 1
-#endif
-
-#if !COLOR_SOLVER_ENABLE_FILAMENT_MIXER && !COLOR_SOLVER_ENABLE_PIGMENT_PAINTER
-#error "ColorSolver requires COLOR_SOLVER_ENABLE_FILAMENT_MIXER or COLOR_SOLVER_ENABLE_PIGMENT_PAINTER"
-#endif
-
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -40,8 +28,7 @@ namespace Slic3r {
 
 enum class ColorSolverMixModel : int
 {
-    FilamentMixer = 0,
-    PigmentPainter = 1
+    PigmentPainter = 0
 };
 
 enum class ColorSolverLookupMode : int

@@ -139,9 +139,6 @@ set(lisbslic3r_sources
     FileParserError.hpp
     ColorSolver.cpp
     ColorSolver.hpp
-    filament_mixer.cpp
-    filament_mixer.h
-    filament_mixer_model.h
     Fill/Fill3DHoneycomb.cpp
     Fill/Fill3DHoneycomb.hpp
     Fill/FillAdaptive.cpp

@@ -66,8 +66,7 @@ struct TextureMappingZone
     };
 
     enum GenericSolverMixModel : uint8_t {
-        GenericSolverFilamentMixer = 0,
-        GenericSolverPigmentPainter = 1
+        GenericSolverPigmentPainter = 0
     };
 
     static constexpr int   DefaultSurfacePattern = int(ImageTexture);

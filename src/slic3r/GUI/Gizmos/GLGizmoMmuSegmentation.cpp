@@ -3797,9 +3797,7 @@ static int generic_solver_mix_model_for_projection_object(const ModelObject *obj
 
         const TextureMappingZone *zone = texture_mgr.zone_from_id(unsigned(extruder_id));
         if (zone != nullptr && zone->enabled && !zone->deleted && zone->is_image_texture())
-            return std::clamp(zone->generic_solver_mix_model,
-                              int(TextureMappingZone::GenericSolverFilamentMixer),
-                              int(TextureMappingZone::GenericSolverPigmentPainter));
+            return TextureMappingZone::DefaultGenericSolverMixModel;
     }
 
     return TextureMappingZone::DefaultGenericSolverMixModel;

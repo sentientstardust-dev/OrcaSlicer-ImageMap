@@ -16,12 +16,7 @@
 
 #include "ColorSolver.hpp"
 
-#if COLOR_SOLVER_ENABLE_FILAMENT_MIXER
-#include "filament_mixer.h"
-#endif
-#if COLOR_SOLVER_ENABLE_PIGMENT_PAINTER
 #include "pigment_painter_mixer.hpp"
-#endif
 
 #include <algorithm>
 #include <cmath>
@@ -39,125 +34,10 @@ float clamp01(float value)
     return std::clamp(value, 0.f, 1.f);
 }
 
-int mix_model_index(ColorSolverMixModel model)
+int mix_model_index(ColorSolverMixModel)
 {
-#if COLOR_SOLVER_ENABLE_FILAMENT_MIXER && COLOR_SOLVER_ENABLE_PIGMENT_PAINTER
-    return std::clamp(int(model), int(ColorSolverMixModel::FilamentMixer), int(ColorSolverMixModel::PigmentPainter));
-#elif COLOR_SOLVER_ENABLE_FILAMENT_MIXER
-    (void) model;
-    return int(ColorSolverMixModel::FilamentMixer);
-#else
-    (void) model;
     return int(ColorSolverMixModel::PigmentPainter);
-#endif
 }
-
-ColorSolverMixModel clamp_mix_model(ColorSolverMixModel model)
-{
-    return ColorSolverMixModel(mix_model_index(model));
-}
-
-#if COLOR_SOLVER_ENABLE_FILAMENT_MIXER
-std::array<float, 3> mix_component_colors_with_filament_mixer(const std::vector<std::array<float, 3>> &component_colors,
-                                                              const std::vector<int>                  &weights)
-{
-    if (component_colors.empty() || component_colors.size() != weights.size())
-        return { 0.f, 0.f, 0.f };
-
-    bool  has_base = false;
-    float out_r = 0.f;
-    float out_g = 0.f;
-    float out_b = 0.f;
-    int   accumulated = 0;
-    for (size_t i = 0; i < component_colors.size(); ++i) {
-        const int weight = std::max(0, weights[i]);
-        if (weight == 0)
-            continue;
-
-        if (!has_base) {
-            out_r = component_colors[i][0];
-            out_g = component_colors[i][1];
-            out_b = component_colors[i][2];
-            accumulated = weight;
-            has_base = true;
-            continue;
-        }
-
-        const float t = float(weight) / float(std::max(1, accumulated + weight));
-        float mixed_r = out_r;
-        float mixed_g = out_g;
-        float mixed_b = out_b;
-        filament_mixer_lerp_float(out_r,
-                                  out_g,
-                                  out_b,
-                                  component_colors[i][0],
-                                  component_colors[i][1],
-                                  component_colors[i][2],
-                                  t,
-                                  &mixed_r,
-                                  &mixed_g,
-                                  &mixed_b);
-        out_r = clamp01(mixed_r);
-        out_g = clamp01(mixed_g);
-        out_b = clamp01(mixed_b);
-        accumulated += weight;
-    }
-
-    if (!has_base)
-        return component_colors.front();
-    return { out_r, out_g, out_b };
-}
-
-std::array<float, 3> mix_component_colors_with_filament_mixer(const std::vector<std::array<float, 3>> &component_colors,
-                                                              const std::vector<float>                &weights)
-{
-    if (component_colors.empty() || component_colors.size() != weights.size())
-        return { 0.f, 0.f, 0.f };
-
-    bool  has_base = false;
-    float out_r = 0.f;
-    float out_g = 0.f;
-    float out_b = 0.f;
-    float accumulated = 0.f;
-    for (size_t i = 0; i < component_colors.size(); ++i) {
-        const float weight = std::isfinite(weights[i]) ? std::clamp(weights[i], 0.f, 1.f) : 0.f;
-        if (weight <= 1e-12f)
-            continue;
-
-        if (!has_base) {
-            out_r = component_colors[i][0];
-            out_g = component_colors[i][1];
-            out_b = component_colors[i][2];
-            accumulated = weight;
-            has_base = true;
-            continue;
-        }
-
-        const float t = weight / std::max(1e-12f, accumulated + weight);
-        float mixed_r = out_r;
-        float mixed_g = out_g;
-        float mixed_b = out_b;
-        filament_mixer_lerp_float(out_r,
-                                  out_g,
-                                  out_b,
-                                  component_colors[i][0],
-                                  component_colors[i][1],
-                                  component_colors[i][2],
-                                  t,
-                                  &mixed_r,
-                                  &mixed_g,
-                                  &mixed_b);
-        out_r = clamp01(mixed_r);
-        out_g = clamp01(mixed_g);
-        out_b = clamp01(mixed_b);
-        accumulated += weight;
-    }
-
-    if (!has_base)
-        return component_colors.front();
-    return { out_r, out_g, out_b };
-}
-#endif
 
 float srgb_to_linear_component(float value)
 {
@@ -428,7 +308,8 @@ ColorSolverNearestResult nearest_color_solver_candidates_perceptual(const ColorS
 
 ColorSolverMixModel color_solver_mix_model_from_index(int model)
 {
-    return ColorSolverMixModel(std::clamp(model, int(ColorSolverMixModel::FilamentMixer), int(ColorSolverMixModel::PigmentPainter)));
+    (void) model;
+    return ColorSolverMixModel::PigmentPainter;
 }
 
 ColorSolverLookupMode color_solver_lookup_mode_from_index(int mode)
@@ -465,53 +346,20 @@ std::array<float, 3> mix_color_solver_components(const std::vector<std::array<fl
                                                  const std::vector<int>                  &weights,
                                                  ColorSolverMixModel                       mix_model)
 {
-#if COLOR_SOLVER_ENABLE_FILAMENT_MIXER && COLOR_SOLVER_ENABLE_PIGMENT_PAINTER
-    return clamp_mix_model(mix_model) == ColorSolverMixModel::PigmentPainter ?
-        pigment_painter::mix_srgb(component_colors, weights) :
-        mix_component_colors_with_filament_mixer(component_colors, weights);
-#elif COLOR_SOLVER_ENABLE_PIGMENT_PAINTER
     (void) mix_model;
     return pigment_painter::mix_srgb(component_colors, weights);
-#elif COLOR_SOLVER_ENABLE_FILAMENT_MIXER
-    (void) mix_model;
-    return mix_component_colors_with_filament_mixer(component_colors, weights);
-#else
-    (void) component_colors;
-    (void) weights;
-    (void) mix_model;
-    return { 0.f, 0.f, 0.f };
-#endif
 }
 
 std::array<float, 3> mix_color_solver_components(const std::vector<std::array<float, 3>> &component_colors,
                                                  const std::vector<float>                &weights,
                                                  ColorSolverMixModel                       mix_model)
 {
-#if COLOR_SOLVER_ENABLE_FILAMENT_MIXER && COLOR_SOLVER_ENABLE_PIGMENT_PAINTER
-    if (clamp_mix_model(mix_model) == ColorSolverMixModel::PigmentPainter) {
-        std::vector<float> safe_weights;
-        safe_weights.reserve(weights.size());
-        for (const float weight : weights)
-            safe_weights.emplace_back(std::isfinite(weight) ? std::clamp(weight, 0.f, 1.f) : 0.f);
-        return pigment_painter::mix_srgb(component_colors, safe_weights);
-    }
-    return mix_component_colors_with_filament_mixer(component_colors, weights);
-#elif COLOR_SOLVER_ENABLE_PIGMENT_PAINTER
     (void) mix_model;
     std::vector<float> safe_weights;
     safe_weights.reserve(weights.size());
     for (const float weight : weights)
         safe_weights.emplace_back(std::isfinite(weight) ? std::clamp(weight, 0.f, 1.f) : 0.f);
     return pigment_painter::mix_srgb(component_colors, safe_weights);
-#elif COLOR_SOLVER_ENABLE_FILAMENT_MIXER
-    (void) mix_model;
-    return mix_component_colors_with_filament_mixer(component_colors, weights);
-#else
-    (void) component_colors;
-    (void) weights;
-    (void) mix_model;
-    return { 0.f, 0.f, 0.f };
-#endif
 }
 
 std::string color_solver_candidate_cache_key(const std::vector<std::array<float, 3>> &component_colors,

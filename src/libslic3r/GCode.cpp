@@ -25,7 +25,6 @@
 #include "Time.hpp"
 #include "Color.hpp"
 #include "GCode/ExtrusionProcessor.hpp"
-#include "filament_mixer.h"
 #include <array>
 #include <algorithm>
 #include <cmath>
@@ -6213,50 +6212,6 @@ static std::array<float, 4> composite_rgba_over_background_for_gcode(const std::
     };
 }
 
-static std::array<float, 3> mix_component_colors_with_filament_mixer_for_gcode(const std::vector<std::array<float, 3>> &component_colors,
-                                                                               const std::vector<int>                  &weights)
-{
-    if (component_colors.empty() || component_colors.size() != weights.size())
-        return { 0.f, 0.f, 0.f };
-
-    bool  has_base = false;
-    float out_r = 0.f;
-    float out_g = 0.f;
-    float out_b = 0.f;
-    int   accumulated = 0;
-    for (size_t i = 0; i < component_colors.size(); ++i) {
-        const int weight = std::max(0, weights[i]);
-        if (weight == 0)
-            continue;
-
-        if (!has_base) {
-            out_r = component_colors[i][0];
-            out_g = component_colors[i][1];
-            out_b = component_colors[i][2];
-            accumulated = weight;
-            has_base = true;
-            continue;
-        }
-
-        const float t = float(weight) / float(std::max(1, accumulated + weight));
-        float mixed_r = out_r;
-        float mixed_g = out_g;
-        float mixed_b = out_b;
-        filament_mixer_lerp_float(out_r, out_g, out_b,
-                                  component_colors[i][0], component_colors[i][1], component_colors[i][2],
-                                  t,
-                                  &mixed_r, &mixed_g, &mixed_b);
-        out_r = clamp01f_for_gcode(mixed_r);
-        out_g = clamp01f_for_gcode(mixed_g);
-        out_b = clamp01f_for_gcode(mixed_b);
-        accumulated += weight;
-    }
-
-    if (!has_base)
-        return component_colors.front();
-    return { out_r, out_g, out_b };
-}
-
 static float srgb_to_linear_component_for_gcode(float value)
 {
     const float x = clamp01f_for_gcode(value);
@@ -8121,9 +8076,7 @@ std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoo
     const int generic_solver_mode = std::clamp(zone->generic_solver_mode,
                                                int(TextureMappingZone::GenericSolverLegacy),
                                                int(TextureMappingZone::GenericSolverV2));
-    const int generic_solver_mix_model = std::clamp(zone->generic_solver_mix_model,
-                                                    int(TextureMappingZone::GenericSolverFilamentMixer),
-                                                    int(TextureMappingZone::GenericSolverPigmentPainter));
+    const int generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
     const bool compact_offset_mode = zone->compact_offset_mode;
     const bool use_legacy_fixed_color_mode = zone->use_legacy_fixed_color_mode;
     const float texture_contrast_pct = std::clamp(zone->contrast_pct, 25.f, 300.f);
@@ -9257,9 +9210,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                             const int generic_solver_mode = std::clamp(zone->generic_solver_mode,
                                                                        int(TextureMappingZone::GenericSolverLegacy),
                                                                        int(TextureMappingZone::GenericSolverV2));
-                            const int generic_solver_mix_model = std::clamp(zone->generic_solver_mix_model,
-                                                                            int(TextureMappingZone::GenericSolverFilamentMixer),
-                                                                            int(TextureMappingZone::GenericSolverPigmentPainter));
+                            const int generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
                             const bool use_legacy_fixed_color_mode = zone->use_legacy_fixed_color_mode;
                             const float texture_contrast_pct = std::clamp(zone->contrast_pct, 25.f, 300.f);
                             const float texture_tone_gamma =

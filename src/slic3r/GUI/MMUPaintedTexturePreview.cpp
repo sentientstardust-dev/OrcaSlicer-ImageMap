@@ -13,7 +13,6 @@
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/TextureMapping.hpp"
 #include "libslic3r/ColorSolver.hpp"
-#include "libslic3r/filament_mixer.h"
 
 #include <algorithm>
 #include <cmath>
@@ -68,7 +67,7 @@ struct TexturePreviewSimulationSettings
     float tone_gamma = 1.f;
     int generic_solver_lookup_mode = int(TextureMappingZone::GenericSolverClosestMix);
     int generic_solver_mode = int(TextureMappingZone::GenericSolverV2);
-    int generic_solver_mix_model = int(TextureMappingZone::GenericSolverFilamentMixer);
+    int generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
     std::vector<unsigned int> component_ids;
     std::vector<std::array<float, 3>> component_colors;
     std::vector<float> component_strength_factors;
@@ -244,38 +243,20 @@ ColorRGBA blend_component_colors(const std::vector<std::array<float, 3>> &colors
     if (colors.empty() || weights.empty())
         return { 0.15f, 0.65f, 0.6f, 1.f };
 
+    const size_t count = std::min(colors.size(), weights.size());
+    if (count == 0)
+        return { 0.15f, 0.65f, 0.6f, 1.f };
+
     float total = 0.f;
-    for (size_t idx = 0; idx < std::min(colors.size(), weights.size()); ++idx)
+    for (size_t idx = 0; idx < count; ++idx)
         total += std::max(0.f, weights[idx]);
     if (total <= k_epsilon)
         return { colors.front()[0], colors.front()[1], colors.front()[2], 1.f };
 
-    float out_r = colors.front()[0];
-    float out_g = colors.front()[1];
-    float out_b = colors.front()[2];
-    float accumulated = std::max(0.f, weights[0]);
-    if (accumulated <= k_epsilon) {
-        for (size_t idx = 1; idx < std::min(colors.size(), weights.size()); ++idx) {
-            if (weights[idx] > k_epsilon) {
-                out_r = colors[idx][0];
-                out_g = colors[idx][1];
-                out_b = colors[idx][2];
-                accumulated = weights[idx];
-                break;
-            }
-        }
-    }
-
-    for (size_t idx = 1; idx < std::min(colors.size(), weights.size()); ++idx) {
-        const float weight = std::max(0.f, weights[idx]);
-        if (weight <= k_epsilon)
-            continue;
-        const float t = weight / std::max(accumulated + weight, k_epsilon);
-        filament_mixer_lerp_float(out_r, out_g, out_b, colors[idx][0], colors[idx][1], colors[idx][2], t, &out_r, &out_g, &out_b);
-        accumulated += weight;
-    }
-
-    return { std::clamp(out_r, 0.f, 1.f), std::clamp(out_g, 0.f, 1.f), std::clamp(out_b, 0.f, 1.f), 1.f };
+    std::vector<std::array<float, 3>> mix_colors(colors.begin(), colors.begin() + count);
+    std::vector<float> mix_weights(weights.begin(), weights.begin() + count);
+    const std::array<float, 3> rgb = mix_color_solver_components(mix_colors, mix_weights, ColorSolverMixModel::PigmentPainter);
+    return { std::clamp(rgb[0], 0.f, 1.f), std::clamp(rgb[1], 0.f, 1.f), std::clamp(rgb[2], 0.f, 1.f), 1.f };
 }
 
 float clamp01(float value)
@@ -714,56 +695,6 @@ std::vector<std::string> physical_filament_colors_for_texture_preview(size_t num
     return colors;
 }
 
-std::array<float, 3> mix_component_colors_with_filament_mixer(const std::vector<std::array<float, 3>> &component_colors,
-                                                              const std::vector<float>                &weights)
-{
-    if (component_colors.empty() || component_colors.size() != weights.size())
-        return { 0.f, 0.f, 0.f };
-
-    bool has_base = false;
-    float out_r = 0.f;
-    float out_g = 0.f;
-    float out_b = 0.f;
-    float accumulated = 0.f;
-    for (size_t idx = 0; idx < component_colors.size(); ++idx) {
-        const float weight = clamp01(weights[idx]);
-        if (weight <= k_epsilon)
-            continue;
-
-        if (!has_base) {
-            out_r = component_colors[idx][0];
-            out_g = component_colors[idx][1];
-            out_b = component_colors[idx][2];
-            accumulated = weight;
-            has_base = true;
-            continue;
-        }
-
-        const float t = weight / std::max(k_epsilon, accumulated + weight);
-        float mixed_r = out_r;
-        float mixed_g = out_g;
-        float mixed_b = out_b;
-        filament_mixer_lerp_float(out_r,
-                                  out_g,
-                                  out_b,
-                                  component_colors[idx][0],
-                                  component_colors[idx][1],
-                                  component_colors[idx][2],
-                                  t,
-                                  &mixed_r,
-                                  &mixed_g,
-                                  &mixed_b);
-        out_r = clamp01(mixed_r);
-        out_g = clamp01(mixed_g);
-        out_b = clamp01(mixed_b);
-        accumulated += weight;
-    }
-
-    if (!has_base)
-        return component_colors.front();
-    return { out_r, out_g, out_b };
-}
-
 float color_distance_sq(const std::array<float, 3> &lhs, const std::array<float, 3> &rhs)
 {
     const float dr = lhs[0] - rhs[0];
@@ -927,7 +858,7 @@ std::vector<TexturePreviewMixCandidate> build_generic_mix_candidates(const std::
             candidate.weights.assign(component_count, 0.f);
             for (size_t weight_idx = 0; weight_idx < component_count; ++weight_idx)
                 candidate.weights[weight_idx] = float(units[weight_idx]) / float(std::max(1, total_units));
-            candidate.rgb = mix_component_colors_with_filament_mixer(component_colors, candidate.weights);
+            candidate.rgb = mix_color_solver_components(component_colors, candidate.weights, ColorSolverMixModel::PigmentPainter);
             candidate.perceptual = oklab_from_srgb(candidate.rgb);
             candidates.emplace_back(std::move(candidate));
             return;
@@ -1488,9 +1419,7 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
     settings.generic_solver_mode = std::clamp(zone->generic_solver_mode,
                                               int(TextureMappingZone::GenericSolverLegacy),
                                               int(TextureMappingZone::GenericSolverV2));
-    settings.generic_solver_mix_model = std::clamp(zone->generic_solver_mix_model,
-                                                   int(TextureMappingZone::GenericSolverFilamentMixer),
-                                                   int(TextureMappingZone::GenericSolverPigmentPainter));
+    settings.generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
     settings.component_ids = TextureMappingManager::effective_texture_component_ids(*zone, num_physical, physical_colors);
     if (settings.component_ids.empty())
         return std::nullopt;
@@ -2439,7 +2368,7 @@ float variable_width_delta(float inset_strength,
 ColorRGBA surface_gradient_preview_color_from_weights(const SurfaceGradientPreviewSettings &settings,
                                                       const std::vector<float>             &weights)
 {
-    const std::array<float, 3> rgb = mix_component_colors_with_filament_mixer(settings.component_colors, weights);
+    const std::array<float, 3> rgb = mix_color_solver_components(settings.component_colors, weights, ColorSolverMixModel::PigmentPainter);
     return { rgb[0], rgb[1], rgb[2], 1.f };
 }
 
@@ -3064,7 +2993,7 @@ size_t texture_preview_settings_signature(size_t num_physical, const TextureMapp
         signature_mix(std::hash<int>{}(zone.use_legacy_fixed_color_mode ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.generic_solver_lookup_mode));
         signature_mix(std::hash<int>{}(zone.generic_solver_mode));
-        signature_mix(std::hash<int>{}(zone.generic_solver_mix_model));
+        signature_mix(std::hash<int>{}(TextureMappingZone::DefaultGenericSolverMixModel));
         signature_mix(std::hash<int>{}(zone.preview_simulate_colors ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.preview_limit_resolution ? 1 : 0));
         signature_mix_float(zone.sagging_ratio);
