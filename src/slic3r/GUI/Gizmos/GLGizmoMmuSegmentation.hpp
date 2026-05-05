@@ -360,6 +360,7 @@ private:
     float                m_projection_opacity = 1.f;
     bool                 m_apply_transparency_as_background = false;
     bool                 m_pass_through_model = false;
+    bool                 m_convert_existing_colors_to_raw_offsets = true;
 };
 
 } // namespace Slic3r

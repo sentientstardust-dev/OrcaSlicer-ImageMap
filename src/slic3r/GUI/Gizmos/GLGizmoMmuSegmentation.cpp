@@ -168,6 +168,31 @@ static size_t display_filament_index_for_requested_id(const std::vector<unsigned
     return selected_it != display_filament_ids.end() ? size_t(std::distance(display_filament_ids.begin(), selected_it)) : 0;
 }
 
+static void persist_texture_mapping_zone_definitions(TextureMappingManager &mgr)
+{
+    if (wxGetApp().preset_bundle == nullptr)
+        return;
+
+    const std::string texture_serialized = mgr.serialize_entries();
+    DynamicPrintConfig *print_cfg = &wxGetApp().preset_bundle->prints.get_edited_preset().config;
+    if (ConfigOptionString *opt = print_cfg->option<ConfigOptionString>("texture_mapping_definitions"))
+        opt->value = texture_serialized;
+    else
+        print_cfg->set_key_value("texture_mapping_definitions", new ConfigOptionString(texture_serialized));
+
+    if (ConfigOptionString *opt = wxGetApp().preset_bundle->project_config.option<ConfigOptionString>("texture_mapping_definitions"))
+        opt->value = texture_serialized;
+    else
+        wxGetApp().preset_bundle->project_config.set_key_value("texture_mapping_definitions", new ConfigOptionString(texture_serialized));
+
+    wxGetApp().sidebar().update_texture_mapping_panel(false);
+    wxGetApp().sidebar().update_dynamic_filament_list();
+    if (auto *print_tab = wxGetApp().get_tab(Preset::TYPE_PRINT))
+        print_tab->update_dirty();
+    if (wxGetApp().mainframe != nullptr)
+        wxGetApp().mainframe->on_config_changed(print_cfg);
+}
+
 static unsigned int ensure_texture_mapping_zone(bool allow_raw_values = false, bool prefer_raw_values = false)
 {
     if (wxGetApp().preset_bundle == nullptr || wxGetApp().plater() == nullptr)
@@ -189,52 +214,23 @@ static unsigned int ensure_texture_mapping_zone(bool allow_raw_values = false, b
         mgr.ensure_image_texture_zone(num_physical, physical_colors, allow_raw_values, prefer_raw_values);
     }
 
-    const std::string texture_serialized = mgr.serialize_entries();
-    DynamicPrintConfig *print_cfg = &wxGetApp().preset_bundle->prints.get_edited_preset().config;
-    if (ConfigOptionString *opt = print_cfg->option<ConfigOptionString>("texture_mapping_definitions"))
-        opt->value = texture_serialized;
-    else
-        print_cfg->set_key_value("texture_mapping_definitions", new ConfigOptionString(texture_serialized));
-
-    if (ConfigOptionString *opt = wxGetApp().preset_bundle->project_config.option<ConfigOptionString>("texture_mapping_definitions"))
-        opt->value = texture_serialized;
-    else
-        wxGetApp().preset_bundle->project_config.set_key_value("texture_mapping_definitions", new ConfigOptionString(texture_serialized));
-
-    wxGetApp().sidebar().update_texture_mapping_panel(false);
-    wxGetApp().sidebar().update_dynamic_filament_list();
-    if (auto *print_tab = wxGetApp().get_tab(Preset::TYPE_PRINT))
-        print_tab->update_dirty();
-    if (wxGetApp().mainframe != nullptr)
-        wxGetApp().mainframe->on_config_changed(print_cfg);
+    persist_texture_mapping_zone_definitions(mgr);
 
     return mgr.find_image_texture_zone_id(num_physical, allow_raw_values, prefer_raw_values);
 }
 
-static void persist_texture_mapping_zone_updates()
+static void enable_texture_mapping_zone_simulated_preview(unsigned int texture_mapping_filament_id)
 {
-    if (wxGetApp().preset_bundle == nullptr)
+    if (texture_mapping_filament_id == 0 || wxGetApp().preset_bundle == nullptr)
         return;
 
     TextureMappingManager &mgr = wxGetApp().preset_bundle->texture_mapping_zones;
-    const std::string texture_serialized = mgr.serialize_entries();
-    DynamicPrintConfig *print_cfg = &wxGetApp().preset_bundle->prints.get_edited_preset().config;
-    if (ConfigOptionString *opt = print_cfg->option<ConfigOptionString>("texture_mapping_definitions"))
-        opt->value = texture_serialized;
-    else
-        print_cfg->set_key_value("texture_mapping_definitions", new ConfigOptionString(texture_serialized));
+    TextureMappingZone *zone = mgr.zone_from_id(texture_mapping_filament_id);
+    if (zone == nullptr || zone->preview_simulate_colors)
+        return;
 
-    if (ConfigOptionString *opt = wxGetApp().preset_bundle->project_config.option<ConfigOptionString>("texture_mapping_definitions"))
-        opt->value = texture_serialized;
-    else
-        wxGetApp().preset_bundle->project_config.set_key_value("texture_mapping_definitions", new ConfigOptionString(texture_serialized));
-
-    wxGetApp().sidebar().update_texture_mapping_panel(false);
-    wxGetApp().sidebar().update_dynamic_filament_list();
-    if (auto *print_tab = wxGetApp().get_tab(Preset::TYPE_PRINT))
-        print_tab->update_dirty();
-    if (wxGetApp().mainframe != nullptr)
-        wxGetApp().mainframe->on_config_changed(print_cfg);
+    zone->preview_simulate_colors = true;
+    persist_texture_mapping_zone_definitions(mgr);
 }
 
 static constexpr size_t MaxImageProjectionRawOffsetChannels = 4;
@@ -258,6 +254,50 @@ static bool model_volume_has_raw_atlas_texture_data(const ModelVolume *volume)
            size_t(volume->imported_texture_width) *
                size_t(volume->imported_texture_height) *
                size_t(volume->imported_texture_raw_channels);
+}
+
+static std::string raw_atlas_color_mode_name_for_keys(const std::vector<std::string> &keys)
+{
+    if (keys.empty())
+        return "Unknown";
+
+    bool all_standard = true;
+    std::string joined;
+    for (const std::string &key : keys) {
+        if (key.size() != 1 || !image_map_raw_filament_is_standard_color(key)) {
+            all_standard = false;
+            break;
+        }
+        joined += key;
+    }
+    auto has_key = [&keys](const std::string &key) {
+        return std::find(keys.begin(), keys.end(), key) != keys.end();
+    };
+    if (all_standard && keys.size() == 3 && has_key("R") && has_key("G") && has_key("B"))
+        return "RGB";
+    if (all_standard && keys.size() == 3 && has_key("C") && has_key("M") && has_key("Y"))
+        return "CMY";
+    if (all_standard && keys.size() == 4 && has_key("C") && has_key("M") && has_key("Y") && has_key("K"))
+        return "CMYK";
+    if (all_standard && keys.size() == 4 && has_key("C") && has_key("M") && has_key("Y") && has_key("W"))
+        return "CMYW";
+    if (all_standard && keys.size() == 4 && has_key("R") && has_key("G") && has_key("B") && has_key("K"))
+        return "RGBK";
+    if (all_standard && keys.size() == 4 && has_key("R") && has_key("G") && has_key("B") && has_key("W"))
+        return "RGBW";
+    if (all_standard && keys.size() == 2 && has_key("K") && has_key("W"))
+        return "BW";
+    if (all_standard && !joined.empty())
+        return joined;
+
+    return "Custom " + std::to_string(keys.size()) + "-channel";
+}
+
+static std::string raw_atlas_color_mode_name_for_volume(const ModelVolume &volume)
+{
+    const std::vector<ImageMapRawFilament> filaments =
+        image_map_raw_filaments_from_metadata_json(volume.imported_texture_raw_metadata_json, volume.imported_texture_raw_channels);
+    return raw_atlas_color_mode_name_for_keys(image_map_raw_filament_channel_keys(filaments));
 }
 
 static bool add_raw_layout_channel(RawAtlasProjectionLayout &layout,
@@ -362,48 +402,6 @@ static std::string raw_layout_metadata_json(uint32_t width, uint32_t height, con
         root["filaments"].push_back(std::move(entry));
     }
     return root.dump();
-}
-
-static void configure_texture_mapping_zone_for_raw_atlas(unsigned int texture_mapping_filament_id,
-                                                         const RawAtlasProjectionLayout &layout)
-{
-    if (texture_mapping_filament_id == 0 || wxGetApp().preset_bundle == nullptr || layout.filaments.empty())
-        return;
-
-    TextureMappingZone *zone = wxGetApp().preset_bundle->texture_mapping_zones.zone_from_id(texture_mapping_filament_id);
-    if (zone == nullptr)
-        return;
-
-    const unsigned int max_physical = unsigned(std::min<size_t>(size_t(std::max(wxGetApp().filaments_cnt(), 0)), 9));
-    std::vector<unsigned int> ids;
-    ids.reserve(layout.filaments.size());
-    auto add_id = [&ids, max_physical, &layout](unsigned int id) {
-        if (id == 0 ||
-            id > max_physical ||
-            ids.size() >= layout.filaments.size() ||
-            std::find(ids.begin(), ids.end(), id) != ids.end())
-            return;
-        ids.emplace_back(id);
-    };
-    for (const ImageMapRawFilament &filament : layout.filaments)
-        add_id(filament.slot);
-    for (unsigned int id = 1; id <= max_physical && ids.size() < layout.filaments.size(); ++id)
-        add_id(id);
-
-    std::string encoded;
-    encoded.reserve(ids.size());
-    for (const unsigned int id : ids)
-        encoded.push_back(char('0' + id));
-
-    zone->texture_mapping_mode = int(TextureMappingZone::TextureMappingRawValues);
-    zone->preview_simulate_colors = true;
-    zone->auto_adjust_filament_selection = false;
-    if (!encoded.empty()) {
-        zone->component_ids = std::move(encoded);
-        zone->component_a = ids.front();
-        zone->component_b = ids.size() > 1 ? ids[1] : ids.front();
-    }
-    persist_texture_mapping_zone_updates();
 }
 
 static bool model_volume_has_imported_image_texture_data(const ModelVolume *volume)
@@ -811,6 +809,17 @@ static bool set_texture_mapping_background_config(ModelConfigObject &config, con
     return true;
 }
 
+static bool texture_mapping_background_color_config_present(const ModelConfigObject &config)
+{
+    return config.has("texture_mapping_background_color");
+}
+
+static bool texture_mapping_background_color_metadata_present(const ColorFacetsAnnotation &annotation)
+{
+    const std::string &metadata = annotation.metadata_json();
+    return metadata.find("\"background_color\":\"#") != std::string::npos;
+}
+
 static bool set_managed_color_data_background_color(ModelObject &object, const ColorRGBA &color)
 {
     ColorRGBA background = color;
@@ -823,6 +832,26 @@ static bool set_managed_color_data_background_color(ModelObject &object, const C
         changed |= set_texture_mapping_background_config(volume->config, background);
         if (!volume->texture_mapping_color_facets.empty() && volume->texture_mapping_color_facets.metadata_json() != metadata) {
             volume->texture_mapping_color_facets.set_metadata_json(metadata);
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+static bool clear_texture_mapping_background_config(ModelConfigObject &config)
+{
+    return config.erase("texture_mapping_background_color");
+}
+
+static bool clear_managed_color_data_background_color(ModelObject &object)
+{
+    bool changed = clear_texture_mapping_background_config(object.config);
+    for (ModelVolume *volume : object.volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+        changed |= clear_texture_mapping_background_config(volume->config);
+        if (texture_mapping_background_color_metadata_present(volume->texture_mapping_color_facets)) {
+            volume->texture_mapping_color_facets.set_metadata_json(std::string());
             changed = true;
         }
     }
@@ -886,6 +915,67 @@ static ColorRGBA managed_color_data_background_color(const ModelObject *object)
     return ColorRGBA(1.f, 1.f, 1.f, 1.f);
 }
 
+static bool managed_color_data_has_background_color(const ModelObject *object)
+{
+    if (object == nullptr)
+        return false;
+
+    if (texture_mapping_background_color_config_present(object->config))
+        return true;
+
+    for (const ModelVolume *volume : object->volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+        if (texture_mapping_background_color_config_present(volume->config))
+            return true;
+        if (texture_mapping_background_color_metadata_present(volume->texture_mapping_color_facets))
+            return true;
+    }
+
+    return false;
+}
+
+static std::optional<ColorRGBA> configured_texture_mapping_background_color_for_volume(const ModelVolume &volume)
+{
+    auto read_config_color = [](const ModelConfigObject &config) -> std::optional<ColorRGBA> {
+        if (!config.has("texture_mapping_background_color"))
+            return std::nullopt;
+        const ConfigOptionString *opt = dynamic_cast<const ConfigOptionString *>(config.option("texture_mapping_background_color"));
+        if (opt == nullptr)
+            return std::nullopt;
+        const std::string &text = opt->value;
+        const size_t hash_pos = text.find('#');
+        const size_t start = hash_pos == std::string::npos ? 0 : hash_pos + 1;
+        if (start + 6 > text.size())
+            return std::nullopt;
+        unsigned int values[3] = { 255, 255, 255 };
+        for (size_t channel = 0; channel < 3; ++channel) {
+            int value = 0;
+            for (size_t digit = 0; digit < 2; ++digit) {
+                const char ch = text[start + channel * 2 + digit];
+                const int hex = ch >= '0' && ch <= '9' ? ch - '0' :
+                                ch >= 'a' && ch <= 'f' ? ch - 'a' + 10 :
+                                ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
+                if (hex < 0)
+                    return std::nullopt;
+                value = (value << 4) | hex;
+            }
+            values[channel] = unsigned(value);
+        }
+        return ColorRGBA(float(values[0]) / 255.f, float(values[1]) / 255.f, float(values[2]) / 255.f, 1.f);
+    };
+
+    if (std::optional<ColorRGBA> color = read_config_color(volume.config))
+        return color;
+    if (const ModelObject *object = volume.get_object()) {
+        if (std::optional<ColorRGBA> color = read_config_color(object->config))
+            return color;
+    }
+    if (!volume.texture_mapping_color_facets.metadata_json().empty())
+        return rgb_metadata_background_color(volume.texture_mapping_color_facets);
+    return std::nullopt;
+}
+
 static void refresh_imported_texture_storage(ModelVolume &volume)
 {
     std::vector<uint8_t> refreshed(volume.imported_texture_rgba.begin(), volume.imported_texture_rgba.end());
@@ -932,24 +1022,65 @@ static ColorRGBA raw_filament_color_for_projection_preview(const ImageMapRawFila
     return ColorRGBA(float(rgba[0]) / 255.f, float(rgba[1]) / 255.f, float(rgba[2]) / 255.f, 1.f);
 }
 
-static ColorRGBA simulated_preview_color_from_raw_offsets(const std::vector<ColorRGBA> &filament_colors,
-                                                          const uint8_t *values,
-                                                          size_t value_count,
-                                                          uint8_t alpha)
+static std::vector<ColorRGBA> raw_filament_colors_for_projection_preview(const std::vector<ImageMapRawFilament> &filaments)
 {
-    if (values == nullptr || value_count == 0 || filament_colors.empty())
-        return ColorRGBA(0.f, 0.f, 0.f, float(alpha) / 255.f);
+    std::vector<ColorRGBA> colors;
+    colors.reserve(filaments.size());
+    for (const ImageMapRawFilament &filament : filaments)
+        colors.emplace_back(raw_filament_color_for_projection_preview(filament));
+    return colors;
+}
+
+static ColorRGBA raw_flat_blend_color_from_filaments(const std::vector<ColorRGBA> &filament_colors)
+{
+    const std::vector<float> weights(filament_colors.size(), 1.f);
+    return color_mix_from_weights(filament_colors, weights, ColorRGBA(1.f, 1.f, 1.f, 1.f));
+}
+
+struct RawOffsetColorConversionCandidate
+{
+    std::array<float, 3> rgb { 0.f, 0.f, 0.f };
+    std::vector<uint8_t> values;
+};
+
+struct RawOffsetColorConversionKdNode
+{
+    uint32_t candidate_idx = 0;
+    int      left = -1;
+    int      right = -1;
+    uint8_t  axis = 0;
+};
+
+struct RawOffsetColorConversionNearest
+{
+    size_t best_idx = size_t(-1);
+    float  best_error = std::numeric_limits<float>::max();
+};
+
+struct RawOffsetColorConversionSolver
+{
+    std::vector<RawOffsetColorConversionCandidate> candidates;
+    std::vector<RawOffsetColorConversionKdNode>    nodes;
+    int                                            root = -1;
+    std::unordered_map<unsigned int, std::vector<uint8_t>> cache;
+};
+
+static ColorRGBA mix_raw_offset_projection_color(const std::vector<ColorRGBA> &filament_colors,
+                                                 const std::vector<float>     &weights,
+                                                 const ColorRGBA              &fallback)
+{
+    if (filament_colors.empty() || weights.empty())
+        return fallback;
 
     bool has_base = false;
     float out_r = 0.f;
     float out_g = 0.f;
     float out_b = 0.f;
     float accumulated = 0.f;
-    for (size_t idx = 0; idx < filament_colors.size() && idx < value_count; ++idx) {
-        const float weight = std::clamp(float(values[idx]) / 255.f, 0.f, 1.f);
+    for (size_t idx = 0; idx < filament_colors.size() && idx < weights.size(); ++idx) {
+        const float weight = std::clamp(weights[idx], 0.f, 1.f);
         if (weight <= EPSILON)
             continue;
-
         if (!has_base) {
             out_r = filament_colors[idx].r();
             out_g = filament_colors[idx].g();
@@ -979,9 +1110,315 @@ static ColorRGBA simulated_preview_color_from_raw_offsets(const std::vector<Colo
         accumulated += weight;
     }
 
+    return has_base ? ColorRGBA(out_r, out_g, out_b, fallback.a()) : fallback;
+}
+
+static int raw_offset_color_conversion_total_units(size_t component_count)
+{
+    return component_count <= 4 ? 40 : (component_count == 5 ? 24 : 20);
+}
+
+static size_t raw_offset_color_conversion_candidate_count(size_t component_count, int total_units)
+{
+    if (component_count == 0)
+        return 0;
+
+    const size_t n = size_t(total_units) + component_count - 1;
+    size_t k = component_count - 1;
+    k = std::min(k, n - k);
+
+    size_t result = 1;
+    for (size_t idx = 1; idx <= k; ++idx)
+        result = (result * (n - k + idx)) / idx;
+    return result;
+}
+
+static std::vector<RawOffsetColorConversionCandidate> build_raw_offset_color_conversion_candidates(
+    const std::vector<ColorRGBA> &filament_colors)
+{
+    if (filament_colors.empty())
+        return {};
+
+    const size_t component_count = filament_colors.size();
+    const int total_units = raw_offset_color_conversion_total_units(component_count);
+    std::vector<int> units(component_count, 0);
+    std::vector<RawOffsetColorConversionCandidate> candidates;
+    candidates.reserve(raw_offset_color_conversion_candidate_count(component_count, total_units));
+
+    std::function<void(size_t, int)> recurse = [&](size_t idx, int remaining_units) {
+        if (idx + 1 == component_count) {
+            units[idx] = remaining_units;
+            RawOffsetColorConversionCandidate candidate;
+            std::vector<float> weights(component_count, 0.f);
+            candidate.values.assign(component_count, 0);
+            for (size_t weight_idx = 0; weight_idx < component_count; ++weight_idx) {
+                weights[weight_idx] = float(units[weight_idx]) / float(std::max(1, total_units));
+                candidate.values[weight_idx] = uint8_t(std::clamp(int(std::lround(weights[weight_idx] * 255.f)), 0, 255));
+            }
+            const ColorRGBA mixed =
+                mix_raw_offset_projection_color(filament_colors, weights, ColorRGBA(1.f, 1.f, 1.f, 1.f));
+            candidate.rgb = { mixed.r(), mixed.g(), mixed.b() };
+            candidates.emplace_back(std::move(candidate));
+            return;
+        }
+
+        for (int unit = 0; unit <= remaining_units; ++unit) {
+            units[idx] = unit;
+            recurse(idx + 1, remaining_units - unit);
+        }
+    };
+    recurse(0, total_units);
+    return candidates;
+}
+
+static int build_raw_offset_color_conversion_kd_tree(const std::vector<RawOffsetColorConversionCandidate> &candidates,
+                                                     std::vector<RawOffsetColorConversionKdNode>          &nodes,
+                                                     std::vector<uint32_t>                                &indices,
+                                                     size_t                                                begin,
+                                                     size_t                                                end,
+                                                     uint8_t                                               axis)
+{
+    if (begin >= end)
+        return -1;
+
+    const size_t mid = begin + (end - begin) / 2;
+    auto axis_value = [&candidates, axis](uint32_t candidate_idx) {
+        return candidates[size_t(candidate_idx)].rgb[size_t(axis)];
+    };
+    std::nth_element(indices.begin() + begin,
+                     indices.begin() + mid,
+                     indices.begin() + end,
+                     [&axis_value](uint32_t lhs, uint32_t rhs) {
+                         return axis_value(lhs) < axis_value(rhs);
+                     });
+
+    const int node_idx = int(nodes.size());
+    RawOffsetColorConversionKdNode node;
+    node.candidate_idx = indices[mid];
+    node.axis = axis;
+    nodes.emplace_back(node);
+
+    const uint8_t next_axis = uint8_t((axis + 1) % 3);
+    const int left = build_raw_offset_color_conversion_kd_tree(candidates, nodes, indices, begin, mid, next_axis);
+    const int right = build_raw_offset_color_conversion_kd_tree(candidates, nodes, indices, mid + 1, end, next_axis);
+    nodes[size_t(node_idx)].left = left;
+    nodes[size_t(node_idx)].right = right;
+    return node_idx;
+}
+
+static int build_raw_offset_color_conversion_kd_tree(const std::vector<RawOffsetColorConversionCandidate> &candidates,
+                                                     std::vector<RawOffsetColorConversionKdNode>          &nodes)
+{
+    nodes.clear();
+    if (candidates.empty())
+        return -1;
+
+    std::vector<uint32_t> indices(candidates.size(), 0);
+    for (size_t idx = 0; idx < indices.size(); ++idx)
+        indices[idx] = uint32_t(idx);
+    nodes.reserve(candidates.size());
+    return build_raw_offset_color_conversion_kd_tree(candidates, nodes, indices, 0, candidates.size(), 0);
+}
+
+static float raw_offset_color_conversion_error(const RawOffsetColorConversionCandidate &candidate,
+                                               const std::array<float, 3>             &target)
+{
+    return Slic3r::sqr(candidate.rgb[0] - target[0]) +
+           Slic3r::sqr(candidate.rgb[1] - target[1]) +
+           Slic3r::sqr(candidate.rgb[2] - target[2]);
+}
+
+static void raw_offset_color_conversion_consider_candidate(
+    const std::vector<RawOffsetColorConversionCandidate> &candidates,
+    size_t                                                candidate_idx,
+    const std::array<float, 3>                           &target,
+    RawOffsetColorConversionNearest                      &nearest)
+{
+    if (candidate_idx >= candidates.size())
+        return;
+    const float error = raw_offset_color_conversion_error(candidates[candidate_idx], target);
+    if (error < nearest.best_error) {
+        nearest.best_error = error;
+        nearest.best_idx = candidate_idx;
+    }
+}
+
+static void query_raw_offset_color_conversion_kd_tree(
+    const std::vector<RawOffsetColorConversionCandidate> &candidates,
+    const std::vector<RawOffsetColorConversionKdNode>    &nodes,
+    const std::array<float, 3>                           &target,
+    int                                                   node_idx,
+    RawOffsetColorConversionNearest                      &nearest)
+{
+    if (node_idx < 0 || size_t(node_idx) >= nodes.size())
+        return;
+
+    const RawOffsetColorConversionKdNode &node = nodes[size_t(node_idx)];
+    if (size_t(node.candidate_idx) >= candidates.size()) {
+        query_raw_offset_color_conversion_kd_tree(candidates, nodes, target, node.left, nearest);
+        query_raw_offset_color_conversion_kd_tree(candidates, nodes, target, node.right, nearest);
+        return;
+    }
+
+    raw_offset_color_conversion_consider_candidate(candidates, size_t(node.candidate_idx), target, nearest);
+    const uint8_t axis = node.axis;
+    const float split_delta = target[size_t(axis)] - candidates[size_t(node.candidate_idx)].rgb[size_t(axis)];
+    const int near_node = split_delta < 0.f ? node.left : node.right;
+    const int far_node = split_delta < 0.f ? node.right : node.left;
+    query_raw_offset_color_conversion_kd_tree(candidates, nodes, target, near_node, nearest);
+    if (Slic3r::sqr(split_delta) <= nearest.best_error)
+        query_raw_offset_color_conversion_kd_tree(candidates, nodes, target, far_node, nearest);
+}
+
+static RawOffsetColorConversionSolver build_raw_offset_color_conversion_solver(const std::vector<ColorRGBA> &filament_colors)
+{
+    RawOffsetColorConversionSolver solver;
+    solver.candidates = build_raw_offset_color_conversion_candidates(filament_colors);
+    solver.root = build_raw_offset_color_conversion_kd_tree(solver.candidates, solver.nodes);
+    solver.cache.reserve(4096);
+    return solver;
+}
+
+static unsigned int raw_offset_color_conversion_cache_key(const ColorRGBA &color)
+{
+    auto to_u8 = [](float value) {
+        return unsigned(std::clamp(int(std::lround(std::clamp(value, 0.f, 1.f) * 255.f)), 0, 255));
+    };
+    return (to_u8(color.r()) << 16) | (to_u8(color.g()) << 8) | to_u8(color.b());
+}
+
+static std::vector<uint8_t> raw_offset_values_from_color(const std::vector<ColorRGBA>   &filament_colors,
+                                                         ColorRGBA                       color,
+                                                         const std::optional<ColorRGBA> &background_color,
+                                                         RawOffsetColorConversionSolver *solver)
+{
+    std::vector<uint8_t> values(filament_colors.size(), 0);
+    if (filament_colors.empty())
+        return values;
+
+    const float alpha = std::clamp(color.a(), 0.f, 1.f);
+    if (alpha <= EPSILON && !background_color)
+        return values;
+    if (alpha < 1.f) {
+        const ColorRGBA background = background_color ? *background_color : raw_flat_blend_color_from_filaments(filament_colors);
+        color = ColorRGBA(color.r() * alpha + background.r() * (1.f - alpha),
+                          color.g() * alpha + background.g() * (1.f - alpha),
+                          color.b() * alpha + background.b() * (1.f - alpha),
+                          1.f);
+    }
+    color.a(1.f);
+    if (solver != nullptr && !solver->candidates.empty()) {
+        const unsigned int cache_key = raw_offset_color_conversion_cache_key(color);
+        auto cached = solver->cache.find(cache_key);
+        if (cached != solver->cache.end())
+            return cached->second;
+
+        RawOffsetColorConversionNearest nearest;
+        query_raw_offset_color_conversion_kd_tree(solver->candidates,
+                                                 solver->nodes,
+                                                 { color.r(), color.g(), color.b() },
+                                                 solver->root,
+                                                 nearest);
+        if (nearest.best_idx < solver->candidates.size()) {
+            values = solver->candidates[nearest.best_idx].values;
+            solver->cache.emplace(cache_key, values);
+            return values;
+        }
+    }
+
+    const std::vector<float> weights = closest_color_mix_weights(filament_colors, color);
+    for (size_t idx = 0; idx < values.size() && idx < weights.size(); ++idx)
+        values[idx] = uint8_t(std::clamp(int(std::lround(std::clamp(weights[idx], 0.f, 1.f) * 255.f)), 0, 255));
+    return values;
+}
+
+static ColorRGBA simulated_preview_color_from_raw_offsets(const std::vector<ColorRGBA> &filament_colors,
+                                                          const uint8_t *values,
+                                                          size_t value_count,
+                                                          uint8_t alpha)
+{
+    if (values == nullptr || value_count == 0 || filament_colors.empty())
+        return ColorRGBA(0.f, 0.f, 0.f, float(alpha) / 255.f);
+
+    bool has_base = false;
+    float out_r = 0.f;
+    float out_g = 0.f;
+    float out_b = 0.f;
+    float accumulated = 0.f;
+    auto accumulate_color = [&](size_t idx, float weight) {
+        weight = std::clamp(weight, 0.f, 1.f);
+        if (weight <= EPSILON)
+            return;
+
+        if (!has_base) {
+            out_r = filament_colors[idx].r();
+            out_g = filament_colors[idx].g();
+            out_b = filament_colors[idx].b();
+            accumulated = weight;
+            has_base = true;
+            return;
+        }
+
+        const float t = weight / std::max(float(EPSILON), accumulated + weight);
+        float mixed_r = out_r;
+        float mixed_g = out_g;
+        float mixed_b = out_b;
+        Slic3r::filament_mixer_lerp_float(out_r,
+                                          out_g,
+                                          out_b,
+                                          filament_colors[idx].r(),
+                                          filament_colors[idx].g(),
+                                          filament_colors[idx].b(),
+                                          t,
+                                          &mixed_r,
+                                          &mixed_g,
+                                          &mixed_b);
+        out_r = std::clamp(mixed_r, 0.f, 1.f);
+        out_g = std::clamp(mixed_g, 0.f, 1.f);
+        out_b = std::clamp(mixed_b, 0.f, 1.f);
+        accumulated += weight;
+    };
+
+    for (size_t idx = 0; idx < filament_colors.size() && idx < value_count; ++idx)
+        accumulate_color(idx, float(values[idx]) / 255.f);
+
+    if (!has_base) {
+        for (size_t idx = 0; idx < filament_colors.size() && idx < value_count; ++idx)
+            accumulate_color(idx, 1.f);
+    }
+
     if (!has_base)
         return ColorRGBA(0.f, 0.f, 0.f, float(alpha) / 255.f);
     return ColorRGBA(out_r, out_g, out_b, float(alpha) / 255.f);
+}
+
+static std::vector<uint8_t> image_projection_raw_atlas_simulated_preview_rgba(const ImageMapRawFilamentOffsetAtlas &atlas)
+{
+    std::vector<uint8_t> preview;
+    if (!atlas.valid())
+        return preview;
+
+    const std::vector<ImageMapRawFilament> filaments =
+        image_map_raw_filaments_for_channels(atlas.filaments, atlas.channels);
+    const std::vector<ColorRGBA> filament_colors = raw_filament_colors_for_projection_preview(filaments);
+
+    const size_t pixel_count = size_t(atlas.width) * size_t(atlas.height);
+    preview.assign(pixel_count * 4, 255);
+    for (size_t pixel_idx = 0; pixel_idx < pixel_count; ++pixel_idx) {
+        const size_t raw_idx = pixel_idx * size_t(atlas.channels);
+        const uint8_t alpha = atlas.mask.size() > pixel_idx ? atlas.mask[pixel_idx] : 255;
+        const ColorRGBA color =
+            simulated_preview_color_from_raw_offsets(filament_colors,
+                                                     raw_idx < atlas.offsets.size() ? atlas.offsets.data() + raw_idx : nullptr,
+                                                     size_t(atlas.channels),
+                                                     alpha);
+        const size_t rgba_idx = pixel_idx * 4;
+        preview[rgba_idx + 0] = uint8_t(std::clamp(color.r(), 0.f, 1.f) * 255.f + 0.5f);
+        preview[rgba_idx + 1] = uint8_t(std::clamp(color.g(), 0.f, 1.f) * 255.f + 0.5f);
+        preview[rgba_idx + 2] = uint8_t(std::clamp(color.b(), 0.f, 1.f) * 255.f + 0.5f);
+        preview[rgba_idx + 3] = uint8_t(std::clamp(color.a(), 0.f, 1.f) * 255.f + 0.5f);
+    }
+    return preview;
 }
 
 static ColorRGBA preview_color_from_raw_offsets(const std::vector<uint8_t> &values, uint8_t alpha)
@@ -3718,13 +4155,16 @@ struct ManagedColorDataSummary
     bool     has_color_regions = false;
     bool     has_vertex_colors = false;
     bool     has_image_texture = false;
+    bool     has_raw_offset_image_texture = false;
     bool     has_rgba_data = false;
     size_t   color_region_triangle_count = 0;
     size_t   vertex_color_count = 0;
     size_t   image_texture_count = 0;
+    size_t   raw_offset_image_texture_count = 0;
     uint32_t max_texture_width = 0;
     uint32_t max_texture_height = 0;
     size_t   rgba_data_bytes = 0;
+    std::vector<std::string> raw_offset_color_modes;
 };
 
 static bool object_has_color_regions(const ModelObject &object)
@@ -3840,6 +4280,15 @@ static ManagedColorDataSummary summarize_managed_color_data(const ModelObject *o
             summary.max_texture_height = std::max(summary.max_texture_height, volume->imported_texture_height);
         }
 
+        if (model_volume_has_raw_atlas_texture_data(volume)) {
+            summary.has_raw_offset_image_texture = true;
+            ++summary.raw_offset_image_texture_count;
+            const std::string mode = raw_atlas_color_mode_name_for_volume(*volume);
+            if (std::find(summary.raw_offset_color_modes.begin(), summary.raw_offset_color_modes.end(), mode) ==
+                summary.raw_offset_color_modes.end())
+                summary.raw_offset_color_modes.emplace_back(mode);
+        }
+
         if (!volume->texture_mapping_color_facets.empty()) {
             summary.has_rgba_data = true;
             summary.rgba_data_bytes += estimated_rgba_data_bytes(volume->texture_mapping_color_facets);
@@ -3872,6 +4321,25 @@ static wxString managed_color_data_size_text(const ManagedColorDataSummary &summ
         return wxString::Format(_L("%.2f MB"), double(summary.rgba_data_bytes) / (1024.0 * 1024.0));
     }
     return wxString();
+}
+
+static wxString managed_color_data_raw_offset_mode_text(const ManagedColorDataSummary &summary)
+{
+    if (!summary.has_raw_offset_image_texture)
+        return wxString();
+
+    wxString text;
+    for (size_t idx = 0; idx < summary.raw_offset_color_modes.size(); ++idx) {
+        if (idx > 0)
+            text += ", ";
+        text += from_u8(summary.raw_offset_color_modes[idx]);
+    }
+    if (text.empty())
+        text = _L("Unknown");
+    if (summary.raw_offset_image_texture_count > 1)
+        text += wxString::Format(_L(" (%llu textures)"),
+                                 static_cast<unsigned long long>(summary.raw_offset_image_texture_count));
+    return text;
 }
 
 static bool clear_object_managed_color_data(ModelObject &object, ManagedColorDataType type)
@@ -4805,6 +5273,8 @@ public:
                                                      wxID_ANY,
                                                      wx_colour_from_color_rgba(managed_color_data_background_color(m_object)));
         background_sizer->Add(m_background_picker, 0, wxALIGN_CENTER_VERTICAL);
+        m_background_clear = new wxButton(this, wxID_ANY, _L("Clear"));
+        background_sizer->Add(m_background_clear, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(8));
         main_sizer->Add(background_sizer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP(16));
 
         wxFlexGridSizer *grid = new wxFlexGridSizer(5, 8, 14);
@@ -4819,6 +5289,7 @@ public:
         add_row(grid, ManagedColorDataType::ColorRegions, managed_color_data_type_label(ManagedColorDataType::ColorRegions));
         add_row(grid, ManagedColorDataType::VertexColors, managed_color_data_type_label(ManagedColorDataType::VertexColors));
         add_row(grid, ManagedColorDataType::ImageTexture, managed_color_data_type_label(ManagedColorDataType::ImageTexture));
+        add_raw_image_texture_info_row(grid);
         add_row(grid, ManagedColorDataType::RgbaData, managed_color_data_type_label(ManagedColorDataType::RgbaData));
 
         main_sizer->Add(grid, 1, wxEXPAND | wxALL, 16);
@@ -4840,6 +5311,7 @@ public:
         m_background_picker->Bind(wxEVT_COLOURPICKER_CHANGED, [this](wxColourPickerEvent &event) {
             set_background_color(event.GetColour());
         });
+        m_background_clear->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { clear_background_color(); });
     }
 
 private:
@@ -4851,6 +5323,23 @@ private:
         wxButton            *clear = nullptr;
         wxButton            *create = nullptr;
     };
+
+    void add_raw_image_texture_info_row(wxFlexGridSizer *grid)
+    {
+        wxStaticText *label = new wxStaticText(this, wxID_ANY, _L("Raw Offset Atlas"));
+        wxStaticText *status = new wxStaticText(this, wxID_ANY, wxString());
+        wxStaticText *mode = new wxStaticText(this, wxID_ANY, wxString());
+
+        grid->Add(label, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(12));
+        grid->Add(status, 0, wxALIGN_CENTER_VERTICAL);
+        grid->Add(mode, 1, wxEXPAND | wxALIGN_CENTER_VERTICAL);
+        grid->AddSpacer(1);
+        grid->AddSpacer(1);
+
+        m_raw_image_texture_info_windows = { label, status, mode };
+        m_raw_image_texture_status = status;
+        m_raw_image_texture_mode = mode;
+    }
 
     void add_row(wxFlexGridSizer *grid, ManagedColorDataType type, const wxString &label)
     {
@@ -4872,6 +5361,7 @@ private:
 
     void refresh_rows()
     {
+        refresh_background_controls();
         const ManagedColorDataSummary summary = summarize_managed_color_data(m_object);
         for (Row &row : m_rows) {
             const bool has_data = managed_color_data_summary_has_type(summary, row.type);
@@ -4880,8 +5370,24 @@ private:
             row.clear->Enable(has_data);
             row.create->Enable(m_object != nullptr && !has_data);
         }
+        const bool show_raw_info = summary.has_raw_offset_image_texture;
+        if (m_raw_image_texture_status != nullptr)
+            m_raw_image_texture_status->SetLabel(show_raw_info ? _L("Present") : wxString());
+        if (m_raw_image_texture_mode != nullptr)
+            m_raw_image_texture_mode->SetLabel(show_raw_info ? managed_color_data_raw_offset_mode_text(summary) : wxString());
+        for (wxWindow *window : m_raw_image_texture_info_windows)
+            if (window != nullptr)
+                window->Show(show_raw_info);
         Layout();
         Fit();
+    }
+
+    void refresh_background_controls()
+    {
+        if (m_background_picker != nullptr)
+            m_background_picker->SetColour(wx_colour_from_color_rgba(managed_color_data_background_color(m_object)));
+        if (m_background_clear != nullptr)
+            m_background_clear->Enable(managed_color_data_has_background_color(m_object));
     }
 
     void clear_data(ManagedColorDataType type)
@@ -4975,6 +5481,20 @@ private:
         if (!set_managed_color_data_background_color(*m_object, background))
             return;
 
+        refresh_background_controls();
+        refresh_object_after_change();
+    }
+
+    void clear_background_color()
+    {
+        if (m_object == nullptr || !managed_color_data_has_background_color(m_object))
+            return;
+
+        Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Clear color data background", UndoRedo::SnapshotType::GizmoAction);
+        if (!clear_managed_color_data_background_color(*m_object))
+            return;
+
+        refresh_background_controls();
         refresh_object_after_change();
     }
 
@@ -5027,7 +5547,11 @@ private:
     ModelObject       *m_object = nullptr;
     std::function<void()> m_on_object_changed;
     wxColourPickerCtrl *m_background_picker = nullptr;
+    wxButton          *m_background_clear = nullptr;
     std::vector<Row>   m_rows;
+    std::vector<wxWindow *> m_raw_image_texture_info_windows;
+    wxStaticText       *m_raw_image_texture_status = nullptr;
+    wxStaticText       *m_raw_image_texture_mode = nullptr;
 };
 
 void GLGizmoMmuSegmentation::init_extruders_data(const std::vector<ColorRGBA> &extruder_colors)
@@ -7948,7 +8472,7 @@ bool GLGizmoImageProjection::load_projection_image()
             return false;
         }
 
-        std::vector<uint8_t> preview = image_map_raw_filament_offset_preview_rgba(raw_atlas);
+        std::vector<uint8_t> preview = image_projection_raw_atlas_simulated_preview_rgba(raw_atlas);
         if (preview.empty()) {
             m_image_error = _u8L("Unable to preview the selected raw filament offset atlas.");
             return false;
@@ -7957,6 +8481,7 @@ bool GLGizmoImageProjection::load_projection_image()
         width = raw_atlas.width;
         height = raw_atlas.height;
         m_raw_atlas = std::move(raw_atlas);
+        m_convert_existing_colors_to_raw_offsets = true;
         if (!projection_mode_allowed(m_projection_mode))
             m_projection_mode_initialized = false;
     }
@@ -7979,6 +8504,7 @@ void GLGizmoImageProjection::clear_projection_image()
     m_image_width = 0;
     m_image_height = 0;
     m_raw_atlas = {};
+    m_convert_existing_colors_to_raw_offsets = true;
     m_overlay_texture.reset();
     m_overlay_texture_dirty = false;
     m_show_overlay = false;
@@ -8229,6 +8755,13 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
     ImGui::Checkbox("Apply transparent regions as background color", &m_apply_transparency_as_background);
     ImGui::Checkbox("Pass through model", &m_pass_through_model);
 
+    const bool show_raw_conversion_option =
+        m_raw_atlas.valid() &&
+        selected_model_object() != nullptr &&
+        !selected_object_has_raw_atlas_texture_data();
+    if (show_raw_conversion_option)
+        ImGui::Checkbox("Convert existing colors to raw offset data (slow)", &m_convert_existing_colors_to_raw_offsets);
+
     m_imgui->disabled_begin(m_image_rgba.empty());
     if (m_imgui->button(_L("Project image onto model")) && project_image_to_selected_object()) {
         m_show_overlay = false;
@@ -8293,13 +8826,13 @@ bool GLGizmoImageProjection::project_image_to_selected_object()
 
     unsigned int raw_texture_mapping_filament_id = 0;
     if (m_raw_atlas.valid()) {
-        raw_texture_mapping_filament_id = ensure_texture_mapping_zone(true, true);
+        raw_texture_mapping_filament_id = ensure_texture_mapping_zone();
         if (raw_texture_mapping_filament_id != 0) {
             object->config.set("extruder", int(raw_texture_mapping_filament_id));
             for (ModelVolume *volume : object->volumes)
                 if (volume != nullptr && volume->is_model_part())
                     volume->config.set("extruder", int(raw_texture_mapping_filament_id));
-            configure_texture_mapping_zone_for_raw_atlas(raw_texture_mapping_filament_id, raw_layout);
+            enable_texture_mapping_zone_simulated_preview(raw_texture_mapping_filament_id);
         }
     }
 
@@ -8511,6 +9044,23 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
             return false;
         }
     }
+    const std::vector<ColorRGBA> raw_filament_colors =
+        raw_atlas_projection ? raw_filament_colors_for_projection_preview(raw_layout.filaments) : std::vector<ColorRGBA>();
+    bool object_had_raw_atlas_texture = false;
+    if (raw_atlas_projection) {
+        for (const ModelVolume *volume : object->volumes) {
+            if (volume != nullptr && volume->is_model_part() && model_volume_has_raw_atlas_texture_data(volume)) {
+                object_had_raw_atlas_texture = true;
+                break;
+            }
+        }
+    }
+    const bool convert_existing_colors_for_raw_projection =
+        m_convert_existing_colors_to_raw_offsets || object_had_raw_atlas_texture;
+    RawOffsetColorConversionSolver raw_conversion_solver =
+        raw_atlas_projection && convert_existing_colors_for_raw_projection ?
+            build_raw_offset_color_conversion_solver(raw_filament_colors) :
+            RawOffsetColorConversionSolver();
 
     bool changed = false;
     for (size_t volume_idx = 0; volume_idx < object->volumes.size(); ++volume_idx) {
@@ -8524,24 +9074,43 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
 
         const ColorRGBA fallback_color = projection_base_color_for_volume(*volume);
         const Transform3d world_matrix = projection_world_matrix_for_volume(m_parent, object, volume, instance_idx);
-        const bool generated_texture = !model_volume_has_bakeable_image_texture_data(volume);
+        const bool had_raw_atlas_texture = model_volume_has_raw_atlas_texture_data(volume);
+        const bool discard_existing_texture_for_raw_atlas =
+            raw_atlas_projection &&
+            !had_raw_atlas_texture &&
+            !convert_existing_colors_for_raw_projection;
+        const bool generated_texture =
+            !model_volume_has_bakeable_image_texture_data(volume) ||
+            discard_existing_texture_for_raw_atlas;
         GeneratedImageTextureAtlas generated_atlas;
         if (generated_texture) {
             if (!initialize_generated_image_texture(*volume, fallback_color, &generated_atlas, &world_matrix))
                 continue;
         }
 
+        const VolumeColorSource source = build_volume_color_source(*volume);
+        const bool rewrite_texture_base = generated_texture || !volume->texture_mapping_color_facets.empty();
+        const std::vector<uint8_t> source_texture_rgba(volume->imported_texture_rgba.begin(), volume->imported_texture_rgba.end());
+        const bool seed_raw_from_existing_colors =
+            raw_atlas_projection &&
+            convert_existing_colors_for_raw_projection &&
+            !had_raw_atlas_texture &&
+            (!generated_texture ||
+             !volume->texture_mapping_color_facets.empty() ||
+             volume->imported_vertex_colors_rgba.size() == its.vertices.size());
+        const std::optional<ColorRGBA> raw_conversion_background_color =
+            seed_raw_from_existing_colors ? configured_texture_mapping_background_color_for_volume(*volume) : std::optional<ColorRGBA>();
+        std::vector<uint8_t> raw_seeded_pixels;
+        if (seed_raw_from_existing_colors)
+            raw_seeded_pixels.assign(size_t(volume->imported_texture_width) * size_t(volume->imported_texture_height), 0);
+
         bool volume_changed = generated_texture;
         if (raw_atlas_projection) {
             volume_changed |= merge_imported_texture_raw_atlas(*volume, raw_layout);
-            volume_changed |= refresh_imported_texture_preview_from_raw_offsets(*volume);
         } else if (model_volume_has_raw_atlas_texture_data(volume)) {
             clear_imported_texture_raw_atlas(*volume);
             volume_changed = true;
         }
-        const VolumeColorSource source = build_volume_color_source(*volume);
-        const bool rewrite_texture_base = generated_texture || !volume->texture_mapping_color_facets.empty();
-        const std::vector<uint8_t> source_texture_rgba(volume->imported_texture_rgba.begin(), volume->imported_texture_rgba.end());
 
         for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
             const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
@@ -8630,6 +9199,25 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
                                             volume->imported_texture_width,
                                             wrapped_texture_pixel(x_px, volume->imported_texture_width),
                                             wrapped_texture_pixel(y_px, volume->imported_texture_height));
+                        const uint32_t wrapped_x = wrapped_texture_pixel(x_px, volume->imported_texture_width);
+                        const uint32_t wrapped_y = wrapped_texture_pixel(y_px, volume->imported_texture_height);
+                        const size_t raw_seed_idx = size_t(wrapped_y) * size_t(volume->imported_texture_width) + size_t(wrapped_x);
+                        if (seed_raw_from_existing_colors &&
+                            raw_seed_idx < raw_seeded_pixels.size() &&
+                            raw_seeded_pixels[raw_seed_idx] == 0) {
+                            const std::vector<uint8_t> raw_values =
+                                raw_offset_values_from_color(raw_filament_colors,
+                                                             color,
+                                                             raw_conversion_background_color,
+                                                             &raw_conversion_solver);
+                            volume_changed |= write_raw_offset_pixel(volume->imported_texture_raw_filament_offsets,
+                                                                     volume->imported_texture_width,
+                                                                     volume->imported_texture_raw_channels,
+                                                                     wrapped_x,
+                                                                     wrapped_y,
+                                                                     raw_values);
+                            raw_seeded_pixels[raw_seed_idx] = 1;
+                        }
                         if (m_pass_through_model ||
                             projection_point_is_visible(visibility,
                                                         context,
@@ -8650,8 +9238,6 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
                                             projected_raw_offsets_at_point(context, m_raw_atlas, world_matrix, point);
                                         if (atlas_raw_values.empty())
                                             continue;
-                                        const uint32_t wrapped_x = wrapped_texture_pixel(x_px, volume->imported_texture_width);
-                                        const uint32_t wrapped_y = wrapped_texture_pixel(y_px, volume->imported_texture_height);
                                         std::vector<uint8_t> raw_values = raw_offset_pixel_values(*volume, wrapped_x, wrapped_y);
                                         if (raw_values.size() != size_t(volume->imported_texture_raw_channels))
                                             raw_values.assign(size_t(volume->imported_texture_raw_channels), 0);
@@ -8685,13 +9271,15 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
                         }
                         volume_changed |= write_rgba_pixel(volume->imported_texture_rgba,
                                                            volume->imported_texture_width,
-                                                           wrapped_texture_pixel(x_px, volume->imported_texture_width),
-                                                           wrapped_texture_pixel(y_px, volume->imported_texture_height),
+                                                           wrapped_x,
+                                                           wrapped_y,
                                                            color);
                     }
                 }
             }
         }
+        if (raw_atlas_projection)
+            volume_changed |= refresh_imported_texture_preview_from_raw_offsets(*volume);
         if (volume_changed) {
             refresh_imported_texture_storage(*volume);
             if (raw_atlas_projection)

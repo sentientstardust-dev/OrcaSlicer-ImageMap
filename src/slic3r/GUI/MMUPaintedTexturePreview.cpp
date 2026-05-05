@@ -632,8 +632,7 @@ std::vector<size_t> raw_component_source_channels_for_texture_preview(const std:
     for (size_t component_idx = 0; component_idx < mapping.size(); ++component_idx) {
         if (mapping[component_idx] != sentinel)
             continue;
-        while (next_source < source_keys.size() &&
-               (used[next_source] != 0 || (!target_keys.empty() && !source_keys[next_source].empty())))
+        while (next_source < source_keys.size() && used[next_source] != 0)
             ++next_source;
         if (next_source >= source_keys.size())
             continue;
@@ -1579,7 +1578,6 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
     prepare_texture_preview_simulation_settings(settings);
     const bool use_generic_solver = !settings.generic_mix_candidates.empty();
     const bool use_raw_offsets =
-        settings.mapping_mode == int(TextureMappingZone::TextureMappingRawValues) &&
         source_raw_component_channels.size() == settings.component_colors.size() &&
         source_raw_offsets.size() >= size_t(width) * size_t(height) * size_t(source_raw_channels);
 
@@ -1640,6 +1638,10 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
             float activity = 0.f;
             for (const float weight : component_weights)
                 activity = std::max(activity, clamp01(weight));
+            if (use_raw_offsets && activity <= k_epsilon && !component_weights.empty()) {
+                std::fill(component_weights.begin(), component_weights.end(), 1.f);
+                activity = 1.f;
+            }
 
             const std::array<float, 3> simulated_rgb = activity > k_epsilon ?
                 mix_component_colors_with_filament_mixer(settings.component_colors, component_weights) :

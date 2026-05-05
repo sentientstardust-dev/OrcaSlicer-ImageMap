@@ -2002,7 +2002,6 @@ namespace DoExport {
     }
 } // namespace DoExport
 
-static bool print_has_raw_offset_texture_data_without_raw_zone_for_gcode(const Print &print);
 static bool print_has_raw_offset_texture_zone_without_raw_data_for_gcode(const Print &print);
 
 bool GCode::is_BBL_Printer()
@@ -2043,12 +2042,6 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     GCodeProcessor::s_IsBBLPrinter = print->is_BBL_printer();
     m_writer.set_is_bbl_machine(print->is_BBL_printer());
     print->set_started(psGCodeExport);
-    if (print_has_raw_offset_texture_data_without_raw_zone_for_gcode(*print)) {
-        print->active_step_add_warning(
-            PrintStateBase::WarningLevel::NON_CRITICAL,
-            _(L("An object contains raw filament offset texture data, but it is not assigned to a texture mapping zone "
-                "set to Raw filament offset mode. Slicing will use the preview texture instead of the raw offsets for that object.")));
-    }
     if (print_has_raw_offset_texture_zone_without_raw_data_for_gcode(*print)) {
         print->active_step_add_warning(
             PrintStateBase::WarningLevel::NON_CRITICAL,
@@ -6887,8 +6880,7 @@ static std::vector<size_t> raw_component_source_channels_for_gcode(const std::st
     for (size_t component_idx = 0; component_idx < mapping.size(); ++component_idx) {
         if (mapping[component_idx] != sentinel)
             continue;
-        while (next_source < source_keys.size() &&
-               (used[next_source] != 0 || (!target_keys.empty() && !source_keys[next_source].empty())))
+        while (next_source < source_keys.size() && used[next_source] != 0)
             ++next_source;
         if (next_source >= source_keys.size())
             continue;
@@ -6929,29 +6921,6 @@ static bool model_volume_has_raw_offset_texture_data_for_gcode(const ModelVolume
            size_t(volume->imported_texture_width) *
                size_t(volume->imported_texture_height) *
                size_t(volume->imported_texture_raw_channels);
-}
-
-static bool print_has_raw_offset_texture_data_without_raw_zone_for_gcode(const Print &print)
-{
-    const TextureMappingManager &texture_mgr = print.texture_mapping_manager();
-    for (const PrintObject *print_object : print.objects()) {
-        if (print_object == nullptr || print_object->model_object() == nullptr)
-            continue;
-
-        for (const ModelVolume *volume : print_object->model_object()->volumes) {
-            if (volume == nullptr ||
-                !volume->is_model_part() ||
-                !model_volume_has_raw_offset_texture_data_for_gcode(volume))
-                continue;
-
-            const unsigned int filament_id = unsigned(std::max(0, volume->extruder_id()));
-            const TextureMappingZone *zone = texture_mgr.zone_from_id(filament_id);
-            if (zone == nullptr ||
-                zone->texture_mapping_mode != int(TextureMappingZone::TextureMappingRawValues))
-                return true;
-        }
-    }
-    return false;
 }
 
 static bool print_has_raw_offset_texture_zone_without_raw_data_for_gcode(const Print &print)
@@ -7549,7 +7518,6 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                                                         filament_color_mode,
                                                         component_count);
             const bool use_raw_uv_texture =
-                raw_values_mode &&
                 raw_component_source_channels.size() == component_count &&
                 volume->imported_texture_raw_filament_offsets.size() >=
                     size_t(volume->imported_texture_width) *
@@ -7767,10 +7735,15 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
 
         std::vector<float> desired(component_count, 0.f);
         size_t mapped_component_count = component_count;
-        const bool has_raw_component_weights = raw_values_mode && sample.raw_component_weights.size() == component_count;
+        const bool has_raw_component_weights = sample.raw_component_weights.size() == component_count;
         if (has_raw_component_weights) {
+            float raw_activity = 0.f;
             for (size_t component_idx = 0; component_idx < component_count; ++component_idx)
                 desired[component_idx] = clamp01f_for_gcode(sample.raw_component_weights[component_idx]);
+            for (const float value : desired)
+                raw_activity = std::max(raw_activity, value);
+            if (raw_activity <= EPSILON)
+                std::fill(desired.begin(), desired.end(), 1.f);
         } else {
             std::array<float, 3> target = {
                 clamp01f_for_gcode(sample.rgba[0]),
