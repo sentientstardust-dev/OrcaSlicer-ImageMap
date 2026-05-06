@@ -3538,6 +3538,43 @@ void Print::_make_wipe_tower()
         return texture;
     };
     const PrimeTowerTextureRenderSettings prime_tower_texture = build_prime_tower_texture();
+    const std::vector<size_t> prime_tower_texture_component_tools = prime_tower_texture.component_tools_for_layer_sequence();
+    auto prime_tower_texture_layer_tools = [&prime_tower_texture, &prime_tower_texture_component_tools](const LayerTools &layer_tools) {
+        std::vector<unsigned int> tools;
+        if (!prime_tower_texture.valid())
+            return tools;
+        if (layer_tools.has_texture_mapping_zone && !layer_tools.texture_mapping_component_extruders.empty()) {
+            tools = layer_tools.texture_mapping_component_extruders;
+            return tools;
+        }
+        if (layer_tools.has_texture_mapping_zone && !layer_tools.texture_mapping_extruders.empty()) {
+            tools = layer_tools.texture_mapping_extruders;
+            return tools;
+        }
+        if (!prime_tower_texture_component_tools.empty()) {
+            tools.reserve(prime_tower_texture_component_tools.size());
+            for (const size_t tool : prime_tower_texture_component_tools)
+                tools.emplace_back(unsigned(tool));
+            return tools;
+        }
+        return tools;
+    };
+    auto prime_tower_texture_wall_tool = [&prime_tower_texture](const LayerTools &layer_tools) -> int {
+        if (!prime_tower_texture.valid())
+            return -1;
+        if (layer_tools.has_texture_mapping_zone && !layer_tools.texture_mapping_extruders.empty()) {
+            const size_t sequence_tool = prime_tower_texture.tool_for_layer_sequence(layer_tools.layer_index);
+            if (sequence_tool != size_t(-1) && std::find(layer_tools.texture_mapping_extruders.begin(),
+                                                         layer_tools.texture_mapping_extruders.end(),
+                                                         unsigned(sequence_tool)) != layer_tools.texture_mapping_extruders.end())
+                return int(sequence_tool);
+            return int(layer_tools.texture_mapping_extruders.front());
+        }
+        const size_t tool = prime_tower_texture.tool_for_layer_sequence(layer_tools.layer_index);
+        if (tool != size_t(-1))
+            return int(tool);
+        return -1;
+    };
 
     if (!is_wipe_tower_type2) {
         // in BBL machine, wipe tower is only use to prime extruder. So just use a global wipe volume.
@@ -3584,13 +3621,17 @@ void Print::_make_wipe_tower()
         for (auto& layer_tools : m_wipe_tower_data.tool_ordering.layer_tools()) { // for all layers
             if (!layer_tools.has_wipe_tower) continue;
             bool first_layer = &layer_tools == &m_wipe_tower_data.tool_ordering.front();
+            std::vector<unsigned int> texture_mapping_layer_tools = prime_tower_texture_layer_tools(layer_tools);
+            const int texture_mapping_wall_tool = prime_tower_texture_wall_tool(layer_tools);
             wipe_tower.plan_toolchange((float) layer_tools.print_z,
                                         (float) layer_tools.wipe_tower_layer_height,
                                         current_filament_id,
                                         current_filament_id,
                                         0.f,
                                         0.f,
-                                        layer_tools.has_texture_mapping_zone && layer_tools.extruders.size() == 1);
+                                        layer_tools.has_texture_mapping_zone && layer_tools.extruders.size() == 1,
+                                        texture_mapping_layer_tools,
+                                        texture_mapping_wall_tool);
 
             used_filament_ids.insert(layer_tools.extruders.begin(), layer_tools.extruders.end());
 
@@ -3718,8 +3759,10 @@ void Print::_make_wipe_tower()
                 if (!layer_tools.has_wipe_tower)
                     continue;
                 bool first_layer = &layer_tools == &m_wipe_tower_data.tool_ordering.front();
+                std::vector<unsigned int> texture_mapping_layer_tools = prime_tower_texture_layer_tools(layer_tools);
+                const int texture_mapping_wall_tool = prime_tower_texture_wall_tool(layer_tools);
                 wipe_tower.plan_toolchange((float) layer_tools.print_z, (float) layer_tools.wipe_tower_layer_height, current_extruder_id,
-                                           current_extruder_id, false);
+                                           current_extruder_id, false, texture_mapping_layer_tools, texture_mapping_wall_tool);
                 for (const auto extruder_id : layer_tools.extruders) {
                     if ((first_layer && extruder_id == m_wipe_tower_data.tool_ordering.all_extruders().back()) || extruder_id !=
                         current_extruder_id) {

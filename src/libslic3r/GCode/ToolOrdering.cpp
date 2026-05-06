@@ -269,6 +269,14 @@ void ToolOrdering::handle_dontcare_extruder(const std::vector<unsigned int>& too
             assert(extruder_id > 0);
             --extruder_id;
         }
+        for (unsigned int &extruder_id : lt.texture_mapping_extruders) {
+            assert(extruder_id > 0);
+            --extruder_id;
+        }
+        for (unsigned int &extruder_id : lt.texture_mapping_component_extruders) {
+            assert(extruder_id > 0);
+            --extruder_id;
+        }
     }
 }
 
@@ -336,6 +344,14 @@ void ToolOrdering::handle_dontcare_extruder(unsigned int last_extruder_id)
     // Reindex the extruders, so they are zero based, not 1 based.
     for (LayerTools &lt : m_layer_tools){
         for (unsigned int &extruder_id : lt.extruders) {
+            assert(extruder_id > 0);
+            -- extruder_id;
+        }
+        for (unsigned int &extruder_id : lt.texture_mapping_extruders) {
+            assert(extruder_id > 0);
+            -- extruder_id;
+        }
+        for (unsigned int &extruder_id : lt.texture_mapping_component_extruders) {
             assert(extruder_id > 0);
             -- extruder_id;
         }
@@ -720,10 +736,35 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
 
         // Store the current extruder override (set to zero if no overriden), so that layer_tools.wiping_extrusions().is_overridable_and_mark() will use it.
         layer_tools.extruder_override = extruder_override;
-        auto append_layer_filament = [&layer_tools](unsigned int filament_id) {
-            if (layer_tools.texture_mapping_manager != nullptr && layer_tools.texture_mapping_manager->is_texture_mapping_zone_id(filament_id))
+        auto append_layer_filament = [&layer_tools, &object](unsigned int filament_id) {
+            const bool is_texture_mapping_zone = layer_tools.texture_mapping_manager != nullptr &&
+                                                 layer_tools.texture_mapping_manager->is_texture_mapping_zone_id(filament_id);
+            const unsigned int resolved_filament_id = layer_tools.resolve_filament_id(filament_id);
+            if (is_texture_mapping_zone) {
                 layer_tools.has_texture_mapping_zone = true;
-            layer_tools.extruders.emplace_back(layer_tools.resolve_filament_id(filament_id));
+                if (resolved_filament_id > 0)
+                    layer_tools.texture_mapping_extruders.emplace_back(resolved_filament_id);
+                const TextureMappingZone *zone = layer_tools.texture_mapping_manager->zone_from_id(filament_id);
+                bool added_texture_component = false;
+                if (zone != nullptr && zone->enabled && !zone->deleted) {
+                    std::vector<std::string> filament_colours = object.print()->config().filament_colour.values;
+                    filament_colours.resize(layer_tools.num_physical_filaments, "#FFFFFF");
+                    std::vector<unsigned int> component_ids =
+                        zone->is_image_texture() ?
+                            TextureMappingManager::effective_texture_component_ids(*zone,
+                                                                                   layer_tools.num_physical_filaments,
+                                                                                   filament_colours) :
+                            TextureMappingManager::selected_component_ids(*zone, layer_tools.num_physical_filaments);
+                    for (const unsigned int component_id : component_ids)
+                        if (component_id >= 1 && component_id <= layer_tools.num_physical_filaments) {
+                            layer_tools.texture_mapping_component_extruders.emplace_back(component_id);
+                            added_texture_component = true;
+                        }
+                }
+                if (!added_texture_component && resolved_filament_id > 0)
+                    layer_tools.texture_mapping_component_extruders.emplace_back(resolved_filament_id);
+            }
+            layer_tools.extruders.emplace_back(resolved_filament_id);
         };
 
         // What extruders are required to print this object layer?
@@ -841,6 +882,8 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
     for (auto& layer : m_layer_tools) {
         // Sort and remove duplicates
         sort_remove_duplicates(layer.extruders);
+        sort_remove_duplicates(layer.texture_mapping_extruders);
+        sort_remove_duplicates(layer.texture_mapping_component_extruders);
 
         // make sure that there are some tools for each object layer (e.g. tall wiping object will result in empty extruders vector)
         if (layer.extruders.empty() && layer.has_object)

@@ -50,7 +50,13 @@ public:
 
 	// Appends into internal structure m_plan containing info about the future wipe tower
 	// to be used before building begins. The entries must be added ordered in z.
-    void plan_toolchange(float z_par, float layer_height_par, unsigned int old_tool, unsigned int new_tool, float wipe_volume = 0.f);
+    void plan_toolchange(float                     z_par,
+                         float                     layer_height_par,
+                         unsigned int              old_tool,
+                         unsigned int              new_tool,
+                         float                     wipe_volume = 0.f,
+                         const std::vector<unsigned int> &texture_mapping_layer_tools = {},
+                         int                       texture_mapping_wall_tool = -1);
 
 	// Iterates through prepared m_plan, generates ToolChangeResults and appends them to "result"
 	void generate(std::vector<std::vector<WipeTower::ToolChangeResult>> &result);
@@ -310,6 +316,8 @@ private:
 		float z;		// z position of the layer
 		float height;	// layer height
 		float depth;	// depth of the layer based on all layers above
+        std::vector<size_t> texture_mapping_layer_tools;
+        size_t texture_mapping_wall_tool{size_t(-1)};
 		float toolchanges_depth() const { float sum = 0.f; for (const auto &a : tool_changes) sum += a.required_depth; return sum; }
 
 		std::vector<ToolChange> tool_changes;

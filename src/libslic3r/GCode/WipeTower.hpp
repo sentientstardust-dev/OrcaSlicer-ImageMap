@@ -76,8 +76,8 @@ struct PrimeTowerTextureRenderSettings
     float sample_tool_visibility(size_t tool, float u, float v) const
     {
         const float raw_visibility = sample_tool_visibility_raw(tool, u, v);
-        if (settings_zone_enabled || !compact_offset_mode)
-            return raw_visibility;
+        if (!compact_offset_mode)
+            return adjusted_tool_visibility(tool, raw_visibility);
 
         float max_visibility = std::clamp(raw_visibility, 0.f, 1.f);
         if (!tool_indices.empty()) {
@@ -91,27 +91,126 @@ struct PrimeTowerTextureRenderSettings
                     max_visibility = std::max(max_visibility, std::clamp(sample_tool_visibility_raw(candidate_tool, u, v), 0.f, 1.f));
             }
         }
-        return max_visibility > 1e-6f ?
-            std::clamp(raw_visibility / max_visibility, 0.f, 1.f) :
-            std::clamp(raw_visibility, 0.f, 1.f);
+        return max_visibility > 1e-6f ? adjusted_tool_visibility(tool, raw_visibility / max_visibility) :
+                                        adjusted_tool_visibility(tool, raw_visibility);
     }
 
     float sample_tool_visibility(size_t tool, float u, float v, const std::vector<size_t> &normalization_tools) const
     {
         const float raw_visibility = sample_tool_visibility_raw(tool, u, v);
-        if (settings_zone_enabled || !compact_offset_mode || normalization_tools.empty())
-            return raw_visibility;
+        if (!compact_offset_mode || normalization_tools.empty())
+            return adjusted_tool_visibility(tool, raw_visibility);
 
         float max_visibility = std::clamp(raw_visibility, 0.f, 1.f);
         for (const size_t normalization_tool : normalization_tools)
             max_visibility = std::max(max_visibility, std::clamp(sample_tool_visibility_raw(normalization_tool, u, v), 0.f, 1.f));
 
-        return max_visibility > 1e-6f ?
-            std::clamp(raw_visibility / max_visibility, 0.f, 1.f) :
-            std::clamp(raw_visibility, 0.f, 1.f);
+        return max_visibility > 1e-6f ? adjusted_tool_visibility(tool, raw_visibility / max_visibility) :
+                                        adjusted_tool_visibility(tool, raw_visibility);
+    }
+
+    std::vector<size_t> component_tools_for_layer_sequence() const
+    {
+        std::vector<size_t> tools;
+        if (!valid())
+            return tools;
+
+        if (settings_zone_enabled && !component_ids.empty()) {
+            tools.reserve(component_ids.size());
+            for (const unsigned int physical_id : component_ids) {
+                if (physical_id >= 1 && physical_id <= filament_colours.size()) {
+                    const size_t tool = size_t(physical_id - 1);
+                    if (std::find(tools.begin(), tools.end(), tool) == tools.end())
+                        tools.emplace_back(tool);
+                }
+            }
+            if (!tools.empty())
+                return tools;
+        }
+
+        const std::vector<std::array<float, 3>> ideals = color_mode_ideals(color_mode);
+        if (ideals.empty())
+            return tools;
+
+        std::vector<size_t> candidates;
+        if (!tool_indices.empty()) {
+            for (const size_t tool : tool_indices)
+                if (tool < filament_colours.size() && std::find(candidates.begin(), candidates.end(), tool) == candidates.end())
+                    candidates.emplace_back(tool);
+        } else {
+            candidates.reserve(filament_colours.size());
+            for (size_t tool = 0; tool < filament_colours.size(); ++tool)
+                candidates.emplace_back(tool);
+        }
+        if (candidates.empty())
+            return tools;
+
+        std::vector<char> used(filament_colours.size(), 0);
+        tools.reserve(ideals.size());
+        for (const std::array<float, 3> &ideal : ideals) {
+            size_t best_tool = size_t(-1);
+            float best_distance = std::numeric_limits<float>::max();
+            for (const size_t candidate : candidates) {
+                if (candidate >= used.size() || used[candidate])
+                    continue;
+                const float distance = color_distance2(tool_color(candidate), ideal);
+                if (distance < best_distance) {
+                    best_distance = distance;
+                    best_tool = candidate;
+                }
+            }
+            if (best_tool != size_t(-1)) {
+                used[best_tool] = 1;
+                tools.emplace_back(best_tool);
+            }
+        }
+        return tools;
+    }
+
+    size_t tool_for_layer_sequence(int layer_index) const
+    {
+        const std::vector<size_t> tools = component_tools_for_layer_sequence();
+        if (tools.empty())
+            return size_t(-1);
+        const int tool_count = int(tools.size());
+        const int index = ((layer_index % tool_count) + tool_count) % tool_count;
+        return tools[size_t(index)];
     }
 
 private:
+    static std::vector<std::array<float, 3>> color_mode_ideals(int mode)
+    {
+        switch (mode) {
+        case CMY:
+            return {std::array<float, 3>{0.f, 1.f, 1.f}, std::array<float, 3>{1.f, 0.f, 1.f}, std::array<float, 3>{1.f, 1.f, 0.f}};
+        case CMYK:
+            return {std::array<float, 3>{0.f, 1.f, 1.f},
+                    std::array<float, 3>{1.f, 0.f, 1.f},
+                    std::array<float, 3>{1.f, 1.f, 0.f},
+                    std::array<float, 3>{0.f, 0.f, 0.f}};
+        case CMYW:
+            return {std::array<float, 3>{0.f, 1.f, 1.f},
+                    std::array<float, 3>{1.f, 0.f, 1.f},
+                    std::array<float, 3>{1.f, 1.f, 0.f},
+                    std::array<float, 3>{1.f, 1.f, 1.f}};
+        case RGB:
+            return {std::array<float, 3>{1.f, 0.f, 0.f}, std::array<float, 3>{0.f, 1.f, 0.f}, std::array<float, 3>{0.f, 0.f, 1.f}};
+        case RGBK:
+            return {std::array<float, 3>{1.f, 0.f, 0.f},
+                    std::array<float, 3>{0.f, 1.f, 0.f},
+                    std::array<float, 3>{0.f, 0.f, 1.f},
+                    std::array<float, 3>{0.f, 0.f, 0.f}};
+        case RGBW:
+            return {std::array<float, 3>{1.f, 0.f, 0.f},
+                    std::array<float, 3>{0.f, 1.f, 0.f},
+                    std::array<float, 3>{0.f, 0.f, 1.f},
+                    std::array<float, 3>{1.f, 1.f, 1.f}};
+        case BW:
+            return {std::array<float, 3>{0.f, 0.f, 0.f}, std::array<float, 3>{1.f, 1.f, 1.f}};
+        default: return {};
+        }
+    }
+
     float sample_tool_visibility_raw(size_t tool, float u, float v) const
     {
         if (!valid())
@@ -321,6 +420,14 @@ private:
         return std::clamp(minimum + std::clamp(value, 0.f, 1.f) * strength * (1.f - minimum), 0.f, 1.f);
     }
 
+    float adjusted_tool_visibility(size_t tool, float value) const
+    {
+        const unsigned int physical_id = unsigned(tool + 1);
+        return settings_zone_enabled && std::find(component_ids.begin(), component_ids.end(), physical_id) != component_ids.end() ?
+                   adjusted_visibility_factor(physical_id, value) :
+                   std::clamp(value, 0.f, 1.f);
+    }
+
     float sample_settings_zone_tool_visibility(size_t tool, float u, float v, bool back) const
     {
         const unsigned int physical_id = unsigned(tool + 1);
@@ -350,15 +457,7 @@ private:
             return sample_image_tool_visibility(tool, u, v, back);
 
         apply_contrast(weights, std::clamp(contrast_pct, 25.f, 300.f) / 100.f, mapped_count);
-        if (compact_offset_mode) {
-            float max_weight = 0.f;
-            for (const float weight : weights)
-                max_weight = std::max(max_weight, std::clamp(weight, 0.f, 1.f));
-            if (max_weight > 1e-6f)
-                for (float &weight : weights)
-                    weight = std::clamp(weight / max_weight, 0.f, 1.f);
-        }
-        return adjusted_visibility_factor(physical_id, weights[component_idx]);
+        return std::clamp(weights[component_idx], 0.f, 1.f);
     }
 
     float fixed_mode_visibility(size_t tool, float r, float g, float b) const
@@ -626,7 +725,9 @@ public:
                          unsigned int new_tool,
                          float        wipe_volume = 0.f,
                          float        prime_volume = 0.f,
-                         bool         texture_mapping_single_component_layer = false);
+                         bool         texture_mapping_single_component_layer = false,
+                         const std::vector<unsigned int> &texture_mapping_layer_tools = {},
+                         int          texture_mapping_wall_tool = -1);
 
 	// Iterates through prepared m_plan, generates ToolChangeResults and appends them to "result"
 	void generate(std::vector<std::vector<ToolChangeResult>> &result);
@@ -986,9 +1087,11 @@ private:
 		float z;		// z position of the layer
 		float height;	// layer height
 		float depth;	// depth of the layer based on all layers above
-		float extra_spacing;
+        float extra_spacing;
         bool  extruder_fill{true};
         bool  texture_mapping_single_component_layer{false};
+        std::vector<size_t> texture_mapping_layer_tools;
+        size_t texture_mapping_wall_tool{size_t(-1)};
 		float toolchanges_depth() const { float sum = 0.f; for (const auto &a : tool_changes) sum += a.required_depth; return sum; }
 
 		std::vector<ToolChange> tool_changes;

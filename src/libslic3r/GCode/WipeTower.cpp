@@ -630,7 +630,7 @@ public:
         if (! m_preview_suppressed && e > 0.f && len > 0.f) {
       // Width of a squished extrusion, corrected for the roundings of the squished extrusions.
 			// This is left zero if it is a travel move.
-      float width = e * m_filpar[0].filament_area / (len * m_layer_height);
+      float width = e * m_filpar[m_current_tool].filament_area / (len * m_layer_height);
 			// Correct for the roundings of a squished extrusion.
 			width += m_layer_height * float(1. - M_PI / 4.);
 			if (m_extrusions.empty() || m_extrusions.back().pos != rotated_current_pos)
@@ -688,7 +688,7 @@ public:
 #endif // ENABLE_GCODE_VIEWER_DATA_CHECKING
        // Width of a squished extrusion, corrected for the roundings of the squished extrusions.
        // This is left zero if it is a travel move.
-            float width = e * m_filpar[0].filament_area / (len * m_layer_height);
+            float width = e * m_filpar[m_current_tool].filament_area / (len * m_layer_height);
             // Correct for the roundings of a squished extrusion.
             width += m_layer_height * float(1. - M_PI / 4.);
             if (m_extrusions.empty() || m_extrusions.back().pos != rotated_current_pos) m_extrusions.emplace_back(WipeTower::Extrusion(rotated_current_pos, 0, m_current_tool));
@@ -1447,7 +1447,8 @@ static void prime_tower_textured_path(WipeTowerWriter &writer,
     float width_range = (base_width - min_width) * std::clamp(texture.global_strength, 0.f, 1.f);
     if (texture.sagging_ratio > EPSILON)
         width_range = std::min(width_range, layer_height * texture.sagging_ratio);
-    const float sample_step = std::max(0.35f, reference_width);
+    const float base_extrusion_flow = extrusion_flow * prime_tower_flow_scale_for_width(reference_width, base_width, layer_height);
+    const float sample_step = std::max(0.35f, base_width);
 
     float travelled = 0.f;
     bool have_shifted_pos = false;
@@ -1476,7 +1477,7 @@ static void prime_tower_textured_path(WipeTowerWriter &writer,
             const float u = (mid_distance - texture_path.anchor_distance) / total_length;
             const float visibility = texture.sample_tool_visibility(current_tool, u, v, normalization_tools);
             const float target_width = base_width - (1.f - visibility) * width_range;
-            const float flow_scale = prime_tower_flow_scale_for_width(reference_width, target_width, layer_height);
+            const float flow_scale = prime_tower_flow_scale_for_width(base_width, target_width, layer_height);
             const float centerline_shift = 0.5f * (base_width - reference_width) + 0.5f * (base_width - target_width);
             const Vec2f p0 = a + delta * t0 - outward * centerline_shift;
             const Vec2f p1 = a + delta * t1 - outward * centerline_shift;
@@ -1485,12 +1486,11 @@ static void prime_tower_textured_path(WipeTowerWriter &writer,
                 shifted_pos = p0;
                 have_shifted_pos = true;
             }
-            writer.extrude_explicit(p1, (p1 - p0).norm() * extrusion_flow * flow_scale, feedrate, true);
+            writer.extrude_explicit(p1, (p1 - p0).norm() * base_extrusion_flow * flow_scale, feedrate, true);
             shifted_pos = p1;
         }
         travelled += sample_len;
     }
-    writer.change_analyzer_line_width(reference_width);
 }
 
 static void prime_tower_textured_closed_path(WipeTowerWriter &writer,
@@ -2748,12 +2748,17 @@ WipeTower::ToolChangeResult WipeTower::finish_layer(bool extrude_perimeter, bool
     std::vector<size_t> texture_normalization_tools;
     if (m_prime_tower_texture.valid()) {
         const size_t texture_tool_count = m_prime_tower_texture.filament_colours.size();
-        prime_tower_append_texture_tool(texture_normalization_tools, m_current_tool, texture_tool_count);
-        if (m_layer_info != m_plan.end()) {
+        if (m_layer_info != m_plan.end() && !m_layer_info->texture_mapping_layer_tools.empty()) {
+            for (const size_t tool : m_layer_info->texture_mapping_layer_tools)
+                prime_tower_append_texture_tool(texture_normalization_tools, tool, texture_tool_count);
+        } else if (m_layer_info != m_plan.end()) {
+            prime_tower_append_texture_tool(texture_normalization_tools, m_current_tool, texture_tool_count);
             for (const WipeTowerInfo::ToolChange &tool_change : m_layer_info->tool_changes) {
                 prime_tower_append_texture_tool(texture_normalization_tools, tool_change.old_tool, texture_tool_count);
                 prime_tower_append_texture_tool(texture_normalization_tools, tool_change.new_tool, texture_tool_count);
             }
+        } else {
+            prime_tower_append_texture_tool(texture_normalization_tools, m_current_tool, texture_tool_count);
         }
     }
     if (extrude_perimeter) {
@@ -2835,13 +2840,23 @@ void WipeTower::plan_toolchange(float        z_par,
                                 unsigned int new_tool,
                                 float        wipe_volume,
                                 float        purge_volume,
-                                bool         texture_mapping_single_component_layer)
+                                bool         texture_mapping_single_component_layer,
+                                const std::vector<unsigned int> &texture_mapping_layer_tools,
+                                int          texture_mapping_wall_tool)
 {
 	assert(m_plan.empty() || m_plan.back().z <= z_par + WT_EPSILON);	// refuses to add a layer below the last one
 
 	if (m_plan.empty() || m_plan.back().z + WT_EPSILON < z_par) // if we moved to a new layer, we'll add it to m_plan first
 		m_plan.push_back(WipeTowerInfo(z_par, layer_height_par));
     m_plan.back().texture_mapping_single_component_layer |= texture_mapping_single_component_layer;
+    if (texture_mapping_wall_tool >= 0)
+        m_plan.back().texture_mapping_wall_tool = size_t(texture_mapping_wall_tool);
+    std::vector<size_t> &layer_texture_tools = m_plan.back().texture_mapping_layer_tools;
+    for (const unsigned int tool : texture_mapping_layer_tools) {
+        const size_t tool_id = size_t(tool);
+        if (std::find(layer_texture_tools.begin(), layer_texture_tools.end(), tool_id) == layer_texture_tools.end())
+            layer_texture_tools.emplace_back(tool_id);
+    }
 
     if (m_first_layer_idx == size_t(-1) && (! m_no_sparse_layers || old_tool != new_tool))
         m_first_layer_idx = m_plan.size() - 1;
@@ -4299,10 +4314,28 @@ void WipeTower::generate_new(std::vector<std::vector<WipeTower::ToolChangeResult
         ToolChangeResult timelapse_wall;
 
         auto get_wall_filament_for_this_layer = [this, &layer, &wall_filament]() -> int {
-            if (layer.tool_changes.size() == 0)
+            auto texture_wall_tool_for_this_layer = [this, &layer]() -> int {
+                if (!m_prime_tower_texture.valid() || layer.texture_mapping_wall_tool == size_t(-1))
+                    return -1;
+                const int texture_wall_tool = int(layer.texture_mapping_wall_tool);
+                if (layer.tool_changes.empty())
+                    return texture_wall_tool == int(m_current_tool) ? texture_wall_tool : -1;
+                if (int(layer.tool_changes.front().old_tool) == texture_wall_tool)
+                    return texture_wall_tool;
+                for (const WipeTowerInfo::ToolChange &tool_change : layer.tool_changes)
+                    if (int(tool_change.new_tool) == texture_wall_tool)
+                        return texture_wall_tool;
                 return -1;
-            if (m_prime_tower_texture.valid() && layer.texture_mapping_single_component_layer && layer.tool_changes.size() == 1)
-                return layer.tool_changes.front().new_tool;
+            };
+            if (const int texture_wall_tool = texture_wall_tool_for_this_layer(); texture_wall_tool != -1)
+                return texture_wall_tool;
+            if (layer.tool_changes.size() == 0) {
+                return -1;
+            }
+            if (m_prime_tower_texture.valid()) {
+                if (layer.texture_mapping_single_component_layer && layer.tool_changes.size() == 1)
+                    return layer.tool_changes.front().new_tool;
+            }
 
             int candidate_id = -1;
             for (size_t idx = 0; idx < layer.tool_changes.size(); ++idx) {
@@ -4713,12 +4746,17 @@ Polygon WipeTower::generate_support_wall_new(WipeTowerWriter &writer, const box_
     if (m_prime_tower_texture.valid() && result_wall.size() == 1 && !result_wall.front().points.empty()) {
         std::vector<size_t> texture_normalization_tools;
         const size_t texture_tool_count = m_prime_tower_texture.filament_colours.size();
-        prime_tower_append_texture_tool(texture_normalization_tools, m_current_tool, texture_tool_count);
-        if (m_layer_info != m_plan.end()) {
+        if (m_layer_info != m_plan.end() && !m_layer_info->texture_mapping_layer_tools.empty()) {
+            for (const size_t tool : m_layer_info->texture_mapping_layer_tools)
+                prime_tower_append_texture_tool(texture_normalization_tools, tool, texture_tool_count);
+        } else if (m_layer_info != m_plan.end()) {
+            prime_tower_append_texture_tool(texture_normalization_tools, m_current_tool, texture_tool_count);
             for (const WipeTowerInfo::ToolChange &tool_change : m_layer_info->tool_changes) {
                 prime_tower_append_texture_tool(texture_normalization_tools, tool_change.old_tool, texture_tool_count);
                 prime_tower_append_texture_tool(texture_normalization_tools, tool_change.new_tool, texture_tool_count);
             }
+        } else {
+            prime_tower_append_texture_tool(texture_normalization_tools, m_current_tool, texture_tool_count);
         }
         const bool closed_texture_path = !rib_wall && !skip_points;
         std::vector<Vec2f> points;

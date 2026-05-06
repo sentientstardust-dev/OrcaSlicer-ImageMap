@@ -156,6 +156,8 @@ public:
     bool						has_support = false;
     // Zero based extruder IDs, ordered to minimize tool switches.
     std::vector<unsigned int> 	extruders;
+    std::vector<unsigned int>   texture_mapping_extruders;
+    std::vector<unsigned int>   texture_mapping_component_extruders;
     // If per layer extruder switches are inserted by the G-code preview slider, this value contains the new (1 based) extruder, with which the whole object layer is being printed with.
     // If not overriden, it is set to 0.
     unsigned int 				extruder_override = 0;
