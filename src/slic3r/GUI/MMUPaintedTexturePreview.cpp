@@ -2558,7 +2558,8 @@ bool build_simulated_texture_mapping_color_preview_model_for_state(
     const size_t simulation_signature = texture_preview_simulation_signature(model_volume, source_signature, simulation_settings);
     const size_t cache_key = texture_preview_vertex_color_simulation_cache_key(model_volume, filament_id, 2u);
     std::shared_ptr<const TriangleMesh> mesh = model_volume.mesh_ptr();
-    ColorFacetsAnnotation color_source_copy(*color_source);
+    std::shared_ptr<ColorFacetsAnnotation> color_source_copy = ColorFacetsAnnotation::make_temporary();
+    color_source_copy->assign(*color_source);
     std::vector<TriangleSelector::FacetStateTriangle> triangles = state_triangles;
     const ColorRGBA background_color = texture_mapping_background_color_for_preview(model_volume, color_source);
     TexturePreviewSimulationSettings settings = simulation_settings;
@@ -2566,7 +2567,7 @@ bool build_simulated_texture_mapping_color_preview_model_for_state(
                                                     simulation_signature,
                                                     [simulation_signature,
                                                      mesh = std::move(mesh),
-                                                     color_source_copy = std::move(color_source_copy),
+                                                     color_source_copy,
                                                      triangles = std::move(triangles),
                                                      background_color,
                                                      settings = std::move(settings)]() mutable {
@@ -2574,7 +2575,7 @@ bool build_simulated_texture_mapping_color_preview_model_for_state(
                                                         result.signature = simulation_signature;
                                                         prepare_texture_preview_simulation_settings(settings);
                                                         build_texture_mapping_color_preview_geometry_for_state(mesh->its,
-                                                                                                               color_source_copy,
+                                                                                                               *color_source_copy,
                                                                                                                triangles,
                                                                                                                &settings,
                                                                                                                background_color,
