@@ -3266,7 +3266,12 @@ bool build_mmu_vertex_color_preview_models(
                                                                                       *simulation_settings,
                                                                                       model,
                                                                                       preview_override,
-                                                                                      preview_owner_key))
+                                                                                      preview_owner_key) &&
+                        !build_texture_mapping_color_preview_model_for_state(model_volume,
+                                                                             triangles_per_type[state_id],
+                                                                             nullptr,
+                                                                             model,
+                                                                             preview_override))
                         continue;
                 } else {
                     if (!build_texture_mapping_color_preview_model_for_state(model_volume,
@@ -3283,7 +3288,8 @@ bool build_mmu_vertex_color_preview_models(
                                                                               filament_id,
                                                                               *simulation_settings,
                                                                               preview_owner_key,
-                                                                              model))
+                                                                              model) &&
+                        !build_vertex_color_preview_model_for_state(model_volume, triangles_per_type[state_id], nullptr, model))
                         continue;
                 } else {
                     if (!build_vertex_color_preview_model_for_state(model_volume, triangles_per_type[state_id], nullptr, model))

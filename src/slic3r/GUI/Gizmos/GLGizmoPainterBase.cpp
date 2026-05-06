@@ -1869,12 +1869,8 @@ void TriangleSelectorPatch::render_texture_preview(const Transform3d&          m
         return preview_colors;
     };
 
-    const bool texture_preview_can_defer_source_texture =
-        !m_texture_preview_models.empty() &&
-        texture_preview_simulation_enabled_for_all_filaments(m_texture_preview_filament_ids, num_physical, texture_mgr);
     if (!m_texture_preview_models.empty() &&
-        (texture_preview_can_defer_source_texture ||
-         ensure_model_volume_texture_preview(*m_model_volume, m_texture_preview, m_texture_preview_signature))) {
+        ensure_model_volume_texture_preview(*m_model_volume, m_texture_preview, m_texture_preview_signature)) {
         render_model_texture_preview_models(m_texture_preview_models,
                                             adjusted_preview_colors(m_texture_preview_colors),
                                             m_texture_preview_filament_ids,
