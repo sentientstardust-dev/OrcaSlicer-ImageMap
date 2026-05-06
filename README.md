@@ -1,97 +1,92 @@
 <div align="center">
 
 <picture>
-  <img alt="OrcaSlicer logo" src="resources/images/OrcaSlicer.png" width="15%" height="15%">
+  <img alt="OrcaSlicer-ImageMap logo" src="resources/images/OrcaSlicer.png" width="15%" height="15%">
 </picture>
 
-<a href="https://trendshift.io/repositories/15552" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15552" alt="OrcaSlicer%2FOrcaSlicer | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+### OrcaSlicer-ImageMap: An OrcaSlicer Fork with Image Printing Support (via overhang modulation)
 
-[![GitHub Repo stars](https://img.shields.io/github/stars/OrcaSlicer/OrcaSlicer)](https://github.com/OrcaSlicer/OrcaSlicer/stargazers) [![Build all](https://github.com/OrcaSlicer/OrcaSlicer/actions/workflows/build_all.yml/badge.svg?branch=main)](https://github.com/OrcaSlicer/OrcaSlicer/actions/workflows/build_all.yml)
+[![Build all](https://github.com/OrcaSlicer/OrcaSlicer/actions/workflows/build_all.yml/badge.svg?branch=main)](https://gitlab.com/sentient_stardust/orcaslicer-imagemap/-/packages)
 
-OrcaSlicer: an open source Next-Gen Slicing Software for Precision 3D Prints.  
-Optimize your prints with ultra-fast slicing, intelligent support generation, and seamless printer compatibility—engineered for perfection.
+Test print with white, beige, light and dark blue PLA:
+![The Great Wave off Kanagawa - Katsushika Hokusai](https://gradients.garden/gitlab_images/the_great_wave2.jpeg)
+(image: The Great Wave off Kanagawa - Katsushika Hokusai)
+
+This color sheet was printed with CMYK PLA:
+![CMYW Test Sheet](https://gradients.garden/gitlab_images/cmyw_test_sheet.jpeg)
+(test sheet image Designed by Freepik)
+
 <h3>
 
-# Official links and community
+# Official links
 
-#### Official Website:
-<a href="https://www.orcaslicer.com/" style="font-size:2em;">OrcaSlicer.com</a>
+#### Gitlab Repository: <a href="https://gitlab.com/sentient_stardust/OrcaSlicer-ImageMap"><img src="https://img.shields.io/badge/OrcaSlicer--ImageMap-181717?style=flat&logo=gitlab&logoColor=white" width="200" alt="GitLab Logo"/> </a>
+#### Downloads: <a href="https://gitlab.com/sentient_stardust/orcaslicer-imagemap/-/packages"><img src="https://img.shields.io/badge/Package_Repository-gray" alt="Package Repository"/> </a>
 
-#### Github Repository:
-<a href="https://github.com/OrcaSlicer/OrcaSlicer"><img src="https://img.shields.io/badge/OrcaSlicer-181717?style=flat&logo=github&logoColor=white" width="200" alt="GitHub Logo"/> </a>
+## ⚠️ **IMPORTANT DISCLAIMER** ⚠️
 
-#### Follow us:
-<a href="https://twitter.com/real_OrcaSlicer"><img src="https://img.shields.io/badge/real__OrcaSlicer-000000?style=flat&logo=x&logoColor=white" width="200" alt="X Logo"/> </a>
+**This fork is currently in active development and has been tested on actual hardware.**
 
-#### Join our Discord community:
-<a href="https://discord.gg/P4VE9UY9gJ"><img src="https://img.shields.io/badge/-Discord-5865F2?style=flat&logo=discord&logoColor=fff" width="200" alt="discord logo"/> </a>
-
-<table border="2" style="border-color: #ffa500; background-color:rgb(232, 220, 180); color: #856404;">
-<tr>
-<td>
-<strong>⚠️ CAUTION:</strong><br>
-Several clickbait and malicious websites, such as <b>orca-slicer[.]com</b> and <b>orcaslicer[.]net</b>, are pretending to be the official OrcaSlicer site. These sites may redirect you to dangerous downloads or contain misleading information.<br>
-<b>Our only official website is <a href="https://www.orcaslicer.com/">www.orcaslicer.com</a>.</b><br><br>
-If you come across any of these in search results, please <b>report them</b> as unsafe or phishing to help keep the community secure with:<br>
- - <a href="https://safebrowsing.google.com/safebrowsing/report_phish/">Google Safe Browsing</a><br>
- - <a href="https://www.microsoft.com/en-us/wdsi/support/report-unsafe-site">Microsoft Security Intelligence</a><br>
- - <a href="https://ipthreat.net/tools/reportphishing">IPThreat</a>
-</td>
-</tr>
-</table>
+- **Use at Your Own Risk**: As with any slicer fork, please review critical prints and generated G-code before production use
 
 </div>
 
-# Main features
+# OrcaSlicer-ImageMap Features
 
-- **[Advanced Calibration Tools](https://www.orcaslicer.com/wiki/calibration_guide)**  
-  Comprehensive suite: temperature towers, flow rate, retraction & more for optimal performance.
-- **[Precise Wall](https://www.orcaslicer.com/wiki/quality_settings_precision#precise-wall) and [Seam Control](https://www.orcaslicer.com/wiki/quality_settings_seam)**  
-  Adjust outer wall spacing and apply scarf seams to enhance print accuracy.
-- **[Sandwich Mode](https://www.orcaslicer.com/wiki/quality_settings_wall_and_surfaces#innerouterinner) and [Polyholes](https://www.orcaslicer.com/wiki/quality_settings_precision#polyholes) Support**  
-  Use varied infill [patterns](https://www.orcaslicer.com/wiki/strength_settings_patterns) and accurate hole shapes for improved clarity.
-- **[Overhang](https://www.orcaslicer.com/wiki/quality_settings_overhangs) and [Support Optimization](https://www.orcaslicer.com/wiki#support-settings)**  
-  Modify geometry for printable overhangs with precise support placement.
-- **[Granular Controls and Customization](https://www.orcaslicer.com/wiki#process-settings)**  
-  Fine-tune print speed, layer height, pressure, and temperature with precision.
-- **Network Printer Support**  
-  Seamless integration with Klipper, PrusaLink, and OctoPrint for remote control.
-- **[Mouse Ear Brims](https://www.orcaslicer.com/wiki/others_settings_brim) & [Adaptive Bed Mesh](https://www.orcaslicer.com/wiki/printer_basic_information_adaptive_bed_mesh)**  
-  Automatic brims and adaptive mesh calibration ensure consistent adhesion.
-- **User-Friendly Interface**  
-  Intuitive drag-and-drop design with pre-made profiles for popular printers.
-- **[Open-Source](https://github.com/OrcaSlicer/OrcaSlicer) & [Community Driven](https://discord.gg/P4VE9UY9gJ)**  
-  Regular updates fueled by continuous community contributions.
-- **Wide Printer Compatibility**  
-  Supports a broad range of printers: Bambu Lab, Prusa, Creality, Voron, and more.
-- Additional features can be found in the [change notes](https://github.com/OrcaSlicer/OrcaSlicer/releases/).
+### Texture Mapping
+- **Create Images on the surface of your 3D prints** - each layer alternates through a fixed CMYK (or other) pattern, only varying the amount of overhang around the edge of your print. This creates a smooth surface, printing your image texture on the model with no additional seams.
 
-# Wiki
+![Layer Lines in Slicer Screenshot](https://gradients.garden/gitlab_images/slicer_layer_lines.jpeg)
 
-The [wiki](https://www.orcaslicer.com/wiki) aims to provide a detailed explanation of the slicer settings, including how to maximize their use and how to calibrate and set up your printer.
+Zoomed-out G-code preview:
 
-- **[Access the wiki here](https://www.orcaslicer.com/wiki)**
-- **[Contribute to the wiki](https://www.orcaslicer.com/wiki/how_to_wiki)**
+![Slicer Screenshot](https://gradients.garden/gitlab_images/sliced3.jpeg)
+
+### OBJ Image Texture Loading
+
+- **Load OBJ files with image textures or vertex colors** - slice in full image resolution, no need to subdivide your model or bake vertex colors first
+
+### Fast multicolor printing
+- When printing image textures with this fork, only a single color is used per layer (not dependent on texture color). You can print many different models at once without increasing the number of tool changes.
+
+![More Test Prints](https://gradients.garden/gitlab_images/test_prints.jpeg)
+
+([3D model](https://sketchfab.com/3d-models/snakchameleon-f0e3c872f1984cf7a467645d9e0d3abd) by Pedram Ashoori, CC BY 4.0)
+
+### Print images on your prime towers
+- Turn your prime towers into ornaments (requires no extra tool changes, and typically <1g additional filament)
+
+![Prime Tower Image Printing (The Great Wave off Kanagawa)](https://gradients.garden/gitlab_images/the_great_wave_prime_tower.jpeg)
+
+### Image Projection
+
+![Image Projection Panel](https://gradients.garden/gitlab_images/image_projection_sphere_1.jpeg)
+![Image Projection Result](https://gradients.garden/gitlab_images/image_projection_sphere_2.jpeg)
+
+### 2D Gradient Generation
+- **Create 2D Gradients** on your object by changing a texture mapping zone's pattern to "2D Gradient"
+
+![2D Gradients](https://gradients.garden/gitlab_images/slicergradients.jpeg)
+
+### Paintable regions
+- Texture mapping and gradients integrate with OrcaSlicer color painting, so if you wanted you could have texture mapping only on one part of the model, and a solid filament color or gradient somewhere else.
+
+### RGB Color Painting
 
 # Download
 
-## Stable Release
+## Beta Release Builds
 
-📥 **[Download the Latest Stable Release](https://github.com/OrcaSlicer/OrcaSlicer/releases/latest)**  
-Visit our GitHub Releases page for the latest stable version of OrcaSlicer, recommended for most users.
-
-## Nightly Builds
-
-🌙 **[Download the Latest Nightly Build](https://github.com/OrcaSlicer/OrcaSlicer/releases/tag/nightly-builds)**  
-Explore the latest developments in OrcaSlicer with our nightly builds. Feedback on these versions is highly appreciated.
+📥 **[Download the Latest Build](https://gitlab.com/sentient_stardust/orcaslicer-imagemap/-/packages)**  
+Explore the latest developments in OrcaSlicer-ImageMap with our builds for MacOS and Windows. Feedback is highly appreciated.
 
 # How to install
 
 ## Windows
 
-Download the **Windows Installer exe**  for your preferred version from the [releases page](https://github.com/OrcaSlicer/OrcaSlicer/releases).
+Download the **Windows Portable build**  for your preferred version from the [releases page](https://gitlab.com/sentient_stardust/orcaslicer-imagemap/-/packages).
 
- - *For convenience there is also a portable build available.*
+ - 
     <details>
     <summary>Troubleshooting</summary>
 
@@ -104,17 +99,11 @@ Download the **Windows Installer exe**  for your preferred version from the [rel
         -  This file may already be available on your computer if you've installed visual studio.  Check the following location: `%VCINSTALLDIR%Redist\MSVC\v142`
     </details>
 
-Windows Package Manager
-
-```shell
-winget install --id=SoftFever.OrcaSlicer -e
-```
-
 ## Mac
 
-1. Download the DMG for your computer: `arm64` version for Apple Silicon and `x86_64` for Intel CPU.
+1. Download the DMG for your computer from the [package repository](https://gitlab.com/sentient_stardust/orcaslicer-imagemap/-/packages)
 2. Drag OrcaSlicer.app to Application folder.
-3. *If you want to run a build from a PR, you also need to follow the instructions below:*
+3. The macos builds in this repository are not signed, so to run you also need to follow the instructions below:
 
     <details>
     <summary>Quarantine</summary>
@@ -137,28 +126,9 @@ winget install --id=SoftFever.OrcaSlicer -e
             ![mac_security_setting](./SoftFever_doc/mac_security_setting.png)
     </details>
 
-## Linux         
+## Linux
 
-### Flathub (Recommended)
-OrcaSlicer is available through FlatHub:
-
-<a href='https://flathub.org/apps/com.orcaslicer.OrcaSlicer'><img width='240' alt='Download on Flathub' src='https://dl.flathub.org/assets/badges/flathub-badge-en.png'/></a>
-
-Install from the command line:
-
-```shell
-flatpak install flathub com.orcaslicer.OrcaSlicer
-flatpak run com.orcaslicer.OrcaSlicer
-```
-
-It can also be installed through graphical software managers (KDE Discover, GNOME Software, etc.) when Flathub is enabled. Search for **OrcaSlicer** in your software center.
-
-### AppImage
- 1. Download App image from the [releases page](https://github.com/OrcaSlicer/OrcaSlicer/releases).
- 2. Double click the downloaded file to run it.
-
- 3. If you run into trouble executing it, try this command in the terminal:
-    `chmod +x /path_to_appimage/OrcaSlicer_Linux.AppImage`
+Currently builds are not available for linux, you must build this yourself
 
 # How to Compile
 
@@ -179,49 +149,25 @@ If you're running Klipper, it's recommended to add the following configuration t
 resolution: 0.1
 ```
 
-# Supports
-
-**OrcaSlicer** is an open-source project and I'm deeply grateful to all my sponsors and backers.  
-Their generous support enables me to purchase filaments and other essential 3D printing materials for the project.  
-Thank you! :)
-
-## Sponsors:
-
-<table>
-<tr>
-<td>
-<a href="https://qidi3d.com/" style="display:inline-block; border-radius:8px; background:#fff;">
-  <img src="SoftFever_doc\sponsor_logos\QIDI.png" alt="QIDI" width="100" height="100">
-</a>
-</td>
-<td>
-<a href="https://bigtree-tech.com/" style="display:inline-block; border-radius:8px; background:#222;">
-    <img src="SoftFever_doc\sponsor_logos\BigTreeTech.png" alt="BIGTREE TECH" width="100" height="100">
-</a>
-</td>
-</tr>
-</table>
-
-## Backers:
-
-**Ko-fi supporters** ☕: [Backers list](https://github.com/user-attachments/files/16147016/Supporters_638561417699952499.csv)
-
-## Support me
-
-<a href="https://github.com/sponsors/SoftFever"><img src="https://img.shields.io/badge/GitHub%20Sponsors-30363D?style=flat&logo=GitHub-Sponsors&logoColor=EA4AAA" height="50"></a>
-<a href="https://ko-fi.com/G2G5IP3CP"><img src="https://img.shields.io/badge/Support_me_on_Ko--fi-FF5E5B?style=flat&logo=ko-fi&logoColor=white" height="50"></a>
-<a href="https://paypal.me/softfever3d"><img src="https://img.shields.io/badge/PayPal-003087?style=flat&logo=paypal&logoColor=fff" height="50"></a>
-
 ## Some Background
 
 Open-source slicing has always been built on a tradition of collaboration and attribution. [Slic3r](https://github.com/Slic3r/Slic3r), created by Alessandro Ranellucci and the RepRap community, laid the foundation. [PrusaSlicer](https://github.com/prusa3d/PrusaSlicer) by Prusa Research built on Slic3r and acknowledged that heritage. [Bambu Studio](https://github.com/bambulab/BambuStudio) in turn forked from PrusaSlicer, and [SuperSlicer](https://github.com/supermerill/SuperSlicer) by @supermerill extended PrusaSlicer with community-driven enhancements. Each project carried the work of its predecessors forward, crediting those who came before.
 
 OrcaSlicer began in that same spirit, drawing from BambuStudio, PrusaSlicer, and ideas inspired by CuraSlicer and SuperSlicer. But it has since grown far beyond its origins. Through relentless innovation — introducing advanced calibration tools, precise wall and seam control, tree supports, adaptive slicing, and hundreds of other features — OrcaSlicer has become the most widely used and actively developed open-source slicer in the 3D printing community. Many of its innovations have been adopted by other slicers, making it a driving force for the entire industry.
 
+OrcaSlicer-ImageMap is a fork of OrcaSlicer made by sentientstardust, to add image printing support using overhang and alternating CMYK (or other color) layers.
+
 The OrcaSlicer logo was designed by community member Justin Levine (@freejstnalxndr).
 
+## Acknowledgements
+Use of filament overhang to create the appearance of continuous imagery based on [Kuipers, et. al 2018](https://arxiv.org/pdf/1805.01375)
+
+Thanks to neotko for giving me some helpful suggestions on overhang implementation when I was working on  2D gradient functionality
+
 # License
+- **OrcaSlicer-ImageMap** is licensed under the GNU Affero General Public License, version 3. OrcaSlicer-ImageMap is forked from OrcaSlicer.
 - **OrcaSlicer** is licensed under the GNU Affero General Public License, version 3.
 - The **GNU Affero General Public License**, version 3 ensures that if you use any part of this software in any way (even behind a web server), your software must be released under the same license.
 - OrcaSlicer includes a **pressure advance calibration pattern test** adapted from Andrew Ellis' generator, which is licensed under GNU General Public License, version 3. Ellis' generator is itself adapted from a generator developed by Sineos for Marlin, which is licensed under GNU General Public License, version 3.
 - The **Bambu networking plugin** is based on non-free libraries from BambuLab. It is optional to the OrcaSlicer and provides extended functionalities for Bambulab printer users.
+- This repository uses Pigment Painter in order to predict how filament colors will mix. Pigment Painter is licensed under the GNU General Public License, version 3.
