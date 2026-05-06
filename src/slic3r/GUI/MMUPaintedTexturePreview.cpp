@@ -1840,8 +1840,8 @@ bool texture_preview_simulation_is_pending_impl()
         }
 
         if (entry->ready_geometry.has_value()) {
-            pending = true;
             if (!entry->ready_generation_reported) {
+                pending = true;
                 ++texture_preview_vertex_color_simulation_generation();
                 entry->ready_generation_reported = true;
             }
@@ -2461,10 +2461,14 @@ size_t texture_preview_color_facets_source_signature(const ModelVolume          
     return signature;
 }
 
-size_t texture_preview_vertex_color_simulation_cache_key(const ModelVolume &model_volume, unsigned int filament_id, size_t source_kind)
+size_t texture_preview_vertex_color_simulation_cache_key(const ModelVolume &model_volume,
+                                                         unsigned int       filament_id,
+                                                         size_t             source_kind,
+                                                         size_t             preview_owner_key)
 {
     size_t key = texture_preview_simulation_cache_key(model_volume, filament_id);
     key ^= std::hash<size_t>{}(source_kind) + 0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
+    key ^= std::hash<size_t>{}(preview_owner_key) + 0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
     return key;
 }
 
@@ -2514,6 +2518,7 @@ bool build_simulated_vertex_color_preview_model_for_state(
     const std::vector<TriangleSelector::FacetStateTriangle> &state_triangles,
     unsigned int                                            filament_id,
     const TexturePreviewSimulationSettings                  &simulation_settings,
+    size_t                                                   preview_owner_key,
     GUI::GLModel                                            &out_model)
 {
     if (!model_volume_has_vertex_color_preview_data(model_volume) || state_triangles.empty())
@@ -2521,7 +2526,7 @@ bool build_simulated_vertex_color_preview_model_for_state(
 
     const size_t source_signature = texture_preview_vertex_color_source_signature(model_volume, state_triangles);
     const size_t simulation_signature = texture_preview_simulation_signature(model_volume, source_signature, simulation_settings);
-    const size_t cache_key = texture_preview_vertex_color_simulation_cache_key(model_volume, filament_id, 1u);
+    const size_t cache_key = texture_preview_vertex_color_simulation_cache_key(model_volume, filament_id, 1u, preview_owner_key);
     std::shared_ptr<const TriangleMesh> mesh = model_volume.mesh_ptr();
     std::vector<uint32_t> vertex_colors(model_volume.imported_vertex_colors_rgba.begin(), model_volume.imported_vertex_colors_rgba.end());
     std::vector<TriangleSelector::FacetStateTriangle> triangles = state_triangles;
@@ -2555,7 +2560,8 @@ bool build_simulated_texture_mapping_color_preview_model_for_state(
     unsigned int                                            filament_id,
     const TexturePreviewSimulationSettings                  &simulation_settings,
     GUI::GLModel                                            &out_model,
-    const ColorFacetsAnnotation                             *texture_mapping_color_facets_override = nullptr)
+    const ColorFacetsAnnotation                             *texture_mapping_color_facets_override = nullptr,
+    size_t                                                   preview_owner_key = 0)
 {
     const ColorFacetsAnnotation *color_source = texture_mapping_color_facets_override;
     if (color_source == nullptr || color_source->empty())
@@ -2565,7 +2571,7 @@ bool build_simulated_texture_mapping_color_preview_model_for_state(
 
     const size_t source_signature = texture_preview_color_facets_source_signature(model_volume, *color_source, state_triangles);
     const size_t simulation_signature = texture_preview_simulation_signature(model_volume, source_signature, simulation_settings);
-    const size_t cache_key = texture_preview_vertex_color_simulation_cache_key(model_volume, filament_id, 2u);
+    const size_t cache_key = texture_preview_vertex_color_simulation_cache_key(model_volume, filament_id, 2u, preview_owner_key);
     std::shared_ptr<const TriangleMesh> mesh = model_volume.mesh_ptr();
     std::shared_ptr<ColorFacetsAnnotation> color_source_copy = ColorFacetsAnnotation::make_temporary();
     color_source_copy->assign(*color_source);
@@ -3195,7 +3201,8 @@ bool build_mmu_vertex_color_preview_models(
     std::vector<GUI::GLModel>                                            &out_models,
     std::vector<ColorRGBA>                                               &out_colors,
     std::vector<unsigned int>                                            &out_filament_ids,
-    const ColorFacetsAnnotation                                          *texture_mapping_color_facets_override)
+    const ColorFacetsAnnotation                                          *texture_mapping_color_facets_override,
+    size_t                                                                preview_owner_key)
 {
     out_models.clear();
     out_colors.clear();
@@ -3258,7 +3265,8 @@ bool build_mmu_vertex_color_preview_models(
                                                                                       filament_id,
                                                                                       *simulation_settings,
                                                                                       model,
-                                                                                      preview_override))
+                                                                                      preview_override,
+                                                                                      preview_owner_key))
                         continue;
                 } else {
                     if (!build_texture_mapping_color_preview_model_for_state(model_volume,
@@ -3274,6 +3282,7 @@ bool build_mmu_vertex_color_preview_models(
                                                                               triangles_per_type[state_id],
                                                                               filament_id,
                                                                               *simulation_settings,
+                                                                              preview_owner_key,
                                                                               model))
                         continue;
                 } else {
@@ -3302,7 +3311,8 @@ bool build_mmu_vertex_color_preview_models(
     std::vector<GUI::GLModel>                                            &out_models,
     std::vector<ColorRGBA>                                               &out_colors,
     std::vector<unsigned int>                                            &out_filament_ids,
-    const ColorFacetsAnnotation                                          *texture_mapping_color_facets_override)
+    const ColorFacetsAnnotation                                          *texture_mapping_color_facets_override,
+    size_t                                                                preview_owner_key)
 {
     return build_mmu_vertex_color_preview_models(model_volume,
                                                  triangles_per_type,
@@ -3314,7 +3324,8 @@ bool build_mmu_vertex_color_preview_models(
                                                  out_models,
                                                  out_colors,
                                                  out_filament_ids,
-                                                 texture_mapping_color_facets_override);
+                                                 texture_mapping_color_facets_override,
+                                                 preview_owner_key);
 }
 
 size_t model_volume_texture_preview_signature(const ModelVolume &model_volume)

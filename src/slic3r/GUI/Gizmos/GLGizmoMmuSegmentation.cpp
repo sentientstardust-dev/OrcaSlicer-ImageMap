@@ -3079,11 +3079,14 @@ struct ProjectionVisibility
     float              top = 0.f;
     float              scale = 1.f;
     std::vector<float> depth;
+    std::vector<float> local_depth_tolerance;
     std::vector<uint64_t> triangle_keys;
 };
 
 static constexpr float PROJECTION_VISIBILITY_DEPTH_TOLERANCE = 2e-4f;
 static constexpr float PROJECTION_VISIBILITY_SAME_TRIANGLE_DEPTH_TOLERANCE = 2e-3f;
+static constexpr float PROJECTION_VISIBILITY_PROJECTED_TRIANGLE_DEPTH_TOLERANCE = 2e-3f;
+static constexpr float PROJECTION_VISIBILITY_MAX_LOCAL_DEPTH_TOLERANCE = 8e-3f;
 static constexpr uint64_t PROJECTION_VISIBILITY_INVALID_TRIANGLE_KEY = std::numeric_limits<uint64_t>::max();
 
 static uint64_t projection_visibility_triangle_key(size_t volume_idx, size_t tri_idx)
@@ -3096,7 +3099,50 @@ static bool projection_visibility_valid(const ProjectionVisibility &visibility)
     return visibility.width > 0 &&
            visibility.height > 0 &&
            visibility.depth.size() == size_t(visibility.width) * size_t(visibility.height) &&
+           visibility.local_depth_tolerance.size() == visibility.depth.size() &&
            visibility.triangle_keys.size() == visibility.depth.size();
+}
+
+static void projection_visibility_prepare_local_depth_tolerances(ProjectionVisibility &visibility)
+{
+    visibility.local_depth_tolerance.assign(visibility.depth.size(), PROJECTION_VISIBILITY_DEPTH_TOLERANCE);
+    if (visibility.width <= 0 || visibility.height <= 0 || visibility.depth.size() != size_t(visibility.width) * size_t(visibility.height))
+        return;
+
+    for (int y = 0; y < visibility.height; ++y) {
+        for (int x = 0; x < visibility.width; ++x) {
+            const size_t center_idx = size_t(y) * size_t(visibility.width) + size_t(x);
+            const float center_nearest = visibility.depth[center_idx];
+            if (!std::isfinite(center_nearest))
+                continue;
+
+            float tolerance = PROJECTION_VISIBILITY_DEPTH_TOLERANCE;
+            const int min_x = std::max(0, x - 1);
+            const int max_x = std::min(visibility.width - 1, x + 1);
+            const int min_y = std::max(0, y - 1);
+            const int max_y = std::min(visibility.height - 1, y + 1);
+            for (int sample_y = min_y; sample_y <= max_y; ++sample_y) {
+                for (int sample_x = min_x; sample_x <= max_x; ++sample_x) {
+                    const size_t idx = size_t(sample_y) * size_t(visibility.width) + size_t(sample_x);
+                    const float nearest = visibility.depth[idx];
+                    if (std::isfinite(nearest))
+                        tolerance = std::max(tolerance, std::abs(center_nearest - nearest) + PROJECTION_VISIBILITY_DEPTH_TOLERANCE);
+                }
+            }
+            visibility.local_depth_tolerance[center_idx] = std::min(tolerance, PROJECTION_VISIBILITY_MAX_LOCAL_DEPTH_TOLERANCE);
+        }
+    }
+}
+
+static float projection_visibility_local_depth_tolerance(const ProjectionVisibility &visibility, int x, int y)
+{
+    if (x < 0 || y < 0 || x >= visibility.width || y >= visibility.height)
+        return PROJECTION_VISIBILITY_DEPTH_TOLERANCE;
+
+    const size_t idx = size_t(y) * size_t(visibility.width) + size_t(x);
+    if (idx >= visibility.local_depth_tolerance.size())
+        return PROJECTION_VISIBILITY_DEPTH_TOLERANCE;
+    return visibility.local_depth_tolerance[idx];
 }
 
 static bool projection_visibility_depth_matches_sample(const ProjectionVisibility &visibility,
@@ -3113,16 +3159,21 @@ static bool projection_visibility_depth_matches_sample(const ProjectionVisibilit
     if (!std::isfinite(center_nearest))
         return false;
 
+    const bool has_triangle_key = triangle_key != PROJECTION_VISIBILITY_INVALID_TRIANGLE_KEY;
     const bool center_same_triangle =
-        triangle_key != PROJECTION_VISIBILITY_INVALID_TRIANGLE_KEY &&
-        visibility.triangle_keys[center_idx] == triangle_key;
-    const float center_tolerance =
-        center_same_triangle ? PROJECTION_VISIBILITY_SAME_TRIANGLE_DEPTH_TOLERANCE : PROJECTION_VISIBILITY_DEPTH_TOLERANCE;
+        has_triangle_key && visibility.triangle_keys[center_idx] == triangle_key;
+    const float local_tolerance = projection_visibility_local_depth_tolerance(visibility, x, y);
+    float center_tolerance = PROJECTION_VISIBILITY_DEPTH_TOLERANCE;
+    if (center_same_triangle) {
+        center_tolerance = std::max(PROJECTION_VISIBILITY_SAME_TRIANGLE_DEPTH_TOLERANCE, local_tolerance);
+    } else if (has_triangle_key) {
+        center_tolerance = std::max(PROJECTION_VISIBILITY_PROJECTED_TRIANGLE_DEPTH_TOLERANCE, local_tolerance);
+    }
     if (depth <= center_nearest + center_tolerance)
         return true;
 
-    if (triangle_key == PROJECTION_VISIBILITY_INVALID_TRIANGLE_KEY ||
-        depth > center_nearest + PROJECTION_VISIBILITY_SAME_TRIANGLE_DEPTH_TOLERANCE)
+    if (!has_triangle_key ||
+        depth > center_nearest + std::max(PROJECTION_VISIBILITY_SAME_TRIANGLE_DEPTH_TOLERANCE, local_tolerance))
         return false;
 
     const int min_x = std::max(0, x - 1);
@@ -3139,7 +3190,10 @@ static bool projection_visibility_depth_matches_sample(const ProjectionVisibilit
                 continue;
 
             const float nearest = visibility.depth[idx];
-            if (std::isfinite(nearest) && depth <= nearest + PROJECTION_VISIBILITY_SAME_TRIANGLE_DEPTH_TOLERANCE)
+            const float nearby_tolerance =
+                std::max(PROJECTION_VISIBILITY_SAME_TRIANGLE_DEPTH_TOLERANCE,
+                         projection_visibility_local_depth_tolerance(visibility, sample_x, sample_y));
+            if (std::isfinite(nearest) && depth <= nearest + nearby_tolerance)
                 return true;
         }
     }
@@ -3242,6 +3296,7 @@ static ProjectionVisibility build_projection_visibility(const ProjectionContext 
         }
     }
 
+    projection_visibility_prepare_local_depth_tolerances(visibility);
     return visibility;
 }
 
@@ -9227,9 +9282,10 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
             projected_triangles[tri_idx] = projected_triangle;
             if (projected_triangle) {
                 projected_triangle_depths[tri_idx] =
-                    texture_mapping_depth_from_span(projection_triangle_image_pixel_span(context, world_matrix, vertices),
-                                                    projection_target_span,
-                                                    7);
+                    std::max(1,
+                             texture_mapping_depth_from_span(projection_triangle_image_pixel_span(context, world_matrix, vertices),
+                                                             projection_target_span,
+                                                             7));
                 ++projected_triangle_count;
             }
         }

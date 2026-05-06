@@ -38,7 +38,8 @@ bool build_mmu_vertex_color_preview_models(
     std::vector<GUI::GLModel>                                            &out_models,
     std::vector<ColorRGBA>                                               &out_colors,
     std::vector<unsigned int>                                            &out_filament_ids,
-    const ColorFacetsAnnotation                                          *texture_mapping_color_facets_override = nullptr);
+    const ColorFacetsAnnotation                                          *texture_mapping_color_facets_override = nullptr,
+    size_t                                                                preview_owner_key = 0);
 
 bool build_mmu_vertex_color_preview_models(
     const ModelVolume                                                    &model_volume,
@@ -50,7 +51,8 @@ bool build_mmu_vertex_color_preview_models(
     std::vector<GUI::GLModel>                                            &out_models,
     std::vector<ColorRGBA>                                               &out_colors,
     std::vector<unsigned int>                                            &out_filament_ids,
-    const ColorFacetsAnnotation                                          *texture_mapping_color_facets_override = nullptr);
+    const ColorFacetsAnnotation                                          *texture_mapping_color_facets_override = nullptr,
+    size_t                                                                preview_owner_key = 0);
 
 size_t model_volume_texture_preview_signature(const ModelVolume &model_volume);
 size_t model_volume_texture_mapping_color_preview_signature(const ModelVolume &model_volume);

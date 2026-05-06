@@ -1697,7 +1697,8 @@ void TriangleSelectorPatch::update_render_data()
                                                       m_vertex_color_preview_models,
                                                       m_vertex_color_preview_colors,
                                                       m_vertex_color_preview_filament_ids,
-                                                      m_texture_mapping_color_preview);
+                                                      m_texture_mapping_color_preview,
+                                                      reinterpret_cast<size_t>(this));
             } else {
                 if (model_volume_has_texture_preview_data_for_painting(*m_model_volume)) {
                     build_mmu_texture_preview_models(*m_model_volume,
@@ -1718,7 +1719,9 @@ void TriangleSelectorPatch::update_render_data()
                                                       texture_mgr,
                                                       m_vertex_color_preview_models,
                                                       m_vertex_color_preview_colors,
-                                                      m_vertex_color_preview_filament_ids);
+                                                      m_vertex_color_preview_filament_ids,
+                                                      nullptr,
+                                                      reinterpret_cast<size_t>(this));
             }
         }
 
