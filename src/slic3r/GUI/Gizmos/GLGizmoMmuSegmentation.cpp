@@ -3099,6 +3099,54 @@ static bool projection_visibility_valid(const ProjectionVisibility &visibility)
            visibility.triangle_keys.size() == visibility.depth.size();
 }
 
+static bool projection_visibility_depth_matches_sample(const ProjectionVisibility &visibility,
+                                                       int                         x,
+                                                       int                         y,
+                                                       float                       depth,
+                                                       uint64_t                    triangle_key)
+{
+    if (x < 0 || y < 0 || x >= visibility.width || y >= visibility.height)
+        return false;
+
+    const size_t center_idx = size_t(y) * size_t(visibility.width) + size_t(x);
+    const float center_nearest = visibility.depth[center_idx];
+    if (!std::isfinite(center_nearest))
+        return false;
+
+    const bool center_same_triangle =
+        triangle_key != PROJECTION_VISIBILITY_INVALID_TRIANGLE_KEY &&
+        visibility.triangle_keys[center_idx] == triangle_key;
+    const float center_tolerance =
+        center_same_triangle ? PROJECTION_VISIBILITY_SAME_TRIANGLE_DEPTH_TOLERANCE : PROJECTION_VISIBILITY_DEPTH_TOLERANCE;
+    if (depth <= center_nearest + center_tolerance)
+        return true;
+
+    if (triangle_key == PROJECTION_VISIBILITY_INVALID_TRIANGLE_KEY ||
+        depth > center_nearest + PROJECTION_VISIBILITY_SAME_TRIANGLE_DEPTH_TOLERANCE)
+        return false;
+
+    const int min_x = std::max(0, x - 1);
+    const int max_x = std::min(visibility.width - 1, x + 1);
+    const int min_y = std::max(0, y - 1);
+    const int max_y = std::min(visibility.height - 1, y + 1);
+    for (int sample_y = min_y; sample_y <= max_y; ++sample_y) {
+        for (int sample_x = min_x; sample_x <= max_x; ++sample_x) {
+            if (sample_x == x && sample_y == y)
+                continue;
+
+            const size_t idx = size_t(sample_y) * size_t(visibility.width) + size_t(sample_x);
+            if (visibility.triangle_keys[idx] != triangle_key)
+                continue;
+
+            const float nearest = visibility.depth[idx];
+            if (std::isfinite(nearest) && depth <= nearest + PROJECTION_VISIBILITY_SAME_TRIANGLE_DEPTH_TOLERANCE)
+                return true;
+        }
+    }
+
+    return false;
+}
+
 static ProjectionVisibility build_projection_visibility(const ProjectionContext &context,
                                                         const GLCanvas3D       &parent,
                                                         const ModelObject      *object,
@@ -3216,16 +3264,7 @@ static bool projection_point_is_visible(const ProjectionVisibility &visibility,
     if (x < 0 || y < 0 || x >= visibility.width || y >= visibility.height)
         return false;
 
-    const float nearest = visibility.depth[size_t(y) * size_t(visibility.width) + size_t(x)];
-    if (!std::isfinite(nearest))
-        return false;
-
-    const size_t key_idx = size_t(y) * size_t(visibility.width) + size_t(x);
-    const float tolerance =
-        triangle_key != PROJECTION_VISIBILITY_INVALID_TRIANGLE_KEY && visibility.triangle_keys[key_idx] == triangle_key ?
-        PROJECTION_VISIBILITY_SAME_TRIANGLE_DEPTH_TOLERANCE :
-        PROJECTION_VISIBILITY_DEPTH_TOLERANCE;
-    return depth <= nearest + tolerance;
+    return projection_visibility_depth_matches_sample(visibility, x, y, depth, triangle_key);
 }
 
 static bool projection_screen_triangle_has_visible_sample(const ProjectionVisibility   &visibility,
@@ -3259,13 +3298,7 @@ static bool projection_screen_triangle_has_visible_sample(const ProjectionVisibi
                 continue;
 
             const float depth = depths[0] * weights.x() + depths[1] * weights.y() + depths[2] * weights.z();
-            const size_t key_idx = size_t(y) * size_t(visibility.width) + size_t(x);
-            const float nearest = visibility.depth[key_idx];
-            const float tolerance =
-                triangle_key != PROJECTION_VISIBILITY_INVALID_TRIANGLE_KEY && visibility.triangle_keys[key_idx] == triangle_key ?
-                PROJECTION_VISIBILITY_SAME_TRIANGLE_DEPTH_TOLERANCE :
-                PROJECTION_VISIBILITY_DEPTH_TOLERANCE;
-            if (std::isfinite(nearest) && depth <= nearest + tolerance)
+            if (projection_visibility_depth_matches_sample(visibility, x, y, depth, triangle_key))
                 return true;
         }
     }
@@ -8442,11 +8475,12 @@ GLGizmoImageProjection::ProjectionMode GLGizmoImageProjection::default_projectio
 
 bool GLGizmoImageProjection::projection_mode_allowed(ProjectionMode mode) const
 {
+    const bool has_rgba_data = selected_object_has_rgb_data();
     if (m_raw_atlas.valid())
-        return mode == ProjectionMode::ImageTexture;
+        return mode == ProjectionMode::ImageTexture && !has_rgba_data;
     if (mode == ProjectionMode::ImageTexture)
-        return true;
-    if (selected_object_has_rgb_data())
+        return !has_rgba_data;
+    if (has_rgba_data)
         return mode == ProjectionMode::RGBData;
     if (selected_object_has_image_texture_data())
         return mode == ProjectionMode::ImageTexture || mode == ProjectionMode::RGBData;
@@ -8555,6 +8589,10 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
     if (m_imgui->button(_L("Manage Color Data for this object")))
         open_color_data_management_dialog();
 
+    const bool has_rgba_data = selected_object_has_rgb_data();
+    if (has_rgba_data)
+        m_imgui->warning_text(_L("Image Texture projection is disabled as this object has RGBA data."));
+
     m_imgui->text(_L("Apply to:"));
     ImGui::SameLine();
     const char *mode_labels[] = { "Vertex colors", "Image Texture", "RGB data" };
@@ -8594,7 +8632,7 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
     if (show_raw_conversion_option)
         ImGui::Checkbox("Convert existing colors to raw offset data (slow)", &m_convert_existing_colors_to_raw_offsets);
 
-    m_imgui->disabled_begin(m_image_rgba.empty());
+    m_imgui->disabled_begin(m_image_rgba.empty() || !projection_mode_allowed(m_projection_mode));
     if (m_imgui->button(_L("Project image onto model")) && project_image_to_selected_object()) {
         m_show_overlay = false;
         m_parent.set_as_dirty();
@@ -9280,21 +9318,11 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
             if (m_pass_through_model)
                 return true;
 
-            const Vec3f centroid = (vertices[0] + vertices[1] + vertices[2]) / 3.f;
-            if (projection_point_is_visible(visibility,
-                                            context,
-                                            world_matrix,
-                                            centroid,
-                                            projection_visibility_triangle_key(volume_idx, tri_idx)))
-                return true;
-            for (const Vec3f &vertex : vertices)
-                if (projection_point_is_visible(visibility,
-                                                context,
-                                                world_matrix,
-                                                vertex,
-                                                projection_visibility_triangle_key(volume_idx, tri_idx)))
-                    return true;
-            return false;
+            return projection_triangle_has_visible_sample(visibility,
+                                                         context,
+                                                         world_matrix,
+                                                         vertices,
+                                                         projection_visibility_triangle_key(volume_idx, tri_idx));
         };
 
         volume->texture_mapping_color_facets.set_from_triangle_sampler(*volume,
