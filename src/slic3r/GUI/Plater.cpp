@@ -18317,9 +18317,13 @@ void Plater::on_filament_count_change(size_t num_filaments)
         part_plate->update_first_layer_print_sequence(num_filaments);
     }
 
+    size_t total_filaments = num_filaments;
+    if (wxGetApp().preset_bundle != nullptr)
+        total_filaments = wxGetApp().preset_bundle->texture_mapping_zones.total_filaments(num_filaments);
+
     for (ModelObject* mo : wxGetApp().model().objects) {
         for (ModelVolume* mv : mo->volumes) {
-            mv->update_extruder_count(num_filaments);
+            mv->update_extruder_count(total_filaments);
         }
     }
 }

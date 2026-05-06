@@ -112,6 +112,7 @@ struct TexturePreviewSimulationCacheEntry
     std::unique_ptr<GUI::GLTexture> texture;
     size_t uploaded_signature { 0 };
     size_t pending_signature { 0 };
+    bool ready_frame_requested { false };
     std::future<TexturePreviewSimulationResult> pending_future;
 };
 
@@ -1790,6 +1791,7 @@ bool texture_preview_simulation_is_pending_impl()
 
         if (entry->pending_future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
             pending = true;
+            entry->ready_frame_requested = false;
             ++it;
             continue;
         }
@@ -1798,6 +1800,11 @@ bool texture_preview_simulation_is_pending_impl()
             discard_ready_texture_preview_future(*entry);
             it = cache.erase(it);
             continue;
+        }
+
+        if (entry->pending_signature != 0 && !entry->ready_frame_requested) {
+            pending = true;
+            entry->ready_frame_requested = true;
         }
 
         ++it;
@@ -1897,6 +1904,7 @@ const GUI::GLTexture *simulated_texture_preview_texture_for_filament(const Model
             }
         }
         entry.pending_signature = 0;
+        entry.ready_frame_requested = false;
     }
 
     if (entry.texture != nullptr && entry.uploaded_signature == simulation_signature && entry.texture->get_id() != 0)
@@ -1904,6 +1912,7 @@ const GUI::GLTexture *simulated_texture_preview_texture_for_filament(const Model
 
     if (!entry.pending_future.valid()) {
         entry.pending_signature = simulation_signature;
+        entry.ready_frame_requested = false;
         const unsigned int width = model_volume.imported_texture_width;
         const unsigned int height = model_volume.imported_texture_height;
         std::vector<unsigned char> source_rgba(model_volume.imported_texture_rgba.begin(), model_volume.imported_texture_rgba.end());

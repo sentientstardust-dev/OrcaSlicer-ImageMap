@@ -2535,6 +2535,8 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
                 continue;
 
             unsigned int filaments_count = (unsigned int)dynamic_cast<const ConfigOptionStrings*>(m_config->option("filament_colour"))->values.size();
+            if (wxGetApp().preset_bundle != nullptr)
+                filaments_count = (unsigned int)wxGetApp().preset_bundle->texture_mapping_zones.total_filaments(filaments_count);
             model_volume.update_extruder_count(filaments_count);
         }
     }

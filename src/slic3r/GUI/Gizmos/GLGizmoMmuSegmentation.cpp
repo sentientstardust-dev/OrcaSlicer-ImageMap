@@ -8538,23 +8538,13 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
     if (m_show_overlay && ensure_overlay_texture()) {
         const OverlayRect rect = overlay_rect();
         if (rect.width > 0.f && rect.height > 0.f) {
-            ImGui::SetNextWindowPos(ImVec2(rect.left, rect.top), ImGuiCond_Always);
-            ImGui::SetNextWindowSize(ImVec2(rect.width, rect.height), ImGuiCond_Always);
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
-            ImGui::Begin("##image_projection_overlay",
-                         nullptr,
-                         ImGuiWindowFlags_NoDecoration |
-                         ImGuiWindowFlags_NoInputs |
-                         ImGuiWindowFlags_NoBackground |
-                         ImGuiWindowFlags_NoSavedSettings);
-            ImGui::Image((void *)(intptr_t)m_overlay_texture.get_id(),
-                         ImVec2(rect.width, rect.height),
-                         ImVec2(0.f, 0.f),
-                         ImVec2(1.f, 1.f),
-                         ImVec4(1.f, 1.f, 1.f, 0.72f * std::clamp(m_projection_opacity, 0.f, 1.f)));
-            ImGui::End();
-            ImGui::PopStyleVar(2);
+            ImGui::GetBackgroundDrawList()->AddImage((void *)(intptr_t)m_overlay_texture.get_id(),
+                                                     ImVec2(rect.left, rect.top),
+                                                     ImVec2(rect.left + rect.width, rect.top + rect.height),
+                                                     ImVec2(0.f, 0.f),
+                                                     ImVec2(1.f, 1.f),
+                                                     ImGui::GetColorU32(
+                                                         ImVec4(1.f, 1.f, 1.f, 0.72f * std::clamp(m_projection_opacity, 0.f, 1.f))));
         }
     }
 
