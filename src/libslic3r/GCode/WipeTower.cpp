@@ -1448,7 +1448,8 @@ static void prime_tower_textured_path(WipeTowerWriter &writer,
     if (texture.sagging_ratio > EPSILON)
         width_range = std::min(width_range, layer_height * texture.sagging_ratio);
     const float base_extrusion_flow = extrusion_flow * prime_tower_flow_scale_for_width(reference_width, base_width, layer_height);
-    const float sample_step = std::max(0.35f, base_width);
+    // const float sample_step = std::clamp(base_width * 0.20f, 0.04f, 0.12f);
+    const float sample_step = 0.06f;
 
     float travelled = 0.f;
     bool have_shifted_pos = false;
