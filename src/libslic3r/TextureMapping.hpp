@@ -69,6 +69,12 @@ struct TextureMappingZone
         GenericSolverPigmentPainter = 0
     };
 
+    enum TransmissionDistanceCalibrationMode : uint8_t {
+        TDCalibrationNone = 0,
+        TDCalibrationAbsolute = 1,
+        TDCalibrationNeighbor = 2
+    };
+
     static constexpr int   DefaultSurfacePattern = int(ImageTexture);
     static constexpr int   DefaultOffsetMode = int(OffsetBasic);
     static constexpr bool  DefaultOffsetRotationEnabled = true;
@@ -93,6 +99,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultHighResolutionSampling = true;
     static constexpr float DefaultToneGamma = 1.f;
     static constexpr float DefaultSaggingRatio = 0.f;
+    static constexpr int   DefaultTransmissionDistanceCalibrationMode = int(TDCalibrationAbsolute);
     static constexpr bool  DefaultPreviewSimulateColors = false;
     static constexpr bool  DefaultPreviewLimitResolution = true;
     static constexpr bool  DefaultAutoAdjustFilamentSelection = true;
@@ -134,12 +141,14 @@ struct TextureMappingZone
     bool        high_resolution_sampling = DefaultHighResolutionSampling;
     float       tone_gamma = DefaultToneGamma;
     float       sagging_ratio = DefaultSaggingRatio;
+    int         transmission_distance_calibration_mode = DefaultTransmissionDistanceCalibrationMode;
     float       preview_opacity_pct = DefaultPreviewOpacityPct;
     bool        preview_simulate_colors = DefaultPreviewSimulateColors;
     bool        preview_limit_resolution = DefaultPreviewLimitResolution;
     bool        auto_adjust_filament_selection = DefaultAutoAdjustFilamentSelection;
     std::vector<float> filament_strengths_pct;
     std::vector<float> filament_minimum_offsets_pct;
+    std::vector<float> filament_transmission_distances_mm;
 
     bool is_image_texture() const { return surface_pattern == int(ImageTexture); }
     bool is_2d_gradient() const { return surface_pattern == int(Gradient2D); }
@@ -175,12 +184,14 @@ struct TextureMappingZone
         high_resolution_sampling = DefaultHighResolutionSampling;
         tone_gamma = DefaultToneGamma;
         sagging_ratio = DefaultSaggingRatio;
+        transmission_distance_calibration_mode = DefaultTransmissionDistanceCalibrationMode;
         preview_opacity_pct = DefaultPreviewOpacityPct;
         preview_simulate_colors = DefaultPreviewSimulateColors;
         preview_limit_resolution = DefaultPreviewLimitResolution;
         auto_adjust_filament_selection = DefaultAutoAdjustFilamentSelection;
         filament_strengths_pct.clear();
         filament_minimum_offsets_pct.clear();
+        filament_transmission_distances_mm.clear();
     }
 
     bool has_custom_offset_settings() const

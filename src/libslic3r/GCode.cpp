@@ -5930,15 +5930,150 @@ static float overhang_filament_minimum_offset_factor_for_gcode(const TextureMapp
     return std::clamp(minimum_offset_pct / 100.f, 0.f, 1.f);
 }
 
+struct TransmissionDistanceCalibrationContextForGCode {
+    bool               enabled { false };
+    int                mode { int(TextureMappingZone::TDCalibrationNone) };
+    std::vector<float> own_width_factors;
+    std::vector<float> neighbor_opacity_ratios;
+};
+
+static bool texture_mapping_component_is_black_for_gcode(size_t                                      component_idx,
+                                                         int                                         filament_color_mode,
+                                                         const std::vector<std::array<float, 3>>    &component_colors)
+{
+    switch (std::clamp(filament_color_mode, int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorBW))) {
+    case int(TextureMappingZone::FilamentColorCMYK):
+    case int(TextureMappingZone::FilamentColorRGBK):
+        if (component_idx == 3)
+            return true;
+        break;
+    case int(TextureMappingZone::FilamentColorBW):
+        if (component_idx == 0)
+            return true;
+        break;
+    default:
+        break;
+    }
+
+    if (component_idx >= component_colors.size())
+        return false;
+
+    const std::array<float, 3> &c = component_colors[component_idx];
+    const float max_channel = std::max({ c[0], c[1], c[2] });
+    const float luminance = 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2];
+    return max_channel <= 0.18f && luminance <= 0.12f;
+}
+
+static bool overhang_filament_explicit_transmission_distance_for_gcode(const TextureMappingZone &zone,
+                                                                       unsigned int              physical_filament_id,
+                                                                       float                    &td_mm)
+{
+    if (physical_filament_id == 0)
+        return false;
+
+    const size_t idx = size_t(physical_filament_id - 1);
+    if (idx >= zone.filament_transmission_distances_mm.size())
+        return false;
+
+    const float value = zone.filament_transmission_distances_mm[idx];
+    if (!std::isfinite(value) || value <= 0.f)
+        return false;
+
+    td_mm = std::clamp(value, 0.01f, 50.f);
+    return true;
+}
+
+static float transmission_distance_reference_for_gcode(bool is_black)
+{
+    return is_black ? 0.1f : 3.f;
+}
+
+static float transmission_distance_opacity_for_gcode(float td_mm, float path_extension_mm)
+{
+    constexpr float surface_scatter = 0.50f;
+    constexpr float surface_depth_mm = 0.32f;
+    const float safe_td = std::clamp(td_mm, 0.01f, 50.f);
+    const float path_mm = std::max(0.f, surface_depth_mm + std::max(0.f, path_extension_mm));
+    const float opacity = surface_scatter + (1.f - surface_scatter) * (1.f - std::exp(-path_mm / safe_td));
+    return std::clamp(opacity, 1e-4f, 1.f);
+}
+
+static TransmissionDistanceCalibrationContextForGCode transmission_distance_calibration_context_for_gcode(
+    const TextureMappingZone                         &zone,
+    const std::vector<unsigned int>                  &component_ids,
+    const std::vector<std::array<float, 3>>          &component_colors,
+    int                                               filament_color_mode)
+{
+    TransmissionDistanceCalibrationContextForGCode context;
+    context.mode = std::clamp(zone.transmission_distance_calibration_mode,
+                              int(TextureMappingZone::TDCalibrationNone),
+                              int(TextureMappingZone::TDCalibrationNeighbor));
+    if (context.mode == int(TextureMappingZone::TDCalibrationNone) || component_ids.empty())
+        return context;
+
+    std::vector<float> explicit_tds(component_ids.size(), 0.f);
+    bool has_active_explicit_td = false;
+    for (size_t idx = 0; idx < component_ids.size(); ++idx) {
+        float td_mm = 0.f;
+        if (overhang_filament_explicit_transmission_distance_for_gcode(zone, component_ids[idx], td_mm)) {
+            explicit_tds[idx] = td_mm;
+            has_active_explicit_td = true;
+        }
+    }
+    if (!has_active_explicit_td)
+        return context;
+
+    const bool neighbor_mode = context.mode == int(TextureMappingZone::TDCalibrationNeighbor);
+    const float path_extension_mm = neighbor_mode ? 0.16f : 0.12f;
+    const float own_power = neighbor_mode ? 0.25f : 0.35f;
+    context.own_width_factors.assign(component_ids.size(), 1.f);
+    context.neighbor_opacity_ratios.assign(component_ids.size(), 1.f);
+    context.enabled = true;
+
+    for (size_t idx = 0; idx < component_ids.size(); ++idx) {
+        const bool is_black = texture_mapping_component_is_black_for_gcode(idx, filament_color_mode, component_colors);
+        const float reference_td_mm = transmission_distance_reference_for_gcode(is_black);
+        const float actual_td_mm = explicit_tds[idx] > 0.f ? explicit_tds[idx] : reference_td_mm;
+        const float actual_opacity = transmission_distance_opacity_for_gcode(actual_td_mm, path_extension_mm);
+        const float reference_opacity = transmission_distance_opacity_for_gcode(reference_td_mm, path_extension_mm);
+        context.own_width_factors[idx] =
+            std::clamp(std::pow(reference_opacity / std::max(actual_opacity, 1e-4f), own_power), 0.25f, 2.f);
+        context.neighbor_opacity_ratios[idx] =
+            std::clamp(actual_opacity / std::max(reference_opacity, 1e-4f), 0.25f, 4.f);
+    }
+
+    return context;
+}
+
+static float transmission_distance_width_factor_for_gcode(const TransmissionDistanceCalibrationContextForGCode &context,
+                                                          size_t                                                active_component_idx,
+                                                          size_t                                                previous_component_idx)
+{
+    if (!context.enabled || active_component_idx >= context.own_width_factors.size())
+        return 1.f;
+
+    float factor = context.own_width_factors[active_component_idx];
+    if (context.mode == int(TextureMappingZone::TDCalibrationNeighbor) &&
+        previous_component_idx < context.neighbor_opacity_ratios.size())
+        factor *= std::pow(context.neighbor_opacity_ratios[previous_component_idx], 0.20f);
+
+    return std::clamp(factor, 0.25f, 2.f);
+}
+
 static float variable_width_delta_for_overhang_range_for_gcode(float inset_strength,
                                                                float max_width_delta_limit_mm,
                                                                float minimum_offset_factor,
-                                                               float strength_factor)
+                                                               float strength_factor,
+                                                               float transmission_distance_width_factor)
 {
     if (!std::isfinite(max_width_delta_limit_mm) || max_width_delta_limit_mm <= 0.f)
         return 0.f;
 
-    const float desired_width_factor = 1.f - std::clamp(inset_strength, 0.f, 1.f);
+    const float desired_width_factor =
+        std::clamp((1.f - std::clamp(inset_strength, 0.f, 1.f)) *
+                       std::clamp(transmission_distance_width_factor, 0.f, 2.f),
+                   0.f,
+                   1.f);
     const float min_width_factor = std::clamp(minimum_offset_factor, 0.f, 1.f);
     const float adjusted_width_factor =
         min_width_factor + desired_width_factor * std::clamp(strength_factor, 0.f, 1.f) * (1.f - min_width_factor);
@@ -6014,6 +6149,7 @@ static float variable_width_delta_for_visibility_range_for_gcode(float inset_str
                                                                  float max_width_delta_limit_mm,
                                                                  float minimum_offset_factor,
                                                                  float strength_factor,
+                                                                 float transmission_distance_width_factor,
                                                                  bool  nonlinear_offset_adjustment,
                                                                  float layer_height_mm,
                                                                  float stair_step_mm,
@@ -6022,7 +6158,11 @@ static float variable_width_delta_for_visibility_range_for_gcode(float inset_str
     if (!std::isfinite(max_width_delta_limit_mm) || max_width_delta_limit_mm <= 0.f)
         return 0.f;
 
-    float desired_width_factor = 1.f - std::clamp(inset_strength, 0.f, 1.f);
+    float desired_width_factor =
+        std::clamp((1.f - std::clamp(inset_strength, 0.f, 1.f)) *
+                       std::clamp(transmission_distance_width_factor, 0.f, 2.f),
+                   0.f,
+                   1.f);
     if (nonlinear_offset_adjustment)
         desired_width_factor = nonlinear_visibility_width_factor_for_gcode(desired_width_factor,
                                                                            layer_height_mm,
@@ -8110,6 +8250,12 @@ std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoo
     if (missing_component_color || component_colors.size() != component_ids.size() || component_colors.empty())
         return std::nullopt;
 
+    const TransmissionDistanceCalibrationContextForGCode td_calibration_context =
+        transmission_distance_calibration_context_for_gcode(*zone,
+                                                            component_ids,
+                                                            component_colors,
+                                                            texture_filament_color_mode);
+
     std::ostringstream component_key_stream;
     for (size_t idx = 0; idx < component_ids.size(); ++idx) {
         if (idx > 0)
@@ -8136,6 +8282,7 @@ std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoo
         const VertexColorOverhangWeightField *weight_field { nullptr };
         float        active_component_strength_factor { 1.f };
         float        active_component_minimum_offset_factor { 0.f };
+        float        active_component_td_width_factor { 1.f };
         float        signed_fade_factor { 1.f };
         float        fade_factor { 1.f };
     };
@@ -8156,6 +8303,15 @@ std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoo
         const auto active_component_it = std::find(component_ids.begin(), component_ids.end(), active_component_id);
         if (active_component_it == component_ids.end())
             return std::nullopt;
+        const size_t active_component_idx = size_t(active_component_it - component_ids.begin());
+        size_t previous_component_idx = size_t(-1);
+        if (layer_index > 0) {
+            const unsigned int previous_component_id =
+                texture_mgr.resolve_zone_component(texture_zone_id, num_physical, layer_index - 1);
+            const auto previous_component_it = std::find(component_ids.begin(), component_ids.end(), previous_component_id);
+            if (previous_component_it != component_ids.end())
+                previous_component_idx = size_t(previous_component_it - component_ids.begin());
+        }
 
         std::ostringstream layer_key_stream;
         layer_key_stream << component_key_prefix << "|seamL" << layer->id();
@@ -8199,10 +8355,11 @@ std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoo
             layer,
             layer_height_mm,
             active_component_id,
-            size_t(active_component_it - component_ids.begin()),
+            active_component_idx,
             &weight_field,
             overhang_filament_strength_factor_for_gcode(*zone, active_component_id),
             overhang_filament_minimum_offset_factor_for_gcode(*zone, active_component_id),
+            transmission_distance_width_factor_for_gcode(td_calibration_context, active_component_idx, previous_component_idx),
             signed_fade_factor,
             fade_factor
         };
@@ -8300,7 +8457,8 @@ std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoo
                 variable_width_delta_for_overhang_range_for_gcode(inset_strength,
                                                                   max_width_delta_limit_mm,
                                                                   state.active_component_minimum_offset_factor,
-                                                                  state.active_component_strength_factor);
+                                                                  state.active_component_strength_factor,
+                                                                  state.active_component_td_width_factor);
             const float width_delta_mm = std::clamp(variable_width_delta_mm, 0.f, max_width_delta_limit_mm);
             if (!std::isfinite(width_delta_mm))
                 return std::numeric_limits<float>::quiet_NaN();
@@ -9027,6 +9185,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         float                     max_width_delta_mm { 0.f };
         float                     active_component_strength_factor { 1.f };
         float                     active_component_minimum_offset_factor { 0.f };
+        float                     active_component_td_width_factor { 1.f };
         float                     base_outer_width_mm { 0.4f };
         float                     flow_reference_width_mm { 0.4f };
         float                     base_centerline_shift_mm { 0.f };
@@ -9220,32 +9379,51 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                             const float texture_sagging_ratio =
                                 std::isfinite(zone->sagging_ratio) ? std::clamp(zone->sagging_ratio, 0.f, 6.f) : 0.f;
 
+                            const bool raw_texture_mapping_mode =
+                                zone->texture_mapping_mode == int(TextureMappingZone::TextureMappingRawValues);
+                            std::vector<std::array<float, 3>> component_colors;
+                            component_colors.reserve(component_ids.size());
+                            bool missing_component_color = false;
+                            for (const unsigned int id : component_ids) {
+                                if (id < 1 || id > m_config.filament_colour.values.size()) {
+                                    if (raw_texture_mapping_mode)
+                                        component_colors.push_back({ 0.f, 0.f, 0.f });
+                                    else
+                                        missing_component_color = true;
+                                    continue;
+                                }
+                                ColorRGB decoded;
+                                if (!decode_color(m_config.filament_colour.get_at(size_t(id - 1)), decoded)) {
+                                    if (raw_texture_mapping_mode)
+                                        component_colors.push_back({ 0.f, 0.f, 0.f });
+                                    else
+                                        missing_component_color = true;
+                                    continue;
+                                }
+                                component_colors.push_back({ decoded.r(), decoded.g(), decoded.b() });
+                            }
+                            const TransmissionDistanceCalibrationContextForGCode td_calibration_context =
+                                transmission_distance_calibration_context_for_gcode(*zone,
+                                                                                    component_ids,
+                                                                                    component_colors,
+                                                                                    texture_filament_color_mode);
+                            size_t previous_component_idx = size_t(-1);
+                            if (current_layer_index > 0) {
+                                const unsigned int previous_component_id =
+                                    texture_mgr.resolve_zone_component(texture_zone_id, num_physical, current_layer_index - 1);
+                                const auto previous_component_it =
+                                    std::find(component_ids.begin(), component_ids.end(), previous_component_id);
+                                if (previous_component_it != component_ids.end())
+                                    previous_component_idx = size_t(previous_component_it - component_ids.begin());
+                            }
+                            const float active_component_td_width_factor =
+                                transmission_distance_width_factor_for_gcode(td_calibration_context,
+                                                                             active_component_idx,
+                                                                             previous_component_idx);
+
                             const VertexColorOverhangWeightField *vertex_color_weight_field = nullptr;
                             auto *generic_mix_candidate_cache = &m_generic_solver_mix_candidate_cache;
                             if (vertex_color_match_mode && layer_object != nullptr) {
-                                const bool raw_texture_mapping_mode =
-                                    zone->texture_mapping_mode == int(TextureMappingZone::TextureMappingRawValues);
-                                std::vector<std::array<float, 3>> component_colors;
-                                component_colors.reserve(component_ids.size());
-                                bool missing_component_color = false;
-                                for (const unsigned int id : component_ids) {
-                                    if (id < 1 || id > m_config.filament_colour.values.size()) {
-                                        if (raw_texture_mapping_mode)
-                                            component_colors.push_back({ 0.f, 0.f, 0.f });
-                                        else
-                                            missing_component_color = true;
-                                        continue;
-                                    }
-                                    ColorRGB decoded;
-                                    if (!decode_color(m_config.filament_colour.get_at(size_t(id - 1)), decoded)) {
-                                        if (raw_texture_mapping_mode)
-                                            component_colors.push_back({ 0.f, 0.f, 0.f });
-                                        else
-                                            missing_component_color = true;
-                                        continue;
-                                    }
-                                    component_colors.push_back({ decoded.r(), decoded.g(), decoded.b() });
-                                }
                                 if (!missing_component_color && component_colors.size() == component_ids.size() && !component_colors.empty()) {
                                     std::ostringstream component_key_stream;
                                     for (size_t idx = 0; idx < component_ids.size(); ++idx) {
@@ -9321,6 +9499,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                 outer_wall_gradient_dynamic_ctx.max_width_delta_mm = effective_max_width_delta_mm;
                                 outer_wall_gradient_dynamic_ctx.active_component_strength_factor = active_component_strength_factor;
                                 outer_wall_gradient_dynamic_ctx.active_component_minimum_offset_factor = active_component_minimum_offset_factor;
+                                outer_wall_gradient_dynamic_ctx.active_component_td_width_factor = active_component_td_width_factor;
                                 outer_wall_gradient_dynamic_ctx.base_outer_width_mm = base_outer_width_mm;
                                 outer_wall_gradient_dynamic_ctx.flow_reference_width_mm = flow_reference_width_mm;
                                 outer_wall_gradient_dynamic_ctx.base_centerline_shift_mm = base_centerline_shift_mm;
@@ -9435,6 +9614,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                         max_width_delta_limit_mm,
                                         active_component_minimum_offset_factor,
                                         active_component_strength_factor,
+                                        active_component_td_width_factor,
                                         nonlinear_offset_adjustment,
                                         layer_height_mm,
                                         stair_step_mm,
@@ -10151,6 +10331,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             max_width_delta_limit_mm,
             outer_wall_gradient_dynamic_ctx.active_component_minimum_offset_factor,
             outer_wall_gradient_dynamic_ctx.active_component_strength_factor,
+            outer_wall_gradient_dynamic_ctx.active_component_td_width_factor,
             outer_wall_gradient_dynamic_ctx.nonlinear_offset_adjustment,
             outer_wall_gradient_dynamic_ctx.layer_height_mm,
             stair_step_mm,

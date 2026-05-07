@@ -1023,8 +1023,9 @@ public:
                                         const std::vector<unsigned int> &component_ids,
                                         const std::vector<float> &component_strengths_pct,
                                         const std::vector<float> &component_minimum_offsets_pct,
+                                        const std::vector<float> &component_transmission_distances_mm,
+                                        int transmission_distance_calibration_mode,
                                         float tone_gamma,
-                                        float sagging_ratio,
                                         float preview_opacity_pct,
                                         bool force_sequential_filaments,
                                         bool auto_adjust_filament_selection,
@@ -1099,19 +1100,6 @@ public:
         tone_gamma_row->Add(new wxStaticText(image_page, wxID_ANY, _L("x")), 0, wxALIGN_CENTER_VERTICAL);
         image_root->Add(tone_gamma_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
 
-        auto *sagging_row = new wxBoxSizer(wxHORIZONTAL);
-        sagging_row->Add(new wxStaticText(filament_page, wxID_ANY, _L("Sagging ratio limit")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-        m_sagging_ratio_spin = new wxSpinCtrlDouble(filament_page, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(84), -1),
-                                                    wxSP_ARROW_KEYS | wxALIGN_RIGHT, 0.0, 6.0, std::clamp(double(sagging_ratio), 0.0, 6.0), 0.1);
-        m_sagging_ratio_spin->SetDigits(2);
-        sagging_row->Add(m_sagging_ratio_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
-        sagging_row->Add(new wxStaticText(filament_page, wxID_ANY, _L("x h")), 0, wxALIGN_CENTER_VERTICAL);
-        filament_root->Add(sagging_row, 0, wxEXPAND | wxALL, gap);
-
-        m_force_sequential_filaments_checkbox = new wxCheckBox(filament_page, wxID_ANY, _L("Force sequential order for filaments"));
-        m_force_sequential_filaments_checkbox->SetValue(force_sequential_filaments);
-        filament_root->Add(m_force_sequential_filaments_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
-
         auto *minimum_offsets_box = new wxStaticBoxSizer(wxVERTICAL, filament_page, _L("Per-filament minimum offset"));
         auto *strengths_box = new wxStaticBoxSizer(wxVERTICAL, filament_page, _L("Per-filament strength"));
         const std::vector<wxString> channel_labels = texture_mapping_channel_labels(filament_color_mode);
@@ -1147,11 +1135,15 @@ public:
             box->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
         };
         for (size_t i = 0; i < component_ids.size(); ++i) {
-            const int offset_value = i < component_minimum_offsets_pct.size() ? std::clamp(int(std::lround(component_minimum_offsets_pct[i])), 0, 100) : 0;
+            const int offset_value = i < component_minimum_offsets_pct.size() ?
+                std::clamp(int(std::lround(component_minimum_offsets_pct[i])), 0, 100) :
+                0;
             add_percent_row(minimum_offsets_box, i, offset_value, m_minimum_offset_sliders, m_minimum_offset_spins);
         }
         for (size_t i = 0; i < component_ids.size(); ++i) {
-            const int strength_value = i < component_strengths_pct.size() ? std::clamp(int(std::lround(component_strengths_pct[i])), 0, 100) : 100;
+            const int strength_value = i < component_strengths_pct.size() ?
+                std::clamp(int(std::lround(component_strengths_pct[i])), 0, 100) :
+                100;
             add_percent_row(strengths_box, i, strength_value, m_strength_sliders, m_strength_spins);
         }
         filament_root->Add(minimum_offsets_box, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
@@ -1160,9 +1152,59 @@ public:
         reset_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { reset_strengths_and_offsets(); });
         filament_root->Add(reset_btn, 0, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, gap);
 
+        auto *td_box = new wxStaticBoxSizer(wxVERTICAL, filament_page, _L("Transmission distance"));
+        auto *td_mode_row = new wxBoxSizer(wxHORIZONTAL);
+        td_mode_row->Add(new wxStaticText(filament_page, wxID_ANY, _L("TD calibration mode")),
+                         0,
+                         wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                         gap);
+        wxArrayString td_mode_choices;
+        td_mode_choices.Add(_L("None"));
+        td_mode_choices.Add(_L("Absolute"));
+        td_mode_choices.Add(_L("Neighbor"));
+        m_transmission_distance_calibration_mode_choice =
+            new wxChoice(filament_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, td_mode_choices);
+        m_transmission_distance_calibration_mode_choice->SetSelection(
+            std::clamp(transmission_distance_calibration_mode,
+                       int(TextureMappingZone::TDCalibrationNone),
+                       int(TextureMappingZone::TDCalibrationNeighbor)));
+        td_mode_row->Add(m_transmission_distance_calibration_mode_choice, 1, wxALIGN_CENTER_VERTICAL);
+        td_box->Add(td_mode_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+        for (size_t i = 0; i < component_ids.size(); ++i) {
+            auto *row = new wxBoxSizer(wxHORIZONTAL);
+            row->Add(new wxStaticText(filament_page, wxID_ANY, component_label(i)), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+            const double value = i < component_transmission_distances_mm.size() ?
+                std::clamp(double(component_transmission_distances_mm[i]), 0.0, 50.0) :
+                0.0;
+            auto *spin = new wxSpinCtrlDouble(filament_page,
+                                              wxID_ANY,
+                                              wxEmptyString,
+                                              wxDefaultPosition,
+                                              wxSize(FromDIP(84), -1),
+                                              wxSP_ARROW_KEYS | wxALIGN_RIGHT,
+                                              0.0,
+                                              50.0,
+                                              value,
+                                              0.1);
+            spin->SetDigits(2);
+            row->Add(spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+            row->Add(new wxStaticText(filament_page, wxID_ANY, _L("mm")), 0, wxALIGN_CENTER_VERTICAL);
+            m_transmission_distance_spins.emplace_back(spin);
+            td_box->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+        }
+        filament_root->Add(td_box, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
+        m_force_sequential_filaments_checkbox =
+            new wxCheckBox(filament_page, wxID_ANY, _L("Force sequential order for filaments"));
+        m_force_sequential_filaments_checkbox->SetValue(force_sequential_filaments);
+        filament_root->Add(m_force_sequential_filaments_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
         auto *preview_box = new wxStaticBoxSizer(wxVERTICAL, preview_page, _L("3D Preview"));
         auto *preview_opacity_row = new wxBoxSizer(wxHORIZONTAL);
-        preview_opacity_row->Add(new wxStaticText(preview_page, wxID_ANY, _L("Texture opacity")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        preview_opacity_row->Add(new wxStaticText(preview_page, wxID_ANY, _L("Texture opacity")),
+                                 0,
+                                 wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                                 gap);
         const int opacity = std::clamp(int(std::lround(preview_opacity_pct)), 0, 100);
         m_preview_opacity_slider = new wxSlider(preview_page, wxID_ANY, opacity, 0, 100, wxDefaultPosition, wxSize(FromDIP(180), -1), wxSL_HORIZONTAL | wxSL_AUTOTICKS);
         m_preview_opacity_spin = new wxSpinCtrl(preview_page, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(70), -1),
@@ -1391,7 +1433,15 @@ public:
     }
 
     float tone_gamma() const { return float(std::clamp(m_tone_gamma_spin ? m_tone_gamma_spin->GetValue() : 1.0, 0.5, 3.0)); }
-    float sagging_ratio() const { return float(std::clamp(m_sagging_ratio_spin ? m_sagging_ratio_spin->GetValue() : 0.0, 0.0, 6.0)); }
+    int transmission_distance_calibration_mode() const
+    {
+        return m_transmission_distance_calibration_mode_choice ?
+            std::clamp(m_transmission_distance_calibration_mode_choice->GetSelection(),
+                       int(TextureMappingZone::TDCalibrationNone),
+                       int(TextureMappingZone::TDCalibrationNeighbor)) :
+            TextureMappingZone::DefaultTransmissionDistanceCalibrationMode;
+    }
+
     float preview_opacity_pct() const { return float(std::clamp(m_preview_opacity_spin ? m_preview_opacity_spin->GetValue() : 100, 0, 100)); }
     bool force_sequential_filaments() const { return m_force_sequential_filaments_checkbox && m_force_sequential_filaments_checkbox->GetValue(); }
     bool auto_adjust_filament_selection() const { return m_auto_adjust_filament_selection_checkbox == nullptr || m_auto_adjust_filament_selection_checkbox->GetValue(); }
@@ -1479,6 +1529,17 @@ public:
         out.reserve(m_minimum_offset_spins.size());
         for (wxSpinCtrl *spin : m_minimum_offset_spins)
             out.emplace_back(float(std::clamp(spin ? spin->GetValue() : 0, 0, 100)));
+        return out;
+    }
+
+    std::vector<float> component_transmission_distances_mm() const
+    {
+        std::vector<float> out;
+        out.reserve(m_transmission_distance_spins.size());
+        for (wxSpinCtrlDouble *spin : m_transmission_distance_spins) {
+            const double value = spin ? spin->GetValue() : 0.0;
+            out.emplace_back(value > 0.0 ? float(std::clamp(value, 0.01, 50.0)) : 0.f);
+        }
         return out;
     }
 
@@ -1612,7 +1673,7 @@ private:
     wxSimplebook *m_options_book {nullptr};
     wxChoice *m_texture_mapping_mode_choice {nullptr};
     wxSpinCtrlDouble *m_tone_gamma_spin {nullptr};
-    wxSpinCtrlDouble *m_sagging_ratio_spin {nullptr};
+    wxChoice *m_transmission_distance_calibration_mode_choice {nullptr};
     wxSlider *m_preview_opacity_slider {nullptr};
     wxSpinCtrl *m_preview_opacity_spin {nullptr};
     wxCheckBox *m_force_sequential_filaments_checkbox {nullptr};
@@ -1640,6 +1701,7 @@ private:
     std::vector<wxSpinCtrl*> m_minimum_offset_spins;
     std::vector<wxSlider*> m_strength_sliders;
     std::vector<wxSpinCtrl*> m_strength_spins;
+    std::vector<wxSpinCtrlDouble*> m_transmission_distance_spins;
 };
 
 } // namespace
@@ -5551,19 +5613,35 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             apply_zone(std::move(updated));
             update_texture_mapping_panel(false);
         });
-        advanced_btn->Bind(wxEVT_BUTTON, [this, zone_index, mgr_ptr, palette, apply_zone, bundle, set_config_string](wxCommandEvent &) {
+        advanced_btn->Bind(wxEVT_BUTTON, [this,
+                                          zone_index,
+                                          mgr_ptr,
+                                          palette,
+                                          physical_colors,
+                                          apply_zone,
+                                          bundle,
+                                          set_config_string](wxCommandEvent &) {
             if (zone_index >= mgr_ptr->zones().size())
                 return;
             TextureMappingZone updated = mgr_ptr->zones()[zone_index];
-            const std::vector<unsigned int> ids = texture_mapping_selected_ids(updated, palette.size());
+            std::vector<unsigned int> ids = updated.is_image_texture() ?
+                TextureMappingManager::effective_texture_component_ids(updated, palette.size(), physical_colors) :
+                texture_mapping_selected_ids(updated, palette.size());
+            if (ids.empty())
+                ids = texture_mapping_selected_ids(updated, palette.size());
             std::vector<float> strengths;
             std::vector<float> offsets;
+            std::vector<float> transmission_distances;
             strengths.reserve(ids.size());
             offsets.reserve(ids.size());
+            transmission_distances.reserve(ids.size());
             for (const unsigned int id : ids) {
                 const size_t idx = id > 0 ? size_t(id - 1) : size_t(0);
                 strengths.emplace_back(idx < updated.filament_strengths_pct.size() ? updated.filament_strengths_pct[idx] : 100.f);
                 offsets.emplace_back(idx < updated.filament_minimum_offsets_pct.size() ? updated.filament_minimum_offsets_pct[idx] : 0.f);
+                transmission_distances.emplace_back(idx < updated.filament_transmission_distances_mm.size() ?
+                                                        updated.filament_transmission_distances_mm[idx] :
+                                                        0.f);
             }
             TextureMappingAdvancedOptionsDialog dlg(this,
                                                     updated.texture_mapping_mode,
@@ -5571,8 +5649,9 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     ids,
                                                     strengths,
                                                     offsets,
+                                                    transmission_distances,
+                                                    updated.transmission_distance_calibration_mode,
                                                     updated.tone_gamma,
-                                                    updated.sagging_ratio,
                                                     updated.preview_opacity_pct,
                                                     updated.force_sequential_filaments,
                                                     updated.auto_adjust_filament_selection,
@@ -5596,7 +5675,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 return;
             updated.texture_mapping_mode = dlg.texture_mapping_mode();
             updated.tone_gamma = dlg.tone_gamma();
-            updated.sagging_ratio = dlg.sagging_ratio();
+            updated.sagging_ratio = TextureMappingZone::DefaultSaggingRatio;
+            updated.transmission_distance_calibration_mode = dlg.transmission_distance_calibration_mode();
             updated.preview_opacity_pct = dlg.preview_opacity_pct();
             updated.force_sequential_filaments = dlg.force_sequential_filaments();
             updated.auto_adjust_filament_selection = dlg.auto_adjust_filament_selection();
@@ -5634,6 +5714,15 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                     updated.filament_minimum_offsets_pct[size_t(ids[i] - 1)] = dlg_offsets[i];
             while (!updated.filament_minimum_offsets_pct.empty() && std::abs(updated.filament_minimum_offsets_pct.back()) <= 1e-6f)
                 updated.filament_minimum_offsets_pct.pop_back();
+            if (updated.filament_transmission_distances_mm.size() < palette.size())
+                updated.filament_transmission_distances_mm.resize(palette.size(), 0.f);
+            const std::vector<float> dlg_transmission_distances = dlg.component_transmission_distances_mm();
+            for (size_t i = 0; i < ids.size() && i < dlg_transmission_distances.size(); ++i)
+                if (ids[i] > 0 && size_t(ids[i] - 1) < updated.filament_transmission_distances_mm.size())
+                    updated.filament_transmission_distances_mm[size_t(ids[i] - 1)] = dlg_transmission_distances[i];
+            while (!updated.filament_transmission_distances_mm.empty() &&
+                   std::abs(updated.filament_transmission_distances_mm.back()) <= 1e-6f)
+                updated.filament_transmission_distances_mm.pop_back();
             apply_zone(std::move(updated));
             if (p->plater != nullptr && !p->plater->is_preview_shown()) {
                 if (GLCanvas3D *canvas = p->plater->get_view3D_canvas3D())
