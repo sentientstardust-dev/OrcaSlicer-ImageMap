@@ -394,7 +394,7 @@ static std::vector<RGB> semantic_colors(int filament_color_mode)
 {
     switch (clamp_int(filament_color_mode,
                       int(TextureMappingZone::FilamentColorAny),
-                      int(TextureMappingZone::FilamentColorBW))) {
+                      int(TextureMappingZone::FilamentColorRGBKW))) {
     case int(TextureMappingZone::FilamentColorRGB):  return {{255, 0, 0}, {0, 255, 0}, {0, 0, 255}};
     case int(TextureMappingZone::FilamentColorCMY):  return {{0, 255, 255}, {255, 0, 255}, {255, 255, 0}};
     case int(TextureMappingZone::FilamentColorCMYK): return {{0, 255, 255}, {255, 0, 255}, {255, 255, 0}, {0, 0, 0}};
@@ -402,6 +402,8 @@ static std::vector<RGB> semantic_colors(int filament_color_mode)
     case int(TextureMappingZone::FilamentColorRGBK): return {{255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {0, 0, 0}};
     case int(TextureMappingZone::FilamentColorRGBW): return {{255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {255, 255, 255}};
     case int(TextureMappingZone::FilamentColorBW):   return {{0, 0, 0}, {255, 255, 255}};
+    case int(TextureMappingZone::FilamentColorCMYKW): return {{0, 255, 255}, {255, 0, 255}, {255, 255, 0}, {0, 0, 0}, {255, 255, 255}};
+    case int(TextureMappingZone::FilamentColorRGBKW): return {{255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {0, 0, 0}, {255, 255, 255}};
     default:                                         return {};
     }
 }
@@ -497,7 +499,7 @@ static int mapping_mode_from_name(const std::string &name)
 
 static std::string color_model_name(int mode)
 {
-    switch (clamp_int(mode, int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorBW))) {
+    switch (clamp_int(mode, int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorRGBKW))) {
     case int(TextureMappingZone::FilamentColorRGB):  return "rgb";
     case int(TextureMappingZone::FilamentColorCMY):  return "cmy";
     case int(TextureMappingZone::FilamentColorCMYK): return "cmyk";
@@ -505,6 +507,8 @@ static std::string color_model_name(int mode)
     case int(TextureMappingZone::FilamentColorRGBK): return "rgbk";
     case int(TextureMappingZone::FilamentColorRGBW): return "rgbw";
     case int(TextureMappingZone::FilamentColorBW):   return "bw";
+    case int(TextureMappingZone::FilamentColorCMYKW): return "cmykw";
+    case int(TextureMappingZone::FilamentColorRGBKW): return "rgbkw";
     default:                                         return "any";
     }
 }
@@ -518,6 +522,8 @@ static int color_model_from_name(const std::string &name)
     if (name == "rgbk") return int(TextureMappingZone::FilamentColorRGBK);
     if (name == "rgbw") return int(TextureMappingZone::FilamentColorRGBW);
     if (name == "bw")   return int(TextureMappingZone::FilamentColorBW);
+    if (name == "cmykw") return int(TextureMappingZone::FilamentColorCMYKW);
+    if (name == "rgbkw") return int(TextureMappingZone::FilamentColorRGBKW);
     return int(TextureMappingZone::FilamentColorAny);
 }
 
@@ -620,7 +626,7 @@ static std::string normalized_prime_tower_color_mode_name(std::string name)
     if (name == "generic" || name == "generic_solver" || name == "solver")
         return "generic_solver";
     if (name == "rgb" || name == "cmy" || name == "cmyk" || name == "cmyw" ||
-        name == "rgbk" || name == "rgbw" || name == "bw")
+        name == "rgbk" || name == "rgbw" || name == "bw" || name == "cmykw" || name == "rgbkw")
         return name;
     return "auto";
 }
@@ -1344,7 +1350,7 @@ size_t TextureMappingManager::expected_component_count(int mapping_mode, int fil
 
     switch (clamp_int(filament_color_mode,
                       int(TextureMappingZone::FilamentColorAny),
-                      int(TextureMappingZone::FilamentColorBW))) {
+                      int(TextureMappingZone::FilamentColorRGBKW))) {
     case int(TextureMappingZone::FilamentColorRGB):
     case int(TextureMappingZone::FilamentColorCMY):
         return 3;
@@ -1355,6 +1361,9 @@ size_t TextureMappingManager::expected_component_count(int mapping_mode, int fil
         return 4;
     case int(TextureMappingZone::FilamentColorBW):
         return 2;
+    case int(TextureMappingZone::FilamentColorCMYKW):
+    case int(TextureMappingZone::FilamentColorRGBKW):
+        return 5;
     default:
         return 0;
     }

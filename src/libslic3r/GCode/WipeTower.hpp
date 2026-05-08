@@ -37,7 +37,9 @@ struct PrimeTowerTextureRenderSettings
         RGB,
         RGBK,
         RGBW,
-        BW
+        BW,
+        CMYKW,
+        RGBKW
     };
 
     bool enabled = false;
@@ -207,6 +209,18 @@ private:
                     std::array<float, 3>{1.f, 1.f, 1.f}};
         case BW:
             return {std::array<float, 3>{0.f, 0.f, 0.f}, std::array<float, 3>{1.f, 1.f, 1.f}};
+        case CMYKW:
+            return {std::array<float, 3>{0.f, 1.f, 1.f},
+                    std::array<float, 3>{1.f, 0.f, 1.f},
+                    std::array<float, 3>{1.f, 1.f, 0.f},
+                    std::array<float, 3>{0.f, 0.f, 0.f},
+                    std::array<float, 3>{1.f, 1.f, 1.f}};
+        case RGBKW:
+            return {std::array<float, 3>{1.f, 0.f, 0.f},
+                    std::array<float, 3>{0.f, 1.f, 0.f},
+                    std::array<float, 3>{0.f, 0.f, 1.f},
+                    std::array<float, 3>{0.f, 0.f, 0.f},
+                    std::array<float, 3>{1.f, 1.f, 1.f}};
         default: return {};
         }
     }
@@ -356,6 +370,26 @@ private:
         }
         default:
             break;
+        }
+        if (component_count == 5) {
+            const float chroma = std::max(0.f, 1.f - darkness - whiteness);
+            if (mode == int(TextureMappingZone::FilamentColorCMYKW)) {
+                const float c = chroma <= 1e-6f ? 0.f : 1.f - safe_div(r - whiteness, chroma);
+                const float m = chroma <= 1e-6f ? 0.f : 1.f - safe_div(g - whiteness, chroma);
+                const float y = chroma <= 1e-6f ? 0.f : 1.f - safe_div(b - whiteness, chroma);
+                return {print_visibility_strength(c),
+                        print_visibility_strength(m),
+                        print_visibility_strength(y),
+                        print_visibility_strength(darkness),
+                        print_visibility_strength(whiteness)};
+            }
+            if (mode == int(TextureMappingZone::FilamentColorRGBKW)) {
+                return {print_visibility_strength(safe_div(r - whiteness, chroma)),
+                        print_visibility_strength(safe_div(g - whiteness, chroma)),
+                        print_visibility_strength(safe_div(b - whiteness, chroma)),
+                        print_visibility_strength(darkness),
+                        print_visibility_strength(whiteness)};
+            }
         }
         if (component_count != 4)
             return {};
@@ -528,6 +562,29 @@ private:
             ideals = {{{0.f, 0.f, 0.f}, {1.f, 1.f, 1.f}}};
             weights = {print_visibility_strength(gray >= 0.5f ? 2.f * (1.f - gray) : 1.f),
                        print_visibility_strength(gray <= 0.5f ? 2.f * gray : 1.f)};
+            break;
+        }
+        case CMYKW: {
+            const float chroma = std::max(0.f, 1.f - darkness - whiteness);
+            const float c = chroma <= 1e-6f ? 0.f : 1.f - safe_div(r - whiteness, chroma);
+            const float m = chroma <= 1e-6f ? 0.f : 1.f - safe_div(g - whiteness, chroma);
+            const float y = chroma <= 1e-6f ? 0.f : 1.f - safe_div(b - whiteness, chroma);
+            ideals = {{{0.f, 1.f, 1.f}, {1.f, 0.f, 1.f}, {1.f, 1.f, 0.f}, {0.f, 0.f, 0.f}, {1.f, 1.f, 1.f}}};
+            weights = {print_visibility_strength(c),
+                       print_visibility_strength(m),
+                       print_visibility_strength(y),
+                       print_visibility_strength(darkness),
+                       print_visibility_strength(whiteness)};
+            break;
+        }
+        case RGBKW: {
+            const float chroma = std::max(0.f, 1.f - darkness - whiteness);
+            ideals = {{{1.f, 0.f, 0.f}, {0.f, 1.f, 0.f}, {0.f, 0.f, 1.f}, {0.f, 0.f, 0.f}, {1.f, 1.f, 1.f}}};
+            weights = {print_visibility_strength(safe_div(r - whiteness, chroma)),
+                       print_visibility_strength(safe_div(g - whiteness, chroma)),
+                       print_visibility_strength(safe_div(b - whiteness, chroma)),
+                       print_visibility_strength(darkness),
+                       print_visibility_strength(whiteness)};
             break;
         }
         default:

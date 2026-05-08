@@ -612,12 +612,49 @@ static wxArrayString texture_mapping_color_mode_choices()
     choices.Add(_L("RGBK"));
     choices.Add(_L("RGBW"));
     choices.Add(_L("BW"));
+    choices.Add(_L("5+ toolheads:"));
+    choices.Add(_L("CMYKW"));
+    choices.Add(_L("RGBKW"));
     return choices;
+}
+
+static int texture_mapping_five_toolhead_marker_selection()
+{
+    return 8;
+}
+
+static int texture_mapping_color_mode_selection(int filament_color_mode)
+{
+    const int clamped_mode = std::clamp(filament_color_mode,
+                                        int(TextureMappingZone::FilamentColorAny),
+                                        int(TextureMappingZone::FilamentColorRGBKW));
+    switch (clamped_mode) {
+    case int(TextureMappingZone::FilamentColorCMYKW): return 9;
+    case int(TextureMappingZone::FilamentColorRGBKW): return 10;
+    default: return clamped_mode;
+    }
+}
+
+static int texture_mapping_color_mode_from_selection(int selection, int fallback)
+{
+    switch (selection) {
+    case 0: return int(TextureMappingZone::FilamentColorAny);
+    case 1: return int(TextureMappingZone::FilamentColorRGB);
+    case 2: return int(TextureMappingZone::FilamentColorCMY);
+    case 3: return int(TextureMappingZone::FilamentColorCMYK);
+    case 4: return int(TextureMappingZone::FilamentColorCMYW);
+    case 5: return int(TextureMappingZone::FilamentColorRGBK);
+    case 6: return int(TextureMappingZone::FilamentColorRGBW);
+    case 7: return int(TextureMappingZone::FilamentColorBW);
+    case 9: return int(TextureMappingZone::FilamentColorCMYKW);
+    case 10: return int(TextureMappingZone::FilamentColorRGBKW);
+    default: return std::clamp(fallback, int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorRGBKW));
+    }
 }
 
 static std::vector<wxString> texture_mapping_channel_labels(int filament_color_mode)
 {
-    switch (std::clamp(filament_color_mode, int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorBW))) {
+    switch (std::clamp(filament_color_mode, int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorRGBKW))) {
     case int(TextureMappingZone::FilamentColorRGB):
         return {_L("Red"), _L("Green"), _L("Blue")};
     case int(TextureMappingZone::FilamentColorCMY):
@@ -632,6 +669,10 @@ static std::vector<wxString> texture_mapping_channel_labels(int filament_color_m
         return {_L("Red"), _L("Green"), _L("Blue"), _L("White")};
     case int(TextureMappingZone::FilamentColorBW):
         return {_L("Black"), _L("White")};
+    case int(TextureMappingZone::FilamentColorCMYKW):
+        return {_L("Cyan"), _L("Magenta"), _L("Yellow"), _L("Black"), _L("White")};
+    case int(TextureMappingZone::FilamentColorRGBKW):
+        return {_L("Red"), _L("Green"), _L("Blue"), _L("Black"), _L("White")};
     default:
         return {};
     }
@@ -1348,8 +1389,23 @@ public:
         prime_color_modes.Add(_L("RGBK"));
         prime_color_modes.Add(_L("RGBW"));
         prime_color_modes.Add(_L("BW"));
+        prime_color_modes.Add(_L("5+ toolheads:"));
+        prime_color_modes.Add(_L("CMYKW"));
+        prime_color_modes.Add(_L("RGBKW"));
         m_prime_tower_color_mode_choice = new wxChoice(global_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, prime_color_modes);
         m_prime_tower_color_mode_choice->SetSelection(prime_tower_color_mode_selection(m_global_settings.prime_tower_color_mode));
+        int last_prime_tower_color_mode_selection = m_prime_tower_color_mode_choice->GetSelection();
+        m_prime_tower_color_mode_choice->Bind(wxEVT_CHOICE,
+                                              [this, last_prime_tower_color_mode_selection](wxCommandEvent &) mutable {
+                                                  if (m_prime_tower_color_mode_choice == nullptr)
+                                                      return;
+                                                  const int selection = m_prime_tower_color_mode_choice->GetSelection();
+                                                  if (selection == prime_tower_five_toolhead_marker_selection()) {
+                                                      m_prime_tower_color_mode_choice->SetSelection(last_prime_tower_color_mode_selection);
+                                                      return;
+                                                  }
+                                                  last_prime_tower_color_mode_selection = selection;
+                                              });
         color_mode_row->Add(m_prime_tower_color_mode_choice, 1, wxALIGN_CENTER_VERTICAL);
         global_root->Add(color_mode_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
 
@@ -1555,8 +1611,15 @@ private:
         case 6: return "rgbk";
         case 7: return "rgbw";
         case 8: return "bw";
+        case 10: return "cmykw";
+        case 11: return "rgbkw";
         default: return "auto";
         }
+    }
+
+    static int prime_tower_five_toolhead_marker_selection()
+    {
+        return 9;
     }
 
     static int prime_tower_color_mode_selection(const std::string &mode)
@@ -1570,6 +1633,8 @@ private:
         if (normalized == "rgbk") return 6;
         if (normalized == "rgbw") return 7;
         if (normalized == "bw") return 8;
+        if (normalized == "cmykw") return 10;
+        if (normalized == "rgbkw") return 11;
         return 0;
     }
 
@@ -5489,7 +5554,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         auto *mode_row = new wxWrapSizer(wxHORIZONTAL, wxWRAPSIZER_DEFAULT_FLAGS);
         mode_row->Add(new wxStaticText(editor, wxID_ANY, _L("Filament colors")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         auto *mode_choice = new wxChoice(editor, wxID_ANY, wxDefaultPosition, wxDefaultSize, texture_mapping_color_mode_choices());
-        mode_choice->SetSelection(std::clamp(entry.filament_color_mode, int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorBW)));
+        mode_choice->SetSelection(texture_mapping_color_mode_selection(entry.filament_color_mode));
         mode_row->Add(mode_choice, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         auto *preview_colors_chk = new wxCheckBox(editor, wxID_ANY, _L("Preview Result Colors"));
         preview_colors_chk->SetValue(entry.preview_simulate_colors);
@@ -5535,7 +5600,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.component_a = ids.empty() ? 1 : ids.front();
             updated.component_b = ids.size() > 1 ? ids[1] : updated.component_a;
             updated.filament_color_mode = mode_choice != nullptr ?
-                std::clamp(mode_choice->GetSelection(), int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorBW)) :
+                texture_mapping_color_mode_from_selection(mode_choice->GetSelection(), updated.filament_color_mode) :
                 updated.filament_color_mode;
             updated.preview_simulate_colors = preview_colors_chk != nullptr && preview_colors_chk->GetValue();
             updated.contrast_pct = contrast_spin != nullptr ? std::clamp(float(contrast_spin->GetValue()), 25.f, 300.f) : updated.contrast_pct;
@@ -5576,14 +5641,22 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         for (wxCheckBox *chk : filament_checks)
             if (chk != nullptr)
                 chk->Bind(wxEVT_CHECKBOX, [apply_controls](wxCommandEvent &) { apply_controls(); });
-        mode_choice->Bind(wxEVT_CHOICE, [this, zone_index, mgr_ptr, num_physical, physical_colors, filament_checks, mode_choice, apply_controls](wxCommandEvent &) {
+        int last_mode_selection = mode_choice->GetSelection();
+        mode_choice->Bind(wxEVT_CHOICE, [this, zone_index, mgr_ptr, num_physical, physical_colors, filament_checks, mode_choice, apply_controls, last_mode_selection](wxCommandEvent &) mutable {
+            if (mode_choice != nullptr) {
+                const int selection = mode_choice->GetSelection();
+                if (selection == texture_mapping_five_toolhead_marker_selection()) {
+                    mode_choice->SetSelection(last_mode_selection);
+                    return;
+                }
+                last_mode_selection = selection;
+            }
             if (zone_index < mgr_ptr->zones().size()) {
                 TextureMappingZone &zone = mgr_ptr->zones()[zone_index];
                 if (zone.auto_adjust_filament_selection) {
                     TextureMappingZone adjusted = zone;
-                    adjusted.filament_color_mode = std::clamp(mode_choice != nullptr ? mode_choice->GetSelection() : zone.filament_color_mode,
-                                                              int(TextureMappingZone::FilamentColorAny),
-                                                              int(TextureMappingZone::FilamentColorBW));
+                    adjusted.filament_color_mode = texture_mapping_color_mode_from_selection(
+                        mode_choice != nullptr ? mode_choice->GetSelection() : -1, zone.filament_color_mode);
                     TextureMappingManager::auto_adjust_texture_component_ids(adjusted, num_physical, physical_colors);
                     const std::vector<unsigned int> adjusted_ids = texture_mapping_selected_ids(adjusted, num_physical);
                     for (size_t idx = 0; idx < filament_checks.size(); ++idx)

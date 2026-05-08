@@ -314,6 +314,10 @@ static std::string raw_atlas_color_mode_name_for_keys(const std::vector<std::str
         return "RGBW";
     if (all_standard && keys.size() == 2 && has_key("K") && has_key("W"))
         return "BW";
+    if (all_standard && keys.size() == 5 && has_key("C") && has_key("M") && has_key("Y") && has_key("K") && has_key("W"))
+        return "CMYKW";
+    if (all_standard && keys.size() == 5 && has_key("R") && has_key("G") && has_key("B") && has_key("K") && has_key("W"))
+        return "RGBKW";
     if (all_standard && !joined.empty())
         return joined;
 
@@ -8025,6 +8029,66 @@ void GLGizmoTrueColorPainting::sync_rgb_from_rgbw()
     m_rgb_color[2] = mixed.b();
 }
 
+void GLGizmoTrueColorPainting::sync_cmykw_from_rgb()
+{
+    const std::vector<ColorRGBA> colors = {
+        ColorRGBA(0.f, 1.f, 1.f, 1.f),
+        ColorRGBA(1.f, 0.f, 1.f, 1.f),
+        ColorRGBA(1.f, 1.f, 0.f, 1.f),
+        ColorRGBA(0.f, 0.f, 0.f, 1.f),
+        ColorRGBA(1.f, 1.f, 1.f, 1.f)
+    };
+    const std::vector<float> weights = closest_color_mix_weights(colors, ColorRGBA(m_rgb_color[0], m_rgb_color[1], m_rgb_color[2], 1.f));
+    for (size_t idx = 0; idx < m_cmykw_color.size() && idx < weights.size(); ++idx)
+        m_cmykw_color[idx] = weights[idx];
+}
+
+void GLGizmoTrueColorPainting::sync_rgb_from_cmykw()
+{
+    const std::vector<ColorRGBA> colors = {
+        ColorRGBA(0.f, 1.f, 1.f, 1.f),
+        ColorRGBA(1.f, 0.f, 1.f, 1.f),
+        ColorRGBA(1.f, 1.f, 0.f, 1.f),
+        ColorRGBA(0.f, 0.f, 0.f, 1.f),
+        ColorRGBA(1.f, 1.f, 1.f, 1.f)
+    };
+    const std::vector<float> weights(m_cmykw_color.begin(), m_cmykw_color.end());
+    const ColorRGBA mixed = color_mix_from_weights(colors, weights, ColorRGBA(1.f, 1.f, 1.f, 1.f));
+    m_rgb_color[0] = mixed.r();
+    m_rgb_color[1] = mixed.g();
+    m_rgb_color[2] = mixed.b();
+}
+
+void GLGizmoTrueColorPainting::sync_rgbkw_from_rgb()
+{
+    const std::vector<ColorRGBA> colors = {
+        ColorRGBA(1.f, 0.f, 0.f, 1.f),
+        ColorRGBA(0.f, 1.f, 0.f, 1.f),
+        ColorRGBA(0.f, 0.f, 1.f, 1.f),
+        ColorRGBA(0.f, 0.f, 0.f, 1.f),
+        ColorRGBA(1.f, 1.f, 1.f, 1.f)
+    };
+    const std::vector<float> weights = closest_color_mix_weights(colors, ColorRGBA(m_rgb_color[0], m_rgb_color[1], m_rgb_color[2], 1.f));
+    for (size_t idx = 0; idx < m_rgbkw_color.size() && idx < weights.size(); ++idx)
+        m_rgbkw_color[idx] = weights[idx];
+}
+
+void GLGizmoTrueColorPainting::sync_rgb_from_rgbkw()
+{
+    const std::vector<ColorRGBA> colors = {
+        ColorRGBA(1.f, 0.f, 0.f, 1.f),
+        ColorRGBA(0.f, 1.f, 0.f, 1.f),
+        ColorRGBA(0.f, 0.f, 1.f, 1.f),
+        ColorRGBA(0.f, 0.f, 0.f, 1.f),
+        ColorRGBA(1.f, 1.f, 1.f, 1.f)
+    };
+    const std::vector<float> weights(m_rgbkw_color.begin(), m_rgbkw_color.end());
+    const ColorRGBA mixed = color_mix_from_weights(colors, weights, ColorRGBA(1.f, 1.f, 1.f, 1.f));
+    m_rgb_color[0] = mixed.r();
+    m_rgb_color[1] = mixed.g();
+    m_rgb_color[2] = mixed.b();
+}
+
 void GLGizmoTrueColorPainting::sync_bw_from_rgb()
 {
     const float r = std::clamp(m_rgb_color[0], 0.f, 1.f);
@@ -8114,6 +8178,12 @@ void GLGizmoTrueColorPainting::sync_active_color_mode_from_rgb(bool update_filam
         break;
     case ColorInputMode::BW:
         sync_bw_from_rgb();
+        break;
+    case ColorInputMode::CMYKW:
+        sync_cmykw_from_rgb();
+        break;
+    case ColorInputMode::RGBKW:
+        sync_rgbkw_from_rgb();
         break;
     }
 }
@@ -8262,6 +8332,60 @@ bool GLGizmoTrueColorPainting::render_rgbw_picker(float item_width)
     return changed;
 }
 
+bool GLGizmoTrueColorPainting::render_cmykw_picker(float item_width)
+{
+    bool changed = false;
+    ImGui::PushItemWidth(item_width);
+    ImGuiColorEditFlags flags = ImGuiColorEditFlags_DisplayRGB |
+                                ImGuiColorEditFlags_InputRGB |
+                                ImGuiColorEditFlags_NoInputs;
+    if (ImGui::ColorEdit3("##true_color_cmykw_visual", m_rgb_color.data(), flags)) {
+        sync_cmykw_from_rgb();
+        changed = true;
+    }
+
+    bool cmykw_changed = false;
+    cmykw_changed |= ImGui::SliderFloat("Cyan", &m_cmykw_color[0], 0.f, 1.f, "%.2f");
+    cmykw_changed |= ImGui::SliderFloat("Magenta", &m_cmykw_color[1], 0.f, 1.f, "%.2f");
+    cmykw_changed |= ImGui::SliderFloat("Yellow", &m_cmykw_color[2], 0.f, 1.f, "%.2f");
+    cmykw_changed |= ImGui::SliderFloat("Black", &m_cmykw_color[3], 0.f, 1.f, "%.2f");
+    cmykw_changed |= ImGui::SliderFloat("White", &m_cmykw_color[4], 0.f, 1.f, "%.2f");
+    ImGui::PopItemWidth();
+
+    if (cmykw_changed) {
+        sync_rgb_from_cmykw();
+        changed = true;
+    }
+    return changed;
+}
+
+bool GLGizmoTrueColorPainting::render_rgbkw_picker(float item_width)
+{
+    bool changed = false;
+    ImGui::PushItemWidth(item_width);
+    ImGuiColorEditFlags flags = ImGuiColorEditFlags_DisplayRGB |
+                                ImGuiColorEditFlags_InputRGB |
+                                ImGuiColorEditFlags_NoInputs;
+    if (ImGui::ColorEdit3("##true_color_rgbkw_visual", m_rgb_color.data(), flags)) {
+        sync_rgbkw_from_rgb();
+        changed = true;
+    }
+
+    bool rgbkw_changed = false;
+    rgbkw_changed |= ImGui::SliderFloat("Red", &m_rgbkw_color[0], 0.f, 1.f, "%.2f");
+    rgbkw_changed |= ImGui::SliderFloat("Green", &m_rgbkw_color[1], 0.f, 1.f, "%.2f");
+    rgbkw_changed |= ImGui::SliderFloat("Blue", &m_rgbkw_color[2], 0.f, 1.f, "%.2f");
+    rgbkw_changed |= ImGui::SliderFloat("Black", &m_rgbkw_color[3], 0.f, 1.f, "%.2f");
+    rgbkw_changed |= ImGui::SliderFloat("White", &m_rgbkw_color[4], 0.f, 1.f, "%.2f");
+    ImGui::PopItemWidth();
+
+    if (rgbkw_changed) {
+        sync_rgb_from_rgbkw();
+        changed = true;
+    }
+    return changed;
+}
+
 bool GLGizmoTrueColorPainting::render_bw_picker(float item_width)
 {
     bool changed = false;
@@ -8378,7 +8502,9 @@ void GLGizmoTrueColorPainting::on_render_input_window(float x, float y, float bo
         "CMYW",
         "RGBK",
         "RGBW",
-        "BW"
+        "BW",
+        "CMYKW",
+        "RGBKW"
     };
     const int mode_count = int(sizeof(mode_labels) / sizeof(mode_labels[0]));
     int mode = std::clamp(int(m_color_input_mode), 0, mode_count - 1);
@@ -8434,6 +8560,12 @@ void GLGizmoTrueColorPainting::on_render_input_window(float x, float y, float bo
         break;
     case ColorInputMode::BW:
         color_changed = render_bw_picker(slider_width);
+        break;
+    case ColorInputMode::CMYKW:
+        color_changed = render_cmykw_picker(slider_width);
+        break;
+    case ColorInputMode::RGBKW:
+        color_changed = render_rgbkw_picker(slider_width);
         break;
     }
     if (color_changed)

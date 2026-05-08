@@ -46,8 +46,8 @@ Zoomed-out G-code preview:
 
 - **Load OBJ files with image textures or vertex colors** - slice in full image resolution, no need to subdivide your model or bake vertex colors first
 
-### Fast multicolor printing
-- When printing image textures with this fork, only a single color is used per layer (not dependent on texture color). You can print many different models at once without increasing the number of tool changes.
+### Print with only one tool change per layer
+- When printing image textures with this technique, only a single filament color is used per layer (not dependent on texture color). You can print many different models at once without increasing the number of tool changes.
 
 ![More Test Prints](https://gradients.garden/gitlab_images/test_prints.jpeg)
 

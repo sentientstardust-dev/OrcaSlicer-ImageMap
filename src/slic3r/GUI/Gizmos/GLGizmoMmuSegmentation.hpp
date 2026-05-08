@@ -220,7 +220,9 @@ private:
         CMYW,
         RGBK,
         RGBW,
-        BW
+        BW,
+        CMYKW,
+        RGBKW
     };
 
     bool on_init() override;
@@ -257,6 +259,10 @@ private:
     void sync_rgb_from_rgbk();
     void sync_rgbw_from_rgb();
     void sync_rgb_from_rgbw();
+    void sync_cmykw_from_rgb();
+    void sync_rgb_from_cmykw();
+    void sync_rgbkw_from_rgb();
+    void sync_rgb_from_rgbkw();
     void sync_bw_from_rgb();
     void sync_rgb_from_bw();
     void ensure_filament_mix_colors();
@@ -269,6 +275,8 @@ private:
     bool render_cmyw_picker(float item_width);
     bool render_rgbk_picker(float item_width);
     bool render_rgbw_picker(float item_width);
+    bool render_cmykw_picker(float item_width);
+    bool render_rgbkw_picker(float item_width);
     bool render_bw_picker(float item_width);
     bool render_filament_colors_picker(float item_width);
 
@@ -279,6 +287,8 @@ private:
     std::array<float, 4> m_rgbk_color { 0.f, 0.f, 0.f, 1.f };
     std::array<float, 4> m_rgbw_color { 0.f, 0.f, 0.f, 1.f };
     std::array<float, 2> m_bw_color { 1.f, 0.f };
+    std::array<float, 5> m_cmykw_color { 0.f, 0.f, 0.f, 0.f, 1.f };
+    std::array<float, 5> m_rgbkw_color { 0.f, 0.f, 0.f, 0.f, 1.f };
     std::vector<ColorRGBA> m_filament_mix_colors;
     std::vector<float>  m_filament_mix;
     float                m_brush_hardness = 1.f;

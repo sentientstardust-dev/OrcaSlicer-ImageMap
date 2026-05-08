@@ -137,6 +137,10 @@ static std::vector<std::array<float, 3>> prime_tower_semantic_colors_for_print(i
         return {{{1.f, 0.f, 0.f}, {0.f, 1.f, 0.f}, {0.f, 0.f, 1.f}, {1.f, 1.f, 1.f}}};
     case PrimeTowerTextureRenderSettings::BW:
         return {{{0.f, 0.f, 0.f}, {1.f, 1.f, 1.f}}};
+    case PrimeTowerTextureRenderSettings::CMYKW:
+        return {{{0.f, 1.f, 1.f}, {1.f, 0.f, 1.f}, {1.f, 1.f, 0.f}, {0.f, 0.f, 0.f}, {1.f, 1.f, 1.f}}};
+    case PrimeTowerTextureRenderSettings::RGBKW:
+        return {{{1.f, 0.f, 0.f}, {0.f, 1.f, 0.f}, {0.f, 0.f, 1.f}, {0.f, 0.f, 0.f}, {1.f, 1.f, 1.f}}};
     default:
         return {};
     }
@@ -210,6 +214,8 @@ static int prime_tower_auto_color_mode_for_print(const ToolOrdering &tool_orderi
         PrimeTowerTextureRenderSettings::CMYW,
         PrimeTowerTextureRenderSettings::RGBK,
         PrimeTowerTextureRenderSettings::RGBW,
+        PrimeTowerTextureRenderSettings::CMYKW,
+        PrimeTowerTextureRenderSettings::RGBKW,
         PrimeTowerTextureRenderSettings::CMY,
         PrimeTowerTextureRenderSettings::RGB,
         PrimeTowerTextureRenderSettings::BW
@@ -236,7 +242,7 @@ static int prime_tower_auto_color_mode_for_print(const ToolOrdering &tool_orderi
 
 static int prime_tower_texture_zone_color_mode_for_print(int filament_color_mode)
 {
-    switch (std::clamp(filament_color_mode, int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorBW))) {
+    switch (std::clamp(filament_color_mode, int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorRGBKW))) {
     case int(TextureMappingZone::FilamentColorRGB): return PrimeTowerTextureRenderSettings::RGB;
     case int(TextureMappingZone::FilamentColorCMY): return PrimeTowerTextureRenderSettings::CMY;
     case int(TextureMappingZone::FilamentColorCMYK): return PrimeTowerTextureRenderSettings::CMYK;
@@ -244,6 +250,8 @@ static int prime_tower_texture_zone_color_mode_for_print(int filament_color_mode
     case int(TextureMappingZone::FilamentColorRGBK): return PrimeTowerTextureRenderSettings::RGBK;
     case int(TextureMappingZone::FilamentColorRGBW): return PrimeTowerTextureRenderSettings::RGBW;
     case int(TextureMappingZone::FilamentColorBW): return PrimeTowerTextureRenderSettings::BW;
+    case int(TextureMappingZone::FilamentColorCMYKW): return PrimeTowerTextureRenderSettings::CMYKW;
+    case int(TextureMappingZone::FilamentColorRGBKW): return PrimeTowerTextureRenderSettings::RGBKW;
     default: return PrimeTowerTextureRenderSettings::GenericSolver;
     }
 }
@@ -258,6 +266,8 @@ static int prime_tower_texture_mapping_color_mode_for_print(int prime_tower_colo
     case PrimeTowerTextureRenderSettings::RGBK: return int(TextureMappingZone::FilamentColorRGBK);
     case PrimeTowerTextureRenderSettings::RGBW: return int(TextureMappingZone::FilamentColorRGBW);
     case PrimeTowerTextureRenderSettings::BW: return int(TextureMappingZone::FilamentColorBW);
+    case PrimeTowerTextureRenderSettings::CMYKW: return int(TextureMappingZone::FilamentColorCMYKW);
+    case PrimeTowerTextureRenderSettings::RGBKW: return int(TextureMappingZone::FilamentColorRGBKW);
     default: return int(TextureMappingZone::FilamentColorAny);
     }
 }
@@ -3468,6 +3478,10 @@ void Print::_make_wipe_tower()
             texture.color_mode = PrimeTowerTextureRenderSettings::RGBW;
         else if (mode == "bw")
             texture.color_mode = PrimeTowerTextureRenderSettings::BW;
+        else if (mode == "cmykw")
+            texture.color_mode = PrimeTowerTextureRenderSettings::CMYKW;
+        else if (mode == "rgbkw")
+            texture.color_mode = PrimeTowerTextureRenderSettings::RGBKW;
         else
             texture.color_mode = PrimeTowerTextureRenderSettings::CMYK;
 

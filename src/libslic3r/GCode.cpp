@@ -5941,9 +5941,11 @@ static bool texture_mapping_component_is_black_for_gcode(size_t                 
                                                          int                                         filament_color_mode,
                                                          const std::vector<std::array<float, 3>>    &component_colors)
 {
-    switch (std::clamp(filament_color_mode, int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorBW))) {
+    switch (std::clamp(filament_color_mode, int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorRGBKW))) {
     case int(TextureMappingZone::FilamentColorCMYK):
     case int(TextureMappingZone::FilamentColorRGBK):
+    case int(TextureMappingZone::FilamentColorCMYKW):
+    case int(TextureMappingZone::FilamentColorRGBKW):
         if (component_idx == 3)
             return true;
         break;
@@ -6872,7 +6874,7 @@ static std::array<float, 4> raw_offset_preview_rgba_for_gcode(const std::vector<
 static std::vector<std::string> raw_filament_color_mode_channel_keys_for_gcode(int filament_color_mode, size_t component_count)
 {
     std::vector<std::string> keys;
-    switch (std::clamp(filament_color_mode, int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorBW))) {
+    switch (std::clamp(filament_color_mode, int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorRGBKW))) {
     case int(TextureMappingZone::FilamentColorRGB):
         keys = { "R", "G", "B" };
         break;
@@ -6893,6 +6895,12 @@ static std::vector<std::string> raw_filament_color_mode_channel_keys_for_gcode(i
         break;
     case int(TextureMappingZone::FilamentColorBW):
         keys = { "K", "W" };
+        break;
+    case int(TextureMappingZone::FilamentColorCMYKW):
+        keys = { "C", "M", "Y", "K", "W" };
+        break;
+    case int(TextureMappingZone::FilamentColorRGBKW):
+        keys = { "R", "G", "B", "K", "W" };
         break;
     default:
         break;
@@ -7130,6 +7138,24 @@ static std::vector<size_t> semantic_component_indices_for_gcode(const std::vecto
     case int(TextureMappingZone::FilamentColorRGBW):
         semantic_colors = { { { 1.f, 0.f, 0.f } }, { { 0.f, 1.f, 0.f } }, { { 0.f, 0.f, 1.f } }, { { 1.f, 1.f, 1.f } } };
         break;
+    case int(TextureMappingZone::FilamentColorCMYKW):
+        semantic_colors = {
+            { { 0.f, 1.f, 1.f } },
+            { { 1.f, 0.f, 1.f } },
+            { { 1.f, 1.f, 0.f } },
+            { { 0.f, 0.f, 0.f } },
+            { { 1.f, 1.f, 1.f } }
+        };
+        break;
+    case int(TextureMappingZone::FilamentColorRGBKW):
+        semantic_colors = {
+            { { 1.f, 0.f, 0.f } },
+            { { 0.f, 1.f, 0.f } },
+            { { 0.f, 0.f, 1.f } },
+            { { 0.f, 0.f, 0.f } },
+            { { 1.f, 1.f, 1.f } }
+        };
+        break;
     default:
         return {};
     }
@@ -7141,7 +7167,7 @@ static std::vector<std::array<float, 3>> fixed_color_generic_solver_component_co
 {
     switch (std::clamp(filament_color_mode,
                        int(TextureMappingZone::FilamentColorAny),
-                       int(TextureMappingZone::FilamentColorBW))) {
+                       int(TextureMappingZone::FilamentColorRGBKW))) {
     case int(TextureMappingZone::FilamentColorRGB):
         return { { { 1.f, 0.f, 0.f } }, { { 0.f, 1.f, 0.f } }, { { 0.f, 0.f, 1.f } } };
     case int(TextureMappingZone::FilamentColorCMY):
@@ -7154,6 +7180,10 @@ static std::vector<std::array<float, 3>> fixed_color_generic_solver_component_co
         return { { { 1.f, 0.f, 0.f } }, { { 0.f, 1.f, 0.f } }, { { 0.f, 0.f, 1.f } }, { { 0.f, 0.f, 0.f } } };
     case int(TextureMappingZone::FilamentColorRGBW):
         return { { { 1.f, 0.f, 0.f } }, { { 0.f, 1.f, 0.f } }, { { 0.f, 0.f, 1.f } }, { { 1.f, 1.f, 1.f } } };
+    case int(TextureMappingZone::FilamentColorCMYKW):
+        return { { { 0.f, 1.f, 1.f } }, { { 1.f, 0.f, 1.f } }, { { 1.f, 1.f, 0.f } }, { { 0.f, 0.f, 0.f } }, { { 1.f, 1.f, 1.f } } };
+    case int(TextureMappingZone::FilamentColorRGBKW):
+        return { { { 1.f, 0.f, 0.f } }, { { 0.f, 1.f, 0.f } }, { { 0.f, 0.f, 1.f } }, { { 0.f, 0.f, 0.f } }, { { 1.f, 1.f, 1.f } } };
     default:
         return {};
     }
@@ -7167,7 +7197,7 @@ static std::vector<float> optimized_primary_component_weights_for_target_for_gco
 {
     const int clamped_mode = std::clamp(filament_color_mode,
                                         int(TextureMappingZone::FilamentColorAny),
-                                        int(TextureMappingZone::FilamentColorBW));
+                                        int(TextureMappingZone::FilamentColorRGBKW));
     if (clamped_mode == int(TextureMappingZone::FilamentColorAny))
         return {};
 
@@ -7234,6 +7264,33 @@ static std::vector<float> optimized_primary_component_weights_for_target_for_gco
 
         weights[black_component_idx] = print_visibility_strength(black_strength);
         weights[white_component_idx] = print_visibility_strength(white_strength);
+        return weights;
+    }
+
+    if (clamped_mode == int(TextureMappingZone::FilamentColorCMYKW)) {
+        if (component_count != 5)
+            return {};
+        const float chroma = std::max(0.f, 1.f - darkness - whiteness);
+        const float c = chroma <= EPSILON ? 0.f : 1.f - safe_div(r - whiteness, chroma);
+        const float m = chroma <= EPSILON ? 0.f : 1.f - safe_div(g - whiteness, chroma);
+        const float y = chroma <= EPSILON ? 0.f : 1.f - safe_div(b - whiteness, chroma);
+        weights[component_index_for_role(0)] = print_visibility_strength(c);
+        weights[component_index_for_role(1)] = print_visibility_strength(m);
+        weights[component_index_for_role(2)] = print_visibility_strength(y);
+        weights[component_index_for_role(3)] = print_visibility_strength(darkness);
+        weights[component_index_for_role(4)] = print_visibility_strength(whiteness);
+        return weights;
+    }
+
+    if (clamped_mode == int(TextureMappingZone::FilamentColorRGBKW)) {
+        if (component_count != 5)
+            return {};
+        const float chroma = std::max(0.f, 1.f - darkness - whiteness);
+        weights[component_index_for_role(0)] = print_visibility_strength(safe_div(r - whiteness, chroma));
+        weights[component_index_for_role(1)] = print_visibility_strength(safe_div(g - whiteness, chroma));
+        weights[component_index_for_role(2)] = print_visibility_strength(safe_div(b - whiteness, chroma));
+        weights[component_index_for_role(3)] = print_visibility_strength(darkness);
+        weights[component_index_for_role(4)] = print_visibility_strength(whiteness);
         return weights;
     }
 
@@ -8217,7 +8274,7 @@ std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoo
 
     const int texture_filament_color_mode = std::clamp(zone->filament_color_mode,
                                                        int(TextureMappingZone::FilamentColorAny),
-                                                       int(TextureMappingZone::FilamentColorBW));
+                                                       int(TextureMappingZone::FilamentColorRGBKW));
     const bool raw_texture_mapping_mode =
         zone->texture_mapping_mode == int(TextureMappingZone::TextureMappingRawValues);
     const bool texture_force_sequential_filaments = zone->force_sequential_filaments;
@@ -9372,7 +9429,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                             const int texture_filament_color_mode = std::clamp(
                                 zone->filament_color_mode,
                                 int(TextureMappingZone::FilamentColorAny),
-                                int(TextureMappingZone::FilamentColorBW));
+                                int(TextureMappingZone::FilamentColorRGBKW));
                             const bool texture_force_sequential_filaments = zone->force_sequential_filaments;
                             const int generic_solver_lookup_mode = std::clamp(zone->generic_solver_lookup_mode,
                                                                               int(TextureMappingZone::GenericSolverClosestMix),

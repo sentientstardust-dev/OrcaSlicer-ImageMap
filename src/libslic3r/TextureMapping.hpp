@@ -52,7 +52,9 @@ struct TextureMappingZone
         FilamentColorCMYW = 4,
         FilamentColorRGBK = 5,
         FilamentColorRGBW = 6,
-        FilamentColorBW = 7
+        FilamentColorBW = 7,
+        FilamentColorCMYKW = 8,
+        FilamentColorRGBKW = 9
     };
 
     enum GenericSolverLookupMode : uint8_t {

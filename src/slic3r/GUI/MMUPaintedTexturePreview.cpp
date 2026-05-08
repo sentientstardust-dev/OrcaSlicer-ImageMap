@@ -35,8 +35,8 @@ constexpr float k_preview_clip_padding = 2.f * k_preview_offset;
 constexpr float k_polygon_offset_factor = -1.f;
 constexpr float k_polygon_offset_units = -1.f;
 constexpr float k_epsilon = 1e-6f;
-constexpr unsigned int k_simulated_texture_preview_max_edge = 1024;
-constexpr size_t k_simulated_texture_preview_max_pixels = 1024ull * 1024ull;
+constexpr unsigned int k_simulated_texture_preview_max_edge = 2048;
+constexpr size_t k_simulated_texture_preview_max_pixels = 2048ull * 2048ull;
 constexpr const char *TEXTURE_MAPPING_BACKGROUND_COLOR_CONFIG_KEY = "texture_mapping_background_color";
 
 struct TexturePreviewMixCandidate
@@ -556,7 +556,7 @@ std::vector<std::string> raw_filament_color_mode_channel_keys_for_texture_previe
     std::vector<std::string> keys;
     switch (std::clamp(filament_color_mode,
                        int(TextureMappingZone::FilamentColorAny),
-                       int(TextureMappingZone::FilamentColorBW))) {
+                       int(TextureMappingZone::FilamentColorRGBKW))) {
     case int(TextureMappingZone::FilamentColorRGB):
         keys = { "R", "G", "B" };
         break;
@@ -577,6 +577,12 @@ std::vector<std::string> raw_filament_color_mode_channel_keys_for_texture_previe
         break;
     case int(TextureMappingZone::FilamentColorBW):
         keys = { "K", "W" };
+        break;
+    case int(TextureMappingZone::FilamentColorCMYKW):
+        keys = { "C", "M", "Y", "K", "W" };
+        break;
+    case int(TextureMappingZone::FilamentColorRGBKW):
+        keys = { "R", "G", "B", "K", "W" };
         break;
     default:
         break;
@@ -771,6 +777,24 @@ std::vector<size_t> semantic_component_indices_for_texture_preview(const std::ve
     case int(TextureMappingZone::FilamentColorRGBW):
         semantic_colors = { { { 1.f, 0.f, 0.f } }, { { 0.f, 1.f, 0.f } }, { { 0.f, 0.f, 1.f } }, { { 1.f, 1.f, 1.f } } };
         break;
+    case int(TextureMappingZone::FilamentColorCMYKW):
+        semantic_colors = {
+            { { 0.f, 1.f, 1.f } },
+            { { 1.f, 0.f, 1.f } },
+            { { 1.f, 1.f, 0.f } },
+            { { 0.f, 0.f, 0.f } },
+            { { 1.f, 1.f, 1.f } }
+        };
+        break;
+    case int(TextureMappingZone::FilamentColorRGBKW):
+        semantic_colors = {
+            { { 1.f, 0.f, 0.f } },
+            { { 0.f, 1.f, 0.f } },
+            { { 0.f, 0.f, 1.f } },
+            { { 0.f, 0.f, 0.f } },
+            { { 1.f, 1.f, 1.f } }
+        };
+        break;
     default:
         return {};
     }
@@ -782,7 +806,7 @@ std::vector<std::array<float, 3>> fixed_color_generic_solver_component_colors(in
 {
     switch (std::clamp(filament_color_mode,
                        int(TextureMappingZone::FilamentColorAny),
-                       int(TextureMappingZone::FilamentColorBW))) {
+                       int(TextureMappingZone::FilamentColorRGBKW))) {
     case int(TextureMappingZone::FilamentColorRGB):
         return { { { 1.f, 0.f, 0.f } }, { { 0.f, 1.f, 0.f } }, { { 0.f, 0.f, 1.f } } };
     case int(TextureMappingZone::FilamentColorCMY):
@@ -795,6 +819,10 @@ std::vector<std::array<float, 3>> fixed_color_generic_solver_component_colors(in
         return { { { 1.f, 0.f, 0.f } }, { { 0.f, 1.f, 0.f } }, { { 0.f, 0.f, 1.f } }, { { 0.f, 0.f, 0.f } } };
     case int(TextureMappingZone::FilamentColorRGBW):
         return { { { 1.f, 0.f, 0.f } }, { { 0.f, 1.f, 0.f } }, { { 0.f, 0.f, 1.f } }, { { 1.f, 1.f, 1.f } } };
+    case int(TextureMappingZone::FilamentColorCMYKW):
+        return { { { 0.f, 1.f, 1.f } }, { { 1.f, 0.f, 1.f } }, { { 1.f, 1.f, 0.f } }, { { 0.f, 0.f, 0.f } }, { { 1.f, 1.f, 1.f } } };
+    case int(TextureMappingZone::FilamentColorRGBKW):
+        return { { { 1.f, 0.f, 0.f } }, { { 0.f, 1.f, 0.f } }, { { 0.f, 0.f, 1.f } }, { { 0.f, 0.f, 0.f } }, { { 1.f, 1.f, 1.f } } };
     default:
         return {};
     }
@@ -827,7 +855,7 @@ bool texture_preview_uses_generic_solver(const TexturePreviewSimulationSettings 
 
     const int clamped_mode = std::clamp(settings.filament_color_mode,
                                         int(TextureMappingZone::FilamentColorAny),
-                                        int(TextureMappingZone::FilamentColorBW));
+                                        int(TextureMappingZone::FilamentColorRGBKW));
     size_t expected_component_count = 0;
     switch (clamped_mode) {
     case int(TextureMappingZone::FilamentColorRGB):
@@ -842,6 +870,10 @@ bool texture_preview_uses_generic_solver(const TexturePreviewSimulationSettings 
         break;
     case int(TextureMappingZone::FilamentColorBW):
         expected_component_count = 2;
+        break;
+    case int(TextureMappingZone::FilamentColorCMYKW):
+    case int(TextureMappingZone::FilamentColorRGBKW):
+        expected_component_count = 5;
         break;
     default:
         return true;
@@ -1183,7 +1215,7 @@ std::vector<float> optimized_primary_component_weights_for_target(const std::arr
 {
     const int clamped_mode = std::clamp(filament_color_mode,
                                         int(TextureMappingZone::FilamentColorAny),
-                                        int(TextureMappingZone::FilamentColorBW));
+                                        int(TextureMappingZone::FilamentColorRGBKW));
     if (clamped_mode == int(TextureMappingZone::FilamentColorAny))
         return {};
 
@@ -1246,6 +1278,33 @@ std::vector<float> optimized_primary_component_weights_for_target(const std::arr
 
         weights[black_component_idx] = print_visibility_strength(black_strength);
         weights[white_component_idx] = print_visibility_strength(white_strength);
+        return weights;
+    }
+
+    if (clamped_mode == int(TextureMappingZone::FilamentColorCMYKW)) {
+        if (component_count != 5)
+            return {};
+        const float chroma = std::max(0.f, 1.f - darkness - whiteness);
+        const float c = chroma <= k_epsilon ? 0.f : 1.f - safe_div(r - whiteness, chroma);
+        const float m = chroma <= k_epsilon ? 0.f : 1.f - safe_div(g - whiteness, chroma);
+        const float y = chroma <= k_epsilon ? 0.f : 1.f - safe_div(b - whiteness, chroma);
+        weights[component_index_for_role(0)] = print_visibility_strength(c * chroma);
+        weights[component_index_for_role(1)] = print_visibility_strength(m * chroma);
+        weights[component_index_for_role(2)] = print_visibility_strength(y * chroma);
+        weights[component_index_for_role(3)] = print_visibility_strength(darkness);
+        weights[component_index_for_role(4)] = clamp01(std::pow(whiteness, 1.35f));
+        return weights;
+    }
+
+    if (clamped_mode == int(TextureMappingZone::FilamentColorRGBKW)) {
+        if (component_count != 5)
+            return {};
+        const float chroma = std::max(0.f, 1.f - darkness - whiteness);
+        weights[component_index_for_role(0)] = print_visibility_strength(safe_div(r - whiteness, chroma) * chroma);
+        weights[component_index_for_role(1)] = print_visibility_strength(safe_div(g - whiteness, chroma) * chroma);
+        weights[component_index_for_role(2)] = print_visibility_strength(safe_div(b - whiteness, chroma) * chroma);
+        weights[component_index_for_role(3)] = print_visibility_strength(darkness);
+        weights[component_index_for_role(4)] = clamp01(std::pow(whiteness, 1.35f));
         return weights;
     }
 
@@ -1420,7 +1479,7 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
                                        int(TextureMappingZone::TextureMappingRawValues));
     settings.filament_color_mode = std::clamp(zone->filament_color_mode,
                                               int(TextureMappingZone::FilamentColorAny),
-                                              int(TextureMappingZone::FilamentColorBW));
+                                              int(TextureMappingZone::FilamentColorRGBKW));
     settings.force_sequential_filaments = zone->force_sequential_filaments;
     settings.limit_texture_resolution = zone->preview_limit_resolution;
     settings.compact_offset_mode = zone->compact_offset_mode;

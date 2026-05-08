@@ -265,6 +265,10 @@ static const char *vertex_color_mode_name_for_error(int filament_color_mode)
         return "RGBW";
     case int(TextureMappingZone::FilamentColorBW):
         return "BW";
+    case int(TextureMappingZone::FilamentColorCMYKW):
+        return "CMYKW";
+    case int(TextureMappingZone::FilamentColorRGBKW):
+        return "RGBKW";
     default:
         return "Generic Solver (slow)";
     }
@@ -304,7 +308,7 @@ static std::vector<std::string> collect_texture_mapping_vertex_color_mode_mismat
 
             const int filament_color_mode = std::clamp(zone->filament_color_mode,
                                                        int(TextureMappingZone::FilamentColorAny),
-                                                       int(TextureMappingZone::FilamentColorBW));
+                                                       int(TextureMappingZone::FilamentColorRGBKW));
             const size_t expected_count = TextureMappingManager::expected_component_count(zone->texture_mapping_mode,
                                                                                          filament_color_mode);
             if (expected_count == 0)
