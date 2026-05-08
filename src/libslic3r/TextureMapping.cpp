@@ -766,6 +766,7 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            nonlinear_offset_adjustment == rhs.nonlinear_offset_adjustment &&
            compact_offset_mode == rhs.compact_offset_mode &&
            use_legacy_fixed_color_mode == rhs.use_legacy_fixed_color_mode &&
+           high_speed_image_texture_sampling == rhs.high_speed_image_texture_sampling &&
            generic_solver_lookup_mode == rhs.generic_solver_lookup_mode &&
            generic_solver_mode == rhs.generic_solver_mode &&
            generic_solver_mix_model == rhs.generic_solver_mix_model &&
@@ -1013,6 +1014,7 @@ std::string TextureMappingManager::serialize_entries()
         texture["nonlinear_offset_adjustment"] = zone.nonlinear_offset_adjustment;
         texture["compact_offset_mode"] = zone.compact_offset_mode;
         texture["use_legacy_fixed_color_mode"] = zone.use_legacy_fixed_color_mode;
+        texture["high_speed_image_texture_sampling"] = zone.high_speed_image_texture_sampling;
         texture["generic_solver_lookup"] = generic_solver_lookup_mode_name(zone.generic_solver_lookup_mode);
         texture["generic_solver_mode"] = generic_solver_mode_name(zone.generic_solver_mode);
         texture["generic_solver_mix_model"] = generic_solver_mix_model_name(zone.generic_solver_mix_model);
@@ -1142,6 +1144,8 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.compact_offset_mode = texture.value("compact_offset_mode", TextureMappingZone::DefaultCompactOffsetMode);
         zone.use_legacy_fixed_color_mode =
             texture.value("use_legacy_fixed_color_mode", TextureMappingZone::DefaultUseLegacyFixedColorMode);
+        zone.high_speed_image_texture_sampling =
+            texture.value("high_speed_image_texture_sampling", TextureMappingZone::DefaultHighSpeedImageTextureSampling);
         zone.generic_solver_lookup_mode =
             generic_solver_lookup_mode_from_name(texture.value("generic_solver_lookup", std::string("closest_mix")));
         const auto generic_solver_mode_it = texture.find("generic_solver_mode");

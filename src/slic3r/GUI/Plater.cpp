@@ -612,7 +612,7 @@ static wxArrayString texture_mapping_color_mode_choices()
     choices.Add(_L("RGBK"));
     choices.Add(_L("RGBW"));
     choices.Add(_L("BW"));
-    choices.Add(_L("5+ toolheads:"));
+    choices.Add(_L("(5+ toolheads:)"));
     choices.Add(_L("CMYKW"));
     choices.Add(_L("RGBKW"));
     return choices;
@@ -1076,6 +1076,7 @@ public:
                                         bool nonlinear_offset_adjustment,
                                         bool compact_offset_mode,
                                         bool use_legacy_fixed_color_mode,
+                                        bool high_speed_image_texture_sampling,
                                         int generic_solver_lookup_mode,
                                         int generic_solver_mode,
                                         int generic_solver_mix_model,
@@ -1290,6 +1291,9 @@ public:
         m_use_legacy_fixed_color_mode_checkbox = new wxCheckBox(experimental_page, wxID_ANY, _L("Use legacy fixed color mode"));
         m_use_legacy_fixed_color_mode_checkbox->SetValue(use_legacy_fixed_color_mode);
         experimental_box->Add(m_use_legacy_fixed_color_mode_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        m_high_speed_image_texture_sampling_checkbox = new wxCheckBox(experimental_page, wxID_ANY, _L("High-speed image texture sampling"));
+        m_high_speed_image_texture_sampling_checkbox->SetValue(high_speed_image_texture_sampling);
+        experimental_box->Add(m_high_speed_image_texture_sampling_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
         auto *generic_solver_mode_row = new wxBoxSizer(wxHORIZONTAL);
         generic_solver_mode_row->Add(new wxStaticText(experimental_page, wxID_ANY, _L("Generic solver")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         wxArrayString generic_solver_mode_choices;
@@ -1389,7 +1393,7 @@ public:
         prime_color_modes.Add(_L("RGBK"));
         prime_color_modes.Add(_L("RGBW"));
         prime_color_modes.Add(_L("BW"));
-        prime_color_modes.Add(_L("5+ toolheads:"));
+        prime_color_modes.Add(_L("(5+ toolheads:)"));
         prime_color_modes.Add(_L("CMYKW"));
         prime_color_modes.Add(_L("RGBKW"));
         m_prime_tower_color_mode_choice = new wxChoice(global_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, prime_color_modes);
@@ -1507,6 +1511,7 @@ public:
     bool nonlinear_offset_adjustment() const { return m_nonlinear_offset_adjustment_checkbox && m_nonlinear_offset_adjustment_checkbox->GetValue(); }
     bool compact_offset_mode() const { return m_compact_offset_mode_checkbox && m_compact_offset_mode_checkbox->GetValue(); }
     bool use_legacy_fixed_color_mode() const { return m_use_legacy_fixed_color_mode_checkbox && m_use_legacy_fixed_color_mode_checkbox->GetValue(); }
+    bool high_speed_image_texture_sampling() const { return m_high_speed_image_texture_sampling_checkbox == nullptr || m_high_speed_image_texture_sampling_checkbox->GetValue(); }
     int generic_solver_lookup_mode() const
     {
         return m_generic_solver_lookup_choice ?
@@ -1749,6 +1754,7 @@ private:
     wxCheckBox *m_nonlinear_offset_adjustment_checkbox {nullptr};
     wxCheckBox *m_compact_offset_mode_checkbox {nullptr};
     wxCheckBox *m_use_legacy_fixed_color_mode_checkbox {nullptr};
+    wxCheckBox *m_high_speed_image_texture_sampling_checkbox {nullptr};
     wxChoice *m_generic_solver_lookup_choice {nullptr};
     wxChoice *m_generic_solver_mode_choice {nullptr};
     wxChoice *m_generic_solver_mix_model_choice {nullptr};
@@ -5734,6 +5740,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.nonlinear_offset_adjustment,
                                                     updated.compact_offset_mode,
                                                     updated.use_legacy_fixed_color_mode,
+                                                    updated.high_speed_image_texture_sampling,
                                                     updated.generic_solver_lookup_mode,
                                                     updated.generic_solver_mode,
                                                     updated.generic_solver_mix_model,
@@ -5759,6 +5766,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.nonlinear_offset_adjustment = dlg.nonlinear_offset_adjustment();
             updated.compact_offset_mode = dlg.compact_offset_mode();
             updated.use_legacy_fixed_color_mode = dlg.use_legacy_fixed_color_mode();
+            updated.high_speed_image_texture_sampling = dlg.high_speed_image_texture_sampling();
             updated.generic_solver_lookup_mode = dlg.generic_solver_lookup_mode();
             updated.generic_solver_mode = dlg.generic_solver_mode();
             updated.generic_solver_mix_model = dlg.generic_solver_mix_model();

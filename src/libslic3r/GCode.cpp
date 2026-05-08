@@ -2026,8 +2026,10 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     m_curr_print = print;
     m_warned_texture_mapping_filament_count_mismatch = false;
     m_generic_solver_mix_candidate_cache.clear();
+    m_uv_texture_triangle_cache.clear();
     ScopeGuard clear_generic_solver_mix_candidate_cache([this]() {
         m_generic_solver_mix_candidate_cache.clear();
+        m_uv_texture_triangle_cache.clear();
     });
 
     GCodeWriter::full_gcode_comment = print->config().gcode_comments;
@@ -7077,6 +7079,132 @@ static std::array<Vec2f, 3> unwrap_triangle_uvs_for_sampling_for_gcode(const Vec
     return out;
 }
 
+static GCodeUVTextureTriangleCache build_uv_texture_triangle_cache_for_gcode(const PrintObject &print_object)
+{
+    GCodeUVTextureTriangleCache cache;
+
+    const ModelObject *model_object = print_object.model_object();
+    if (model_object == nullptr)
+        return cache;
+
+    const Transform3d object_trafo = print_object.trafo_centered();
+    for (const ModelVolume *volume : model_object->volumes) {
+        if (volume == nullptr)
+            continue;
+
+        const std::shared_ptr<const TriangleMesh> mesh_ptr = volume->mesh_ptr();
+        if (!mesh_ptr)
+            continue;
+
+        const indexed_triangle_set &its = mesh_ptr->its;
+        const bool has_uv_texture =
+            !volume->imported_texture_rgba.empty() &&
+            volume->imported_texture_width > 0 &&
+            volume->imported_texture_height > 0 &&
+            volume->imported_texture_uv_valid.size() == its.indices.size() &&
+            volume->imported_texture_uvs_per_face.size() >= its.indices.size() * 6 &&
+            volume->imported_texture_rgba.size() >= size_t(volume->imported_texture_width) * size_t(volume->imported_texture_height) * 4;
+        if (!has_uv_texture)
+            continue;
+
+        GCodeUVTextureVolumeMetadata volume_cache;
+        volume_cache.volume = volume;
+        volume_cache.triangles.reserve(its.indices.size());
+        const Transform3d volume_trafo = object_trafo * volume->get_matrix();
+        auto uv_edge_texel_length = [volume](const Vec2f &a, const Vec2f &b) {
+            const float du = (a.x() - b.x()) * float(volume->imported_texture_width);
+            const float dv = (a.y() - b.y()) * float(volume->imported_texture_height);
+            return std::hypot(du, dv);
+        };
+
+        float min_z = std::numeric_limits<float>::max();
+        float max_z = -std::numeric_limits<float>::max();
+        for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+            if (volume->imported_texture_uv_valid[tri_idx] == 0)
+                continue;
+
+            const auto &tri = its.indices[tri_idx];
+            if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
+                continue;
+            if (size_t(tri[0]) >= its.vertices.size() ||
+                size_t(tri[1]) >= its.vertices.size() ||
+                size_t(tri[2]) >= its.vertices.size())
+                continue;
+
+            const Vec3d p0 = volume_trafo * its.vertices[size_t(tri[0])].cast<double>();
+            const Vec3d p1 = volume_trafo * its.vertices[size_t(tri[1])].cast<double>();
+            const Vec3d p2 = volume_trafo * its.vertices[size_t(tri[2])].cast<double>();
+            if (!p0.allFinite() || !p1.allFinite() || !p2.allFinite())
+                continue;
+
+            const size_t uv_off = tri_idx * 6;
+            const Vec2f uv0(volume->imported_texture_uvs_per_face[uv_off + 0], volume->imported_texture_uvs_per_face[uv_off + 1]);
+            const Vec2f uv1(volume->imported_texture_uvs_per_face[uv_off + 2], volume->imported_texture_uvs_per_face[uv_off + 3]);
+            const Vec2f uv2(volume->imported_texture_uvs_per_face[uv_off + 4], volume->imported_texture_uvs_per_face[uv_off + 5]);
+            if (!uv0.allFinite() || !uv1.allFinite() || !uv2.allFinite())
+                continue;
+
+            const std::array<Vec2f, 3> tri_uv = unwrap_triangle_uvs_for_sampling_for_gcode(uv0, uv1, uv2);
+            const float tri_min_z = std::min({ float(p0.z()), float(p1.z()), float(p2.z()) });
+            const float tri_max_z = std::max({ float(p0.z()), float(p1.z()), float(p2.z()) });
+            const float max_uv_edge_texel = std::max({
+                uv_edge_texel_length(tri_uv[0], tri_uv[1]),
+                uv_edge_texel_length(tri_uv[1], tri_uv[2]),
+                uv_edge_texel_length(tri_uv[2], tri_uv[0])
+            });
+            const float max_world_edge_mm = std::max({
+                float((p1 - p0).norm()),
+                float((p2 - p1).norm()),
+                float((p0 - p2).norm())
+            });
+            const double tri_area_mm2 = 0.5 * ((p1 - p0).cross(p2 - p0)).norm();
+            if (!std::isfinite(tri_min_z) || !std::isfinite(tri_max_z) ||
+                !std::isfinite(max_uv_edge_texel) || !std::isfinite(max_world_edge_mm) ||
+                !std::isfinite(tri_area_mm2))
+                continue;
+
+            min_z = std::min(min_z, tri_min_z);
+            max_z = std::max(max_z, tri_max_z);
+            volume_cache.triangles.push_back({ volume, p0, p1, p2, tri_uv, tri_min_z, tri_max_z, max_uv_edge_texel, max_world_edge_mm, tri_area_mm2 });
+        }
+
+        if (volume_cache.triangles.empty() || !std::isfinite(min_z) || !std::isfinite(max_z))
+            continue;
+
+        volume_cache.min_z = min_z;
+        volume_cache.max_z = max_z;
+        const float z_span = std::max(max_z - min_z, 1e-3f);
+        const int z_bin_count = std::clamp(int(std::ceil(z_span / 0.2f)), 1, 2048);
+        volume_cache.z_bin_step_mm = std::max(1e-3f, z_span / float(z_bin_count));
+        volume_cache.z_bins.assign(size_t(z_bin_count), {});
+        for (size_t tri_idx = 0; tri_idx < volume_cache.triangles.size(); ++tri_idx) {
+            const GCodeUVTextureTriangleMetadata &tri = volume_cache.triangles[tri_idx];
+            const int first_bin = std::clamp(int(std::floor((tri.min_z - min_z) / volume_cache.z_bin_step_mm)) - 1, 0, z_bin_count - 1);
+            const int last_bin = std::clamp(int(std::floor((tri.max_z - min_z) / volume_cache.z_bin_step_mm)) + 1, 0, z_bin_count - 1);
+            if (first_bin > last_bin || last_bin - first_bin > 256 || (z_bin_count > 16 && last_bin - first_bin > z_bin_count / 4)) {
+                volume_cache.fallback_triangle_indices.emplace_back(uint32_t(tri_idx));
+                continue;
+            }
+            for (int bin = first_bin; bin <= last_bin; ++bin)
+                volume_cache.z_bins[size_t(bin)].emplace_back(uint32_t(tri_idx));
+        }
+
+        cache.volumes.emplace_back(std::move(volume_cache));
+    }
+
+    return cache;
+}
+
+static const GCodeUVTextureTriangleCache &uv_texture_triangle_cache_for_gcode(
+    const PrintObject &print_object,
+    std::map<const PrintObject*, GCodeUVTextureTriangleCache> &triangle_cache)
+{
+    auto it = triangle_cache.find(&print_object);
+    if (it == triangle_cache.end())
+        it = triangle_cache.emplace(&print_object, build_uv_texture_triangle_cache_for_gcode(print_object)).first;
+    return it->second;
+}
+
 static float color_distance_sq_for_gcode(const std::array<float, 3> &lhs, const std::array<float, 3> &rhs)
 {
     const float dr = lhs[0] - rhs[0];
@@ -7351,12 +7479,14 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                                                                                 int                                       generic_solver_mix_model,
                                                                                 bool                                      use_legacy_fixed_color_mode,
                                                                                 std::map<std::string, GCodeGenericMixCandidateSet> *generic_mix_candidate_cache,
+                                                                                std::map<const PrintObject*, GCodeUVTextureTriangleCache> *uv_texture_triangle_cache,
                                                                                 float                                     texture_contrast_pct,
                                                                                 float                                     texture_tone_gamma,
                                                                                 bool                                      layer_aware_weighting,
                                                                                 float                                     layer_z_mm,
                                                                                 float                                     layer_z_falloff_mm,
-                                                                                bool                                      high_resolution_texture_sampling)
+                                                                                bool                                      high_resolution_texture_sampling,
+                                                                                bool                                      high_speed_image_texture_sampling)
 {
     VertexColorOverhangWeightField weight_field;
     if (component_colors.empty())
@@ -7600,6 +7730,14 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
     };
 
     const Transform3d object_trafo = print_object.trafo_centered();
+    GCodeUVTextureTriangleCache local_uv_texture_cache;
+    const GCodeUVTextureTriangleCache *uv_texture_cache = nullptr;
+    if (uv_texture_triangle_cache != nullptr)
+        uv_texture_cache = &uv_texture_triangle_cache_for_gcode(print_object, *uv_texture_triangle_cache);
+    else {
+        local_uv_texture_cache = build_uv_texture_triangle_cache_for_gcode(print_object);
+        uv_texture_cache = &local_uv_texture_cache;
+    }
     for (const ModelVolume *volume : model_object->volumes) {
         if (volume == nullptr)
             continue;
@@ -7630,15 +7768,17 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
         }
 
         bool sampled_from_uv_texture = false;
-        const bool has_uv_texture =
-            !volume->imported_texture_rgba.empty() &&
-            volume->imported_texture_width > 0 &&
-            volume->imported_texture_height > 0 &&
-            volume->imported_texture_uv_valid.size() == its.indices.size() &&
-            volume->imported_texture_uvs_per_face.size() >= its.indices.size() * 6 &&
-            volume->imported_texture_rgba.size() >= size_t(volume->imported_texture_width) * size_t(volume->imported_texture_height) * 4;
+        const GCodeUVTextureVolumeMetadata *volume_uv_cache = nullptr;
+        if (uv_texture_cache != nullptr) {
+            for (const GCodeUVTextureVolumeMetadata &candidate : uv_texture_cache->volumes) {
+                if (candidate.volume == volume) {
+                    volume_uv_cache = &candidate;
+                    break;
+                }
+            }
+        }
 
-        if (has_uv_texture) {
+        if (volume_uv_cache != nullptr && !volume_uv_cache->triangles.empty()) {
             const std::vector<size_t> raw_component_source_channels =
                 raw_component_source_channels_for_gcode(volume->imported_texture_raw_metadata_json,
                                                         volume->imported_texture_raw_channels,
@@ -7650,102 +7790,57 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                     size_t(volume->imported_texture_width) *
                         size_t(volume->imported_texture_height) *
                         size_t(volume->imported_texture_raw_channels);
-            const auto uv_edge_texel_length = [volume](const Vec2f &a, const Vec2f &b) {
-                const float du = (a.x() - b.x()) * float(volume->imported_texture_width);
-                const float dv = (a.y() - b.y()) * float(volume->imported_texture_height);
-                return std::hypot(du, dv);
+
+            auto sample_data_for_uv = [&](const Vec2f &uv) {
+                std::array<float, 4> rgba = sample_texture_rgba_bilinear_for_gcode(volume->imported_texture_rgba,
+                                                                                    volume->imported_texture_width,
+                                                                                    volume->imported_texture_height,
+                                                                                    uv.x(),
+                                                                                    uv.y());
+                std::vector<float> raw_component_weights;
+                if (use_raw_uv_texture) {
+                    const std::vector<float> raw_sample =
+                        sample_texture_raw_offsets_bilinear_for_gcode(volume->imported_texture_raw_filament_offsets,
+                                                                       volume->imported_texture_width,
+                                                                       volume->imported_texture_height,
+                                                                       volume->imported_texture_raw_channels,
+                                                                       uv.x(),
+                                                                       uv.y());
+                    raw_component_weights = map_raw_sample_to_components_for_gcode(raw_sample, raw_component_source_channels);
+                    if (raw_component_weights.size() == component_count)
+                        rgba = raw_offset_preview_rgba_for_gcode(raw_component_weights);
+                }
+                if (raw_component_weights.size() != component_count)
+                    rgba = composite_rgba_over_background_for_gcode(rgba, background_color);
+                return TextureSampleData{ rgba, std::move(raw_component_weights), use_raw_uv_texture };
             };
 
-            for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
-                if (volume->imported_texture_uv_valid[tri_idx] == 0)
-                    continue;
-
-                const auto &tri = its.indices[tri_idx];
-                if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
-                    continue;
-                if (size_t(tri[0]) >= its.vertices.size() ||
-                    size_t(tri[1]) >= its.vertices.size() ||
-                    size_t(tri[2]) >= its.vertices.size())
-                    continue;
-
-                const Vec3d p0 = volume_trafo * its.vertices[size_t(tri[0])].cast<double>();
-                const Vec3d p1 = volume_trafo * its.vertices[size_t(tri[1])].cast<double>();
-                const Vec3d p2 = volume_trafo * its.vertices[size_t(tri[2])].cast<double>();
-                if (!p0.allFinite() || !p1.allFinite() || !p2.allFinite())
-                    continue;
-
-                const size_t uv_off = tri_idx * 6;
-                const Vec2f uv0(volume->imported_texture_uvs_per_face[uv_off + 0], volume->imported_texture_uvs_per_face[uv_off + 1]);
-                const Vec2f uv1(volume->imported_texture_uvs_per_face[uv_off + 2], volume->imported_texture_uvs_per_face[uv_off + 3]);
-                const Vec2f uv2(volume->imported_texture_uvs_per_face[uv_off + 4], volume->imported_texture_uvs_per_face[uv_off + 5]);
-                if (!uv0.allFinite() || !uv1.allFinite() || !uv2.allFinite())
-                    continue;
-                const std::array<Vec2f, 3> tri_uv = unwrap_triangle_uvs_for_sampling_for_gcode(uv0, uv1, uv2);
-
-                auto sample_data_for_uv = [&](const Vec2f &uv) {
-                    std::array<float, 4> rgba = sample_texture_rgba_bilinear_for_gcode(volume->imported_texture_rgba,
-                                                                                        volume->imported_texture_width,
-                                                                                        volume->imported_texture_height,
-                                                                                        uv.x(),
-                                                                                        uv.y());
-                    std::vector<float> raw_component_weights;
-                    if (use_raw_uv_texture) {
-                        const std::vector<float> raw_sample =
-                            sample_texture_raw_offsets_bilinear_for_gcode(volume->imported_texture_raw_filament_offsets,
-                                                                           volume->imported_texture_width,
-                                                                           volume->imported_texture_height,
-                                                                           volume->imported_texture_raw_channels,
-                                                                           uv.x(),
-                                                                           uv.y());
-                        raw_component_weights = map_raw_sample_to_components_for_gcode(raw_sample, raw_component_source_channels);
-                        if (raw_component_weights.size() == component_count)
-                            rgba = raw_offset_preview_rgba_for_gcode(raw_component_weights);
-                    }
-                    if (raw_component_weights.size() != component_count)
-                        rgba = composite_rgba_over_background_for_gcode(rgba, background_color);
-                    return TextureSampleData{ rgba, std::move(raw_component_weights), use_raw_uv_texture };
-                };
-
-                auto sample_data_for_barycentric = [&](const Vec3f &barycentric) {
-                    const Vec2f uv = tri_uv[0] * barycentric.x() + tri_uv[1] * barycentric.y() + tri_uv[2] * barycentric.z();
+            auto accumulate_uv_texture_triangle_samples = [&](const GCodeUVTextureTriangleMetadata &tri) {
+                auto sample_data_for_barycentric = [&tri, &sample_data_for_uv](const Vec3f &barycentric) {
+                    const Vec2f uv = tri.uv[0] * barycentric.x() + tri.uv[1] * barycentric.y() + tri.uv[2] * barycentric.z();
                     return sample_data_for_uv(uv);
                 };
-                if (accumulate_layer_plane_triangle_samples(p0, p1, p2, sample_data_for_barycentric)) {
-                    sampled_from_uv_texture = true;
-                    continue;
-                }
-
-                const float max_uv_edge_texel = std::max({
-                    uv_edge_texel_length(tri_uv[0], tri_uv[1]),
-                    uv_edge_texel_length(tri_uv[1], tri_uv[2]),
-                    uv_edge_texel_length(tri_uv[2], tri_uv[0])
-                });
-                const float max_world_edge_mm = std::max({
-                    float((p1 - p0).norm()),
-                    float((p2 - p1).norm()),
-                    float((p0 - p2).norm())
-                });
-                if (!std::isfinite(max_uv_edge_texel) || !std::isfinite(max_world_edge_mm))
-                    continue;
+                if (accumulate_layer_plane_triangle_samples(tri.p0, tri.p1, tri.p2, sample_data_for_barycentric))
+                    return true;
+                if (!std::isfinite(tri.max_uv_edge_texel) || !std::isfinite(tri.max_world_edge_mm) || !std::isfinite(tri.area_mm2))
+                    return false;
 
                 const float uv_texels_per_step = high_resolution_texture_sampling ? 8.f : 18.f;
                 const float world_sample_pitch_mm = high_resolution_texture_sampling ? 0.08f : 0.16f;
                 const int max_bary_steps = high_resolution_texture_sampling ? 80 : 40;
-                const int uv_steps = std::clamp(int(std::ceil(max_uv_edge_texel / uv_texels_per_step)), 1, max_bary_steps);
-                const int world_steps = std::clamp(int(std::ceil(max_world_edge_mm / world_sample_pitch_mm)), 1, max_bary_steps);
+                const int uv_steps = std::clamp(int(std::ceil(tri.max_uv_edge_texel / uv_texels_per_step)), 1, max_bary_steps);
+                const int world_steps = std::clamp(int(std::ceil(tri.max_world_edge_mm / world_sample_pitch_mm)), 1, max_bary_steps);
                 const int bary_steps = std::max(uv_steps, world_steps);
                 const int sample_count = bary_steps * (bary_steps + 1) / 2;
                 if (sample_count <= 0)
-                    continue;
+                    return false;
 
-                const double tri_area_mm2 = 0.5 * ((p1 - p0).cross(p2 - p0)).norm();
-                if (!std::isfinite(tri_area_mm2))
-                    continue;
-                const float area_weight = std::max(0.05f, float(tri_area_mm2)) / float(sample_count);
+                const float area_weight = std::max(0.05f, float(tri.area_mm2)) / float(sample_count);
                 if (!std::isfinite(area_weight))
-                    continue;
+                    return false;
                 const float inv_steps = 1.f / float(bary_steps);
 
+                bool sampled = false;
                 for (int i = 0; i < bary_steps; ++i) {
                     for (int j = 0; j < (bary_steps - i); ++j) {
                         const float b1 = (float(i) + 0.33333334f) * inv_steps;
@@ -7754,8 +7849,8 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                         if (b0 < 0.f)
                             continue;
 
-                        const Vec3d world_pos = p0 * double(b0) + p1 * double(b1) + p2 * double(b2);
-                        const Vec2f uv = tri_uv[0] * b0 + tri_uv[1] * b1 + tri_uv[2] * b2;
+                        const Vec3d world_pos = tri.p0 * double(b0) + tri.p1 * double(b1) + tri.p2 * double(b2);
+                        const Vec2f uv = tri.uv[0] * b0 + tri.uv[1] * b1 + tri.uv[2] * b2;
                         TextureSampleData sample_data = sample_data_for_uv(uv);
 
                         float sample_weight = area_weight;
@@ -7776,9 +7871,70 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                                           sample_weight,
                                           std::move(sample_data.raw_component_weights),
                                           sample_data.raw_component_weights_from_texture);
-                        sampled_from_uv_texture = true;
+                        sampled = true;
                     }
                 }
+
+                return sampled;
+            };
+
+            auto visit_triangle = [&](uint32_t tri_idx, std::vector<uint8_t> *visited) {
+                if (size_t(tri_idx) >= volume_uv_cache->triangles.size())
+                    return;
+                if (visited != nullptr) {
+                    if ((*visited)[size_t(tri_idx)] != 0)
+                        return;
+                    (*visited)[size_t(tri_idx)] = 1;
+                }
+                if (accumulate_uv_texture_triangle_samples(volume_uv_cache->triangles[size_t(tri_idx)]))
+                    sampled_from_uv_texture = true;
+            };
+
+            const bool use_fast_layer_lookup =
+                high_speed_image_texture_sampling && use_layer_weighting && !volume_uv_cache->z_bins.empty();
+            if (use_fast_layer_lookup) {
+                std::vector<uint8_t> visited(volume_uv_cache->triangles.size(), 0);
+                const float z_margin = std::max(1e-4f, safe_layer_z_falloff_mm * 8.f + float(EPSILON));
+                const float query_min_z = layer_z_mm - z_margin;
+                const float query_max_z = layer_z_mm + z_margin;
+                const bool valid_query =
+                    std::isfinite(query_min_z) &&
+                    std::isfinite(query_max_z) &&
+                    std::isfinite(volume_uv_cache->min_z) &&
+                    std::isfinite(volume_uv_cache->max_z) &&
+                    std::isfinite(volume_uv_cache->z_bin_step_mm) &&
+                    volume_uv_cache->z_bin_step_mm > 0.f;
+                const bool query_overlaps_volume =
+                    valid_query && query_max_z >= volume_uv_cache->min_z && query_min_z <= volume_uv_cache->max_z;
+                if (!valid_query || query_overlaps_volume) {
+                    for (const uint32_t tri_idx : volume_uv_cache->fallback_triangle_indices)
+                        visit_triangle(tri_idx, &visited);
+                }
+                if (query_overlaps_volume) {
+                    const int bin_count = int(volume_uv_cache->z_bins.size());
+                    const int first_bin = std::clamp(
+                        int(std::floor((query_min_z - volume_uv_cache->min_z) / volume_uv_cache->z_bin_step_mm)) - 1,
+                        0,
+                        bin_count - 1);
+                    const int last_bin = std::clamp(
+                        int(std::floor((query_max_z - volume_uv_cache->min_z) / volume_uv_cache->z_bin_step_mm)) + 1,
+                        0,
+                        bin_count - 1);
+                    if (first_bin <= last_bin) {
+                        for (int bin = first_bin; bin <= last_bin; ++bin)
+                            for (const uint32_t tri_idx : volume_uv_cache->z_bins[size_t(bin)])
+                                visit_triangle(tri_idx, &visited);
+                    } else {
+                        for (uint32_t tri_idx = 0; tri_idx < volume_uv_cache->triangles.size(); ++tri_idx)
+                            visit_triangle(tri_idx, &visited);
+                    }
+                } else if (!valid_query) {
+                    for (uint32_t tri_idx = 0; tri_idx < volume_uv_cache->triangles.size(); ++tri_idx)
+                        visit_triangle(tri_idx, &visited);
+                }
+            } else {
+                for (uint32_t tri_idx = 0; tri_idx < volume_uv_cache->triangles.size(); ++tri_idx)
+                    visit_triangle(tri_idx, nullptr);
             }
         }
 
@@ -7971,6 +8127,187 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
     return weight_field;
 }
 
+static std::vector<float> sample_vertex_color_weight_field_components_for_gcode(const VertexColorOverhangWeightField &weight_field,
+                                                                                float                                  x_mm,
+                                                                                float                                  y_mm,
+                                                                                bool                                   high_resolution_texture_sampling)
+{
+    std::vector<float> fallback = weight_field.fallback_weights;
+    if (fallback.size() < weight_field.component_count)
+        fallback.resize(weight_field.component_count, 0.f);
+    if (weight_field.empty())
+        return fallback;
+    if (!std::isfinite(x_mm) || !std::isfinite(y_mm))
+        return fallback;
+
+    const float gx_unclamped = (x_mm - weight_field.min_x_mm) / std::max(weight_field.bucket_width_mm, 1e-6f);
+    const float gy_unclamped = (y_mm - weight_field.min_y_mm) / std::max(weight_field.bucket_height_mm, 1e-6f);
+    const int cx = std::clamp(int(std::floor(gx_unclamped)), 0, weight_field.bucket_width - 1);
+    const int cy = std::clamp(int(std::floor(gy_unclamped)), 0, weight_field.bucket_height - 1);
+
+    const float sigma_scale = high_resolution_texture_sampling ? 0.45f : 0.7f;
+    const float min_sigma_mm = high_resolution_texture_sampling ? 0.04f : 0.06f;
+    const float sigma_x_mm = std::max(min_sigma_mm, weight_field.bucket_width_mm * sigma_scale);
+    const float sigma_y_mm = std::max(min_sigma_mm, weight_field.bucket_height_mm * sigma_scale);
+    const float inv_two_sigma_x2 = 1.f / std::max(2.f * sigma_x_mm * sigma_x_mm, 1e-8f);
+    const float inv_two_sigma_y2 = 1.f / std::max(2.f * sigma_y_mm * sigma_y_mm, 1e-8f);
+
+    const float min_radius_mm = high_resolution_texture_sampling ? 0.16f : 0.30f;
+    const float radius_scale = high_resolution_texture_sampling ? 1.75f : 3.f;
+    const float max_radius_mm = std::max(min_radius_mm, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * radius_scale);
+    const float max_radius2 = max_radius_mm * max_radius_mm;
+    const float min_bucket_span_mm = std::max(1e-3f, std::min(weight_field.bucket_width_mm, weight_field.bucket_height_mm));
+    const int max_ring = std::max(1, int(std::ceil(max_radius_mm / min_bucket_span_mm)));
+
+    std::vector<float> weighted_sum(weight_field.component_count, 0.f);
+    float total_weight = 0.f;
+    size_t contributing_samples = 0;
+
+    auto process_bucket = [&weight_field,
+                           x_mm,
+                           y_mm,
+                           max_radius2,
+                           inv_two_sigma_x2,
+                           inv_two_sigma_y2,
+                           &weighted_sum,
+                           &total_weight,
+                           &contributing_samples](int bx, int by) {
+        if (bx < 0 || by < 0 || bx >= weight_field.bucket_width || by >= weight_field.bucket_height)
+            return;
+
+        const size_t bucket_idx = size_t(by) * size_t(weight_field.bucket_width) + size_t(bx);
+        if (bucket_idx >= weight_field.buckets.size())
+            return;
+
+        for (const uint32_t sample_idx_u32 : weight_field.buckets[bucket_idx]) {
+            const size_t sample_idx = size_t(sample_idx_u32);
+            if (sample_idx >= weight_field.sample_x_mm.size() ||
+                sample_idx >= weight_field.sample_y_mm.size() ||
+                sample_idx >= weight_field.sample_weight.size())
+                continue;
+
+            const float dx = x_mm - weight_field.sample_x_mm[sample_idx];
+            const float dy = y_mm - weight_field.sample_y_mm[sample_idx];
+            const float d2 = dx * dx + dy * dy;
+            if (d2 > max_radius2)
+                continue;
+
+            const float kernel = std::exp(-(dx * dx) * inv_two_sigma_x2 - (dy * dy) * inv_two_sigma_y2);
+            const float sample_w = weight_field.sample_weight[sample_idx] * kernel;
+            if (!std::isfinite(sample_w) || sample_w <= EPSILON)
+                continue;
+
+            const size_t value_idx = sample_idx * weight_field.component_count;
+            if (value_idx + weight_field.component_count > weight_field.sample_component_weights.size())
+                continue;
+
+            for (size_t component_idx = 0; component_idx < weight_field.component_count; ++component_idx)
+                weighted_sum[component_idx] += weight_field.sample_component_weights[value_idx + component_idx] * sample_w;
+            total_weight += sample_w;
+            ++contributing_samples;
+        }
+    };
+
+    for (int ring = 0; ring <= max_ring; ++ring) {
+        const int min_x = std::max(0, cx - ring);
+        const int max_x = std::min(weight_field.bucket_width - 1, cx + ring);
+        const int min_y = std::max(0, cy - ring);
+        const int max_y = std::min(weight_field.bucket_height - 1, cy + ring);
+
+        if (ring == 0) {
+            process_bucket(cx, cy);
+        } else {
+            for (int x = min_x; x <= max_x; ++x) {
+                process_bucket(x, min_y);
+                if (max_y != min_y)
+                    process_bucket(x, max_y);
+            }
+            for (int y = min_y + 1; y <= max_y - 1; ++y) {
+                process_bucket(min_x, y);
+                if (max_x != min_x)
+                    process_bucket(max_x, y);
+            }
+        }
+
+        if (total_weight > EPSILON && contributing_samples >= 12)
+            break;
+    }
+
+    if (total_weight > EPSILON) {
+        std::vector<float> values(weight_field.component_count, 0.f);
+        for (size_t component_idx = 0; component_idx < weight_field.component_count; ++component_idx)
+            values[component_idx] = clamp01f_for_gcode(weighted_sum[component_idx] / total_weight);
+        return values;
+    }
+
+    float nearest_d2 = std::numeric_limits<float>::max();
+    size_t nearest_sample_idx = size_t(-1);
+    const int nearest_ring_limit = std::min(std::max(max_ring + 2, 4), std::max(weight_field.bucket_width, weight_field.bucket_height));
+
+    for (int ring = 0; ring <= nearest_ring_limit; ++ring) {
+        const int min_x = std::max(0, cx - ring);
+        const int max_x = std::min(weight_field.bucket_width - 1, cx + ring);
+        const int min_y = std::max(0, cy - ring);
+        const int max_y = std::min(weight_field.bucket_height - 1, cy + ring);
+
+        auto visit_bucket = [&weight_field, x_mm, y_mm, &nearest_d2, &nearest_sample_idx](int bx, int by) {
+            if (bx < 0 || by < 0 || bx >= weight_field.bucket_width || by >= weight_field.bucket_height)
+                return;
+
+            const size_t bucket_idx = size_t(by) * size_t(weight_field.bucket_width) + size_t(bx);
+            if (bucket_idx >= weight_field.buckets.size())
+                return;
+
+            for (const uint32_t sample_idx_u32 : weight_field.buckets[bucket_idx]) {
+                const size_t sample_idx = size_t(sample_idx_u32);
+                if (sample_idx >= weight_field.sample_x_mm.size() || sample_idx >= weight_field.sample_y_mm.size())
+                    continue;
+
+                const float dx = x_mm - weight_field.sample_x_mm[sample_idx];
+                const float dy = y_mm - weight_field.sample_y_mm[sample_idx];
+                const float d2 = dx * dx + dy * dy;
+                if (d2 >= nearest_d2)
+                    continue;
+
+                const size_t value_idx = sample_idx * weight_field.component_count;
+                if (value_idx + weight_field.component_count > weight_field.sample_component_weights.size())
+                    continue;
+
+                nearest_d2 = d2;
+                nearest_sample_idx = sample_idx;
+            }
+        };
+
+        if (ring == 0) {
+            visit_bucket(cx, cy);
+        } else {
+            for (int x = min_x; x <= max_x; ++x) {
+                visit_bucket(x, min_y);
+                if (max_y != min_y)
+                    visit_bucket(x, max_y);
+            }
+            for (int y = min_y + 1; y <= max_y - 1; ++y) {
+                visit_bucket(min_x, y);
+                if (max_x != min_x)
+                    visit_bucket(max_x, y);
+            }
+        }
+
+        if (nearest_d2 < std::numeric_limits<float>::max() && ring >= 2)
+            break;
+    }
+
+    if (nearest_sample_idx != size_t(-1)) {
+        std::vector<float> values(weight_field.component_count, 0.f);
+        const size_t value_idx = nearest_sample_idx * weight_field.component_count;
+        for (size_t component_idx = 0; component_idx < weight_field.component_count; ++component_idx)
+            values[component_idx] = clamp01f_for_gcode(weight_field.sample_component_weights[value_idx + component_idx]);
+        return values;
+    }
+
+    return fallback;
+}
+
 static float sample_vertex_color_weight_field_for_gcode(const VertexColorOverhangWeightField &weight_field,
                                                         float                                  x_mm,
                                                         float                                  y_mm,
@@ -7980,17 +8317,13 @@ static float sample_vertex_color_weight_field_for_gcode(const VertexColorOverhan
 {
     if (compact_offset_mode && !weight_field.raw_component_weights_from_texture && !weight_field.empty() &&
         component_idx < weight_field.component_count) {
-        std::vector<float> values(weight_field.component_count, 0.f);
+        std::vector<float> values = sample_vertex_color_weight_field_components_for_gcode(weight_field,
+                                                                                          x_mm,
+                                                                                          y_mm,
+                                                                                          high_resolution_texture_sampling);
         float max_value = 0.f;
-        for (size_t idx = 0; idx < weight_field.component_count; ++idx) {
-            values[idx] = sample_vertex_color_weight_field_for_gcode(weight_field,
-                                                                     x_mm,
-                                                                     y_mm,
-                                                                     idx,
-                                                                     high_resolution_texture_sampling,
-                                                                     false);
+        for (size_t idx = 0; idx < weight_field.component_count && idx < values.size(); ++idx)
             max_value = std::max(max_value, clamp01f_for_gcode(values[idx]));
-        }
         if (max_value > EPSILON)
             return clamp01f_for_gcode(values[component_idx] / max_value);
     }
@@ -8293,6 +8626,7 @@ std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoo
             1.f :
             std::clamp(zone->tone_gamma, 0.5f, 3.f);
     const bool high_resolution_texture_sampling = zone->high_resolution_sampling;
+    const bool high_speed_image_texture_sampling = zone->high_speed_image_texture_sampling;
 
     std::vector<std::array<float, 3>> component_colors;
     component_colors.reserve(component_ids.size());
@@ -8340,6 +8674,7 @@ std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoo
     component_key_stream << "|ct" << int(std::lround(texture_contrast_pct));
     component_key_stream << "|tg" << int(std::lround(texture_tone_gamma * 100.f));
     component_key_stream << "|hr" << (high_resolution_texture_sampling ? 1 : 0);
+    component_key_stream << "|hs" << (high_speed_image_texture_sampling ? 1 : 0);
     const std::string component_key_prefix = component_key_stream.str();
 
     struct SeamLayerTextureState {
@@ -8401,12 +8736,14 @@ std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoo
                                                                               generic_solver_mix_model,
                                                                               use_legacy_fixed_color_mode,
                                                                               &m_generic_solver_mix_candidate_cache,
+                                                                              &m_uv_texture_triangle_cache,
                                                                               texture_contrast_pct,
                                                                               texture_tone_gamma,
                                                                               true,
                                                                               float(layer->print_z),
                                                                               layer_sample_falloff_mm,
-                                                                              high_resolution_texture_sampling))
+                                                                              high_resolution_texture_sampling,
+                                                                              high_speed_image_texture_sampling))
                            .first;
         }
         const VertexColorOverhangWeightField &weight_field = cache_it->second;
@@ -9420,6 +9757,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                 zone->offset_angle_mode != int(TextureMappingZone::OffsetAngleSurfaceNormal);
                             const bool use_layer_aware_weighting = m_layer != nullptr;
                             const bool high_resolution_texture_sampling = zone->high_resolution_sampling;
+                            const bool high_speed_image_texture_sampling = zone->high_speed_image_texture_sampling;
                             const bool nonlinear_offset_adjustment = zone->nonlinear_offset_adjustment;
                             const bool compact_offset_mode = zone->compact_offset_mode;
                             const float layer_sample_z_mm = use_layer_aware_weighting ? float(m_layer->print_z) : 0.f;
@@ -9509,6 +9847,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                     component_key_stream << "|ct" << int(std::lround(texture_contrast_pct));
                                     component_key_stream << "|tg" << int(std::lround(texture_tone_gamma * 100.f));
                                     component_key_stream << "|hr" << (high_resolution_texture_sampling ? 1 : 0);
+                                    component_key_stream << "|hs" << (high_speed_image_texture_sampling ? 1 : 0);
                                     if (m_layer != nullptr)
                                         component_key_stream << "|L" << m_layer->id();
                                     const auto cache_key = std::make_tuple(layer_object, texture_zone_id, component_key_stream.str());
@@ -9526,12 +9865,14 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                                                                                          generic_solver_mix_model,
                                                                                                          use_legacy_fixed_color_mode,
                                                                                                          generic_mix_candidate_cache,
+                                                                                                         &m_uv_texture_triangle_cache,
                                                                                                          texture_contrast_pct,
                                                                                                          texture_tone_gamma,
                                                                                                          use_layer_aware_weighting,
                                                                                                          layer_sample_z_mm,
                                                                                                          layer_sample_falloff_mm,
-                                                                                                         high_resolution_texture_sampling))
+                                                                                                         high_resolution_texture_sampling,
+                                                                                                         high_speed_image_texture_sampling))
                                                        .first;
                                     }
                                     if (!cache_it->second.empty())

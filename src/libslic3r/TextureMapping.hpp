@@ -94,6 +94,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultNonlinearOffsetAdjustment = false;
     static constexpr bool  DefaultCompactOffsetMode = true;
     static constexpr bool  DefaultUseLegacyFixedColorMode = false;
+    static constexpr bool  DefaultHighSpeedImageTextureSampling = true;
     static constexpr int   DefaultGenericSolverLookupMode = int(GenericSolverClosestMix);
     static constexpr int   DefaultGenericSolverMode = int(GenericSolverV2);
     static constexpr int   DefaultGenericSolverMixModel = int(GenericSolverPigmentPainter);
@@ -136,6 +137,7 @@ struct TextureMappingZone
     bool        nonlinear_offset_adjustment = DefaultNonlinearOffsetAdjustment;
     bool        compact_offset_mode = DefaultCompactOffsetMode;
     bool        use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
+    bool        high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;
     int         generic_solver_lookup_mode = DefaultGenericSolverLookupMode;
     int         generic_solver_mode = DefaultGenericSolverMode;
     int         generic_solver_mix_model = DefaultGenericSolverMixModel;
@@ -179,6 +181,7 @@ struct TextureMappingZone
         nonlinear_offset_adjustment = DefaultNonlinearOffsetAdjustment;
         compact_offset_mode = DefaultCompactOffsetMode;
         use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
+        high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;
         generic_solver_lookup_mode = DefaultGenericSolverLookupMode;
         generic_solver_mode = DefaultGenericSolverMode;
         generic_solver_mix_model = DefaultGenericSolverMixModel;

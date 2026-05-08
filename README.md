@@ -52,6 +52,7 @@ Zoomed-out G-code preview:
 ![More Test Prints](https://gradients.garden/gitlab_images/test_prints.jpeg)
 
 ([3D model](https://sketchfab.com/3d-models/snakchameleon-f0e3c872f1984cf7a467645d9e0d3abd) by Pedram Ashoori, CC BY 4.0)
+(Himalayan Monal photo from https://en.wikipedia.org/wiki/Himalayan_monal#/media/File:Himalayan_Monal_at_Sagarmatha_National_Park,_Nepal.jpg - CC BY-SA 4.0)
 
 ### Print images on your prime towers
 - Turn your prime towers into ornaments (requires no extra tool changes, and typically <1g additional filament)

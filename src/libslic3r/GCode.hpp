@@ -45,6 +45,7 @@ namespace Slic3r {
 
 // Forward declarations.
 class GCode;
+class ModelVolume;
 
 namespace CustomGCode{ struct Item; }
 struct PrintInstance;
@@ -78,6 +79,33 @@ struct VertexColorOverhangWeightField {
                sample_weight.size() != sample_x_mm.size() ||
                sample_component_weights.size() != sample_x_mm.size() * component_count;
     }
+};
+
+struct GCodeUVTextureTriangleMetadata {
+    const ModelVolume *volume { nullptr };
+    Vec3d p0;
+    Vec3d p1;
+    Vec3d p2;
+    std::array<Vec2f, 3> uv;
+    float min_z { 0.f };
+    float max_z { 0.f };
+    float max_uv_edge_texel { 0.f };
+    float max_world_edge_mm { 0.f };
+    double area_mm2 { 0.0 };
+};
+
+struct GCodeUVTextureVolumeMetadata {
+    const ModelVolume *volume { nullptr };
+    std::vector<GCodeUVTextureTriangleMetadata> triangles;
+    std::vector<std::vector<uint32_t>> z_bins;
+    std::vector<uint32_t> fallback_triangle_indices;
+    float min_z { 0.f };
+    float max_z { 0.f };
+    float z_bin_step_mm { 1.f };
+};
+
+struct GCodeUVTextureTriangleCache {
+    std::vector<GCodeUVTextureVolumeMetadata> volumes;
 };
 
 class OozePrevention {
@@ -528,6 +556,7 @@ private:
     ExtrusionQualityEstimator m_extrusion_quality_estimator;
 
     std::map<std::tuple<const PrintObject*, unsigned int, std::string>, VertexColorOverhangWeightField> m_vertex_color_overhang_weight_field_cache;
+    std::map<const PrintObject*, GCodeUVTextureTriangleCache> m_uv_texture_triangle_cache;
     std::map<std::string, GCodeGenericMixCandidateSet> m_generic_solver_mix_candidate_cache;
     bool                                m_warned_texture_mapping_filament_count_mismatch { false };
 
