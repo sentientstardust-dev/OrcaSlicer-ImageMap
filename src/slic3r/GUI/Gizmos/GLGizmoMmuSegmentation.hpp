@@ -236,6 +236,7 @@ private:
     void open_color_data_management_dialog();
     bool selected_object_has_rgb_data() const;
     bool selected_object_has_imported_color_data() const;
+    bool selected_object_has_raw_atlas_texture_data() const;
     void initialize_selected_object_rgb_data();
     void convert_selected_object_vertex_colors_to_rgb_data();
     void convert_selected_object_image_texture_to_rgb_data();
@@ -282,11 +283,12 @@ private:
     std::vector<float>  m_filament_mix;
     float                m_brush_hardness = 1.f;
     float                m_opacity = 1.f;
-    ColorInputMode       m_color_input_mode = ColorInputMode::RGB;
+    ColorInputMode       m_color_input_mode = ColorInputMode::FilamentColors;
     bool                 m_selected_has_rgb_data = false;
     bool                 m_selected_has_imported_color_data = false;
     bool                 m_selected_can_convert_vertex = false;
     bool                 m_selected_can_convert_image = false;
+    bool                 m_selected_has_raw_atlas_texture_data = false;
     bool                 m_color_picker_active = false;
     bool                 m_brush_stroke_active = false;
     ObjectID             m_selected_color_state_object_id;

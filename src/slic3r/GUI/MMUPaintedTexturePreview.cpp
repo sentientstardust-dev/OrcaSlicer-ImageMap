@@ -2497,8 +2497,8 @@ bool consume_or_queue_vertex_color_simulation(size_t cache_key,
     }
 
     if (entry.ready_geometry.has_value() && entry.ready_signature == simulation_signature) {
-        out_model.init_from(std::move(*entry.ready_geometry));
-        cache.erase(cache_key);
+        GUI::GLModel::Geometry geometry = *entry.ready_geometry;
+        out_model.init_from(std::move(geometry));
         return true;
     }
 

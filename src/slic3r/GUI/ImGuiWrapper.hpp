@@ -147,6 +147,8 @@ public:
     static void text(const wxString &label);
     void warning_text(const char *all_text);
     void warning_text(const wxString &all_text);
+    void warning_text(const char *all_text, float wrap_width);
+    void warning_text(const wxString &all_text, float wrap_width);
     static void text_colored(const ImVec4& color, const char* label);
     static void text_colored(const ImVec4& color, const std::string& label);
     static void text_colored(const ImVec4& color, const wxString& label);

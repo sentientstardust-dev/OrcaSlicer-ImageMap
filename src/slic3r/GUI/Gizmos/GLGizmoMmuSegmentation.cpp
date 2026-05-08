@@ -234,6 +234,7 @@ static void enable_texture_mapping_zone_simulated_preview(unsigned int texture_m
 }
 
 static constexpr size_t MaxImageProjectionRawOffsetChannels = 4;
+static constexpr float  RawOffsetDataWarningWrapEm          = 24.f;
 
 struct RawAtlasProjectionLayout
 {
@@ -254,6 +255,32 @@ static bool model_volume_has_raw_atlas_texture_data(const ModelVolume *volume)
            size_t(volume->imported_texture_width) *
                size_t(volume->imported_texture_height) *
                size_t(volume->imported_texture_raw_channels);
+}
+
+static wxString raw_offset_data_rgba_conversion_warning_text()
+{
+    return _L("Painting or projecting to RGBA data on a model with raw offset data will create RGBA color data from the raw offset atlas. "
+              "(raw offset data will no longer be used)");
+}
+
+static wxString raw_offset_data_image_texture_projection_warning_text()
+{
+    return _L("Projecting a normal image in Image Texture mode will convert the raw offset atlas into a regular RGBA image before "
+              "projecting, destroying the raw offset data.");
+}
+
+static void show_raw_offset_data_converted_to_rgba_message()
+{
+    show_info(wxGetApp().mainframe,
+              _L("Raw offset data was converted to RGBA color data. The raw offset data will no longer be shown or used when slicing."),
+              _L("Raw Offset Data Converted"));
+}
+
+static void show_raw_offset_data_converted_to_rgba_image_message()
+{
+    show_info(wxGetApp().mainframe,
+              _L("Raw offset data was converted to a regular RGBA image. (Raw offset data no longer exists)"),
+              _L("Raw Offset Data Converted"));
 }
 
 static std::string raw_atlas_color_mode_name_for_keys(const std::vector<std::string> &keys)
@@ -4063,6 +4090,16 @@ enum class ManagedColorDataType
     RgbaData
 };
 
+enum class ManagedColorDataPreviewKind
+{
+    None,
+    ColorRegions,
+    VertexColors,
+    ImageTexture,
+    RawOffsetAtlas,
+    RgbaData
+};
+
 struct ManagedColorDataCreateSource
 {
     std::optional<ManagedColorDataType> type;
@@ -4260,6 +4297,41 @@ static wxString managed_color_data_raw_offset_mode_text(const ManagedColorDataSu
     return text;
 }
 
+static ManagedColorDataPreviewKind managed_color_data_preview_kind(const ManagedColorDataSummary &summary)
+{
+    if (summary.has_rgba_data)
+        return ManagedColorDataPreviewKind::RgbaData;
+    if (summary.has_raw_offset_image_texture)
+        return ManagedColorDataPreviewKind::RawOffsetAtlas;
+    if (summary.has_image_texture)
+        return ManagedColorDataPreviewKind::ImageTexture;
+    if (summary.has_vertex_colors)
+        return ManagedColorDataPreviewKind::VertexColors;
+    if (summary.has_color_regions)
+        return ManagedColorDataPreviewKind::ColorRegions;
+    return ManagedColorDataPreviewKind::None;
+}
+
+static bool managed_color_data_preview_kind_matches_type(ManagedColorDataPreviewKind kind, ManagedColorDataType type)
+{
+    switch (type) {
+    case ManagedColorDataType::ColorRegions:
+        return kind == ManagedColorDataPreviewKind::ColorRegions;
+    case ManagedColorDataType::VertexColors:
+        return kind == ManagedColorDataPreviewKind::VertexColors;
+    case ManagedColorDataType::ImageTexture:
+        return kind == ManagedColorDataPreviewKind::ImageTexture;
+    case ManagedColorDataType::RgbaData:
+        return kind == ManagedColorDataPreviewKind::RgbaData;
+    }
+    return false;
+}
+
+static wxString managed_color_data_preview_marker(bool shown)
+{
+    return shown ? _L("*") : wxString();
+}
+
 static bool clear_object_managed_color_data(ModelObject &object, ManagedColorDataType type)
 {
     bool changed = false;
@@ -4304,19 +4376,6 @@ static bool clear_object_managed_color_data(ModelObject &object, ManagedColorDat
         }
     }
     return changed;
-}
-
-static bool assign_object_to_texture_mapping_zone(ModelObject &object)
-{
-    const unsigned int texture_mapping_filament_id = ensure_texture_mapping_zone();
-    if (texture_mapping_filament_id == 0)
-        return false;
-
-    object.config.set("extruder", int(texture_mapping_filament_id));
-    for (ModelVolume *volume : object.volumes)
-        if (volume != nullptr && volume->is_model_part())
-            volume->config.set("extruder", int(texture_mapping_filament_id));
-    return true;
 }
 
 static void assign_texture_mapping_zone_preserving_painted_regions(ModelObject &object, unsigned int texture_mapping_filament_id)
@@ -4974,8 +5033,10 @@ static bool convert_object_to_rgba_data(ModelObject &object, const ManagedColorD
         changed = true;
     }
 
-    if (changed)
-        assign_object_to_texture_mapping_zone(object);
+    if (changed) {
+        const unsigned int texture_mapping_filament_id = ensure_texture_mapping_zone();
+        assign_texture_mapping_zone_preserving_painted_regions(object, texture_mapping_filament_id);
+    }
     return changed;
 }
 
@@ -5287,11 +5348,12 @@ public:
         background_sizer->Add(m_background_clear, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(8));
         main_sizer->Add(background_sizer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP(16));
 
-        wxFlexGridSizer *grid = new wxFlexGridSizer(5, 8, 14);
-        grid->AddGrowableCol(2, 1);
+        wxFlexGridSizer *grid = new wxFlexGridSizer(6, 8, 14);
+        grid->AddGrowableCol(3, 1);
 
         grid->Add(new wxStaticText(this, wxID_ANY, _L("Type")), 0, wxALIGN_CENTER_VERTICAL);
         grid->Add(new wxStaticText(this, wxID_ANY, _L("Status")), 0, wxALIGN_CENTER_VERTICAL);
+        grid->Add(new wxStaticText(this, wxID_ANY, _L("Shown")), 0, wxALIGN_CENTER_VERTICAL);
         grid->Add(new wxStaticText(this, wxID_ANY, _L("Size")), 0, wxALIGN_CENTER_VERTICAL);
         grid->AddSpacer(1);
         grid->AddSpacer(1);
@@ -5329,6 +5391,7 @@ private:
     {
         ManagedColorDataType type;
         wxStaticText        *status = nullptr;
+        wxStaticText        *preview = nullptr;
         wxStaticText        *size = nullptr;
         wxButton            *clear = nullptr;
         wxButton            *create = nullptr;
@@ -5336,46 +5399,53 @@ private:
 
     void add_raw_image_texture_info_row(wxFlexGridSizer *grid)
     {
-        wxStaticText *label = new wxStaticText(this, wxID_ANY, _L("Raw Offset Atlas"));
+        wxStaticText *label = new wxStaticText(this, wxID_ANY, _L("(Raw Offset Atlas)"));
         wxStaticText *status = new wxStaticText(this, wxID_ANY, wxString());
+        wxStaticText *preview = new wxStaticText(this, wxID_ANY, wxString());
         wxStaticText *mode = new wxStaticText(this, wxID_ANY, wxString());
 
         grid->Add(label, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(12));
         grid->Add(status, 0, wxALIGN_CENTER_VERTICAL);
+        grid->Add(preview, 0, wxALIGN_CENTER_VERTICAL);
         grid->Add(mode, 1, wxEXPAND | wxALIGN_CENTER_VERTICAL);
         grid->AddSpacer(1);
         grid->AddSpacer(1);
 
-        m_raw_image_texture_info_windows = { label, status, mode };
+        m_raw_image_texture_info_windows = { label, status, preview, mode };
         m_raw_image_texture_status = status;
+        m_raw_image_texture_preview = preview;
         m_raw_image_texture_mode = mode;
     }
 
     void add_row(wxFlexGridSizer *grid, ManagedColorDataType type, const wxString &label)
     {
         wxStaticText *status = new wxStaticText(this, wxID_ANY, wxString());
+        wxStaticText *preview = new wxStaticText(this, wxID_ANY, wxString());
         wxStaticText *size = new wxStaticText(this, wxID_ANY, wxString());
         wxButton *clear = new wxButton(this, wxID_ANY, _L("Clear"));
         wxButton *create = new wxButton(this, wxID_ANY, _L("Create From..."));
 
         grid->Add(new wxStaticText(this, wxID_ANY, label), 0, wxALIGN_CENTER_VERTICAL);
         grid->Add(status, 0, wxALIGN_CENTER_VERTICAL);
+        grid->Add(preview, 0, wxALIGN_CENTER_VERTICAL);
         grid->Add(size, 1, wxEXPAND | wxALIGN_CENTER_VERTICAL);
         grid->Add(clear, 0, wxALIGN_CENTER_VERTICAL);
         grid->Add(create, 0, wxALIGN_CENTER_VERTICAL);
 
         clear->Bind(wxEVT_BUTTON, [this, type](wxCommandEvent &) { clear_data(type); });
         create->Bind(wxEVT_BUTTON, [this, type, create](wxCommandEvent &) { show_create_menu(type, create); });
-        m_rows.push_back({ type, status, size, clear, create });
+        m_rows.push_back({ type, status, preview, size, clear, create });
     }
 
     void refresh_rows()
     {
         refresh_background_controls();
         const ManagedColorDataSummary summary = summarize_managed_color_data(m_object);
+        const ManagedColorDataPreviewKind preview_kind = managed_color_data_preview_kind(summary);
         for (Row &row : m_rows) {
             const bool has_data = managed_color_data_summary_has_type(summary, row.type);
             row.status->SetLabel(has_data ? _L("Present") : _L("None"));
+            row.preview->SetLabel(managed_color_data_preview_marker(managed_color_data_preview_kind_matches_type(preview_kind, row.type)));
             row.size->SetLabel(managed_color_data_size_text(summary, row.type));
             row.clear->Enable(has_data);
             row.create->Enable(m_object != nullptr && !has_data);
@@ -5383,6 +5453,11 @@ private:
         const bool show_raw_info = summary.has_raw_offset_image_texture;
         if (m_raw_image_texture_status != nullptr)
             m_raw_image_texture_status->SetLabel(show_raw_info ? _L("Present") : wxString());
+        if (m_raw_image_texture_preview != nullptr)
+            m_raw_image_texture_preview->SetLabel(
+                show_raw_info ?
+                    managed_color_data_preview_marker(preview_kind == ManagedColorDataPreviewKind::RawOffsetAtlas) :
+                    wxString());
         if (m_raw_image_texture_mode != nullptr)
             m_raw_image_texture_mode->SetLabel(show_raw_info ? managed_color_data_raw_offset_mode_text(summary) : wxString());
         for (wxWindow *window : m_raw_image_texture_info_windows)
@@ -5561,6 +5636,7 @@ private:
     std::vector<Row>   m_rows;
     std::vector<wxWindow *> m_raw_image_texture_info_windows;
     wxStaticText       *m_raw_image_texture_status = nullptr;
+    wxStaticText       *m_raw_image_texture_preview = nullptr;
     wxStaticText       *m_raw_image_texture_mode = nullptr;
 };
 
@@ -7421,6 +7497,7 @@ void GLGizmoTrueColorPainting::update_model_object()
     if (object == nullptr)
         return;
 
+    const bool converting_raw_to_rgba = selected_object_has_raw_atlas_texture_data() && !selected_object_has_rgb_data();
     bool updated = false;
     int selector_idx = -1;
     for (ModelVolume *volume : object->volumes) {
@@ -7481,6 +7558,8 @@ void GLGizmoTrueColorPainting::update_model_object()
     assign_texture_mapping_zone_preserving_painted_regions(*object, texture_mapping_filament_id);
 
     refresh_selected_object_after_rgb_change(object);
+    if (converting_raw_to_rgba && selected_object_has_rgb_data())
+        show_raw_offset_data_converted_to_rgba_message();
 }
 
 ModelObject *GLGizmoTrueColorPainting::selected_model_object() const
@@ -7515,6 +7594,7 @@ void GLGizmoTrueColorPainting::update_selected_object_color_state()
     m_selected_has_imported_color_data = false;
     m_selected_can_convert_vertex = false;
     m_selected_can_convert_image = false;
+    m_selected_has_raw_atlas_texture_data = false;
 
     const ModelObject *object = selected_model_object();
     const ObjectID previous_object_id = m_selected_color_state_object_id;
@@ -7530,6 +7610,7 @@ void GLGizmoTrueColorPainting::update_selected_object_color_state()
         m_selected_has_rgb_data |= !volume->texture_mapping_color_facets.empty();
         m_selected_can_convert_vertex |= !volume->imported_vertex_colors_rgba.empty();
         m_selected_can_convert_image |= model_volume_has_bakeable_image_texture_data(volume);
+        m_selected_has_raw_atlas_texture_data |= model_volume_has_raw_atlas_texture_data(volume);
     }
     m_selected_has_imported_color_data = m_selected_can_convert_vertex || m_selected_can_convert_image;
 }
@@ -7542,6 +7623,11 @@ bool GLGizmoTrueColorPainting::selected_object_has_rgb_data() const
 bool GLGizmoTrueColorPainting::selected_object_has_imported_color_data() const
 {
     return m_selected_has_imported_color_data;
+}
+
+bool GLGizmoTrueColorPainting::selected_object_has_raw_atlas_texture_data() const
+{
+    return m_selected_has_raw_atlas_texture_data;
 }
 
 void GLGizmoTrueColorPainting::initialize_selected_object_rgb_data()
@@ -8220,10 +8306,43 @@ bool GLGizmoTrueColorPainting::render_filament_colors_picker(float item_width)
         sync_filament_mix_from_rgb();
 
     bool mix_changed = false;
-    for (size_t idx = 0; idx < m_filament_mix.size(); ++idx) {
+    const float swatch_size = ImGui::GetFrameHeight();
+    const ImGuiColorEditFlags swatch_flags = ImGuiColorEditFlags_NoAlpha |
+                                             ImGuiColorEditFlags_NoInputs |
+                                             ImGuiColorEditFlags_NoLabel |
+                                             ImGuiColorEditFlags_NoPicker |
+                                             ImGuiColorEditFlags_NoTooltip;
+    const auto render_filament_slider = [this, swatch_size, swatch_flags](size_t idx) {
         const std::string label = GUI::format(_u8L("Filament %1%"), idx + 1);
-        mix_changed |= ImGui::SliderFloat(label.c_str(), &m_filament_mix[idx], 0.f, 1.f, "%.2f");
+        const bool slider_changed = ImGui::SliderFloat(label.c_str(), &m_filament_mix[idx], 0.f, 1.f, "%.2f");
+        ImGui::SameLine();
+        const std::string swatch_id = "##true_color_filament_swatch_" + std::to_string(idx);
+        const ImVec4 swatch_color = ImGuiWrapper::to_ImVec4(m_filament_mix_colors[idx]);
+        ImGui::ColorButton(swatch_id.c_str(), swatch_color, swatch_flags, ImVec2(swatch_size, swatch_size));
+        return slider_changed;
+    };
+
+    const size_t visible_filament_rows = 6;
+    const bool scrollable = m_filament_mix.size() > visible_filament_rows;
+    const std::string max_label = GUI::format(_u8L("Filament %1%"), m_filament_mix.size());
+    const float list_width = item_width +
+                             ImGui::GetStyle().ItemInnerSpacing.x +
+                             ImGui::CalcTextSize(max_label.c_str(), nullptr, true).x +
+                             ImGui::GetStyle().ItemSpacing.x +
+                             swatch_size +
+                             (scrollable ? ImGui::GetStyle().ScrollbarSize : 0.f);
+    if (scrollable)
+        ImGui::BeginChild("##true_color_filament_mix_scroll",
+                          ImVec2(list_width, ImGui::GetFrameHeightWithSpacing() * float(visible_filament_rows)),
+                          false,
+                          ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    for (size_t idx = 0; idx < m_filament_mix.size(); ++idx) {
+        ImGui::PushItemWidth(item_width);
+        mix_changed |= render_filament_slider(idx);
+        ImGui::PopItemWidth();
     }
+    if (scrollable)
+        ImGui::EndChild();
     ImGui::PopItemWidth();
 
     if (mix_changed) {
@@ -8286,6 +8405,9 @@ void GLGizmoTrueColorPainting::on_render_input_window(float x, float y, float bo
 
     if (m_imgui->button(_L("Manage Color Data for this object")))
         open_color_data_management_dialog();
+
+    if (selected_object_has_raw_atlas_texture_data() && !selected_object_has_rgb_data())
+        m_imgui->warning_text(raw_offset_data_rgba_conversion_warning_text(), m_imgui->scaled(RawOffsetDataWarningWrapEm));
 
     bool color_changed = false;
     switch (m_color_input_mode) {
@@ -8697,6 +8819,17 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
         m_imgui->text(from_u8(slash == std::string::npos ? m_image_path : m_image_path.substr(slash + 1)));
     }
 
+    if (!m_image_error.empty())
+        m_imgui->warning_text(from_u8(m_image_error));
+
+    const bool has_rgba_data = selected_object_has_rgb_data();
+    if (!m_image_rgba.empty() && !m_raw_atlas.valid() && selected_object_has_raw_atlas_texture_data() && !has_rgba_data) {
+        if (m_projection_mode == ProjectionMode::ImageTexture)
+            m_imgui->warning_text(raw_offset_data_image_texture_projection_warning_text(), m_imgui->scaled(RawOffsetDataWarningWrapEm));
+        else if (m_projection_mode == ProjectionMode::RGBData)
+            m_imgui->warning_text(raw_offset_data_rgba_conversion_warning_text(), m_imgui->scaled(RawOffsetDataWarningWrapEm));
+    }
+
     if (!m_image_rgba.empty() && ImGui::Checkbox("Show image overlay", &m_show_overlay)) {
         m_parent.set_as_dirty();
         m_parent.request_extra_frame();
@@ -8705,7 +8838,6 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
     if (m_imgui->button(_L("Manage Color Data for this object")))
         open_color_data_management_dialog();
 
-    const bool has_rgba_data = selected_object_has_rgb_data();
     if (has_rgba_data)
         m_imgui->warning_text(_L("Image Texture projection is disabled as this object has RGBA data."));
 
@@ -8756,9 +8888,6 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
     }
     m_imgui->disabled_end();
 
-    if (!m_image_error.empty())
-        m_imgui->warning_text(from_u8(m_image_error));
-
     GizmoImguiEnd();
     ImGuiWrapper::pop_toolbar_style();
 }
@@ -8792,6 +8921,17 @@ bool GLGizmoImageProjection::project_image_to_selected_object()
     update_default_projection_mode();
     if (!projection_mode_allowed(m_projection_mode))
         return false;
+
+    const bool converting_raw_to_rgba_image =
+        !m_raw_atlas.valid() &&
+        m_projection_mode == ProjectionMode::ImageTexture &&
+        selected_object_has_raw_atlas_texture_data() &&
+        !selected_object_has_rgb_data();
+    const bool creating_rgba_data_from_raw =
+        !m_raw_atlas.valid() &&
+        m_projection_mode == ProjectionMode::RGBData &&
+        selected_object_has_raw_atlas_texture_data() &&
+        !selected_object_has_rgb_data();
 
     bool changed = false;
     Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Project image onto model", UndoRedo::SnapshotType::GizmoAction);
@@ -8850,6 +8990,10 @@ bool GLGizmoImageProjection::project_image_to_selected_object()
     refresh_projected_object(object);
     m_projection_mode_initialized = true;
     m_projection_mode_object_id = object->id();
+    if (converting_raw_to_rgba_image && !selected_object_has_raw_atlas_texture_data())
+        show_raw_offset_data_converted_to_rgba_image_message();
+    if (creating_rgba_data_from_raw && object_has_rgba_data(*object))
+        show_raw_offset_data_converted_to_rgba_message();
     return true;
 }
 

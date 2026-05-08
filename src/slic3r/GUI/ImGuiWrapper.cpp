@@ -1018,6 +1018,19 @@ void ImGuiWrapper::warning_text(const wxString &all_text)
     warning_text(label_utf8.c_str());
 }
 
+void ImGuiWrapper::warning_text(const char *label, float wrap_width)
+{
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGuiWrapper::to_ImVec4(ColorRGB::WARNING()));
+    this->text_wrapped(label, wrap_width);
+    ImGui::PopStyleColor();
+}
+
+void ImGuiWrapper::warning_text(const wxString &all_text, float wrap_width)
+{
+    auto label_utf8 = into_u8(all_text);
+    warning_text(label_utf8.c_str(), wrap_width);
+}
+
 void ImGuiWrapper::text_colored(const ImVec4& color, const char* label)
 {
     ImGui::TextColored(color, "%s", label);
