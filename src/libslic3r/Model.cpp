@@ -332,6 +332,13 @@ static bool decode_image_texture_rgba(const std::string &texture_path,
     return false;
 }
 
+static bool is_supported_obj_texture_path(const std::string &texture_path)
+{
+    return boost::algorithm::iends_with(texture_path, ".png") ||
+           boost::algorithm::iends_with(texture_path, ".jpg") ||
+           boost::algorithm::iends_with(texture_path, ".jpeg");
+}
+
 struct ObjTextureImage
 {
     std::string          resolved_path;
@@ -343,8 +350,49 @@ struct ObjTextureImage
 struct ObjTextureImportData
 {
     std::vector<ObjTextureImage>              textures;
-    std::unordered_map<std::string, size_t> map_kd_to_texture_idx;
+    std::unordered_map<std::string, size_t>   map_kd_to_texture_idx;
 };
+
+static std::vector<std::string> obj_texture_map_references(const ObjInfo &obj_info)
+{
+    std::vector<std::string> references;
+
+    auto push_unique = [&references](const std::string &reference) {
+        if (reference.empty())
+            return;
+        if (std::find(references.begin(), references.end(), reference) == references.end())
+            references.emplace_back(reference);
+    };
+
+    for (const auto &face_to_map : obj_info.uv_map_pngs)
+        push_unique(face_to_map.second);
+
+    if (references.empty())
+        push_unique(obj_info.single_texture_image);
+
+    return references;
+}
+
+static size_t count_resolved_obj_albedo_texture_references(const std::string &obj_path, const ObjInfo &obj_info)
+{
+    std::vector<std::string> resolved_paths;
+
+    for (const std::string &map_kd_raw : obj_texture_map_references(obj_info)) {
+        const std::string texture_ref = extract_obj_texture_reference(map_kd_raw);
+        const auto        candidates  = resolve_obj_texture_path_candidates(obj_path, texture_ref);
+        for (const std::string &candidate : candidates) {
+            if (!is_supported_obj_texture_path(candidate) || !boost::filesystem::exists(candidate))
+                continue;
+
+            const std::string normalized = boost::filesystem::path(candidate).lexically_normal().string();
+            if (std::find(resolved_paths.begin(), resolved_paths.end(), normalized) == resolved_paths.end())
+                resolved_paths.emplace_back(normalized);
+            break;
+        }
+    }
+
+    return resolved_paths.size();
+}
 
 static ObjTextureImportData load_obj_albedo_textures(const std::string &obj_path, const ObjInfo &obj_info)
 {
@@ -402,11 +450,8 @@ static ObjTextureImportData load_obj_albedo_textures(const std::string &obj_path
         }
     };
 
-    for (const auto &face_to_map : obj_info.uv_map_pngs)
-        register_map(face_to_map.second);
-
-    if (result.textures.empty() && !obj_info.single_texture_image.empty())
-        register_map(obj_info.single_texture_image);
+    for (const std::string &map_kd_raw : obj_texture_map_references(obj_info))
+        register_map(map_kd_raw);
 
     return result;
 }
@@ -766,15 +811,15 @@ Model Model::read_from_file(const std::string&                                  
             if (!message.empty())
                 BOOST_LOG_TRIVIAL(error) << message;
 
-            const ObjTextureImportData texture_import_data = load_obj_albedo_textures(input_file, obj_info);
             const bool has_valid_texture_uvs = std::any_of(obj_info.triangle_uvs_valid.begin(), obj_info.triangle_uvs_valid.end(), [](uint8_t uv_valid) {
                 return uv_valid != 0;
             });
+            const size_t texture_count = count_resolved_obj_albedo_texture_references(input_file, obj_info);
             const ObjImportCapabilities capabilities{
                 !obj_info.vertex_colors.empty(),
                 !obj_info.face_colors.empty(),
                 obj_info.is_single_mtl,
-                texture_import_data.textures.size(),
+                texture_count,
                 has_valid_texture_uvs
             };
             const bool has_mode_selection = bool(objModeFn);
@@ -812,6 +857,7 @@ Model Model::read_from_file(const std::string&                                  
                             true;
 
                         if (import_textures) {
+                            const ObjTextureImportData texture_import_data = load_obj_albedo_textures(input_file, obj_info);
                             std::vector<uint8_t> atlas_rgba;
                             uint32_t atlas_width = 0;
                             uint32_t atlas_height = 0;

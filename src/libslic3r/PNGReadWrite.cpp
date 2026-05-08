@@ -139,7 +139,28 @@ bool decode_colored_png(IStream &in_buf, ImageColorscale &out_img)
     out_img.rows = png_get_image_height(dsc.png, dsc.info);
     size_t color_type = png_get_color_type(dsc.png, dsc.info);
     size_t bit_depth  = png_get_bit_depth(dsc.png, dsc.info);
+
+    if (bit_depth == 16)
+        png_set_strip_16(dsc.png);
+    if (color_type == PNG_COLOR_TYPE_PALETTE)
+        png_set_palette_to_rgb(dsc.png);
+    if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8)
+        png_set_expand_gray_1_2_4_to_8(dsc.png);
+    if (png_get_valid(dsc.png, dsc.info, PNG_INFO_tRNS))
+        png_set_tRNS_to_alpha(dsc.png);
+    if (color_type == PNG_COLOR_TYPE_GRAY || color_type == PNG_COLOR_TYPE_GRAY_ALPHA)
+        png_set_gray_to_rgb(dsc.png);
+
+    png_read_update_info(dsc.png, dsc.info);
+
+    color_type = png_get_color_type(dsc.png, dsc.info);
+    bit_depth  = png_get_bit_depth(dsc.png, dsc.info);
     unsigned long rowbytes = png_get_rowbytes(dsc.png, dsc.info);
+
+    if (bit_depth != 8) {
+        png_destroy_read_struct(&dsc.png, &dsc.info, NULL);
+        return false;
+    }
 
     switch(color_type)
     {
