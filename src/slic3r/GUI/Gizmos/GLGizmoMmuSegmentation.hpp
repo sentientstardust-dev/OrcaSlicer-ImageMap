@@ -7,12 +7,23 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+class wxWindow;
+
+namespace Slic3r {
+class ModelObject;
+}
+
 namespace Slic3r::GUI {
+
+class GLCanvas3D;
+
+void open_color_data_management_dialog(wxWindow *parent, GLCanvas3D &canvas, ModelObject *object, std::function<void()> on_object_changed = {});
 
 class GLMmSegmentationGizmo3DScene
 {

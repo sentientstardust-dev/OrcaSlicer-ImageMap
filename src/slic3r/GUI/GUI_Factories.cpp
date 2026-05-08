@@ -18,6 +18,7 @@
 //BBS: add partplate related logic
 #include "PartPlate.hpp"
 #include "Gizmos/GLGizmoEmboss.hpp"
+#include "Gizmos/GLGizmoMmuSegmentation.hpp"
 #include "Gizmos/GLGizmoSVG.hpp"
 
 #include <boost/algorithm/string.hpp>
@@ -96,6 +97,31 @@ static std::vector<unsigned int> ui_ordered_filament_ids(int fallback_count)
             ids.emplace_back(unsigned(i));
     }
     return ids;
+}
+
+static int menu_item_position(wxMenu *menu, const wxString &name)
+{
+    int position = 0;
+    for (auto node = menu->GetMenuItems().GetFirst(); node; node = node->GetNext(), ++position) {
+        wxMenuItem *item = node->GetData();
+        if (item != nullptr && item->GetItemLabelText() == name)
+            return position;
+    }
+    return wxNOT_FOUND;
+}
+
+static ModelObject *selected_managed_color_data_object()
+{
+    Plater *app_plater = wxGetApp().plater();
+    if (app_plater == nullptr)
+        return nullptr;
+
+    const int object_idx = app_plater->get_selection().get_object_idx();
+    ModelObjectPtrs &objects = wxGetApp().model().objects;
+    if (object_idx < 0 || size_t(object_idx) >= objects.size())
+        return nullptr;
+
+    return objects[size_t(object_idx)];
 }
 
 static bool is_improper_category(const std::string& category, const int filaments_cnt, const bool is_object_settings = true)
@@ -1174,6 +1200,45 @@ void MenuFactory::append_menu_items_flush_options(wxMenu* menu)
     menu->Insert(i, wxID_ANY, _L("Flush Options"), flush_options_menu);
 }
 
+void MenuFactory::append_menu_item_manage_color_data(wxMenu *menu)
+{
+    const wxString name = _L("Manage Color Data");
+    const int item_id = menu->FindItem(name);
+    if (item_id != wxNOT_FOUND)
+        menu->Destroy(item_id);
+
+    if (selected_managed_color_data_object() == nullptr)
+        return;
+
+    int insert_pos = menu_item_position(menu, _L("Flush Options"));
+    if (insert_pos != wxNOT_FOUND)
+        ++insert_pos;
+    else {
+        insert_pos = menu_item_position(menu, _L("Edit in Parameter Table"));
+        if (insert_pos != wxNOT_FOUND)
+            ++insert_pos;
+    }
+
+    auto can_manage_color_data = []() {
+        Plater *app_plater = wxGetApp().plater();
+        return app_plater != nullptr && app_plater->get_view3D_canvas3D() != nullptr && selected_managed_color_data_object() != nullptr;
+    };
+
+    append_menu_item(menu, wxID_ANY, name, _L("Manage Color Data for this object"),
+        [this](wxCommandEvent &) {
+            Plater *app_plater = wxGetApp().plater();
+            if (app_plater == nullptr)
+                return;
+
+            GLCanvas3D *canvas = app_plater->get_view3D_canvas3D();
+            ModelObject *object = selected_managed_color_data_object();
+            if (canvas == nullptr || object == nullptr)
+                return;
+
+            Slic3r::GUI::open_color_data_management_dialog(m_parent, *canvas, object);
+        }, "", menu, can_manage_color_data, m_parent, insert_pos);
+}
+
 void MenuFactory::append_menu_items_convert_unit(wxMenu* menu)
 {
     std::vector<int> obj_idxs, vol_idxs;
@@ -1825,6 +1890,7 @@ wxMenu* MenuFactory::object_menu()
 {
     append_menu_items_convert_unit(&m_object_menu);
     append_menu_items_flush_options(&m_object_menu);
+    append_menu_item_manage_color_data(&m_object_menu);
     append_menu_item_invalidate_cut_info(&m_object_menu);
     append_menu_item_edit_text(&m_object_menu);
     append_menu_item_edit_svg(&m_object_menu);

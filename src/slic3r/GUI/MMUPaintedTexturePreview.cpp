@@ -3663,8 +3663,13 @@ void render_model_vertex_color_preview_models(
                         print_volume_z);
 
     for (size_t idx = 0; idx < models.size(); ++idx) {
-        const float mix = texture_preview_mix_for_filament(filament_ids[idx], num_physical, texture_mgr);
-        const bool invalid = texture_preview_settings_invalid_for_filament(filament_ids[idx], num_physical, texture_mgr);
+        const bool raw_vertex_color_preview = filament_ids[idx] == 0;
+        const float mix = raw_vertex_color_preview ?
+            1.f :
+            texture_preview_mix_for_filament(filament_ids[idx], num_physical, texture_mgr);
+        const bool invalid = raw_vertex_color_preview ?
+            false :
+            texture_preview_settings_invalid_for_filament(filament_ids[idx], num_physical, texture_mgr);
         if (mix <= 0.f && !invalid)
             continue;
         shader->set_uniform("texture_preview_mix", mix);

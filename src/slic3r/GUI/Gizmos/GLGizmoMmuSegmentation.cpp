@@ -4319,6 +4319,30 @@ static bool assign_object_to_texture_mapping_zone(ModelObject &object)
     return true;
 }
 
+static void assign_texture_mapping_zone_preserving_painted_regions(ModelObject &object, unsigned int texture_mapping_filament_id)
+{
+    if (texture_mapping_filament_id == 0)
+        return;
+
+    bool has_painted_regions = false;
+    for (const ModelVolume *volume : object.volumes) {
+        if (volume != nullptr && volume->is_model_part() && !volume->mmu_segmentation_facets.empty()) {
+            has_painted_regions = true;
+            break;
+        }
+    }
+
+    if (!has_painted_regions)
+        object.config.set("extruder", int(texture_mapping_filament_id));
+
+    for (ModelVolume *volume : object.volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+        if (!has_painted_regions || volume->mmu_segmentation_facets.empty())
+            volume->config.set("extruder", int(texture_mapping_filament_id));
+    }
+}
+
 struct ManagedRegionColorSource
 {
     std::vector<std::vector<TriangleSelector::FacetStateTriangle>> triangles_per_type;
@@ -5471,6 +5495,15 @@ private:
     wxStaticText       *m_raw_image_texture_status = nullptr;
     wxStaticText       *m_raw_image_texture_mode = nullptr;
 };
+
+void open_color_data_management_dialog(wxWindow *parent, GLCanvas3D &canvas, ModelObject *object, std::function<void()> on_object_changed)
+{
+    if (object == nullptr)
+        return;
+
+    ColorDataManagementDialog dialog(parent, canvas, object, std::move(on_object_changed));
+    dialog.ShowModal();
+}
 
 void GLGizmoMmuSegmentation::init_extruders_data(const std::vector<ColorRGBA> &extruder_colors)
 {
@@ -6674,12 +6707,7 @@ void GLGizmoMmuSegmentation::convert_selected_object_vertex_colors_to_texture_ma
         return;
 
     const unsigned int texture_mapping_filament_id = ensure_texture_mapping_zone();
-    if (texture_mapping_filament_id != 0) {
-        object->config.set("extruder", int(texture_mapping_filament_id));
-        for (ModelVolume *volume : object->volumes)
-            if (volume != nullptr && volume->is_model_part())
-                volume->config.set("extruder", int(texture_mapping_filament_id));
-    }
+    assign_texture_mapping_zone_preserving_painted_regions(*object, texture_mapping_filament_id);
 
     for (auto &selector : m_triangle_selectors)
         if (selector != nullptr)
@@ -6750,12 +6778,7 @@ void GLGizmoMmuSegmentation::convert_selected_object_image_texture_to_texture_ma
         return;
 
     const unsigned int texture_mapping_filament_id = ensure_texture_mapping_zone();
-    if (texture_mapping_filament_id != 0) {
-        object->config.set("extruder", int(texture_mapping_filament_id));
-        for (ModelVolume *volume : object->volumes)
-            if (volume != nullptr && volume->is_model_part())
-                volume->config.set("extruder", int(texture_mapping_filament_id));
-    }
+    assign_texture_mapping_zone_preserving_painted_regions(*object, texture_mapping_filament_id);
 
     for (auto &selector : m_triangle_selectors)
         if (selector != nullptr)
@@ -7239,13 +7262,15 @@ void GLGizmoTrueColorPainting::init_model_triangle_selectors()
                 preview_rgb_data = preview.get();
                 m_preview_rgb_data_by_volume.back() = std::move(preview);
             }
+        } else {
+            preview_rgb_data = &volume->texture_mapping_color_facets;
         }
 
         m_triangle_selectors.emplace_back(std::make_unique<TriangleSelectorPatch>(volume->mesh(), volume, colors, 0.2f));
         if (TriangleSelectorPatch *patch = dynamic_cast<TriangleSelectorPatch *>(m_triangle_selectors.back().get())) {
             patch->set_none_state_rendered(false);
             patch->set_texture_mapping_color_preview(preview_rgb_data);
-            patch->set_texture_preview_needed(!volume->texture_mapping_color_facets.empty() || preview_rgb_data != nullptr);
+            patch->set_texture_preview_needed(preview_rgb_data != nullptr);
             patch->set_texture_preview_opaque(true);
         }
         m_triangle_selectors.back()->set_wireframe_needed(true);
@@ -7385,12 +7410,7 @@ void GLGizmoTrueColorPainting::update_model_object()
         return;
 
     const unsigned int texture_mapping_filament_id = ensure_texture_mapping_zone();
-    if (texture_mapping_filament_id != 0) {
-        object->config.set("extruder", int(texture_mapping_filament_id));
-        for (ModelVolume *volume : object->volumes)
-            if (volume != nullptr && volume->is_model_part())
-                volume->config.set("extruder", int(texture_mapping_filament_id));
-    }
+    assign_texture_mapping_zone_preserving_painted_regions(*object, texture_mapping_filament_id);
 
     refresh_selected_object_after_rgb_change(object);
 }
@@ -7409,13 +7429,12 @@ void GLGizmoTrueColorPainting::open_color_data_management_dialog()
     if (object == nullptr)
         return;
 
-    ColorDataManagementDialog dialog(wxGetApp().mainframe, m_parent, object, [this]() {
+    Slic3r::GUI::open_color_data_management_dialog(wxGetApp().mainframe, m_parent, object, [this]() {
         update_selected_object_color_state();
         init_model_triangle_selectors();
         m_parent.set_as_dirty();
         m_parent.request_extra_frame();
     });
-    dialog.ShowModal();
     update_selected_object_color_state();
     init_model_triangle_selectors();
     m_parent.set_as_dirty();
@@ -7475,12 +7494,7 @@ void GLGizmoTrueColorPainting::initialize_selected_object_rgb_data()
         return;
 
     const unsigned int texture_mapping_filament_id = ensure_texture_mapping_zone();
-    if (texture_mapping_filament_id != 0) {
-        object->config.set("extruder", int(texture_mapping_filament_id));
-        for (ModelVolume *volume : object->volumes)
-            if (volume != nullptr && volume->is_model_part())
-                volume->config.set("extruder", int(texture_mapping_filament_id));
-    }
+    assign_texture_mapping_zone_preserving_painted_regions(*object, texture_mapping_filament_id);
 
     refresh_selected_object_after_rgb_change(object);
 }
@@ -7540,12 +7554,7 @@ void GLGizmoTrueColorPainting::convert_selected_object_vertex_colors_to_rgb_data
         return;
 
     const unsigned int texture_mapping_filament_id = ensure_texture_mapping_zone();
-    if (texture_mapping_filament_id != 0) {
-        object->config.set("extruder", int(texture_mapping_filament_id));
-        for (ModelVolume *volume : object->volumes)
-            if (volume != nullptr && volume->is_model_part())
-                volume->config.set("extruder", int(texture_mapping_filament_id));
-    }
+    assign_texture_mapping_zone_preserving_painted_regions(*object, texture_mapping_filament_id);
 
     refresh_selected_object_after_rgb_change(object);
 }
@@ -7601,12 +7610,7 @@ void GLGizmoTrueColorPainting::convert_selected_object_image_texture_to_rgb_data
         return;
 
     const unsigned int texture_mapping_filament_id = ensure_texture_mapping_zone();
-    if (texture_mapping_filament_id != 0) {
-        object->config.set("extruder", int(texture_mapping_filament_id));
-        for (ModelVolume *volume : object->volumes)
-            if (volume != nullptr && volume->is_model_part())
-                volume->config.set("extruder", int(texture_mapping_filament_id));
-    }
+    assign_texture_mapping_zone_preserving_painted_regions(*object, texture_mapping_filament_id);
 
     refresh_selected_object_after_rgb_change(object);
 }
@@ -8490,13 +8494,12 @@ void GLGizmoImageProjection::open_color_data_management_dialog()
     if (object == nullptr)
         return;
 
-    ColorDataManagementDialog dialog(wxGetApp().mainframe, m_parent, object, [this]() {
+    Slic3r::GUI::open_color_data_management_dialog(wxGetApp().mainframe, m_parent, object, [this]() {
         m_projection_mode_initialized = false;
         update_default_projection_mode();
         m_parent.set_as_dirty();
         m_parent.request_extra_frame();
     });
-    dialog.ShowModal();
     m_projection_mode_initialized = false;
     update_default_projection_mode();
     m_parent.set_as_dirty();
