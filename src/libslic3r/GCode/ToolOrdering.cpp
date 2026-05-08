@@ -136,6 +136,8 @@ unsigned int LayerTools::resolve_filament_id(unsigned int filament_id_1based) co
         num_physical_filaments > 0 &&
         texture_mapping_manager->is_texture_mapping_zone_id(filament_id_1based))
         return texture_mapping_manager->resolve_zone_component(filament_id_1based, num_physical_filaments, layer_index);
+    if (num_physical_filaments > 0 && filament_id_1based > num_physical_filaments)
+        return 1;
     return filament_id_1based;
 }
 
@@ -582,10 +584,14 @@ std::vector<unsigned int> ToolOrdering::generate_first_layer_tool_order(const Pr
 
         for (auto layerm : target_layer->regions()) {
             const int raw_extruder_id = layerm->region().config().option("wall_filament")->getInt();
-            const unsigned int resolved_extruder_id = raw_extruder_id <= 0 ? 0 :
-                print.texture_mapping_manager().resolve_zone_component(unsigned(raw_extruder_id), print.config().filament_colour.size(), int(target_layer->id()));
-            if (resolved_extruder_id == 0 || resolved_extruder_id > print.config().filament_colour.size())
+            unsigned int resolved_extruder_id = raw_extruder_id <= 0 ? 0 :
+                print.texture_mapping_manager().resolve_zone_component(unsigned(raw_extruder_id),
+                                                                       print.config().filament_colour.size(),
+                                                                       int(target_layer->id()));
+            if (resolved_extruder_id == 0)
                 continue;
+            if (resolved_extruder_id > print.config().filament_colour.size())
+                resolved_extruder_id = 1;
             int extruder_id = int(resolved_extruder_id);
 
             for (auto expoly : layerm->raw_slices) {
@@ -651,10 +657,14 @@ std::vector<unsigned int> ToolOrdering::generate_first_layer_tool_order(const Pr
 
     for (auto layerm : target_layer->regions()) {
         const int raw_extruder_id = layerm->region().config().option("wall_filament")->getInt();
-        const unsigned int resolved_extruder_id = raw_extruder_id <= 0 ? 0 :
-            object.print()->texture_mapping_manager().resolve_zone_component(unsigned(raw_extruder_id), object.print()->config().filament_colour.size(), int(target_layer->id()));
-        if (resolved_extruder_id == 0 || resolved_extruder_id > object.print()->config().filament_colour.size())
+        unsigned int resolved_extruder_id = raw_extruder_id <= 0 ? 0 :
+            object.print()->texture_mapping_manager().resolve_zone_component(unsigned(raw_extruder_id),
+                                                                             object.print()->config().filament_colour.size(),
+                                                                             int(target_layer->id()));
+        if (resolved_extruder_id == 0)
             continue;
+        if (resolved_extruder_id > object.print()->config().filament_colour.size())
+            resolved_extruder_id = 1;
         int extruder_id = int(resolved_extruder_id);
         for (auto expoly : layerm->raw_slices) {
             const double nozzle_diameter = object.print()->config().nozzle_diameter.get_at(0);

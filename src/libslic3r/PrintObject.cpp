@@ -14,6 +14,7 @@
 #include "Surface.hpp"
 #include "Slicing.hpp"
 #include "Tesselate.hpp"
+#include "TextureMapping.hpp"
 #include "TriangleMeshSlicer.hpp"
 #include "Utils.hpp"
 #include "Fill/FillAdaptive.hpp"
@@ -22,6 +23,7 @@
 #include "format.hpp"
 #include "AABBTreeLines.hpp"
 
+#include <algorithm>
 #include <float.h>
 #include <oneapi/tbb/blocked_range.h>
 #include <oneapi/tbb/concurrent_vector.h>
@@ -289,6 +291,68 @@ void PrintObject::_transform_hole_to_polyholes()
     }
 }
 
+static std::vector<unsigned int> physical_extruders_for_filament_id(const TextureMappingManager        &texture_mgr,
+                                                                    int                                 filament_id,
+                                                                    size_t                              num_physical,
+                                                                    const std::vector<std::string>     &filament_colours)
+{
+    std::vector<unsigned int> out;
+    if (filament_id <= 0 || num_physical == 0)
+        return out;
+
+    auto append_physical = [num_physical, &out](unsigned int physical_id) {
+        if (physical_id >= 1 && physical_id <= num_physical)
+            out.emplace_back(physical_id - 1);
+    };
+
+    const TextureMappingZone *zone = texture_mgr.zone_from_id(unsigned(filament_id));
+    if (zone != nullptr) {
+        if (!zone->enabled || zone->deleted)
+            return out;
+
+        std::vector<std::string> colors = filament_colours;
+        colors.resize(num_physical, "#FFFFFF");
+        std::vector<unsigned int> component_ids = zone->is_image_texture() ?
+            TextureMappingManager::effective_texture_component_ids(*zone, num_physical, colors) :
+            TextureMappingManager::selected_component_ids(*zone, num_physical);
+
+        for (unsigned int component_id : component_ids)
+            append_physical(component_id);
+
+        if (out.empty())
+            append_physical(texture_mgr.resolve_zone_component(unsigned(filament_id), num_physical, 0));
+    } else {
+        const unsigned int physical_id = unsigned(filament_id);
+        append_physical(physical_id <= num_physical ? physical_id : 1);
+    }
+
+    sort_remove_duplicates(out);
+    return out;
+}
+
+template<typename Set>
+static bool contains_any_physical_extruder(const Set &set, const std::vector<unsigned int> &extruders)
+{
+    return std::any_of(extruders.begin(), extruders.end(), [&set](unsigned int extruder) {
+        return set.count(int(extruder)) > 0;
+    });
+}
+
+template<typename Set>
+static bool contains_missing_physical_extruder(const Set &set, const std::vector<unsigned int> &extruders)
+{
+    return std::any_of(extruders.begin(), extruders.end(), [&set](unsigned int extruder) {
+        return set.count(int(extruder)) == 0;
+    });
+}
+
+template<typename Set>
+static void insert_physical_extruders(Set &set, const std::vector<unsigned int> &extruders)
+{
+    for (unsigned int extruder : extruders)
+        set.insert(int(extruder));
+}
+
 std::vector<std::set<int>> PrintObject::detect_extruder_geometric_unprintables() const
 {
     int extruder_size = m_print->config().nozzle_diameter.size();
@@ -296,6 +360,12 @@ std::vector<std::set<int>> PrintObject::detect_extruder_geometric_unprintables()
         return std::vector<std::set<int>>(1, std::set<int>());
 
     std::vector<std::set<int>> geometric_unprintables(extruder_size); // the container to return
+    const size_t num_physical_filaments = m_print->config().filament_colour.size();
+    const TextureMappingManager &texture_mgr = m_print->texture_mapping_manager();
+    const std::vector<std::string> filament_colours = m_print->config().filament_colour.values;
+    auto resolve_physical_extruders = [&texture_mgr, num_physical_filaments, &filament_colours](int filament_id) {
+        return physical_extruders_for_filament_id(texture_mgr, filament_id, num_physical_filaments, filament_colours);
+    };
 
     std::vector<double> printable_height_per_extruder = m_print->config().extruder_printable_height.values;
     assert(printable_height_per_extruder.size() == extruder_size);
@@ -309,18 +379,18 @@ std::vector<std::set<int>> PrintObject::detect_extruder_geometric_unprintables()
                 continue;
             for (auto layerm : layer->regions()) {
                 auto region = layerm->region();
-                int wall_filament = region.config().wall_filament;
-                int solid_infill_filament = region.config().solid_infill_filament;
-                int sparse_infill_filament = region.config().sparse_infill_filament;
+                const std::vector<unsigned int> wall_filaments = resolve_physical_extruders(region.config().wall_filament);
+                const std::vector<unsigned int> solid_infill_filaments =
+                    resolve_physical_extruders(region.config().solid_infill_filament);
+                const std::vector<unsigned int> sparse_infill_filaments =
+                    resolve_physical_extruders(region.config().sparse_infill_filament);
 
                 if (!layerm->fills.entities.empty()) {
-                    if (solid_infill_filament > 0)
-                        geometric_unprintables[extruder_id].insert(solid_infill_filament - 1);
-                    if (sparse_infill_filament > 0)
-                        geometric_unprintables[extruder_id].insert(sparse_infill_filament - 1);
+                    insert_physical_extruders(geometric_unprintables[extruder_id], solid_infill_filaments);
+                    insert_physical_extruders(geometric_unprintables[extruder_id], sparse_infill_filaments);
                 }
-                if (!layerm->perimeters.entities.empty() && wall_filament > 0)
-                    geometric_unprintables[extruder_id].insert(wall_filament - 1);
+                if (!layerm->perimeters.entities.empty())
+                    insert_physical_extruders(geometric_unprintables[extruder_id], wall_filaments);
             }
         }
     }
@@ -340,26 +410,33 @@ std::vector<std::set<int>> PrintObject::detect_extruder_geometric_unprintables()
 
     // check unprintbale filaments caused by printable area limit
     tbb::parallel_for(tbb::blocked_range<int>(0, m_layers.size()),
-        [this, &tbb_geometric_unprintables, &unprintable_area_in_obj_coord, &unprintable_area_bbox](const tbb::blocked_range<int>& range) {
+        [this,
+         &tbb_geometric_unprintables,
+         &unprintable_area_in_obj_coord,
+         &unprintable_area_bbox,
+         &resolve_physical_extruders](const tbb::blocked_range<int>& range) {
             for (int j = range.begin(); j < range.end(); ++j) {
                 auto layer = m_layers[j];
                 for (auto layerm : layer->regions()) {
                     const auto& region = layerm->region();
-                    int wall_filament = region.config().wall_filament;
-                    int solid_infill_filament = region.config().solid_infill_filament;
-                    int sparse_infill_filament = region.config().sparse_infill_filament;
+                    const std::vector<unsigned int> wall_filaments = resolve_physical_extruders(region.config().wall_filament);
+                    const std::vector<unsigned int> solid_infill_filaments =
+                        resolve_physical_extruders(region.config().solid_infill_filament);
+                    const std::vector<unsigned int> sparse_infill_filaments =
+                        resolve_physical_extruders(region.config().sparse_infill_filament);
                     std::optional<ExPolygons> fill_expolys;
                     BoundingBox fill_bbox;
                     std::optional<ExPolygons> wall_expolys;
                     BoundingBox wall_bbox;
 
                     for (size_t idx = 0; idx < unprintable_area_in_obj_coord.size(); ++idx) {
-                        bool do_infill_filament_detect = (solid_infill_filament > 0 && tbb_geometric_unprintables[idx].count(solid_infill_filament - 1) == 0) ||
-                            (sparse_infill_filament > 0 && tbb_geometric_unprintables[idx].count(sparse_infill_filament-1) == 0);
+                        bool do_infill_filament_detect =
+                            contains_missing_physical_extruder(tbb_geometric_unprintables[idx], solid_infill_filaments) ||
+                            contains_missing_physical_extruder(tbb_geometric_unprintables[idx], sparse_infill_filaments);
 
                         bool infill_unprintable = !layerm->fills.entities.empty() &&
-                            ((solid_infill_filament > 0 && tbb_geometric_unprintables[idx].count(solid_infill_filament - 1) > 0) ||
-                                (sparse_infill_filament > 0 && tbb_geometric_unprintables[idx].count(sparse_infill_filament - 1) > 0));
+                            (contains_any_physical_extruder(tbb_geometric_unprintables[idx], solid_infill_filaments) ||
+                             contains_any_physical_extruder(tbb_geometric_unprintables[idx], sparse_infill_filaments));
 
                         if (!layerm->fills.entities.empty() && do_infill_filament_detect) {
                             if (!fill_expolys) {
@@ -368,19 +445,17 @@ std::vector<std::set<int>> PrintObject::detect_extruder_geometric_unprintables()
                             }
                             if (fill_bbox.overlap(unprintable_area_bbox[idx]) &&
                                 !intersection(*fill_expolys, unprintable_area_in_obj_coord[idx]).empty()) {
-                                if (solid_infill_filament > 0)
-                                    tbb_geometric_unprintables[idx].insert(solid_infill_filament - 1);
-                                if (sparse_infill_filament > 0)
-                                    tbb_geometric_unprintables[idx].insert(sparse_infill_filament - 1);
+                                insert_physical_extruders(tbb_geometric_unprintables[idx], solid_infill_filaments);
+                                insert_physical_extruders(tbb_geometric_unprintables[idx], sparse_infill_filaments);
                                 infill_unprintable = true;
                             }
                         }
 
-                        bool do_wall_filament_detect = wall_filament > 0 && tbb_geometric_unprintables[idx].count(wall_filament - 1) == 0;
+                        bool do_wall_filament_detect = contains_missing_physical_extruder(tbb_geometric_unprintables[idx], wall_filaments);
                         if (!layerm->perimeters.entities.empty() && do_wall_filament_detect) {
                             // if infill is unprintable, no need to check wall since wall contour surrounds infill contour
                             if (infill_unprintable) {
-                                tbb_geometric_unprintables[idx].insert(wall_filament - 1);
+                                insert_physical_extruders(tbb_geometric_unprintables[idx], wall_filaments);
                                 continue;
                             }
 
@@ -395,7 +470,7 @@ std::vector<std::set<int>> PrintObject::detect_extruder_geometric_unprintables()
 
                             if (wall_bbox.overlap(unprintable_area_bbox[idx]) &&
                                 !intersection(*wall_expolys, unprintable_area_in_obj_coord[idx]).empty()) {
-                                tbb_geometric_unprintables[idx].insert(wall_filament - 1);
+                                insert_physical_extruders(tbb_geometric_unprintables[idx], wall_filaments);
                             }
                         }
                     }
@@ -3477,11 +3552,16 @@ std::vector<unsigned int> PrintObject::object_extruders() const
         region.collect_object_printing_extruders(*this->print(), extruders);
 
     const ModelObject* mo = this->model_object();
+    const size_t num_physical = this->print()->config().filament_colour.size();
     for (const ModelVolume* mv : mo->volumes) {
         std::vector<int> volume_extruders = mv->get_extruders();
         for (int extruder : volume_extruders) {
             assert(extruder > 0);
-            extruders.push_back(extruder - 1);
+            append(extruders,
+                   physical_extruders_for_filament_id(this->print()->texture_mapping_manager(),
+                                                       extruder,
+                                                       num_physical,
+                                                       this->print()->config().filament_colour.values));
         }
     }
     sort_remove_duplicates(extruders);

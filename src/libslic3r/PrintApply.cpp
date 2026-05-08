@@ -1254,7 +1254,8 @@ static void append_used_filament_from_config_id(const TextureMappingManager     
         return;
     }
 
-    append_physical(unsigned(filament_id));
+    const unsigned int physical_id = unsigned(filament_id);
+    append_physical(physical_id <= num_physical_extruders ? physical_id : 1);
 }
 
 static void append_model_used_filaments_for_normalization(const Model                       &model,

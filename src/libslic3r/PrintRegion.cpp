@@ -63,7 +63,8 @@ static void append_used_physical_extruders_for_filament_id(const Print          
         return;
     }
 
-    append_physical(unsigned(filament_id));
+    const unsigned int physical_id = unsigned(filament_id);
+    append_physical(physical_id <= num_physical ? physical_id : 1);
 }
 
 // 1-based extruder identifier for this region and role.
@@ -153,9 +154,15 @@ void PrintRegion::collect_object_printing_extruders(const Print &print, std::vec
 #ifndef NDEBUG
     // BBS
     auto num_extruders = int(print.config().filament_diameter.size());
-    assert(this->config().wall_filament <= num_extruders || print.texture_mapping_manager().is_texture_mapping_zone_id(this->config().wall_filament));
-    assert(this->config().sparse_infill_filament <= num_extruders || print.texture_mapping_manager().is_texture_mapping_zone_id(this->config().sparse_infill_filament));
-    assert(this->config().solid_infill_filament <= num_extruders || print.texture_mapping_manager().is_texture_mapping_zone_id(this->config().solid_infill_filament));
+    auto can_resolve_filament_id = [num_extruders, &print](int filament_id) {
+        return filament_id >= 0 &&
+               (filament_id <= num_extruders ||
+                print.texture_mapping_manager().is_texture_mapping_zone_id(unsigned(filament_id)) ||
+                num_extruders > 0);
+    };
+    assert(can_resolve_filament_id(this->config().wall_filament));
+    assert(can_resolve_filament_id(this->config().sparse_infill_filament));
+    assert(can_resolve_filament_id(this->config().solid_infill_filament));
 #endif
     if (this->config().wall_loops.value > 0 || print.has_brim())
         append_used_physical_extruders_for_filament_id(print, this->config().wall_filament.value, object_extruders);
