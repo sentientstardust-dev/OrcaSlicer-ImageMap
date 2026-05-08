@@ -39,6 +39,16 @@ static void update_ui(wxWindow* window)
     Slic3r::GUI::wxGetApp().UpdateDarkUI(window);
 }
 
+static ModelObject *single_volume_model_object(Model *model)
+{
+    if (model == nullptr || model->objects.size() != 1)
+        return nullptr;
+    ModelObject *object = model->objects[0];
+    if (object == nullptr || object->volumes.size() != 1 || object->volumes[0] == nullptr)
+        return nullptr;
+    return object;
+}
+
 static const char g_min_cluster_color = 1;
 static const char g_max_color = 16;
 
@@ -104,8 +114,10 @@ ObjColorDialog::ObjColorDialog(wxWindow *parent, Slic3r::ObjDialogInOut &in_out,
     bool some_face_no_color = false;
     if (!in_out.deal_vertex_color) {
         auto temp0 = in_out.input_colors.size();
-        auto temp1 = in_out.model->objects[0]->volumes[0]->mesh_ptr()->facets_count();
-        some_face_no_color = temp0 < temp1;
+        if (ModelObject *object = single_volume_model_object(in_out.model)) {
+            auto temp1 = object->volumes[0]->mesh_ptr()->facets_count();
+            some_face_no_color = temp0 < temp1;
+        }
     }
     bool ok        = in_out.lost_material_name.empty() && !some_face_no_color;
     if (ok) {
@@ -275,14 +287,17 @@ ObjColorPanel::ObjColorPanel(wxWindow *parent, Slic3r::ObjDialogInOut &in_out, c
             auto      icon_sizer     = new wxBoxSizer(wxHORIZONTAL);
             auto plater     = wxGetApp().plater();
             {
-                auto mo = m_obj_in_out.model->objects[0];
-                mo->add_instance();
-                auto mv  = mo->volumes[0];
-                m_thumbnail_offset = Slic3r::Vec3d::Zero();
-                auto box = mo->bounding_box_exact();
-                if (box.min.x() < 0 || box.min.y() < 0 || box.min.z() < 0) {
-                    m_thumbnail_offset = Slic3r::Vec3d(box.min.x() < 0 ? -box.min.x() : 0, box.min.y() < 0 ? -box.min.y() : 0, box.min.z() < 0 ? -box.min.z() : 0);
-                    mv->translate(m_thumbnail_offset);
+                if (ModelObject *mo = single_volume_model_object(m_obj_in_out.model)) {
+                    mo->add_instance();
+                    auto mv  = mo->volumes[0];
+                    m_thumbnail_offset = Slic3r::Vec3d::Zero();
+                    auto box = mo->bounding_box_exact();
+                    if (box.min.x() < 0 || box.min.y() < 0 || box.min.z() < 0) {
+                        m_thumbnail_offset = Slic3r::Vec3d(box.min.x() < 0 ? -box.min.x() : 0,
+                                                           box.min.y() < 0 ? -box.min.y() : 0,
+                                                           box.min.z() < 0 ? -box.min.z() : 0);
+                        mv->translate(m_thumbnail_offset);
+                    }
                 }
             }
 
@@ -443,7 +458,11 @@ void ObjColorPanel::send_new_filament_to_ui()
 
 void ObjColorPanel::cancel_paint_color() {
     m_filament_ids.clear();
-    auto mo = m_obj_in_out.model->objects[0];
+    ModelObject *mo = single_volume_model_object(m_obj_in_out.model);
+    if (mo == nullptr) {
+        m_first_extruder_id = 1;
+        return;
+    }
     mo->config.set("extruder", 1);
     clear_instance_and_revert_offset();
     auto mv = mo->volumes[0];
@@ -785,6 +804,10 @@ void ObjColorPanel::deal_default_strategy()
 
 void ObjColorPanel::deal_thumbnail() {
     update_filament_ids();
+    if (single_volume_model_object(m_obj_in_out.model) == nullptr) {
+        m_deal_thumbnail_flag = false;
+        return;
+    }
     // generate model volume
     if (m_obj_in_out.deal_vertex_color) {
         if (m_obj_in_out.filament_ids.size() > 0) {
@@ -800,42 +823,37 @@ void ObjColorPanel::deal_thumbnail() {
 
 void ObjColorPanel::generate_thumbnail()
 {
-    if (m_deal_thumbnail_flag && m_obj_in_out.model->objects.size() == 1) {
-        std::vector<Slic3r::ColorRGBA> colors = GUI::wxGetApp().plater()->get_extruders_colors();
-        for (size_t i = 0; i < m_new_add_colors.size(); i++) {
-            Slic3r::ColorRGBA temp_color;
-            temp_color[0] = m_new_add_colors[i].Red() / 255.f;
-            temp_color[1] = m_new_add_colors[i].Green() / 255.f;
-            temp_color[2] = m_new_add_colors[i].Blue() / 255.f;
-            temp_color[3] = m_new_add_colors[i].Alpha() / 255.f;
-            colors.emplace_back(temp_color);
-        }
+    ModelObject *mo = single_volume_model_object(m_obj_in_out.model);
+    if (!m_deal_thumbnail_flag || mo == nullptr)
+        return;
 
-            auto mo = m_obj_in_out.model->objects[0];
-            wxGetApp().plater()->update_obj_preview_thumbnail(mo, 0, 0, colors, (int) m_camera_view_angle_type);
-            // get thumbnail image
-            PartPlate *plate = wxGetApp().plater()->get_partplate_list().get_plate(0);
-            auto &     data  = plate->obj_preview_thumbnail_data;
-            if (data.is_valid()) {
-                wxImage image(data.width, data.height);
-                image.InitAlpha();
-                for (unsigned int r = 0; r < data.height; ++r) {
-                    unsigned int rr = (data.height - 1 - r) * data.width;
-                    for (unsigned int c = 0; c < data.width; ++c) {
-                        unsigned char *px = (unsigned char *) data.pixels.data() + 4 * (rr + c);
-                        image.SetRGB((int) c, (int) r, px[0], px[1], px[2]);
-                        image.SetAlpha((int) c, (int) r, px[3]);
-                    }
-                }
-                image = image.Rescale(FromDIP(IMAGE_SIZE_WIDTH), FromDIP(IMAGE_SIZE_WIDTH));
-                m_image_button->SetBitmap(image);
-            }
-
+    std::vector<Slic3r::ColorRGBA> colors = GUI::wxGetApp().plater()->get_extruders_colors();
+    for (size_t i = 0; i < m_new_add_colors.size(); i++) {
+        Slic3r::ColorRGBA temp_color;
+        temp_color[0] = m_new_add_colors[i].Red() / 255.f;
+        temp_color[1] = m_new_add_colors[i].Green() / 255.f;
+        temp_color[2] = m_new_add_colors[i].Blue() / 255.f;
+        temp_color[3] = m_new_add_colors[i].Alpha() / 255.f;
+        colors.emplace_back(temp_color);
     }
-    else {
-#ifdef _WIN32
-        __debugbreak();
-#endif
+
+    wxGetApp().plater()->update_obj_preview_thumbnail(mo, 0, 0, colors, (int) m_camera_view_angle_type);
+    // get thumbnail image
+    PartPlate *plate = wxGetApp().plater()->get_partplate_list().get_plate(0);
+    auto &     data  = plate->obj_preview_thumbnail_data;
+    if (data.is_valid()) {
+        wxImage image(data.width, data.height);
+        image.InitAlpha();
+        for (unsigned int r = 0; r < data.height; ++r) {
+            unsigned int rr = (data.height - 1 - r) * data.width;
+            for (unsigned int c = 0; c < data.width; ++c) {
+                unsigned char *px = (unsigned char *) data.pixels.data() + 4 * (rr + c);
+                image.SetRGB((int) c, (int) r, px[0], px[1], px[2]);
+                image.SetAlpha((int) c, (int) r, px[3]);
+            }
+        }
+        image = image.Rescale(FromDIP(IMAGE_SIZE_WIDTH), FromDIP(IMAGE_SIZE_WIDTH));
+        m_image_button->SetBitmap(image);
     }
 }
 
@@ -850,7 +868,9 @@ void ObjColorPanel::set_view_angle_type(int value)
 
 void ObjColorPanel::clear_instance_and_revert_offset()
 {
-    auto mo = m_obj_in_out.model->objects[0];
+    ModelObject *mo = single_volume_model_object(m_obj_in_out.model);
+    if (mo == nullptr)
+        return;
     mo->clear_instances();
     auto mv  = mo->volumes[0];
     auto box = mo->bounding_box_exact();

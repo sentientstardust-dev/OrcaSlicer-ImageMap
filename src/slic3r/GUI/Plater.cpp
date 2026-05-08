@@ -1084,13 +1084,15 @@ public:
                                         const TextureMappingGlobalSettings &global_settings,
                                         const TextureMappingPrimeTowerImage &prime_tower_image,
                                         const TextureMappingPrimeTowerImage &prime_tower_image_back,
-                                        int initial_options_tab)
+                                        int initial_options_tab,
+                                        bool initial_strength_offsets_expanded)
         : wxDialog(parent, wxID_ANY, _L("Texture Mapping Options"), wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
         , m_global_settings(global_settings)
         , m_prime_tower_image(prime_tower_image)
         , m_prime_tower_image_back(prime_tower_image_back)
     {
         (void) generic_solver_mix_model;
+        m_strength_offsets_expanded = initial_strength_offsets_expanded;
         const int gap = FromDIP(8);
         auto *root = new wxBoxSizer(wxVERTICAL);
         auto *tab_row = new wxBoxSizer(wxHORIZONTAL);
@@ -1142,8 +1144,6 @@ public:
         tone_gamma_row->Add(new wxStaticText(image_page, wxID_ANY, _L("x")), 0, wxALIGN_CENTER_VERTICAL);
         image_root->Add(tone_gamma_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
 
-        auto *minimum_offsets_box = new wxStaticBoxSizer(wxVERTICAL, filament_page, _L("Per-filament minimum offset"));
-        auto *strengths_box = new wxStaticBoxSizer(wxVERTICAL, filament_page, _L("Per-filament strength"));
         const std::vector<wxString> channel_labels = texture_mapping_channel_labels(filament_color_mode);
         auto component_label = [&component_ids, &channel_labels](size_t i) {
             wxString text = wxString::Format("F%d", int(component_ids[i]));
@@ -1151,48 +1151,6 @@ public:
                 text += wxString::Format(" (%s)", channel_labels[i]);
             return text;
         };
-        auto add_percent_row = [this, gap, filament_page, component_label](wxStaticBoxSizer *box,
-                                                                           size_t idx,
-                                                                           int value,
-                                                                           std::vector<wxSlider*> &sliders,
-                                                                           std::vector<wxSpinCtrl*> &spins) {
-            auto *row = new wxBoxSizer(wxHORIZONTAL);
-            row->Add(new wxStaticText(filament_page, wxID_ANY, component_label(idx)), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-            auto *slider = new wxSlider(filament_page, wxID_ANY, value, 0, 100, wxDefaultPosition, wxSize(FromDIP(180), -1), wxSL_HORIZONTAL | wxSL_AUTOTICKS);
-            auto *spin = new wxSpinCtrl(filament_page, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(70), -1),
-                                        wxSP_ARROW_KEYS | wxALIGN_RIGHT, 0, 100, value);
-            slider->Bind(wxEVT_SLIDER, [spin](wxCommandEvent &evt) {
-                if (spin)
-                    spin->SetValue(evt.GetInt());
-            });
-            spin->Bind(wxEVT_SPINCTRL, [slider](wxSpinEvent &evt) {
-                if (slider)
-                    slider->SetValue(evt.GetInt());
-            });
-            row->Add(slider, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-            row->Add(spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
-            row->Add(new wxStaticText(filament_page, wxID_ANY, _L("%")), 0, wxALIGN_CENTER_VERTICAL);
-            sliders.emplace_back(slider);
-            spins.emplace_back(spin);
-            box->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
-        };
-        for (size_t i = 0; i < component_ids.size(); ++i) {
-            const int offset_value = i < component_minimum_offsets_pct.size() ?
-                std::clamp(int(std::lround(component_minimum_offsets_pct[i])), 0, 100) :
-                0;
-            add_percent_row(minimum_offsets_box, i, offset_value, m_minimum_offset_sliders, m_minimum_offset_spins);
-        }
-        for (size_t i = 0; i < component_ids.size(); ++i) {
-            const int strength_value = i < component_strengths_pct.size() ?
-                std::clamp(int(std::lround(component_strengths_pct[i])), 0, 100) :
-                100;
-            add_percent_row(strengths_box, i, strength_value, m_strength_sliders, m_strength_spins);
-        }
-        filament_root->Add(minimum_offsets_box, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
-        filament_root->Add(strengths_box, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
-        auto *reset_btn = new wxButton(filament_page, wxID_ANY, _L("Reset strengths and offsets"));
-        reset_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { reset_strengths_and_offsets(); });
-        filament_root->Add(reset_btn, 0, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, gap);
 
         auto *td_box = new wxStaticBoxSizer(wxVERTICAL, filament_page, _L("Transmission distance"));
         auto *td_mode_row = new wxBoxSizer(wxHORIZONTAL);
@@ -1214,7 +1172,7 @@ public:
         td_box->Add(td_mode_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
         for (size_t i = 0; i < component_ids.size(); ++i) {
             auto *row = new wxBoxSizer(wxHORIZONTAL);
-            row->Add(new wxStaticText(filament_page, wxID_ANY, component_label(i)), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+            row->Add(new wxStaticText(filament_page, wxID_ANY, component_label(i) + _L(" TD")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
             const double value = i < component_transmission_distances_mm.size() ?
                 std::clamp(double(component_transmission_distances_mm[i]), 0.0, 50.0) :
                 0.0;
@@ -1235,6 +1193,64 @@ public:
             td_box->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
         }
         filament_root->Add(td_box, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
+        m_strength_offsets_toggle_button = new wxButton(filament_page, wxID_ANY, wxEmptyString);
+        m_strength_offsets_toggle_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+            m_strength_offsets_expanded = !m_strength_offsets_expanded;
+            update_strength_offsets_visibility(true);
+        });
+        filament_root->Add(m_strength_offsets_toggle_button, 0, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
+        m_strength_offsets_panel = new wxPanel(filament_page, wxID_ANY);
+        auto *strength_offsets_root = new wxBoxSizer(wxVERTICAL);
+        m_strength_offsets_panel->SetSizer(strength_offsets_root);
+        auto *minimum_offsets_box = new wxStaticBoxSizer(wxVERTICAL, m_strength_offsets_panel, _L("Per-filament minimum offset"));
+        auto *strengths_box = new wxStaticBoxSizer(wxVERTICAL, m_strength_offsets_panel, _L("Per-filament strength"));
+        auto add_percent_row = [this, gap, component_label](wxWindow *parent,
+                                                            wxStaticBoxSizer *box,
+                                                            size_t idx,
+                                                            int value,
+                                                            std::vector<wxSlider*> &sliders,
+                                                            std::vector<wxSpinCtrl*> &spins) {
+            auto *row = new wxBoxSizer(wxHORIZONTAL);
+            row->Add(new wxStaticText(parent, wxID_ANY, component_label(idx)), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+            auto *slider = new wxSlider(parent, wxID_ANY, value, 0, 100, wxDefaultPosition, wxSize(FromDIP(180), -1), wxSL_HORIZONTAL | wxSL_AUTOTICKS);
+            auto *spin = new wxSpinCtrl(parent, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(70), -1),
+                                        wxSP_ARROW_KEYS | wxALIGN_RIGHT, 0, 100, value);
+            slider->Bind(wxEVT_SLIDER, [spin](wxCommandEvent &evt) {
+                if (spin)
+                    spin->SetValue(evt.GetInt());
+            });
+            spin->Bind(wxEVT_SPINCTRL, [slider](wxSpinEvent &evt) {
+                if (slider)
+                    slider->SetValue(evt.GetInt());
+            });
+            row->Add(slider, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+            row->Add(spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+            row->Add(new wxStaticText(parent, wxID_ANY, _L("%")), 0, wxALIGN_CENTER_VERTICAL);
+            sliders.emplace_back(slider);
+            spins.emplace_back(spin);
+            box->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+        };
+        for (size_t i = 0; i < component_ids.size(); ++i) {
+            const int offset_value = i < component_minimum_offsets_pct.size() ?
+                std::clamp(int(std::lround(component_minimum_offsets_pct[i])), 0, 100) :
+                0;
+            add_percent_row(m_strength_offsets_panel, minimum_offsets_box, i, offset_value, m_minimum_offset_sliders, m_minimum_offset_spins);
+        }
+        for (size_t i = 0; i < component_ids.size(); ++i) {
+            const int strength_value = i < component_strengths_pct.size() ?
+                std::clamp(int(std::lround(component_strengths_pct[i])), 0, 100) :
+                100;
+            add_percent_row(m_strength_offsets_panel, strengths_box, i, strength_value, m_strength_sliders, m_strength_spins);
+        }
+        strength_offsets_root->Add(minimum_offsets_box, 0, wxEXPAND | wxBOTTOM, gap);
+        strength_offsets_root->Add(strengths_box, 0, wxEXPAND | wxBOTTOM, gap);
+        auto *reset_btn = new wxButton(m_strength_offsets_panel, wxID_ANY, _L("Reset strengths and offsets"));
+        reset_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { reset_strengths_and_offsets(); });
+        strength_offsets_root->Add(reset_btn, 0, wxALIGN_RIGHT | wxBOTTOM, gap);
+        filament_root->Add(m_strength_offsets_panel, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        update_strength_offsets_visibility(false);
 
         m_force_sequential_filaments_checkbox =
             new wxCheckBox(filament_page, wxID_ANY, _L("Force sequential order for filaments"));
@@ -1463,12 +1479,7 @@ public:
         m_options_book->AddPage(preview_page, _L("Preview Options"));
         m_options_book->AddPage(experimental_page, _L("Experimental Options"));
         m_options_book->AddPage(global_page, _L("Prime Tower Texture Mapping"));
-        m_options_book->SetMinSize(wxSize(FromDIP(420),
-                                          std::max({image_page->GetBestSize().y,
-                                                    filament_page->GetBestSize().y,
-                                                    preview_page->GetBestSize().y,
-                                                    experimental_page->GetBestSize().y,
-                                                    global_page->GetBestSize().y})));
+        update_options_book_min_size();
         m_options_tab_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &evt) {
             if (m_options_book)
                 m_options_book->SetSelection(std::clamp(evt.GetSelection(), 0, 4));
@@ -1574,6 +1585,7 @@ public:
     const TextureMappingPrimeTowerImage& prime_tower_image() const { return m_prime_tower_image; }
     const TextureMappingPrimeTowerImage& prime_tower_image_back() const { return m_prime_tower_image_back; }
     int selected_options_tab() const { return std::clamp(m_options_tab_choice ? m_options_tab_choice->GetSelection() : 0, 0, 4); }
+    bool strength_offsets_expanded() const { return m_strength_offsets_expanded; }
 
     std::vector<float> component_strengths_pct() const
     {
@@ -1739,11 +1751,43 @@ private:
                 spin->SetValue(100);
     }
 
+    void update_options_book_min_size()
+    {
+        if (m_options_book == nullptr)
+            return;
+        int max_height = 0;
+        for (size_t i = 0; i < m_options_book->GetPageCount(); ++i) {
+            wxWindow *page = m_options_book->GetPage(i);
+            if (page != nullptr)
+                max_height = std::max(max_height, page->GetBestSize().y);
+        }
+        m_options_book->SetMinSize(wxSize(FromDIP(420), max_height));
+    }
+
+    void update_strength_offsets_visibility(bool fit_dialog)
+    {
+        if (m_strength_offsets_toggle_button != nullptr)
+            m_strength_offsets_toggle_button->SetLabel(m_strength_offsets_expanded ?
+                                                        _L("Hide Filament Strengths & Offsets") :
+                                                        _L("Show Filament Strengths & Offsets"));
+        if (m_strength_offsets_panel != nullptr)
+            m_strength_offsets_panel->Show(m_strength_offsets_expanded);
+        if (!fit_dialog)
+            return;
+        update_options_book_min_size();
+        if (GetSizer() != nullptr) {
+            Layout();
+            Fit();
+        }
+    }
+
     wxChoice *m_options_tab_choice {nullptr};
     wxSimplebook *m_options_book {nullptr};
     wxChoice *m_texture_mapping_mode_choice {nullptr};
     wxSpinCtrlDouble *m_tone_gamma_spin {nullptr};
     wxChoice *m_transmission_distance_calibration_mode_choice {nullptr};
+    wxButton *m_strength_offsets_toggle_button {nullptr};
+    wxPanel *m_strength_offsets_panel {nullptr};
     wxSlider *m_preview_opacity_slider {nullptr};
     wxSpinCtrl *m_preview_opacity_spin {nullptr};
     wxCheckBox *m_force_sequential_filaments_checkbox {nullptr};
@@ -1773,6 +1817,7 @@ private:
     std::vector<wxSlider*> m_strength_sliders;
     std::vector<wxSpinCtrl*> m_strength_spins;
     std::vector<wxSpinCtrlDouble*> m_transmission_distance_spins;
+    bool m_strength_offsets_expanded {false};
 };
 
 } // namespace
@@ -1909,6 +1954,7 @@ struct Sidebar::priv
     Button* m_btn_add_texture_map = nullptr;
     std::unordered_set<size_t> m_expanded_texture_mapping_rows;
     int m_texture_mapping_advanced_options_tab = 0;
+    bool m_texture_mapping_filament_strength_offsets_expanded = false;
     wxPanel* m_panel_project_title;
     ScalableButton* m_filament_icon = nullptr;
     Button * m_flushing_volume_btn = nullptr;
@@ -5748,9 +5794,11 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     bundle->texture_mapping_global_settings,
                                                     wxGetApp().model().texture_mapping_prime_tower_image,
                                                     wxGetApp().model().texture_mapping_prime_tower_image_back,
-                                                    p->m_texture_mapping_advanced_options_tab);
+                                                    p->m_texture_mapping_advanced_options_tab,
+                                                    p->m_texture_mapping_filament_strength_offsets_expanded);
             const int result = dlg.ShowModal();
             p->m_texture_mapping_advanced_options_tab = dlg.selected_options_tab();
+            p->m_texture_mapping_filament_strength_offsets_expanded = dlg.strength_offsets_expanded();
             if (result != wxID_OK)
                 return;
             updated.texture_mapping_mode = dlg.texture_mapping_mode();

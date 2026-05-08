@@ -139,14 +139,12 @@ bool filament_state_uses_surface_gradient_preview(unsigned int filament_id,
     return zone != nullptr && zone->is_2d_gradient();
 }
 
-bool texture_preview_has_surface_gradient_state(size_t states_count,
-                                                unsigned int base_filament_id,
-                                                size_t num_physical,
-                                                const TextureMappingManager *texture_mgr)
+bool texture_preview_used_states_have_surface_gradient(const std::vector<bool> &used_states,
+                                                       size_t num_physical,
+                                                       const TextureMappingManager *texture_mgr)
 {
-    for (size_t state_id = 0; state_id < states_count; ++state_id) {
-        const unsigned int filament_id = state_id == 0 ? base_filament_id : unsigned(state_id);
-        if (filament_state_uses_surface_gradient_preview(filament_id, num_physical, texture_mgr))
+    for (size_t state_id = 1; state_id < used_states.size(); ++state_id) {
+        if (used_states[state_id] && filament_state_uses_surface_gradient_preview(unsigned(state_id), num_physical, texture_mgr))
             return true;
     }
 
@@ -669,9 +667,16 @@ void GLVolume::simple_render(GLShaderProgram* shader,
         const bool base_uses_surface_gradient_preview =
             filament_state_uses_surface_gradient_preview(base_filament_id, num_physical, texture_mgr);
         const bool base_uses_image_texture_preview = base_uses_texture_preview && !base_uses_surface_gradient_preview;
+        const bool has_surface_gradient_preview_state =
+            base_uses_surface_gradient_preview ||
+            (has_mmu_segmentation &&
+             texture_preview_used_states_have_surface_gradient(model_volume->mmu_segmentation_facets.get_data().used_states,
+                                                               num_physical,
+                                                               texture_mgr));
         const bool has_texture_mapping_color_preview_data =
             base_uses_texture_preview && model_volume_has_texture_mapping_color_preview_data(*model_volume);
         const bool has_texture_preview_data = model_volume_has_texture_preview_data(*model_volume);
+        const Transform3d preview_world_matrix = this->world_matrix();
         use_original_mesh_texture_preview =
             !has_mmu_segmentation &&
             !has_texture_mapping_color_preview_data &&
@@ -708,6 +713,15 @@ void GLVolume::simple_render(GLShaderProgram* shader,
                                     (preview_visual_signature << 6) + (preview_visual_signature >> 2);
         preview_visual_signature ^= model_volume_texture_mapping_color_preview_signature(*model_volume) + 0x9e3779b97f4a7c15ull +
                                     (preview_visual_signature << 6) + (preview_visual_signature >> 2);
+        if (has_surface_gradient_preview_state) {
+            for (int row = 0; row < 4; ++row) {
+                for (int col = 0; col < 4; ++col) {
+                    preview_visual_signature ^= std::hash<int>{}(int(std::lround(preview_world_matrix(row, col) * 1000000.0))) +
+                                                0x9e3779b97f4a7c15ull + (preview_visual_signature << 6) +
+                                                (preview_visual_signature >> 2);
+                }
+            }
+        }
         if (model_volume->mmu_segmentation_facets.timestamp() != mmuseg_ts ||
             preview_visual_signature != mmuseg_texture_preview_visual_signature) {
             mmuseg_models.clear();
@@ -760,14 +774,14 @@ void GLVolume::simple_render(GLShaderProgram* shader,
             if (has_texture_preview_state &&
                 (has_active_texture_mapping_color_preview_data ||
                 !has_texture_preview_data ||
-                texture_preview_has_surface_gradient_state(triangles_per_type.size(), base_filament_id, num_physical, texture_mgr))) {
+                has_surface_gradient_preview_state)) {
                 build_mmu_vertex_color_preview_models(*model_volume,
                                                       triangles_per_type,
                                                       state_colors,
                                                       base_filament_id,
                                                       num_physical,
                                                       texture_mgr,
-                                                      this->world_matrix(),
+                                                      preview_world_matrix,
                                                       mmuseg_vertex_color_preview_models,
                                                       mmuseg_vertex_color_preview_colors,
                                                       mmuseg_vertex_color_preview_filament_ids);
