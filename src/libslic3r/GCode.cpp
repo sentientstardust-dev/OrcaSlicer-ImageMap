@@ -9784,6 +9784,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                     std::clamp(zone->tone_gamma, 0.5f, 3.f);
                             const float texture_sagging_ratio =
                                 std::isfinite(zone->sagging_ratio) ? std::clamp(zone->sagging_ratio, 0.f, 6.f) : 0.f;
+                            const bool reduce_outer_surface_texture =
+                                vertex_color_match_mode && zone->reduce_outer_surface_texture && !compact_offset_mode;
 
                             const bool raw_texture_mapping_mode =
                                 zone->texture_mapping_mode == int(TextureMappingZone::TextureMappingRawValues);
@@ -10057,6 +10059,41 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                         continue;
                                     }
                                     outer_wall_gradient_segment_mods.emplace_back(mod);
+                                }
+
+                                if (reduce_outer_surface_texture && max_width_delta_limit_mm > EPSILON) {
+                                    double weighted_shift_mm = 0.0;
+                                    double weighted_length_mm = 0.0;
+                                    double weighted_balance_weight_mm = 0.0;
+                                    for (const OuterWallGradientSegmentMod &mod : outer_wall_gradient_segment_mods) {
+                                        if (mod.length_mm <= EPSILON || !std::isfinite(mod.centerline_shift_mm))
+                                            continue;
+                                        weighted_shift_mm += double(mod.centerline_shift_mm) * mod.length_mm;
+                                        weighted_length_mm += mod.length_mm;
+                                        weighted_balance_weight_mm += double(mod.balance_weight) * mod.length_mm;
+                                    }
+                                    if (weighted_length_mm > EPSILON && weighted_balance_weight_mm > EPSILON) {
+                                        const float average_shift_mm = float(weighted_shift_mm / weighted_length_mm);
+                                        const float target_average_shift_mm = base_centerline_shift_mm + 0.25f * max_width_delta_limit_mm;
+                                        const float balance_weight_average = float(weighted_balance_weight_mm / weighted_length_mm);
+                                        const float balance_mm =
+                                            std::clamp((target_average_shift_mm - average_shift_mm) /
+                                                           std::max(balance_weight_average, float(EPSILON)),
+                                                       -0.5f * max_width_delta_limit_mm,
+                                                       0.5f * max_width_delta_limit_mm);
+                                        outer_wall_gradient_dynamic_ctx.centerline_shift_balance_mm = balance_mm;
+                                        outer_wall_gradient_dynamic_ctx.centerline_shift_balance_weight_scale = 1.f;
+                                        for (OuterWallGradientSegmentMod &mod : outer_wall_gradient_segment_mods) {
+                                            if (mod.length_mm <= EPSILON)
+                                                continue;
+                                            const float balanced_shift_mm =
+                                                std::clamp(mod.centerline_shift_mm + balance_mm * mod.balance_weight,
+                                                           0.f,
+                                                           base_centerline_shift_mm + 0.5f * max_width_delta_limit_mm);
+                                            if (!apply_centerline_shift_to_mod(mod, balanced_shift_mm))
+                                                mod = OuterWallGradientSegmentMod{};
+                                        }
+                                    }
                                 }
 
                                 outer_wall_gradient_modulated_path = std::any_of(

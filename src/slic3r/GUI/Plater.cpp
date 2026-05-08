@@ -590,6 +590,17 @@ static std::vector<unsigned int> texture_mapping_selected_ids(const TextureMappi
     return ids;
 }
 
+static std::vector<unsigned int> texture_mapping_checkbox_ordered_ids(const TextureMappingZone &zone, size_t num_physical)
+{
+    const std::vector<unsigned int> selected = texture_mapping_selected_ids(zone, num_physical);
+    std::vector<unsigned int> ordered;
+    ordered.reserve(selected.size());
+    for (size_t id = 1; id <= std::min<size_t>(num_physical, 9); ++id)
+        if (std::find(selected.begin(), selected.end(), unsigned(id)) != selected.end())
+            ordered.emplace_back(unsigned(id));
+    return ordered.size() >= 2 ? ordered : selected;
+}
+
 static std::string encode_texture_mapping_float_values(const std::vector<float> &values)
 {
     std::ostringstream ss;
@@ -5742,18 +5753,15 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                           zone_index,
                                           mgr_ptr,
                                           palette,
-                                          physical_colors,
                                           apply_zone,
                                           bundle,
                                           set_config_string](wxCommandEvent &) {
             if (zone_index >= mgr_ptr->zones().size())
                 return;
             TextureMappingZone updated = mgr_ptr->zones()[zone_index];
-            std::vector<unsigned int> ids = updated.is_image_texture() ?
-                TextureMappingManager::effective_texture_component_ids(updated, palette.size(), physical_colors) :
-                texture_mapping_selected_ids(updated, palette.size());
+            const std::vector<unsigned int> ids = texture_mapping_checkbox_ordered_ids(updated, palette.size());
             if (ids.empty())
-                ids = texture_mapping_selected_ids(updated, palette.size());
+                return;
             std::vector<float> strengths;
             std::vector<float> offsets;
             std::vector<float> transmission_distances;
@@ -5807,6 +5815,11 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.transmission_distance_calibration_mode = dlg.transmission_distance_calibration_mode();
             updated.preview_opacity_pct = dlg.preview_opacity_pct();
             updated.force_sequential_filaments = dlg.force_sequential_filaments();
+            if (updated.force_sequential_filaments && ids.size() >= 2) {
+                updated.component_ids = encode_texture_mapping_component_ids(ids);
+                updated.component_a = ids[0];
+                updated.component_b = ids[1];
+            }
             updated.auto_adjust_filament_selection = dlg.auto_adjust_filament_selection();
             updated.preview_limit_resolution = dlg.preview_limit_resolution();
             updated.reduce_outer_surface_texture = dlg.reduce_outer_surface_texture();

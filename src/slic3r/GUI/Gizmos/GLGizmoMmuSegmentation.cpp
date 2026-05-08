@@ -5246,6 +5246,17 @@ static bool apply_dialog_vertex_filaments_to_color_regions(ModelObject          
     return changed && offset == vertex_filament_ids.size();
 }
 
+static std::unique_ptr<Model> build_color_region_dialog_preview_model(const ModelObject &object, size_t vertex_count)
+{
+    TriangleMesh mesh = object.raw_mesh();
+    if (mesh.empty() || mesh.its.vertices.size() != vertex_count)
+        return nullptr;
+
+    std::unique_ptr<Model> preview_model = std::make_unique<Model>();
+    preview_model->add_object(object.name.c_str(), object.input_file.c_str(), std::move(mesh));
+    return preview_model;
+}
+
 static bool convert_object_to_color_regions(ModelObject &object, const ManagedColorDataCreateSource &source, wxWindow *parent)
 {
     if (object_has_color_regions(object))
@@ -5271,13 +5282,15 @@ static bool convert_object_to_color_regions(ModelObject &object, const ManagedCo
 
     std::vector<unsigned char> filament_ids;
     unsigned char first_extruder_id = 1;
-    const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config();
+    std::unique_ptr<Model> preview_model = build_color_region_dialog_preview_model(object, input_colors.size());
+    const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config(nullptr, false);
     ObjDialogInOut in_out;
     in_out.input_colors = input_colors;
     in_out.is_single_color = is_single_color;
     in_out.filament_ids = filament_ids;
     in_out.first_extruder_id = first_extruder_id;
     in_out.deal_vertex_color = true;
+    in_out.model = preview_model.get();
     ObjColorDialog color_dlg(parent, in_out, extruder_colours);
     if (color_dlg.ShowModal() != wxID_OK)
         return false;
@@ -6650,7 +6663,7 @@ void GLGizmoMmuSegmentation::open_obj_vertex_color_mapping_dialog()
 
     std::vector<unsigned char> filament_ids;
     unsigned char first_extruder_id = 1;
-    const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config();
+    const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config(nullptr, false);
     ObjDialogInOut in_out;
     in_out.input_colors = input_colors;
     in_out.is_single_color = is_single_color;
