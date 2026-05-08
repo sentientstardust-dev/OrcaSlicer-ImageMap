@@ -7331,6 +7331,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
     struct TextureSampleData {
         std::array<float, 4> rgba { { 0.f, 0.f, 0.f, 1.f } };
         std::vector<float>   raw_component_weights;
+        bool                 raw_component_weights_from_texture { false };
     };
 
     struct WeightedTextureSample {
@@ -7338,16 +7339,18 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
         float               y_mm { 0.f };
         std::array<float, 4> rgba { { 0.f, 0.f, 0.f, 1.f } };
         std::vector<float>   raw_component_weights;
+        bool                 raw_component_weights_from_texture { false };
         float               weight { 0.f };
     };
     std::vector<WeightedTextureSample> samples;
     samples.reserve(8192);
 
-    auto accumulate_sample = [&samples](float x_mm,
-                                        float y_mm,
-                                        const std::array<float, 4> &rgba,
-                                        float sample_weight,
-                                        std::vector<float> raw_component_weights = {}) {
+    auto accumulate_sample = [&samples, component_count](float x_mm,
+                                                        float y_mm,
+                                                        const std::array<float, 4> &rgba,
+                                                        float sample_weight,
+                                                        std::vector<float> raw_component_weights = {},
+                                                        bool raw_component_weights_from_texture = false) {
         if (!std::isfinite(x_mm) || !std::isfinite(y_mm) || sample_weight <= EPSILON)
             return;
         if (!std::isfinite(sample_weight) ||
@@ -7356,8 +7359,10 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
             !std::isfinite(rgba[2]) ||
             !std::isfinite(rgba[3]))
             return;
+        if (raw_component_weights.size() != component_count)
+            raw_component_weights_from_texture = false;
 
-        samples.push_back({ x_mm, y_mm, rgba, std::move(raw_component_weights), sample_weight });
+        samples.push_back({ x_mm, y_mm, rgba, std::move(raw_component_weights), raw_component_weights_from_texture, sample_weight });
     };
 
     struct LayerPlaneSamplePoint {
@@ -7473,7 +7478,8 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                               float(world_pos.y()),
                               sample_data.rgba,
                               sample_weight,
-                              std::move(sample_data.raw_component_weights));
+                              std::move(sample_data.raw_component_weights),
+                              sample_data.raw_component_weights_from_texture);
         }
 
         return true;
@@ -7483,7 +7489,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                                                             const Vec3d &p1,
                                                             const Vec3d &p2,
                                                             const std::array<float, 4> &rgba) {
-        if (accumulate_layer_plane_triangle_samples(p0, p1, p2, [&rgba](const Vec3f &) { return TextureSampleData{ rgba, {} }; }))
+        if (accumulate_layer_plane_triangle_samples(p0, p1, p2, [&rgba](const Vec3f &) { return TextureSampleData{ rgba, {}, false }; }))
             return;
 
         const float max_world_edge_mm = std::max({
@@ -7640,7 +7646,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                     }
                     if (raw_component_weights.size() != component_count)
                         rgba = composite_rgba_over_background_for_gcode(rgba, background_color);
-                    return TextureSampleData{ rgba, std::move(raw_component_weights) };
+                    return TextureSampleData{ rgba, std::move(raw_component_weights), use_raw_uv_texture };
                 };
 
                 auto sample_data_for_barycentric = [&](const Vec3f &barycentric) {
@@ -7711,7 +7717,8 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                                           float(world_pos.y()),
                                           sample_data.rgba,
                                           sample_weight,
-                                          std::move(sample_data.raw_component_weights));
+                                          std::move(sample_data.raw_component_weights),
+                                          sample_data.raw_component_weights_from_texture);
                         sampled_from_uv_texture = true;
                     }
                 }
@@ -7789,6 +7796,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
     weight_field.sample_y_mm.resize(sample_count);
     weight_field.sample_weight.resize(sample_count);
     weight_field.sample_component_weights.assign(sample_count * component_count, 0.f);
+    weight_field.raw_component_weights_from_texture = false;
 
     std::vector<float> fallback_acc(component_count, 0.f);
     float fallback_weight = 0.f;
@@ -7796,6 +7804,8 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
         const WeightedTextureSample &sample = samples[sample_idx];
         if (sample.weight <= EPSILON)
             continue;
+        if (sample.raw_component_weights_from_texture)
+            weight_field.raw_component_weights_from_texture = true;
 
         weight_field.sample_x_mm[sample_idx] = sample.x_mm;
         weight_field.sample_y_mm[sample_idx] = sample.y_mm;
@@ -7911,7 +7921,8 @@ static float sample_vertex_color_weight_field_for_gcode(const VertexColorOverhan
                                                         bool                                   high_resolution_texture_sampling,
                                                         bool                                   compact_offset_mode = false)
 {
-    if (compact_offset_mode && !weight_field.empty() && component_idx < weight_field.component_count) {
+    if (compact_offset_mode && !weight_field.raw_component_weights_from_texture && !weight_field.empty() &&
+        component_idx < weight_field.component_count) {
         std::vector<float> values(weight_field.component_count, 0.f);
         float max_value = 0.f;
         for (size_t idx = 0; idx < weight_field.component_count; ++idx) {

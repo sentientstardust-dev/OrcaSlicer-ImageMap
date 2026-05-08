@@ -4343,6 +4343,74 @@ static void assign_texture_mapping_zone_preserving_painted_regions(ModelObject &
     }
 }
 
+static bool image_texture_zone_is_usable_for_projection(const TextureMappingManager &texture_mgr, unsigned int zone_id)
+{
+    const TextureMappingZone *zone = texture_mgr.zone_from_id(zone_id);
+    return zone != nullptr && zone->enabled && !zone->deleted && zone->is_image_texture();
+}
+
+static unsigned int painted_image_texture_zone_id_for_projection(const ModelObject &object)
+{
+    if (wxGetApp().preset_bundle == nullptr)
+        return 0;
+
+    const TextureMappingManager &texture_mgr = wxGetApp().preset_bundle->texture_mapping_zones;
+    std::vector<unsigned int> painted_ids;
+    for (const ModelVolume *volume : object.volumes) {
+        if (volume == nullptr || !volume->is_model_part() || volume->mmu_segmentation_facets.empty())
+            continue;
+
+        const auto &used_states = volume->mmu_segmentation_facets.get_data().used_states;
+        for (size_t state_idx = static_cast<size_t>(EnforcerBlockerType::Extruder1); state_idx < used_states.size(); ++state_idx) {
+            if (used_states[state_idx] && image_texture_zone_is_usable_for_projection(texture_mgr, unsigned(state_idx)))
+                painted_ids.emplace_back(unsigned(state_idx));
+        }
+    }
+
+    for (const TextureMappingZone &zone : texture_mgr.zones())
+        if (image_texture_zone_is_usable_for_projection(texture_mgr, zone.zone_id) &&
+            std::find(painted_ids.begin(), painted_ids.end(), zone.zone_id) != painted_ids.end())
+            return zone.zone_id;
+    return 0;
+}
+
+static unsigned int base_image_texture_zone_id_for_projection(const ModelObject &object)
+{
+    if (wxGetApp().preset_bundle == nullptr)
+        return 0;
+
+    const TextureMappingManager &texture_mgr = wxGetApp().preset_bundle->texture_mapping_zones;
+    std::vector<unsigned int> base_ids;
+    if (const ConfigOption *opt = object.config.option("extruder"); opt != nullptr) {
+        const int extruder_id = opt->getInt();
+        if (extruder_id > 0 && image_texture_zone_is_usable_for_projection(texture_mgr, unsigned(extruder_id)))
+            base_ids.emplace_back(unsigned(extruder_id));
+    }
+
+    for (const ModelVolume *volume : object.volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+        const int extruder_id = volume->extruder_id();
+        if (extruder_id > 0 && image_texture_zone_is_usable_for_projection(texture_mgr, unsigned(extruder_id)))
+            base_ids.emplace_back(unsigned(extruder_id));
+    }
+
+    for (const TextureMappingZone &zone : texture_mgr.zones())
+        if (image_texture_zone_is_usable_for_projection(texture_mgr, zone.zone_id) &&
+            std::find(base_ids.begin(), base_ids.end(), zone.zone_id) != base_ids.end())
+            return zone.zone_id;
+    return 0;
+}
+
+static unsigned int texture_mapping_zone_id_for_image_projection(ModelObject &object)
+{
+    if (const unsigned int painted_id = painted_image_texture_zone_id_for_projection(object); painted_id != 0)
+        return painted_id;
+    if (const unsigned int base_id = base_image_texture_zone_id_for_projection(object); base_id != 0)
+        return base_id;
+    return ensure_texture_mapping_zone();
+}
+
 struct ManagedRegionColorSource
 {
     std::vector<std::vector<TriangleSelector::FacetStateTriangle>> triangles_per_type;
@@ -8742,21 +8810,13 @@ bool GLGizmoImageProjection::project_image_to_selected_object()
     if (!changed)
         return false;
 
-    unsigned int raw_texture_mapping_filament_id = 0;
-    if (m_raw_atlas.valid()) {
-        raw_texture_mapping_filament_id = ensure_texture_mapping_zone();
-        if (raw_texture_mapping_filament_id != 0) {
-            object->config.set("extruder", int(raw_texture_mapping_filament_id));
-            for (ModelVolume *volume : object->volumes)
-                if (volume != nullptr && volume->is_model_part())
-                    volume->config.set("extruder", int(raw_texture_mapping_filament_id));
-            enable_texture_mapping_zone_simulated_preview(raw_texture_mapping_filament_id);
-        }
-    }
+    const bool whole_image_texture_mapped_without_regions = object_is_whole_image_texture_mapped_without_regions(*object);
+    const unsigned int texture_mapping_filament_id =
+        (!whole_image_texture_mapped_without_regions || m_raw_atlas.valid()) ? texture_mapping_zone_id_for_image_projection(*object) : 0;
+    if (m_raw_atlas.valid() && texture_mapping_filament_id != 0)
+        enable_texture_mapping_zone_simulated_preview(texture_mapping_filament_id);
 
-    if (!object_is_whole_image_texture_mapped_without_regions(*object)) {
-        const unsigned int texture_mapping_filament_id =
-            raw_texture_mapping_filament_id != 0 ? raw_texture_mapping_filament_id : ensure_texture_mapping_zone();
+    if (!whole_image_texture_mapped_without_regions) {
         if (texture_mapping_filament_id != 0) {
             const Selection &selection = m_parent.get_selection();
             const int instance_idx = selection.get_instance_idx();
