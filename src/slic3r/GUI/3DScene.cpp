@@ -696,6 +696,8 @@ void GLVolume::simple_render(GLShaderProgram* shader,
 
         color_volume = has_mmu_segmentation;
         size_t preview_visual_signature = texture_preview_settings_signature(num_physical, texture_mgr);
+        preview_visual_signature ^= size_t(base_filament_id) + 0x9e3779b97f4a7c15ull +
+                                    (preview_visual_signature << 6) + (preview_visual_signature >> 2);
         preview_visual_signature ^= texture_preview_simulation_generation_signature() + 0x9e3779b97f4a7c15ull +
                                     (preview_visual_signature << 6) + (preview_visual_signature >> 2);
         preview_visual_signature ^= model_volume_texture_preview_signature(*model_volume) + 0x9e3779b97f4a7c15ull +
