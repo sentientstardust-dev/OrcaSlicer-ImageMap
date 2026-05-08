@@ -1893,12 +1893,17 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             for (size_t state_idx = static_cast<size_t>(EnforcerBlockerType::Extruder1); state_idx < used_facet_states.size(); ++state_idx) {
                 if (!used_facet_states[state_idx] || state_idx > num_total_filaments)
                     continue;
-                painting_extruders.emplace_back(state_idx);
-                append_texture_mapping_component_extruders(m_texture_mapping_mgr,
-                                                           static_cast<unsigned int>(state_idx),
-                                                           num_extruders,
-                                                           physical_filament_colors,
-                                                           painting_extruders);
+                const unsigned int state_id = static_cast<unsigned int>(state_idx);
+                if (state_idx <= num_extruders) {
+                    painting_extruders.emplace_back(state_id);
+                } else if (m_texture_mapping_mgr.is_texture_mapping_zone_id(state_id)) {
+                    painting_extruders.emplace_back(state_id);
+                    append_texture_mapping_component_extruders(m_texture_mapping_mgr,
+                                                               state_id,
+                                                               num_extruders,
+                                                               physical_filament_colors,
+                                                               painting_extruders);
+                }
             }
             std::sort(painting_extruders.begin(), painting_extruders.end());
             painting_extruders.erase(std::unique(painting_extruders.begin(), painting_extruders.end()), painting_extruders.end());

@@ -1069,8 +1069,10 @@ static inline void apply_mm_segmentation(PrintObject &print_object, ThrowOnCance
             const auto  &layer_ranges   = print_object.shared_regions()->layer_ranges;
             double       z              = print_object.get_layer(int(range.begin()))->slice_z;
             auto         it_layer_range = layer_range_first(layer_ranges, z);
-            // BBS
-            const size_t num_extruders = print_object.print()->config().filament_diameter.size();
+            const size_t                 num_physical = print_object.print()->config().filament_diameter.size();
+            const TextureMappingManager &texture_mgr  = print_object.print()->texture_mapping_manager();
+            const size_t                 num_channels = segmentation.empty() ? 0 : segmentation.front().size();
+            const size_t                 num_extruders = num_channels > 0 ? num_channels - 1 : 0;
 
             struct ByExtruder {
                 ExPolygons  expolygons;
@@ -1090,12 +1092,15 @@ static inline void apply_mm_segmentation(PrintObject &print_object, ThrowOnCance
                 it_layer_range = layer_range_next(layer_ranges, it_layer_range, layer.slice_z);
                 const PrintObjectRegions::LayerRangeRegions &layer_range = *it_layer_range;
                 // Gather per extruder expolygons.
+                assert(segmentation[layer_id].size() == num_channels);
                 by_extruder.assign(num_extruders, ByExtruder());
                 by_region.assign(layer.region_count(), ByRegion());
                 bool layer_split = false;
-                for (size_t extruder_id = 0; extruder_id < num_extruders; ++ extruder_id) {
-                    ByExtruder &region = by_extruder[extruder_id];
-                    append(region.expolygons, std::move(segmentation[layer_id][extruder_id]));
+                for (size_t channel_idx = 1; channel_idx < num_channels; ++ channel_idx) {
+                    if (channel_idx > num_physical && !texture_mgr.is_texture_mapping_zone_id(unsigned(channel_idx)))
+                        continue;
+                    ByExtruder &region = by_extruder[channel_idx - 1];
+                    append(region.expolygons, std::move(segmentation[layer_id][channel_idx]));
                     if (! region.expolygons.empty()) {
                         region.bbox = get_extents(region.expolygons);
                         layer_split = true;
