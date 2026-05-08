@@ -7139,7 +7139,7 @@ bool GUI_App::checked_tab(Tab* tab)
 
 // Update UI / Tabs to reflect changes in the currently loaded presets
 //BBS: add preset combo box re-activate logic
-void GUI_App::load_current_presets(bool active_preset_combox/*= false*/, bool check_printer_presets_ /*= true*/)
+void GUI_App::load_current_presets(bool active_preset_combox/*= false*/, bool check_printer_presets_ /*= true*/, bool sync_filaments_to_nozzles /*= true*/)
 {
     // check printer_presets for the containing information about "Print Host upload"
     // and create physical printer from it, if any exists
@@ -7150,7 +7150,7 @@ void GUI_App::load_current_presets(bool active_preset_combox/*= false*/, bool ch
     PrinterTechnology printer_technology = edited_printer_preset.printer_technology();
     // ORCA: Sync filament count with the printer's nozzle count before loading presets for multi-tool printers.
     // This ensures filament_presets vector is properly sized when combo boxes are created/updated.
-    if (printer_technology == ptFFF && !edited_printer_preset.config.opt_bool("single_extruder_multi_material")) {
+    if (sync_filaments_to_nozzles && printer_technology == ptFFF && !edited_printer_preset.config.opt_bool("single_extruder_multi_material")) {
         auto* nozzle_diameter = edited_printer_preset.config.option<ConfigOptionFloats>("nozzle_diameter");
         if (nozzle_diameter) {
             preset_bundle->set_num_filaments(nozzle_diameter->values.size());

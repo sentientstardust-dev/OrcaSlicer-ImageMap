@@ -559,7 +559,7 @@ public:
     bool            check_print_host_queue();
     bool            checked_tab(Tab* tab);
     //BBS: add preset combox re-active logic
-    void            load_current_presets(bool active_preset_combox = false, bool check_printer_presets = true);
+    void            load_current_presets(bool active_preset_combox = false, bool check_printer_presets = true, bool sync_filaments_to_nozzles = true);
     std::vector<std::string> &get_delete_cache_presets();
     std::vector<std::string> get_delete_cache_presets_lock();
     void            delete_preset_from_cloud(std::string setting_id);

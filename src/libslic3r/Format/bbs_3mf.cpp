@@ -2905,7 +2905,17 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
                 mo->config.set_key_value("extruder", new ConfigOptionInt(1));
 
             if (mo->volumes.size() == 1) {
-                mo->volumes[0]->config.erase("extruder");
+                ModelVolume* mv = mo->volumes[0];
+                const ConfigOptionInt* vol_extruder_opt = dynamic_cast<const ConfigOptionInt*>(mv->config.option("extruder"));
+                if (vol_extruder_opt != nullptr) {
+                    const int vol_extruder_id = vol_extruder_opt->getInt();
+                    if (vol_extruder_id > 0 &&
+                        (vol_extruder_id <= max_filament_id ||
+                         is_texture_mapping_virtual_filament_id(config, vol_extruder_id, size_t(max_filament_id))) &&
+                        vol_extruder_id != extruder_id)
+                        mo->config.set_key_value("extruder", new ConfigOptionInt(vol_extruder_id));
+                }
+                mv->config.erase("extruder");
             }
             else {
                 for (ModelVolume* mv : mo->volumes) {

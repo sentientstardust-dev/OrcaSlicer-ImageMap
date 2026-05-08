@@ -145,7 +145,9 @@
 #include "Widgets/RoundedRectangle.hpp"
 #include "Widgets/RadioGroup.hpp"
 #include "Widgets/CheckBox.hpp"
+#include "Widgets/ComboBox.hpp"
 #include "Widgets/Button.hpp"
+#include "Widgets/SpinInput.hpp"
 #include "Widgets/StaticGroup.hpp"
 
 #include "GUI_ObjectTable.hpp"
@@ -588,17 +590,6 @@ static std::vector<unsigned int> texture_mapping_selected_ids(const TextureMappi
     if (ids.size() < 2)
         ids = {1, 2};
     return ids;
-}
-
-static std::vector<unsigned int> texture_mapping_checkbox_ordered_ids(const TextureMappingZone &zone, size_t num_physical)
-{
-    const std::vector<unsigned int> selected = texture_mapping_selected_ids(zone, num_physical);
-    std::vector<unsigned int> ordered;
-    ordered.reserve(selected.size());
-    for (size_t id = 1; id <= std::min<size_t>(num_physical, 9); ++id)
-        if (std::find(selected.begin(), selected.end(), unsigned(id)) != selected.end())
-            ordered.emplace_back(unsigned(id));
-    return ordered.size() >= 2 ? ordered : selected;
 }
 
 static std::string encode_texture_mapping_float_values(const std::vector<float> &values)
@@ -1264,7 +1255,7 @@ public:
         update_strength_offsets_visibility(false);
 
         m_force_sequential_filaments_checkbox =
-            new wxCheckBox(filament_page, wxID_ANY, _L("Force sequential order for filaments"));
+            new wxCheckBox(filament_page, wxID_ANY, _L("Trust color order for filaments (don't detect colors)"));
         m_force_sequential_filaments_checkbox->SetValue(force_sequential_filaments);
         filament_root->Add(m_force_sequential_filaments_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
 
@@ -1779,8 +1770,8 @@ private:
     {
         if (m_strength_offsets_toggle_button != nullptr)
             m_strength_offsets_toggle_button->SetLabel(m_strength_offsets_expanded ?
-                                                        _L("Hide Filament Strengths & Offsets") :
-                                                        _L("Show Filament Strengths & Offsets"));
+                                                        _L("Hide Filament Strengths and Offsets") :
+                                                        _L("Show Filament Strengths and Offsets"));
         if (m_strength_offsets_panel != nullptr)
             m_strength_offsets_panel->Show(m_strength_offsets_expanded);
         if (!fit_dialog)
@@ -5456,6 +5447,55 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
     const int gap = FromDIP(6);
     p->m_panel_texture_mapping_content->SetBackgroundColour(rows_bg);
 
+    auto make_sidebar_combo = [](wxWindow *parent, const wxArrayString &choices, int selection, const wxSize &size) {
+        auto *combo = new ::ComboBox(parent, wxID_ANY, wxString(), wxDefaultPosition, size, 0, nullptr, wxCB_READONLY);
+        for (unsigned int i = 0; i < choices.GetCount(); ++i)
+            combo->Append(choices[i]);
+        if (choices.GetCount() > 0)
+            combo->SetSelection(std::clamp(selection, 0, int(choices.GetCount() - 1)));
+        return combo;
+    };
+
+    auto repaint_sidebar_checkbox = [](::CheckBox *checkbox) {
+        if (checkbox == nullptr)
+            return;
+        checkbox->Refresh();
+        checkbox->Update();
+    };
+
+    auto set_sidebar_checkbox_value = [repaint_sidebar_checkbox](::CheckBox *checkbox, bool value) {
+        if (checkbox == nullptr)
+            return;
+        checkbox->SetValue(value);
+        repaint_sidebar_checkbox(checkbox);
+    };
+
+    auto make_sidebar_checkbox_row = [text_fg, gap, repaint_sidebar_checkbox, set_sidebar_checkbox_value](wxWindow *parent,
+                                                                                                           ::CheckBox *&checkbox,
+                                                                                                           const wxString &label,
+                                                                                                           bool value) {
+        auto *row = new wxBoxSizer(wxHORIZONTAL);
+        checkbox = new ::CheckBox(parent);
+        set_sidebar_checkbox_value(checkbox, value);
+        checkbox->Bind(wxEVT_TOGGLEBUTTON, [checkbox, repaint_sidebar_checkbox](wxCommandEvent &evt) {
+            repaint_sidebar_checkbox(checkbox);
+            evt.Skip();
+        });
+        auto *text = new wxStaticText(parent, wxID_ANY, label);
+        text->SetForegroundColour(text_fg);
+        text->Bind(wxEVT_LEFT_DOWN, [checkbox, set_sidebar_checkbox_value](wxMouseEvent &) {
+            if (checkbox == nullptr || !checkbox->IsEnabled())
+                return;
+            set_sidebar_checkbox_value(checkbox, !checkbox->GetValue());
+            wxCommandEvent event(wxEVT_TOGGLEBUTTON, checkbox->GetId());
+            event.SetEventObject(checkbox);
+            checkbox->GetEventHandler()->ProcessEvent(event);
+        });
+        row->Add(checkbox, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, std::max(2, gap / 2));
+        row->Add(text, 0, wxALIGN_CENTER_VERTICAL);
+        return row;
+    };
+
     std::vector<wxColour> palette;
     palette.reserve(physical_colors.size());
     for (const std::string &color : physical_colors)
@@ -5596,44 +5636,56 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         wxArrayString surface_choices;
         surface_choices.Add(_L("Image Texture"));
         surface_choices.Add(_L("2D Gradient"));
-        auto *surface_choice = new wxChoice(editor, wxID_ANY, wxDefaultPosition, wxDefaultSize, surface_choices);
-        surface_choice->SetSelection(entry.is_2d_gradient() ? 1 : 0);
+        auto *surface_choice = make_sidebar_combo(editor, surface_choices, entry.is_2d_gradient() ? 1 : 0, wxSize(FromDIP(170), -1));
         surface_row->Add(surface_choice, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         editor_sizer->Add(surface_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
 
         auto *filaments_row = new wxWrapSizer(wxHORIZONTAL, wxWRAPSIZER_DEFAULT_FLAGS);
         filaments_row->Add(new wxStaticText(editor, wxID_ANY, _L("Filaments")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-        std::vector<wxCheckBox*> filament_checks;
+        std::vector<::CheckBox*> filament_checks;
         const std::vector<unsigned int> selected_ids = texture_mapping_selected_ids(entry, num_physical);
         for (size_t i = 1; i <= std::min<size_t>(num_physical, 9); ++i) {
-            auto *chk = new wxCheckBox(editor, wxID_ANY, wxString::Format("F%d", int(i)));
-            chk->SetForegroundColour(text_fg);
-            chk->SetValue(std::find(selected_ids.begin(), selected_ids.end(), unsigned(i)) != selected_ids.end());
+            ::CheckBox *chk = nullptr;
+            auto *chk_row = make_sidebar_checkbox_row(editor,
+                                                       chk,
+                                                       wxString::Format("F%d", int(i)),
+                                                       std::find(selected_ids.begin(), selected_ids.end(), unsigned(i)) != selected_ids.end());
             filament_checks.emplace_back(chk);
-            filaments_row->Add(chk, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, std::max(FromDIP(2), gap / 2));
+            filaments_row->Add(chk_row, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, std::max(FromDIP(2), gap / 2));
         }
         editor_sizer->Add(filaments_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
 
         auto *mode_row = new wxWrapSizer(wxHORIZONTAL, wxWRAPSIZER_DEFAULT_FLAGS);
         mode_row->Add(new wxStaticText(editor, wxID_ANY, _L("Filament colors")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-        auto *mode_choice = new wxChoice(editor, wxID_ANY, wxDefaultPosition, wxDefaultSize, texture_mapping_color_mode_choices());
-        mode_choice->SetSelection(texture_mapping_color_mode_selection(entry.filament_color_mode));
+        auto *mode_choice = make_sidebar_combo(editor,
+                                               texture_mapping_color_mode_choices(),
+                                               texture_mapping_color_mode_selection(entry.filament_color_mode),
+                                               wxSize(FromDIP(220), -1));
         mode_row->Add(mode_choice, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-        auto *preview_colors_chk = new wxCheckBox(editor, wxID_ANY, _L("Preview Result Colors"));
-        preview_colors_chk->SetValue(entry.preview_simulate_colors);
-        mode_row->Add(preview_colors_chk, 0, wxALIGN_CENTER_VERTICAL);
+        ::CheckBox *preview_colors_chk = nullptr;
+        mode_row->Add(make_sidebar_checkbox_row(editor, preview_colors_chk, _L("Preview Result Colors"), entry.preview_simulate_colors),
+                      0,
+                      wxALIGN_CENTER_VERTICAL);
         editor_sizer->Add(mode_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
 
         auto *contrast_row = new wxWrapSizer(wxHORIZONTAL, wxWRAPSIZER_DEFAULT_FLAGS);
         contrast_row->Add(new wxStaticText(editor, wxID_ANY, _L("Texture contrast")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-        auto *contrast_spin = new wxSpinCtrl(editor, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(72), -1),
-                                             wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER,
-                                             25, 300, std::clamp(int(std::lround(entry.contrast_pct)), 25, 300));
+        auto *contrast_spin = new ::SpinInput(editor,
+                                              wxEmptyString,
+                                              wxEmptyString,
+                                              wxDefaultPosition,
+                                              wxSize(FromDIP(86), -1),
+                                              wxSP_ARROW_KEYS,
+                                              25,
+                                              300,
+                                              std::clamp(int(std::lround(entry.contrast_pct)), 25, 300),
+                                              5);
         contrast_row->Add(contrast_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
         contrast_row->Add(new wxStaticText(editor, wxID_ANY, _L("%")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-        auto *high_res_chk = new wxCheckBox(editor, wxID_ANY, _L("High-resolution texture sampling"));
-        high_res_chk->SetValue(entry.high_resolution_sampling);
-        contrast_row->Add(high_res_chk, 0, wxALIGN_CENTER_VERTICAL);
+        ::CheckBox *high_res_chk = nullptr;
+        contrast_row->Add(make_sidebar_checkbox_row(editor, high_res_chk, _L("High-resolution texture sampling"), entry.high_resolution_sampling),
+                          0,
+                          wxALIGN_CENTER_VERTICAL);
         editor_sizer->Add(contrast_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
 
         auto *button_row = new wxBoxSizer(wxHORIZONTAL);
@@ -5697,15 +5749,31 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         };
         update_pattern_visibility();
 
-        surface_choice->Bind(wxEVT_CHOICE, [update_pattern_visibility, apply_controls](wxCommandEvent &) {
+        surface_choice->Bind(wxEVT_COMBOBOX, [update_pattern_visibility, apply_controls](wxCommandEvent &) {
             update_pattern_visibility();
             apply_controls();
         });
-        for (wxCheckBox *chk : filament_checks)
+        for (::CheckBox *chk : filament_checks)
             if (chk != nullptr)
-                chk->Bind(wxEVT_CHECKBOX, [apply_controls](wxCommandEvent &) { apply_controls(); });
+                chk->Bind(wxEVT_TOGGLEBUTTON, [apply_controls](wxCommandEvent &evt) {
+                    apply_controls();
+                    evt.Skip();
+                });
         int last_mode_selection = mode_choice->GetSelection();
-        mode_choice->Bind(wxEVT_CHOICE, [this, zone_index, mgr_ptr, num_physical, physical_colors, filament_checks, mode_choice, apply_controls, last_mode_selection](wxCommandEvent &) mutable {
+        auto on_mode_choice = [this,
+                               zone_index,
+                               mgr_ptr,
+                               num_physical,
+                               physical_colors,
+                               filament_checks,
+                               mode_choice,
+                               surface_choice,
+                               preview_colors_chk,
+                               contrast_spin,
+                               high_res_chk,
+                               set_sidebar_checkbox_value,
+                               apply_zone,
+                               last_mode_selection](wxCommandEvent &) mutable {
             if (mode_choice != nullptr) {
                 const int selection = mode_choice->GetSelection();
                 if (selection == texture_mapping_five_toolhead_marker_selection()) {
@@ -5714,25 +5782,63 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 }
                 last_mode_selection = selection;
             }
-            if (zone_index < mgr_ptr->zones().size()) {
-                TextureMappingZone &zone = mgr_ptr->zones()[zone_index];
-                if (zone.auto_adjust_filament_selection) {
-                    TextureMappingZone adjusted = zone;
-                    adjusted.filament_color_mode = texture_mapping_color_mode_from_selection(
-                        mode_choice != nullptr ? mode_choice->GetSelection() : -1, zone.filament_color_mode);
-                    TextureMappingManager::auto_adjust_texture_component_ids(adjusted, num_physical, physical_colors);
-                    const std::vector<unsigned int> adjusted_ids = texture_mapping_selected_ids(adjusted, num_physical);
-                    for (size_t idx = 0; idx < filament_checks.size(); ++idx)
-                        if (filament_checks[idx] != nullptr)
-                            filament_checks[idx]->SetValue(std::find(adjusted_ids.begin(), adjusted_ids.end(), unsigned(idx + 1)) != adjusted_ids.end());
+            if (zone_index >= mgr_ptr->zones().size())
+                return;
+
+            TextureMappingZone updated = mgr_ptr->zones()[zone_index];
+            std::vector<unsigned int> ids;
+            for (size_t idx = 0; idx < filament_checks.size(); ++idx)
+                if (filament_checks[idx] != nullptr && filament_checks[idx]->GetValue())
+                    ids.emplace_back(unsigned(idx + 1));
+            if (ids.size() < 2)
+                ids = texture_mapping_selected_ids(updated, num_physical);
+
+            updated.enabled = true;
+            updated.surface_pattern = surface_choice != nullptr && surface_choice->GetSelection() == 1 ?
+                int(TextureMappingZone::Gradient2D) : int(TextureMappingZone::ImageTexture);
+            updated.component_ids = encode_texture_mapping_component_ids(ids);
+            updated.component_a = ids.empty() ? 1 : ids.front();
+            updated.component_b = ids.size() > 1 ? ids[1] : updated.component_a;
+            updated.filament_color_mode = mode_choice != nullptr ?
+                texture_mapping_color_mode_from_selection(mode_choice->GetSelection(), updated.filament_color_mode) :
+                updated.filament_color_mode;
+            updated.preview_simulate_colors = preview_colors_chk != nullptr && preview_colors_chk->GetValue();
+            updated.contrast_pct = contrast_spin != nullptr ? std::clamp(float(contrast_spin->GetValue()), 25.f, 300.f) : updated.contrast_pct;
+            updated.high_resolution_sampling = high_res_chk == nullptr || high_res_chk->GetValue();
+
+            if (updated.auto_adjust_filament_selection) {
+                TextureMappingZone adjusted = updated;
+                if (!adjusted.force_sequential_filaments) {
+                    std::vector<unsigned int> candidate_ids;
+                    for (size_t i = 1; i <= std::min<size_t>(num_physical, 9); ++i)
+                        candidate_ids.emplace_back(unsigned(i));
+                    if (candidate_ids.size() >= 2) {
+                        adjusted.component_ids = encode_texture_mapping_component_ids(candidate_ids);
+                        adjusted.component_a = candidate_ids[0];
+                        adjusted.component_b = candidate_ids[1];
+                    }
+                }
+                if (TextureMappingManager::auto_adjust_texture_component_ids(adjusted, num_physical, physical_colors)) {
+                    updated = std::move(adjusted);
+                    ids = texture_mapping_selected_ids(updated, num_physical);
                 }
             }
+            for (size_t idx = 0; idx < filament_checks.size(); ++idx)
+                if (filament_checks[idx] != nullptr)
+                    set_sidebar_checkbox_value(filament_checks[idx],
+                                               std::find(ids.begin(), ids.end(), unsigned(idx + 1)) != ids.end());
+            apply_zone(std::move(updated));
+        };
+        mode_choice->Bind(wxEVT_COMBOBOX, on_mode_choice);
+        preview_colors_chk->Bind(wxEVT_TOGGLEBUTTON, [apply_controls](wxCommandEvent &evt) {
             apply_controls();
-            update_texture_mapping_panel(false);
+            evt.Skip();
         });
-        preview_colors_chk->Bind(wxEVT_CHECKBOX, [apply_controls](wxCommandEvent &) { apply_controls(); });
-        high_res_chk->Bind(wxEVT_CHECKBOX, [apply_controls](wxCommandEvent &) { apply_controls(); });
-        contrast_spin->Bind(wxEVT_SPINCTRL, [apply_controls](wxSpinEvent &) { apply_controls(); });
+        high_res_chk->Bind(wxEVT_TOGGLEBUTTON, [apply_controls](wxCommandEvent &evt) {
+            apply_controls();
+            evt.Skip();
+        });
+        contrast_spin->Bind(wxEVT_SPINCTRL, [apply_controls](wxCommandEvent &) { apply_controls(); });
         contrast_spin->Bind(wxEVT_TEXT_ENTER, [apply_controls](wxCommandEvent &) { apply_controls(); });
         contrast_spin->Bind(wxEVT_KILL_FOCUS, [apply_controls](wxFocusEvent &evt) {
             apply_controls();
@@ -5753,15 +5859,18 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                           zone_index,
                                           mgr_ptr,
                                           palette,
+                                          physical_colors,
                                           apply_zone,
                                           bundle,
                                           set_config_string](wxCommandEvent &) {
             if (zone_index >= mgr_ptr->zones().size())
                 return;
             TextureMappingZone updated = mgr_ptr->zones()[zone_index];
-            const std::vector<unsigned int> ids = texture_mapping_checkbox_ordered_ids(updated, palette.size());
+            std::vector<unsigned int> ids = updated.is_image_texture() ?
+                TextureMappingManager::effective_texture_component_ids(updated, palette.size(), physical_colors) :
+                texture_mapping_selected_ids(updated, palette.size());
             if (ids.empty())
-                return;
+                ids = texture_mapping_selected_ids(updated, palette.size());
             std::vector<float> strengths;
             std::vector<float> offsets;
             std::vector<float> transmission_distances;
@@ -8645,7 +8754,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                             // For exporting from the amf/3mf we shouldn't check printer_presets for the containing information about "Print Host upload"
                             // BBS: add preset combo box re-active logic
                             // currently found only needs re-active here
-                            wxGetApp().load_current_presets(false, false);
+                            wxGetApp().load_current_presets(false, false, false);
                             // Update filament colors for the MM-printer profile in the full config
                             // to avoid black (default) colors for Extruders in the ObjectList,
                             // when for extruder colors are used filament colors

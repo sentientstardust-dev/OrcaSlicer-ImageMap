@@ -1427,8 +1427,10 @@ std::vector<unsigned int> TextureMappingManager::effective_texture_component_ids
     };
 
     if (zone.force_sequential_filaments) {
-        for (unsigned int id = 1; result.size() < expected && id <= num_physical; ++id) {
-            if (std::find(selected.begin(), selected.end(), id) != selected.end() && id < used.size() && !used[id]) {
+        for (const unsigned int id : selected) {
+            if (result.size() >= expected)
+                break;
+            if (id >= 1 && id <= num_physical && id < used.size() && !used[id]) {
                 used[id] = true;
                 result.emplace_back(id);
             }
