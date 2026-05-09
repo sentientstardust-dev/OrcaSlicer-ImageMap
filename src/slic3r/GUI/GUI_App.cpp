@@ -22,6 +22,7 @@
 #include <iterator>
 #include <exception>
 #include <cstdlib>
+#include <optional>
 #include <regex>
 #include <thread>
 #include <string_view>
@@ -2965,9 +2966,16 @@ bool GUI_App::on_init_inner()
                 if (!skip_this_version
                     || evt.GetInt() != 0) {
                     UpdateVersionDialog dialog(this->mainframe);
-                    wxString            extmsg = wxString::FromUTF8(version_info.description);
-                    dialog.update_version_info(extmsg, version_info.version_str);
-                    //dialog.update_version_info(version_info.description);
+                    std::string version_check_mode = app_config->version_check_mode();
+                    boost::algorithm::to_lower(version_check_mode);
+                    const bool simple_update_dialog = version_check_mode == "platform_json" || version_check_mode == "json_platform";
+                    if (simple_update_dialog) {
+                        dialog.update_version_info_simple(SoftFever_VERSION, version_info.version_str);
+                    } else {
+                        wxString extmsg = wxString::FromUTF8(version_info.description);
+                        dialog.update_version_info(extmsg, version_info.version_str);
+                        //dialog.update_version_info(version_info.description);
+                    }
                     if (evt.GetInt() != 0) {
                         dialog.m_button_skip_version->Hide();
                     }
@@ -5349,11 +5357,133 @@ void maybe_attach_updater_signature(Http& http, const std::string& canonical_que
 
 void GUI_App::check_new_version_sf(bool show_tips, int by_user)
 {
-    return;
+    (void) show_tips;
 
     AppConfig* app_config = wxGetApp().app_config;
     bool       check_stable_only = app_config->get_bool("check_stable_update_only");
     auto version_check_url = app_config->version_check_url();
+    auto version_check_mode = app_config->version_check_mode();
+    boost::algorithm::to_lower(version_check_mode);
+
+    const bool platform_json_mode = version_check_mode == "platform_json" || version_check_mode == "json_platform";
+
+    if (platform_json_mode) {
+        auto http = Http::get(version_check_url);
+
+        http.header("accept", "application/json")
+            .timeout_connect(5)
+            .timeout_max(10)
+            .on_error([](std::string body, std::string error, unsigned http_status) {
+              (void)body;
+              BOOST_LOG_TRIVIAL(error) << format("Error getting: `%1%`: HTTP %2%, %3%", "check_new_version_sf", http_status, error);
+            })
+            .on_complete([this, by_user, app_config](std::string body, unsigned http_status) {
+              if (http_status != 200)
+                return;
+              try {
+                boost::trim(body);
+                if (body.empty()) {
+                    if (by_user != 0)
+                        this->no_new_version();
+                    return;
+                }
+
+                std::regex matcher("[0-9]+\\.[0-9]+(\\.[0-9]+)*(-[A-Za-z0-9.]+)?(\\+[A-Za-z0-9.]+)?");
+                std::string remote_version_str;
+                json root = json::parse(body);
+                std::vector<std::string> os_keys;
+                const std::string os   = detect_updater_os();
+                const std::string arch = detect_updater_arch();
+                if (os == "win") {
+                    os_keys.push_back("windows_" + arch);
+                } else if (os == "macos") {
+                    os_keys.push_back("macos_" + arch);
+                } else if (os == "linux") {
+                    os_keys.push_back("linux_" + arch);
+                }
+                os_keys.push_back(os);
+
+                auto read_version = [arch](const json& value) -> std::optional<std::string> {
+                    if (value.is_string())
+                        return value.get<std::string>();
+                    if (!value.is_object())
+                        return std::nullopt;
+                    if (value.contains(arch)) {
+                        const json& arch_value = value.at(arch);
+                        if (arch_value.is_string())
+                            return arch_value.get<std::string>();
+                        if (arch_value.is_object() && arch_value.contains("version") && arch_value.at("version").is_string())
+                            return arch_value.at("version").get<std::string>();
+                    }
+                    if (value.contains("version") && value.at("version").is_string())
+                        return value.at("version").get<std::string>();
+                    return std::nullopt;
+                };
+
+                auto find_version = [&os_keys, &read_version](const json& container) -> std::optional<std::string> {
+                    if (!container.is_object())
+                        return std::nullopt;
+                    for (const std::string& key : os_keys) {
+                        if (container.contains(key)) {
+                            auto version = read_version(container.at(key));
+                            if (version)
+                                return version;
+                        }
+                    }
+                    return std::nullopt;
+                };
+
+                std::optional<std::string> platform_version = find_version(root);
+                if (!platform_version && root.is_object() && root.contains("platforms"))
+                    platform_version = find_version(root.at("platforms"));
+                if (!platform_version && root.is_object() && root.contains("versions"))
+                    platform_version = find_version(root.at("versions"));
+                if (!platform_version && root.is_object() && root.contains("version"))
+                    platform_version = read_version(root.at("version"));
+
+                if (!platform_version) {
+                    if (by_user != 0)
+                        this->no_new_version();
+                    return;
+                }
+                remote_version_str = *platform_version;
+
+                boost::trim(remote_version_str);
+                if (remote_version_str.empty()) {
+                    if (by_user != 0)
+                        this->no_new_version();
+                    return;
+                }
+                if (remote_version_str.front() == 'v')
+                    remote_version_str.erase(0, 1);
+
+                Semver current_version = get_version(SoftFever_VERSION, matcher);
+                Semver remote_version  = get_version(remote_version_str, matcher);
+
+                if (!remote_version.valid()) {
+                    if (by_user != 0)
+                        this->no_new_version();
+                    return;
+                }
+
+                if (current_version.valid() && remote_version <= current_version) {
+                    if (by_user != 0)
+                        this->no_new_version();
+                    return;
+                }
+
+                version_info.url           = app_config->version_download_url();
+                version_info.version_str   = remote_version.to_string_sf();
+                version_info.description   = "";
+                version_info.force_upgrade = false;
+
+                this->request_new_version(by_user);
+              } catch (...) {}
+            });
+
+        http.perform();
+        return;
+    }
 
     UpdaterQuery query{
         detect_updater_iid(app_config),

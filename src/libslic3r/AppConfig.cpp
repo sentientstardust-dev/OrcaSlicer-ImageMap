@@ -21,6 +21,7 @@
 #include <boost/property_tree/ini_parser.hpp>
 #include <boost/property_tree/ptree_fwd.hpp>
 #include <boost/algorithm/string/predicate.hpp>
+#include <boost/algorithm/string.hpp>
 #include <boost/format/format_fwd.hpp>
 #include <boost/log/trivial.hpp>
 #include <boost/uuid/uuid.hpp>
@@ -39,7 +40,10 @@ using namespace nlohmann;
 
 namespace Slic3r {
 
-static const std::string VERSION_CHECK_URL = "https://check-version.orcaslicer.com/latest";
+static const std::string VERSION_CHECK_URL = "https://gradients.garden/orcaslicer_imagemap/current_version.json";
+static const std::string VERSION_CHECK_URL_LEGACY = "https://check-version.orcaslicer.com/latest";
+static const std::string VERSION_CHECK_MODE = "platform_json";
+static const std::string VERSION_DOWNLOAD_URL = "https://gitlab.com/sentient_stardust/orcaslicer-imagemap/-/packages";
 static const std::string PROFILE_UPDATE_URL = "https://api.github.com/repos/OrcaSlicer/orcaslicer-profiles/releases/tags";
 static const std::string MODELS_STR = "models";
 
@@ -1604,7 +1608,26 @@ std::string AppConfig::config_path()
 std::string AppConfig::version_check_url() const
 {
     auto from_settings = get("version_check_url");
-    return from_settings.empty() ? VERSION_CHECK_URL : from_settings;
+    if (!from_settings.empty())
+        return from_settings;
+
+    auto mode = version_check_mode();
+    boost::algorithm::to_lower(mode);
+    if (mode == "platform_json" || mode == "json_platform")
+        return VERSION_CHECK_URL;
+    return VERSION_CHECK_URL_LEGACY;
+}
+
+std::string AppConfig::version_check_mode() const
+{
+    auto from_settings = get("version_check_mode");
+    return from_settings.empty() ? VERSION_CHECK_MODE : from_settings;
+}
+
+std::string AppConfig::version_download_url() const
+{
+    auto from_settings = get("version_download_url");
+    return from_settings.empty() ? VERSION_DOWNLOAD_URL : from_settings;
 }
 
 std::string AppConfig::profile_update_url() const

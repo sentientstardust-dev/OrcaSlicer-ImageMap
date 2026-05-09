@@ -92,6 +92,7 @@ public:
     void RunScript(std::string script);
     void on_dpi_changed(const wxRect& suggested_rect) override;
     void update_version_info(wxString release_note, wxString version);
+    void update_version_info_simple(wxString current_version, wxString available_version);
     std::vector<std::string> splitWithStl(std::string str, std::string pattern);
 
     wxStaticBitmap*   m_brand{nullptr};
@@ -104,6 +105,7 @@ public:
     wxStaticBitmap*   m_bitmap_open_in_browser;
     Button*           m_button_skip_version;
     CheckBox*         m_cb_stable_only;
+    Label*            m_stable_only_label{nullptr};
     Button*           m_button_download;
     Button*           m_button_cancel;
     std::string       url_line;

@@ -330,6 +330,7 @@ UpdateVersionDialog::UpdateVersionDialog(wxWindow *parent)
     stable_only_label->SetFont(Label::Body_13);
     stable_only_label->SetForegroundColour(wxColour(38, 46, 48));
     stable_only_label->SetFont(Label::Body_12);
+    m_stable_only_label = stable_only_label;
 
     m_button_cancel = new Button(this, _L("Cancel"));
     m_button_cancel->SetStyle(ButtonStyle::Regular, ButtonType::Choice);
@@ -479,6 +480,7 @@ void UpdateVersionDialog::update_version_info(wxString release_note, wxString ve
     //     m_vebview_release_note->LoadURL(from_u8(url_line));
     // }
     // else {
+    m_button_download->SetLabel(_L("Download"));
     m_simplebook_release_note->SetMaxSize(wxSize(FromDIP(560), FromDIP(430)));
     m_simplebook_release_note->SetSelection(1);
     m_text_up_info->SetLabel(wxString::Format(_L("Click to download new version in default browser: %s"), version));
@@ -501,6 +503,56 @@ void UpdateVersionDialog::update_version_info(wxString release_note, wxString ve
     wxGetApp().UpdateDlgDarkUI(this);
     Layout();
     Fit();
+}
+
+void UpdateVersionDialog::update_version_info_simple(wxString current_version, wxString available_version)
+{
+    m_text_up_info->Hide();
+    m_button_download->SetLabel(_L("Open Downloads"));
+    m_cb_stable_only->Hide();
+    m_stable_only_label->Hide();
+    m_simplebook_release_note->SetSelection(0);
+    const wxSize compact_note_size(FromDIP(360), FromDIP(110));
+    m_simplebook_release_note->SetSize(compact_note_size);
+    m_simplebook_release_note->SetMinSize(compact_note_size);
+    m_simplebook_release_note->SetMaxSize(compact_note_size);
+    m_scrollwindows_release_note->SetSize(compact_note_size);
+    m_scrollwindows_release_note->SetMinSize(compact_note_size);
+    m_scrollwindows_release_note->SetMaxSize(compact_note_size);
+
+    auto content_sizer = new wxBoxSizer(wxVERTICAL);
+    auto versions      = new wxFlexGridSizer(2, 0, FromDIP(14));
+    versions->AddGrowableCol(1);
+
+    auto current_label = new Label(m_scrollwindows_release_note, _L("Current version:"));
+    current_label->SetFont(Label::Body_13);
+    current_label->SetForegroundColour(wxColour(38, 46, 48));
+    auto current_value = new Label(m_scrollwindows_release_note, current_version);
+    current_value->SetFont(Label::Body_13);
+    current_value->SetForegroundColour(wxColour(38, 46, 48));
+    auto available_label = new Label(m_scrollwindows_release_note, _L("Available version:"));
+    available_label->SetFont(Label::Body_13);
+    available_label->SetForegroundColour(wxColour(38, 46, 48));
+    auto available_value = new Label(m_scrollwindows_release_note, available_version);
+    available_value->SetFont(Label::Body_13);
+    available_value->SetForegroundColour(wxColour(38, 46, 48));
+
+    versions->Add(current_label, 0, wxALIGN_RIGHT | wxALIGN_CENTER_VERTICAL);
+    versions->Add(current_value, 1, wxEXPAND);
+    versions->Add(available_label, 0, wxALIGN_RIGHT | wxALIGN_CENTER_VERTICAL);
+    versions->Add(available_value, 1, wxEXPAND);
+    content_sizer->Add(versions, 0, wxALL | wxEXPAND, FromDIP(24));
+
+    m_scrollwindows_release_note->SetSizer(content_sizer);
+    m_scrollwindows_release_note->Layout();
+
+    wxGetApp().UpdateDlgDarkUI(this);
+    SetMinSize(wxDefaultSize);
+    SetMaxSize(wxDefaultSize);
+    Layout();
+    Fit();
+    SetMinSize(GetSize());
+    Centre(wxBOTH);
 }
 
 SecondaryCheckDialog::SecondaryCheckDialog(wxWindow* parent, wxWindowID id, const wxString& title, enum VisibleButtons btn_style, const wxPoint& pos, const wxSize& size, long style, bool not_show_again_check) // ORCA VisibleButtons instead ButtonStyle 
