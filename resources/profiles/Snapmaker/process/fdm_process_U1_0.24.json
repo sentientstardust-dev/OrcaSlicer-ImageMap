@@ -11,7 +11,7 @@
 	"bridge_flow": "1",
 	"initial_layer_speed": "50",
 	"initial_layer_infill_speed": "105",
-	"outer_wall_speed": "200",
+	"outer_wall_speed": "100",
 	"inner_wall_speed": "230",
 	"sparse_infill_speed": "230",
 	"internal_solid_infill_speed": "230",

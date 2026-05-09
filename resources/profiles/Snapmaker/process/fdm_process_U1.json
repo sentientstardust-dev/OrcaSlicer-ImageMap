@@ -13,7 +13,7 @@
 	"bridge_no_support": "0",
 	"elefant_foot_compensation": "0.1",
 	"outer_wall_line_width": "0.42",
-	"outer_wall_speed": "120",
+	"outer_wall_speed": "100",
 	"line_width": "0.45",
 	"infill_direction": "45",
 	"sparse_infill_density": "15%",

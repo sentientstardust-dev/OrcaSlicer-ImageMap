@@ -13,7 +13,7 @@
 	"top_shell_thickness": "0.5",
 	"initial_layer_speed": "100",
 	"initial_layer_infill_speed": "180",
-	"outer_wall_speed": "180",
+	"outer_wall_speed": "100",
 	"inner_wall_speed": "200",
 	"sparse_infill_speed": "200",
 	"internal_solid_infill_speed": "200",
