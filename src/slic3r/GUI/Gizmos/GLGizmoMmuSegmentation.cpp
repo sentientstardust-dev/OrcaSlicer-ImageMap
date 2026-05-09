@@ -18,6 +18,7 @@
 #include "libslic3r/TextureMapping.hpp"
 #include "libslic3r/ColorSolver.hpp"
 #include "slic3r/Utils/UndoRedo.hpp"
+#include "GLGizmosCommon.hpp"
 #include "GLGizmoUtils.hpp"
 
 
@@ -2092,7 +2093,66 @@ struct ProjectionContext
     uint32_t                     image_height = 0;
     float                        image_opacity = 1.f;
     bool                         apply_transparency_as_background = false;
+    ClippingPlane                section_clipping_plane;
 };
+
+static bool projection_section_view_active(const ProjectionContext &context)
+{
+    return context.section_clipping_plane.is_active();
+}
+
+static bool projection_world_point_visible_in_section(const ProjectionContext &context, const Vec3d &world_point)
+{
+    return !projection_section_view_active(context) || context.section_clipping_plane.distance(world_point) >= -1e-7;
+}
+
+static std::vector<Vec3d> projection_visible_world_polygon(const ProjectionContext     &context,
+                                                           const Transform3d          &world_matrix,
+                                                           const std::array<Vec3f, 3> &vertices)
+{
+    std::vector<Vec3d> polygon;
+    polygon.reserve(4);
+    for (const Vec3f &vertex : vertices)
+        polygon.emplace_back(world_matrix * vertex.cast<double>());
+
+    if (!projection_section_view_active(context))
+        return polygon;
+
+    std::vector<Vec3d> clipped;
+    clipped.reserve(4);
+
+    Vec3d previous = polygon.back();
+    double previous_distance = context.section_clipping_plane.distance(previous);
+    bool previous_inside = previous_distance >= -1e-7;
+    for (const Vec3d &current : polygon) {
+        const double current_distance = context.section_clipping_plane.distance(current);
+        const bool current_inside = current_distance >= -1e-7;
+        if (current_inside != previous_inside) {
+            const double denom = previous_distance - current_distance;
+            if (std::abs(denom) > 1e-12) {
+                const double t = std::clamp(previous_distance / denom, 0.0, 1.0);
+                clipped.emplace_back(previous + (current - previous) * t);
+            }
+        }
+        if (current_inside)
+            clipped.emplace_back(current);
+        previous = current;
+        previous_distance = current_distance;
+        previous_inside = current_inside;
+    }
+
+    return clipped;
+}
+
+static void apply_projection_section_view(ProjectionContext &context, const CommonGizmosDataObjects::ObjectClipper *clipper)
+{
+    if (clipper == nullptr || clipper->get_position() == 0.)
+        return;
+
+    const ClippingPlane *plane = clipper->get_clipping_plane();
+    if (plane != nullptr && plane->is_active())
+        context.section_clipping_plane = *plane;
+}
 
 struct VolumeColorSource
 {
@@ -2289,8 +2349,12 @@ static std::optional<ColorRGBA> projected_image_color_at_point(const ProjectionC
     if (context.image_rgba == nullptr || context.overlay_width <= 0.f || context.overlay_height <= 0.f)
         return std::nullopt;
 
+    const Vec3d world_point = world_matrix * point.cast<double>();
+    if (!projection_world_point_visible_in_section(context, world_point))
+        return std::nullopt;
+
     Vec2f screen = Vec2f::Zero();
-    if (!project_point_to_screen(context, world_matrix * point.cast<double>(), screen))
+    if (!project_point_to_screen(context, world_point, screen))
         return std::nullopt;
     if (screen.x() < context.overlay_left ||
         screen.y() < context.overlay_top ||
@@ -2311,8 +2375,12 @@ static std::vector<uint8_t> projected_raw_offsets_at_point(const ProjectionConte
     if (!atlas.valid() || context.overlay_width <= 0.f || context.overlay_height <= 0.f)
         return {};
 
+    const Vec3d world_point = world_matrix * point.cast<double>();
+    if (!projection_world_point_visible_in_section(context, world_point))
+        return {};
+
     Vec2f screen = Vec2f::Zero();
-    if (!project_point_to_screen(context, world_matrix * point.cast<double>(), screen))
+    if (!project_point_to_screen(context, world_point, screen))
         return {};
     if (screen.x() < context.overlay_left ||
         screen.y() < context.overlay_top ||
@@ -2329,15 +2397,19 @@ static bool projection_triangle_intersects_overlay(const ProjectionContext      
                                                    const Transform3d           &world_matrix,
                                                    const std::array<Vec3f, 3>  &vertices)
 {
+    const std::vector<Vec3d> polygon = projection_visible_world_polygon(context, world_matrix, vertices);
+    if (polygon.empty())
+        return false;
+
     float min_x = std::numeric_limits<float>::max();
     float min_y = std::numeric_limits<float>::max();
     float max_x = std::numeric_limits<float>::lowest();
     float max_y = std::numeric_limits<float>::lowest();
     bool any_projected = false;
 
-    for (const Vec3f &vertex : vertices) {
+    for (const Vec3d &vertex : polygon) {
         Vec2f screen = Vec2f::Zero();
-        if (!project_point_to_depth_clipped_screen(context, world_matrix * vertex.cast<double>(), screen))
+        if (!project_point_to_depth_clipped_screen(context, vertex, screen))
             continue;
         min_x = std::min(min_x, screen.x());
         min_y = std::min(min_y, screen.y());
@@ -2396,12 +2468,19 @@ static float projection_triangle_image_pixel_span(const ProjectionContext     &c
                                                   const Transform3d          &world_matrix,
                                                   const std::array<Vec3f, 3> &vertices)
 {
-    std::array<Vec2f, 3> image_pixels;
+    const std::vector<Vec3d> polygon = projection_visible_world_polygon(context, world_matrix, vertices);
+    if (polygon.empty())
+        return 0.f;
+
+    std::vector<Vec2f> image_pixels;
+    image_pixels.reserve(polygon.size());
     size_t projected_count = 0;
-    for (const Vec3f &vertex : vertices) {
+    for (const Vec3d &vertex : polygon) {
         Vec2f image_pixel = Vec2f::Zero();
-        if (project_point_to_image_pixel(context, world_matrix * vertex.cast<double>(), image_pixel))
-            image_pixels[projected_count++] = image_pixel;
+        if (project_point_to_image_pixel(context, vertex, image_pixel)) {
+            image_pixels.emplace_back(image_pixel);
+            ++projected_count;
+        }
     }
 
     if (projected_count < 2)
@@ -2459,11 +2538,15 @@ static float projection_triangle_overlay_image_pixel_span(const ProjectionContex
         context.image_height == 0)
         return 0.f;
 
+    const std::vector<Vec3d> world_polygon = projection_visible_world_polygon(context, world_matrix, vertices);
+    if (world_polygon.empty())
+        return 0.f;
+
     std::vector<Vec2f> polygon;
-    polygon.reserve(3);
-    for (const Vec3f &vertex : vertices) {
+    polygon.reserve(world_polygon.size());
+    for (const Vec3d &vertex : world_polygon) {
         Vec2f screen = Vec2f::Zero();
-        if (project_point_to_depth_clipped_screen(context, world_matrix * vertex.cast<double>(), screen))
+        if (project_point_to_depth_clipped_screen(context, vertex, screen))
             polygon.emplace_back(screen);
     }
 
@@ -3312,23 +3395,24 @@ static ProjectionVisibility build_projection_visibility(const ProjectionContext 
                 its.vertices[size_t(tri[1])].cast<float>(),
                 its.vertices[size_t(tri[2])].cast<float>()
             };
-            if (!projection_triangle_intersects_overlay(context, world_matrix, vertices))
+            const std::vector<Vec3d> polygon = projection_visible_world_polygon(context, world_matrix, vertices);
+            if (polygon.size() < 3 || !projection_triangle_intersects_overlay(context, world_matrix, vertices))
                 continue;
 
-            std::array<Vec2f, 3> screen;
-            std::array<float, 3> depths;
-            bool projected = true;
-            for (size_t idx = 0; idx < vertices.size(); ++idx) {
-                if (!project_point_to_depth_clipped_screen(context,
-                                                           world_matrix * vertices[idx].cast<double>(),
-                                                           screen[idx],
-                                                           &depths[idx])) {
-                    projected = false;
-                    break;
+            for (size_t polygon_idx = 1; polygon_idx + 1 < polygon.size(); ++polygon_idx) {
+                const std::array<Vec3d, 3> fan = { polygon[0], polygon[polygon_idx], polygon[polygon_idx + 1] };
+                std::array<Vec2f, 3> screen;
+                std::array<float, 3> depths;
+                bool projected = true;
+                for (size_t idx = 0; idx < fan.size(); ++idx) {
+                    if (!project_point_to_depth_clipped_screen(context, fan[idx], screen[idx], &depths[idx])) {
+                        projected = false;
+                        break;
+                    }
                 }
+                if (projected)
+                    rasterize_triangle(screen, depths, projection_visibility_triangle_key(volume_idx, tri_idx));
             }
-            if (projected)
-                rasterize_triangle(screen, depths, projection_visibility_triangle_key(volume_idx, tri_idx));
         }
     }
 
@@ -3342,12 +3426,16 @@ static bool projection_point_is_visible(const ProjectionVisibility &visibility,
                                         const Vec3f               &point,
                                         uint64_t                   triangle_key = PROJECTION_VISIBILITY_INVALID_TRIANGLE_KEY)
 {
+    const Vec3d world_point = world_matrix * point.cast<double>();
+    if (!projection_world_point_visible_in_section(context, world_point))
+        return false;
+
     if (!projection_visibility_valid(visibility))
         return true;
 
     Vec2f screen = Vec2f::Zero();
     float depth = 0.f;
-    if (!project_point_to_screen(context, world_matrix * point.cast<double>(), screen, &depth))
+    if (!project_point_to_screen(context, world_point, screen, &depth))
         return false;
 
     const int x = int(std::floor((screen.x() - visibility.left) * visibility.scale));
@@ -3486,9 +3574,13 @@ static bool projection_triangle_image_pixel_bounds(const ProjectionContext     &
     max_y = std::numeric_limits<float>::lowest();
     bool any_projected = false;
 
-    for (const Vec3f &vertex : vertices) {
+    const std::vector<Vec3d> polygon = projection_visible_world_polygon(context, world_matrix, vertices);
+    if (polygon.empty())
+        return false;
+
+    for (const Vec3d &vertex : polygon) {
         Vec2f image_pixel = Vec2f::Zero();
-        if (!project_depth_clipped_point_to_image_pixel(context, world_matrix * vertex.cast<double>(), image_pixel))
+        if (!project_depth_clipped_point_to_image_pixel(context, vertex, image_pixel))
             continue;
         min_x = std::min(min_x, image_pixel.x());
         min_y = std::min(min_y, image_pixel.y());
@@ -3530,6 +3622,10 @@ static bool projection_triangle_has_visible_sample(const ProjectionVisibility &v
                                                    const std::array<Vec3f, 3> &vertices,
                                                    uint64_t                   triangle_key)
 {
+    const std::vector<Vec3d> polygon = projection_visible_world_polygon(context, world_matrix, vertices);
+    if (polygon.size() < 3)
+        return false;
+
     if (!projection_visibility_valid(visibility))
         return true;
 
@@ -3544,13 +3640,22 @@ static bool projection_triangle_has_visible_sample(const ProjectionVisibility &v
         if (projection_point_is_visible(visibility, context, world_matrix, (vertices[idx] + vertices[(idx + 1) % 3]) * 0.5f, triangle_key))
             return true;
 
-    std::array<Vec2f, 3> screen;
-    std::array<float, 3> depths;
-    for (size_t idx = 0; idx < vertices.size(); ++idx)
-        if (!project_point_to_depth_clipped_screen(context, world_matrix * vertices[idx].cast<double>(), screen[idx], &depths[idx]))
-            return false;
+    for (size_t polygon_idx = 1; polygon_idx + 1 < polygon.size(); ++polygon_idx) {
+        const std::array<Vec3d, 3> fan = { polygon[0], polygon[polygon_idx], polygon[polygon_idx + 1] };
+        std::array<Vec2f, 3> screen;
+        std::array<float, 3> depths;
+        bool projected = true;
+        for (size_t idx = 0; idx < fan.size(); ++idx) {
+            if (!project_point_to_depth_clipped_screen(context, fan[idx], screen[idx], &depths[idx])) {
+                projected = false;
+                break;
+            }
+        }
+        if (projected && projection_screen_triangle_has_visible_sample(visibility, screen, depths, triangle_key))
+            return true;
+    }
 
-    return projection_screen_triangle_has_visible_sample(visibility, screen, depths, triangle_key);
+    return false;
 }
 
 static bool projection_triangle_should_project(const ProjectionContext            &context,
@@ -8838,6 +8943,10 @@ bool GLGizmoImageProjection::on_init()
 
 void GLGizmoImageProjection::on_render()
 {
+    if (m_c != nullptr && m_c->object_clipper() != nullptr)
+        m_c->object_clipper()->render_cut();
+    if (m_c != nullptr && m_c->instances_hider() != nullptr)
+        m_c->instances_hider()->render_cut();
 }
 
 std::string GLGizmoImageProjection::on_get_name() const
@@ -8872,7 +8981,9 @@ bool GLGizmoImageProjection::on_is_activable() const
 
 CommonGizmosDataID GLGizmoImageProjection::on_get_requirements() const
 {
-    return CommonGizmosDataID(int(CommonGizmosDataID::SelectionInfo) | int(CommonGizmosDataID::InstancesHider));
+    return CommonGizmosDataID(int(CommonGizmosDataID::SelectionInfo) |
+                              int(CommonGizmosDataID::InstancesHider) |
+                              int(CommonGizmosDataID::ObjectClipper));
 }
 
 bool GLGizmoImageProjection::load_projection_image()
@@ -9139,6 +9250,7 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
     ImGuiWrapper::push_toolbar_style(m_parent.get_scale());
     GizmoImguiBegin(get_name(), ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize |
                                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar);
+    const float max_tooltip_width = ImGui::GetFontSize() * 20.f;
 
     if (m_imgui->button(_L("Load image")))
         load_projection_image();
@@ -9205,6 +9317,27 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
         m_parent.set_as_dirty();
     }
     ImGui::PopItemWidth();
+
+    if (m_c != nullptr && m_c->object_clipper() != nullptr) {
+        ImGui::Separator();
+        if (m_c->object_clipper()->get_position() == 0.f) {
+            m_imgui->text(_L("Section view"));
+        } else if (m_imgui->button(_L("Reset section view direction"))) {
+            wxGetApp().CallAfter([this]() {
+                if (m_c != nullptr && m_c->object_clipper() != nullptr)
+                    m_c->object_clipper()->set_position_by_ratio(-1., false);
+            });
+        }
+
+        float clp_dist = float(m_c->object_clipper()->get_position());
+        ImGui::PushItemWidth(m_imgui->scaled(8.f));
+        if (m_imgui->bbl_slider_float_style("##image_projection_clp_dist", &clp_dist, 0.f, 1.f, "%.2f", 1.f, true))
+            m_c->object_clipper()->set_position_by_ratio(clp_dist, true);
+        ImGui::PopItemWidth();
+
+        if (ImGui::IsItemHovered())
+            m_imgui->tooltip(_L("Section view"), max_tooltip_width);
+    }
 
     ImGui::Checkbox("Apply transparent regions as background color", &m_apply_transparency_as_background);
     ImGui::Checkbox("Pass through model", &m_pass_through_model);
@@ -9313,6 +9446,7 @@ bool GLGizmoImageProjection::project_image_to_selected_object()
             context.image_height = m_image_height;
             context.image_opacity = m_projection_opacity;
             context.apply_transparency_as_background = m_apply_transparency_as_background;
+            apply_projection_section_view(context, m_c != nullptr ? m_c->object_clipper() : nullptr);
 
             project_texture_mapping_zone_to_regions(*object,
                                                     m_parent,
@@ -9354,6 +9488,7 @@ bool GLGizmoImageProjection::project_to_vertex_colors(ModelObject *object)
     context.image_height = m_image_height;
     context.image_opacity = m_projection_opacity;
     context.apply_transparency_as_background = m_apply_transparency_as_background;
+    apply_projection_section_view(context, m_c != nullptr ? m_c->object_clipper() : nullptr);
 
     const ProjectionVisibility visibility = m_pass_through_model ?
         ProjectionVisibility() :
@@ -9487,6 +9622,7 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
     context.image_height = m_image_height;
     context.image_opacity = m_projection_opacity;
     context.apply_transparency_as_background = m_apply_transparency_as_background;
+    apply_projection_section_view(context, m_c != nullptr ? m_c->object_clipper() : nullptr);
 
     const ProjectionVisibility visibility = m_pass_through_model ?
         ProjectionVisibility() :
@@ -9778,6 +9914,7 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
     context.image_height = m_image_height;
     context.image_opacity = m_projection_opacity;
     context.apply_transparency_as_background = m_apply_transparency_as_background;
+    apply_projection_section_view(context, m_c != nullptr ? m_c->object_clipper() : nullptr);
 
     const ProjectionVisibility visibility = m_pass_through_model ?
         ProjectionVisibility() :
