@@ -941,6 +941,50 @@ size_t pick_nearest_seam_point_index(const std::vector<SeamCandidate> &perimeter
   return seam_index;
 }
 
+std::optional<size_t> pick_preferred_seam_point_index(const std::vector<SeamCandidate> &perimeter_points,
+                                                      size_t start_index,
+                                                      const PreferredSeamPoint &preferred_seam,
+                                                      size_t fallback_index,
+                                                      const SeamComparator &comparator) {
+  if (preferred_seam.confidence <= 0.f || perimeter_points.empty())
+    return std::nullopt;
+
+  if (start_index >= perimeter_points.size() || fallback_index >= perimeter_points.size())
+    return std::nullopt;
+
+  const size_t end_index = perimeter_points[start_index].perimeter.end_index;
+  if (start_index >= end_index || end_index > perimeter_points.size())
+    return std::nullopt;
+
+  const Vec2f preferred_pos = unscale(preferred_seam.point).cast<float>();
+  const SeamCandidate &fallback = perimeter_points[fallback_index];
+  size_t preferred_index = start_index;
+  float best_dist = std::numeric_limits<float>::max();
+  for (size_t index = start_index; index < end_index; ++index) {
+    const float dist = (perimeter_points[index].position.head<2>() - preferred_pos).norm();
+    if (dist < best_dist) {
+      best_dist = dist;
+      preferred_index = index;
+    }
+  }
+
+  const SeamCandidate &preferred = perimeter_points[preferred_index];
+  const float max_dist = std::max(0.25f, 4.f * std::max(preferred.perimeter.flow_width, 0.05f));
+  if (!std::isfinite(best_dist) || best_dist > max_dist)
+    return std::nullopt;
+  if (preferred.type == EnforcedBlockedSeamPoint::Blocked)
+    return std::nullopt;
+  if (fallback.type > preferred.type)
+    return std::nullopt;
+  if ((comparator.setup == SeamPosition::spAligned || comparator.setup == SeamPosition::spAlignedBack) &&
+      fallback.central_enforcer && !preferred.central_enforcer)
+    return std::nullopt;
+  if (!comparator.is_first_not_much_worse(preferred, fallback) && preferred_seam.confidence < 0.8f)
+    return std::nullopt;
+
+  return preferred_index;
+}
+
 // picks random seam point uniformly, respecting enforcers blockers and overhang avoidance.
 void pick_random_seam_point(const std::vector<SeamCandidate> &perimeter_points, size_t start_index) {
   SeamComparator comparator { spRandom };
@@ -1498,7 +1542,8 @@ void SeamPlacer::init(const Print &print, std::function<void(void)> throw_if_can
 }
 
 void SeamPlacer::place_seam(const Layer *layer, ExtrusionLoop &loop,
-                            const Point &last_pos, float& overhang) const {
+                            const Point &last_pos, float& overhang,
+                            const std::optional<PreferredSeamPoint> &preferred_seam) const {
   using namespace SeamPlacerImpl;
   const PrintObject *po = layer->object();
   // Must not be called with supprot layer.
@@ -1546,8 +1591,8 @@ void SeamPlacer::place_seam(const Layer *layer, ExtrusionLoop &loop,
 
   Vec3f seam_position;
   size_t seam_index;
-  if (const Perimeter &perimeter = layer_perimeters.points[closest_perimeter_point_index].perimeter;
-      perimeter.finalized) {
+  const Perimeter &perimeter = layer_perimeters.points[closest_perimeter_point_index].perimeter;
+  if (perimeter.finalized) {
     seam_position = perimeter.final_seam_position;
     seam_index = perimeter.seam_index;
   } else {
@@ -1557,6 +1602,16 @@ void SeamPlacer::place_seam(const Layer *layer, ExtrusionLoop &loop,
                                                                               unscaled<float>(last_pos)) :
                                                 perimeter.seam_index;
     seam_position = layer_perimeters.points[seam_index].position;
+  }
+
+  if (preferred_seam) {
+    const SeamComparator comparator { po->config().seam_position.value };
+    if (const std::optional<size_t> preferred_index =
+            pick_preferred_seam_point_index(layer_perimeters.points, perimeter.start_index, *preferred_seam, seam_index, comparator)) {
+      seam_index = *preferred_index;
+      const Vec2f preferred_pos = unscale(preferred_seam->point).cast<float>();
+      seam_position = Vec3f(preferred_pos.x(), preferred_pos.y(), float(unscaled_z));
+    }
   }
 
   Point seam_point = Point::new_scale(seam_position.x(), seam_position.y());

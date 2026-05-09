@@ -5770,6 +5770,120 @@ static bool find_nearest_layer_slice_boundary_point_for_gcode(const Layer *layer
     return found;
 }
 
+struct NormalAwareLayerSliceBoundaryPointForGCode {
+    Point  point;
+    double outward_x { 0.0 };
+    double outward_y { 0.0 };
+    float  normal_delta_mm { 0.f };
+    float  tangent_delta_mm { 0.f };
+};
+
+static std::optional<NormalAwareLayerSliceBoundaryPointForGCode> find_normal_aware_layer_slice_boundary_point_for_gcode(
+    const Layer *layer,
+    const Point &query_point,
+    double       reference_outward_x,
+    double       reference_outward_y,
+    double       reference_tangent_x,
+    double       reference_tangent_y,
+    float        max_normal_delta_mm,
+    float        max_tangent_delta_mm)
+{
+    if (layer == nullptr ||
+        layer->lslices.empty() ||
+        !std::isfinite(reference_outward_x) ||
+        !std::isfinite(reference_outward_y) ||
+        !std::isfinite(reference_tangent_x) ||
+        !std::isfinite(reference_tangent_y))
+        return std::nullopt;
+
+    const double max_search_scaled = scale_(std::max(max_normal_delta_mm, max_tangent_delta_mm));
+    const double max_search_sq = max_search_scaled * max_search_scaled;
+    const bool has_slice_bboxes = layer->lslices_bboxes.size() == layer->lslices.size();
+    double best_score = std::numeric_limits<double>::max();
+    std::optional<NormalAwareLayerSliceBoundaryPointForGCode> best;
+
+    auto consider_polygon = [&](const Polygon &poly) {
+        const Points &points = poly.points;
+        if (points.size() < 2)
+            return;
+
+        for (size_t idx = 0; idx < points.size(); ++idx) {
+            const Point &a = points[idx];
+            const Point &b = points[next_idx_modulo(idx, points.size())];
+            const double ax = double(a.x());
+            const double ay = double(a.y());
+            const double bx = double(b.x());
+            const double by = double(b.y());
+            const double dx = bx - ax;
+            const double dy = by - ay;
+            const double len_sq = dx * dx + dy * dy;
+            if (len_sq <= EPSILON)
+                continue;
+
+            const double qx = double(query_point.x());
+            const double qy = double(query_point.y());
+            const double t = std::clamp(((qx - ax) * dx + (qy - ay) * dy) / len_sq, 0.0, 1.0);
+            const double px = ax + t * dx;
+            const double py = ay + t * dy;
+            const double delta_x = px - qx;
+            const double delta_y = py - qy;
+            const double dist_sq = delta_x * delta_x + delta_y * delta_y;
+            if (dist_sq > max_search_sq)
+                continue;
+
+            const double len = std::sqrt(len_sq);
+            const double tangent_x = dx / len;
+            const double tangent_y = dy / len;
+            const double outward_x = dy / len;
+            const double outward_y = -dx / len;
+            const double normal_alignment = outward_x * reference_outward_x + outward_y * reference_outward_y;
+            if (normal_alignment < 0.15)
+                continue;
+
+            const float normal_delta_mm = unscale<float>(delta_x * reference_outward_x + delta_y * reference_outward_y);
+            const float tangent_delta_mm = std::abs(unscale<float>(delta_x * reference_tangent_x + delta_y * reference_tangent_y));
+            if (!std::isfinite(normal_delta_mm) ||
+                !std::isfinite(tangent_delta_mm) ||
+                std::abs(normal_delta_mm) > max_normal_delta_mm ||
+                tangent_delta_mm > max_tangent_delta_mm)
+                continue;
+
+            const double tangent_alignment = std::abs(tangent_x * reference_tangent_x + tangent_y * reference_tangent_y);
+            if (tangent_alignment < 0.2 && tangent_delta_mm > 0.25f * max_tangent_delta_mm)
+                continue;
+
+            const double dist_mm = unscale<double>(std::sqrt(dist_sq));
+            const double score = dist_mm + 1.5 * double(tangent_delta_mm) + (1.0 - normal_alignment) * double(max_normal_delta_mm);
+            if (score < best_score) {
+                best_score = score;
+                best = NormalAwareLayerSliceBoundaryPointForGCode {
+                    Point(coord_t(std::llround(px)), coord_t(std::llround(py))),
+                    outward_x,
+                    outward_y,
+                    normal_delta_mm,
+                    tangent_delta_mm
+                };
+            }
+        }
+    };
+
+    for (size_t slice_idx = 0; slice_idx < layer->lslices.size(); ++slice_idx) {
+        const ExPolygon &slice = layer->lslices[slice_idx];
+        if (slice.empty())
+            continue;
+
+        if (has_slice_bboxes && layer->lslices_bboxes[slice_idx].defined &&
+            bbox_distance_sq_to_point_for_gcode(layer->lslices_bboxes[slice_idx], query_point) > max_search_sq)
+            continue;
+
+        consider_polygon(slice.contour);
+        for (const Polygon &hole : slice.holes)
+            consider_polygon(hole);
+    }
+
+    return best;
+}
+
 static void choose_segment_outward_normal_from_reference_for_gcode(double reference_x,
                                                                    double reference_y,
                                                                    double n0x,
@@ -8567,7 +8681,7 @@ static float component_angular_influence_for_gcode(unsigned int                 
     return 0.f;
 }
 
-std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoop &loop)
+std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const ExtrusionLoop &loop)
 {
     if (m_curr_print == nullptr ||
         m_layer == nullptr ||
@@ -8577,17 +8691,19 @@ std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoo
         !is_external_perimeter(loop.role()))
         return std::nullopt;
 
-    const size_t num_physical = m_config.filament_diameter.values.size();
+    const size_t num_physical = m_config.filament_colour.values.size();
     const unsigned int texture_zone_id = unsigned(std::max(0, m_config.wall_filament.value));
     const TextureMappingManager &texture_mgr = m_curr_print->texture_mapping_manager();
     if (num_physical == 0 || texture_zone_id == 0 || !texture_mgr.is_texture_mapping_zone_id(texture_zone_id))
         return std::nullopt;
 
     const TextureMappingZone *zone = texture_mgr.zone_from_id(texture_zone_id);
-    if (zone == nullptr ||
-        !zone->seam_hiding ||
-        !is_vertex_color_match_overhang_row_for_gcode(*zone) ||
-        !is_horizontal_overhang_gradient_row_for_gcode(*zone))
+    if (zone == nullptr || !zone->seam_hiding)
+        return std::nullopt;
+
+    const bool vertex_color_match_mode = is_vertex_color_match_overhang_row_for_gcode(*zone);
+    const bool offset_gradient_mode = is_2d_offset_gradient_row_for_gcode(*zone);
+    if (!vertex_color_match_mode && !offset_gradient_mode)
         return std::nullopt;
 
     const PrintObject *layer_object = m_layer->object();
@@ -8596,12 +8712,13 @@ std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoo
     if (layer_object == nullptr || upper_layer == nullptr || object_layer_count <= 0)
         return std::nullopt;
 
-    std::vector<unsigned int> component_ids =
-        TextureMappingManager::effective_texture_component_ids(*zone,
-                                                               num_physical,
-                                                               m_config.filament_colour.values);
-    if (component_ids.empty())
-        component_ids = decode_offset_component_ids_for_gcode(*zone, num_physical);
+    std::vector<unsigned int> component_ids = decode_offset_component_ids_for_gcode(*zone, num_physical);
+    if (vertex_color_match_mode) {
+        const std::vector<unsigned int> effective_component_ids =
+            TextureMappingManager::effective_texture_component_ids(*zone, num_physical, m_config.filament_colour.values);
+        if (!effective_component_ids.empty())
+            component_ids = effective_component_ids;
+    }
     if (component_ids.empty())
         return std::nullopt;
 
@@ -8619,6 +8736,7 @@ std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoo
                                                int(TextureMappingZone::GenericSolverV2));
     const int generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
     const bool compact_offset_mode = zone->compact_offset_mode;
+    const bool nonlinear_offset_adjustment = zone->nonlinear_offset_adjustment;
     const bool use_legacy_fixed_color_mode = zone->use_legacy_fixed_color_mode;
     const float texture_contrast_pct = std::clamp(zone->contrast_pct, 25.f, 300.f);
     const float texture_tone_gamma =
@@ -8649,7 +8767,8 @@ std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoo
         }
         component_colors.push_back({ decoded.r(), decoded.g(), decoded.b() });
     }
-    if (missing_component_color || component_colors.size() != component_ids.size() || component_colors.empty())
+    if (vertex_color_match_mode &&
+        (missing_component_color || component_colors.size() != component_ids.size() || component_colors.empty()))
         return std::nullopt;
 
     const TransmissionDistanceCalibrationContextForGCode td_calibration_context =
@@ -8680,6 +8799,7 @@ std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoo
     struct SeamLayerTextureState {
         const Layer *layer { nullptr };
         float        layer_height_mm { 0.f };
+        int          layer_index { 0 };
         unsigned int active_component_id { 0 };
         size_t       active_component_idx { size_t(-1) };
         const VertexColorOverhangWeightField *weight_field { nullptr };
@@ -8716,39 +8836,42 @@ std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoo
                 previous_component_idx = size_t(previous_component_it - component_ids.begin());
         }
 
-        std::ostringstream layer_key_stream;
-        layer_key_stream << component_key_prefix << "|seamL" << layer->id();
-        const auto cache_key = std::make_tuple(layer_object, texture_zone_id, layer_key_stream.str());
-        auto cache_it = m_vertex_color_overhang_weight_field_cache.find(cache_key);
-        if (cache_it == m_vertex_color_overhang_weight_field_cache.end()) {
-            const float layer_sample_falloff_mm = high_resolution_texture_sampling ?
-                std::max(0.03f, layer_height_mm * 0.5f) :
-                std::max(0.12f, layer_height_mm * 1.5f);
-            cache_it = m_vertex_color_overhang_weight_field_cache
-                           .emplace(cache_key,
-                                    build_vertex_color_weight_field_for_gcode(*layer_object,
-                                                                              component_colors,
-                                                                              raw_texture_mapping_mode,
-                                                                              texture_filament_color_mode,
-                                                                              texture_force_sequential_filaments,
-                                                                              generic_solver_lookup_mode,
-                                                                              generic_solver_mode,
-                                                                              generic_solver_mix_model,
-                                                                              use_legacy_fixed_color_mode,
-                                                                              &m_generic_solver_mix_candidate_cache,
-                                                                              &m_uv_texture_triangle_cache,
-                                                                              texture_contrast_pct,
-                                                                              texture_tone_gamma,
-                                                                              true,
-                                                                              float(layer->print_z),
-                                                                              layer_sample_falloff_mm,
-                                                                              high_resolution_texture_sampling,
-                                                                              high_speed_image_texture_sampling))
-                           .first;
+        const VertexColorOverhangWeightField *weight_field = nullptr;
+        if (vertex_color_match_mode) {
+            std::ostringstream layer_key_stream;
+            layer_key_stream << component_key_prefix << "|seamL" << layer->id();
+            const auto cache_key = std::make_tuple(layer_object, texture_zone_id, layer_key_stream.str());
+            auto cache_it = m_vertex_color_overhang_weight_field_cache.find(cache_key);
+            if (cache_it == m_vertex_color_overhang_weight_field_cache.end()) {
+                const float layer_sample_falloff_mm = high_resolution_texture_sampling ?
+                    std::max(0.03f, layer_height_mm * 0.5f) :
+                    std::max(0.12f, layer_height_mm * 1.5f);
+                cache_it = m_vertex_color_overhang_weight_field_cache
+                               .emplace(cache_key,
+                                        build_vertex_color_weight_field_for_gcode(*layer_object,
+                                                                                  component_colors,
+                                                                                  raw_texture_mapping_mode,
+                                                                                  texture_filament_color_mode,
+                                                                                  texture_force_sequential_filaments,
+                                                                                  generic_solver_lookup_mode,
+                                                                                  generic_solver_mode,
+                                                                                  generic_solver_mix_model,
+                                                                                  use_legacy_fixed_color_mode,
+                                                                                  &m_generic_solver_mix_candidate_cache,
+                                                                                  &m_uv_texture_triangle_cache,
+                                                                                  texture_contrast_pct,
+                                                                                  texture_tone_gamma,
+                                                                                  true,
+                                                                                  float(layer->print_z),
+                                                                                  layer_sample_falloff_mm,
+                                                                                  high_resolution_texture_sampling,
+                                                                                  high_speed_image_texture_sampling))
+                               .first;
+            }
+            if (cache_it->second.empty())
+                return std::nullopt;
+            weight_field = &cache_it->second;
         }
-        const VertexColorOverhangWeightField &weight_field = cache_it->second;
-        if (weight_field.empty())
-            return std::nullopt;
 
         const float signed_fade_factor =
             offset_fade_factor_for_gcode(zone->offset_fade_mode, z_progress);
@@ -8759,9 +8882,10 @@ std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoo
         return SeamLayerTextureState{
             layer,
             layer_height_mm,
+            layer_index,
             active_component_id,
             active_component_idx,
-            &weight_field,
+            weight_field,
             overhang_filament_strength_factor_for_gcode(*zone, active_component_id),
             overhang_filament_minimum_offset_factor_for_gcode(*zone, active_component_id),
             transmission_distance_width_factor_for_gcode(td_calibration_context, active_component_idx, previous_component_idx),
@@ -8797,6 +8921,28 @@ std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoo
     if (max_allowed_distance_mm <= EPSILON)
         return std::nullopt;
 
+    std::vector<float> distances_mm = TextureMappingManager::effective_offset_distances(*zone, component_ids.size(), reference_nozzle);
+    std::vector<float> angles_deg = TextureMappingManager::effective_offset_angles(*zone, component_ids.size());
+    if (distances_mm.size() != component_ids.size())
+        distances_mm.assign(component_ids.size(), 0.f);
+    if (angles_deg.size() != component_ids.size())
+        angles_deg = TextureMappingManager::default_offset_angles(component_ids.size());
+    for (float &a : angles_deg)
+        a = normalize_angle_deg_for_gcode(a);
+
+    bool has_nonzero_distance = false;
+    if (vertex_color_match_mode) {
+        distances_mm.assign(component_ids.size(), max_allowed_distance_mm);
+        has_nonzero_distance = max_allowed_distance_mm > EPSILON;
+    } else {
+        for (float &d : distances_mm) {
+            d = std::clamp(d, 0.f, max_allowed_distance_mm);
+            has_nonzero_distance = has_nonzero_distance || d > EPSILON;
+        }
+    }
+    if (!has_nonzero_distance)
+        return std::nullopt;
+
     const float global_strength_factor =
         std::clamp(float(m_config.texture_mapping_outer_wall_gradient_global_strength.value) / 100.f, 0.f, 1.f);
     const float texture_sagging_ratio =
@@ -8804,174 +8950,508 @@ std::optional<Point> GCode::texture_mapping_seam_hiding_point(const ExtrusionLoo
     if (global_strength_factor <= EPSILON)
         return std::nullopt;
 
-    struct SeamCandidate {
-        Point  point;
-        float  score_mm { 0.f };
-        double length_mm { 0.0 };
+    struct SeamTextureEnvelope {
+        float outer_offset_mm { 0.f };
+        float width_delta_mm { 0.f };
     };
 
-    std::vector<SeamCandidate> candidates;
+    struct SeamHidingCandidate {
+        Point  point;
+        float  cover_mm { 0.f };
+        float  score_mm { 0.f };
+        double arc_mm { 0.0 };
+        double span_mm { 0.0 };
+        double segment_t { 0.0 };
+        size_t path_index { 0 };
+        size_t segment_index { 0 };
+    };
+
+    std::vector<SeamHidingCandidate> candidates;
     double total_length_mm = 0.0;
-    float best_score_mm = -1.f;
+    float best_score_mm = std::numeric_limits<float>::lowest();
     float min_score_mm = std::numeric_limits<float>::max();
-    Point best_point;
+    double weighted_score_mm = 0.0;
+    double weighted_length_mm = 0.0;
+    SeamHidingCandidate best_candidate;
     const Point object_center = layer_object->bounding_box().center();
 
-    for (const ExtrusionPath &path : loop.paths) {
-        if (!is_external_perimeter(path.role()) || path.polyline.points.size() < 2)
-            continue;
-
-        const float base_outer_width_mm = std::max(
+    auto texture_envelope_for_state = [&](const SeamLayerTextureState &state,
+                                          const ExtrusionPath         &path,
+                                          const Point                 &center_point,
+                                          double                       outward_x,
+                                          double                       outward_y,
+                                          float                        reference_nozzle) -> std::optional<SeamTextureEnvelope> {
+        const float path_outer_width_mm = std::max(
+            0.01f,
+            path.width > EPSILON ? path.width : float(m_config.outer_wall_line_width.get_abs_value(reference_nozzle)));
+        const float texture_mapping_max_outer_width_mm = std::max(
             0.05f,
             float(m_config.texture_mapping_outer_wall_gradient_max_line_width.value));
+        const float base_outer_width_mm = vertex_color_match_mode ? texture_mapping_max_outer_width_mm : path_outer_width_mm;
+        const float flow_reference_width_mm = path_outer_width_mm;
+        const float base_centerline_shift_mm = vertex_color_match_mode ? 0.5f * (base_outer_width_mm - flow_reference_width_mm) : 0.f;
+        const float layer_height_mm = std::max(
+            0.01f,
+            path.height > EPSILON ? path.height : state.layer_height_mm);
+        const float config_min_gradient_width_mm = std::clamp(
+            float(m_config.texture_mapping_outer_wall_gradient_min_line_width.value),
+            0.05f,
+            base_outer_width_mm);
+        const float min_width_for_positive_spacing_mm =
+            layer_height_mm * float(1. - 0.25 * PI) + 1e-4f;
+        const float safe_min_gradient_width_mm = std::clamp(
+            std::max(config_min_gradient_width_mm, min_width_for_positive_spacing_mm),
+            0.05f,
+            base_outer_width_mm);
+        const float max_width_delta_mm = std::max(0.f, base_outer_width_mm - safe_min_gradient_width_mm);
+        const float effective_max_width_delta_mm = max_width_delta_mm * global_strength_factor;
+        float max_width_delta_limit_mm = std::min(effective_max_width_delta_mm, 2.f * max_allowed_distance_mm);
+        if (texture_sagging_ratio > EPSILON)
+            max_width_delta_limit_mm = std::min(max_width_delta_limit_mm, layer_height_mm * texture_sagging_ratio);
+        if (!std::isfinite(max_width_delta_limit_mm) || max_width_delta_limit_mm <= EPSILON)
+            return std::nullopt;
 
-        auto exterior_inset_for_state = [&](const SeamLayerTextureState &state,
-                                            float                        mid_x_mm,
-                                            float                        mid_y_mm) {
-            const float layer_height_mm = std::max(
-                0.01f,
-                path.height > EPSILON ? path.height : state.layer_height_mm);
-            const float config_min_gradient_width_mm = std::clamp(
-                float(m_config.texture_mapping_outer_wall_gradient_min_line_width.value),
-                0.05f,
-                base_outer_width_mm);
-            const float min_width_for_positive_spacing_mm =
-                layer_height_mm * float(1. - 0.25 * PI) + 1e-4f;
-            const float safe_min_gradient_width_mm = std::clamp(
-                std::max(config_min_gradient_width_mm, min_width_for_positive_spacing_mm),
-                0.05f,
-                base_outer_width_mm);
-            const float max_width_delta_mm = std::max(0.f, base_outer_width_mm - safe_min_gradient_width_mm);
-            const float effective_max_width_delta_mm = max_width_delta_mm * global_strength_factor;
-            float max_width_delta_limit_mm = std::min(effective_max_width_delta_mm, 2.f * max_allowed_distance_mm);
-            if (texture_sagging_ratio > EPSILON)
-                max_width_delta_limit_mm = std::min(max_width_delta_limit_mm,
-                                                    layer_height_mm * texture_sagging_ratio);
-            if (!std::isfinite(max_width_delta_limit_mm) || max_width_delta_limit_mm <= EPSILON)
-                return 0.f;
-
+        float inset_strength = 0.f;
+        if (vertex_color_match_mode) {
+            if (state.weight_field == nullptr || state.weight_field->empty())
+                return std::nullopt;
+            const float sample_x_mm = unscale<float>(center_point.x());
+            const float sample_y_mm = unscale<float>(center_point.y());
             const float desired_strength =
                 sample_vertex_color_weight_field_for_gcode(*state.weight_field,
-                                                           mid_x_mm,
-                                                           mid_y_mm,
+                                                           sample_x_mm,
+                                                           sample_y_mm,
                                                            state.active_component_idx,
                                                            high_resolution_texture_sampling,
                                                            compact_offset_mode);
-            const float inset_strength = std::clamp((1.f - desired_strength) * state.fade_factor, 0.f, 1.f);
-            const float variable_width_delta_mm =
-                variable_width_delta_for_overhang_range_for_gcode(inset_strength,
-                                                                  max_width_delta_limit_mm,
-                                                                  state.active_component_minimum_offset_factor,
-                                                                  state.active_component_strength_factor,
-                                                                  state.active_component_td_width_factor);
-            const float width_delta_mm = std::clamp(variable_width_delta_mm, 0.f, max_width_delta_limit_mm);
-            if (!std::isfinite(width_delta_mm))
-                return std::numeric_limits<float>::quiet_NaN();
+            inset_strength = std::clamp(1.f - desired_strength, 0.f, 1.f);
+        } else {
+            const float z_progress = object_layer_count > 1 ?
+                std::clamp(float(state.layer_index) / float(object_layer_count - 1), 0.f, 1.f) :
+                0.f;
+            float rotation_deg = 0.f;
+            if (zone->offset_rotation_enabled) {
+                const float repeated =
+                    repeated_rotation_progress_for_gcode(z_progress, std::max(1.f, zone->offset_repeats), zone->offset_reverse_repeats);
+                const float direction = zone->offset_clockwise ? -1.f : 1.f;
+                rotation_deg = direction * 360.f * zone->offset_rotations * repeated;
+            }
+            std::vector<float> rotated_angles = angles_deg;
+            for (float &a : rotated_angles)
+                a = normalize_angle_deg_for_gcode(a + rotation_deg);
 
-            return state.signed_fade_factor >= 0.f ? width_delta_mm : 0.f;
-        };
+            double theta_direction_x = outward_x;
+            double theta_direction_y = outward_y;
+            if (zone->offset_angle_mode != int(TextureMappingZone::OffsetAngleSurfaceNormal)) {
+                const double radial_x = double(center_point.x()) - double(object_center.x());
+                const double radial_y = double(center_point.y()) - double(object_center.y());
+                const double radial_len = std::hypot(radial_x, radial_y);
+                if (radial_len > EPSILON) {
+                    theta_direction_x = radial_x / radial_len;
+                    theta_direction_y = radial_y / radial_len;
+                }
+            }
 
+            const float theta_deg =
+                normalize_angle_deg_for_gcode(float(Geometry::rad2deg(std::atan2(theta_direction_y, theta_direction_x))));
+            float raw_inset_mm = 0.f;
+            for (size_t i = 0; i < component_ids.size(); ++i) {
+                if (i == state.active_component_idx)
+                    continue;
+                const float influence = component_angular_influence_for_gcode(component_ids[i],
+                                                                               theta_deg,
+                                                                               component_ids,
+                                                                               rotated_angles);
+                raw_inset_mm += distances_mm[i] * influence;
+            }
+            inset_strength = std::clamp(raw_inset_mm / std::max(max_allowed_distance_mm, float(EPSILON)), 0.f, 1.f);
+        }
+        inset_strength = std::clamp(inset_strength * state.fade_factor, 0.f, 1.f);
+        const float stair_step_mm = nonlinear_offset_adjustment ?
+            local_surface_stair_step_distance_for_gcode(state.layer,
+                                                        center_point,
+                                                        outward_x,
+                                                        outward_y,
+                                                        base_outer_width_mm,
+                                                        max_allowed_distance_mm) :
+            std::numeric_limits<float>::quiet_NaN();
+        const float variable_width_delta_mm =
+            variable_width_delta_for_visibility_range_for_gcode(inset_strength,
+                                                                max_width_delta_limit_mm,
+                                                                state.active_component_minimum_offset_factor,
+                                                                state.active_component_strength_factor,
+                                                                state.active_component_td_width_factor,
+                                                                nonlinear_offset_adjustment,
+                                                                layer_height_mm,
+                                                                stair_step_mm,
+                                                                texture_sagging_ratio);
+        const float width_delta_mm = std::clamp(variable_width_delta_mm, 0.f, max_width_delta_limit_mm);
+        if (!std::isfinite(width_delta_mm))
+            return std::nullopt;
+
+        const float target_width_mm = base_outer_width_mm - width_delta_mm;
+        if (!std::isfinite(target_width_mm) || target_width_mm <= 0.f)
+            return std::nullopt;
+
+        const float centerline_shift_mm = base_centerline_shift_mm + 0.5f * width_delta_mm;
+        const float centerline_outward_shift_mm = state.signed_fade_factor >= 0.f ? -centerline_shift_mm : centerline_shift_mm;
+        const float outer_offset_mm = centerline_outward_shift_mm + 0.5f * target_width_mm;
+        if (!std::isfinite(outer_offset_mm))
+            return std::nullopt;
+
+        return SeamTextureEnvelope{ outer_offset_mm, width_delta_mm };
+    };
+
+    auto scaled_offset_point = [](const Point &point, double dir_x, double dir_y, float distance_mm) {
+        const double distance_scaled = scale_(double(distance_mm));
+        return Point(coord_t(std::llround(double(point.x()) + dir_x * distance_scaled)),
+                     coord_t(std::llround(double(point.y()) + dir_y * distance_scaled)));
+    };
+
+    std::vector<const ExtrusionPath *> external_paths;
+    external_paths.reserve(loop.paths.size());
+    for (const ExtrusionPath &path : loop.paths)
+        if (is_external_perimeter(path.role()) && path.polyline.points.size() >= 2)
+            external_paths.push_back(&path);
+
+    for (size_t external_path_idx = 0; external_path_idx < external_paths.size(); ++external_path_idx) {
+        const ExtrusionPath *path_ptr = external_paths[external_path_idx];
+        const ExtrusionPath &path = *path_ptr;
+        if (!is_external_perimeter(path.role()) || path.polyline.points.size() < 2)
+            continue;
+
+        const float path_outer_width_mm = std::max(
+            0.01f,
+            path.width > EPSILON ? path.width : float(m_config.outer_wall_line_width.get_abs_value(reference_nozzle)));
+        const float texture_mapping_max_outer_width_mm = std::max(
+            0.05f,
+            float(m_config.texture_mapping_outer_wall_gradient_max_line_width.value));
+        const float base_outer_width_mm = vertex_color_match_mode ? texture_mapping_max_outer_width_mm : path_outer_width_mm;
+        const float flow_reference_width_mm = path_outer_width_mm;
+        const double half_flow_reference_scaled = scale_(0.5 * double(flow_reference_width_mm));
+        const float sample_step_mm = std::clamp(0.5f * base_outer_width_mm, 0.15f, 0.5f);
+        const float max_local_edge_tangent_delta_mm = std::max(0.75f, base_outer_width_mm * 1.5f);
+        const float max_local_edge_normal_delta_mm =
+            std::max(1.25f, base_outer_width_mm * 3.f + 2.f * max_allowed_distance_mm);
         const Points &points = path.polyline.points;
-        for (size_t point_idx = 1; point_idx < points.size(); ++point_idx) {
-            const Point &a = points[point_idx - 1];
-            const Point &b = points[point_idx];
-            const float ax_mm = unscale<float>(a.x());
-            const float ay_mm = unscale<float>(a.y());
-            const float bx_mm = unscale<float>(b.x());
-            const float by_mm = unscale<float>(b.y());
-            const double len_mm = std::hypot(double(bx_mm - ax_mm), double(by_mm - ay_mm));
-            if (len_mm <= EPSILON)
-                continue;
+        const size_t path_index = external_path_idx;
+        double path_arc_start_mm = total_length_mm;
 
-            const float mid_x_mm = 0.5f * (ax_mm + bx_mm);
-            const float mid_y_mm = 0.5f * (ay_mm + by_mm);
-            const float current_inset_mm = exterior_inset_for_state(*current_state, mid_x_mm, mid_y_mm);
-            const float upper_inset_mm = exterior_inset_for_state(*upper_state, mid_x_mm, mid_y_mm);
-            if (!std::isfinite(current_inset_mm) || !std::isfinite(upper_inset_mm))
-                continue;
-
-            const Point mid_point(coord_t(std::llround(0.5 * (double(a.x()) + double(b.x())))),
-                                  coord_t(std::llround(0.5 * (double(a.y()) + double(b.y())))));
-            const double dx_scaled = double(b.x()) - double(a.x());
-            const double dy_scaled = double(b.y()) - double(a.y());
+        auto evaluate_sample = [&](size_t segment_index,
+                                   double segment_t,
+                                   double arc_mm,
+                                   double span_mm,
+                                   bool add_candidate) -> std::optional<SeamHidingCandidate> {
+            const Point &a = points[segment_index - 1];
+            const Point &b = points[segment_index];
+            const double ax = double(a.x());
+            const double ay = double(a.y());
+            const double bx = double(b.x());
+            const double by = double(b.y());
+            const double dx_scaled = bx - ax;
+            const double dy_scaled = by - ay;
             const double len_scaled = std::hypot(dx_scaled, dy_scaled);
             if (len_scaled <= EPSILON)
-                continue;
+                return std::nullopt;
 
+            const Point sample_point(coord_t(std::llround(ax + segment_t * dx_scaled)),
+                                     coord_t(std::llround(ay + segment_t * dy_scaled)));
             double outward_x = 0.0;
             double outward_y = 0.0;
             resolve_segment_shift_outward_normal_for_gcode(m_layer,
-                                                           mid_point,
+                                                           sample_point,
                                                            dx_scaled,
                                                            dy_scaled,
                                                            len_scaled,
-                                                           double(mid_point.x()) - double(object_center.x()),
-                                                           double(mid_point.y()) - double(object_center.y()),
+                                                           double(sample_point.x()) - double(object_center.x()),
+                                                           double(sample_point.y()) - double(object_center.y()),
                                                            outward_x,
                                                            outward_y);
 
-            const double half_width_scaled = scale_(0.5 * double(base_outer_width_mm));
-            const Point current_base_edge(
-                coord_t(std::llround(double(mid_point.x()) + outward_x * half_width_scaled)),
-                coord_t(std::llround(double(mid_point.y()) + outward_y * half_width_scaled)));
+            const double tangent_x = dx_scaled / len_scaled;
+            const double tangent_y = dy_scaled / len_scaled;
+            const std::optional<SeamTextureEnvelope> current_envelope =
+                texture_envelope_for_state(*current_state, path, sample_point, outward_x, outward_y, reference_nozzle);
+            if (!current_envelope)
+                return std::nullopt;
 
-            Point upper_base_edge;
-            if (!find_nearest_layer_slice_boundary_point_for_gcode(upper_layer, current_base_edge, upper_base_edge))
-                continue;
+            const Point current_outer_edge = scaled_offset_point(sample_point,
+                                                                 outward_x,
+                                                                 outward_y,
+                                                                 current_envelope->outer_offset_mm);
+            const std::optional<NormalAwareLayerSliceBoundaryPointForGCode> upper_boundary =
+                find_normal_aware_layer_slice_boundary_point_for_gcode(upper_layer,
+                                                                       current_outer_edge,
+                                                                       outward_x,
+                                                                       outward_y,
+                                                                       tangent_x,
+                                                                       tangent_y,
+                                                                       max_local_edge_normal_delta_mm,
+                                                                       max_local_edge_tangent_delta_mm);
+            if (!upper_boundary)
+                return std::nullopt;
 
-            const double edge_delta_x = double(upper_base_edge.x()) - double(current_base_edge.x());
-            const double edge_delta_y = double(upper_base_edge.y()) - double(current_base_edge.y());
-            const double edge_distance_scaled = std::hypot(edge_delta_x, edge_delta_y);
-            const double edge_normal_delta_scaled = edge_delta_x * outward_x + edge_delta_y * outward_y;
-            const double edge_tangent_delta_scaled_sq =
-                std::max(0.0, edge_distance_scaled * edge_distance_scaled - edge_normal_delta_scaled * edge_normal_delta_scaled);
-            const float edge_tangent_delta_mm = unscale<float>(std::sqrt(edge_tangent_delta_scaled_sq));
-            const float max_local_edge_tangent_delta_mm = std::max(1.0f, base_outer_width_mm * 2.f);
-            if (!std::isfinite(edge_tangent_delta_mm) || edge_tangent_delta_mm > max_local_edge_tangent_delta_mm)
-                continue;
+            const Point upper_centerline(
+                coord_t(std::llround(double(upper_boundary->point.x()) - upper_boundary->outward_x * half_flow_reference_scaled)),
+                coord_t(std::llround(double(upper_boundary->point.y()) - upper_boundary->outward_y * half_flow_reference_scaled)));
+            const std::optional<SeamTextureEnvelope> upper_envelope =
+                texture_envelope_for_state(*upper_state,
+                                           path,
+                                           upper_centerline,
+                                           upper_boundary->outward_x,
+                                           upper_boundary->outward_y,
+                                           reference_nozzle);
+            if (!upper_envelope)
+                return std::nullopt;
 
-            const float base_edge_cover_mm = unscale<float>(edge_normal_delta_scaled);
-            if (!std::isfinite(base_edge_cover_mm))
-                continue;
-            const float max_local_edge_normal_delta_mm =
-                std::max(2.0f, base_outer_width_mm * 4.f + 2.f * max_allowed_distance_mm);
-            if (std::abs(base_edge_cover_mm) > max_local_edge_normal_delta_mm)
-                continue;
+            const Point upper_outer_edge = scaled_offset_point(upper_centerline,
+                                                               upper_boundary->outward_x,
+                                                               upper_boundary->outward_y,
+                                                               upper_envelope->outer_offset_mm);
+            const double cover_scaled =
+                (double(upper_outer_edge.x()) - double(current_outer_edge.x())) * outward_x +
+                (double(upper_outer_edge.y()) - double(current_outer_edge.y())) * outward_y;
+            const float cover_mm = unscale<float>(cover_scaled);
+            if (!std::isfinite(cover_mm))
+                return std::nullopt;
 
-            const float texture_cover_delta_mm = current_inset_mm - upper_inset_mm;
-            const float actual_cover_mm = base_edge_cover_mm + texture_cover_delta_mm;
-            const float score_mm =
-                texture_cover_delta_mm > 0.005f && actual_cover_mm > 0.005f ? actual_cover_mm : 0.f;
+            const float texture_cover_bonus_mm = std::max(0.f, current_envelope->width_delta_mm - upper_envelope->width_delta_mm);
+            const float score_mm = cover_mm > 0.f ?
+                std::max(0.f, cover_mm + 0.25f * texture_cover_bonus_mm - 0.2f * upper_boundary->tangent_delta_mm) :
+                0.f;
+            SeamHidingCandidate candidate{
+                sample_point,
+                std::max(0.f, cover_mm),
+                score_mm,
+                arc_mm,
+                span_mm,
+                segment_t,
+                path_index,
+                segment_index
+            };
 
-            candidates.push_back({ mid_point, score_mm, len_mm });
-            total_length_mm += len_mm;
-            min_score_mm = std::min(min_score_mm, score_mm);
-            if (score_mm > best_score_mm) {
-                best_score_mm = score_mm;
-                best_point = mid_point;
+            if (add_candidate) {
+                candidates.push_back(candidate);
+                min_score_mm = std::min(min_score_mm, score_mm);
+                weighted_score_mm += double(score_mm) * span_mm;
+                weighted_length_mm += span_mm;
+                if (score_mm > best_score_mm) {
+                    best_score_mm = score_mm;
+                    best_candidate = candidate;
+                }
             }
+
+            return candidate;
+        };
+
+        for (size_t point_idx = 1; point_idx < points.size(); ++point_idx) {
+            const Point &a = points[point_idx - 1];
+            const Point &b = points[point_idx];
+            const double len_mm = unscale<double>((b - a).cast<double>().norm());
+            if (len_mm <= EPSILON)
+                continue;
+
+            const int sample_count = std::max(1, int(std::ceil(len_mm / sample_step_mm)));
+            const double span_mm = len_mm / double(sample_count);
+            for (int sample_idx = 0; sample_idx <= sample_count; ++sample_idx) {
+                if (point_idx > 1 && sample_idx == 0)
+                    continue;
+                const double t = double(sample_idx) / double(sample_count);
+                evaluate_sample(point_idx,
+                                t,
+                                path_arc_start_mm + t * len_mm,
+                                span_mm,
+                                true);
+            }
+
+            path_arc_start_mm += len_mm;
         }
+
+        total_length_mm = path_arc_start_mm;
     }
 
     if (candidates.empty() || total_length_mm <= EPSILON || best_score_mm <= 0.f || !std::isfinite(best_score_mm))
         return std::nullopt;
 
+    const ExtrusionPath *best_path = nullptr;
+    size_t external_path_idx = 0;
+    for (const ExtrusionPath *path_ptr : external_paths) {
+        if (external_path_idx == best_candidate.path_index) {
+            best_path = path_ptr;
+            break;
+        }
+        ++external_path_idx;
+    }
+    if (best_path != nullptr &&
+        best_candidate.segment_index > 0 &&
+        best_candidate.segment_index < best_path->polyline.points.size()) {
+        const Point &a = best_path->polyline.points[best_candidate.segment_index - 1];
+        const Point &b = best_path->polyline.points[best_candidate.segment_index];
+        const double len_mm = unscale<double>((b - a).cast<double>().norm());
+        if (len_mm > EPSILON) {
+            const float best_path_outer_width_mm = std::max(
+                0.01f,
+                best_path->width > EPSILON ? best_path->width : float(m_config.outer_wall_line_width.get_abs_value(reference_nozzle)));
+            const float best_texture_mapping_max_outer_width_mm = std::max(
+                0.05f,
+                float(m_config.texture_mapping_outer_wall_gradient_max_line_width.value));
+            const float best_base_outer_width_mm =
+                vertex_color_match_mode ? best_texture_mapping_max_outer_width_mm : best_path_outer_width_mm;
+            const double delta_t = std::clamp(
+                0.25 * std::clamp(0.5f * best_base_outer_width_mm, 0.15f, 0.5f) / len_mm,
+                0.02,
+                0.35);
+            for (double t : {
+                     std::clamp(best_candidate.segment_t - 2.0 * delta_t, 0.0, 1.0),
+                     std::clamp(best_candidate.segment_t - delta_t, 0.0, 1.0),
+                     std::clamp(best_candidate.segment_t + delta_t, 0.0, 1.0),
+                     std::clamp(best_candidate.segment_t + 2.0 * delta_t, 0.0, 1.0) }) {
+                if (std::abs(t - best_candidate.segment_t) <= 1e-5)
+                    continue;
+                const std::optional<SeamHidingCandidate> refined =
+                    [&]() -> std::optional<SeamHidingCandidate> {
+                        const Points &points = best_path->polyline.points;
+                        const float path_outer_width_mm = std::max(
+                            0.01f,
+                            best_path->width > EPSILON ?
+                                best_path->width :
+                                float(m_config.outer_wall_line_width.get_abs_value(reference_nozzle)));
+                        const float texture_mapping_max_outer_width_mm = std::max(
+                            0.05f,
+                            float(m_config.texture_mapping_outer_wall_gradient_max_line_width.value));
+                        const float base_outer_width_mm =
+                            vertex_color_match_mode ? texture_mapping_max_outer_width_mm : path_outer_width_mm;
+                        const float flow_reference_width_mm = path_outer_width_mm;
+                        const double half_flow_reference_scaled = scale_(0.5 * double(flow_reference_width_mm));
+                        const float max_local_edge_tangent_delta_mm = std::max(0.75f, base_outer_width_mm * 1.5f);
+                        const float max_local_edge_normal_delta_mm =
+                            std::max(1.25f, base_outer_width_mm * 3.f + 2.f * max_allowed_distance_mm);
+                        const Point &a = points[best_candidate.segment_index - 1];
+                        const Point &b = points[best_candidate.segment_index];
+                        const double ax = double(a.x());
+                        const double ay = double(a.y());
+                        const double bx = double(b.x());
+                        const double by = double(b.y());
+                        const double dx_scaled = bx - ax;
+                        const double dy_scaled = by - ay;
+                        const double len_scaled = std::hypot(dx_scaled, dy_scaled);
+                        if (len_scaled <= EPSILON)
+                            return std::nullopt;
+                        const Point sample_point(coord_t(std::llround(ax + t * dx_scaled)),
+                                                 coord_t(std::llround(ay + t * dy_scaled)));
+                        double outward_x = 0.0;
+                        double outward_y = 0.0;
+                        resolve_segment_shift_outward_normal_for_gcode(m_layer,
+                                                                       sample_point,
+                                                                       dx_scaled,
+                                                                       dy_scaled,
+                                                                       len_scaled,
+                                                                       double(sample_point.x()) - double(object_center.x()),
+                                                                       double(sample_point.y()) - double(object_center.y()),
+                                                                       outward_x,
+                                                                       outward_y);
+                        const double tangent_x = dx_scaled / len_scaled;
+                        const double tangent_y = dy_scaled / len_scaled;
+                        const std::optional<SeamTextureEnvelope> current_envelope =
+                            texture_envelope_for_state(*current_state, *best_path, sample_point, outward_x, outward_y, reference_nozzle);
+                        if (!current_envelope)
+                            return std::nullopt;
+                        const Point current_outer_edge = scaled_offset_point(sample_point,
+                                                                             outward_x,
+                                                                             outward_y,
+                                                                             current_envelope->outer_offset_mm);
+                        const std::optional<NormalAwareLayerSliceBoundaryPointForGCode> upper_boundary =
+                            find_normal_aware_layer_slice_boundary_point_for_gcode(upper_layer,
+                                                                                   current_outer_edge,
+                                                                                   outward_x,
+                                                                                   outward_y,
+                                                                                   tangent_x,
+                                                                                   tangent_y,
+                                                                                   max_local_edge_normal_delta_mm,
+                                                                                   max_local_edge_tangent_delta_mm);
+                        if (!upper_boundary)
+                            return std::nullopt;
+                        const Point upper_centerline(
+                            coord_t(std::llround(double(upper_boundary->point.x()) -
+                                                 upper_boundary->outward_x * half_flow_reference_scaled)),
+                            coord_t(std::llround(double(upper_boundary->point.y()) -
+                                                 upper_boundary->outward_y * half_flow_reference_scaled)));
+                        const std::optional<SeamTextureEnvelope> upper_envelope =
+                            texture_envelope_for_state(*upper_state,
+                                                       *best_path,
+                                                       upper_centerline,
+                                                       upper_boundary->outward_x,
+                                                       upper_boundary->outward_y,
+                                                       reference_nozzle);
+                        if (!upper_envelope)
+                            return std::nullopt;
+                        const Point upper_outer_edge = scaled_offset_point(upper_centerline,
+                                                                           upper_boundary->outward_x,
+                                                                           upper_boundary->outward_y,
+                                                                           upper_envelope->outer_offset_mm);
+                        const double cover_scaled =
+                            (double(upper_outer_edge.x()) - double(current_outer_edge.x())) * outward_x +
+                            (double(upper_outer_edge.y()) - double(current_outer_edge.y())) * outward_y;
+                        const float cover_mm = unscale<float>(cover_scaled);
+                        const float texture_cover_bonus_mm =
+                            std::max(0.f, current_envelope->width_delta_mm - upper_envelope->width_delta_mm);
+                        const float score_mm = cover_mm > 0.f ?
+                            std::max(0.f, cover_mm + 0.25f * texture_cover_bonus_mm - 0.2f * upper_boundary->tangent_delta_mm) :
+                            0.f;
+                        return SeamHidingCandidate{
+                            sample_point,
+                            std::max(0.f, cover_mm),
+                            score_mm,
+                            best_candidate.arc_mm + (t - best_candidate.segment_t) * len_mm,
+                            0.25 * len_mm,
+                            t,
+                            best_candidate.path_index,
+                            best_candidate.segment_index
+                        };
+                    }();
+                if (refined && refined->score_mm > best_score_mm) {
+                    best_score_mm = refined->score_mm;
+                    best_candidate = *refined;
+                }
+            }
+        }
+    }
+
+    if (best_score_mm <= 0.f || !std::isfinite(best_score_mm))
+        return std::nullopt;
+
+    const float useful_score_mm =
+        std::max(0.015f, std::min(0.08f, 0.05f * float(m_config.texture_mapping_outer_wall_gradient_max_line_width.value)));
+    if (best_score_mm < useful_score_mm)
+        return std::nullopt;
+
     const float score_range_mm = best_score_mm - min_score_mm;
-    const float useful_score_mm = std::max(0.015f, best_score_mm * 0.35f);
-    const float required_range_mm = std::max(0.01f, best_score_mm * 0.2f);
-    if (best_score_mm < useful_score_mm || score_range_mm < required_range_mm)
+    const double mean_score_mm = weighted_length_mm > EPSILON ? weighted_score_mm / weighted_length_mm : 0.0;
+    const double seam_gap_mm = m_config.seam_gap.get_abs_value(reference_nozzle);
+    const double required_local_length_mm = std::max({ seam_gap_mm, double(reference_nozzle), 0.4 });
+    const float strong_score_mm = std::max(useful_score_mm, best_score_mm * 0.55f);
+    double local_support_mm = 0.0;
+    for (const SeamHidingCandidate &candidate : candidates) {
+        double arc_distance_mm = std::abs(candidate.arc_mm - best_candidate.arc_mm);
+        arc_distance_mm = std::min(arc_distance_mm, total_length_mm - arc_distance_mm);
+        if (arc_distance_mm <= 0.5 * required_local_length_mm && candidate.score_mm >= strong_score_mm)
+            local_support_mm += candidate.span_mm;
+    }
+
+    const bool has_local_support = local_support_mm >= 0.65 * required_local_length_mm;
+    const bool clearly_stronger =
+        score_range_mm >= std::max(0.025f, best_score_mm * 0.35f) &&
+        best_score_mm >= float(mean_score_mm) + std::max(0.025f, best_score_mm * 0.30f);
+    if (!has_local_support && !clearly_stronger)
         return std::nullopt;
 
-    const float strong_score_mm = std::max(useful_score_mm, best_score_mm * 0.65f);
-    double strong_length_mm = 0.0;
-    for (const SeamCandidate &candidate : candidates)
-        if (candidate.score_mm >= strong_score_mm)
-            strong_length_mm += candidate.length_mm;
+    const float cover_confidence = std::clamp(best_candidate.cover_mm / std::max(0.05f, 0.25f * reference_nozzle), 0.f, 1.f);
+    const float support_confidence = std::clamp(float(local_support_mm / std::max(required_local_length_mm, 1e-6)), 0.f, 1.f);
+    const float contrast_confidence = std::clamp((best_score_mm - float(mean_score_mm)) / std::max(best_score_mm, 1e-6f), 0.f, 1.f);
+    const float confidence =
+        std::clamp(0.35f + 0.45f * cover_confidence + 0.20f * std::max(support_confidence, contrast_confidence), 0.f, 1.f);
 
-    if (strong_length_mm / total_length_mm < 0.12)
-        return std::nullopt;
-
-    return best_point;
+    return PreferredSeamPoint{ best_candidate.point, best_candidate.cover_mm, confidence };
 }
 
 std::string GCode::extrude_loop(ExtrusionLoop loop, std::string description, double speed, const ExtrusionEntitiesPtr& region_perimeters, const Point* start_point)
@@ -8999,13 +9479,7 @@ std::string GCode::extrude_loop(ExtrusionLoop loop, std::string description, dou
     float seam_overhang = std::numeric_limits<float>::lowest();
     if (!m_config.spiral_mode && description == "perimeter") {
         assert(m_layer != nullptr);
-        if (std::optional<Point> texture_hidden_seam = texture_mapping_seam_hiding_point(loop)) {
-            seam_overhang = 0.f;
-            if (!loop.split_at_vertex(*texture_hidden_seam, scaled<double>(0.0015)))
-                loop.split_at(*texture_hidden_seam, true);
-        } else {
-            m_seam_placer.place_seam(m_layer, loop, last_pos, seam_overhang);
-        }
+        m_seam_placer.place_seam(m_layer, loop, last_pos, seam_overhang, texture_mapping_seam_hiding_hint(loop));
     } else
         loop.split_at(last_pos, false);
 
