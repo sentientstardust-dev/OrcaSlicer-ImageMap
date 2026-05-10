@@ -1037,8 +1037,10 @@ void GLVolume::render_sinking_contours()
 
 static constexpr float prime_tower_preview_epsilon = 1e-6f;
 static constexpr float prime_tower_preview_offset = 0.001f;
+static constexpr float prime_tower_preview_coord_epsilon = 1e-4f;
 
-float prime_tower_preview_anchor_distance(const std::array<Vec2f, 4> &points, const Vec2f &center, float angle_deg)
+template<class Points>
+float prime_tower_preview_anchor_distance(const Points &points, const Vec2f &center, float angle_deg)
 {
     float travelled = 0.f;
     float fallback_distance = 0.f;
@@ -1104,7 +1106,8 @@ float prime_tower_preview_texture_v(float z, float texture_z_min, float texture_
     return 1.f - v;
 }
 
-float prime_tower_preview_anchor_angle(const std::array<Vec2f, 4> &points, float angle_deg)
+template<class Points>
+float prime_tower_preview_anchor_angle(const Points &points, float angle_deg)
 {
     Vec2f min_pt(std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
     Vec2f max_pt(std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest());
@@ -1239,6 +1242,387 @@ GUI::GLModel::Geometry prime_tower_image_preview_geometry(float width,
     return data;
 }
 
+struct PrimeTowerPreviewRingEdgeGroup
+{
+    float z = 0.f;
+    std::vector<Vec2f> points;
+    std::vector<std::pair<int, int>> edges;
+};
+
+struct PrimeTowerPreviewRing
+{
+    float z = 0.f;
+    std::vector<Vec2f> points;
+    std::vector<float> distances;
+    float total_length = 0.f;
+    float anchor_distance = 0.f;
+};
+
+int prime_tower_preview_find_z_group(std::vector<PrimeTowerPreviewRingEdgeGroup> &groups, float z)
+{
+    for (size_t i = 0; i < groups.size(); ++i) {
+        if (std::abs(groups[i].z - z) <= prime_tower_preview_coord_epsilon)
+            return int(i);
+    }
+    groups.emplace_back();
+    groups.back().z = z;
+    return int(groups.size() - 1);
+}
+
+int prime_tower_preview_find_point(std::vector<Vec2f> &points, const Vec2f &point)
+{
+    for (size_t i = 0; i < points.size(); ++i) {
+        if ((points[i] - point).norm() <= prime_tower_preview_coord_epsilon)
+            return int(i);
+    }
+    points.emplace_back(point);
+    return int(points.size() - 1);
+}
+
+void prime_tower_preview_add_edge(PrimeTowerPreviewRingEdgeGroup &group, int a, int b)
+{
+    if (a == b)
+        return;
+    for (const std::pair<int, int> &edge : group.edges)
+        if ((edge.first == a && edge.second == b) || (edge.first == b && edge.second == a))
+            return;
+    group.edges.emplace_back(a, b);
+}
+
+size_t prime_tower_preview_lowest_point_index(const std::vector<Vec2f> &points)
+{
+    size_t best = 0;
+    for (size_t i = 1; i < points.size(); ++i) {
+        if (points[i].y() < points[best].y() - prime_tower_preview_coord_epsilon ||
+            (std::abs(points[i].y() - points[best].y()) <= prime_tower_preview_coord_epsilon &&
+             points[i].x() < points[best].x())) {
+            best = i;
+        }
+    }
+    return best;
+}
+
+float prime_tower_preview_polygon_area(const std::vector<Vec2f> &points)
+{
+    double area = 0.;
+    for (size_t i = 0; i < points.size(); ++i) {
+        const Vec2f &a = points[i];
+        const Vec2f &b = points[(i + 1) % points.size()];
+        area += double(a.x()) * double(b.y()) - double(b.x()) * double(a.y());
+    }
+    return float(0.5 * area);
+}
+
+void prime_tower_preview_rotate_to_lowest_point(std::vector<Vec2f> &points)
+{
+    if (points.empty())
+        return;
+    const size_t start = prime_tower_preview_lowest_point_index(points);
+    std::rotate(points.begin(), points.begin() + start, points.end());
+}
+
+bool prime_tower_preview_build_loop(const PrimeTowerPreviewRingEdgeGroup &group, std::vector<Vec2f> &loop)
+{
+    loop.clear();
+    if (group.points.size() < 3 || group.edges.size() < 3)
+        return false;
+
+    std::vector<std::vector<int>> adjacency(group.points.size());
+    for (const std::pair<int, int> &edge : group.edges) {
+        if (edge.first < 0 || edge.second < 0 || edge.first >= int(group.points.size()) || edge.second >= int(group.points.size()))
+            continue;
+        adjacency[size_t(edge.first)].emplace_back(edge.second);
+        adjacency[size_t(edge.second)].emplace_back(edge.first);
+    }
+
+    const int start = int(prime_tower_preview_lowest_point_index(group.points));
+    int prev = -1;
+    int current = start;
+    bool closed = false;
+    for (size_t guard = 0; guard <= group.points.size(); ++guard) {
+        loop.emplace_back(group.points[size_t(current)]);
+        const std::vector<int> &neighbors = adjacency[size_t(current)];
+        if (neighbors.empty())
+            return false;
+
+        int next = -1;
+        for (const int candidate : neighbors) {
+            if (candidate != prev) {
+                next = candidate;
+                break;
+            }
+        }
+        if (next < 0)
+            return false;
+        if (next == start) {
+            closed = true;
+            break;
+        }
+        prev = current;
+        current = next;
+    }
+
+    if (!closed || loop.size() < 3)
+        return false;
+    if (prime_tower_preview_polygon_area(loop) < 0.f)
+        std::reverse(loop.begin(), loop.end());
+    prime_tower_preview_rotate_to_lowest_point(loop);
+    return true;
+}
+
+void prime_tower_preview_prepare_ring(PrimeTowerPreviewRing &ring, float angle_offset_deg)
+{
+    ring.distances.assign(ring.points.size(), 0.f);
+    ring.total_length = 0.f;
+    for (size_t i = 0; i < ring.points.size(); ++i) {
+        ring.distances[i] = ring.total_length;
+        ring.total_length += (ring.points[(i + 1) % ring.points.size()] - ring.points[i]).norm();
+    }
+
+    Vec2f min_pt(std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
+    Vec2f max_pt(std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest());
+    for (const Vec2f &point : ring.points) {
+        min_pt.x() = std::min(min_pt.x(), point.x());
+        min_pt.y() = std::min(min_pt.y(), point.y());
+        max_pt.x() = std::max(max_pt.x(), point.x());
+        max_pt.y() = std::max(max_pt.y(), point.y());
+    }
+    const Vec2f center = (min_pt + max_pt) * 0.5f;
+    ring.anchor_distance =
+        prime_tower_preview_anchor_distance(ring.points, center, prime_tower_preview_anchor_angle(ring.points, angle_offset_deg));
+}
+
+std::vector<PrimeTowerPreviewRing> prime_tower_preview_extract_mesh_rings(const TriangleMesh &mesh, float angle_offset_deg)
+{
+    std::vector<PrimeTowerPreviewRingEdgeGroup> groups;
+    for (const stl_triangle_vertex_indices &face : mesh.its.indices) {
+        const Vec3f vertices[3] = {
+            mesh.its.vertices[size_t(face[0])],
+            mesh.its.vertices[size_t(face[1])],
+            mesh.its.vertices[size_t(face[2])]
+        };
+        const float z_min = std::min({vertices[0].z(), vertices[1].z(), vertices[2].z()});
+        const float z_max = std::max({vertices[0].z(), vertices[1].z(), vertices[2].z()});
+        if (z_max - z_min <= prime_tower_preview_coord_epsilon)
+            continue;
+
+        for (int edge_idx = 0; edge_idx < 3; ++edge_idx) {
+            const Vec3f &a = vertices[edge_idx];
+            const Vec3f &b = vertices[(edge_idx + 1) % 3];
+            if (std::abs(a.z() - b.z()) > prime_tower_preview_coord_epsilon)
+                continue;
+            PrimeTowerPreviewRingEdgeGroup &group = groups[size_t(prime_tower_preview_find_z_group(groups, 0.5f * (a.z() + b.z())))];
+            const int a_idx = prime_tower_preview_find_point(group.points, Vec2f(a.x(), a.y()));
+            const int b_idx = prime_tower_preview_find_point(group.points, Vec2f(b.x(), b.y()));
+            prime_tower_preview_add_edge(group, a_idx, b_idx);
+        }
+    }
+
+    std::sort(groups.begin(), groups.end(), [](const PrimeTowerPreviewRingEdgeGroup &lhs, const PrimeTowerPreviewRingEdgeGroup &rhs) {
+        return lhs.z < rhs.z;
+    });
+
+    std::vector<PrimeTowerPreviewRing> rings;
+    rings.reserve(groups.size());
+    for (const PrimeTowerPreviewRingEdgeGroup &group : groups) {
+        PrimeTowerPreviewRing ring;
+        ring.z = group.z;
+        if (!prime_tower_preview_build_loop(group, ring.points))
+            continue;
+        prime_tower_preview_prepare_ring(ring, angle_offset_deg);
+        if (ring.total_length > prime_tower_preview_epsilon)
+            rings.emplace_back(std::move(ring));
+    }
+    return rings;
+}
+
+PrimeTowerPreviewRing prime_tower_preview_interpolate_ring(const PrimeTowerPreviewRing &lower,
+                                                           const PrimeTowerPreviewRing &upper,
+                                                           float z,
+                                                           float angle_offset_deg)
+{
+    PrimeTowerPreviewRing ring;
+    ring.z = z;
+    const float t = std::clamp((z - lower.z) / (upper.z - lower.z), 0.f, 1.f);
+    ring.points.reserve(lower.points.size());
+    for (size_t i = 0; i < lower.points.size(); ++i)
+        ring.points.emplace_back(lower.points[i] + (upper.points[i] - lower.points[i]) * t);
+    prime_tower_preview_prepare_ring(ring, angle_offset_deg);
+    return ring;
+}
+
+std::vector<PrimeTowerPreviewRing> prime_tower_preview_insert_z_cuts(const std::vector<PrimeTowerPreviewRing> &rings,
+                                                                     float texture_z_min,
+                                                                     float texture_z_max,
+                                                                     float angle_offset_deg)
+{
+    if (rings.size() < 2)
+        return rings;
+
+    std::vector<PrimeTowerPreviewRing> out;
+    for (size_t i = 0; i + 1 < rings.size(); ++i) {
+        const PrimeTowerPreviewRing &lower = rings[i];
+        const PrimeTowerPreviewRing &upper = rings[i + 1];
+        if (lower.points.size() != upper.points.size() || upper.z - lower.z <= prime_tower_preview_epsilon)
+            return rings;
+
+        if (out.empty())
+            out.emplace_back(lower);
+
+        std::vector<float> cuts;
+        if (texture_z_min > lower.z + prime_tower_preview_coord_epsilon && texture_z_min < upper.z - prime_tower_preview_coord_epsilon)
+            cuts.emplace_back(texture_z_min);
+        if (texture_z_max > lower.z + prime_tower_preview_coord_epsilon && texture_z_max < upper.z - prime_tower_preview_coord_epsilon)
+            cuts.emplace_back(texture_z_max);
+        std::sort(cuts.begin(), cuts.end());
+        cuts.erase(std::unique(cuts.begin(), cuts.end(), [](float lhs, float rhs) {
+            return std::abs(lhs - rhs) <= prime_tower_preview_coord_epsilon;
+        }), cuts.end());
+
+        for (const float cut : cuts)
+            out.emplace_back(prime_tower_preview_interpolate_ring(lower, upper, cut, angle_offset_deg));
+        out.emplace_back(upper);
+    }
+    return out;
+}
+
+void prime_tower_preview_add_raw_u_cuts(std::vector<float> &cuts, float raw0, float raw1, int image_slot)
+{
+    if (std::abs(raw1 - raw0) <= prime_tower_preview_epsilon)
+        return;
+    const float boundary_step = image_slot == 0 ? 1.f : 0.5f;
+    const float raw_min = std::min(raw0, raw1);
+    const float raw_max = std::max(raw0, raw1);
+    const int first = int(std::floor(raw_min / boundary_step)) - 1;
+    const int last = int(std::ceil(raw_max / boundary_step)) + 1;
+    for (int boundary_idx = first; boundary_idx <= last; ++boundary_idx) {
+        const float boundary = float(boundary_idx) * boundary_step;
+        const float t = (boundary - raw0) / (raw1 - raw0);
+        if (t > prime_tower_preview_epsilon && t < 1.f - prime_tower_preview_epsilon)
+            cuts.emplace_back(t);
+    }
+}
+
+float prime_tower_preview_texture_u_from_raw(float raw_u, float mid_raw_u, int image_slot)
+{
+    const float base = std::floor(mid_raw_u);
+    if (image_slot == 0)
+        return std::clamp(raw_u - base, 0.f, 1.f);
+    return image_slot == 1 ? std::clamp(2.f * (raw_u - base), 0.f, 1.f) :
+                             std::clamp(2.f * (raw_u - base - 0.5f), 0.f, 1.f);
+}
+
+GUI::GLModel::Geometry prime_tower_mesh_image_preview_geometry(const TriangleMesh &mesh,
+                                                               float angle_offset_deg,
+                                                               float texture_z_min,
+                                                               float texture_z_max,
+                                                               int image_slot)
+{
+    GUI::GLModel::Geometry data;
+    data.format = {GUI::GLModel::Geometry::EPrimitiveType::Triangles, GUI::GLModel::Geometry::EVertexLayout::P3N3T2};
+
+    std::vector<PrimeTowerPreviewRing> rings =
+        prime_tower_preview_insert_z_cuts(prime_tower_preview_extract_mesh_rings(mesh, angle_offset_deg),
+                                          texture_z_min,
+                                          texture_z_max,
+                                          angle_offset_deg);
+    if (rings.size() < 2)
+        return data;
+
+    data.reserve_vertices(mesh.its.indices.size() * 6);
+    data.reserve_indices(mesh.its.indices.size() * 6);
+
+    for (size_t ring_idx = 0; ring_idx + 1 < rings.size(); ++ring_idx) {
+        const PrimeTowerPreviewRing &lower = rings[ring_idx];
+        const PrimeTowerPreviewRing &upper = rings[ring_idx + 1];
+        if (lower.points.size() != upper.points.size() || lower.points.size() < 3)
+            continue;
+
+        const size_t point_count = lower.points.size();
+        for (size_t point_idx = 0; point_idx < point_count; ++point_idx) {
+            const size_t next_idx = (point_idx + 1) % point_count;
+            const Vec2f lower_a = lower.points[point_idx];
+            const Vec2f lower_b = lower.points[next_idx];
+            const Vec2f upper_a = upper.points[point_idx];
+            const Vec2f upper_b = upper.points[next_idx];
+            const float lower_len = (lower_b - lower_a).norm();
+            const float upper_len = (upper_b - upper_a).norm();
+            if (lower_len <= prime_tower_preview_epsilon && upper_len <= prime_tower_preview_epsilon)
+                continue;
+
+            const float lower_raw0 = (lower.distances[point_idx] - lower.anchor_distance) / lower.total_length;
+            const float lower_raw1 = (lower.distances[point_idx] + lower_len - lower.anchor_distance) / lower.total_length;
+            const float upper_raw0 = (upper.distances[point_idx] - upper.anchor_distance) / upper.total_length;
+            const float upper_raw1 = (upper.distances[point_idx] + upper_len - upper.anchor_distance) / upper.total_length;
+
+            std::vector<float> cuts = {0.f, 1.f};
+            prime_tower_preview_add_raw_u_cuts(cuts, lower_raw0, lower_raw1, image_slot);
+            prime_tower_preview_add_raw_u_cuts(cuts, upper_raw0, upper_raw1, image_slot);
+            std::sort(cuts.begin(), cuts.end());
+            cuts.erase(std::unique(cuts.begin(), cuts.end(), [](float lhs, float rhs) {
+                return std::abs(lhs - rhs) <= prime_tower_preview_epsilon;
+            }), cuts.end());
+
+            for (size_t cut_idx = 0; cut_idx + 1 < cuts.size(); ++cut_idx) {
+                const float t0 = cuts[cut_idx];
+                const float t1 = cuts[cut_idx + 1];
+                if (t1 - t0 <= prime_tower_preview_epsilon)
+                    continue;
+
+                const float mid_t = 0.5f * (t0 + t1);
+                const float lower_mid_raw = lower_raw0 + (lower_raw1 - lower_raw0) * mid_t;
+                const float upper_mid_raw = upper_raw0 + (upper_raw1 - upper_raw0) * mid_t;
+                const float mid_raw = 0.5f * (lower_mid_raw + upper_mid_raw);
+                if (image_slot != 0) {
+                    const float mid_u = mid_raw - std::floor(mid_raw);
+                    if ((mid_u >= 0.5f ? 2 : 1) != image_slot)
+                        continue;
+                }
+
+                const Vec2f lower_p0 = lower_a + (lower_b - lower_a) * t0;
+                const Vec2f lower_p1 = lower_a + (lower_b - lower_a) * t1;
+                const Vec2f upper_p0 = upper_a + (upper_b - upper_a) * t0;
+                const Vec2f upper_p1 = upper_a + (upper_b - upper_a) * t1;
+
+                Vec3f p0(lower_p0.x(), lower_p0.y(), lower.z);
+                Vec3f p1(lower_p1.x(), lower_p1.y(), lower.z);
+                Vec3f p2(upper_p1.x(), upper_p1.y(), upper.z);
+                Vec3f p3(upper_p0.x(), upper_p0.y(), upper.z);
+                Vec3f normal = (p1 - p0).cross(p3 - p0);
+                if (normal.norm() <= prime_tower_preview_epsilon)
+                    continue;
+                normal.normalize();
+                const Vec3f offset = normal * prime_tower_preview_offset;
+                p0 += offset;
+                p1 += offset;
+                p2 += offset;
+                p3 += offset;
+
+                const float lower_raw_t0 = lower_raw0 + (lower_raw1 - lower_raw0) * t0;
+                const float lower_raw_t1 = lower_raw0 + (lower_raw1 - lower_raw0) * t1;
+                const float upper_raw_t0 = upper_raw0 + (upper_raw1 - upper_raw0) * t0;
+                const float upper_raw_t1 = upper_raw0 + (upper_raw1 - upper_raw0) * t1;
+                const float u0 = prime_tower_preview_texture_u_from_raw(lower_raw_t0, mid_raw, image_slot);
+                const float u1 = prime_tower_preview_texture_u_from_raw(lower_raw_t1, mid_raw, image_slot);
+                const float u2 = prime_tower_preview_texture_u_from_raw(upper_raw_t1, mid_raw, image_slot);
+                const float u3 = prime_tower_preview_texture_u_from_raw(upper_raw_t0, mid_raw, image_slot);
+                const float v0 = prime_tower_preview_texture_v(lower.z, texture_z_min, texture_z_max);
+                const float v1 = prime_tower_preview_texture_v(upper.z, texture_z_min, texture_z_max);
+                const unsigned int base = unsigned(data.vertices_count());
+
+                data.add_vertex(p0, normal, Vec2f(u0, v0));
+                data.add_vertex(p1, normal, Vec2f(u1, v0));
+                data.add_vertex(p2, normal, Vec2f(u2, v1));
+                data.add_vertex(p3, normal, Vec2f(u3, v1));
+                data.add_triangle(base, base + 1, base + 2);
+                data.add_triangle(base, base + 2, base + 3);
+            }
+        }
+    }
+
+    return data;
+}
+
 void set_prime_tower_preview_uniforms(GLShaderProgram &shader,
                                       const Transform3d &model_matrix,
                                       const Transform3d &view_matrix,
@@ -1303,6 +1687,61 @@ void GLWipeTowerVolume::set_prime_tower_image_preview(std::vector<unsigned char>
 
         GUI::GLModel::Geometry image_geometry =
             prime_tower_image_preview_geometry(width, depth, height, angle_offset_deg, texture_z_min, texture_z_max, image_slot);
+        if (image_geometry.is_empty())
+            return;
+
+        target.rgba = std::move(rgba);
+        target.width = image_w;
+        target.height = image_h;
+        target.model.init_from(std::move(image_geometry));
+    };
+
+    reset_image(m_prime_tower_image);
+    reset_image(m_prime_tower_image_back);
+
+    const bool front_valid = valid_image(image_rgba, image_width, image_height);
+    const bool back_valid = valid_image(image_rgba_back, image_width_back, image_height_back);
+    if (front_valid && back_valid) {
+        assign_image(m_prime_tower_image, std::move(image_rgba), image_width, image_height, 1);
+        assign_image(m_prime_tower_image_back, std::move(image_rgba_back), image_width_back, image_height_back, 2);
+    } else if (front_valid) {
+        assign_image(m_prime_tower_image, std::move(image_rgba), image_width, image_height, 0);
+    } else if (back_valid) {
+        assign_image(m_prime_tower_image_back, std::move(image_rgba_back), image_width_back, image_height_back, 0);
+    }
+}
+
+void GLWipeTowerVolume::set_prime_tower_image_preview(std::vector<unsigned char> image_rgba,
+                                                       unsigned int image_width,
+                                                       unsigned int image_height,
+                                                       std::vector<unsigned char> image_rgba_back,
+                                                       unsigned int image_width_back,
+                                                       unsigned int image_height_back,
+                                                       float angle_offset_deg,
+                                                       const TriangleMesh &mesh,
+                                                       float texture_z_min,
+                                                       float texture_z_max)
+{
+    auto reset_image = [](PrimeTowerPreviewImage &image) {
+        image.model.reset();
+        image.texture.reset();
+        image.rgba.clear();
+        image.width = 0;
+        image.height = 0;
+    };
+    auto valid_image = [](const std::vector<unsigned char> &rgba, unsigned int width, unsigned int height) {
+        return width > 0 && height > 0 && rgba.size() >= size_t(width) * size_t(height) * 4;
+    };
+    auto assign_image = [&](PrimeTowerPreviewImage &target,
+                            std::vector<unsigned char> rgba,
+                            unsigned int image_w,
+                            unsigned int image_h,
+                            int image_slot) {
+        if (!valid_image(rgba, image_w, image_h))
+            return;
+
+        GUI::GLModel::Geometry image_geometry =
+            prime_tower_mesh_image_preview_geometry(mesh, angle_offset_deg, texture_z_min, texture_z_max, image_slot);
         if (image_geometry.is_empty())
             return;
 
@@ -1662,8 +2101,17 @@ int GLVolumeCollection::load_wipe_tower_preview(
     return int(volumes.size() - 1);
 }
 
-int GLVolumeCollection::load_real_wipe_tower_preview(
-    int obj_idx, float pos_x, float pos_y, const TriangleMesh& wt_mesh,const TriangleMesh &brim_mesh,bool render_brim, float rotation_angle, bool size_unknown,  bool opengl_initialized)
+int GLVolumeCollection::load_real_wipe_tower_preview(int                 obj_idx,
+                                                     float               pos_x,
+                                                     float               pos_y,
+                                                     const TriangleMesh &wt_mesh,
+                                                     const TriangleMesh &brim_mesh,
+                                                     bool                render_brim,
+                                                     float               rotation_angle,
+                                                     bool                size_unknown,
+                                                     bool                opengl_initialized,
+                                                     float               texture_z_min,
+                                                     float               texture_z_max)
 {
     int plate_idx = obj_idx - 1000;
     if (wt_mesh.its.vertices.empty()) return int(this->volumes.size() - 1);
@@ -1688,6 +2136,30 @@ int GLVolumeCollection::load_real_wipe_tower_preview(
     if (!colors.empty()) {
         v.model_per_colors.resize(1);
         v.model_per_colors[0].init_from(mesh);
+    }
+    const TextureMappingGlobalSettings *texture_mapping_global_settings = GUI::wxGetApp().preset_bundle != nullptr ?
+        &GUI::wxGetApp().preset_bundle->texture_mapping_global_settings :
+        nullptr;
+    const TextureMappingPrimeTowerImage &prime_tower_image = GUI::wxGetApp().model().texture_mapping_prime_tower_image;
+    const TextureMappingPrimeTowerImage &prime_tower_image_back = GUI::wxGetApp().model().texture_mapping_prime_tower_image_back;
+    if (texture_mapping_global_settings != nullptr &&
+        texture_mapping_global_settings->effective_enabled(prime_tower_image, prime_tower_image_back)) {
+        const BoundingBoxf3 mesh_bbox = wt_mesh.bounding_box();
+        const bool valid_texture_z_range = texture_z_max > texture_z_min + prime_tower_preview_epsilon;
+        const float resolved_texture_z_min = valid_texture_z_range ? texture_z_min : mesh_bbox.min.z();
+        const float resolved_texture_z_max = valid_texture_z_range ? texture_z_max : mesh_bbox.max.z();
+        std::vector<unsigned char> texture_data(prime_tower_image.rgba.begin(), prime_tower_image.rgba.end());
+        std::vector<unsigned char> texture_data_back(prime_tower_image_back.rgba.begin(), prime_tower_image_back.rgba.end());
+        v.set_prime_tower_image_preview(std::move(texture_data),
+                                        prime_tower_image.width,
+                                        prime_tower_image.height,
+                                        std::move(texture_data_back),
+                                        prime_tower_image_back.width,
+                                        prime_tower_image_back.height,
+                                        texture_mapping_global_settings->angle_offset_deg,
+                                        wt_mesh,
+                                        resolved_texture_z_min,
+                                        resolved_texture_z_max);
     }
     TriangleMesh wipe_tower_shell = mesh.convex_hull_3d();
     v.model.init_from(wipe_tower_shell);

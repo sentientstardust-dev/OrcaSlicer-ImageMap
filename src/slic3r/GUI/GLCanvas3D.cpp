@@ -2921,10 +2921,29 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
                         BoundingBoxf3 plate_bbox        = wxGetApp().plater()->get_partplate_list().get_plate(plate_id)->get_build_volume(true);
                         BoundingBox   plate_bbox2d      = BoundingBox(scaled(Vec2f(plate_bbox.min[0], plate_bbox.min[1])), scaled(Vec2f(plate_bbox.max[0], plate_bbox.max[1])));
                         Vec2f         offset            = WipeTower::move_box_inside_box(tower_bottom_bbox, plate_bbox2d, scaled(margin));
-                        int volume_idx_wipe_tower_new = m_volumes.load_real_wipe_tower_preview(1000 + plate_id, x + plate_origin(0), y + plate_origin(1),
-                                                                                               current_print->wipe_tower_data().wipe_tower_mesh_data->real_wipe_tower_mesh,
-                                                                                               current_print->wipe_tower_data().wipe_tower_mesh_data->real_brim_mesh,
-                                                                                            true,a,/*!print->is_step_done(psWipeTower)*/ true, m_initialized);
+                        float         real_texture_z_min = texture_z_min;
+                        float         real_texture_z_max = texture_z_max;
+                        bool          have_texture_z = false;
+                        for (const LayerTools &layer_tools : current_print->wipe_tower_data().tool_ordering.layer_tools()) {
+                            if (!layer_tools.has_wipe_tower)
+                                continue;
+                            const float print_z = float(layer_tools.print_z);
+                            real_texture_z_min = have_texture_z ? std::min(real_texture_z_min, print_z) : print_z;
+                            real_texture_z_max = have_texture_z ? std::max(real_texture_z_max, print_z) : print_z;
+                            have_texture_z = true;
+                        }
+                        int volume_idx_wipe_tower_new = m_volumes.load_real_wipe_tower_preview(
+                            1000 + plate_id,
+                            x + plate_origin(0),
+                            y + plate_origin(1),
+                            current_print->wipe_tower_data().wipe_tower_mesh_data->real_wipe_tower_mesh,
+                            current_print->wipe_tower_data().wipe_tower_mesh_data->real_brim_mesh,
+                            true,
+                            a,
+                            /*!print->is_step_done(psWipeTower)*/ true,
+                            m_initialized,
+                            real_texture_z_min,
+                            real_texture_z_max);
                         int volume_idx_wipe_tower_old = volume_idxs_wipe_tower_old[plate_id];
                         if (volume_idx_wipe_tower_old != -1) map_glvolume_old_to_new[volume_idx_wipe_tower_old] = volume_idx_wipe_tower_new;
                     }

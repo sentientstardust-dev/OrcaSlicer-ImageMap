@@ -414,6 +414,16 @@ public:
                                         float height,
                                         float texture_z_min,
                                         float texture_z_max);
+    void set_prime_tower_image_preview(std::vector<unsigned char> image_rgba,
+                                        unsigned int image_width,
+                                        unsigned int image_height,
+                                        std::vector<unsigned char> image_rgba_back,
+                                        unsigned int image_width_back,
+                                        unsigned int image_height_back,
+                                        float angle_offset_deg,
+                                        const TriangleMesh &mesh,
+                                        float texture_z_min,
+                                        float texture_z_max);
     void render_prime_tower_image_preview(const Transform3d& view_matrix,
                                           const Transform3d& projection_matrix,
                                           const std::array<float, 2>& z_range,
@@ -547,8 +557,17 @@ public:
                                 float brim_width,
                                 float texture_z_min = 0.f,
                                 float texture_z_max = 0.f);
-    int load_real_wipe_tower_preview(
-    int obj_idx, float pos_x, float pos_y,const TriangleMesh& wt_mesh,const TriangleMesh &brim_mesh,bool render_brim, float rotation_angle, bool size_unknown,  bool opengl_initialized);
+    int load_real_wipe_tower_preview(int                 obj_idx,
+                                     float               pos_x,
+                                     float               pos_y,
+                                     const TriangleMesh &wt_mesh,
+                                     const TriangleMesh &brim_mesh,
+                                     bool                render_brim,
+                                     float               rotation_angle,
+                                     bool                size_unknown,
+                                     bool                opengl_initialized,
+                                     float               texture_z_min = 0.f,
+                                     float               texture_z_max = 0.f);
     GLVolume* new_toolpath_volume(const ColorRGBA& rgba);
     GLVolume* new_nontoolpath_volume(const ColorRGBA& rgba);
 
