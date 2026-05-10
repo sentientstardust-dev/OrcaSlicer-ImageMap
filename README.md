@@ -4,7 +4,11 @@
   <img alt="OrcaSlicer-ImageMap logo" src="resources/images/OrcaSlicer.png" width="15%" height="15%">
 </picture>
 
-### OrcaSlicer-ImageMap: An OrcaSlicer Fork with Image Printing Support (via overhang modulation)
+<h1>
+    <p "font-size:200px;">OrcaSlicer-ImageMap</p>
+</h1>
+
+### An OrcaSlicer Fork with Image Printing Support (via overhang modulation)
 
 [![Build all](https://github.com/OrcaSlicer/OrcaSlicer/actions/workflows/build_all.yml/badge.svg?branch=main)](https://gitlab.com/sentient_stardust/orcaslicer-imagemap/-/packages)
 
