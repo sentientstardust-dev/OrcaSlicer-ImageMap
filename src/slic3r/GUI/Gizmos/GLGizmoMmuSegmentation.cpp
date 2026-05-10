@@ -61,6 +61,25 @@ static std::vector<ColorRGBA> get_extruders_colors()
     return wxGetApp().plater() != nullptr ? wxGetApp().plater()->get_extruders_colors() : std::vector<ColorRGBA>{};
 }
 
+static size_t extruder_color_index_for_filament_id(unsigned int filament_id, size_t color_count)
+{
+    if (color_count == 0)
+        return 0;
+
+    if (filament_id >= 1 && filament_id <= color_count)
+        return size_t(filament_id - 1);
+
+    if (wxGetApp().preset_bundle != nullptr) {
+        const size_t       physical_count = size_t(std::max(wxGetApp().filaments_cnt(), 0));
+        const unsigned int resolved_id =
+            wxGetApp().preset_bundle->texture_mapping_zones.resolve_zone_component(filament_id, physical_count, 0);
+        if (resolved_id >= 1 && resolved_id <= color_count)
+            return size_t(resolved_id - 1);
+    }
+
+    return 0;
+}
+
 void GLGizmoMmuSegmentation::on_opening()
 {
     if (get_extruders_colors().size() > GLGizmoMmuSegmentation::EXTRUDERS_LIMIT)
@@ -2226,6 +2245,11 @@ static ColorRGBA sample_rgba_bilinear_clamped(const std::vector<uint8_t> &rgba, 
                      a);
 }
 
+static ColorRGBA sample_rgba_bilinear_wrapped(const std::vector<uint8_t> &rgba, uint32_t width, uint32_t height, float u, float v)
+{
+    return sample_rgba_bilinear_clamped(rgba, width, height, wrap_texture_uv_for_vertex_bake(u), wrap_texture_uv_for_vertex_bake(v));
+}
+
 static std::vector<uint8_t> sample_raw_offsets_bilinear_clamped(const ImageMapRawFilamentOffsetAtlas &atlas, float u, float v)
 {
     std::vector<uint8_t> values;
@@ -2246,6 +2270,43 @@ static std::vector<uint8_t> sample_raw_offsets_bilinear_clamped(const ImageMapRa
 
     auto channel = [&atlas](size_t sx, size_t sy, size_t ch) {
         return float(atlas.offsets[(sy * size_t(atlas.width) + sx) * size_t(atlas.channels) + ch]);
+    };
+    for (size_t ch = 0; ch < values.size(); ++ch) {
+        const float c00 = channel(x0, y0, ch);
+        const float c10 = channel(x1, y0, ch);
+        const float c01 = channel(x0, y1, ch);
+        const float c11 = channel(x1, y1, ch);
+        const float value = (c00 + (c10 - c00) * tx) + ((c01 + (c11 - c01) * tx) - (c00 + (c10 - c00) * tx)) * ty;
+        values[ch] = uint8_t(std::clamp(int(std::lround(value)), 0, 255));
+    }
+    return values;
+}
+
+static std::vector<uint8_t> sample_raw_offsets_bilinear_wrapped(const std::vector<uint8_t> &offsets,
+                                                                uint32_t                    width,
+                                                                uint32_t                    height,
+                                                                uint32_t                    channels,
+                                                                float                       u,
+                                                                float                       v)
+{
+    std::vector<uint8_t> values(size_t(channels), 0);
+    if (width == 0 || height == 0 || channels == 0 ||
+        offsets.size() < size_t(width) * size_t(height) * size_t(channels))
+        return values;
+
+    u = wrap_texture_uv_for_vertex_bake(u);
+    v = wrap_texture_uv_for_vertex_bake(v);
+    const float x = u * float(width > 1 ? width - 1 : 0);
+    const float y = v * float(height > 1 ? height - 1 : 0);
+    const size_t x0 = std::min<size_t>(size_t(std::floor(x)), size_t(width - 1));
+    const size_t y0 = std::min<size_t>(size_t(std::floor(y)), size_t(height - 1));
+    const size_t x1 = std::min<size_t>(x0 + 1, size_t(width - 1));
+    const size_t y1 = std::min<size_t>(y0 + 1, size_t(height - 1));
+    const float tx = x - float(x0);
+    const float ty = y - float(y0);
+
+    auto channel = [&offsets, width, channels](size_t sx, size_t sy, size_t ch) {
+        return float(offsets[(sy * size_t(width) + sx) * size_t(channels) + ch]);
     };
     for (size_t ch = 0; ch < values.size(); ++ch) {
         const float c00 = channel(x0, y0, ch);
@@ -2875,6 +2936,7 @@ static ColorRGBA projection_base_color_for_volume(const ModelVolume &volume)
 }
 
 static constexpr uint32_t GENERATED_IMAGE_TEXTURE_SIZE = 4096;
+static constexpr int GENERATED_IMAGE_TEXTURE_UV_MAP_VERSION = 1;
 
 struct GeneratedImageTextureIsland
 {
@@ -3113,6 +3175,7 @@ static bool initialize_generated_image_texture(ModelVolume                &volum
     volume.imported_texture_width = GENERATED_IMAGE_TEXTURE_SIZE;
     volume.imported_texture_height = GENERATED_IMAGE_TEXTURE_SIZE;
     volume.imported_texture_rgba.assign(size_t(GENERATED_IMAGE_TEXTURE_SIZE) * size_t(GENERATED_IMAGE_TEXTURE_SIZE) * 4, 0);
+    volume.uv_map_generator_version = GENERATED_IMAGE_TEXTURE_UV_MAP_VERSION;
     clear_imported_texture_raw_atlas(volume);
     for (size_t idx = 0; idx < size_t(GENERATED_IMAGE_TEXTURE_SIZE) * size_t(GENERATED_IMAGE_TEXTURE_SIZE); ++idx) {
         volume.imported_texture_rgba[idx * 4 + 0] = r;
@@ -4593,6 +4656,7 @@ static bool clear_object_managed_color_data(ModelObject &object, ManagedColorDat
                 clear_imported_texture_raw_atlas(*volume);
                 volume->imported_texture_width = 0;
                 volume->imported_texture_height = 0;
+                volume->uv_map_generator_version = 0;
                 changed = true;
             }
             break;
@@ -5370,6 +5434,190 @@ static bool convert_object_to_image_texture(ModelObject &object, const ManagedCo
     return changed;
 }
 
+static bool object_has_regenerable_image_texture_uvs(const ModelObject &object)
+{
+    for (const ModelVolume *volume : object.volumes)
+        if (volume != nullptr && volume->is_model_part() && model_volume_has_bakeable_image_texture_data(volume))
+            return true;
+    return false;
+}
+
+static wxString managed_image_texture_uv_map_info_text(const ModelObject *object)
+{
+    if (object == nullptr)
+        return _L("UV map: none");
+
+    bool has_texture = false;
+    bool has_imported = false;
+    bool has_generated = false;
+    int generated_version = -1;
+    bool mixed_generated_versions = false;
+    for (const ModelVolume *volume : object->volumes) {
+        if (volume == nullptr || !volume->is_model_part() || !model_volume_has_imported_image_texture_data(volume))
+            continue;
+
+        has_texture = true;
+        if (volume->uv_map_generator_version > 0) {
+            has_generated = true;
+            if (generated_version < 0)
+                generated_version = volume->uv_map_generator_version;
+            else if (generated_version != volume->uv_map_generator_version)
+                mixed_generated_versions = true;
+        } else {
+            has_imported = true;
+        }
+    }
+
+    if (!has_texture)
+        return _L("UV map: none");
+    if (has_imported && has_generated)
+        return _L("UV map: mixed");
+    if (has_generated) {
+        if (mixed_generated_versions)
+            return _L("UV map: generated (mixed)");
+        return wxString::Format(_L("UV map: generated (v%d)"), generated_version);
+    }
+    return _L("UV map: imported");
+}
+
+static bool regenerate_volume_image_texture_uv_map(ModelObject &object, ModelVolume &volume)
+{
+    if (!model_volume_has_bakeable_image_texture_data(&volume))
+        return false;
+
+    const indexed_triangle_set &its = volume.mesh().its;
+    const uint32_t source_width = volume.imported_texture_width;
+    const uint32_t source_height = volume.imported_texture_height;
+    const std::vector<uint8_t> source_rgba(volume.imported_texture_rgba.begin(), volume.imported_texture_rgba.end());
+    const std::vector<float> source_uvs(volume.imported_texture_uvs_per_face.begin(), volume.imported_texture_uvs_per_face.end());
+    const std::vector<uint8_t> source_uv_valid(volume.imported_texture_uv_valid.begin(), volume.imported_texture_uv_valid.end());
+    const bool source_has_raw_atlas = model_volume_has_raw_atlas_texture_data(&volume);
+    const uint32_t source_raw_channels = volume.imported_texture_raw_channels;
+    const std::vector<uint8_t> source_raw_offsets(volume.imported_texture_raw_filament_offsets.begin(),
+                                                  volume.imported_texture_raw_filament_offsets.end());
+    const std::string source_raw_metadata = volume.imported_texture_raw_metadata_json;
+
+    GeneratedImageTextureAtlas generated_atlas;
+    Transform3d metric_matrix = volume.get_matrix();
+    if (!object.instances.empty() && object.instances.front() != nullptr)
+        metric_matrix = object.instances.front()->get_transformation().get_matrix() * metric_matrix;
+    if (!initialize_generated_image_texture(volume,
+                                            blank_color_for_managed_target(ManagedColorDataType::ImageTexture),
+                                            &generated_atlas,
+                                            &metric_matrix))
+        return false;
+
+    if (source_has_raw_atlas) {
+        volume.imported_texture_raw_channels = source_raw_channels;
+        volume.imported_texture_raw_metadata_json = source_raw_metadata;
+        volume.imported_texture_raw_filament_offsets.assign(size_t(volume.imported_texture_width) *
+                                                                size_t(volume.imported_texture_height) *
+                                                                size_t(source_raw_channels),
+                                                            0);
+    }
+
+    bool changed = true;
+    const float target_width = float(volume.imported_texture_width);
+    const float target_height = float(volume.imported_texture_height);
+    for (const GeneratedImageTextureIsland &island : generated_atlas.islands) {
+        const size_t tri_idx = island.tri_idx;
+        if (tri_idx >= its.indices.size() ||
+            tri_idx >= source_uv_valid.size() ||
+            source_uv_valid[tri_idx] == 0)
+            continue;
+
+        const size_t source_uv_offset = tri_idx * 6;
+        const size_t target_uv_offset = tri_idx * 6;
+        if (source_uv_offset + 5 >= source_uvs.size() ||
+            target_uv_offset + 5 >= volume.imported_texture_uvs_per_face.size())
+            continue;
+
+        const std::array<Vec2f, 3> source_face_uvs = unwrap_projection_uvs(std::array<Vec2f, 3>{
+            Vec2f(source_uvs[source_uv_offset + 0], source_uvs[source_uv_offset + 1]),
+            Vec2f(source_uvs[source_uv_offset + 2], source_uvs[source_uv_offset + 3]),
+            Vec2f(source_uvs[source_uv_offset + 4], source_uvs[source_uv_offset + 5])
+        });
+        const std::array<Vec2f, 3> target_pixel_uvs = {
+            Vec2f(volume.imported_texture_uvs_per_face[target_uv_offset + 0] * target_width,
+                  volume.imported_texture_uvs_per_face[target_uv_offset + 1] * target_height),
+            Vec2f(volume.imported_texture_uvs_per_face[target_uv_offset + 2] * target_width,
+                  volume.imported_texture_uvs_per_face[target_uv_offset + 3] * target_height),
+            Vec2f(volume.imported_texture_uvs_per_face[target_uv_offset + 4] * target_width,
+                  volume.imported_texture_uvs_per_face[target_uv_offset + 5] * target_height)
+        };
+
+        const int min_x = std::clamp(island.x, 0, int(volume.imported_texture_width) - 1);
+        const int max_x = std::clamp(island.x + island.rect_width - 1, 0, int(volume.imported_texture_width) - 1);
+        const int min_y = std::clamp(island.y, 0, int(volume.imported_texture_height) - 1);
+        const int max_y = std::clamp(island.y + island.rect_height - 1, 0, int(volume.imported_texture_height) - 1);
+        for (int y_px = min_y; y_px <= max_y; ++y_px) {
+            for (int x_px = min_x; x_px <= max_x; ++x_px) {
+                Vec3f barycentric = Vec3f::Zero();
+                const Vec2f pixel(float(x_px) + 0.5f, float(y_px) + 0.5f);
+                if (!barycentric_weights_2d(pixel, target_pixel_uvs[0], target_pixel_uvs[1], target_pixel_uvs[2], barycentric))
+                    continue;
+                if (barycentric.x() < -1e-4f || barycentric.y() < -1e-4f || barycentric.z() < -1e-4f)
+                    barycentric = normalized_nonnegative_barycentric(barycentric);
+
+                const Vec3f safe_barycentric =
+                    texture_barycentric_for_bleed_safe_sampling(barycentric,
+                                                                source_face_uvs[0],
+                                                                source_face_uvs[1],
+                                                                source_face_uvs[2],
+                                                                source_width,
+                                                                source_height);
+                const Vec2f source_uv = source_face_uvs[0] * safe_barycentric.x() +
+                                        source_face_uvs[1] * safe_barycentric.y() +
+                                        source_face_uvs[2] * safe_barycentric.z();
+                if (source_has_raw_atlas) {
+                    const std::vector<uint8_t> values =
+                        sample_raw_offsets_bilinear_wrapped(source_raw_offsets,
+                                                            source_width,
+                                                            source_height,
+                                                            source_raw_channels,
+                                                            source_uv.x(),
+                                                            source_uv.y());
+                    write_raw_offset_pixel(volume.imported_texture_raw_filament_offsets,
+                                           volume.imported_texture_width,
+                                           source_raw_channels,
+                                           uint32_t(x_px),
+                                           uint32_t(y_px),
+                                           values);
+                } else {
+                    const ColorRGBA color = sample_rgba_bilinear_wrapped(source_rgba,
+                                                                         source_width,
+                                                                         source_height,
+                                                                         source_uv.x(),
+                                                                         source_uv.y());
+                    write_rgba_pixel(volume.imported_texture_rgba,
+                                     volume.imported_texture_width,
+                                     uint32_t(x_px),
+                                     uint32_t(y_px),
+                                     color);
+                }
+            }
+        }
+    }
+
+    if (source_has_raw_atlas) {
+        refresh_imported_texture_preview_from_raw_offsets(volume);
+        refresh_imported_texture_raw_storage(volume);
+    }
+    refresh_imported_texture_storage(volume);
+    return changed;
+}
+
+static bool regenerate_object_image_texture_uv_maps(ModelObject &object)
+{
+    bool changed = false;
+    for (ModelVolume *volume : object.volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+        changed |= regenerate_volume_image_texture_uv_map(object, *volume);
+    }
+    return changed;
+}
+
 static bool convert_object_to_rgba_data(ModelObject &object, const ManagedColorDataCreateSource &source)
 {
     if (object_has_rgba_data(object))
@@ -5823,6 +6071,7 @@ private:
         wxStaticText        *size = nullptr;
         wxButton            *clear = nullptr;
         wxButton            *create = nullptr;
+        wxButton            *actions = nullptr;
     };
 
     void add_raw_image_texture_info_row(wxFlexGridSizer *grid)
@@ -5852,17 +6101,27 @@ private:
         wxStaticText *size = new wxStaticText(this, wxID_ANY, wxString());
         wxButton *clear = new wxButton(this, wxID_ANY, _L("Clear"));
         wxButton *create = new wxButton(this, wxID_ANY, _L("Create From..."));
+        wxButton *actions = nullptr;
+        wxBoxSizer *size_sizer = new wxBoxSizer(wxHORIZONTAL);
+        size_sizer->Add(size, 1, wxALIGN_CENTER_VERTICAL);
+        if (type == ManagedColorDataType::ImageTexture) {
+            actions = new wxButton(this, wxID_ANY, wxString::FromUTF8("\xE2\x96\xBE"), wxDefaultPosition, wxDefaultSize, wxBU_EXACTFIT);
+            actions->SetToolTip(_L("Image texture actions"));
+            size_sizer->Add(actions, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(6));
+        }
 
         grid->Add(new wxStaticText(this, wxID_ANY, label), 0, wxALIGN_CENTER_VERTICAL);
         grid->Add(status, 0, wxALIGN_CENTER_VERTICAL);
         grid->Add(preview, 0, wxALIGN_CENTER_VERTICAL);
-        grid->Add(size, 1, wxEXPAND | wxALIGN_CENTER_VERTICAL);
+        grid->Add(size_sizer, 1, wxEXPAND | wxALIGN_CENTER_VERTICAL);
         grid->Add(clear, 0, wxALIGN_CENTER_VERTICAL);
         grid->Add(create, 0, wxALIGN_CENTER_VERTICAL);
 
         clear->Bind(wxEVT_BUTTON, [this, type](wxCommandEvent &) { clear_data(type); });
         create->Bind(wxEVT_BUTTON, [this, type, create](wxCommandEvent &) { show_create_menu(type, create); });
-        m_rows.push_back({ type, status, preview, size, clear, create });
+        if (actions != nullptr)
+            actions->Bind(wxEVT_BUTTON, [this, actions](wxCommandEvent &) { show_image_texture_menu(actions); });
+        m_rows.push_back({ type, status, preview, size, clear, create, actions });
     }
 
     void refresh_rows()
@@ -5877,6 +6136,8 @@ private:
             row.size->SetLabel(managed_color_data_size_text(summary, row.type));
             row.clear->Enable(has_data);
             row.create->Enable(m_object != nullptr && !has_data);
+            if (row.actions != nullptr)
+                row.actions->Enable(m_object != nullptr);
         }
         const bool show_raw_info = summary.has_raw_offset_image_texture;
         if (m_raw_image_texture_status != nullptr)
@@ -5957,6 +6218,39 @@ private:
             }
         });
         button->PopupMenu(&menu, wxPoint(0, button->GetSize().GetHeight()));
+    }
+
+    void show_image_texture_menu(wxButton *button)
+    {
+        if (button == nullptr)
+            return;
+
+        wxMenu menu;
+        wxMenuItem *info = menu.Append(wxWindow::NewControlId(), managed_image_texture_uv_map_info_text(m_object));
+        info->Enable(false);
+        menu.AppendSeparator();
+
+        const int generate_id = wxWindow::NewControlId();
+        wxMenuItem *generate = menu.Append(generate_id, _L("Generate new UV Map"));
+        generate->Enable(m_object != nullptr && object_has_regenerable_image_texture_uvs(*m_object));
+        menu.Bind(wxEVT_COMMAND_MENU_SELECTED, [this, generate_id](wxCommandEvent &event) {
+            if (event.GetId() == generate_id)
+                generate_new_uv_map();
+        });
+        button->PopupMenu(&menu, wxPoint(0, button->GetSize().GetHeight()));
+    }
+
+    void generate_new_uv_map()
+    {
+        if (m_object == nullptr || !object_has_regenerable_image_texture_uvs(*m_object))
+            return;
+
+        Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Generate new image texture UV map", UndoRedo::SnapshotType::GizmoAction);
+        if (!regenerate_object_image_texture_uv_maps(*m_object))
+            return;
+
+        refresh_object_after_change();
+        refresh_rows();
     }
 
     void create_data(ManagedColorDataType type, const ManagedColorDataCreateSource &source)
@@ -6891,9 +7185,10 @@ void GLGizmoMmuSegmentation::init_model_triangle_selectors()
         if (!mv->is_model_part())
             continue;
 
-        int extruder_idx = (mv->extruder_id() > 0) ? mv->extruder_id() - 1 : 0;
+        const unsigned int extruder_id       = mv->extruder_id() > 0 ? unsigned(mv->extruder_id()) : 1u;
+        const size_t       extruder_color_id = extruder_color_index_for_filament_id(extruder_id, m_extruders_colors.size());
         std::vector<ColorRGBA> ebt_colors;
-        ebt_colors.push_back(m_extruders_colors[size_t(extruder_idx)]);
+        ebt_colors.push_back(m_extruders_colors[extruder_color_id]);
         ebt_colors.insert(ebt_colors.end(), m_extruders_colors.begin(), m_extruders_colors.end());
 
         // This mesh does not account for the possible Z up SLA offset.
@@ -6910,10 +7205,14 @@ void GLGizmoMmuSegmentation::init_model_triangle_selectors()
 
 void GLGizmoMmuSegmentation::update_triangle_selectors_colors()
 {
+    if (m_extruders_colors.empty())
+        return;
+
     for (int i = 0; i < m_triangle_selectors.size(); i++) {
         TriangleSelectorPatch* selector = dynamic_cast<TriangleSelectorPatch*>(m_triangle_selectors[i].get());
-        int extruder_idx = m_volumes_extruder_idxs[i];
-        int extruder_color_idx = std::max(0, extruder_idx - 1);
+        int extruder_idx = i < int(m_volumes_extruder_idxs.size()) ? m_volumes_extruder_idxs[i] : 1;
+        const unsigned int extruder_id        = extruder_idx > 0 ? unsigned(extruder_idx) : 1u;
+        const size_t       extruder_color_idx = extruder_color_index_for_filament_id(extruder_id, m_extruders_colors.size());
         std::vector<ColorRGBA> ebt_colors;
         ebt_colors.push_back(m_extruders_colors[extruder_color_idx]);
         ebt_colors.insert(ebt_colors.end(), m_extruders_colors.begin(), m_extruders_colors.end());
@@ -7201,6 +7500,7 @@ void GLGizmoMmuSegmentation::bake_selected_object_image_texture_to_vertex_colors
         clear_imported_texture_raw_atlas(*volume);
         volume->imported_texture_width = 0;
         volume->imported_texture_height = 0;
+        volume->uv_map_generator_version = 0;
         baked = true;
     }
 
@@ -7564,6 +7864,7 @@ void GLGizmoMmuSegmentation::clear_selected_object_image_texture_data()
         clear_imported_texture_raw_atlas(*volume);
         volume->imported_texture_width = 0;
         volume->imported_texture_height = 0;
+        volume->uv_map_generator_version = 0;
         cleared = true;
     }
 

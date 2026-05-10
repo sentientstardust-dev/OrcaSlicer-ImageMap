@@ -92,6 +92,7 @@ static inline void model_volume_list_copy_configs(ModelObject &model_object_dst,
         mv_dst.imported_texture_height = mv_src.imported_texture_height;
         mv_dst.imported_texture_raw_channels = mv_src.imported_texture_raw_channels;
         mv_dst.imported_texture_raw_metadata_json = mv_src.imported_texture_raw_metadata_json;
+        mv_dst.uv_map_generator_version = mv_src.uv_map_generator_version;
         assert(mv_dst.fuzzy_skin_facets.id() == mv_src.fuzzy_skin_facets.id());
         mv_dst.fuzzy_skin_facets.assign(mv_src.fuzzy_skin_facets);
         //FIXME what to do with the materials?

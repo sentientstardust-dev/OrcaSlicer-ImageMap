@@ -431,6 +431,7 @@ static constexpr const char* SOURCE_OFFSET_Y_KEY = "source_offset_y";
 static constexpr const char* SOURCE_OFFSET_Z_KEY = "source_offset_z";
 static constexpr const char* SOURCE_IN_INCHES    = "source_in_inches";
 static constexpr const char* SOURCE_IN_METERS    = "source_in_meters";
+static constexpr const char* UV_MAP_GENERATOR_VERSION_KEY = "uv_map_generator_version";
 
 static constexpr const char *MATERIALS_NAMESPACE = "http://schemas.microsoft.com/3dmanufacturing/material/2015/02";
 static constexpr const char *MODEL_TEXTURE_REL_TYPE = "http://schemas.microsoft.com/3dmanufacturing/2013/01/3dtexture";
@@ -5910,6 +5911,8 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
                     volume->source.is_converted_from_inches = metadata.value == "1";
                 else if (metadata.key == SOURCE_IN_METERS)
                     volume->source.is_converted_from_meters = metadata.value == "1";
+                else if (metadata.key == UV_MAP_GENERATOR_VERSION_KEY)
+                    volume->uv_map_generator_version = std::max(0, ::atoi(metadata.value.c_str()));
                 else if ((metadata.key == MATRIX_KEY) || (metadata.key == MESH_SHARED_KEY))
                     continue;
                 else
@@ -6126,6 +6129,8 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
                     volume->source.is_converted_from_inches = metadata.value == "1";
                 else if (metadata.key == SOURCE_IN_METERS)
                     volume->source.is_converted_from_meters = metadata.value == "1";
+                else if (metadata.key == UV_MAP_GENERATOR_VERSION_KEY)
+                    volume->uv_map_generator_version = std::max(0, ::atoi(metadata.value.c_str()));
                 else
                     volume->config.set_deserialize(metadata.key, metadata.value, config_substitutions);
             }
@@ -7984,7 +7989,8 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
                                     && (shared_volume->imported_texture_width == volume->imported_texture_width)
                                     && (shared_volume->imported_texture_height == volume->imported_texture_height)
                                     && (shared_volume->imported_texture_raw_channels == volume->imported_texture_raw_channels)
-                                    && (shared_volume->imported_texture_raw_metadata_json == volume->imported_texture_raw_metadata_json))
+                                    && (shared_volume->imported_texture_raw_metadata_json == volume->imported_texture_raw_metadata_json)
+                                    && (shared_volume->uv_map_generator_version == volume->uv_map_generator_version))
                                 {
                                     auto data = iter->second.first;
                                     const_cast<_BBS_3MF_Exporter *>(this)->m_volume_paths.insert({volume, {data->sub_path, data->volumes_objectID.find(iter->second.second)->second}});
@@ -9285,6 +9291,10 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
                                 }
                             }
                             stream << "\"/>\n";
+
+                            if (volume->uv_map_generator_version > 0)
+                                stream << "      <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << UV_MAP_GENERATOR_VERSION_KEY << "\" "
+                                       << VALUE_ATTR << "=\"" << volume->uv_map_generator_version << "\"/>\n";
 
                             // stores volume's source data
                             {

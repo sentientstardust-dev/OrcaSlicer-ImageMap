@@ -283,7 +283,8 @@ static bool model_volume_texture_mapping_data_equal_for_print_sharing(const Mode
            lhs.imported_texture_width == rhs.imported_texture_width &&
            lhs.imported_texture_height == rhs.imported_texture_height &&
            lhs.imported_texture_raw_channels == rhs.imported_texture_raw_channels &&
-           lhs.imported_texture_raw_metadata_json == rhs.imported_texture_raw_metadata_json;
+           lhs.imported_texture_raw_metadata_json == rhs.imported_texture_raw_metadata_json &&
+           lhs.uv_map_generator_version == rhs.uv_map_generator_version;
 }
 
 template class PrintState<PrintStep, psCount>;

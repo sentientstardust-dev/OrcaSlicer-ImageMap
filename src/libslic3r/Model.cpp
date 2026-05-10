@@ -845,6 +845,7 @@ Model Model::read_from_file(const std::string&                                  
                     volume->imported_texture_height = 0;
                     volume->imported_texture_raw_channels = 0;
                     volume->imported_texture_raw_metadata_json.clear();
+                    volume->uv_map_generator_version = 0;
                     bool has_imported_usable_uv_texture_data = false;
 
                     const size_t triangle_count = volume->mesh().its.indices.size();
@@ -882,6 +883,7 @@ Model Model::read_from_file(const std::string&                                  
                                 volume->imported_texture_raw_filament_offsets.clear();
                                 volume->imported_texture_raw_channels = 0;
                                 volume->imported_texture_raw_metadata_json.clear();
+                                volume->uv_map_generator_version = 0;
                                 has_imported_usable_uv_texture_data = has_any_valid_uv_face;
                             }
                         }
@@ -4918,7 +4920,8 @@ static bool model_volume_texture_mapping_data_matches(const ModelVolume &mv_old,
            mv_old.imported_texture_width == mv_new.imported_texture_width &&
            mv_old.imported_texture_height == mv_new.imported_texture_height &&
            mv_old.imported_texture_raw_channels == mv_new.imported_texture_raw_channels &&
-           mv_old.imported_texture_raw_metadata_json == mv_new.imported_texture_raw_metadata_json;
+           mv_old.imported_texture_raw_metadata_json == mv_new.imported_texture_raw_metadata_json &&
+           mv_old.uv_map_generator_version == mv_new.uv_map_generator_version;
 }
 
 bool model_texture_mapping_color_data_changed(const ModelObject& mo, const ModelObject& mo_new)

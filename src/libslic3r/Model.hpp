@@ -1065,6 +1065,7 @@ public:
     uint32_t             imported_texture_height{0};
     uint32_t             imported_texture_raw_channels{0};
     std::string          imported_texture_raw_metadata_json;
+    int                  uv_map_generator_version{0};
 
     // List of mesh facets painted for fuzzy skin.
     FacetsAnnotation    fuzzy_skin_facets;
@@ -1317,6 +1318,7 @@ private:
         imported_texture_height(other.imported_texture_height),
         imported_texture_raw_channels(other.imported_texture_raw_channels),
         imported_texture_raw_metadata_json(other.imported_texture_raw_metadata_json),
+        uv_map_generator_version(other.uv_map_generator_version),
         fuzzy_skin_facets(other.fuzzy_skin_facets), cut_info(other.cut_info), text_configuration(other.text_configuration), emboss_shape(other.emboss_shape)
     {
 		assert(this->id().valid()); 
@@ -1417,7 +1419,7 @@ private:
         cereal::load_by_value(ar, imported_texture_uv_valid);
         cereal::load_by_value(ar, imported_texture_rgba);
         cereal::load_by_value(ar, imported_texture_raw_filament_offsets);
-        ar(imported_texture_width, imported_texture_height, imported_texture_raw_channels, imported_texture_raw_metadata_json);
+        ar(imported_texture_width, imported_texture_height, imported_texture_raw_channels, imported_texture_raw_metadata_json, uv_map_generator_version);
         cereal::load_by_value(ar, fuzzy_skin_facets);
         mesh_changed |= t != fuzzy_skin_facets.timestamp();
         cereal::load_by_value(ar, config);
@@ -1434,6 +1436,7 @@ private:
             imported_texture_height = 0;
             imported_texture_raw_channels = 0;
             imported_texture_raw_metadata_json.clear();
+            uv_map_generator_version = 0;
             texture_mapping_color_facets.reset();
         }
 		assert(m_mesh);
@@ -1459,7 +1462,7 @@ private:
         cereal::save_by_value(ar, imported_texture_uv_valid);
         cereal::save_by_value(ar, imported_texture_rgba);
         cereal::save_by_value(ar, imported_texture_raw_filament_offsets);
-        ar(imported_texture_width, imported_texture_height, imported_texture_raw_channels, imported_texture_raw_metadata_json);
+        ar(imported_texture_width, imported_texture_height, imported_texture_raw_channels, imported_texture_raw_metadata_json, uv_map_generator_version);
         cereal::save_by_value(ar, fuzzy_skin_facets);
         cereal::save_by_value(ar, config);
         cereal::save(ar, text_configuration);

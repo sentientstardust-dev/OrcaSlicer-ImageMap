@@ -110,6 +110,17 @@ static int menu_item_position(wxMenu *menu, const wxString &name)
     return wxNOT_FOUND;
 }
 
+static int first_separator_position(wxMenu *menu)
+{
+    int position = 0;
+    for (auto node = menu->GetMenuItems().GetFirst(); node; node = node->GetNext(), ++position) {
+        wxMenuItem *item = node->GetData();
+        if (item != nullptr && item->IsSeparator())
+            return position;
+    }
+    return wxNOT_FOUND;
+}
+
 static ModelObject *selected_managed_color_data_object()
 {
     Plater *app_plater = wxGetApp().plater();
@@ -1210,13 +1221,18 @@ void MenuFactory::append_menu_item_manage_color_data(wxMenu *menu)
     if (selected_managed_color_data_object() == nullptr)
         return;
 
-    int insert_pos = menu_item_position(menu, _L("Flush Options"));
+    int insert_pos = first_separator_position(menu);
     if (insert_pos != wxNOT_FOUND)
         ++insert_pos;
     else {
-        insert_pos = menu_item_position(menu, _L("Edit in Parameter Table"));
+        insert_pos = menu_item_position(menu, _L("Flush Options"));
         if (insert_pos != wxNOT_FOUND)
             ++insert_pos;
+        else {
+            insert_pos = menu_item_position(menu, _L("Edit in Parameter Table"));
+            if (insert_pos != wxNOT_FOUND)
+                ++insert_pos;
+        }
     }
 
     auto can_manage_color_data = []() {
