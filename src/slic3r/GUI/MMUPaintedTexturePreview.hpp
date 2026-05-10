@@ -66,6 +66,7 @@ bool ensure_model_volume_texture_preview(const ModelVolume &model_volume,
                                          size_t            &texture_signature);
 
 bool texture_preview_simulation_is_pending();
+bool texture_preview_simulation_has_temporary_pending();
 void clear_texture_preview_simulation_cache();
 bool texture_preview_simulation_enabled_for_filament(unsigned int                 filament_id,
                                                      size_t                       num_physical,

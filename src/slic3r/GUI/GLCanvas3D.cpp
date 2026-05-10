@@ -7961,6 +7961,7 @@ void GLCanvas3D::_render_overlays()
     m_labels.render(sorted_instances);
 
     if (Slic3r::texture_preview_simulation_is_pending()) {
+        const bool temporary_texture_preview_pending = Slic3r::texture_preview_simulation_has_temporary_pending();
         ImGuiWrapper &imgui = *wxGetApp().imgui();
         const Size cnv_size = get_canvas_size();
         const float scale = imgui.get_style_scaling();
@@ -7977,7 +7978,9 @@ void GLCanvas3D::_render_overlays()
                     ImGuiWindowFlags_NoDecoration |
                     ImGuiWindowFlags_NoFocusOnAppearing);
         ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());
-        imgui.text(_L("Generating simulated color preview..."));
+        imgui.text(temporary_texture_preview_pending ?
+                       _L("Generating simulated color preview (1/2)...") :
+                       _L("Generating simulated color preview (2/2)..."));
         imgui.end();
         ImGui::PopStyleColor(2);
         ImGui::PopStyleVar(2);
