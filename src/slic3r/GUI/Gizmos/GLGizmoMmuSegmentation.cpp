@@ -4446,6 +4446,23 @@ static bool object_has_rgba_data(const ModelObject &object)
     return false;
 }
 
+static bool model_volume_has_non_region_color_data(const ModelVolume *volume)
+{
+    return volume != nullptr &&
+           volume->is_model_part() &&
+           (!volume->imported_vertex_colors_rgba.empty() ||
+            model_volume_has_imported_image_texture_data(volume) ||
+            !volume->texture_mapping_color_facets.empty());
+}
+
+static bool object_has_non_region_color_data(const ModelObject &object)
+{
+    for (const ModelVolume *volume : object.volumes)
+        if (model_volume_has_non_region_color_data(volume))
+            return true;
+    return false;
+}
+
 static bool object_has_managed_color_data(const ModelObject &object, ManagedColorDataType type)
 {
     switch (type) {
@@ -4695,10 +4712,46 @@ static void assign_texture_mapping_zone_preserving_painted_regions(ModelObject &
     }
 }
 
-static bool image_texture_zone_is_usable_for_projection(const TextureMappingManager &texture_mgr, unsigned int zone_id)
+static bool image_texture_zone_is_usable(const TextureMappingManager &texture_mgr, unsigned int zone_id)
 {
     const TextureMappingZone *zone = texture_mgr.zone_from_id(zone_id);
     return zone != nullptr && zone->enabled && !zone->deleted && zone->is_image_texture();
+}
+
+static bool non_region_color_data_is_assigned_to_image_texture_zone(const ModelObject &object)
+{
+    if (wxGetApp().preset_bundle == nullptr)
+        return false;
+
+    const TextureMappingManager &texture_mgr = wxGetApp().preset_bundle->texture_mapping_zones;
+    bool has_color_data = false;
+    for (const ModelVolume *volume : object.volumes) {
+        if (!model_volume_has_non_region_color_data(volume))
+            continue;
+
+        has_color_data = true;
+        const int extruder_id = volume->extruder_id();
+        if (extruder_id <= 0 || !image_texture_zone_is_usable(texture_mgr, unsigned(extruder_id)))
+            return false;
+    }
+    return has_color_data;
+}
+
+static bool assign_non_region_color_data_to_image_texture_zone(ModelObject &object)
+{
+    if (!object_has_non_region_color_data(object) ||
+        non_region_color_data_is_assigned_to_image_texture_zone(object))
+        return false;
+
+    const unsigned int texture_mapping_filament_id = ensure_texture_mapping_zone();
+    if (texture_mapping_filament_id == 0)
+        return false;
+
+    object.config.set("extruder", int(texture_mapping_filament_id));
+    for (ModelVolume *volume : object.volumes)
+        if (model_volume_has_non_region_color_data(volume))
+            volume->config.set("extruder", int(texture_mapping_filament_id));
+    return true;
 }
 
 static unsigned int painted_image_texture_zone_id_for_projection(const ModelObject &object)
@@ -4714,13 +4767,13 @@ static unsigned int painted_image_texture_zone_id_for_projection(const ModelObje
 
         const auto &used_states = volume->mmu_segmentation_facets.get_data().used_states;
         for (size_t state_idx = static_cast<size_t>(EnforcerBlockerType::Extruder1); state_idx < used_states.size(); ++state_idx) {
-            if (used_states[state_idx] && image_texture_zone_is_usable_for_projection(texture_mgr, unsigned(state_idx)))
+            if (used_states[state_idx] && image_texture_zone_is_usable(texture_mgr, unsigned(state_idx)))
                 painted_ids.emplace_back(unsigned(state_idx));
         }
     }
 
     for (const TextureMappingZone &zone : texture_mgr.zones())
-        if (image_texture_zone_is_usable_for_projection(texture_mgr, zone.zone_id) &&
+        if (image_texture_zone_is_usable(texture_mgr, zone.zone_id) &&
             std::find(painted_ids.begin(), painted_ids.end(), zone.zone_id) != painted_ids.end())
             return zone.zone_id;
     return 0;
@@ -4735,7 +4788,7 @@ static unsigned int base_image_texture_zone_id_for_projection(const ModelObject 
     std::vector<unsigned int> base_ids;
     if (const ConfigOption *opt = object.config.option("extruder"); opt != nullptr) {
         const int extruder_id = opt->getInt();
-        if (extruder_id > 0 && image_texture_zone_is_usable_for_projection(texture_mgr, unsigned(extruder_id)))
+        if (extruder_id > 0 && image_texture_zone_is_usable(texture_mgr, unsigned(extruder_id)))
             base_ids.emplace_back(unsigned(extruder_id));
     }
 
@@ -4743,12 +4796,12 @@ static unsigned int base_image_texture_zone_id_for_projection(const ModelObject 
         if (volume == nullptr || !volume->is_model_part())
             continue;
         const int extruder_id = volume->extruder_id();
-        if (extruder_id > 0 && image_texture_zone_is_usable_for_projection(texture_mgr, unsigned(extruder_id)))
+        if (extruder_id > 0 && image_texture_zone_is_usable(texture_mgr, unsigned(extruder_id)))
             base_ids.emplace_back(unsigned(extruder_id));
     }
 
     for (const TextureMappingZone &zone : texture_mgr.zones())
-        if (image_texture_zone_is_usable_for_projection(texture_mgr, zone.zone_id) &&
+        if (image_texture_zone_is_usable(texture_mgr, zone.zone_id) &&
             std::find(base_ids.begin(), base_ids.end(), zone.zone_id) != base_ids.end())
             return zone.zone_id;
     return 0;
@@ -6172,6 +6225,8 @@ private:
         Plater::TakeSnapshot snapshot(wxGetApp().plater(), clear_snapshot_name(type), UndoRedo::SnapshotType::GizmoAction);
         if (!clear_object_managed_color_data(*m_object, type))
             return;
+        if (type == ManagedColorDataType::ColorRegions)
+            assign_non_region_color_data_to_image_texture_zone(*m_object);
 
         refresh_object_after_change();
         refresh_rows();
