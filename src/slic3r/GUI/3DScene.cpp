@@ -2198,6 +2198,8 @@ GLVolumeWithIdAndZList volumes_to_render(const GLVolumePtrs& volumes, GLVolumeCo
 
     for (unsigned int i = 0; i < (unsigned int)volumes.size(); ++i) {
         GLVolume* volume = volumes[i];
+        if (!volume->is_active)
+            continue;
         bool is_transparent = volume->render_color.is_transparent();
         if (volume->is_wipe_tower) {
             GLWipeTowerVolume *wipe_tower_volume = static_cast<GLWipeTowerVolume *>(volume);

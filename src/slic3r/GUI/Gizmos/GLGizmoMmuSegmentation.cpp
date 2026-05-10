@@ -2082,6 +2082,8 @@ static bool initialize_volume_rgb_data(ModelVolume &volume, const ColorRGBA &bac
 struct ProjectionContext
 {
     Matrix4d                     view_projection = Matrix4d::Identity();
+    Vec3d                        camera_forward = Vec3d::Zero();
+    Vec3d                        camera_position = Vec3d::Zero();
     int                          canvas_width = 1;
     int                          canvas_height = 1;
     float                        overlay_left = 0.f;
@@ -2104,6 +2106,26 @@ static bool projection_section_view_active(const ProjectionContext &context)
 static bool projection_world_point_visible_in_section(const ProjectionContext &context, const Vec3d &world_point)
 {
     return !projection_section_view_active(context) || context.section_clipping_plane.distance(world_point) >= -1e-7;
+}
+
+static bool projection_sample_allowed_by_camera_facing(const ProjectionContext &context,
+                                                       const Vec3d             &world_point,
+                                                       const Vec3d             &world_normal)
+{
+    static constexpr double back_face_rejection_dot = 0.25;
+
+    if (!projection_section_view_active(context))
+        return true;
+    if (world_normal.squaredNorm() <= EPSILON)
+        return true;
+
+    Vec3d view_direction = world_point - context.camera_position;
+    if (view_direction.squaredNorm() <= EPSILON)
+        view_direction = context.camera_forward;
+    if (view_direction.squaredNorm() <= EPSILON)
+        return true;
+
+    return world_normal.normalized().dot(view_direction.normalized()) <= back_face_rejection_dot;
 }
 
 static std::vector<Vec3d> projection_visible_world_polygon(const ProjectionContext     &context,
@@ -3190,6 +3212,73 @@ static Transform3d projection_world_matrix_for_volume(const GLCanvas3D &parent,
     return instance->get_transformation().get_matrix() * volume->get_matrix();
 }
 
+static std::vector<Vec3d> projection_smoothed_vertex_normals(const indexed_triangle_set &its)
+{
+    std::vector<Vec3d> normals(its.vertices.size(), Vec3d::Zero());
+    for (const stl_triangle_vertex_indices &tri : its.indices) {
+        if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
+            continue;
+        if (size_t(tri[0]) >= its.vertices.size() ||
+            size_t(tri[1]) >= its.vertices.size() ||
+            size_t(tri[2]) >= its.vertices.size())
+            continue;
+
+        const Vec3d v0 = its.vertices[size_t(tri[0])].cast<double>();
+        const Vec3d v1 = its.vertices[size_t(tri[1])].cast<double>();
+        const Vec3d v2 = its.vertices[size_t(tri[2])].cast<double>();
+        const Vec3d normal = (v1 - v0).cross(v2 - v0);
+        if (normal.squaredNorm() <= EPSILON)
+            continue;
+
+        normals[size_t(tri[0])] += normal;
+        normals[size_t(tri[1])] += normal;
+        normals[size_t(tri[2])] += normal;
+    }
+
+    for (Vec3d &normal : normals)
+        if (normal.squaredNorm() > EPSILON)
+            normal.normalize();
+    return normals;
+}
+
+static Vec3d projection_interpolated_local_normal(const std::vector<Vec3d>         &vertex_normals,
+                                                  const stl_triangle_vertex_indices &tri,
+                                                  const Vec3f                      &barycentric)
+{
+    if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
+        return Vec3d::Zero();
+    if (size_t(tri[0]) >= vertex_normals.size() ||
+        size_t(tri[1]) >= vertex_normals.size() ||
+        size_t(tri[2]) >= vertex_normals.size())
+        return Vec3d::Zero();
+
+    Vec3d normal = vertex_normals[size_t(tri[0])] * double(barycentric.x()) +
+                   vertex_normals[size_t(tri[1])] * double(barycentric.y()) +
+                   vertex_normals[size_t(tri[2])] * double(barycentric.z());
+    if (normal.squaredNorm() > EPSILON)
+        normal.normalize();
+    return normal;
+}
+
+static bool projection_point_allowed_by_camera_facing(const ProjectionContext            &context,
+                                                      const Transform3d                 &world_matrix,
+                                                      const Matrix3d                    &world_normal_matrix,
+                                                      const std::vector<Vec3d>          &vertex_normals,
+                                                      const stl_triangle_vertex_indices &tri,
+                                                      const Vec3f                       &point,
+                                                      const Vec3f                       &barycentric)
+{
+    if (!projection_section_view_active(context))
+        return true;
+
+    const Vec3d world_point = world_matrix * point.cast<double>();
+    const Vec3d local_normal = projection_interpolated_local_normal(vertex_normals, tri, barycentric);
+    Vec3d world_normal = world_normal_matrix * local_normal;
+    if (world_normal.squaredNorm() > EPSILON)
+        world_normal.normalize();
+    return projection_sample_allowed_by_camera_facing(context, world_point, world_normal);
+}
+
 struct ProjectionVisibility
 {
     int                width = 0;
@@ -3204,8 +3293,8 @@ struct ProjectionVisibility
 
 static constexpr float PROJECTION_VISIBILITY_DEPTH_TOLERANCE = 2e-4f;
 static constexpr float PROJECTION_VISIBILITY_SAME_TRIANGLE_DEPTH_TOLERANCE = 2e-3f;
-static constexpr float PROJECTION_VISIBILITY_PROJECTED_TRIANGLE_DEPTH_TOLERANCE = 2e-3f;
-static constexpr float PROJECTION_VISIBILITY_MAX_LOCAL_DEPTH_TOLERANCE = 8e-3f;
+static constexpr float PROJECTION_VISIBILITY_PROJECTED_TRIANGLE_DEPTH_TOLERANCE = 5e-3f;
+static constexpr float PROJECTION_VISIBILITY_MAX_LOCAL_DEPTH_TOLERANCE = 2e-2f;
 static constexpr uint64_t PROJECTION_VISIBILITY_INVALID_TRIANGLE_KEY = std::numeric_limits<uint64_t>::max();
 
 static uint64_t projection_visibility_triangle_key(size_t volume_idx, size_t tri_idx)
@@ -3275,8 +3364,6 @@ static bool projection_visibility_depth_matches_sample(const ProjectionVisibilit
 
     const size_t center_idx = size_t(y) * size_t(visibility.width) + size_t(x);
     const float center_nearest = visibility.depth[center_idx];
-    if (!std::isfinite(center_nearest))
-        return false;
 
     const bool has_triangle_key = triangle_key != PROJECTION_VISIBILITY_INVALID_TRIANGLE_KEY;
     const bool center_same_triangle =
@@ -3288,17 +3375,17 @@ static bool projection_visibility_depth_matches_sample(const ProjectionVisibilit
     } else if (has_triangle_key) {
         center_tolerance = std::max(PROJECTION_VISIBILITY_PROJECTED_TRIANGLE_DEPTH_TOLERANCE, local_tolerance);
     }
-    if (depth <= center_nearest + center_tolerance)
+    if (std::isfinite(center_nearest) && depth <= center_nearest + center_tolerance)
         return true;
 
-    if (!has_triangle_key ||
-        depth > center_nearest + std::max(PROJECTION_VISIBILITY_SAME_TRIANGLE_DEPTH_TOLERANCE, local_tolerance))
+    if (!has_triangle_key)
         return false;
 
-    const int min_x = std::max(0, x - 1);
-    const int max_x = std::min(visibility.width - 1, x + 1);
-    const int min_y = std::max(0, y - 1);
-    const int max_y = std::min(visibility.height - 1, y + 1);
+    const int search_radius = std::isfinite(center_nearest) ? 1 : 2;
+    const int min_x = std::max(0, x - search_radius);
+    const int max_x = std::min(visibility.width - 1, x + search_radius);
+    const int min_y = std::max(0, y - search_radius);
+    const int max_y = std::min(visibility.height - 1, y + search_radius);
     for (int sample_y = min_y; sample_y <= max_y; ++sample_y) {
         for (int sample_x = min_x; sample_x <= max_x; ++sample_x) {
             if (sample_x == x && sample_y == y)
@@ -3311,6 +3398,21 @@ static bool projection_visibility_depth_matches_sample(const ProjectionVisibilit
             const float nearest = visibility.depth[idx];
             const float nearby_tolerance =
                 std::max(PROJECTION_VISIBILITY_SAME_TRIANGLE_DEPTH_TOLERANCE,
+                         projection_visibility_local_depth_tolerance(visibility, sample_x, sample_y));
+            if (std::isfinite(nearest) && depth <= nearest + nearby_tolerance)
+                return true;
+        }
+    }
+
+    for (int sample_y = min_y; sample_y <= max_y; ++sample_y) {
+        for (int sample_x = min_x; sample_x <= max_x; ++sample_x) {
+            if (sample_x == x && sample_y == y)
+                continue;
+
+            const size_t idx = size_t(sample_y) * size_t(visibility.width) + size_t(sample_x);
+            const float nearest = visibility.depth[idx];
+            const float nearby_tolerance =
+                std::max(PROJECTION_VISIBILITY_PROJECTED_TRIANGLE_DEPTH_TOLERANCE,
                          projection_visibility_local_depth_tolerance(visibility, sample_x, sample_y));
             if (std::isfinite(nearest) && depth <= nearest + nearby_tolerance)
                 return true;
@@ -4065,6 +4167,8 @@ static bool project_texture_mapping_zone_to_regions(ModelObject             &obj
             continue;
 
         const Transform3d world_matrix = projection_world_matrix_for_volume(parent, &object, volume, instance_idx);
+        const Matrix3d world_normal_matrix = world_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
+        const std::vector<Vec3d> vertex_normals = projection_smoothed_vertex_normals(its);
         std::vector<bool> projected_triangles(its.indices.size(), false);
         std::vector<int> projected_triangle_depths(its.indices.size(), 0);
         size_t projected_triangle_count = 0;
@@ -4116,20 +4220,31 @@ static bool project_texture_mapping_zone_to_regions(ModelObject             &obj
         ProjectionRegionStateSampler sampler =
             [context,
              world_matrix,
+             world_normal_matrix,
              pass_through_model,
              texture_mapping_filament_id,
+             volume,
              volume_idx,
              &visibility,
+             &vertex_normals,
              &projected_triangles,
-             &state_source](size_t tri_idx, const Vec3f &point, const Vec3f &) {
+             &state_source](size_t tri_idx, const Vec3f &point, const Vec3f &barycentric) {
             unsigned int state = sample_projection_region_state(state_source, int(tri_idx), point);
             if (tri_idx < projected_triangles.size() && projected_triangles[tri_idx]) {
+                const stl_triangle_vertex_indices &tri = volume->mesh().its.indices[tri_idx];
                 if (pass_through_model ||
-                    projection_point_is_visible(visibility,
-                                                context,
-                                                world_matrix,
-                                                point,
-                                                projection_visibility_triangle_key(volume_idx, tri_idx))) {
+                    (projection_point_allowed_by_camera_facing(context,
+                                                               world_matrix,
+                                                               world_normal_matrix,
+                                                               vertex_normals,
+                                                               tri,
+                                                               point,
+                                                               barycentric) &&
+                     projection_point_is_visible(visibility,
+                                                 context,
+                                                 world_matrix,
+                                                 point,
+                                                 projection_visibility_triangle_key(volume_idx, tri_idx)))) {
                     if (std::optional<ColorRGBA> projected = projected_image_color_at_point(context, world_matrix, point);
                         projected && projection_overlay_has_paintable_alpha(*projected, context)) {
                         state = texture_mapping_filament_id;
@@ -9435,6 +9550,8 @@ bool GLGizmoImageProjection::project_image_to_selected_object()
 
             ProjectionContext context;
             context.view_projection = camera.get_projection_matrix().matrix() * camera.get_view_matrix().matrix();
+            context.camera_forward = camera.get_dir_forward();
+            context.camera_position = camera.get_position();
             context.canvas_width = std::max(1, viewport[2]);
             context.canvas_height = std::max(1, viewport[3]);
             context.overlay_left = rect.left;
@@ -9477,6 +9594,8 @@ bool GLGizmoImageProjection::project_to_vertex_colors(ModelObject *object)
 
     ProjectionContext context;
     context.view_projection = camera.get_projection_matrix().matrix() * camera.get_view_matrix().matrix();
+    context.camera_forward = camera.get_dir_forward();
+    context.camera_position = camera.get_position();
     context.canvas_width = std::max(1, viewport[2]);
     context.canvas_height = std::max(1, viewport[3]);
     context.overlay_left = rect.left;
@@ -9546,6 +9665,8 @@ bool GLGizmoImageProjection::project_to_vertex_colors(ModelObject *object)
         std::vector<std::array<float, 4>> projected_accum(its.vertices.size(), { 0.f, 0.f, 0.f, 0.f });
         std::vector<unsigned int> projected_counts(its.vertices.size(), 0);
         const Transform3d world_matrix = projection_world_matrix_for_volume(m_parent, object, volume, instance_idx);
+        const Matrix3d world_normal_matrix = world_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
+        const std::vector<Vec3d> vertex_normals = projection_smoothed_vertex_normals(its);
 
         for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
             const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
@@ -9561,8 +9682,20 @@ bool GLGizmoImageProjection::project_to_vertex_colors(ModelObject *object)
                 its.vertices[size_t(tri[1])].cast<float>(),
                 its.vertices[size_t(tri[2])].cast<float>()
             };
+
             for (int corner = 0; corner < 3; ++corner) {
                 const size_t vertex_idx = size_t(tri[corner]);
+                Vec3f barycentric = Vec3f::Zero();
+                barycentric[corner] = 1.f;
+                if (!m_pass_through_model &&
+                    !projection_point_allowed_by_camera_facing(context,
+                                                               world_matrix,
+                                                               world_normal_matrix,
+                                                               vertex_normals,
+                                                               tri,
+                                                               vertices[size_t(corner)],
+                                                               barycentric))
+                    continue;
                 if (!m_pass_through_model &&
                     !projection_point_is_visible(visibility,
                                                  context,
@@ -9611,6 +9744,8 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
 
     ProjectionContext context;
     context.view_projection = camera.get_projection_matrix().matrix() * camera.get_view_matrix().matrix();
+    context.camera_forward = camera.get_dir_forward();
+    context.camera_position = camera.get_position();
     context.canvas_width = std::max(1, viewport[2]);
     context.canvas_height = std::max(1, viewport[3]);
     context.overlay_left = rect.left;
@@ -9672,6 +9807,8 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
 
         const ColorRGBA fallback_color = projection_base_color_for_volume(*volume);
         const Transform3d world_matrix = projection_world_matrix_for_volume(m_parent, object, volume, instance_idx);
+        const Matrix3d world_normal_matrix = world_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
+        const std::vector<Vec3d> vertex_normals = projection_smoothed_vertex_normals(its);
         const bool had_raw_atlas_texture = model_volume_has_raw_atlas_texture_data(volume);
         const bool discard_existing_texture_for_raw_atlas =
             raw_atlas_projection &&
@@ -9818,11 +9955,18 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
                             raw_seeded_pixels[raw_seed_idx] = 1;
                         }
                         if (m_pass_through_model ||
-                            projection_point_is_visible(visibility,
-                                                        context,
-                                                        world_matrix,
-                                                        point,
-                                                        projection_visibility_triangle_key(volume_idx, tri_idx))) {
+                            (projection_point_allowed_by_camera_facing(context,
+                                                                       world_matrix,
+                                                                       world_normal_matrix,
+                                                                       vertex_normals,
+                                                                       tri,
+                                                                       point,
+                                                                       barycentric) &&
+                             projection_point_is_visible(visibility,
+                                                         context,
+                                                         world_matrix,
+                                                         point,
+                                                         projection_visibility_triangle_key(volume_idx, tri_idx)))) {
                             if (std::optional<ColorRGBA> projected = projected_image_color_at_point(context, world_matrix, point)) {
                                 const bool transparent_sample =
                                     !context.apply_transparency_as_background &&
@@ -9903,6 +10047,8 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
 
     ProjectionContext context;
     context.view_projection = camera.get_projection_matrix().matrix() * camera.get_view_matrix().matrix();
+    context.camera_forward = camera.get_dir_forward();
+    context.camera_position = camera.get_position();
     context.canvas_width = std::max(1, viewport[2]);
     context.canvas_height = std::max(1, viewport[3]);
     context.overlay_left = rect.left;
@@ -9934,6 +10080,8 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
         const VolumeColorSource source = build_volume_color_source(*volume);
         const ColorRGBA fallback_color = projection_base_color_for_volume(*volume);
         const Transform3d world_matrix = projection_world_matrix_for_volume(m_parent, object, volume, instance_idx);
+        const Matrix3d world_normal_matrix = world_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
+        const std::vector<Vec3d> vertex_normals = projection_smoothed_vertex_normals(its);
         std::vector<bool> projected_triangles(its.indices.size(), false);
         std::vector<int> projected_triangle_depths(its.indices.size(), 0);
         const float projection_target_span = image_projection_rgb_target_triangle_pixel_span(context);
@@ -9978,20 +10126,30 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
                                               source,
                                               context,
                                               world_matrix,
+                                              world_normal_matrix,
                                               fallback_color,
                                               volume_idx,
+                                              &vertex_normals,
                                               &projected_triangles,
                                               &visibility](size_t tri_idx,
                                                            const Vec3f &point,
                                                            const Vec3f &barycentric) {
             ColorRGBA color = sample_volume_color_source(*volume, source, tri_idx, point, barycentric, true, &fallback_color);
             if (tri_idx < projected_triangles.size() && projected_triangles[tri_idx]) {
+                const stl_triangle_vertex_indices &tri = volume->mesh().its.indices[tri_idx];
                 if (m_pass_through_model ||
-                    projection_point_is_visible(visibility,
-                                                context,
-                                                world_matrix,
-                                                point,
-                                                projection_visibility_triangle_key(volume_idx, tri_idx))) {
+                    (projection_point_allowed_by_camera_facing(context,
+                                                               world_matrix,
+                                                               world_normal_matrix,
+                                                               vertex_normals,
+                                                               tri,
+                                                               point,
+                                                               barycentric) &&
+                     projection_point_is_visible(visibility,
+                                                 context,
+                                                 world_matrix,
+                                                 point,
+                                                 projection_visibility_triangle_key(volume_idx, tri_idx)))) {
                     if (std::optional<ColorRGBA> projected = projected_image_color_at_point(context, world_matrix, point)) {
                         if (!context.apply_transparency_as_background && !projection_overlay_has_paintable_alpha(*projected, context))
                             return pack_vertex_color_rgba(color);

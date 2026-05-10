@@ -46,7 +46,7 @@
 	"internal_solid_infill_speed": "150",
 	"initial_layer_infill_speed": "60",
 	"resolution": "0.012",
-	"support_type": "normal(auto)",
+	"support_type": "tree(auto)",
 	"support_style": "default",
 	"support_top_z_distance": "0.2",
 	"support_bottom_z_distance": "0.2",
