@@ -13,6 +13,9 @@
 
 #include <glad/gl.h>
 
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <thread>
 
 namespace Slic3r::GUI {
@@ -163,12 +166,16 @@ void GLGizmoSimplify::on_render_input_window(float x, float y, float bottom_limi
     bool is_cancelling = false;
     bool is_worker_running = false;
     bool is_result_ready = false;
-    int progress = 0;
+    bool skip_color_conversion_requested = false;
+    bool color_conversion_in_progress = false;
+    float progress = 0.f;
     {
         std::lock_guard lk(m_state_mutex);
         is_cancelling = m_state.status == State::cancelling;
         is_worker_running = m_state.status == State::running;
         is_result_ready = bool(m_state.result);
+        skip_color_conversion_requested = m_state.skip_color_conversion_requested;
+        color_conversion_in_progress = m_state.color_conversion_in_progress;
         progress = m_state.progress;
     }
 
@@ -336,6 +343,21 @@ void GLGizmoSimplify::on_render_input_window(float x, float y, float bottom_limi
     m_imgui->disabled_end(); // use_count
 
     m_imgui->bbl_checkbox(_L("Show wireframe").c_str(), m_show_wireframe);
+    const wxString skip_color_conversion_label = color_conversion_in_progress ?
+        _L("Skip color conversion (in progress)") :
+        _L("Skip color conversion");
+    m_imgui->disabled_begin(!is_worker_running || is_cancelling || skip_color_conversion_requested);
+    m_imgui->push_cancel_button_style();
+    if (m_imgui->bbl_button(skip_color_conversion_label)) {
+        skip_color_conversion_request();
+    } else if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        if (skip_color_conversion_requested)
+            ImGui::SetTooltip("%s", _u8L("Color conversion will be skipped.").c_str());
+        else if (!is_worker_running)
+            ImGui::SetTooltip("%s", _u8L("Color conversion can only be skipped while processing.").c_str());
+    }
+    m_imgui->pop_cancel_button_style();
+    m_imgui->disabled_end();
 
      // draw progress bar
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding,12);
@@ -343,9 +365,15 @@ void GLGizmoSimplify::on_render_input_window(float x, float y, float bottom_limi
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,ImVec2(10,20));
     if (is_worker_running) { // apply or preview
         // draw progress bar
-        std::string progress_text = GUI::format("%1%", std::to_string(progress)) + "%%";
+        char progress_buffer[32];
+        const float displayed_progress = std::clamp(progress, 0.f, 100.f);
+        if (std::abs(displayed_progress - std::round(displayed_progress)) < 0.05f)
+            std::snprintf(progress_buffer, sizeof(progress_buffer), "%.0f%%", displayed_progress);
+        else
+            std::snprintf(progress_buffer, sizeof(progress_buffer), "%.1f%%", displayed_progress);
+        std::string progress_text = progress_buffer;
         ImVec2 progress_size(bottom_left_width - space_size, 0.0f);
-        ImGui::BBLProgressBar2(progress / 100., progress_size);
+        ImGui::BBLProgressBar2(displayed_progress / 100.f, progress_size);
         ImGui::SameLine();
         ImGui::AlignTextToFramePadding();
         ImGui::TextColored(ImVec4(0.42f, 0.42f, 0.42f, 1.00f), progress_text.c_str());
@@ -407,6 +435,16 @@ void GLGizmoSimplify::stop_worker_thread_request()
         m_state.status = State::Status::cancelling;
 }
 
+void GLGizmoSimplify::skip_color_conversion_request()
+{
+    {
+        std::lock_guard lk(m_state_mutex);
+        if (m_state.status == State::running)
+            m_state.skip_color_conversion_requested = true;
+    }
+    request_rerender(true);
+}
+
 
 // Following is called from a UI thread when the worker terminates
 // worker calls it through a CallAfter.
@@ -424,8 +462,8 @@ void GLGizmoSimplify::worker_finished()
         m_worker.join();
     if (GLGizmoBase::m_state == Off)
         return;
-    if (m_state.result)
-        init_model(*m_state.result);
+    if (m_state.result && m_state.result->mesh)
+        init_model(*m_state.result->mesh);
     if (m_state.config != m_configuration || m_state.mv != m_volume) {
         // Settings were changed, restart the worker immediately.
         process();
@@ -471,13 +509,16 @@ void GLGizmoSimplify::process()
     m_state.config = m_configuration;
     m_state.mv = m_volume;
     m_state.status = State::running;
+    m_state.skip_color_conversion_requested = false;
+    m_state.color_conversion_in_progress = false;
 
     // Create a copy of current mesh to pass to the worker thread.
     // Using unique_ptr instead of pass-by-value to avoid an extra
     // copy (which would happen when passing to std::thread).
+    SimplifyTextureDataSnapshot texture_snapshot = snapshot_simplify_texture_data(*m_volume);
     auto its = std::make_unique<indexed_triangle_set>(m_volume->mesh().its);
 
-    m_worker = std::thread([this](std::unique_ptr<indexed_triangle_set> its) {
+    m_worker = std::thread([this](std::unique_ptr<indexed_triangle_set> its, SimplifyTextureDataSnapshot texture_snapshot) {
 
         // Checks that the UI thread did not request cancellation, throws if so.
         std::function<void(void)> throw_on_cancel = [this]() {
@@ -488,10 +529,23 @@ void GLGizmoSimplify::process()
 
         // Called by worker thread, updates progress bar.
         // Using CallAfter so the rerequest function is run in UI thread.
-        std::function<void(int)> statusfn = [this](int percent) {
+        std::function<void(float)> statusfn = [this](float percent) {
             std::lock_guard lk(m_state_mutex);
-            m_state.progress = percent;
+            m_state.progress = std::clamp(percent, 0.f, 100.f);
             call_after_if_active([this]() { request_rerender(); });
+        };
+        auto set_color_conversion_in_progress = [this](bool in_progress) {
+            {
+                std::lock_guard lk(m_state_mutex);
+                m_state.color_conversion_in_progress = in_progress;
+            }
+            call_after_if_active([this]() { request_rerender(); });
+        };
+        auto throw_on_color_conversion_stop = [this, &throw_on_cancel]() {
+            throw_on_cancel();
+            std::lock_guard lk(m_state_mutex);
+            if (m_state.skip_color_conversion_requested)
+                throw SimplifyColorConversionSkippedException();
         };
 
         // Initialize.
@@ -503,32 +557,63 @@ void GLGizmoSimplify::process()
                 triangle_count = m_state.config.wanted_count;
             if (! m_state.config.use_count)
                 max_error = m_state.config.max_error;
-            m_state.progress = 0;
+            m_state.progress = 0.f;
             m_state.result.reset();
+            m_state.color_conversion_in_progress = false;
             m_state.status = State::Status::running;
         }
 
         // Start the actual calculation.
         try {
-            its_quadric_edge_collapse(*its, triangle_count, &max_error, throw_on_cancel, statusfn);
+            auto decimate_statusfn = [&statusfn](int percent) {
+                statusfn(float(std::clamp(percent, 0, 100)) * 0.9f);
+            };
+            its_quadric_edge_collapse(*its, triangle_count, &max_error, throw_on_cancel, decimate_statusfn);
+            statusfn(90);
+            SimplifyTextureDataResult texture_result;
+            set_color_conversion_in_progress(true);
+            try {
+                throw_on_color_conversion_stop();
+                texture_result =
+                    remap_simplify_texture_data(texture_snapshot, *its, throw_on_color_conversion_stop, [&statusfn](int percent) {
+                        statusfn(90.f + float(std::clamp(percent, 0, 100)) * 0.1f);
+                    });
+            } catch (SimplifyColorConversionSkippedException &) {
+                texture_result = SimplifyTextureDataResult();
+            } catch (...) {
+                set_color_conversion_in_progress(false);
+                throw;
+            }
+            set_color_conversion_in_progress(false);
+            statusfn(100);
+            auto result = std::make_unique<SimplifyResult>();
+            result->mesh = std::move(its);
+            result->texture_data = std::move(texture_result);
+
+            std::lock_guard lk(m_state_mutex);
+            if (m_state.status == State::Status::running) {
+                m_state.status = State::Status::idle;
+                m_state.color_conversion_in_progress = false;
+                m_state.result = std::move(result);
+            } else if (m_state.status == State::Status::cancelling) {
+                m_state.color_conversion_in_progress = false;
+                m_state.status = State::Status::idle;
+            }
         } catch (SimplifyCanceledException &) {
             std::lock_guard lk(m_state_mutex);
+            m_state.color_conversion_in_progress = false;
             m_state.status = State::idle;
-        }
-
-        std::lock_guard lk(m_state_mutex);
-        if (m_state.status == State::Status::running) {
-            // We were not cancelled, the result is valid.
-            m_state.status = State::Status::idle;
-            m_state.result = std::move(its);
         }
 
         // Update UI. Use CallAfter so the function is run on UI thread.
         call_after_if_active([this]() { worker_finished(); });
-    }, std::move(its));
+    }, std::move(its), std::move(texture_snapshot));
 }
 
 void GLGizmoSimplify::apply_simplify() {
+
+    if (!m_state.result || !m_state.result->mesh)
+        return;
 
     const Selection& selection = m_parent.get_selection();
     int object_idx = selection.get_object_idx();
@@ -540,7 +625,10 @@ void GLGizmoSimplify::apply_simplify() {
     ModelVolume* mv = get_model_volume(selection, wxGetApp().model());
     assert(mv == m_volume);
 
-    mv->set_mesh(std::move(*m_state.result));
+    const bool remap_failed = m_state.result->texture_data.remap_failed;
+    const bool used_fallback_rgba = m_state.result->texture_data.used_fallback_rgba;
+    mv->set_mesh(std::move(*m_state.result->mesh));
+    apply_simplify_texture_data_result(*mv, std::move(m_state.result->texture_data));
     m_state.result.reset();
     mv->calculate_convex_hull();
     mv->invalidate_convex_hull_2d();
@@ -550,6 +638,17 @@ void GLGizmoSimplify::apply_simplify() {
 
     // fix hollowing, sla support points, modifiers, ...
     plater->changed_mesh(object_idx);
+    if (used_fallback_rgba) {
+        plater->get_notification_manager()->push_notification(
+            NotificationType::CustomNotification,
+            NotificationManager::NotificationLevel::PrintInfoNotificationLevel,
+            _u8L("Image texture UVs could not be regenerated after simplification; texture colors were preserved as RGBA data."));
+    } else if (remap_failed) {
+        plater->get_notification_manager()->push_notification(
+            NotificationType::CustomNotification,
+            NotificationManager::NotificationLevel::PrintInfoNotificationLevel,
+            _u8L("Image texture UVs could not be regenerated after simplification; stale texture data was cleared."));
+    }
     // Fix warning icon in object list
     wxGetApp().obj_list()->update_item_error_icon(object_idx, -1);
     close();

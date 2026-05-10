@@ -46,3 +46,5 @@ test.js
 internal_docs/
 *.flatpak
 /flatpak-repo/
+*.3mf
+*.gcode

@@ -1,3 +1,5 @@
+// original author: sentientstardust
+
 #ifndef slic3r_TextureMapping_hpp_
 #define slic3r_TextureMapping_hpp_
 

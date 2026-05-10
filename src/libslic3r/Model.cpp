@@ -4580,11 +4580,23 @@ bool ColorFacetsAnnotation::set_from_triangle_sampler(const ModelVolume         
                                                       float                             split_color_threshold,
                                                       const TextureMappingColorSubdivisionDepths &subdivision_depths,
                                                       const std::vector<bool> *resample_triangles,
-                                                      const TextureMappingColorLeafResamplePredicate &resample_leaf)
+                                                      const TextureMappingColorLeafResamplePredicate &resample_leaf,
+                                                      const TextureMappingColorProgressFn &progress_fn)
+{
+    return this->set_from_triangle_sampler(mv.mesh().its, sampler, max_depth, split_color_threshold, subdivision_depths, resample_triangles, resample_leaf, progress_fn);
+}
+
+bool ColorFacetsAnnotation::set_from_triangle_sampler(const indexed_triangle_set         &its,
+                                                      const TextureMappingColorSampler &sampler,
+                                                      int                               max_depth,
+                                                      float                             split_color_threshold,
+                                                      const TextureMappingColorSubdivisionDepths &subdivision_depths,
+                                                      const std::vector<bool> *resample_triangles,
+                                                      const TextureMappingColorLeafResamplePredicate &resample_leaf,
+                                                      const TextureMappingColorProgressFn &progress_fn)
 {
     TriangleColorSplittingData new_data;
     new_data.metadata_json = m_data.metadata_json;
-    const indexed_triangle_set &its = mv.mesh().its;
     new_data.triangles_to_split.reserve(its.indices.size());
     if (resample_triangles != nullptr) {
         new_data.bitstream.reserve(m_data.bitstream.size());
@@ -4599,6 +4611,21 @@ bool ColorFacetsAnnotation::set_from_triangle_sampler(const ModelVolume         
 
     max_depth = std::clamp(max_depth, 0, 7);
     split_color_threshold = std::max(split_color_threshold, 0.f);
+
+    const size_t total_triangles = its.indices.size();
+    int last_progress = -1;
+    auto report_progress = [&progress_fn, total_triangles, &last_progress](size_t completed_triangles) {
+        if (!progress_fn)
+            return;
+        const int progress = total_triangles == 0 ?
+            100 :
+            int((uint64_t(completed_triangles) * 100u) / uint64_t(total_triangles));
+        if (progress != last_progress) {
+            last_progress = progress;
+            progress_fn(completed_triangles, total_triangles);
+        }
+    };
+    report_progress(0);
 
     size_t preserved_mapping_idx = 0;
     auto existing_triangle_range = [this, &preserved_mapping_idx](size_t tri_idx,
@@ -4655,13 +4682,20 @@ bool ColorFacetsAnnotation::set_from_triangle_sampler(const ModelVolume         
     };
 
     for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+        auto report_triangle_done = [&report_progress, tri_idx]() {
+            report_progress(tri_idx + 1);
+        };
         const auto &tri = its.indices[tri_idx];
-        if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
+        if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0) {
+            report_triangle_done();
             continue;
+        }
         if (size_t(tri[0]) >= its.vertices.size() ||
             size_t(tri[1]) >= its.vertices.size() ||
-            size_t(tri[2]) >= its.vertices.size())
+            size_t(tri[2]) >= its.vertices.size()) {
+            report_triangle_done();
             continue;
+        }
 
         const std::array<Vec3f, 3> vertices = {
             its.vertices[size_t(tri[0])].cast<float>(),
@@ -4676,8 +4710,10 @@ bool ColorFacetsAnnotation::set_from_triangle_sampler(const ModelVolume         
         if (resample_triangles != nullptr &&
             tri_idx < resample_triangles->size() &&
             !(*resample_triangles)[tri_idx] &&
-            append_preserved_triangle(tri_idx))
+            append_preserved_triangle(tri_idx)) {
+            report_triangle_done();
             continue;
+        }
 
         int triangle_min_depth = 0;
         int triangle_max_depth = max_depth;
@@ -4714,8 +4750,10 @@ bool ColorFacetsAnnotation::set_from_triangle_sampler(const ModelVolume         
                                                                      0,
                                                                      triangle_min_depth,
                                                                      triangle_max_depth,
-                                                                     split_color_threshold))
+                                                                     split_color_threshold)) {
+                    report_triangle_done();
                     continue;
+                }
                 new_data.bitstream.resize(new_bitstream_start);
                 new_data.colors_rgba.resize(new_color_start);
             }
@@ -4729,7 +4767,9 @@ bool ColorFacetsAnnotation::set_from_triangle_sampler(const ModelVolume         
                                              triangle_min_depth,
                                              triangle_max_depth,
                                              split_color_threshold);
+        report_triangle_done();
     }
+    report_progress(total_triangles);
 
     new_data.triangles_to_split.shrink_to_fit();
     new_data.bitstream.shrink_to_fit();

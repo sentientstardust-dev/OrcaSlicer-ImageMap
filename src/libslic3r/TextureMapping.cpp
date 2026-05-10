@@ -1,3 +1,5 @@
+// original author: sentientstardust
+
 #include "TextureMapping.hpp"
 #include "ColorSolver.hpp"
 

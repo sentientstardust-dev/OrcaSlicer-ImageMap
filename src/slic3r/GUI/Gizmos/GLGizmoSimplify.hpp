@@ -5,6 +5,7 @@
 // which overrides our localization "L" macro.
 #include "GLGizmoBase.hpp"
 #include "slic3r/GUI/3DScene.hpp"
+#include "libslic3r/ModelTextureDataRemap.hpp"
 #include "admesh/stl.h" // indexed_triangle_set
 #include <mutex>
 #include <thread>
@@ -46,6 +47,7 @@ private:
 
     void process();
     void stop_worker_thread_request();
+    void skip_color_conversion_request();
     void worker_finished();
 
     void create_gui_cfg();
@@ -86,6 +88,12 @@ private:
 
     // Following struct is accessed by both UI and worker thread.
     // Accesses protected by a mutex.
+    struct SimplifyResult
+    {
+        std::unique_ptr<indexed_triangle_set> mesh;
+        SimplifyTextureDataResult texture_data;
+    };
+
     struct State {
         enum Status {
             idle,
@@ -94,10 +102,12 @@ private:
         };
 
         Status status = idle;
-        int progress = 0; // percent of done work
+        float progress = 0.f; // percent of done work
         Configuration config; // Configuration we started with.
         const ModelVolume* mv = nullptr;
-        std::unique_ptr<indexed_triangle_set> result;
+        bool skip_color_conversion_requested = false;
+        bool color_conversion_in_progress = false;
+        std::unique_ptr<SimplifyResult> result;
     };
 
     std::thread m_worker;
@@ -139,6 +149,15 @@ private:
         const char *what() const throw()
         {
             return L("Model simplification has been canceled");
+        }
+    };
+
+    class SimplifyColorConversionSkippedException: public std::exception
+    {
+    public:
+        const char *what() const throw()
+        {
+            return L("Color conversion has been skipped");
         }
     };
 };
