@@ -41,6 +41,7 @@
 #include <wx/image.h>
 #include <wx/menu.h>
 #include <wx/sizer.h>
+#include <wx/spinctrl.h>
 #include <wx/statline.h>
 #include <wx/stattext.h>
 
@@ -2319,6 +2320,202 @@ static std::vector<uint8_t> sample_raw_offsets_bilinear_wrapped(const std::vecto
     return values;
 }
 
+static bool checked_texture_buffer_size(uint32_t width, uint32_t height, uint32_t channels, size_t& size)
+{
+    size = 0;
+    if (width == 0 || height == 0 || channels == 0)
+        return false;
+    if (size_t(width) > std::numeric_limits<size_t>::max() / size_t(height))
+        return false;
+    const size_t pixels = size_t(width) * size_t(height);
+    if (pixels > std::numeric_limits<size_t>::max() / size_t(channels))
+        return false;
+    size = pixels * size_t(channels);
+    return true;
+}
+
+static std::vector<uint8_t> resize_rgba_texture_bilinear(
+    const std::vector<uint8_t>& rgba, uint32_t width, uint32_t height, uint32_t resized_width, uint32_t resized_height)
+{
+    size_t resized_size = 0;
+    if (!checked_texture_buffer_size(resized_width, resized_height, 4, resized_size))
+        return {};
+
+    std::vector<uint8_t> resized(resized_size, 255);
+    size_t               source_size = 0;
+    if (!checked_texture_buffer_size(width, height, 4, source_size) || rgba.size() < source_size)
+        return resized;
+
+    auto channel = [&rgba, width](size_t sx, size_t sy, size_t ch) { return float(rgba[(sy * size_t(width) + sx) * 4 + ch]) / 255.f; };
+    for (uint32_t y = 0; y < resized_height; ++y) {
+        const float  source_y = std::clamp((float(y) + 0.5f) * float(height) / float(resized_height) - 0.5f, 0.f, float(height - 1));
+        const size_t y0       = std::min<size_t>(size_t(std::floor(source_y)), size_t(height - 1));
+        const size_t y1       = std::min<size_t>(y0 + 1, size_t(height - 1));
+        const float  ty       = source_y - float(y0);
+        for (uint32_t x = 0; x < resized_width; ++x) {
+            const float  source_x      = std::clamp((float(x) + 0.5f) * float(width) / float(resized_width) - 0.5f, 0.f, float(width - 1));
+            const size_t x0            = std::min<size_t>(size_t(std::floor(source_x)), size_t(width - 1));
+            const size_t x1            = std::min<size_t>(x0 + 1, size_t(width - 1));
+            const float  tx            = source_x - float(x0);
+            auto         blend_channel = [&](size_t ch) {
+                const float c00 = channel(x0, y0, ch);
+                const float c10 = channel(x1, y0, ch);
+                const float c01 = channel(x0, y1, ch);
+                const float c11 = channel(x1, y1, ch);
+                const float cx0 = c00 + (c10 - c00) * tx;
+                const float cx1 = c01 + (c11 - c01) * tx;
+                return std::clamp(cx0 + (cx1 - cx0) * ty, 0.f, 1.f);
+            };
+            auto blend_premultiplied_channel = [&](size_t ch) {
+                const float c00 = channel(x0, y0, ch) * channel(x0, y0, 3);
+                const float c10 = channel(x1, y0, ch) * channel(x1, y0, 3);
+                const float c01 = channel(x0, y1, ch) * channel(x0, y1, 3);
+                const float c11 = channel(x1, y1, ch) * channel(x1, y1, 3);
+                const float cx0 = c00 + (c10 - c00) * tx;
+                const float cx1 = c01 + (c11 - c01) * tx;
+                return std::clamp(cx0 + (cx1 - cx0) * ty, 0.f, 1.f);
+            };
+            const float  a   = blend_channel(3);
+            const size_t idx = (size_t(y) * size_t(resized_width) + size_t(x)) * 4;
+            resized[idx + 0] =
+                uint8_t(std::clamp(a > 0.f ? blend_premultiplied_channel(0) / a : blend_channel(0), 0.f, 1.f) * 255.f + 0.5f);
+            resized[idx + 1] =
+                uint8_t(std::clamp(a > 0.f ? blend_premultiplied_channel(1) / a : blend_channel(1), 0.f, 1.f) * 255.f + 0.5f);
+            resized[idx + 2] =
+                uint8_t(std::clamp(a > 0.f ? blend_premultiplied_channel(2) / a : blend_channel(2), 0.f, 1.f) * 255.f + 0.5f);
+            resized[idx + 3] = uint8_t(a * 255.f + 0.5f);
+        }
+    }
+    return resized;
+}
+
+static std::vector<uint8_t> resize_raw_offsets_bilinear(const std::vector<uint8_t>& offsets,
+                                                        uint32_t                    width,
+                                                        uint32_t                    height,
+                                                        uint32_t                    channels,
+                                                        uint32_t                    resized_width,
+                                                        uint32_t                    resized_height)
+{
+    size_t resized_size = 0;
+    if (!checked_texture_buffer_size(resized_width, resized_height, channels, resized_size))
+        return {};
+
+    std::vector<uint8_t> resized(resized_size, 0);
+    size_t               source_size = 0;
+    if (!checked_texture_buffer_size(width, height, channels, source_size) || offsets.size() < source_size)
+        return resized;
+
+    auto channel = [&offsets, width, channels](size_t sx, size_t sy, size_t ch) {
+        return float(offsets[(sy * size_t(width) + sx) * size_t(channels) + ch]);
+    };
+    for (uint32_t y = 0; y < resized_height; ++y) {
+        const float  source_y = std::clamp((float(y) + 0.5f) * float(height) / float(resized_height) - 0.5f, 0.f, float(height - 1));
+        const size_t y0       = std::min<size_t>(size_t(std::floor(source_y)), size_t(height - 1));
+        const size_t y1       = std::min<size_t>(y0 + 1, size_t(height - 1));
+        const float  ty       = source_y - float(y0);
+        for (uint32_t x = 0; x < resized_width; ++x) {
+            const float  source_x = std::clamp((float(x) + 0.5f) * float(width) / float(resized_width) - 0.5f, 0.f, float(width - 1));
+            const size_t x0       = std::min<size_t>(size_t(std::floor(source_x)), size_t(width - 1));
+            const size_t x1       = std::min<size_t>(x0 + 1, size_t(width - 1));
+            const float  tx       = source_x - float(x0);
+            const size_t idx      = (size_t(y) * size_t(resized_width) + size_t(x)) * size_t(channels);
+            for (size_t ch = 0; ch < size_t(channels); ++ch) {
+                const float c00   = channel(x0, y0, ch);
+                const float c10   = channel(x1, y0, ch);
+                const float c01   = channel(x0, y1, ch);
+                const float c11   = channel(x1, y1, ch);
+                const float cx0   = c00 + (c10 - c00) * tx;
+                const float cx1   = c01 + (c11 - c01) * tx;
+                resized[idx + ch] = uint8_t(std::clamp(cx0 + (cx1 - cx0) * ty, 0.f, 255.f) + 0.5f);
+            }
+        }
+    }
+    return resized;
+}
+
+static std::string resized_raw_texture_metadata_json(const std::string& metadata_json, uint32_t width, uint32_t height, uint32_t channels)
+{
+    nlohmann::json root;
+    try {
+        root = nlohmann::json::parse(metadata_json);
+        if (!root.is_object())
+            root = nlohmann::json::object();
+    } catch (...) {
+        root = nlohmann::json::object();
+    }
+    root["format"] = "raw_filament_offset_atlas";
+    root["image"]  = {{"width", width}, {"height", height}, {"channels", channels}};
+    root.erase("regions");
+    return root.dump();
+}
+
+static bool resize_volume_image_texture(ModelVolume& volume, uint32_t resized_width, uint32_t resized_height)
+{
+    if (!model_volume_has_imported_image_texture_data(&volume) || resized_width == 0 || resized_height == 0)
+        return false;
+
+    const uint32_t old_width  = volume.imported_texture_width;
+    const uint32_t old_height = volume.imported_texture_height;
+    if (old_width == resized_width && old_height == resized_height)
+        return false;
+
+    const bool has_raw_atlas = model_volume_has_raw_atlas_texture_data(&volume);
+    if (has_raw_atlas) {
+        std::vector<uint8_t> resized_offsets = resize_raw_offsets_bilinear(volume.imported_texture_raw_filament_offsets, old_width,
+                                                                           old_height, volume.imported_texture_raw_channels, resized_width,
+                                                                           resized_height);
+        if (resized_offsets.empty())
+            return false;
+        volume.imported_texture_raw_filament_offsets = std::move(resized_offsets);
+        volume.imported_texture_width                = resized_width;
+        volume.imported_texture_height               = resized_height;
+        volume.imported_texture_raw_metadata_json    = resized_raw_texture_metadata_json(volume.imported_texture_raw_metadata_json,
+                                                                                         resized_width, resized_height,
+                                                                                         volume.imported_texture_raw_channels);
+        refresh_imported_texture_preview_from_raw_offsets(volume);
+        volume.imported_texture_raw_filament_offsets.set_new_unique_id();
+        volume.imported_texture_rgba.set_new_unique_id();
+        return true;
+    }
+
+    size_t source_rgba_size = 0;
+    if (!checked_texture_buffer_size(old_width, old_height, 4, source_rgba_size) || volume.imported_texture_rgba.size() < source_rgba_size)
+        return false;
+
+    std::vector<uint8_t> resized_rgba = resize_rgba_texture_bilinear(volume.imported_texture_rgba, old_width, old_height, resized_width,
+                                                                     resized_height);
+    if (resized_rgba.empty())
+        return false;
+
+    volume.imported_texture_rgba = std::move(resized_rgba);
+    const bool cleared_raw_data  = !volume.imported_texture_raw_filament_offsets.empty() || volume.imported_texture_raw_channels != 0 ||
+                                  !volume.imported_texture_raw_metadata_json.empty();
+    if (cleared_raw_data)
+        clear_imported_texture_raw_atlas(volume);
+    volume.imported_texture_width  = resized_width;
+    volume.imported_texture_height = resized_height;
+    volume.imported_texture_rgba.set_new_unique_id();
+    if (cleared_raw_data)
+        volume.imported_texture_raw_filament_offsets.set_new_unique_id();
+    return true;
+}
+
+static bool resize_object_image_textures(ModelObject& object, double scale)
+{
+    if (!std::isfinite(scale) || scale <= 0.0)
+        return false;
+
+    bool changed = false;
+    for (ModelVolume* volume : object.volumes) {
+        if (volume == nullptr || !volume->is_model_part() || !model_volume_has_imported_image_texture_data(volume))
+            continue;
+        const uint32_t resized_width  = std::max<uint32_t>(1, uint32_t(std::llround(double(volume->imported_texture_width) * scale)));
+        const uint32_t resized_height = std::max<uint32_t>(1, uint32_t(std::llround(double(volume->imported_texture_height) * scale)));
+        changed |= resize_volume_image_texture(*volume, resized_width, resized_height);
+    }
+    return changed;
+}
+
 static ColorRGBA blend_projection_color(const ColorRGBA &base, const ColorRGBA &overlay, float opacity)
 {
     const float alpha = std::clamp(overlay.a(), 0.f, 1.f) * std::clamp(opacity, 0.f, 1.f);
@@ -4410,7 +4607,7 @@ struct ManagedColorDataSummary
     size_t   raw_offset_image_texture_count = 0;
     uint32_t max_texture_width = 0;
     uint32_t max_texture_height = 0;
-    size_t   rgba_data_bytes = 0;
+    size_t   rgba_data_triangle_count = 0;
     std::vector<std::string> raw_offset_color_modes;
 };
 
@@ -4508,15 +4705,6 @@ static wxString managed_color_data_type_label(ManagedColorDataType type)
     return wxString();
 }
 
-static size_t estimated_rgba_data_bytes(const ColorFacetsAnnotation &annotation)
-{
-    const TriangleColorSplittingData &data = annotation.get_data();
-    return data.triangles_to_split.size() * sizeof(ColorTriangleBitStreamMapping) +
-           (data.bitstream.size() + 7) / 8 +
-           data.colors_rgba.size() * sizeof(uint32_t) +
-           data.metadata_json.size();
-}
-
 static ManagedColorDataSummary summarize_managed_color_data(const ModelObject *object)
 {
     ManagedColorDataSummary summary;
@@ -4555,7 +4743,7 @@ static ManagedColorDataSummary summarize_managed_color_data(const ModelObject *o
 
         if (!volume->texture_mapping_color_facets.empty()) {
             summary.has_rgba_data = true;
-            summary.rgba_data_bytes += estimated_rgba_data_bytes(volume->texture_mapping_color_facets);
+            summary.rgba_data_triangle_count += volume->texture_mapping_color_facets.get_data().colors_rgba.size();
         }
     }
     return summary;
@@ -4580,9 +4768,7 @@ static wxString managed_color_data_size_text(const ManagedColorDataSummary &summ
                                 static_cast<unsigned>(summary.max_texture_width),
                                 static_cast<unsigned>(summary.max_texture_height));
     case ManagedColorDataType::RgbaData:
-        if (summary.rgba_data_bytes > 0 && summary.rgba_data_bytes < 1024 * 1024 / 100)
-            return _L("<0.01 MB");
-        return wxString::Format(_L("%.2f MB"), double(summary.rgba_data_bytes) / (1024.0 * 1024.0));
+        return wxString::Format(_L("%llu triangles"), static_cast<unsigned long long>(summary.rgba_data_triangle_count));
     }
     return wxString();
 }
@@ -5111,6 +5297,364 @@ static void managed_color_data_append_rgba_hex(std::string &out, uint32_t rgba)
 {
     for (int shift = 28; shift >= 0; shift -= 4)
         out.push_back(managed_color_data_hex_digit((rgba >> shift) & 0x0Fu));
+}
+
+struct ManagedColorDataRgbaAccumulator
+{
+    double r = 0.0;
+    double g = 0.0;
+    double b = 0.0;
+    double a = 0.0;
+    double area_weight = 0.0;
+    double count_r = 0.0;
+    double count_g = 0.0;
+    double count_b = 0.0;
+    double count_a = 0.0;
+    size_t count = 0;
+};
+
+static double managed_color_data_triangle_area(const std::array<Vec3f, 3> &vertices)
+{
+    const Vec3f edge0 = vertices[1] - vertices[0];
+    const Vec3f edge1 = vertices[2] - vertices[0];
+    const double area = 0.5 * double(edge0.cross(edge1).norm());
+    return std::isfinite(area) && area > double(EPSILON) ? area : 0.0;
+}
+
+static double managed_color_data_triangle_area(const ColorFacetTriangle &facet)
+{
+    return managed_color_data_triangle_area(facet.vertices);
+}
+
+static void managed_color_data_accumulate_rgba(ManagedColorDataRgbaAccumulator &accumulator, uint32_t rgba, double area)
+{
+    const ColorRGBA color = unpack_vertex_color_rgba_for_conversion(rgba);
+    if (area > 0.0) {
+        accumulator.r += double(color.r()) * area;
+        accumulator.g += double(color.g()) * area;
+        accumulator.b += double(color.b()) * area;
+        accumulator.a += double(color.a()) * area;
+        accumulator.area_weight += area;
+    }
+    accumulator.count_r += double(color.r());
+    accumulator.count_g += double(color.g());
+    accumulator.count_b += double(color.b());
+    accumulator.count_a += double(color.a());
+    ++accumulator.count;
+}
+
+static uint32_t managed_color_data_averaged_rgba(const ManagedColorDataRgbaAccumulator &accumulator)
+{
+    if (accumulator.area_weight > 0.0)
+        return pack_vertex_color_rgba(ColorRGBA(float(accumulator.r / accumulator.area_weight),
+                                               float(accumulator.g / accumulator.area_weight),
+                                               float(accumulator.b / accumulator.area_weight),
+                                               float(accumulator.a / accumulator.area_weight)));
+
+    const double count = std::max<double>(1.0, double(accumulator.count));
+    return pack_vertex_color_rgba(ColorRGBA(float(accumulator.count_r / count),
+                                           float(accumulator.count_g / count),
+                                           float(accumulator.count_b / count),
+                                           float(accumulator.count_a / count)));
+}
+
+static void managed_color_data_merge_rgba_accumulator(ManagedColorDataRgbaAccumulator       &target,
+                                                      const ManagedColorDataRgbaAccumulator &source)
+{
+    target.r += source.r;
+    target.g += source.g;
+    target.b += source.b;
+    target.a += source.a;
+    target.area_weight += source.area_weight;
+    target.count_r += source.count_r;
+    target.count_g += source.count_g;
+    target.count_b += source.count_b;
+    target.count_a += source.count_a;
+    target.count += source.count;
+}
+
+static int managed_color_data_read_rgba_nibble(const TriangleColorSplittingData &data, int bitstream_end, int &bit_idx)
+{
+    if (bit_idx < 0 || bit_idx + 4 > bitstream_end || size_t(bit_idx + 3) >= data.bitstream.size())
+        return -1;
+
+    int code = 0;
+    for (int bit = 0; bit < 4; ++bit)
+        code |= int(data.bitstream[size_t(bit_idx++)]) << bit;
+    return code;
+}
+
+static std::array<std::array<Vec3f, 3>, 4> managed_color_data_split_rgba_triangle(const std::array<Vec3f, 3> &vertices,
+                                                                                  int                         split_sides,
+                                                                                  int                         special_side)
+{
+    std::array<std::array<Vec3f, 3>, 4> children{};
+    special_side = std::clamp(special_side, 0, 2);
+    const int j = (special_side + 1) % 3;
+    const int k = (special_side + 2) % 3;
+    const Vec3f a = vertices[size_t(special_side)];
+    const Vec3f b = vertices[size_t(j)];
+    const Vec3f c = vertices[size_t(k)];
+    const Vec3f ab = 0.5f * (a + b);
+    const Vec3f bc = 0.5f * (b + c);
+    const Vec3f ca = 0.5f * (c + a);
+
+    if (split_sides == 1) {
+        children[0] = { a, b, bc };
+        children[1] = { bc, c, a };
+    } else if (split_sides == 2) {
+        children[0] = { a, ab, ca };
+        children[1] = { ab, b, ca };
+        children[2] = { b, c, ca };
+    } else {
+        children[0] = { a, ab, ca };
+        children[1] = { ab, b, bc };
+        children[2] = { bc, c, ca };
+        children[3] = { ab, bc, ca };
+    }
+
+    return children;
+}
+
+struct ManagedColorDataUnsplitResult
+{
+    bool valid = false;
+    bool input_leaf = false;
+    bool changed = false;
+    ManagedColorDataRgbaAccumulator accumulator;
+    std::vector<bool> bits;
+    std::vector<uint32_t> colors;
+};
+
+static ManagedColorDataUnsplitResult managed_color_data_unsplit_rgba_node_once(const TriangleColorSplittingData &data,
+                                                                               int                               bitstream_end,
+                                                                               size_t                            color_end,
+                                                                               int                              &bit_idx,
+                                                                               size_t                           &color_idx,
+                                                                               const std::array<Vec3f, 3>       &vertices)
+{
+    ManagedColorDataUnsplitResult result;
+    const int code = managed_color_data_read_rgba_nibble(data, bitstream_end, bit_idx);
+    if (code < 0)
+        return result;
+
+    const int split_sides = code & 0b11;
+    if (split_sides == 0) {
+        if (color_idx >= color_end || color_idx >= data.colors_rgba.size())
+            return result;
+
+        const uint32_t rgba = data.colors_rgba[color_idx++];
+        managed_color_data_append_nibble(result.bits, 0u);
+        result.colors.emplace_back(rgba);
+        managed_color_data_accumulate_rgba(result.accumulator, rgba, managed_color_data_triangle_area(vertices));
+        result.valid = true;
+        result.input_leaf = true;
+        return result;
+    }
+
+    const int special_side = (code >> 2) & 0b11;
+    const std::array<std::array<Vec3f, 3>, 4> child_vertices =
+        managed_color_data_split_rgba_triangle(vertices, split_sides, special_side);
+    std::array<ManagedColorDataUnsplitResult, 4> child_results;
+    bool all_children_are_leaves = true;
+    bool any_child_changed = false;
+    for (int child_idx = split_sides; child_idx >= 0; --child_idx) {
+        child_results[size_t(child_idx)] = managed_color_data_unsplit_rgba_node_once(data,
+                                                                                     bitstream_end,
+                                                                                     color_end,
+                                                                                     bit_idx,
+                                                                                     color_idx,
+                                                                                     child_vertices[size_t(child_idx)]);
+        const ManagedColorDataUnsplitResult &child = child_results[size_t(child_idx)];
+        if (!child.valid)
+            return ManagedColorDataUnsplitResult();
+        all_children_are_leaves &= child.input_leaf;
+        any_child_changed |= child.changed;
+        managed_color_data_merge_rgba_accumulator(result.accumulator, child.accumulator);
+    }
+
+    result.valid = true;
+    if (all_children_are_leaves) {
+        managed_color_data_append_nibble(result.bits, 0u);
+        result.colors.emplace_back(managed_color_data_averaged_rgba(result.accumulator));
+        result.changed = true;
+        return result;
+    }
+
+    managed_color_data_append_nibble(result.bits, unsigned(code));
+    for (int child_idx = split_sides; child_idx >= 0; --child_idx) {
+        const ManagedColorDataUnsplitResult &child = child_results[size_t(child_idx)];
+        result.bits.insert(result.bits.end(), child.bits.begin(), child.bits.end());
+        result.colors.insert(result.colors.end(), child.colors.begin(), child.colors.end());
+    }
+    result.changed = any_child_changed;
+    return result;
+}
+
+static bool rgba_data_has_split_triangles(const ColorFacetsAnnotation &annotation)
+{
+    const std::vector<bool> &bitstream = annotation.get_data().bitstream;
+    for (size_t bit_idx = 0; bit_idx + 3 < bitstream.size(); bit_idx += 4) {
+        int code = 0;
+        for (int bit = 0; bit < 4; ++bit)
+            code |= int(bitstream[bit_idx + size_t(bit)]) << bit;
+        if ((code & 0b11) != 0)
+            return true;
+    }
+    return false;
+}
+
+static bool object_has_splittable_rgba_data(const ModelObject &object)
+{
+    for (const ModelVolume *volume : object.volumes)
+        if (volume != nullptr && volume->is_model_part() && rgba_data_has_split_triangles(volume->texture_mapping_color_facets))
+            return true;
+    return false;
+}
+
+static bool unsplit_volume_rgba_data_once(ModelVolume &volume)
+{
+    const TriangleColorSplittingData &data = volume.texture_mapping_color_facets.get_data();
+    if (data.triangles_to_split.empty() || !rgba_data_has_split_triangles(volume.texture_mapping_color_facets))
+        return false;
+
+    const indexed_triangle_set &its = volume.mesh().its;
+    if (its.indices.empty())
+        return false;
+
+    std::unique_ptr<ColorFacetsAnnotation> unsplit = ColorFacetsAnnotation::make_temporary();
+    if (!unsplit)
+        return false;
+
+    unsplit->set_metadata_json(volume.texture_mapping_color_facets.metadata_json());
+    unsplit->reserve(int(data.triangles_to_split.size()));
+    bool any = false;
+    for (auto mapping_it = data.triangles_to_split.begin(); mapping_it != data.triangles_to_split.end(); ++mapping_it) {
+        if (mapping_it->triangle_idx < 0 || size_t(mapping_it->triangle_idx) >= its.indices.size())
+            continue;
+
+        const auto &tri = its.indices[size_t(mapping_it->triangle_idx)];
+        if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
+            continue;
+        if (size_t(tri[0]) >= its.vertices.size() ||
+            size_t(tri[1]) >= its.vertices.size() ||
+            size_t(tri[2]) >= its.vertices.size())
+            continue;
+
+        const auto next_it = std::next(mapping_it);
+        const int bitstream_end = next_it == data.triangles_to_split.end() ?
+            int(data.bitstream.size()) :
+            next_it->bitstream_start_idx;
+        const size_t color_end = next_it == data.triangles_to_split.end() ?
+            data.colors_rgba.size() :
+            size_t(next_it->color_start_idx);
+        if (mapping_it->bitstream_start_idx < 0 ||
+            mapping_it->bitstream_start_idx >= bitstream_end ||
+            size_t(bitstream_end) > data.bitstream.size() ||
+            mapping_it->color_start_idx < 0 ||
+            size_t(mapping_it->color_start_idx) >= color_end ||
+            color_end > data.colors_rgba.size())
+            continue;
+
+        const std::array<Vec3f, 3> vertices = {
+            its.vertices[size_t(tri[0])].cast<float>(),
+            its.vertices[size_t(tri[1])].cast<float>(),
+            its.vertices[size_t(tri[2])].cast<float>()
+        };
+        int bit_idx = mapping_it->bitstream_start_idx;
+        size_t color_idx = size_t(mapping_it->color_start_idx);
+        ManagedColorDataUnsplitResult result =
+            managed_color_data_unsplit_rgba_node_once(data, bitstream_end, color_end, bit_idx, color_idx, vertices);
+        if (!result.valid || result.bits.empty() || result.colors.empty())
+            continue;
+
+        std::string encoded;
+        managed_color_data_bits_to_hex(result.bits, encoded);
+        encoded.push_back('|');
+        for (uint32_t rgba : result.colors)
+            managed_color_data_append_rgba_hex(encoded, rgba);
+        unsplit->set_triangle_from_string(mapping_it->triangle_idx, encoded);
+        any = true;
+    }
+    if (!any)
+        return false;
+
+    unsplit->shrink_to_fit();
+    if (volume.texture_mapping_color_facets.equals(*unsplit))
+        return false;
+
+    volume.texture_mapping_color_facets.assign(*unsplit);
+    return true;
+}
+
+static bool unsplit_object_rgba_data_once(ModelObject &object)
+{
+    bool changed = false;
+    for (ModelVolume *volume : object.volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+        changed |= unsplit_volume_rgba_data_once(*volume);
+    }
+    return changed;
+}
+
+static bool simplify_volume_rgba_data_to_one_color_per_triangle(ModelVolume &volume)
+{
+    if (volume.texture_mapping_color_facets.empty())
+        return false;
+
+    const indexed_triangle_set &its = volume.mesh().its;
+    if (its.indices.empty())
+        return false;
+
+    std::vector<ColorFacetTriangle> facets;
+    volume.texture_mapping_color_facets.get_facet_triangles(volume, facets);
+    if (facets.empty())
+        return false;
+
+    std::vector<ManagedColorDataRgbaAccumulator> accumulators(its.indices.size());
+    for (const ColorFacetTriangle &facet : facets) {
+        if (facet.source_triangle < 0 || size_t(facet.source_triangle) >= accumulators.size())
+            continue;
+        managed_color_data_accumulate_rgba(accumulators[size_t(facet.source_triangle)], facet.rgba, managed_color_data_triangle_area(facet));
+    }
+
+    std::unique_ptr<ColorFacetsAnnotation> simplified = ColorFacetsAnnotation::make_temporary();
+    if (!simplified)
+        return false;
+
+    simplified->set_metadata_json(volume.texture_mapping_color_facets.metadata_json());
+    simplified->reserve(int(its.indices.size()));
+    bool any = false;
+    for (size_t triangle_idx = 0; triangle_idx < accumulators.size(); ++triangle_idx) {
+        if (accumulators[triangle_idx].count == 0)
+            continue;
+
+        std::string encoded = "0|";
+        managed_color_data_append_rgba_hex(encoded, managed_color_data_averaged_rgba(accumulators[triangle_idx]));
+        simplified->set_triangle_from_string(int(triangle_idx), encoded);
+        any = true;
+    }
+    if (!any)
+        return false;
+
+    simplified->shrink_to_fit();
+    if (volume.texture_mapping_color_facets.equals(*simplified))
+        return false;
+
+    volume.texture_mapping_color_facets.assign(*simplified);
+    return true;
+}
+
+static bool simplify_object_rgba_data_to_one_color_per_triangle(ModelObject &object)
+{
+    bool changed = false;
+    for (ModelVolume *volume : object.volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+        changed |= simplify_volume_rgba_data_to_one_color_per_triangle(*volume);
+    }
+    return changed;
 }
 
 static ColorRGBA managed_color_data_state_color(const ManagedRegionColorSource &source, unsigned int state)
@@ -6052,6 +6596,139 @@ static void refresh_managed_color_data_object(GLCanvas3D &parent, ModelObject *o
     parent.post_event(SimpleEvent(EVT_GLCANVAS_SCHEDULE_BACKGROUND_PROCESS));
 }
 
+class ResizeImageTextureDialog : public wxDialog
+{
+public:
+    ResizeImageTextureDialog(wxWindow* parent, uint32_t width, uint32_t height)
+        : wxDialog(parent, wxID_ANY, _L("Resize Texture"), wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE)
+        , m_original_width(width)
+        , m_original_height(height)
+    {
+        wxBoxSizer* main_sizer = new wxBoxSizer(wxVERTICAL);
+        main_sizer->Add(new wxStaticText(this, wxID_ANY,
+                                         wxString::Format(_L("Original size: %u x %u"), static_cast<unsigned>(m_original_width),
+                                                          static_cast<unsigned>(m_original_height))),
+                        0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP(16));
+
+        wxFlexGridSizer* grid = new wxFlexGridSizer(2, FromDIP(8), FromDIP(8));
+        grid->AddGrowableCol(1, 1);
+        const uint32_t max_axis          = std::min<uint32_t>(std::max({uint32_t(8192), m_original_width, m_original_height}),
+                                                              uint32_t(std::numeric_limits<int>::max()));
+        const uint32_t original_max_axis = std::max(m_original_width, m_original_height);
+        const double   max_scale         = original_max_axis > 0 ? double(max_axis) / double(original_max_axis) : 1.0;
+        auto scaled_max = [max_scale](uint32_t value) {
+            return std::min<uint32_t>(uint32_t(std::numeric_limits<int>::max()),
+                                      std::max<uint32_t>(std::max<uint32_t>(1, value),
+                                                         uint32_t(std::floor(double(value) * max_scale))));
+        };
+        m_max_width  = scaled_max(m_original_width);
+        m_max_height = scaled_max(m_original_height);
+        m_width_spin  = new wxSpinCtrl(this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(96), -1), wxSP_ARROW_KEYS, 1,
+                                       int(m_max_width), int(std::min(m_original_width, m_max_width)));
+        m_height_spin = new wxSpinCtrl(this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(96), -1), wxSP_ARROW_KEYS, 1,
+                                       int(m_max_height), int(std::min(m_original_height, m_max_height)));
+        grid->Add(new wxStaticText(this, wxID_ANY, _L("Width")), 0, wxALIGN_CENTER_VERTICAL);
+        grid->Add(m_width_spin, 0, wxALIGN_CENTER_VERTICAL);
+        grid->Add(new wxStaticText(this, wxID_ANY, _L("Height")), 0, wxALIGN_CENTER_VERTICAL);
+        grid->Add(m_height_spin, 0, wxALIGN_CENTER_VERTICAL);
+        main_sizer->Add(grid, 0, wxEXPAND | wxALL, FromDIP(16));
+
+        m_scale_text = new wxStaticText(this, wxID_ANY, wxString());
+        main_sizer->Add(m_scale_text, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(16));
+        main_sizer->Add(new wxStaticLine(this), 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP(16));
+
+        wxStdDialogButtonSizer* buttons = new wxStdDialogButtonSizer();
+        m_ok_button                     = new wxButton(this, wxID_OK, _L("OK"));
+        wxButton* cancel_button         = new wxButton(this, wxID_CANCEL, _L("Cancel"));
+        buttons->AddButton(m_ok_button);
+        buttons->AddButton(cancel_button);
+        buttons->Realize();
+        main_sizer->Add(buttons, 0, wxEXPAND | wxALL, FromDIP(16));
+
+        SetSizer(main_sizer);
+        update_summary();
+        Fit();
+        SetMinSize(GetSize());
+        CenterOnParent();
+
+        m_width_spin->Bind(wxEVT_SPINCTRL, [this](wxSpinEvent&) { update_from_width(); });
+        m_width_spin->Bind(wxEVT_TEXT, [this](wxCommandEvent&) { update_from_width(); });
+        m_height_spin->Bind(wxEVT_SPINCTRL, [this](wxSpinEvent&) { update_from_height(); });
+        m_height_spin->Bind(wxEVT_TEXT, [this](wxCommandEvent&) { update_from_height(); });
+    }
+
+    double scale() const { return m_scale; }
+
+private:
+    static uint32_t rounded_dimension(double value) { return std::max<uint32_t>(1, uint32_t(std::llround(value))); }
+
+    void set_spin_value(wxSpinCtrl* spin, uint32_t value, uint32_t max_value)
+    {
+        value = std::clamp<uint32_t>(value, 1, max_value);
+        if (spin != nullptr && spin->GetValue() != int(value))
+            spin->SetValue(int(value));
+    }
+
+    void update_from_width()
+    {
+        if (m_updating || m_width_spin == nullptr || m_height_spin == nullptr || m_original_width == 0)
+            return;
+
+        m_updating           = true;
+        const uint32_t width = std::clamp<uint32_t>(uint32_t(std::max(1, m_width_spin->GetValue())), 1, m_max_width);
+        set_spin_value(m_width_spin, width, m_max_width);
+        m_scale = double(width) / double(m_original_width);
+        set_spin_value(m_height_spin, rounded_dimension(double(m_original_height) * m_scale), m_max_height);
+        m_updating = false;
+        update_summary();
+    }
+
+    void update_from_height()
+    {
+        if (m_updating || m_width_spin == nullptr || m_height_spin == nullptr || m_original_height == 0)
+            return;
+
+        m_updating            = true;
+        const uint32_t height = std::clamp<uint32_t>(uint32_t(std::max(1, m_height_spin->GetValue())), 1, m_max_height);
+        set_spin_value(m_height_spin, height, m_max_height);
+        m_scale = double(height) / double(m_original_height);
+        set_spin_value(m_width_spin, rounded_dimension(double(m_original_width) * m_scale), m_max_width);
+        m_updating = false;
+        update_summary();
+    }
+
+    void update_summary()
+    {
+        if (m_width_spin == nullptr || m_height_spin == nullptr)
+            return;
+
+        const uint32_t width           = std::clamp<uint32_t>(uint32_t(std::max(1, m_width_spin->GetValue())), 1, m_max_width);
+        const uint32_t height          = std::clamp<uint32_t>(uint32_t(std::max(1, m_height_spin->GetValue())), 1, m_max_height);
+        const double   dimension_pct   = m_scale * 100.0;
+        const double   original_pixels = double(m_original_width) * double(m_original_height);
+        const double   resized_pixels  = double(width) * double(height);
+        const double   pixel_pct       = original_pixels > 0.0 ? resized_pixels * 100.0 / original_pixels : 100.0;
+        if (m_scale_text != nullptr)
+            m_scale_text->SetLabel(wxString::Format(_L("New size: %u x %u (%.1f%% dimensions, %.1f%% pixels)"),
+                                                    static_cast<unsigned>(width), static_cast<unsigned>(height), dimension_pct, pixel_pct));
+        if (m_ok_button != nullptr)
+            m_ok_button->Enable(width != m_original_width || height != m_original_height);
+        Layout();
+        Fit();
+    }
+
+    uint32_t      m_original_width  = 0;
+    uint32_t      m_original_height = 0;
+    uint32_t      m_max_width       = 1;
+    uint32_t      m_max_height      = 1;
+    wxSpinCtrl*   m_width_spin      = nullptr;
+    wxSpinCtrl*   m_height_spin     = nullptr;
+    wxStaticText* m_scale_text      = nullptr;
+    wxButton*     m_ok_button       = nullptr;
+    double        m_scale           = 1.0;
+    bool          m_updating        = false;
+};
+
 class ColorDataManagementDialog : public wxDialog
 {
 public:
@@ -6157,9 +6834,9 @@ private:
         wxButton *actions = nullptr;
         wxBoxSizer *size_sizer = new wxBoxSizer(wxHORIZONTAL);
         size_sizer->Add(size, 1, wxALIGN_CENTER_VERTICAL);
-        if (type == ManagedColorDataType::ImageTexture) {
+        if (type == ManagedColorDataType::ImageTexture || type == ManagedColorDataType::RgbaData) {
             actions = new wxButton(this, wxID_ANY, wxString::FromUTF8("\xE2\x96\xBE"), wxDefaultPosition, wxDefaultSize, wxBU_EXACTFIT);
-            actions->SetToolTip(_L("Image texture actions"));
+            actions->SetToolTip(type == ManagedColorDataType::ImageTexture ? _L("Image texture actions") : _L("RGBA data actions"));
             size_sizer->Add(actions, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(6));
         }
 
@@ -6172,8 +6849,14 @@ private:
 
         clear->Bind(wxEVT_BUTTON, [this, type](wxCommandEvent &) { clear_data(type); });
         create->Bind(wxEVT_BUTTON, [this, type, create](wxCommandEvent &) { show_create_menu(type, create); });
-        if (actions != nullptr)
-            actions->Bind(wxEVT_BUTTON, [this, actions](wxCommandEvent &) { show_image_texture_menu(actions); });
+        if (actions != nullptr) {
+            actions->Bind(wxEVT_BUTTON, [this, type, actions](wxCommandEvent &) {
+                if (type == ManagedColorDataType::ImageTexture)
+                    show_image_texture_menu(actions);
+                else if (type == ManagedColorDataType::RgbaData)
+                    show_rgba_data_menu(actions);
+            });
+        }
         m_rows.push_back({ type, status, preview, size, clear, create, actions });
     }
 
@@ -6285,14 +6968,62 @@ private:
         info->Enable(false);
         menu.AppendSeparator();
 
-        const int generate_id = wxWindow::NewControlId();
-        wxMenuItem *generate = menu.Append(generate_id, _L("Generate new UV Map"));
+        const int   resize_id = wxWindow::NewControlId();
+        wxMenuItem* resize    = menu.Append(resize_id, _L("Resize Texture"));
+        resize->Enable(m_object != nullptr && object_has_image_texture_data(*m_object));
+
+        const int   generate_id = wxWindow::NewControlId();
+        wxMenuItem* generate    = menu.Append(generate_id, _L("Generate new UV Map"));
         generate->Enable(m_object != nullptr && object_has_regenerable_image_texture_uvs(*m_object));
-        menu.Bind(wxEVT_COMMAND_MENU_SELECTED, [this, generate_id](wxCommandEvent &event) {
+        menu.Bind(wxEVT_COMMAND_MENU_SELECTED, [this, resize_id, generate_id](wxCommandEvent& event) {
+            if (event.GetId() == resize_id)
+                resize_image_texture();
             if (event.GetId() == generate_id)
                 generate_new_uv_map();
         });
         button->PopupMenu(&menu, wxPoint(0, button->GetSize().GetHeight()));
+    }
+
+    void show_rgba_data_menu(wxButton *button)
+    {
+        if (button == nullptr)
+            return;
+
+        wxMenu menu;
+        const int unsplit_id = wxWindow::NewControlId();
+        const int simplify_id = wxWindow::NewControlId();
+        wxMenuItem *unsplit = menu.Append(unsplit_id, _L("Unsplit once"));
+        wxMenuItem *simplify = menu.Append(simplify_id, _L("Simplify to 1 color per triangle"));
+        unsplit->Enable(m_object != nullptr && object_has_splittable_rgba_data(*m_object));
+        simplify->Enable(m_object != nullptr && object_has_rgba_data(*m_object));
+        menu.Bind(wxEVT_COMMAND_MENU_SELECTED, [this, unsplit_id, simplify_id](wxCommandEvent &event) {
+            if (event.GetId() == unsplit_id)
+                unsplit_rgba_data_once();
+            else if (event.GetId() == simplify_id)
+                simplify_rgba_data_to_one_color_per_triangle();
+        });
+        button->PopupMenu(&menu, wxPoint(0, button->GetSize().GetHeight()));
+    }
+
+    void resize_image_texture()
+    {
+        if (m_object == nullptr)
+            return;
+
+        const ManagedColorDataSummary summary = summarize_managed_color_data(m_object);
+        if (!summary.has_image_texture || summary.max_texture_width == 0 || summary.max_texture_height == 0)
+            return;
+
+        ResizeImageTextureDialog dialog(this, summary.max_texture_width, summary.max_texture_height);
+        if (dialog.ShowModal() != wxID_OK)
+            return;
+
+        Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Resize image texture", UndoRedo::SnapshotType::GizmoAction);
+        if (!resize_object_image_textures(*m_object, dialog.scale()))
+            return;
+
+        refresh_object_after_change();
+        refresh_rows();
     }
 
     void generate_new_uv_map()
@@ -6302,6 +7033,32 @@ private:
 
         Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Generate new image texture UV map", UndoRedo::SnapshotType::GizmoAction);
         if (!regenerate_object_image_texture_uv_maps(*m_object))
+            return;
+
+        refresh_object_after_change();
+        refresh_rows();
+    }
+
+    void unsplit_rgba_data_once()
+    {
+        if (m_object == nullptr || !object_has_splittable_rgba_data(*m_object))
+            return;
+
+        Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Unsplit RGBA data", UndoRedo::SnapshotType::GizmoAction);
+        if (!unsplit_object_rgba_data_once(*m_object))
+            return;
+
+        refresh_object_after_change();
+        refresh_rows();
+    }
+
+    void simplify_rgba_data_to_one_color_per_triangle()
+    {
+        if (m_object == nullptr || !object_has_rgba_data(*m_object))
+            return;
+
+        Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Simplify RGBA data", UndoRedo::SnapshotType::GizmoAction);
+        if (!simplify_object_rgba_data_to_one_color_per_triangle(*m_object))
             return;
 
         refresh_object_after_change();
