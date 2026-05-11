@@ -7979,8 +7979,8 @@ void GLCanvas3D::_render_overlays()
                     ImGuiWindowFlags_NoFocusOnAppearing);
         ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());
         imgui.text(temporary_texture_preview_pending ?
-                       _L("Generating simulated color preview (1/2)...") :
-                       _L("Generating simulated color preview (2/2)..."));
+                       _L("Generating simulated color preview...") :
+                       _L("Generating simulated color preview (hi-res)..."));
         imgui.end();
         ImGui::PopStyleColor(2);
         ImGui::PopStyleVar(2);

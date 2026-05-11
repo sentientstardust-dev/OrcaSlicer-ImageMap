@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -17,6 +18,7 @@ class wxWindow;
 
 namespace Slic3r {
 class ModelObject;
+class ModelVolume;
 }
 
 namespace Slic3r::GUI {
@@ -189,7 +191,7 @@ class GLGizmoTrueColorPainting : public GLGizmoPainterBase
 {
 public:
     GLGizmoTrueColorPainting(GLCanvas3D& parent, const std::string& icon_filename, unsigned int sprite_id);
-    ~GLGizmoTrueColorPainting() override = default;
+    ~GLGizmoTrueColorPainting() override;
 
     void render_painter_gizmo() override;
     bool gizmo_event(SLAGizmoEventType action, const Vec2d& mouse_position, bool shift_down, bool alt_down, bool control_down) override;
@@ -247,6 +249,11 @@ private:
     void convert_selected_object_image_texture_to_rgb_data();
     void refresh_selected_object_after_rgb_change(ModelObject *object);
     void update_triangle_selectors_color();
+    void update_rgb_data_preview_conversion();
+    void start_rgb_data_preview_conversion(ModelObject &object);
+    void cancel_rgb_data_preview_conversion();
+    bool rgb_data_preview_conversion_pending_for_selected_object() const;
+    ColorFacetsAnnotation *preview_rgb_data_for_volume(const ModelVolume &volume) const;
     bool record_brush_stroke_point(const Vec2d &mouse_position);
     void clear_brush_stroke_points();
     bool pick_color_from_model(const Vec2d &mouse_position);
@@ -306,7 +313,13 @@ private:
     bool                 m_brush_stroke_active = false;
     ObjectID             m_selected_color_state_object_id;
     std::vector<std::vector<Vec3f>> m_brush_stroke_points_by_volume;
+    std::vector<ObjectID> m_preview_rgb_data_volume_ids;
     std::vector<std::unique_ptr<ColorFacetsAnnotation>> m_preview_rgb_data_by_volume;
+    struct RgbDataConversionState;
+    std::shared_ptr<RgbDataConversionState> m_rgb_data_conversion_state;
+    std::thread          m_rgb_data_conversion_thread;
+    uint64_t             m_rgb_data_conversion_generation = 0;
+    ObjectID             m_rgb_data_conversion_object_id;
     struct ColorPickerVolumeSourceCache
     {
         ObjectID volume_id;
