@@ -808,6 +808,10 @@ Model Model::read_from_file(const std::string&                                  
         ObjInfo                 obj_info;
         result = load_obj(input_file.c_str(), &model, obj_info, message);
         if (result){
+            for (ModelObject *obj : model.objects)
+                if (obj != nullptr)
+                    obj->rotate(Geometry::deg2rad(90.0), Axis::X);
+
             if (!message.empty())
                 BOOST_LOG_TRIVIAL(error) << message;
 

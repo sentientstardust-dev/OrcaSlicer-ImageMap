@@ -5,6 +5,7 @@
 
 
 #include <cfloat>
+#include <functional>
 #include "Point.hpp"
 #include "TriangleMesh.hpp"
 
@@ -347,6 +348,16 @@ public:
 
     // Set facet of the mesh to a given state. Only works for original triangles.
     void set_facet(int facet_idx, EnforcerBlockerType state);
+    bool apply_state_by_world_normal(const Transform3d &trafo_no_translate,
+                                     EnforcerBlockerType new_state,
+                                     const std::function<bool(EnforcerBlockerType, float)> &predicate,
+                                     bool clear_non_matching);
+    bool apply_state_by_smooth_world_normal(const Transform3d &trafo_no_translate,
+                                            EnforcerBlockerType new_state,
+                                            const std::function<bool(EnforcerBlockerType, float)> &predicate,
+                                            float max_world_edge,
+                                            int max_depth,
+                                            bool clear_non_matching);
 
     // Clear everything and make the tree empty.
     void reset();
@@ -455,6 +466,9 @@ protected:
         int ref_cnt;
     };
 
+    Vec3f smooth_normal(const Triangle &tr, int vertex_idx) const;
+    float smooth_world_normal_z(const Triangle &tr, int vertex_idx, const Matrix3f &normal_matrix) const;
+
     void append_touching_subtriangles(int itriangle, int vertexi, int vertexj, std::vector<int>& touching_subtriangles_out) const;
     bool verify_triangle_neighbors(const Triangle& tr, const Vec3i32& neighbors) const;
 
@@ -465,6 +479,7 @@ protected:
     const TriangleMesh &m_mesh;
     const std::vector<Vec3i32> m_neighbors;
     const std::vector<Vec3f> m_face_normals;
+    std::vector<std::array<Vec3f, 3>> m_corner_normals;
 
     // BBS
     float m_edge_limit = 0.6f;
@@ -489,10 +504,21 @@ private:
     bool select_triangle_recursive(int facet_idx, const Vec3i32 &neighbors, EnforcerBlockerType type, bool triangle_splitting);
     void undivide_triangle(int facet_idx);
     void split_triangle(int facet_idx, const Vec3i32 &neighbors);
+    bool split_triangle_for_world_edge_limit(int facet_idx, const Vec3i32 &neighbors, const Transform3f &trafo, float edge_limit_sqr);
+    bool apply_state_by_smooth_world_normal_recursive(int facet_idx,
+                                                      const Vec3i32 &neighbors,
+                                                      const Matrix3f &normal_matrix,
+                                                      const Transform3f &trafo,
+                                                      EnforcerBlockerType new_state,
+                                                      const std::function<bool(EnforcerBlockerType, float)> &predicate,
+                                                      float max_world_edge_sqr,
+                                                      int max_depth,
+                                                      bool clear_non_matching);
     void remove_useless_children(int facet_idx); // No hidden meaning. Triangles are meant.
     bool is_facet_clipped(int facet_idx, const ClippingPlane &clp) const;
     int  push_triangle(int a, int b, int c, int source_triangle, EnforcerBlockerType state = EnforcerBlockerType{0});
     void perform_split(int facet_idx, const Vec3i32 &neighbors, EnforcerBlockerType old_state);
+    float triangle_max_world_edge_sqr(const Triangle &tr, const Transform3f &trafo) const;
     Vec3i32 child_neighbors(const Triangle &tr, const Vec3i32 &neighbors, int child_idx) const;
     Vec3i32 child_neighbors_propagated(const Triangle &tr, const Vec3i32 &neighbors_propagated, int child_idx, const Vec3i32 &child_neighbors) const;
     // Return child of itriangle at a CCW oriented side (vertexi, vertexj), either first or 2nd part.

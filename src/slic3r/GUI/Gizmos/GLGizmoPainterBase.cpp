@@ -10,6 +10,7 @@
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/OpenGLManager.hpp"
 #include "slic3r/Utils/UndoRedo.hpp"
+#include "libslic3r/Geometry.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/TriangleMesh.hpp"
@@ -92,6 +93,31 @@ GLGizmoPainterBase::ClippingPlaneDataWrapper GLGizmoPainterBase::get_clipping_pl
     return clp_data_out;
 }
 
+void GLGizmoPainterBase::set_render_triangle_slope_uniforms(GLShaderProgram *shader,
+                                                            const ModelVolume *model_volume,
+                                                            const Matrix3f &normal_matrix) const
+{
+    if (shader == nullptr)
+        return;
+
+    float normal_z = -::cos(Geometry::deg2rad(m_highlight_by_angle_threshold_deg));
+    shader->set_uniform("slope.actived", m_parent.is_using_slope());
+    shader->set_uniform("slope.volume_world_normal_matrix", normal_matrix);
+    shader->set_uniform("slope.normal_z", normal_z);
+    shader->set_uniform("slope.preview_mode", 0);
+    shader->set_uniform("slope.top_z", 1.f);
+    shader->set_uniform("slope.bottom_z", -1.f);
+    shader->set_uniform("slope.highlight_color", ColorRGBA(0.78f, 0.f, 0.f, 1.f));
+    shader->set_uniform("slope.override_all", true);
+    shader->set_uniform("slope.current_state", 0);
+    shader->set_uniform("slope.base_state", model_volume != nullptr && model_volume->extruder_id() > 0 ? int(model_volume->extruder_id()) : 1);
+    const std::array<float, 4> empty_mask = { 0.f, 0.f, 0.f, 0.f };
+    shader->set_uniform("slope.override_mask0", empty_mask);
+    shader->set_uniform("slope.override_mask1", empty_mask);
+    shader->set_uniform("slope.override_mask2", empty_mask);
+    shader->set_uniform("slope.override_mask3", empty_mask);
+}
+
 void GLGizmoPainterBase::render_triangles(const Selection& selection) const
 {
     auto* shader = wxGetApp().get_shader("mm_gouraud");
@@ -143,20 +169,18 @@ void GLGizmoPainterBase::render_triangles(const Selection& selection) const
         const Matrix3d view_normal_matrix = view_matrix.matrix().block(0, 0, 3, 3) * trafo_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
         shader->set_uniform("view_normal_matrix", view_normal_matrix);
 
-        float normal_z = -::cos(Geometry::deg2rad(m_highlight_by_angle_threshold_deg));
         Matrix3f normal_matrix = static_cast<Matrix3f>(trafo_matrix.matrix().block(0, 0, 3, 3).inverse().transpose().cast<float>());
 
         shader->set_uniform("volume_world_matrix", trafo_matrix);
         shader->set_uniform("volume_mirrored", is_left_handed);
-        shader->set_uniform("slope.actived", m_parent.is_using_slope());
-        shader->set_uniform("slope.volume_world_normal_matrix", normal_matrix);
-        shader->set_uniform("slope.normal_z", normal_z);
+        set_render_triangle_slope_uniforms(shader, mv, normal_matrix);
         m_triangle_selectors[mesh_id]->render(m_imgui, trafo_matrix);
-        m_triangle_selectors[mesh_id]->render_texture_preview(trafo_matrix,
-                                                              view_matrix,
-                                                              camera.get_projection_matrix(),
-                                                              clp_data.z_range,
-                                                              clp_data.clp_dataf);
+        if (should_render_triangle_texture_preview())
+            m_triangle_selectors[mesh_id]->render_texture_preview(trafo_matrix,
+                                                                  view_matrix,
+                                                                  camera.get_projection_matrix(),
+                                                                  clp_data.z_range,
+                                                                  clp_data.clp_dataf);
         shader->start_using();
 
         if (is_left_handed)
@@ -1446,6 +1470,7 @@ void TriangleSelectorPatch::render(ImGuiWrapper* imgui, const Transform3d& matri
             }
             //to make black not too hard too see
             ColorRGBA new_color = adjust_color_for_rendering(color);
+            shader->set_uniform("slope.current_state", int(patch.type));
             shader->set_uniform("uniform_color", new_color);
             this->render(buffer_idx, show_wireframe);
         }
@@ -1464,8 +1489,6 @@ void TriangleSelectorPatch::update_triangles_per_type()
         patch.triangle_indices.reserve(m_triangles.size() / 3);
     }
 
-    bool using_wireframe = (m_need_wireframe && wxGetApp().plater()->is_wireframe_enabled() && wxGetApp().plater()->is_show_wireframe()) ? true : false;
-
     for (auto& triangle : m_triangles) {
         if (!triangle.valid() || triangle.is_split())
             continue;
@@ -1477,27 +1500,29 @@ void TriangleSelectorPatch::update_triangles_per_type()
         //patch.triangle_indices.insert(patch.triangle_indices.end(), triangle.verts_idxs.begin(), triangle.verts_idxs.end());
         for (int i = 0; i < 3; ++i) {
             int j = triangle.verts_idxs[i];
-            int index = using_wireframe?int(patch.patch_vertices.size()/6) : int(patch.patch_vertices.size()/3);
+            int index = int(patch.patch_vertices.size() / 9);
             //BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", Line %1%: i=%2%, j=%3%, index=%4%, v[%5%,%6%,%7%]")%__LINE__%i%j%index%m_vertices[j].v(0)%m_vertices[j].v(1)%m_vertices[j].v(2);
             patch.patch_vertices.emplace_back(m_vertices[j].v(0));
             patch.patch_vertices.emplace_back(m_vertices[j].v(1));
             patch.patch_vertices.emplace_back(m_vertices[j].v(2));
-            if (using_wireframe) {
-                if (i == 0) {
-                    patch.patch_vertices.emplace_back(1.0);
-                    patch.patch_vertices.emplace_back(0.0);
-                    patch.patch_vertices.emplace_back(0.0);
-                }
-                else if (i == 1) {
-                    patch.patch_vertices.emplace_back(0.0);
-                    patch.patch_vertices.emplace_back(1.0);
-                    patch.patch_vertices.emplace_back(0.0);
-                }
-                else {
-                    patch.patch_vertices.emplace_back(0.0);
-                    patch.patch_vertices.emplace_back(0.0);
-                    patch.patch_vertices.emplace_back(1.0);
-                }
+            const Vec3f normal = smooth_normal(triangle, i);
+            patch.patch_vertices.emplace_back(normal(0));
+            patch.patch_vertices.emplace_back(normal(1));
+            patch.patch_vertices.emplace_back(normal(2));
+            if (i == 0) {
+                patch.patch_vertices.emplace_back(1.0);
+                patch.patch_vertices.emplace_back(0.0);
+                patch.patch_vertices.emplace_back(0.0);
+            }
+            else if (i == 1) {
+                patch.patch_vertices.emplace_back(0.0);
+                patch.patch_vertices.emplace_back(1.0);
+                patch.patch_vertices.emplace_back(0.0);
+            }
+            else {
+                patch.patch_vertices.emplace_back(0.0);
+                patch.patch_vertices.emplace_back(0.0);
+                patch.patch_vertices.emplace_back(1.0);
             }
             patch.triangle_indices.emplace_back( index);
         }
@@ -1735,6 +1760,7 @@ void TriangleSelectorPatch::update_render_data()
 
 void TriangleSelectorPatch::render(int triangle_indices_idx, bool show_wireframe)
 {
+    (void)show_wireframe;
     assert(triangle_indices_idx < this->m_triangle_indices_VBO_ids.size());
     assert(this->m_triangle_patches.size() == this->m_triangle_indices_VBO_ids.size());
 #if !SLIC3R_OPENGL_ES
@@ -1762,21 +1788,28 @@ void TriangleSelectorPatch::render(int triangle_indices_idx, bool show_wireframe
 #endif // !SLIC3R_OPENGL_ES
     // the following binding is needed to set the vertex attributes
     glsafe(::glBindBuffer(GL_ARRAY_BUFFER, this->m_vertices_VBO_ids[triangle_indices_idx]));
+    const GLsizei vertex_stride = 9 * sizeof(float);
     const GLint position_id = shader->get_attrib_location("v_position");
     if (position_id != -1) {
-        if (show_wireframe) {
-            glsafe(::glVertexAttribPointer((GLint) position_id, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (const void *) 0));
-        } else {
-            glsafe(::glVertexAttribPointer((GLint) position_id, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr));
-        }
+        glsafe(::glVertexAttribPointer((GLint) position_id, 3, GL_FLOAT, GL_FALSE, vertex_stride, (const void *) 0));
         glsafe(::glEnableVertexAttribArray((GLint)position_id));
+    }
+    const GLint normal_id = shader->get_attrib_location("v_normal");
+    if (normal_id != -1) {
+        glsafe(::glVertexAttribPointer((GLint) normal_id, 3, GL_FLOAT, GL_FALSE, vertex_stride, (const void *) (3 * sizeof(float))));
+        glsafe(::glEnableVertexAttribArray((GLint)normal_id));
+    }
+    const GLint slope_normal_id = shader->get_attrib_location("v_slope_normal");
+    if (slope_normal_id != -1) {
+        glsafe(::glVertexAttribPointer((GLint) slope_normal_id, 3, GL_FLOAT, GL_FALSE, vertex_stride, (const void *) (3 * sizeof(float))));
+        glsafe(::glEnableVertexAttribArray((GLint)slope_normal_id));
     }
     GLint barycentric_id = -1;
     // Orca: This is required even if wireframe is not displayed, otherwise on AMD Vega GPUs the painter gizmo won't render properly
     /*if (show_wireframe)*/ {
         barycentric_id = shader->get_attrib_location("v_barycentric");
         if (barycentric_id != -1) {
-            glsafe(::glVertexAttribPointer((GLint) barycentric_id, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (const void *) (3 * sizeof(float))));
+            glsafe(::glVertexAttribPointer((GLint) barycentric_id, 3, GL_FLOAT, GL_FALSE, vertex_stride, (const void *) (6 * sizeof(float))));
             glsafe(::glEnableVertexAttribArray((GLint) barycentric_id));
         }
     }
@@ -1791,6 +1824,10 @@ void TriangleSelectorPatch::render(int triangle_indices_idx, bool show_wireframe
 
     if (position_id != -1)
         glsafe(::glDisableVertexAttribArray(position_id));
+    if (normal_id != -1)
+        glsafe(::glDisableVertexAttribArray(normal_id));
+    if (slope_normal_id != -1)
+        glsafe(::glDisableVertexAttribArray(slope_normal_id));
     if (barycentric_id != -1)
         glsafe(::glDisableVertexAttribArray(barycentric_id));
 

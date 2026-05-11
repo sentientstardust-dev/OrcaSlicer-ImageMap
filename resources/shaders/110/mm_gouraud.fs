@@ -31,12 +31,24 @@ uniform mat3 view_normal_matrix;
 varying vec3 clipping_planes_dots;
 varying vec4 model_pos;
 varying vec4 world_pos;
+varying float smooth_world_normal_z;
 
 struct SlopeDetection
 {
     bool actived;
 	 float normal_z;
     mat3 volume_world_normal_matrix;
+    int preview_mode;
+    float top_z;
+    float bottom_z;
+    vec4 highlight_color;
+    bool override_all;
+    vec4 override_mask0;
+    vec4 override_mask1;
+    vec4 override_mask2;
+    vec4 override_mask3;
+    int current_state;
+    int base_state;
 };
 uniform SlopeDetection slope;
 
@@ -62,6 +74,77 @@ vec3 getWireframeColor(vec3 fill) {
 }
 uniform bool show_wireframe;
 
+float slopeOverrideMaskSlot(int slot) {
+    if (slot == 0)
+        return slope.override_mask0.x;
+    if (slot == 1)
+        return slope.override_mask0.y;
+    if (slot == 2)
+        return slope.override_mask0.z;
+    if (slot == 3)
+        return slope.override_mask0.w;
+    if (slot == 4)
+        return slope.override_mask1.x;
+    if (slot == 5)
+        return slope.override_mask1.y;
+    if (slot == 6)
+        return slope.override_mask1.z;
+    if (slot == 7)
+        return slope.override_mask1.w;
+    if (slot == 8)
+        return slope.override_mask2.x;
+    if (slot == 9)
+        return slope.override_mask2.y;
+    if (slot == 10)
+        return slope.override_mask2.z;
+    if (slot == 11)
+        return slope.override_mask2.w;
+    if (slot == 12)
+        return slope.override_mask3.x;
+    if (slot == 13)
+        return slope.override_mask3.y;
+    if (slot == 14)
+        return slope.override_mask3.z;
+    if (slot == 15)
+        return slope.override_mask3.w;
+    return 0.0;
+}
+
+bool slopeOverrideMatches(int state) {
+    if (slope.override_all)
+        return true;
+    if (state < 0 || state >= 256)
+        return false;
+    int slot = state / 16;
+    int bit = state - slot * 16;
+    float mask = slopeOverrideMaskSlot(slot);
+    float divisor = pow(2.0, float(bit));
+    return floor(mod(floor(mask / divisor), 2.0)) > 0.5;
+}
+
+bool slopePreviewMatches(float world_normal_z) {
+    if (slope.preview_mode == 1)
+        return world_normal_z >= slope.top_z - EPSILON;
+    if (slope.preview_mode == 2)
+        return world_normal_z <= slope.bottom_z + EPSILON;
+    if (slope.preview_mode == 3)
+        return world_normal_z <= slope.top_z + EPSILON && world_normal_z >= slope.bottom_z - EPSILON;
+    return false;
+}
+
+float slopePreviewChecker(vec3 position, vec3 normal) {
+    vec2 uv;
+    vec3 abs_normal = abs(normal);
+    if (abs_normal.z >= abs_normal.x && abs_normal.z >= abs_normal.y)
+        uv = position.xy;
+    else if (abs_normal.x >= abs_normal.y)
+        uv = position.yz;
+    else
+        uv = position.xz;
+    vec2 cells = floor(uv / 3.0);
+    return mod(cells.x + cells.y, 2.0);
+}
+
 void main()
 {
     if (any(lessThan(clipping_planes_dots, ZERO)))
@@ -80,15 +163,28 @@ void main()
     vec3 transformed_normal = normalize(slope.volume_world_normal_matrix * triangle_normal);
      
     if (slope.actived) {
-        if(world_pos.z<0.1&&world_pos.z>-0.1)
-         {
-              color = LightBlue;
-              alpha = 1.0;
-         }
-         else if( transformed_normal.z < slope.normal_z - EPSILON)
-        {
-            color = color * 0.5 + LightRed * 0.5;
-            alpha = 1.0;
+        if (slope.preview_mode == 0) {
+            if(world_pos.z<0.1&&world_pos.z>-0.1)
+             {
+                  color = LightBlue;
+                  alpha = 1.0;
+             }
+             else if( transformed_normal.z < slope.normal_z - EPSILON)
+            {
+                color = color * 0.5 + LightRed * 0.5;
+                alpha = 1.0;
+            }
+        } else {
+            int effective_state = slope.current_state == 0 ? slope.base_state : slope.current_state;
+            if (slopeOverrideMatches(effective_state) && slopePreviewMatches(smooth_world_normal_z)) {
+                float preview_luma = dot(slope.highlight_color.rgb, vec3(0.2126, 0.7152, 0.0722));
+                vec3 preview_accent = preview_luma > 0.75 ? vec3(0.02, 0.08, 0.24) : vec3(1.0, 1.0, 1.0);
+                float preview_check = slopePreviewChecker(world_pos.xyz, transformed_normal);
+                vec3 preview_color_a = slope.highlight_color.rgb * 0.78 + preview_accent * 0.22;
+                vec3 preview_color_b = slope.highlight_color.rgb * 0.25 + preview_accent * 0.75;
+                color = mix(preview_color_a, preview_color_b, preview_check);
+                alpha = max(alpha, slope.highlight_color.a);
+            }
         }
     }
     // First transform the normal into camera space and normalize the result.

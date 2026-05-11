@@ -27,6 +27,23 @@ class GLCanvas3D;
 
 void open_color_data_management_dialog(wxWindow *parent, GLCanvas3D &canvas, ModelObject *object, std::function<void()> on_object_changed = {});
 
+enum class SlopeAutoPaintMode : int
+{
+    Top,
+    Bottom,
+    Side
+};
+
+struct SlopeAutoPaintSettings
+{
+    SlopeAutoPaintMode mode = SlopeAutoPaintMode::Top;
+    float top_angle_deg = 10.f;
+    float bottom_angle_deg = 10.f;
+    unsigned int target_filament_id = 1;
+    bool override_all = true;
+    std::vector<unsigned int> override_filament_ids;
+};
+
 class GLMmSegmentationGizmo3DScene
 {
 public:
@@ -162,6 +179,13 @@ private:
     void update_triangle_selectors_colors();
     void init_extruders_data();
     void init_extruders_data(const std::vector<ColorRGBA> &extruder_colors);
+    void open_slope_auto_paint_overlay();
+    void render_slope_auto_paint_overlay();
+    void update_slope_auto_paint_preview(const SlopeAutoPaintSettings &settings);
+    void clear_slope_auto_paint_preview();
+    bool apply_slope_auto_paint(const SlopeAutoPaintSettings &settings, bool preview);
+    void set_render_triangle_slope_uniforms(GLShaderProgram *shader, const ModelVolume *model_volume, const Matrix3f &normal_matrix) const override;
+    bool should_render_triangle_texture_preview() const override;
     
     // Filament remapping methods
     void remap_filament_assignments();
@@ -185,6 +209,11 @@ private:
     // This map holds all translated description texts, so they can be easily referenced during layout calculations
     // etc. When language changes, GUI is recreated and this class constructed again, so the change takes effect.
     std::map<std::string, wxString> m_desc;
+    SlopeAutoPaintSettings m_slope_auto_paint_settings;
+    SlopeAutoPaintSettings m_slope_auto_paint_preview_settings;
+    bool m_show_slope_auto_paint_overlay = false;
+    bool m_slope_auto_paint_overlay_positioned = false;
+    bool m_slope_auto_paint_preview_active = false;
 };
 
 class GLGizmoTrueColorPainting : public GLGizmoPainterBase

@@ -252,6 +252,8 @@ public:
 
 protected:
     virtual void render_triangles(const Selection& selection) const;
+    virtual void set_render_triangle_slope_uniforms(GLShaderProgram *shader, const ModelVolume *model_volume, const Matrix3f &normal_matrix) const;
+    virtual bool should_render_triangle_texture_preview() const { return true; }
     void render_cursor();
     void render_cursor_circle();
     void render_cursor_sphere(const Transform3d& trafo) const;

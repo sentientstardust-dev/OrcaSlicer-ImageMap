@@ -1,8 +1,10 @@
 #include "TriangleSelector.hpp"
 #include "Model.hpp"
 
+#include <algorithm>
 #include <boost/container/small_vector.hpp>
 #include <boost/log/trivial.hpp>
+#include <cmath>
 #include <cstddef>
 #include <tbb/parallel_for.h>
 
@@ -11,6 +13,47 @@
 #endif // NDEBUG
 
 namespace Slic3r {
+
+static Vec3f normalized_or_default(const Vec3f &normal, const Vec3f &fallback)
+{
+    const float len = normal.norm();
+    return len > float(EPSILON) ? normal / len : fallback;
+}
+
+static std::vector<std::array<Vec3f, 3>> its_corner_normals(const indexed_triangle_set &its)
+{
+    constexpr float crease_dot = 0.5f;
+    std::vector<Vec3f> face_vectors(its.indices.size(), Vec3f::Zero());
+    std::vector<Vec3f> face_normals(its.indices.size(), Vec3f(0.f, 0.f, 1.f));
+    std::vector<std::vector<int>> faces_by_vertex(its.vertices.size());
+    for (size_t face_idx = 0; face_idx < its.indices.size(); ++face_idx) {
+        const stl_triangle_vertex_indices &ind = its.indices[face_idx];
+        if (ind[0] < 0 || ind[1] < 0 || ind[2] < 0 ||
+            ind[0] >= int(its.vertices.size()) || ind[1] >= int(its.vertices.size()) || ind[2] >= int(its.vertices.size()))
+            continue;
+        const Vec3f face_vector = (its.vertices[ind[1]] - its.vertices[ind[0]]).cross(its.vertices[ind[2]] - its.vertices[ind[0]]);
+        face_vectors[face_idx] = face_vector;
+        face_normals[face_idx] = normalized_or_default(face_vector, Vec3f(0.f, 0.f, 1.f));
+        faces_by_vertex[size_t(ind[0])].emplace_back(int(face_idx));
+        faces_by_vertex[size_t(ind[1])].emplace_back(int(face_idx));
+        faces_by_vertex[size_t(ind[2])].emplace_back(int(face_idx));
+    }
+    std::vector<std::array<Vec3f, 3>> corner_normals(its.indices.size());
+    for (size_t face_idx = 0; face_idx < its.indices.size(); ++face_idx) {
+        const stl_triangle_vertex_indices &ind = its.indices[face_idx];
+        for (int corner_idx = 0; corner_idx < 3; ++corner_idx) {
+            Vec3f normal = Vec3f::Zero();
+            const int vertex_idx = ind[corner_idx];
+            if (vertex_idx >= 0 && vertex_idx < int(faces_by_vertex.size())) {
+                for (const int neighbor_face_idx : faces_by_vertex[size_t(vertex_idx)])
+                    if (face_normals[face_idx].dot(face_normals[size_t(neighbor_face_idx)]) >= crease_dot)
+                        normal += face_vectors[size_t(neighbor_face_idx)];
+            }
+            corner_normals[face_idx][size_t(corner_idx)] = normalized_or_default(normal, face_normals[face_idx]);
+        }
+    }
+    return corner_normals;
+}
 
 // Check if the line is whole inside the sphere, or it is partially inside (intersecting) the sphere.
 // Inspired by Christer Ericson's Real-Time Collision Detection, pp. 177-179.
@@ -966,6 +1009,252 @@ void TriangleSelector::set_facet(int facet_idx, EnforcerBlockerType state)
     m_triangles[facet_idx].set_state(state);
 }
 
+bool TriangleSelector::apply_state_by_world_normal(const Transform3d &trafo_no_translate,
+                                                   EnforcerBlockerType new_state,
+                                                   const std::function<bool(EnforcerBlockerType, float)> &predicate,
+                                                   bool clear_non_matching)
+{
+    if (!predicate)
+        return false;
+
+    Matrix3f normal_matrix = static_cast<Matrix3f>(trafo_no_translate.matrix().block(0, 0, 3, 3).inverse().transpose().cast<float>());
+    bool changed = false;
+
+    for (Triangle &tr : m_triangles) {
+        if (!tr.valid() || tr.is_split())
+            continue;
+
+        const Vec3f &facet_normal = m_face_normals[tr.source_triangle];
+        const float  world_normal_z = (normal_matrix * facet_normal).normalized().z();
+        const EnforcerBlockerType current_state = tr.get_state();
+        const bool match = predicate(current_state, world_normal_z);
+        const EnforcerBlockerType next_state = match ? new_state : (clear_non_matching ? EnforcerBlockerType::NONE : current_state);
+        if (next_state != current_state) {
+            tr.set_state(next_state);
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        for (int facet_idx = 0; facet_idx < int(m_triangles.size()); ++facet_idx)
+            if (m_triangles[facet_idx].valid() && m_triangles[facet_idx].is_split())
+                remove_useless_children(facet_idx);
+    }
+
+    return changed;
+}
+
+Vec3f TriangleSelector::smooth_normal(const Triangle &tr, int vertex_idx) const
+{
+    if (tr.source_triangle < 0 || tr.source_triangle >= int(m_mesh.its.indices.size()) ||
+        tr.source_triangle >= int(m_corner_normals.size()) || vertex_idx < 0 || vertex_idx >= 3)
+        return tr.source_triangle >= 0 && tr.source_triangle < int(m_face_normals.size()) ?
+            m_face_normals[size_t(tr.source_triangle)] :
+            Vec3f(0.f, 0.f, 1.f);
+
+    const stl_triangle_vertex_indices &source_indices = m_mesh.its.indices[size_t(tr.source_triangle)];
+    const Vec3f &a = m_mesh.its.vertices[size_t(source_indices[0])];
+    const Vec3f &b = m_mesh.its.vertices[size_t(source_indices[1])];
+    const Vec3f &c = m_mesh.its.vertices[size_t(source_indices[2])];
+    const Vec3f &p = m_vertices[size_t(tr.verts_idxs[size_t(vertex_idx)])].v;
+
+    const Vec3f v0 = b - a;
+    const Vec3f v1 = c - a;
+    const Vec3f v2 = p - a;
+    const float d00 = v0.dot(v0);
+    const float d01 = v0.dot(v1);
+    const float d11 = v1.dot(v1);
+    const float d20 = v2.dot(v0);
+    const float d21 = v2.dot(v1);
+    const float denom = d00 * d11 - d01 * d01;
+    if (std::abs(denom) <= float(EPSILON))
+        return m_face_normals[size_t(tr.source_triangle)];
+
+    const float v = (d11 * d20 - d01 * d21) / denom;
+    const float w = (d00 * d21 - d01 * d20) / denom;
+    const float u = 1.f - v - w;
+    const auto &corner_normals = m_corner_normals[size_t(tr.source_triangle)];
+    return normalized_or_default(u * corner_normals[0] + v * corner_normals[1] + w * corner_normals[2],
+                                 m_face_normals[size_t(tr.source_triangle)]);
+}
+
+float TriangleSelector::smooth_world_normal_z(const Triangle &tr, int vertex_idx, const Matrix3f &normal_matrix) const
+{
+    return normalized_or_default(normal_matrix * smooth_normal(tr, vertex_idx), Vec3f(0.f, 0.f, 1.f)).z();
+}
+
+float TriangleSelector::triangle_max_world_edge_sqr(const Triangle &tr, const Transform3f &trafo) const
+{
+    const Vec3f p0 = trafo * m_vertices[size_t(tr.verts_idxs[0])].v;
+    const Vec3f p1 = trafo * m_vertices[size_t(tr.verts_idxs[1])].v;
+    const Vec3f p2 = trafo * m_vertices[size_t(tr.verts_idxs[2])].v;
+    return std::max({ (p2 - p1).squaredNorm(), (p0 - p2).squaredNorm(), (p1 - p0).squaredNorm() });
+}
+
+bool TriangleSelector::split_triangle_for_world_edge_limit(int facet_idx, const Vec3i32 &neighbors, const Transform3f &trafo, float edge_limit_sqr)
+{
+    if (facet_idx < 0 || facet_idx >= int(m_triangles.size()))
+        return false;
+    if (m_triangles[facet_idx].is_split())
+        return true;
+
+    Triangle *tr = &m_triangles[facet_idx];
+    assert(this->verify_triangle_neighbors(*tr, neighbors));
+    const EnforcerBlockerType old_type = tr->get_state();
+
+    const std::array<int, 3> &facet = tr->verts_idxs;
+    const std::array<Vec3f, 3> pts = {
+        trafo * m_vertices[size_t(facet[0])].v,
+        trafo * m_vertices[size_t(facet[1])].v,
+        trafo * m_vertices[size_t(facet[2])].v
+    };
+    const std::array<float, 3> sides = {
+        (pts[2] - pts[1]).squaredNorm(),
+        (pts[0] - pts[2]).squaredNorm(),
+        (pts[1] - pts[0]).squaredNorm()
+    };
+
+    boost::container::small_vector<int, 3> sides_to_split;
+    int side_to_keep = -1;
+    for (int side_idx = 0; side_idx < 3; ++side_idx) {
+        if (sides[size_t(side_idx)] > edge_limit_sqr)
+            sides_to_split.push_back(side_idx);
+        else
+            side_to_keep = side_idx;
+    }
+    if (sides_to_split.empty())
+        return false;
+
+    tr->set_division(int(sides_to_split.size()), sides_to_split.size() == 2 ? side_to_keep : sides_to_split[0]);
+    perform_split(facet_idx, neighbors, old_type);
+    return m_triangles[facet_idx].is_split();
+}
+
+bool TriangleSelector::apply_state_by_smooth_world_normal_recursive(int facet_idx,
+                                                                    const Vec3i32 &neighbors,
+                                                                    const Matrix3f &normal_matrix,
+                                                                    const Transform3f &trafo,
+                                                                    EnforcerBlockerType new_state,
+                                                                    const std::function<bool(EnforcerBlockerType, float)> &predicate,
+                                                                    float max_world_edge_sqr,
+                                                                    int max_depth,
+                                                                    bool clear_non_matching)
+{
+    if (facet_idx < 0 || facet_idx >= int(m_triangles.size()) || !m_triangles[size_t(facet_idx)].valid())
+        return false;
+
+    Triangle *tr = &m_triangles[size_t(facet_idx)];
+    if (tr->is_split()) {
+        bool changed = false;
+        const int child_count = tr->number_of_split_sides() + 1;
+        for (int child_idx = 0; child_idx < child_count; ++child_idx) {
+            changed |= apply_state_by_smooth_world_normal_recursive(tr->children[size_t(child_idx)],
+                                                                    child_neighbors(*tr, neighbors, child_idx),
+                                                                    normal_matrix,
+                                                                    trafo,
+                                                                    new_state,
+                                                                    predicate,
+                                                                    max_world_edge_sqr,
+                                                                    max_depth,
+                                                                    clear_non_matching);
+            tr = &m_triangles[size_t(facet_idx)];
+        }
+        return changed;
+    }
+
+    const EnforcerBlockerType current_state = tr->get_state();
+    std::array<float, 3> normal_z;
+    std::array<bool, 3> matches;
+    int match_count = 0;
+    for (int vertex_idx = 0; vertex_idx < 3; ++vertex_idx) {
+        normal_z[size_t(vertex_idx)] = smooth_world_normal_z(*tr, vertex_idx, normal_matrix);
+        matches[size_t(vertex_idx)] = predicate(current_state, normal_z[size_t(vertex_idx)]);
+        if (matches[size_t(vertex_idx)])
+            ++match_count;
+    }
+
+    if (match_count == 0) {
+        const EnforcerBlockerType next_state = clear_non_matching ? EnforcerBlockerType::NONE : current_state;
+        if (next_state != current_state) {
+            tr->set_state(next_state);
+            return true;
+        }
+        return false;
+    }
+    if (match_count == 3) {
+        if (current_state != new_state) {
+            tr->set_state(new_state);
+            return true;
+        }
+        return false;
+    }
+
+    if (max_depth > 0 && triangle_max_world_edge_sqr(*tr, trafo) > max_world_edge_sqr &&
+        split_triangle_for_world_edge_limit(facet_idx, neighbors, trafo, max_world_edge_sqr)) {
+        bool changed = false;
+        tr = &m_triangles[size_t(facet_idx)];
+        const int child_count = tr->number_of_split_sides() + 1;
+        for (int child_idx = 0; child_idx < child_count; ++child_idx) {
+            changed |= apply_state_by_smooth_world_normal_recursive(tr->children[size_t(child_idx)],
+                                                                    child_neighbors(*tr, neighbors, child_idx),
+                                                                    normal_matrix,
+                                                                    trafo,
+                                                                    new_state,
+                                                                    predicate,
+                                                                    max_world_edge_sqr,
+                                                                    max_depth - 1,
+                                                                    clear_non_matching);
+            tr = &m_triangles[size_t(facet_idx)];
+        }
+        return changed;
+    }
+
+    const float center_normal_z = (normal_z[0] + normal_z[1] + normal_z[2]) / 3.f;
+    const bool center_match = predicate(current_state, center_normal_z);
+    const EnforcerBlockerType next_state = center_match ? new_state : (clear_non_matching ? EnforcerBlockerType::NONE : current_state);
+    if (next_state != current_state) {
+        tr->set_state(next_state);
+        return true;
+    }
+    return false;
+}
+
+bool TriangleSelector::apply_state_by_smooth_world_normal(const Transform3d &trafo_no_translate,
+                                                          EnforcerBlockerType new_state,
+                                                          const std::function<bool(EnforcerBlockerType, float)> &predicate,
+                                                          float max_world_edge,
+                                                          int max_depth,
+                                                          bool clear_non_matching)
+{
+    if (!predicate)
+        return false;
+
+    const Matrix3f normal_matrix = static_cast<Matrix3f>(trafo_no_translate.matrix().block(0, 0, 3, 3).inverse().transpose().cast<float>());
+    const Transform3f trafo = trafo_no_translate.cast<float>();
+    const float max_world_edge_sqr = std::max(max_world_edge, float(EPSILON)) * std::max(max_world_edge, float(EPSILON));
+    bool changed = false;
+
+    for (int facet_idx = 0; facet_idx < m_orig_size_indices; ++facet_idx) {
+        changed |= apply_state_by_smooth_world_normal_recursive(facet_idx,
+                                                                m_neighbors[size_t(facet_idx)],
+                                                                normal_matrix,
+                                                                trafo,
+                                                                new_state,
+                                                                predicate,
+                                                                max_world_edge_sqr,
+                                                                max_depth,
+                                                                clear_non_matching);
+    }
+
+    if (changed) {
+        for (int facet_idx = 0; facet_idx < m_orig_size_indices; ++facet_idx)
+            if (m_triangles[size_t(facet_idx)].valid() && m_triangles[size_t(facet_idx)].is_split())
+                remove_useless_children(facet_idx);
+    }
+
+    return changed;
+}
+
 // called by select_patch()->select_triangle()...select_triangle()
 // to decide which sides of the triangle to split and to actually split it calling set_division() and perform_split().
 void TriangleSelector::split_triangle(int facet_idx, const Vec3i32 &neighbors)
@@ -1287,12 +1576,13 @@ void TriangleSelector::reset()
 {
     m_vertices.clear();
     m_triangles.clear();
+    m_corner_normals = its_corner_normals(m_mesh.its);
     m_invalid_triangles = 0;
     m_free_triangles_head = -1;
     m_free_vertices_head = -1;
     m_vertices.reserve(m_mesh.its.vertices.size());
-    for (const stl_vertex& vert : m_mesh.its.vertices)
-        m_vertices.emplace_back(vert);
+    for (size_t idx = 0; idx < m_mesh.its.vertices.size(); ++idx)
+        m_vertices.emplace_back(m_mesh.its.vertices[idx]);
     m_triangles.reserve(m_mesh.its.indices.size());
     for (size_t i = 0; i < m_mesh.its.indices.size(); ++i) {
         const stl_triangle_vertex_indices &ind = m_mesh.its.indices[i];

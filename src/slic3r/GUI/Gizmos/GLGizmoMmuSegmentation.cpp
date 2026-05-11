@@ -17,6 +17,7 @@
 #include "libslic3r/Model.hpp"
 #include "libslic3r/TextureMapping.hpp"
 #include "libslic3r/ColorSolver.hpp"
+#include "libslic3r/Geometry.hpp"
 #include "slic3r/Utils/UndoRedo.hpp"
 #include "GLGizmosCommon.hpp"
 #include "GLGizmoUtils.hpp"
@@ -36,6 +37,7 @@
 #include <optional>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <boost/log/trivial.hpp>
 #include <nlohmann/json.hpp>
@@ -52,6 +54,13 @@
 
 namespace Slic3r::GUI {
 
+namespace {
+constexpr size_t SlopePreviewOverrideIdCount = size_t(EnforcerBlockerType::ExtruderMax) + 1;
+constexpr float SlopeAutoPaintMaxEdgeMm = 0.03f;
+constexpr int SlopeAutoPaintMaxDepth = 13;
+constexpr float SlopeAutoPaintMaxAngleDeg = 180.f;
+}
+
 struct ManagedRegionColorSource
 {
     std::vector<std::vector<TriangleSelector::FacetStateTriangle>> triangles_per_type;
@@ -65,6 +74,10 @@ static std::optional<ColorRGBA> sample_managed_region_color_source(const Managed
                                                                    int                             tri_idx,
                                                                    const Vec3f                    &point);
 static ManagedRegionColorSource build_managed_region_color_source(const ModelVolume &volume);
+static void render_extruders_combo(const std::string& label,
+                                   const std::vector<std::string>& extruders,
+                                   const std::vector<ColorRGBA>& extruders_colors,
+                                   size_t& selection_idx);
 static std::unique_ptr<ColorFacetsAnnotation> build_rgba_data_from_color_regions(const ModelVolume &volume, const ColorRGBA &background);
 static std::unique_ptr<ColorFacetsAnnotation> build_rgba_data_from_color_region_data(
     const TriangleSelector::TriangleSplittingData &data,
@@ -166,6 +179,8 @@ void GLGizmoMmuSegmentation::on_opening()
 
 void GLGizmoMmuSegmentation::on_shutdown()
 {
+    m_show_slope_auto_paint_overlay = false;
+    m_slope_auto_paint_preview_active = false;
     m_parent.use_slope(false);
     m_parent.toggle_model_objects_visibility(true);
 }
@@ -264,6 +279,36 @@ static size_t display_filament_index_for_requested_id(const std::vector<unsigned
 
     auto selected_it = std::find(display_filament_ids.begin(), display_filament_ids.end(), selected_id);
     return selected_it != display_filament_ids.end() ? size_t(std::distance(display_filament_ids.begin(), selected_it)) : 0;
+}
+
+static bool is_texture_mapping_filament_id(unsigned int filament_id)
+{
+    return wxGetApp().preset_bundle != nullptr &&
+           wxGetApp().preset_bundle->texture_mapping_zones.is_texture_mapping_zone_id(filament_id);
+}
+
+static wxString slope_auto_paint_filament_label(unsigned int filament_id)
+{
+    return is_texture_mapping_filament_id(filament_id) ?
+        wxString::Format(_L("Filament %u (Texture Mapping)"), filament_id) :
+        wxString::Format(_L("Filament %u"), filament_id);
+}
+
+static bool slope_auto_paint_matches_normal(const SlopeAutoPaintSettings &settings, float world_normal_z)
+{
+    constexpr float normal_epsilon = 0.0001f;
+    const float z = std::clamp(world_normal_z, -1.f, 1.f);
+    const float top_z = float(std::cos(Geometry::deg2rad(std::clamp(settings.top_angle_deg, 0.f, SlopeAutoPaintMaxAngleDeg))));
+    const float bottom_z = -float(std::cos(Geometry::deg2rad(std::clamp(settings.bottom_angle_deg, 0.f, SlopeAutoPaintMaxAngleDeg))));
+    switch (settings.mode) {
+    case SlopeAutoPaintMode::Top:
+        return z >= top_z - normal_epsilon;
+    case SlopeAutoPaintMode::Bottom:
+        return z <= bottom_z + normal_epsilon;
+    case SlopeAutoPaintMode::Side:
+        return z <= top_z + normal_epsilon && z >= bottom_z - normal_epsilon;
+    }
+    return false;
 }
 
 static void persist_texture_mapping_zone_definitions(TextureMappingManager &mgr)
@@ -7666,6 +7711,340 @@ void GLGizmoMmuSegmentation::render_painter_gizmo()
     glsafe(::glDisable(GL_BLEND));
 }
 
+void GLGizmoMmuSegmentation::set_render_triangle_slope_uniforms(GLShaderProgram *shader,
+                                                                const ModelVolume *model_volume,
+                                                                const Matrix3f &normal_matrix) const
+{
+    if (!m_slope_auto_paint_preview_active || shader == nullptr) {
+        GLGizmoPainterBase::set_render_triangle_slope_uniforms(shader, model_volume, normal_matrix);
+        return;
+    }
+
+    const SlopeAutoPaintSettings &settings = m_slope_auto_paint_preview_settings;
+    const int preview_mode = settings.mode == SlopeAutoPaintMode::Bottom ? 2 :
+                             settings.mode == SlopeAutoPaintMode::Side   ? 3 :
+                                                                           1;
+    const float top_z = float(std::cos(Geometry::deg2rad(std::clamp(settings.top_angle_deg, 0.f, SlopeAutoPaintMaxAngleDeg))));
+    const float bottom_z = -float(std::cos(Geometry::deg2rad(std::clamp(settings.bottom_angle_deg, 0.f, SlopeAutoPaintMaxAngleDeg))));
+    const unsigned int base_filament_id =
+        model_volume != nullptr && model_volume->extruder_id() > 0 ? unsigned(model_volume->extruder_id()) : 1u;
+    const size_t target_color_idx = extruder_color_index_for_filament_id(settings.target_filament_id, m_extruders_colors.size());
+    ColorRGBA highlight_color = m_extruders_colors.empty() ? ColorRGBA(0.15f, 0.65f, 0.6f, 1.f) : m_extruders_colors[target_color_idx];
+    highlight_color.a(1.f);
+
+    std::array<std::array<unsigned int, 4>, 4> override_mask_bits{};
+    if (!settings.override_all) {
+        for (const unsigned int filament_id : settings.override_filament_ids) {
+            if (filament_id >= SlopePreviewOverrideIdCount)
+                continue;
+            const unsigned int slot = filament_id / 16u;
+            override_mask_bits[size_t(slot / 4u)][size_t(slot % 4u)] |= 1u << (filament_id % 16u);
+        }
+    }
+    std::array<std::array<float, 4>, 4> override_masks{};
+    for (size_t group_idx = 0; group_idx < override_masks.size(); ++group_idx)
+        for (size_t component_idx = 0; component_idx < override_masks[group_idx].size(); ++component_idx)
+            override_masks[group_idx][component_idx] = float(override_mask_bits[group_idx][component_idx]);
+
+    shader->set_uniform("slope.actived", true);
+    shader->set_uniform("slope.volume_world_normal_matrix", normal_matrix);
+    shader->set_uniform("slope.normal_z", 0.f);
+    shader->set_uniform("slope.preview_mode", preview_mode);
+    shader->set_uniform("slope.top_z", top_z);
+    shader->set_uniform("slope.bottom_z", bottom_z);
+    shader->set_uniform("slope.highlight_color", highlight_color);
+    shader->set_uniform("slope.override_all", settings.override_all);
+    shader->set_uniform("slope.current_state", 0);
+    shader->set_uniform("slope.base_state", int(base_filament_id));
+    shader->set_uniform("slope.override_mask0", override_masks[0]);
+    shader->set_uniform("slope.override_mask1", override_masks[1]);
+    shader->set_uniform("slope.override_mask2", override_masks[2]);
+    shader->set_uniform("slope.override_mask3", override_masks[3]);
+}
+
+bool GLGizmoMmuSegmentation::should_render_triangle_texture_preview() const
+{
+    return !m_slope_auto_paint_preview_active;
+}
+
+void GLGizmoMmuSegmentation::render_slope_auto_paint_overlay()
+{
+    if (!m_show_slope_auto_paint_overlay)
+        return;
+
+    std::vector<unsigned int> filament_ids = m_display_filament_ids;
+    if (filament_ids.empty())
+        filament_ids.emplace_back(1u);
+
+    std::vector<std::string> filament_labels;
+    std::vector<ColorRGBA> filament_colors;
+    filament_labels.reserve(filament_ids.size());
+    filament_colors.reserve(filament_ids.size());
+    for (const unsigned int filament_id : filament_ids) {
+        filament_labels.emplace_back(into_u8(slope_auto_paint_filament_label(filament_id)));
+        const size_t color_idx = extruder_color_index_for_filament_id(filament_id, m_extruders_colors.size());
+        filament_colors.emplace_back(m_extruders_colors.empty() ? ColorRGBA(0.15f, 0.65f, 0.6f, 1.f) : m_extruders_colors[color_idx]);
+    }
+
+    if (std::find(filament_ids.begin(), filament_ids.end(), m_slope_auto_paint_settings.target_filament_id) == filament_ids.end())
+        m_slope_auto_paint_settings.target_filament_id = filament_ids.front();
+
+    if (!m_slope_auto_paint_overlay_positioned) {
+        const Size canvas_size = m_parent.get_canvas_size();
+        const float window_width = m_imgui->scaled(22.f);
+        ImGui::SetNextWindowPos(ImVec2(std::max(m_imgui->scaled(8.f), float(canvas_size.get_width()) - window_width - m_imgui->scaled(24.f)),
+                                       m_parent.get_main_toolbar_height() + m_imgui->scaled(16.f)),
+                                ImGuiCond_Always);
+        m_slope_auto_paint_overlay_positioned = true;
+    }
+
+    m_imgui->push_common_window_style(m_parent.get_scale());
+    ImGui::SetNextWindowSize(ImVec2(m_imgui->scaled(22.f), 0.f), ImGuiCond_FirstUseEver);
+    bool open = true;
+    const int flags = ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse;
+    m_imgui->begin(_L("Paint by slope"), &open, flags);
+
+    bool changed = false;
+    const float label_width = m_imgui->scaled(7.5f);
+    const float item_width = m_imgui->scaled(11.f);
+
+    std::vector<std::string> modes = {
+        into_u8(_L("Upper surfaces")),
+        into_u8(_L("Lower surfaces")),
+        into_u8(_L("Sides"))
+    };
+    int mode_idx = m_slope_auto_paint_settings.mode == SlopeAutoPaintMode::Bottom ? 1 :
+                   m_slope_auto_paint_settings.mode == SlopeAutoPaintMode::Side   ? 2 :
+                                                                                     0;
+    ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonHovered));
+    if (m_imgui->combo(_L("Mode"), modes, mode_idx, 0, label_width, item_width)) {
+        m_slope_auto_paint_settings.mode = mode_idx == 1 ? SlopeAutoPaintMode::Bottom :
+                                           mode_idx == 2 ? SlopeAutoPaintMode::Side :
+                                                           SlopeAutoPaintMode::Top;
+        changed = true;
+    }
+    ImGui::PopStyleColor();
+
+    size_t target_idx = 0;
+    for (size_t idx = 0; idx < filament_ids.size(); ++idx) {
+        if (filament_ids[idx] == m_slope_auto_paint_settings.target_filament_id) {
+            target_idx = idx;
+            break;
+        }
+    }
+    const size_t old_target_idx = target_idx;
+    ImGui::AlignTextToFramePadding();
+    m_imgui->text(_L("Paint with"));
+    ImGui::SameLine(label_width);
+    ImGui::PushItemWidth(item_width);
+    render_extruders_combo("##slope_auto_paint_target", filament_labels, filament_colors, target_idx);
+    ImGui::PopItemWidth();
+    if (target_idx != old_target_idx && target_idx < filament_ids.size()) {
+        m_slope_auto_paint_settings.target_filament_id = filament_ids[target_idx];
+        changed = true;
+    }
+
+    auto render_angle = [this, label_width, item_width](const wxString &label, const char *id, float &angle) {
+        bool angle_changed = false;
+        ImGui::AlignTextToFramePadding();
+        m_imgui->text(label);
+        ImGui::SameLine(label_width);
+        ImGui::PushItemWidth(item_width);
+        angle_changed |= ImGui::SliderFloat(id, &angle, 0.f, SlopeAutoPaintMaxAngleDeg, "%.1f");
+        ImGui::PopItemWidth();
+        angle = std::clamp(angle, 0.f, SlopeAutoPaintMaxAngleDeg);
+        return angle_changed;
+    };
+    if (m_slope_auto_paint_settings.mode == SlopeAutoPaintMode::Top ||
+        m_slope_auto_paint_settings.mode == SlopeAutoPaintMode::Side)
+        changed |= render_angle(_L("Angle from top"), "##slope_top_angle", m_slope_auto_paint_settings.top_angle_deg);
+    if (m_slope_auto_paint_settings.mode == SlopeAutoPaintMode::Bottom ||
+        m_slope_auto_paint_settings.mode == SlopeAutoPaintMode::Side)
+        changed |= render_angle(_L("Angle from bottom"), "##slope_bottom_angle", m_slope_auto_paint_settings.bottom_angle_deg);
+
+    ImGui::Separator();
+    bool override_all = m_slope_auto_paint_settings.override_all;
+    if (m_imgui->bbl_checkbox(_L("All"), override_all)) {
+        if (override_all) {
+            m_slope_auto_paint_settings.override_all = true;
+            m_slope_auto_paint_settings.override_filament_ids.clear();
+            changed = true;
+        } else {
+            override_all = true;
+        }
+    }
+
+    const float row_height = ImGui::GetTextLineHeightWithSpacing();
+    const float override_height = std::min(row_height * (float(filament_ids.size()) + 0.5f), row_height * 6.5f);
+    ImGui::BeginChild("##slope_auto_paint_override_scroll", ImVec2(0.f, override_height), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    for (size_t idx = 0; idx < filament_ids.size(); ++idx) {
+        const unsigned int filament_id = filament_ids[idx];
+        const bool currently_selected = !m_slope_auto_paint_settings.override_all &&
+            std::find(m_slope_auto_paint_settings.override_filament_ids.begin(),
+                      m_slope_auto_paint_settings.override_filament_ids.end(),
+                      filament_id) != m_slope_auto_paint_settings.override_filament_ids.end();
+        bool selected = currently_selected;
+        ImGui::PushID(int(filament_id));
+        if (ImGui::Checkbox("##override", &selected)) {
+            if (selected) {
+                if (m_slope_auto_paint_settings.override_all) {
+                    m_slope_auto_paint_settings.override_all = false;
+                    m_slope_auto_paint_settings.override_filament_ids.clear();
+                }
+                if (std::find(m_slope_auto_paint_settings.override_filament_ids.begin(),
+                              m_slope_auto_paint_settings.override_filament_ids.end(),
+                              filament_id) == m_slope_auto_paint_settings.override_filament_ids.end())
+                    m_slope_auto_paint_settings.override_filament_ids.emplace_back(filament_id);
+            } else {
+                auto &override_ids = m_slope_auto_paint_settings.override_filament_ids;
+                override_ids.erase(std::remove(override_ids.begin(), override_ids.end(), filament_id), override_ids.end());
+                if (override_ids.empty())
+                    m_slope_auto_paint_settings.override_all = true;
+            }
+            changed = true;
+        }
+        ImGui::SameLine();
+        ImGuiColorEditFlags swatch_flags = ImGuiColorEditFlags_NoAlpha | ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel |
+                                           ImGuiColorEditFlags_NoPicker | ImGuiColorEditFlags_NoTooltip;
+        ImGui::ColorButton("##swatch", ImGuiWrapper::to_ImVec4(filament_colors[idx]), swatch_flags,
+                           ImVec2(ImGui::GetTextLineHeight() * 1.5f, ImGui::GetTextLineHeight()));
+        ImGui::SameLine();
+        ImGui::Text("%s", filament_labels[idx].c_str());
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+
+    if (changed)
+        update_slope_auto_paint_preview(m_slope_auto_paint_settings);
+    else if (!m_slope_auto_paint_preview_active)
+        update_slope_auto_paint_preview(m_slope_auto_paint_settings);
+
+    ImGui::Separator();
+    bool close_overlay = false;
+    m_imgui->push_confirm_button_style();
+    if (m_imgui->bbl_button(_L("Apply"))) {
+        Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Paint by slope", UndoRedo::SnapshotType::GizmoAction);
+        if (apply_slope_auto_paint(m_slope_auto_paint_settings, false)) {
+            update_model_object();
+            m_parent.set_as_dirty();
+        }
+        close_overlay = true;
+    }
+    m_imgui->pop_confirm_button_style();
+    ImGui::SameLine();
+    m_imgui->push_cancel_button_style();
+    if (m_imgui->bbl_button(_L("Cancel")))
+        close_overlay = true;
+    m_imgui->pop_cancel_button_style();
+
+    m_imgui->end();
+    m_imgui->pop_common_window_style();
+
+    if (!open || close_overlay) {
+        m_show_slope_auto_paint_overlay = false;
+        m_slope_auto_paint_overlay_positioned = false;
+        clear_slope_auto_paint_preview();
+    }
+}
+
+void GLGizmoMmuSegmentation::open_slope_auto_paint_overlay()
+{
+    if (m_c->selection_info()->model_object() == nullptr)
+        return;
+
+    m_slope_auto_paint_settings = SlopeAutoPaintSettings();
+    m_slope_auto_paint_settings.target_filament_id = m_selected_extruder_idx < m_display_filament_ids.size() ?
+        m_display_filament_ids[m_selected_extruder_idx] :
+        1u;
+    if (!m_display_filament_ids.empty() &&
+        std::find(m_display_filament_ids.begin(), m_display_filament_ids.end(), m_slope_auto_paint_settings.target_filament_id) ==
+            m_display_filament_ids.end())
+        m_slope_auto_paint_settings.target_filament_id = m_display_filament_ids.front();
+
+    m_show_slope_auto_paint_overlay = true;
+    m_slope_auto_paint_overlay_positioned = false;
+    update_slope_auto_paint_preview(m_slope_auto_paint_settings);
+}
+
+void GLGizmoMmuSegmentation::update_slope_auto_paint_preview(const SlopeAutoPaintSettings &settings)
+{
+    ModelObject *mo = m_c->selection_info()->model_object();
+    const Selection &selection = m_parent.get_selection();
+    m_slope_auto_paint_preview_active = mo != nullptr &&
+                                        !m_triangle_selectors.empty() &&
+                                        selection.get_instance_idx() >= 0 &&
+                                        selection.get_instance_idx() < int(mo->instances.size());
+    m_slope_auto_paint_preview_settings = settings;
+    m_parent.set_as_dirty();
+    m_parent.schedule_extra_frame(0);
+}
+
+void GLGizmoMmuSegmentation::clear_slope_auto_paint_preview()
+{
+    m_slope_auto_paint_preview_active = false;
+    m_parent.set_as_dirty();
+    m_parent.schedule_extra_frame(0);
+}
+
+bool GLGizmoMmuSegmentation::apply_slope_auto_paint(const SlopeAutoPaintSettings &settings, bool preview)
+{
+    if (preview) {
+        update_slope_auto_paint_preview(settings);
+        return false;
+    }
+
+    ModelObject *mo = m_c->selection_info()->model_object();
+    if (mo == nullptr || m_triangle_selectors.empty())
+        return false;
+
+    const Selection &selection = m_parent.get_selection();
+    if (selection.get_instance_idx() < 0 || selection.get_instance_idx() >= int(mo->instances.size()))
+        return false;
+
+    const Transform3d instance_trafo_not_translate = m_parent.get_canvas_type() == GLCanvas3D::CanvasAssembleView ?
+        mo->instances[selection.get_instance_idx()]->get_assemble_transformation().get_matrix_no_offset() :
+        mo->instances[selection.get_instance_idx()]->get_transformation().get_matrix_no_offset();
+
+    const std::unordered_set<unsigned int> override_ids(settings.override_filament_ids.begin(), settings.override_filament_ids.end());
+    bool changed = false;
+    int selector_idx = -1;
+
+    for (const ModelVolume *mv : mo->volumes) {
+        if (!mv->is_model_part())
+            continue;
+
+        ++selector_idx;
+        if (selector_idx < 0 || size_t(selector_idx) >= m_triangle_selectors.size() ||
+            m_triangle_selectors[size_t(selector_idx)] == nullptr)
+            continue;
+
+        const unsigned int base_filament_id = mv->extruder_id() > 0 ? static_cast<unsigned int>(mv->extruder_id()) : 1u;
+        TriangleSelectorGUI *selector_gui = m_triangle_selectors[size_t(selector_idx)].get();
+        TriangleSelector *selector = selector_gui;
+
+        const Transform3d trafo_matrix_not_translate = instance_trafo_not_translate * mv->get_matrix_no_offset();
+        const bool selector_changed =
+            selector->apply_state_by_smooth_world_normal(trafo_matrix_not_translate,
+                                                         static_cast<EnforcerBlockerType>(settings.target_filament_id),
+                                                         [&settings, &override_ids, base_filament_id](
+                                                             EnforcerBlockerType current_state, float world_normal_z) {
+                                                             if (!slope_auto_paint_matches_normal(settings, world_normal_z))
+                                                                 return false;
+                                                             const unsigned int current_filament_id = current_state == EnforcerBlockerType::NONE ?
+                                                                 base_filament_id :
+                                                                 static_cast<unsigned int>(current_state);
+                                                             return settings.override_all || override_ids.count(current_filament_id) != 0;
+                                                         },
+                                                         SlopeAutoPaintMaxEdgeMm,
+                                                         SlopeAutoPaintMaxDepth,
+                                                         preview);
+        selector_gui->request_update_render_data(true);
+        changed |= selector_changed;
+    }
+
+    return changed;
+}
+
 void GLGizmoMmuSegmentation::data_changed(bool is_serializing)
 {
     GLGizmoPainterBase::data_changed(is_serializing);
@@ -7748,7 +8127,10 @@ static void render_extruders_combo(const std::string& label,
     // It is necessary to use BeginGroup(). Otherwise, when using SameLine() is called, then other items will be drawn inside the combobox.
     ImGui::BeginGroup();
     ImVec2 combo_pos = ImGui::GetCursorScreenPos();
-    if (ImGui::BeginCombo(label.c_str(), "")) {
+    ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonHovered));
+    const bool combo_open = ImGui::BeginCombo(label.c_str(), "");
+    ImGui::PopStyleColor();
+    if (combo_open) {
         for (size_t extruder_idx = 0; extruder_idx < extruders.size(); ++extruder_idx) {
             ImGui::PushID(int(extruder_idx));
             ImVec2 start_position = ImGui::GetCursorScreenPos();
@@ -8217,6 +8599,20 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
 
     ImGui::Separator();
 
+    if (m_imgui->button(_L("Paint by slope"))) {
+        if (m_show_slope_auto_paint_overlay) {
+            m_show_slope_auto_paint_overlay = false;
+            m_slope_auto_paint_overlay_positioned = false;
+            clear_slope_auto_paint_preview();
+        } else {
+            open_slope_auto_paint_overlay();
+        }
+    }
+    if (ImGui::IsItemHovered())
+        m_imgui->tooltip(_L("Paint color regions by surface slope with a live preview."), max_tooltip_width);
+
+    ImGui::Separator();
+
     const bool can_convert_regions_to_vertex_colors = selected_object_has_painted_regions();
     m_imgui->disabled_begin(!can_convert_regions_to_vertex_colors);
     if (m_imgui->button(_L("Convert regions to vertex colors")))
@@ -8330,6 +8726,8 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
 
     // BBS
     ImGuiWrapper::pop_toolbar_style();
+
+    render_slope_auto_paint_overlay();
 }
 
 
@@ -8381,6 +8779,7 @@ void GLGizmoMmuSegmentation::init_model_triangle_selectors()
 {
     const ModelObject *mo = m_c->selection_info()->model_object();
     m_triangle_selectors.clear();
+    m_slope_auto_paint_preview_active = false;
     m_volumes_extruder_idxs.clear();
 
     // Don't continue when extruders colors are not initialized
