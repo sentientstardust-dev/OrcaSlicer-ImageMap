@@ -2530,6 +2530,16 @@ bool build_texture_mapping_color_preview_geometry_for_state(
         if (emitted_color_facets)
             continue;
 
+        if (color_facets_for_triangle == facets_by_source_triangle.end() || color_facets_for_triangle->second.empty()) {
+            const ColorRGBA color = preview_color(background_color);
+            geometry.add_vertex(triangle.vertices[0] + offset, normal, color);
+            geometry.add_vertex(triangle.vertices[1] + offset, normal, color);
+            geometry.add_vertex(triangle.vertices[2] + offset, normal, color);
+            geometry.add_triangle(vertex_index, vertex_index + 1, vertex_index + 2);
+            vertex_index += 3;
+            continue;
+        }
+
         std::array<ColorRGBA, 3> leaf_colors;
         bool valid_leaf = true;
         for (size_t vertex_idx = 0; vertex_idx < triangle.vertices.size(); ++vertex_idx) {
@@ -3467,7 +3477,8 @@ bool build_mmu_vertex_color_preview_models(
         } else {
             const bool has_texture_mapping_color_preview =
                 has_texture_mapping_color_override || model_volume_has_texture_mapping_color_preview_data(model_volume);
-            if (!has_texture_mapping_color_preview && !model_volume_has_vertex_color_preview_data(model_volume))
+            const bool has_texture_preview = model_volume_has_texture_preview_data(model_volume);
+            if (!has_texture_mapping_color_preview && (has_texture_preview || !model_volume_has_vertex_color_preview_data(model_volume)))
                 continue;
 
             std::optional<TexturePreviewSimulationSettings> simulation_settings =

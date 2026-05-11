@@ -4953,9 +4953,16 @@ static bool model_volume_imported_vector_matches(const ModelVolumeImportedVector
     return lhs.size() == rhs.size() && std::equal(lhs.begin(), lhs.end(), rhs.begin());
 }
 
+static std::string model_volume_texture_mapping_background_config_value(const ModelVolume &volume)
+{
+    const ConfigOptionString *opt = dynamic_cast<const ConfigOptionString *>(volume.config.option("texture_mapping_background_color"));
+    return opt != nullptr ? opt->value : std::string();
+}
+
 static bool model_volume_texture_mapping_data_matches(const ModelVolume &mv_old, const ModelVolume &mv_new)
 {
     return mv_old.texture_mapping_color_facets.timestamp_matches(mv_new.texture_mapping_color_facets) &&
+           model_volume_texture_mapping_background_config_value(mv_old) == model_volume_texture_mapping_background_config_value(mv_new) &&
            model_volume_imported_vector_matches(mv_old.imported_vertex_colors_rgba, mv_new.imported_vertex_colors_rgba) &&
            model_volume_imported_vector_matches(mv_old.imported_texture_uvs_per_face, mv_new.imported_texture_uvs_per_face) &&
            model_volume_imported_vector_matches(mv_old.imported_texture_uv_valid, mv_new.imported_texture_uv_valid) &&

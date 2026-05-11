@@ -66,6 +66,7 @@ struct ManagedRegionColorSource
     std::vector<std::vector<TriangleSelector::FacetStateTriangle>> triangles_per_type;
     std::vector<std::unordered_map<int, std::vector<size_t>>>      by_source_triangle;
     std::vector<ColorRGBA>                                         state_colors;
+    std::vector<bool>                                              state_is_texture_mapping_zone;
     std::vector<std::vector<int>>                                  nearby_source_triangles;
     float                                                          nearby_painted_distance_sq = 0.f;
 };
@@ -73,18 +74,21 @@ struct ManagedRegionColorSource
 static std::optional<ColorRGBA> sample_managed_region_color_source(const ManagedRegionColorSource &source,
                                                                    int                             tri_idx,
                                                                    const Vec3f                    &point);
+static ColorRGBA managed_color_data_state_color(const ManagedRegionColorSource &source, unsigned int state);
 static ManagedRegionColorSource build_managed_region_color_source(const ModelVolume &volume);
 static void render_extruders_combo(const std::string& label,
                                    const std::vector<std::string>& extruders,
                                    const std::vector<ColorRGBA>& extruders_colors,
                                    size_t& selection_idx);
-static std::unique_ptr<ColorFacetsAnnotation> build_rgba_data_from_color_regions(const ModelVolume &volume, const ColorRGBA &background);
+static std::unique_ptr<ColorFacetsAnnotation> build_rgba_data_from_color_regions(const ModelVolume &volume, const ColorRGBA &fallback_color);
 static std::unique_ptr<ColorFacetsAnnotation> build_rgba_data_from_color_region_data(
     const TriangleSelector::TriangleSplittingData &data,
     size_t                                         triangle_count,
     const ManagedRegionColorSource                &source,
-    const ColorRGBA                               &background,
+    const ColorRGBA                               &fallback_color,
     const std::function<void()>                   &check_cancel = {});
+static bool managed_color_data_replace_rgba(ColorFacetsAnnotation &annotation, uint32_t source_rgba, uint32_t target_rgba);
+static ColorRGBA managed_color_data_background_color(const ModelObject *object);
 
 static void call_after_if_true_color_painting_active(std::function<void()> fn, GUI_App *app = &wxGetApp())
 {
@@ -1071,12 +1075,22 @@ static bool set_managed_color_data_background_color(ModelObject &object, const C
 {
     ColorRGBA background = color;
     background.a(1.f);
+    ColorRGBA previous_background = managed_color_data_background_color(&object);
+    previous_background.a(1.f);
+    ColorRGBA transparent_background = background;
+    transparent_background.a(0.f);
+    const uint32_t previous_background_rgba = pack_vertex_color_rgba(previous_background);
+    const uint32_t transparent_background_rgba = pack_vertex_color_rgba(transparent_background);
     bool changed = set_texture_mapping_background_config(object.config, background);
     const std::string metadata = rgb_metadata_json(background);
     for (ModelVolume *volume : object.volumes) {
         if (volume == nullptr || !volume->is_model_part())
             continue;
         changed |= set_texture_mapping_background_config(volume->config, background);
+        if (!volume->texture_mapping_color_facets.empty())
+            changed |= managed_color_data_replace_rgba(volume->texture_mapping_color_facets,
+                                                       previous_background_rgba,
+                                                       transparent_background_rgba);
         if (!volume->texture_mapping_color_facets.empty() && volume->texture_mapping_color_facets.metadata_json() != metadata) {
             volume->texture_mapping_color_facets.set_metadata_json(metadata);
             changed = true;
@@ -3814,6 +3828,27 @@ static bool write_rgba_pixel(std::vector<uint8_t> &rgba, uint32_t width, uint32_
     return true;
 }
 
+static bool fill_rgba_pixels(std::vector<uint8_t> &rgba, const ColorRGBA &color)
+{
+    const uint8_t r = uint8_t(std::clamp(color.r(), 0.f, 1.f) * 255.f + 0.5f);
+    const uint8_t g = uint8_t(std::clamp(color.g(), 0.f, 1.f) * 255.f + 0.5f);
+    const uint8_t b = uint8_t(std::clamp(color.b(), 0.f, 1.f) * 255.f + 0.5f);
+    const uint8_t a = uint8_t(std::clamp(color.a(), 0.f, 1.f) * 255.f + 0.5f);
+    bool changed = false;
+    for (size_t idx = 0; idx + 3 < rgba.size(); idx += 4) {
+        changed = changed ||
+                  rgba[idx + 0] != r ||
+                  rgba[idx + 1] != g ||
+                  rgba[idx + 2] != b ||
+                  rgba[idx + 3] != a;
+        rgba[idx + 0] = r;
+        rgba[idx + 1] = g;
+        rgba[idx + 2] = b;
+        rgba[idx + 3] = a;
+    }
+    return changed;
+}
+
 static bool write_raw_offset_pixel(std::vector<uint8_t> &offsets,
                                    uint32_t width,
                                    uint32_t channels,
@@ -5449,6 +5484,44 @@ static ManagedColorSourceFlags managed_color_source_flags(const ManagedColorData
     return flags;
 }
 
+static bool managed_color_source_flags_empty(const ManagedColorSourceFlags &flags)
+{
+    return !flags.use_rgba && !flags.use_image_texture && !flags.use_vertex_colors && !flags.use_color_regions;
+}
+
+static bool managed_color_source_has_volume_data(const ModelVolume &volume, ManagedColorDataType type)
+{
+    switch (type) {
+    case ManagedColorDataType::ColorRegions:
+        return !volume.mmu_segmentation_facets.empty();
+    case ManagedColorDataType::VertexColors:
+        return volume.imported_vertex_colors_rgba.size() == volume.mesh().its.vertices.size();
+    case ManagedColorDataType::ImageTexture:
+        return model_volume_has_bakeable_image_texture_data(&volume);
+    case ManagedColorDataType::RgbaData:
+        return !volume.texture_mapping_color_facets.empty();
+    }
+    return false;
+}
+
+static ManagedColorSourceFlags managed_color_source_flags_for_type(ManagedColorDataType type)
+{
+    return managed_color_source_flags(ManagedColorDataCreateSource{ std::optional<ManagedColorDataType>(type) });
+}
+
+static ManagedColorSourceFlags managed_target_or_highest_existing_color_source_flags(const ModelVolume &volume, ManagedColorDataType target)
+{
+    if (managed_color_source_has_volume_data(volume, target))
+        return managed_color_source_flags_for_type(target);
+    if (managed_color_source_has_volume_data(volume, ManagedColorDataType::RgbaData))
+        return managed_color_source_flags_for_type(ManagedColorDataType::RgbaData);
+    if (managed_color_source_has_volume_data(volume, ManagedColorDataType::ImageTexture))
+        return managed_color_source_flags_for_type(ManagedColorDataType::ImageTexture);
+    if (managed_color_source_has_volume_data(volume, ManagedColorDataType::VertexColors))
+        return managed_color_source_flags_for_type(ManagedColorDataType::VertexColors);
+    return ManagedColorSourceFlags();
+}
+
 static ColorRGBA blank_color_for_managed_target(ManagedColorDataType target)
 {
     return target == ManagedColorDataType::RgbaData ? rgba_data_conversion_fallback_color() :
@@ -5502,6 +5575,15 @@ static ColorRGBA managed_filament_color(unsigned int                      filame
     return fallback;
 }
 
+static bool managed_filament_is_texture_mapping_zone(unsigned int filament_id)
+{
+    if (wxGetApp().preset_bundle == nullptr)
+        return false;
+
+    const TextureMappingZone *zone = wxGetApp().preset_bundle->texture_mapping_zones.zone_from_id(filament_id);
+    return zone != nullptr && zone->enabled && !zone->deleted;
+}
+
 static std::vector<ColorRGBA> managed_region_color_source_state_colors(const ModelVolume &volume, size_t state_count)
 {
     const std::vector<std::string> physical_color_strings =
@@ -5525,10 +5607,24 @@ static std::vector<ColorRGBA> managed_region_color_source_state_colors(const Mod
     return state_colors;
 }
 
+static std::vector<bool> managed_region_color_source_texture_zone_states(const ModelVolume &volume, size_t state_count)
+{
+    const unsigned int base_filament_id = volume.extruder_id() > 0 ? unsigned(volume.extruder_id()) : 1u;
+
+    std::vector<bool> states;
+    states.reserve(state_count);
+    for (size_t state_idx = 0; state_idx < state_count; ++state_idx) {
+        const unsigned int filament_id = state_idx == 0 ? base_filament_id : unsigned(state_idx);
+        states.emplace_back(managed_filament_is_texture_mapping_zone(filament_id));
+    }
+    return states;
+}
+
 static ManagedRegionColorSource build_managed_region_color_state_source(const ModelVolume &volume, size_t state_count)
 {
     ManagedRegionColorSource source;
     source.state_colors = managed_region_color_source_state_colors(volume, state_count);
+    source.state_is_texture_mapping_zone = managed_region_color_source_texture_zone_states(volume, state_count);
     return source;
 }
 
@@ -5547,6 +5643,7 @@ static ManagedRegionColorSource build_managed_region_color_source(const ModelVol
     source.nearby_painted_distance_sq = nearby_distance * nearby_distance;
 
     source.state_colors = managed_region_color_source_state_colors(volume, source.triangles_per_type.size());
+    source.state_is_texture_mapping_zone = managed_region_color_source_texture_zone_states(volume, source.triangles_per_type.size());
     for (size_t state_idx = 0; state_idx < source.triangles_per_type.size(); ++state_idx) {
         std::unordered_map<int, std::vector<size_t>> &by_source = source.by_source_triangle[state_idx];
         by_source.reserve(source.triangles_per_type[state_idx].size());
@@ -5576,6 +5673,14 @@ static ManagedRegionColorSource build_managed_region_color_source(const ModelVol
         nearby.erase(std::unique(nearby.begin(), nearby.end()), nearby.end());
     }
 
+    return source;
+}
+
+static ManagedRegionColorSource build_managed_region_color_overlay_source(const ModelVolume &volume)
+{
+    ManagedRegionColorSource source = build_managed_region_color_source(volume);
+    if (source.state_colors.empty())
+        source = build_managed_region_color_state_source(volume, 1);
     return source;
 }
 
@@ -5678,6 +5783,112 @@ static std::optional<ColorRGBA> sample_managed_region_color_source(const Managed
     return std::nullopt;
 }
 
+static bool managed_region_state_is_texture_mapping_zone(const ManagedRegionColorSource &source, unsigned int state)
+{
+    return size_t(state) < source.state_is_texture_mapping_zone.size() &&
+           source.state_is_texture_mapping_zone[size_t(state)];
+}
+
+static std::optional<unsigned int> sample_managed_region_state_source(const ManagedRegionColorSource &source,
+                                                                      int                             source_triangle,
+                                                                      const Vec3f                    &point)
+{
+    ManagedRegionColorCandidate same_triangle;
+    consider_managed_region_source_triangle(source, source_triangle, point, same_triangle);
+
+    if (same_triangle.inside_color && same_triangle.inside_state > 0)
+        return unsigned(same_triangle.inside_state);
+
+    ManagedRegionColorCandidate nearby = same_triangle;
+    if (source_triangle >= 0 && size_t(source_triangle) < source.nearby_source_triangles.size()) {
+        for (const int nearby_triangle : source.nearby_source_triangles[size_t(source_triangle)]) {
+            if (nearby_triangle == source_triangle)
+                continue;
+            consider_managed_region_source_triangle(source, nearby_triangle, point, nearby);
+        }
+    }
+
+    if (nearby.nearest_painted_color && nearby.nearest_painted_distance_sq <= source.nearby_painted_distance_sq)
+        return unsigned(nearby.nearest_painted_state);
+    if (same_triangle.inside_color)
+        return unsigned(same_triangle.inside_state);
+    if (same_triangle.nearest_color)
+        return unsigned(same_triangle.nearest_state);
+    if (nearby.nearest_color)
+        return unsigned(nearby.nearest_state);
+    return std::nullopt;
+}
+
+static std::optional<ColorRGBA> sample_managed_region_overlay_color_source(const ManagedRegionColorSource &source,
+                                                                          int                             source_triangle,
+                                                                          const Vec3f                    &point)
+{
+    const std::optional<unsigned int> state = sample_managed_region_state_source(source, source_triangle, point);
+    if (state && managed_region_state_is_texture_mapping_zone(source, *state))
+        return std::nullopt;
+    if (state)
+        return managed_color_data_state_color(source, *state);
+    if (managed_region_state_is_texture_mapping_zone(source, 0))
+        return std::nullopt;
+    return managed_color_data_state_color(source, 0);
+}
+
+static std::optional<ColorRGBA> sample_managed_region_rgba_overlay_color_source(const ManagedRegionColorSource &source,
+                                                                               int                             source_triangle,
+                                                                               const Vec3f                    &point,
+                                                                               const ColorRGBA                &unpainted_color)
+{
+    const std::optional<unsigned int> state = sample_managed_region_state_source(source, source_triangle, point);
+    if (state && managed_region_state_is_texture_mapping_zone(source, *state))
+        return std::nullopt;
+    if (state && *state == 0)
+        return unpainted_color;
+    if (state)
+        return managed_color_data_state_color(source, *state);
+    if (managed_region_state_is_texture_mapping_zone(source, 0))
+        return std::nullopt;
+    return unpainted_color;
+}
+
+static std::vector<bool> managed_region_overlay_source_triangles(const ManagedRegionColorSource &source, size_t triangle_count)
+{
+    std::vector<bool> triangles(triangle_count, false);
+    if (source.triangles_per_type.empty()) {
+        if (!managed_region_state_is_texture_mapping_zone(source, 0))
+            std::fill(triangles.begin(), triangles.end(), true);
+        return triangles;
+    }
+
+    for (size_t state_idx = 0; state_idx < source.triangles_per_type.size(); ++state_idx) {
+        if (managed_region_state_is_texture_mapping_zone(source, unsigned(state_idx)))
+            continue;
+
+        for (const TriangleSelector::FacetStateTriangle &triangle : source.triangles_per_type[state_idx]) {
+            if (triangle.source_triangle < 0 || size_t(triangle.source_triangle) >= triangle_count)
+                continue;
+            triangles[size_t(triangle.source_triangle)] = true;
+            if (size_t(triangle.source_triangle) < source.nearby_source_triangles.size())
+                for (const int nearby_triangle : source.nearby_source_triangles[size_t(triangle.source_triangle)])
+                    if (nearby_triangle >= 0 && size_t(nearby_triangle) < triangle_count)
+                        triangles[size_t(nearby_triangle)] = true;
+        }
+    }
+    return triangles;
+}
+
+static bool managed_region_source_uses_texture_mapping_zone(const ManagedRegionColorSource &source)
+{
+    if (managed_region_state_is_texture_mapping_zone(source, 0))
+        return true;
+
+    for (size_t state_idx = 1; state_idx < source.triangles_per_type.size(); ++state_idx)
+        if (managed_region_state_is_texture_mapping_zone(source, unsigned(state_idx)) &&
+            !source.triangles_per_type[state_idx].empty())
+            return true;
+
+    return false;
+}
+
 static char managed_color_data_hex_digit(unsigned int value)
 {
     value &= 0x0Fu;
@@ -5720,6 +5931,72 @@ static void managed_color_data_append_rgba_hex(std::string &out, uint32_t rgba)
 {
     for (int shift = 28; shift >= 0; shift -= 4)
         out.push_back(managed_color_data_hex_digit((rgba >> shift) & 0x0Fu));
+}
+
+static int managed_color_data_hex_value(char ch)
+{
+    if (ch >= '0' && ch <= '9')
+        return ch - '0';
+    if (ch >= 'a' && ch <= 'f')
+        return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F')
+        return ch - 'A' + 10;
+    return -1;
+}
+
+static bool managed_color_data_parse_rgba_hex(const std::string &text, size_t offset, uint32_t &rgba)
+{
+    if (offset + 8 > text.size())
+        return false;
+
+    rgba = 0;
+    for (size_t idx = 0; idx < 8; ++idx) {
+        const int value = managed_color_data_hex_value(text[offset + idx]);
+        if (value < 0)
+            return false;
+        rgba = (rgba << 4) | uint32_t(value);
+    }
+    return true;
+}
+
+static bool managed_color_data_replace_rgba(ColorFacetsAnnotation &annotation, uint32_t source_rgba, uint32_t target_rgba)
+{
+    if (annotation.empty() || source_rgba == target_rgba)
+        return false;
+
+    const TriangleColorSplittingData &data = annotation.get_data();
+    if (std::find(data.colors_rgba.begin(), data.colors_rgba.end(), source_rgba) == data.colors_rgba.end())
+        return false;
+
+    std::unique_ptr<ColorFacetsAnnotation> rewritten = ColorFacetsAnnotation::make_temporary();
+    if (!rewritten)
+        return false;
+
+    std::string target_hex;
+    managed_color_data_append_rgba_hex(target_hex, target_rgba);
+    bool changed = false;
+    for (const ColorTriangleBitStreamMapping &mapping : data.triangles_to_split) {
+        std::string encoded = annotation.get_triangle_as_string(mapping.triangle_idx);
+        const size_t separator = encoded.find('|');
+        if (separator != std::string::npos) {
+            for (size_t offset = separator + 1; offset + 8 <= encoded.size(); offset += 8) {
+                uint32_t rgba = 0;
+                if (managed_color_data_parse_rgba_hex(encoded, offset, rgba) && rgba == source_rgba) {
+                    encoded.replace(offset, 8, target_hex);
+                    changed = true;
+                }
+            }
+        }
+        if (!encoded.empty())
+            rewritten->set_triangle_from_string(mapping.triangle_idx, encoded);
+    }
+
+    if (!changed)
+        return false;
+
+    rewritten->set_metadata_json(annotation.metadata_json());
+    annotation.assign(*rewritten);
+    return true;
 }
 
 struct ManagedColorDataRgbaAccumulator
@@ -6087,10 +6364,34 @@ static ColorRGBA managed_color_data_state_color(const ManagedRegionColorSource &
     return source.state_colors.empty() ? ColorRGBA(1.f, 1.f, 1.f, 1.f) : source.state_colors.front();
 }
 
+static ColorRGBA managed_color_data_region_background_color(const ManagedRegionColorSource &source, const ColorRGBA &fallback_color)
+{
+    ColorRGBA color = source.state_colors.empty() ? fallback_color : managed_color_data_state_color(source, 0);
+    color.a(1.f);
+    return color;
+}
+
+static ColorRGBA managed_color_data_region_unpainted_color(const ManagedRegionColorSource &source, const ColorRGBA &fallback_color)
+{
+    ColorRGBA color = managed_color_data_region_background_color(source, fallback_color);
+    color.a(0.f);
+    return color;
+}
+
+static ColorRGBA managed_color_data_region_rgba_color(const ManagedRegionColorSource &source,
+                                                      unsigned int                    state,
+                                                      const ColorRGBA                &unpainted_color)
+{
+    return state == 0 || managed_region_state_is_texture_mapping_zone(source, state) ?
+        unpainted_color :
+        managed_color_data_state_color(source, state);
+}
+
 static bool managed_color_data_append_region_tree_as_rgba_tree(const TriangleSelector::TriangleSplittingData &data,
                                                                int                                             bitstream_end,
                                                                int                                            &bit_idx,
                                                                const ManagedRegionColorSource                &source,
+                                                               const ColorRGBA                               &unpainted_color,
                                                                std::vector<bool>                             &out_bits,
                                                                std::vector<uint32_t>                         &out_colors)
 {
@@ -6105,7 +6406,13 @@ static bool managed_color_data_append_region_tree_as_rgba_tree(const TriangleSel
             return false;
         managed_color_data_append_nibble(out_bits, unsigned(code));
         for (int child_idx = split_sides; child_idx >= 0; --child_idx)
-            if (!managed_color_data_append_region_tree_as_rgba_tree(data, bitstream_end, bit_idx, source, out_bits, out_colors))
+            if (!managed_color_data_append_region_tree_as_rgba_tree(data,
+                                                                    bitstream_end,
+                                                                    bit_idx,
+                                                                    source,
+                                                                    unpainted_color,
+                                                                    out_bits,
+                                                                    out_colors))
                 return false;
         return true;
     }
@@ -6128,13 +6435,14 @@ static bool managed_color_data_append_region_tree_as_rgba_tree(const TriangleSel
     }
 
     managed_color_data_append_nibble(out_bits, 0u);
-    out_colors.emplace_back(pack_vertex_color_rgba(managed_color_data_state_color(source, state)));
+    out_colors.emplace_back(pack_vertex_color_rgba(managed_color_data_region_rgba_color(source, state, unpainted_color)));
     return true;
 }
 
 static bool append_direct_color_region_rgba_triangle(const TriangleSelector::TriangleSplittingData &data,
                                                      size_t                                         mapping_idx,
                                                      const ManagedRegionColorSource                &source,
+                                                     const ColorRGBA                               &unpainted_color,
                                                      ColorFacetsAnnotation                         &out)
 {
     if (mapping_idx >= data.triangles_to_split.size())
@@ -6154,7 +6462,7 @@ static bool append_direct_color_region_rgba_triangle(const TriangleSelector::Tri
     int bit_idx = bitstream_start;
     std::vector<bool> out_bits;
     std::vector<uint32_t> out_colors;
-    if (!managed_color_data_append_region_tree_as_rgba_tree(data, bitstream_end, bit_idx, source, out_bits, out_colors) ||
+    if (!managed_color_data_append_region_tree_as_rgba_tree(data, bitstream_end, bit_idx, source, unpainted_color, out_bits, out_colors) ||
         out_bits.empty() ||
         out_colors.empty())
         return false;
@@ -6168,7 +6476,7 @@ static bool append_direct_color_region_rgba_triangle(const TriangleSelector::Tri
     return true;
 }
 
-static std::unique_ptr<ColorFacetsAnnotation> build_rgba_data_from_color_regions(const ModelVolume &volume, const ColorRGBA &background)
+static std::unique_ptr<ColorFacetsAnnotation> build_rgba_data_from_color_regions(const ModelVolume &volume, const ColorRGBA &fallback_color)
 {
     if (volume.mmu_segmentation_facets.empty())
         return nullptr;
@@ -6178,14 +6486,14 @@ static std::unique_ptr<ColorFacetsAnnotation> build_rgba_data_from_color_regions
         return nullptr;
 
     const ManagedRegionColorSource source = build_managed_region_color_source(volume);
-    return build_rgba_data_from_color_region_data(data, volume.mesh().its.indices.size(), source, background);
+    return build_rgba_data_from_color_region_data(data, volume.mesh().its.indices.size(), source, fallback_color);
 }
 
 static std::unique_ptr<ColorFacetsAnnotation> build_rgba_data_from_color_region_data(
     const TriangleSelector::TriangleSplittingData &data,
     size_t                                         triangle_count,
     const ManagedRegionColorSource                &source,
-    const ColorRGBA                               &background,
+    const ColorRGBA                               &fallback_color,
     const std::function<void()>                   &check_cancel)
 {
     if (data.triangles_to_split.empty())
@@ -6196,6 +6504,8 @@ static std::unique_ptr<ColorFacetsAnnotation> build_rgba_data_from_color_region_
         return nullptr;
 
     out->reserve(int(data.triangles_to_split.size()));
+    const ColorRGBA background_color = managed_color_data_region_background_color(source, fallback_color);
+    const ColorRGBA unpainted_color = managed_color_data_region_unpainted_color(source, fallback_color);
     bool any = false;
     for (size_t mapping_idx = 0; mapping_idx < data.triangles_to_split.size(); ++mapping_idx) {
         if (check_cancel)
@@ -6203,12 +6513,12 @@ static std::unique_ptr<ColorFacetsAnnotation> build_rgba_data_from_color_region_
         const int triangle_idx = data.triangles_to_split[mapping_idx].triangle_idx;
         if (triangle_idx < 0 || size_t(triangle_idx) >= triangle_count)
             continue;
-        any |= append_direct_color_region_rgba_triangle(data, mapping_idx, source, *out);
+        any |= append_direct_color_region_rgba_triangle(data, mapping_idx, source, unpainted_color, *out);
     }
     if (!any)
         return nullptr;
 
-    out->set_metadata_json(rgb_metadata_json(background));
+    out->set_metadata_json(rgb_metadata_json(background_color));
     out->shrink_to_fit();
     return out;
 }
@@ -6259,6 +6569,34 @@ static ColorRGBA sample_managed_volume_color_source(const ModelVolume           
     return fallback_color;
 }
 
+static ColorRGBA sample_managed_volume_color_source_with_region_overlay(const ModelVolume              &volume,
+                                                                        const VolumeColorSource        &rgba_source,
+                                                                        const ManagedRegionColorSource &region_source,
+                                                                        size_t                          tri_idx,
+                                                                        const Vec3f                    &point,
+                                                                        const Vec3f                    &barycentric,
+                                                                        const ManagedColorSourceFlags  &base_source_flags,
+                                                                        bool                            use_region_overlay,
+                                                                        const ColorRGBA                &fallback_color)
+{
+    if (use_region_overlay) {
+        if (std::optional<ColorRGBA> color = sample_managed_region_overlay_color_source(region_source, int(tri_idx), point))
+            return *color;
+    }
+
+    return sample_managed_volume_color_source(volume,
+                                              rgba_source,
+                                              region_source,
+                                              tri_idx,
+                                              point,
+                                              barycentric,
+                                              base_source_flags.use_rgba,
+                                              base_source_flags.use_image_texture,
+                                              base_source_flags.use_vertex_colors,
+                                              false,
+                                              fallback_color);
+}
+
 static bool convert_object_to_vertex_colors(ModelObject &object, const ManagedColorDataCreateSource &source, bool replace_existing = false)
 {
     if (!replace_existing && object_has_vertex_color_data(object))
@@ -6275,8 +6613,16 @@ static bool convert_object_to_vertex_colors(ModelObject &object, const ManagedCo
         if (its.vertices.empty())
             continue;
 
+        const bool use_region_overlay = source_flags.use_color_regions;
+        const ManagedColorSourceFlags base_source_flags = use_region_overlay ?
+            managed_target_or_highest_existing_color_source_flags(*volume, ManagedColorDataType::VertexColors) :
+            source_flags;
         const VolumeColorSource rgba_source = build_volume_color_source(*volume);
-        const ManagedRegionColorSource region_source = build_managed_region_color_source(*volume);
+        const ManagedRegionColorSource region_source = use_region_overlay ? build_managed_region_color_overlay_source(*volume) :
+                                                                            build_managed_region_color_source(*volume);
+        const ColorRGBA sample_fallback_color = use_region_overlay ?
+            managed_color_data_region_background_color(region_source, fallback_color) :
+            fallback_color;
         std::vector<std::array<float, 4>> accumulators(its.vertices.size(), { 0.f, 0.f, 0.f, 0.f });
         std::vector<unsigned int> counts(its.vertices.size(), 0);
 
@@ -6287,17 +6633,28 @@ static bool convert_object_to_vertex_colors(ModelObject &object, const ManagedCo
                     continue;
                 Vec3f barycentric = Vec3f::Zero();
                 barycentric[corner] = 1.f;
-                const ColorRGBA color = sample_managed_volume_color_source(*volume,
-                                                                           rgba_source,
-                                                                           region_source,
-                                                                           tri_idx,
-                                                                           its.vertices[size_t(tri[corner])].cast<float>(),
-                                                                           barycentric,
-                                                                           source_flags.use_rgba,
-                                                                           source_flags.use_image_texture,
-                                                                           source_flags.use_vertex_colors,
-                                                                           source_flags.use_color_regions,
-                                                                           fallback_color);
+                const Vec3f point = its.vertices[size_t(tri[corner])].cast<float>();
+                const ColorRGBA color = use_region_overlay ?
+                    sample_managed_volume_color_source_with_region_overlay(*volume,
+                                                                          rgba_source,
+                                                                          region_source,
+                                                                          tri_idx,
+                                                                          point,
+                                                                          barycentric,
+                                                                          base_source_flags,
+                                                                          true,
+                                                                          sample_fallback_color) :
+                    sample_managed_volume_color_source(*volume,
+                                                       rgba_source,
+                                                       region_source,
+                                                       tri_idx,
+                                                       point,
+                                                       barycentric,
+                                                       source_flags.use_rgba,
+                                                       source_flags.use_image_texture,
+                                                       source_flags.use_vertex_colors,
+                                                       source_flags.use_color_regions,
+                                                       sample_fallback_color);
                 std::array<float, 4> &accumulator = accumulators[size_t(tri[corner])];
                 accumulator[0] += color.r();
                 accumulator[1] += color.g();
@@ -6335,6 +6692,7 @@ static bool convert_object_to_image_texture(ModelObject &object, const ManagedCo
     bool changed = false;
     const ManagedColorSourceFlags source_flags = managed_color_source_flags(source);
     const ColorRGBA fallback_color = blank_color_for_managed_target(ManagedColorDataType::ImageTexture);
+    std::optional<ColorRGBA> color_region_background_color;
     for (ModelVolume *volume : object.volumes) {
         if (volume == nullptr || !volume->is_model_part())
             continue;
@@ -6343,29 +6701,41 @@ static bool convert_object_to_image_texture(ModelObject &object, const ManagedCo
         if (its.vertices.empty() || its.indices.empty())
             continue;
 
+        const bool use_region_overlay = source_flags.use_color_regions;
+        const ManagedRegionColorSource region_source = use_region_overlay ? build_managed_region_color_overlay_source(*volume) :
+                                                                            ManagedRegionColorSource();
+        const ColorRGBA sample_fallback_color = use_region_overlay ?
+            managed_color_data_region_background_color(region_source, fallback_color) :
+            fallback_color;
+        const ManagedColorSourceFlags base_source_flags = use_region_overlay ?
+            managed_target_or_highest_existing_color_source_flags(*volume, ManagedColorDataType::ImageTexture) :
+            source_flags;
+        const bool preserve_existing_image_target = use_region_overlay && base_source_flags.use_image_texture;
+        const bool preserve_existing_image_pixels =
+            preserve_existing_image_target && managed_region_source_uses_texture_mapping_zone(region_source);
         GeneratedImageTextureAtlas generated_atlas;
-        Transform3d metric_matrix = volume->get_matrix();
-        if (!object.instances.empty() && object.instances.front() != nullptr)
-            metric_matrix = object.instances.front()->get_transformation().get_matrix() * metric_matrix;
-        if (!initialize_generated_image_texture(*volume, fallback_color, &generated_atlas, &metric_matrix))
-            continue;
-
-        std::unique_ptr<ColorFacetsAnnotation> region_rgba_data;
-        const ColorFacetsAnnotation *rgba_annotation = nullptr;
-        bool use_rgba_source = source_flags.use_rgba;
-        bool use_color_region_source = source_flags.use_color_regions;
-        if (source_flags.use_color_regions && !volume->mmu_segmentation_facets.empty()) {
-            region_rgba_data = build_rgba_data_from_color_regions(*volume, blank_color_for_managed_target(ManagedColorDataType::RgbaData));
-            if (region_rgba_data && !region_rgba_data->empty()) {
-                rgba_annotation = region_rgba_data.get();
-                use_rgba_source = true;
-                use_color_region_source = false;
-            }
+        if (!preserve_existing_image_target) {
+            Transform3d metric_matrix = volume->get_matrix();
+            if (!object.instances.empty() && object.instances.front() != nullptr)
+                metric_matrix = object.instances.front()->get_transformation().get_matrix() * metric_matrix;
+            if (!initialize_generated_image_texture(*volume, sample_fallback_color, &generated_atlas, &metric_matrix))
+                continue;
         }
 
-        const VolumeColorSource rgba_source = build_volume_color_source(*volume, rgba_annotation);
-        const ManagedRegionColorSource region_source = use_color_region_source ? build_managed_region_color_source(*volume) :
-                                                                                  ManagedRegionColorSource();
+        if (use_region_overlay) {
+            const ColorRGBA background_color = managed_color_data_region_background_color(region_source, fallback_color);
+            if (!color_region_background_color)
+                color_region_background_color = background_color;
+            changed |= set_texture_mapping_background_config(volume->config, background_color);
+        }
+
+        const std::vector<uint8_t> preserved_texture_rgba = preserve_existing_image_pixels ?
+            std::vector<uint8_t>(volume->imported_texture_rgba.begin(), volume->imported_texture_rgba.end()) :
+            std::vector<uint8_t>();
+        if (preserve_existing_image_target)
+            changed |= fill_rgba_pixels(volume->imported_texture_rgba, sample_fallback_color);
+
+        const VolumeColorSource rgba_source = build_volume_color_source(*volume);
         for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
             const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
             if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
@@ -6399,12 +6769,12 @@ static bool convert_object_to_image_texture(ModelObject &object, const ManagedCo
                 Vec2f(uvs[1].x() * texture_width, uvs[1].y() * texture_height),
                 Vec2f(uvs[2].x() * texture_width, uvs[2].y() * texture_height)
             };
-            const int padding_px = std::max(generated_atlas.padding_px, 0);
+            const int padding_px = preserve_existing_image_target ? 2 : std::max(generated_atlas.padding_px, 0);
             int min_x = int(std::floor(std::min({ uvs[0].x(), uvs[1].x(), uvs[2].x() }) * texture_width)) - padding_px;
             int max_x = int(std::ceil(std::max({ uvs[0].x(), uvs[1].x(), uvs[2].x() }) * texture_width)) + padding_px;
             int min_y = int(std::floor(std::min({ uvs[0].y(), uvs[1].y(), uvs[2].y() }) * texture_height)) - padding_px;
             int max_y = int(std::ceil(std::max({ uvs[0].y(), uvs[1].y(), uvs[2].y() }) * texture_height)) + padding_px;
-            if (tri_idx < generated_atlas.island_by_triangle.size()) {
+            if (!preserve_existing_image_target && tri_idx < generated_atlas.island_by_triangle.size()) {
                 const int island_idx = generated_atlas.island_by_triangle[tri_idx];
                 if (island_idx >= 0 && size_t(island_idx) < generated_atlas.islands.size()) {
                     const GeneratedImageTextureIsland &island = generated_atlas.islands[size_t(island_idx)];
@@ -6414,33 +6784,58 @@ static bool convert_object_to_image_texture(ModelObject &object, const ManagedCo
                     max_y = std::clamp(max_y, island.y, island.y + island.rect_height - 1);
                 }
             }
+            if (preserve_existing_image_target &&
+                (max_x - min_x > int(volume->imported_texture_width) * 2 ||
+                 max_y - min_y > int(volume->imported_texture_height) * 2)) {
+                min_x = 0;
+                max_x = int(volume->imported_texture_width) - 1;
+                min_y = 0;
+                max_y = int(volume->imported_texture_height) - 1;
+            }
             for (int y_px = min_y; y_px <= max_y; ++y_px) {
                 for (int x_px = min_x; x_px <= max_x; ++x_px) {
                     Vec3f barycentric = Vec3f::Zero();
                     const Vec2f pixel(float(x_px) + 0.5f, float(y_px) + 0.5f);
-                    if (!barycentric_weights_2d(pixel, pixel_uvs[0], pixel_uvs[1], pixel_uvs[2], barycentric))
+                    if (!conservative_barycentric_weights_2d(pixel,
+                                                              pixel_uvs[0],
+                                                              pixel_uvs[1],
+                                                              pixel_uvs[2],
+                                                              float(padding_px) + 0.7072f,
+                                                              barycentric))
                         continue;
-                    if (barycentric.x() < -1e-4f || barycentric.y() < -1e-4f || barycentric.z() < -1e-4f)
-                        barycentric = normalized_nonnegative_barycentric(barycentric);
 
                     const Vec3f point = vertices[0] * barycentric.x() +
                                         vertices[1] * barycentric.y() +
                                         vertices[2] * barycentric.z();
-                    const ColorRGBA color = sample_managed_volume_color_source(*volume,
-                                                                               rgba_source,
-                                                                               region_source,
-                                                                               tri_idx,
-                                                                               point,
-                                                                               barycentric,
-                                                                               use_rgba_source,
-                                                                               source_flags.use_image_texture,
-                                                                               source_flags.use_vertex_colors,
-                                                                               use_color_region_source,
-                                                                               fallback_color);
+                    std::optional<ColorRGBA> overlay_color;
+                    if (use_region_overlay)
+                        overlay_color = sample_managed_region_overlay_color_source(region_source, int(tri_idx), point);
+
+                    const uint32_t write_x = preserve_existing_image_target ?
+                        wrapped_texture_pixel(x_px, volume->imported_texture_width) :
+                        uint32_t(x_px);
+                    const uint32_t write_y = preserve_existing_image_target ?
+                        wrapped_texture_pixel(y_px, volume->imported_texture_height) :
+                        uint32_t(y_px);
+                    const ColorRGBA color = overlay_color ?
+                        *overlay_color :
+                        (!preserved_texture_rgba.empty() ?
+                             read_rgba_pixel(preserved_texture_rgba, volume->imported_texture_width, write_x, write_y) :
+                             sample_managed_volume_color_source(*volume,
+                                                                rgba_source,
+                                                                region_source,
+                                                                tri_idx,
+                                                                point,
+                                                                barycentric,
+                                                                base_source_flags.use_rgba,
+                                                                base_source_flags.use_image_texture,
+                                                                base_source_flags.use_vertex_colors,
+                                                                false,
+                                                                sample_fallback_color));
                     write_rgba_pixel(volume->imported_texture_rgba,
                                      volume->imported_texture_width,
-                                     uint32_t(x_px),
-                                     uint32_t(y_px),
+                                     write_x,
+                                     write_y,
                                      color);
                 }
             }
@@ -6449,6 +6844,8 @@ static bool convert_object_to_image_texture(ModelObject &object, const ManagedCo
         refresh_imported_texture_storage(*volume);
         changed = true;
     }
+    if (color_region_background_color)
+        changed |= set_texture_mapping_background_config(object.config, *color_region_background_color);
     return changed;
 }
 
@@ -6644,6 +7041,7 @@ static bool convert_object_to_rgba_data(ModelObject &object, const ManagedColorD
     bool changed = false;
     const ManagedColorSourceFlags source_flags = managed_color_source_flags(source);
     const ColorRGBA fallback_color = blank_color_for_managed_target(ManagedColorDataType::RgbaData);
+    std::optional<ColorRGBA> color_region_background_color;
     for (ModelVolume *volume : object.volumes) {
         if (volume == nullptr || !volume->is_model_part())
             continue;
@@ -6652,9 +7050,23 @@ static bool convert_object_to_rgba_data(ModelObject &object, const ManagedColorD
         if (its.indices.empty() || its.vertices.empty())
             continue;
 
+        const bool use_region_overlay = source_flags.use_color_regions;
+        const ManagedColorSourceFlags base_source_flags = use_region_overlay ?
+            managed_target_or_highest_existing_color_source_flags(*volume, ManagedColorDataType::RgbaData) :
+            source_flags;
+        const ManagedRegionColorSource region_source = use_region_overlay ? build_managed_region_color_overlay_source(*volume) :
+                                                                            ManagedRegionColorSource();
+        const ColorRGBA sample_fallback_color = use_region_overlay ?
+            managed_color_data_region_background_color(region_source, fallback_color) :
+            fallback_color;
+        const ColorRGBA region_unpainted_color = use_region_overlay ?
+            managed_color_data_region_unpainted_color(region_source, fallback_color) :
+            fallback_color;
         std::unique_ptr<ColorFacetsAnnotation> rgb_data;
         bool sampled = false;
-        if (source_flags.use_color_regions && !volume->mmu_segmentation_facets.empty()) {
+        if (use_region_overlay &&
+            managed_color_source_flags_empty(base_source_flags) &&
+            !volume->mmu_segmentation_facets.empty()) {
             rgb_data = build_rgba_data_from_color_regions(*volume, fallback_color);
             sampled = rgb_data != nullptr && !rgb_data->empty();
         }
@@ -6665,50 +7077,102 @@ static bool convert_object_to_rgba_data(ModelObject &object, const ManagedColorD
                 continue;
 
             const VolumeColorSource rgba_source = build_volume_color_source(*volume);
-            const ManagedRegionColorSource region_source = build_managed_region_color_source(*volume);
-            TextureMappingColorSampler sampler = [volume, rgba_source, region_source, fallback_color, source_flags](
+            TextureMappingColorSampler sampler = [volume,
+                                                  rgba_source,
+                                                  region_source,
+                                                  sample_fallback_color,
+                                                  region_unpainted_color,
+                                                  source_flags,
+                                                  base_source_flags,
+                                                  use_region_overlay](
                                                      size_t tri_idx,
                                                      const Vec3f &point,
                                                      const Vec3f &barycentric) {
-                return pack_vertex_color_rgba(sample_managed_volume_color_source(*volume,
-                                                                                 rgba_source,
-                                                                                 region_source,
-                                                                                 tri_idx,
-                                                                                 point,
-                                                                                 barycentric,
-                                                                                 source_flags.use_rgba,
-                                                                                 source_flags.use_image_texture,
-                                                                                 source_flags.use_vertex_colors,
-                                                                                 source_flags.use_color_regions,
-                                                                                 fallback_color));
+                ColorRGBA color = sample_fallback_color;
+                if (use_region_overlay) {
+                    if (std::optional<ColorRGBA> overlay_color =
+                            sample_managed_region_rgba_overlay_color_source(region_source, int(tri_idx), point, region_unpainted_color)) {
+                        color = *overlay_color;
+                    } else {
+                        color = sample_managed_volume_color_source(*volume,
+                                                                   rgba_source,
+                                                                   region_source,
+                                                                   tri_idx,
+                                                                   point,
+                                                                   barycentric,
+                                                                   base_source_flags.use_rgba,
+                                                                   base_source_flags.use_image_texture,
+                                                                   base_source_flags.use_vertex_colors,
+                                                                   false,
+                                                                   sample_fallback_color);
+                    }
+                } else {
+                    color = sample_managed_volume_color_source(*volume,
+                                                               rgba_source,
+                                                               region_source,
+                                                               tri_idx,
+                                                               point,
+                                                               barycentric,
+                                                               source_flags.use_rgba,
+                                                               source_flags.use_image_texture,
+                                                               source_flags.use_vertex_colors,
+                                                               source_flags.use_color_regions,
+                                                               sample_fallback_color);
+                }
+                return pack_vertex_color_rgba(color);
             };
 
-            const bool has_image_texture_source = source_flags.use_image_texture && model_volume_has_bakeable_image_texture_data(volume);
+            const bool has_image_texture_source = base_source_flags.use_image_texture && model_volume_has_bakeable_image_texture_data(volume);
             const bool has_geometry_color_source =
-                (source_flags.use_vertex_colors && !volume->imported_vertex_colors_rgba.empty()) ||
-                (source_flags.use_color_regions && !volume->mmu_segmentation_facets.empty());
-            sampled = build_rgba_data_from_color_sampler(its,
-                                                         sampler,
-                                                         has_image_texture_source,
-                                                         has_geometry_color_source,
-                                                         [volume](size_t tri_idx) {
-                                                             return texture_triangle_uv_pixel_span(volume, tri_idx);
-                                                         },
-                                                         fallback_color,
-                                                         *rgb_data);
+                (base_source_flags.use_vertex_colors && !volume->imported_vertex_colors_rgba.empty()) ||
+                (use_region_overlay && !volume->mmu_segmentation_facets.empty());
+            if (use_region_overlay && base_source_flags.use_rgba && !volume->texture_mapping_color_facets.empty()) {
+                rgb_data->assign(volume->texture_mapping_color_facets);
+                std::vector<bool> resample_triangles = managed_region_overlay_source_triangles(region_source, its.indices.size());
+                const bool has_resample_triangle = std::find(resample_triangles.begin(), resample_triangles.end(), true) != resample_triangles.end();
+                if (has_resample_triangle) {
+                    const float target_edge = std::max(mesh_max_axis_span(its) / 160.f, 0.25f);
+                    TextureMappingColorSubdivisionDepths subdivision_depths =
+                        [target_edge](size_t, const std::array<Vec3f, 3> &vertices) {
+                            const int depth = texture_mapping_depth_from_span(triangle_max_edge_length(vertices), target_edge, 5);
+                            return std::make_pair(depth, depth);
+                        };
+                    sampled = rgb_data->set_from_triangle_sampler(its, sampler, 5, 0.025f, subdivision_depths, &resample_triangles);
+                } else {
+                    sampled = !rgb_data->empty();
+                }
+            } else {
+                sampled = build_rgba_data_from_color_sampler(its,
+                                                             sampler,
+                                                             has_image_texture_source,
+                                                             has_geometry_color_source,
+                                                             [volume](size_t tri_idx) {
+                                                                 return texture_triangle_uv_pixel_span(volume, tri_idx);
+                                                             },
+                                                             sample_fallback_color,
+                                                             *rgb_data);
+            }
         }
 
         if (!sampled && rgb_data->empty())
             continue;
         if (rgb_data->metadata_json().empty())
-            rgb_data->set_metadata_json(rgb_metadata_json(fallback_color));
+            rgb_data->set_metadata_json(rgb_metadata_json(sample_fallback_color));
         if (!replace_existing && volume->texture_mapping_color_facets.equals(*rgb_data))
             continue;
+        if (source_flags.use_color_regions) {
+            const ColorRGBA background_color = rgb_metadata_background_color(*rgb_data);
+            if (!color_region_background_color)
+                color_region_background_color = background_color;
+            changed |= set_texture_mapping_background_config(volume->config, background_color);
+        }
         volume->texture_mapping_color_facets.assign(*rgb_data);
         changed = true;
     }
 
     if (changed) {
+        if (color_region_background_color)
+            changed |= set_texture_mapping_background_config(object.config, *color_region_background_color);
         const unsigned int texture_mapping_filament_id = ensure_texture_mapping_zone();
         assign_texture_mapping_zone_preserving_painted_regions(object, texture_mapping_filament_id);
     }
@@ -8613,31 +9077,48 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
 
     ImGui::Separator();
 
-    const bool can_convert_regions_to_vertex_colors = selected_object_has_painted_regions();
+    const bool has_painted_regions = selected_object_has_painted_regions();
+    const bool has_image_texture_color_data = selected_object_has_imported_texture_data();
+    const bool has_rgba_color_data = selected_object_has_texture_mapping_color_data();
+    const bool can_convert_regions_to_vertex_colors =
+        has_painted_regions && !has_image_texture_color_data && !has_rgba_color_data;
+    const bool can_convert_regions_to_image_texture = has_painted_regions && !has_rgba_color_data;
+    const bool can_convert_regions_to_rgba_data = has_painted_regions;
+
     m_imgui->disabled_begin(!can_convert_regions_to_vertex_colors);
     if (m_imgui->button(_L("Convert regions to vertex colors")))
         convert_selected_regions_to_vertex_colors();
     if (ImGui::IsItemHovered()) {
         if (can_convert_regions_to_vertex_colors)
             m_imgui->tooltip(_L("Convert painted color regions into imported vertex color data, clear the regions, and assign a texture mapping zone."), max_tooltip_width);
-        else
+        else if (!has_painted_regions)
             m_imgui->tooltip(_L("This object does not have painted color regions."), max_tooltip_width);
+        else if (has_rgba_color_data)
+            m_imgui->tooltip(_L("This object already has RGBA data, which is shown before vertex colors."), max_tooltip_width);
+        else
+            m_imgui->tooltip(_L("This object already has image texture data, which is shown before vertex colors."), max_tooltip_width);
     }
+    m_imgui->disabled_end();
 
+    m_imgui->disabled_begin(!can_convert_regions_to_image_texture);
     if (m_imgui->button(_L("Convert regions to Image Texture")))
         convert_selected_regions_to_image_texture();
     if (ImGui::IsItemHovered()) {
-        if (can_convert_regions_to_vertex_colors)
+        if (can_convert_regions_to_image_texture)
             m_imgui->tooltip(_L("Convert painted color regions into image texture data, clear the regions, and assign a texture mapping zone."),
                              max_tooltip_width);
-        else
+        else if (!has_painted_regions)
             m_imgui->tooltip(_L("This object does not have painted color regions."), max_tooltip_width);
+        else
+            m_imgui->tooltip(_L("This object already has RGBA data, which is shown before image texture data."), max_tooltip_width);
     }
+    m_imgui->disabled_end();
 
+    m_imgui->disabled_begin(!can_convert_regions_to_rgba_data);
     if (m_imgui->button(_L("Convert regions to RGBA data")))
         convert_selected_regions_to_rgba_data();
     if (ImGui::IsItemHovered()) {
-        if (can_convert_regions_to_vertex_colors)
+        if (can_convert_regions_to_rgba_data)
             m_imgui->tooltip(_L("Convert painted color regions into RGBA data, clear the regions, and assign a texture mapping zone."),
                              max_tooltip_width);
         else
@@ -8646,7 +9127,7 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
     m_imgui->disabled_end();
 
     // "Convert vertex colors to regions (will erase painting)" button
-#if 1
+#if 0
     ImGui::Separator();
 
     const bool can_apply_stored_vertex_colors = selected_object_has_imported_vertex_colors();
@@ -9346,6 +9827,7 @@ void GLGizmoMmuSegmentation::finish_selected_regions_color_data_conversion(Model
     update_from_model_object();
     m_parent.update_volumes_colors_by_extruder();
     m_parent.set_as_dirty();
+    m_parent.request_extra_frame();
 
     const ModelObjectPtrs &objects = wxGetApp().model().objects;
     const size_t object_idx = size_t(std::find(objects.begin(), objects.end(), &object) - objects.begin());
@@ -9355,6 +9837,7 @@ void GLGizmoMmuSegmentation::finish_selected_regions_color_data_conversion(Model
         wxGetApp().plater()->get_partplate_list().notify_instance_update(object_idx, 0);
     }
     m_parent.post_event(SimpleEvent(EVT_GLCANVAS_SCHEDULE_BACKGROUND_PROCESS));
+    m_parent.render();
 }
 
 void GLGizmoMmuSegmentation::clear_selected_object_image_texture_data()

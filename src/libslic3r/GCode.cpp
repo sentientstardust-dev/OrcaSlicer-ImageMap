@@ -7867,7 +7867,11 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
         if (!volume->texture_mapping_color_facets.empty()) {
             std::vector<ColorFacetTriangle> color_facets;
             volume->texture_mapping_color_facets.get_facet_triangles(*volume, color_facets);
+            std::vector<uint8_t> rgba_source_triangles(its.indices.size(), 0);
             for (const ColorFacetTriangle &facet : color_facets) {
+                if (facet.source_triangle >= 0 && size_t(facet.source_triangle) < rgba_source_triangles.size())
+                    rgba_source_triangles[size_t(facet.source_triangle)] = 1;
+
                 const Vec3d p0 = volume_trafo * facet.vertices[0].cast<double>();
                 const Vec3d p1 = volume_trafo * facet.vertices[1].cast<double>();
                 const Vec3d p2 = volume_trafo * facet.vertices[2].cast<double>();
@@ -7877,6 +7881,26 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                 std::array<float, 4> rgba = composite_rgba_over_background_for_gcode(unpack_rgba_u32(facet.rgba), background_color);
 
                 accumulate_constant_surface_triangle_samples(p0, p1, p2, rgba);
+            }
+            for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+                if (tri_idx < rgba_source_triangles.size() && rgba_source_triangles[tri_idx] != 0)
+                    continue;
+
+                const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
+                if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
+                    continue;
+                if (size_t(tri[0]) >= its.vertices.size() ||
+                    size_t(tri[1]) >= its.vertices.size() ||
+                    size_t(tri[2]) >= its.vertices.size())
+                    continue;
+
+                const Vec3d p0 = volume_trafo * its.vertices[size_t(tri[0])].cast<double>();
+                const Vec3d p1 = volume_trafo * its.vertices[size_t(tri[1])].cast<double>();
+                const Vec3d p2 = volume_trafo * its.vertices[size_t(tri[2])].cast<double>();
+                if (!p0.allFinite() || !p1.allFinite() || !p2.allFinite())
+                    continue;
+
+                accumulate_constant_surface_triangle_samples(p0, p1, p2, background_color);
             }
             continue;
         }
