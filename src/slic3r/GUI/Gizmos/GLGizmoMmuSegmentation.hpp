@@ -174,6 +174,9 @@ private:
     void convert_selected_object_vertex_colors_to_texture_mapping_colors();
     void convert_selected_object_image_texture_to_texture_mapping_colors();
     void convert_selected_regions_to_vertex_colors();
+    void convert_selected_regions_to_image_texture();
+    void convert_selected_regions_to_rgba_data();
+    void finish_selected_regions_color_data_conversion(ModelObject &object);
     void clear_selected_object_image_texture_data();
     void clear_selected_object_texture_mapping_color_data();
 

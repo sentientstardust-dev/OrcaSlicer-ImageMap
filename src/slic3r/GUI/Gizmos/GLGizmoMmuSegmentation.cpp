@@ -4592,6 +4592,7 @@ enum class ManagedColorDataPreviewKind
 struct ManagedColorDataCreateSource
 {
     std::optional<ManagedColorDataType> type;
+    bool                                erase_color_regions = false;
 };
 
 struct ManagedColorDataSummary
@@ -4938,6 +4939,29 @@ static bool assign_non_region_color_data_to_image_texture_zone(ModelObject &obje
         if (model_volume_has_non_region_color_data(volume))
             volume->config.set("extruder", int(texture_mapping_filament_id));
     return true;
+}
+
+static bool erase_color_regions_and_assign_texture_mapping_zone(ModelObject &object)
+{
+    bool changed = false;
+    for (ModelVolume *volume : object.volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+        if (!volume->mmu_segmentation_facets.empty()) {
+            volume->mmu_segmentation_facets.reset();
+            changed = true;
+        }
+    }
+
+    const unsigned int texture_mapping_filament_id = ensure_texture_mapping_zone();
+    if (texture_mapping_filament_id != 0) {
+        object.config.set("extruder", int(texture_mapping_filament_id));
+        for (ModelVolume *volume : object.volumes)
+            if (volume != nullptr && volume->is_model_part())
+                volume->config.set("extruder", int(texture_mapping_filament_id));
+        changed = true;
+    }
+    return changed;
 }
 
 static unsigned int painted_image_texture_zone_id_for_projection(const ModelObject &object)
@@ -5906,9 +5930,9 @@ static bool convert_object_to_vertex_colors(ModelObject &object, const ManagedCo
     return changed;
 }
 
-static bool convert_object_to_image_texture(ModelObject &object, const ManagedColorDataCreateSource &source)
+static bool convert_object_to_image_texture(ModelObject &object, const ManagedColorDataCreateSource &source, bool replace_existing = false)
 {
-    if (object_has_image_texture_data(object))
+    if (!replace_existing && object_has_image_texture_data(object))
         return false;
 
     bool changed = false;
@@ -6215,9 +6239,9 @@ static bool regenerate_object_image_texture_uv_maps(ModelObject &object)
     return changed;
 }
 
-static bool convert_object_to_rgba_data(ModelObject &object, const ManagedColorDataCreateSource &source)
+static bool convert_object_to_rgba_data(ModelObject &object, const ManagedColorDataCreateSource &source, bool replace_existing = false)
 {
-    if (object_has_rgba_data(object))
+    if (!replace_existing && object_has_rgba_data(object))
         return false;
 
     bool changed = false;
@@ -6287,7 +6311,7 @@ static bool convert_object_to_rgba_data(ModelObject &object, const ManagedColorD
             continue;
         if (rgb_data->metadata_json().empty())
             rgb_data->set_metadata_json(rgb_metadata_json(fallback_color));
-        if (volume->texture_mapping_color_facets.equals(*rgb_data))
+        if (!replace_existing && volume->texture_mapping_color_facets.equals(*rgb_data))
             continue;
         volume->texture_mapping_color_facets.assign(*rgb_data);
         changed = true;
@@ -6941,6 +6965,9 @@ private:
                 continue;
             add_item(managed_color_data_type_label(source_type),
                      ManagedColorDataCreateSource{ std::optional<ManagedColorDataType>(source_type) });
+            if (source_type == ManagedColorDataType::ColorRegions && type != ManagedColorDataType::ColorRegions)
+                add_item(_L("3mf color regions (erase regions)"),
+                         ManagedColorDataCreateSource{ std::optional<ManagedColorDataType>(source_type), true });
             added_data_source = true;
         }
         if (added_data_source)
@@ -7082,6 +7109,8 @@ private:
         Plater::TakeSnapshot snapshot(wxGetApp().plater(), create_snapshot_name(type), UndoRedo::SnapshotType::GizmoAction);
         if (!convert_object_managed_color_data(*m_object, type, source))
             return;
+        if (source.erase_color_regions)
+            erase_color_regions_and_assign_texture_mapping_zone(*m_object);
 
         refresh_object_after_change();
         refresh_rows();
@@ -7852,8 +7881,30 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
         else
             m_imgui->tooltip(_L("This object does not have painted color regions."), max_tooltip_width);
     }
+
+    if (m_imgui->button(_L("Convert regions to Image Texture")))
+        convert_selected_regions_to_image_texture();
+    if (ImGui::IsItemHovered()) {
+        if (can_convert_regions_to_vertex_colors)
+            m_imgui->tooltip(_L("Convert painted color regions into image texture data, clear the regions, and assign a texture mapping zone."),
+                             max_tooltip_width);
+        else
+            m_imgui->tooltip(_L("This object does not have painted color regions."), max_tooltip_width);
+    }
+
+    if (m_imgui->button(_L("Convert regions to RGBA data")))
+        convert_selected_regions_to_rgba_data();
+    if (ImGui::IsItemHovered()) {
+        if (can_convert_regions_to_vertex_colors)
+            m_imgui->tooltip(_L("Convert painted color regions into RGBA data, clear the regions, and assign a texture mapping zone."),
+                             max_tooltip_width);
+        else
+            m_imgui->tooltip(_L("This object does not have painted color regions."), max_tooltip_width);
+    }
     m_imgui->disabled_end();
 
+    // "Convert vertex colors to regions (will erase painting)" button
+#if 1
     ImGui::Separator();
 
     const bool can_apply_stored_vertex_colors = selected_object_has_imported_vertex_colors();
@@ -7869,6 +7920,7 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
     m_imgui->disabled_end();
 
     ImGui::Separator();
+#endif
 
 
     if (m_imgui->button(m_desc.at("perform_remap"))) {
@@ -8652,6 +8704,69 @@ void GLGizmoMmuSegmentation::convert_selected_regions_to_vertex_colors()
     const ModelObjectPtrs &objects = wxGetApp().model().objects;
     const size_t object_idx = size_t(std::find(objects.begin(), objects.end(), object) - objects.begin());
     if (object_idx < objects.size()) {
+        wxGetApp().obj_list()->update_info_items(object_idx);
+        wxGetApp().plater()->get_partplate_list().notify_instance_update(object_idx, 0);
+    }
+    m_parent.post_event(SimpleEvent(EVT_GLCANVAS_SCHEDULE_BACKGROUND_PROCESS));
+}
+
+void GLGizmoMmuSegmentation::convert_selected_regions_to_image_texture()
+{
+    ModelObject *object = m_c->selection_info()->model_object();
+    if (object == nullptr || m_triangle_selectors.empty() || !selected_object_has_painted_regions())
+        return;
+
+    Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Convert regions to image texture", UndoRedo::SnapshotType::GizmoAction);
+    update_model_object();
+
+    ManagedColorDataCreateSource source{ std::optional<ManagedColorDataType>(ManagedColorDataType::ColorRegions) };
+    if (!convert_object_to_image_texture(*object, source, true))
+        return;
+
+    finish_selected_regions_color_data_conversion(*object);
+}
+
+void GLGizmoMmuSegmentation::convert_selected_regions_to_rgba_data()
+{
+    ModelObject *object = m_c->selection_info()->model_object();
+    if (object == nullptr || m_triangle_selectors.empty() || !selected_object_has_painted_regions())
+        return;
+
+    Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Convert regions to RGBA data", UndoRedo::SnapshotType::GizmoAction);
+    update_model_object();
+
+    ManagedColorDataCreateSource source{ std::optional<ManagedColorDataType>(ManagedColorDataType::ColorRegions) };
+    if (!convert_object_to_rgba_data(*object, source, true))
+        return;
+
+    finish_selected_regions_color_data_conversion(*object);
+}
+
+void GLGizmoMmuSegmentation::finish_selected_regions_color_data_conversion(ModelObject &object)
+{
+    int selector_idx = -1;
+    for (ModelVolume *volume : object.volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+
+        ++selector_idx;
+        if (selector_idx >= 0 &&
+            size_t(selector_idx) < m_triangle_selectors.size() &&
+            m_triangle_selectors[size_t(selector_idx)] != nullptr) {
+            m_triangle_selectors[size_t(selector_idx)]->reset();
+            m_triangle_selectors[size_t(selector_idx)]->request_update_render_data(true);
+        }
+    }
+    erase_color_regions_and_assign_texture_mapping_zone(object);
+
+    update_from_model_object();
+    m_parent.update_volumes_colors_by_extruder();
+    m_parent.set_as_dirty();
+
+    const ModelObjectPtrs &objects = wxGetApp().model().objects;
+    const size_t object_idx = size_t(std::find(objects.begin(), objects.end(), &object) - objects.begin());
+    if (object_idx < objects.size()) {
+        m_parent.invalidate_texture_mapping_preview_for_object(object_idx);
         wxGetApp().obj_list()->update_info_items(object_idx);
         wxGetApp().plater()->get_partplate_list().notify_instance_update(object_idx, 0);
     }
