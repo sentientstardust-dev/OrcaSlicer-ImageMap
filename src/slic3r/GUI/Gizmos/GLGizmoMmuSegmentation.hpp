@@ -24,6 +24,7 @@ class ModelVolume;
 namespace Slic3r::GUI {
 
 class GLCanvas3D;
+struct TextureMappingBackgroundConfigSnapshot;
 
 void open_color_data_management_dialog(wxWindow *parent, GLCanvas3D &canvas, ModelObject *object, std::function<void()> on_object_changed = {});
 
@@ -308,6 +309,8 @@ private:
     void sync_filament_mix_from_rgb();
     void sync_rgb_from_filament_mix();
     void sync_active_color_mode_from_rgb(bool update_filament_mix);
+    bool render_color_input_mode_combo();
+    bool render_brush_color_picker(const char *id);
     bool render_rgb_picker(float item_width);
     bool render_cmy_picker(float item_width);
     bool render_cmyk_picker(float item_width);
@@ -318,6 +321,9 @@ private:
     bool render_rgbkw_picker(float item_width);
     bool render_bw_picker(float item_width);
     bool render_filament_colors_picker(float item_width);
+    void render_background_color_picker(float max_tooltip_width);
+    void clear_selected_object_background_color();
+    void refresh_selected_object_after_background_color_change(ModelObject *object);
 
     std::array<float, 4> m_rgb_color { 0.f, 0.f, 0.f, 1.f };
     std::array<float, 3> m_cmy_color { 1.f, 1.f, 1.f };
@@ -344,6 +350,7 @@ private:
     std::vector<std::vector<Vec3f>> m_brush_stroke_points_by_volume;
     std::vector<ObjectID> m_preview_rgb_data_volume_ids;
     std::vector<std::unique_ptr<ColorFacetsAnnotation>> m_preview_rgb_data_by_volume;
+    std::unique_ptr<TextureMappingBackgroundConfigSnapshot> m_background_color_edit_config_snapshot;
     struct RgbDataConversionState;
     std::shared_ptr<RgbDataConversionState> m_rgb_data_conversion_state;
     std::thread          m_rgb_data_conversion_thread;

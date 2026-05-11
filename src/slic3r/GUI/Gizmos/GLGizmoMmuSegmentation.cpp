@@ -42,11 +42,12 @@
 #include <boost/log/trivial.hpp>
 #include <nlohmann/json.hpp>
 #include <wx/button.h>
-#include <wx/clrpicker.h>
+#include <wx/colordlg.h>
 #include <wx/dialog.h>
 #include <wx/filedlg.h>
 #include <wx/image.h>
 #include <wx/menu.h>
+#include <wx/panel.h>
 #include <wx/sizer.h>
 #include <wx/spinctrl.h>
 #include <wx/statline.h>
@@ -1133,6 +1134,90 @@ static ColorRGBA color_rgba_from_wx_colour(const wxColour &color)
                      float(color.Green()) / 255.f,
                      float(color.Blue()) / 255.f,
                      1.f);
+}
+
+static bool show_background_color_dialog(wxWindow *parent,
+                                         const wxColour &initial_color,
+                                         wxColour &selected_color)
+{
+    wxColourData color_data;
+    color_data.SetChooseFull(false);
+    color_data.SetColour(initial_color);
+    wxColourDialog dialog(parent, &color_data);
+    dialog.SetTitle(_L("Background color"));
+    const wxSize compact_size(parent != nullptr ? parent->FromDIP(420) : 420,
+                              parent != nullptr ? parent->FromDIP(360) : 360);
+    dialog.SetInitialSize(compact_size);
+    dialog.SetSize(compact_size);
+    dialog.CenterOnParent();
+
+    if (dialog.ShowModal() != wxID_OK)
+        return false;
+
+    selected_color = dialog.GetColourData().GetColour();
+    return selected_color.IsOk();
+}
+
+struct TextureMappingBackgroundConfigState
+{
+    bool        has = false;
+    std::string value;
+};
+
+struct TextureMappingBackgroundConfigSnapshot
+{
+    TextureMappingBackgroundConfigState object;
+    std::vector<std::pair<ModelVolume *, TextureMappingBackgroundConfigState>> volumes;
+};
+
+static TextureMappingBackgroundConfigState texture_mapping_background_config_state(const ModelConfigObject &config)
+{
+    TextureMappingBackgroundConfigState state;
+    if (!config.has("texture_mapping_background_color"))
+        return state;
+    const ConfigOptionString *opt = dynamic_cast<const ConfigOptionString *>(config.option("texture_mapping_background_color"));
+    if (opt == nullptr)
+        return state;
+    state.has = true;
+    state.value = opt->value;
+    return state;
+}
+
+static TextureMappingBackgroundConfigSnapshot snapshot_texture_mapping_background_config(ModelObject &object)
+{
+    TextureMappingBackgroundConfigSnapshot snapshot;
+    snapshot.object = texture_mapping_background_config_state(object.config);
+    snapshot.volumes.reserve(object.volumes.size());
+    for (ModelVolume *volume : object.volumes)
+        if (volume != nullptr && volume->is_model_part())
+            snapshot.volumes.emplace_back(volume, texture_mapping_background_config_state(volume->config));
+    return snapshot;
+}
+
+static void restore_texture_mapping_background_config(ModelObject &object, const TextureMappingBackgroundConfigSnapshot &snapshot)
+{
+    if (snapshot.object.has)
+        object.config.set("texture_mapping_background_color", snapshot.object.value);
+    else
+        clear_texture_mapping_background_config(object.config);
+
+    for (const auto &volume_state : snapshot.volumes) {
+        ModelVolume *volume = volume_state.first;
+        if (volume == nullptr)
+            continue;
+        if (volume_state.second.has)
+            volume->config.set("texture_mapping_background_color", volume_state.second.value);
+        else
+            clear_texture_mapping_background_config(volume->config);
+    }
+}
+
+static void preview_texture_mapping_background_config(ModelObject &object, const ColorRGBA &color)
+{
+    set_texture_mapping_background_config(object.config, color);
+    for (ModelVolume *volume : object.volumes)
+        if (volume != nullptr && volume->is_model_part())
+            set_texture_mapping_background_config(volume->config, color);
 }
 
 static ColorRGBA managed_color_data_background_color(const ModelObject *object)
@@ -7625,9 +7710,13 @@ public:
         wxBoxSizer *main_sizer = new wxBoxSizer(wxVERTICAL);
         wxBoxSizer *background_sizer = new wxBoxSizer(wxHORIZONTAL);
         background_sizer->Add(new wxStaticText(this, wxID_ANY, _L("Background color")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
-        m_background_picker = new wxColourPickerCtrl(this,
-                                                     wxID_ANY,
-                                                     wx_colour_from_color_rgba(managed_color_data_background_color(m_object)));
+        m_background_picker = new wxPanel(this,
+                                          wxID_ANY,
+                                          wxDefaultPosition,
+                                          wxSize(FromDIP(38), FromDIP(24)),
+                                          wxBORDER_SIMPLE);
+        m_background_picker->SetMinSize(wxSize(FromDIP(38), FromDIP(24)));
+        m_background_picker->SetToolTip(_L("Background color"));
         background_sizer->Add(m_background_picker, 0, wxALIGN_CENTER_VERTICAL);
         m_background_clear = new wxButton(this, wxID_ANY, _L("Clear"));
         background_sizer->Add(m_background_clear, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(8));
@@ -7665,9 +7754,7 @@ public:
         CenterOnParent();
 
         Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { EndModal(wxID_CLOSE); }, wxID_CLOSE);
-        m_background_picker->Bind(wxEVT_COLOURPICKER_CHANGED, [this](wxColourPickerEvent &event) {
-            set_background_color(event.GetColour());
-        });
+        m_background_picker->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent &) { pick_background_color(); });
         m_background_clear->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { clear_background_color(); });
     }
 
@@ -7773,8 +7860,10 @@ private:
 
     void refresh_background_controls()
     {
-        if (m_background_picker != nullptr)
-            m_background_picker->SetColour(wx_colour_from_color_rgba(managed_color_data_background_color(m_object)));
+        if (m_background_picker != nullptr) {
+            m_background_picker->SetBackgroundColour(wx_colour_from_color_rgba(managed_color_data_background_color(m_object)));
+            m_background_picker->Refresh();
+        }
         if (m_background_clear != nullptr)
             m_background_clear->Enable(managed_color_data_has_background_color(m_object));
     }
@@ -7971,6 +8060,18 @@ private:
         refresh_rows();
     }
 
+    void pick_background_color()
+    {
+        if (m_object == nullptr)
+            return;
+
+        wxColour color;
+        if (!show_background_color_dialog(this, wx_colour_from_color_rgba(managed_color_data_background_color(m_object)), color))
+            return;
+
+        set_background_color(color);
+    }
+
     void set_background_color(const wxColour &color)
     {
         if (m_object == nullptr || !color.IsOk())
@@ -8049,7 +8150,7 @@ private:
     GLCanvas3D        &m_canvas;
     ModelObject       *m_object = nullptr;
     std::function<void()> m_on_object_changed;
-    wxColourPickerCtrl *m_background_picker = nullptr;
+    wxPanel          *m_background_picker = nullptr;
     wxButton          *m_background_clear = nullptr;
     std::vector<Row>   m_rows;
     std::vector<wxWindow *> m_raw_image_texture_info_windows;
@@ -9993,6 +10094,7 @@ void GLGizmoTrueColorPainting::on_shutdown()
     m_preview_rgb_data_volume_ids.clear();
     m_preview_rgb_data_by_volume.clear();
     m_color_picker_source_cache.clear();
+    m_background_color_edit_config_snapshot.reset();
     m_parent.use_slope(false);
     m_parent.toggle_model_objects_visibility(true);
 }
@@ -10082,13 +10184,11 @@ bool GLGizmoTrueColorPainting::gizmo_event(SLAGizmoEventType action,
 
     if (m_color_picker_active) {
         if (action == SLAGizmoEventType::LeftDown) {
-            if (pick_color_from_model(mouse_position))
-                m_color_picker_active = false;
+            pick_color_from_model(mouse_position);
             m_parent.set_as_dirty();
             return true;
         }
         if (action == SLAGizmoEventType::RightDown) {
-            m_color_picker_active = false;
             m_parent.set_as_dirty();
             return true;
         }
@@ -10553,6 +10653,7 @@ void GLGizmoTrueColorPainting::update_selected_object_color_state()
         m_preview_rgb_data_volume_ids.clear();
         m_preview_rgb_data_by_volume.clear();
         m_color_picker_source_cache.clear();
+        m_background_color_edit_config_snapshot.reset();
     }
     if (object == nullptr)
         return;
@@ -10800,9 +10901,9 @@ bool GLGizmoTrueColorPainting::sample_color_from_model(const Vec2d &mouse_positi
                                                                        source.rgb_by_source_triangle,
                                                                        int(tri_idx),
                                                                        hit)) {
-            color = *sampled;
+            color = sampled->a() <= EPSILON ? managed_color_data_background_color(object) : *sampled;
         } else {
-            color = rgb_metadata_background_color(volume->texture_mapping_color_facets);
+            color = managed_color_data_background_color(object);
         }
         return true;
     }
@@ -11137,14 +11238,57 @@ void GLGizmoTrueColorPainting::sync_active_color_mode_from_rgb(bool update_filam
     }
 }
 
+bool GLGizmoTrueColorPainting::render_brush_color_picker(const char *id)
+{
+    m_imgui->text(_L("Brush color:"));
+    ImGui::SameLine();
+    ImGuiColorEditFlags flags = ImGuiColorEditFlags_DisplayRGB |
+                                ImGuiColorEditFlags_InputRGB |
+                                ImGuiColorEditFlags_NoInputs;
+    return ImGui::ColorEdit3(id, m_rgb_color.data(), flags);
+}
+
+bool GLGizmoTrueColorPainting::render_color_input_mode_combo()
+{
+    const char *mode_labels[] = {
+        "Filament colors",
+        "RGB",
+        "CMY",
+        "CMYK",
+        "CMYW",
+        "RGBK",
+        "RGBW",
+        "BW",
+        "CMYKW",
+        "RGBKW"
+    };
+    const int mode_count = int(sizeof(mode_labels) / sizeof(mode_labels[0]));
+    int mode = std::clamp(int(m_color_input_mode), 0, mode_count - 1);
+    bool changed = false;
+    if (ImGui::BeginCombo("##true_color_mode", mode_labels[mode])) {
+        for (int idx = 0; idx < mode_count; ++idx) {
+            const bool selected = idx == mode;
+            if (ImGui::Selectable(mode_labels[idx], selected)) {
+                mode = idx;
+                m_color_input_mode = ColorInputMode(mode);
+                sync_active_color_mode_from_rgb(true);
+                update_triangle_selectors_color();
+                changed = true;
+            }
+            if (selected)
+                ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    return changed;
+}
+
 bool GLGizmoTrueColorPainting::render_rgb_picker(float item_width)
 {
     bool changed = false;
     ImGui::PushItemWidth(item_width);
-    ImGuiColorEditFlags flags = ImGuiColorEditFlags_DisplayRGB |
-                                ImGuiColorEditFlags_InputRGB |
-                                ImGuiColorEditFlags_NoInputs;
-    changed |= ImGui::ColorEdit3("##true_color_rgb_visual", m_rgb_color.data(), flags);
+    changed |= render_brush_color_picker("##true_color_rgb_visual");
+    render_color_input_mode_combo();
     changed |= ImGui::SliderFloat("Red", &m_rgb_color[0], 0.f, 1.f, "%.2f");
     changed |= ImGui::SliderFloat("Green", &m_rgb_color[1], 0.f, 1.f, "%.2f");
     changed |= ImGui::SliderFloat("Blue", &m_rgb_color[2], 0.f, 1.f, "%.2f");
@@ -11156,13 +11300,11 @@ bool GLGizmoTrueColorPainting::render_cmy_picker(float item_width)
 {
     bool changed = false;
     ImGui::PushItemWidth(item_width);
-    ImGuiColorEditFlags flags = ImGuiColorEditFlags_DisplayRGB |
-                                ImGuiColorEditFlags_InputRGB |
-                                ImGuiColorEditFlags_NoInputs;
-    if (ImGui::ColorEdit3("##true_color_cmy_visual", m_rgb_color.data(), flags)) {
+    if (render_brush_color_picker("##true_color_cmy_visual")) {
         sync_cmy_from_rgb();
         changed = true;
     }
+    render_color_input_mode_combo();
 
     bool cmy_changed = false;
     cmy_changed |= ImGui::SliderFloat("Cyan", &m_cmy_color[0], 0.f, 1.f, "%.2f");
@@ -11181,13 +11323,11 @@ bool GLGizmoTrueColorPainting::render_cmyk_picker(float item_width)
 {
     bool changed = false;
     ImGui::PushItemWidth(item_width);
-    ImGuiColorEditFlags flags = ImGuiColorEditFlags_DisplayRGB |
-                                ImGuiColorEditFlags_InputRGB |
-                                ImGuiColorEditFlags_NoInputs;
-    if (ImGui::ColorEdit3("##true_color_cmyk_visual", m_rgb_color.data(), flags)) {
+    if (render_brush_color_picker("##true_color_cmyk_visual")) {
         sync_cmyk_from_rgb();
         changed = true;
     }
+    render_color_input_mode_combo();
 
     bool cmyk_changed = false;
     cmyk_changed |= ImGui::SliderFloat("Cyan", &m_cmyk_color[0], 0.f, 1.f, "%.2f");
@@ -11207,13 +11347,11 @@ bool GLGizmoTrueColorPainting::render_cmyw_picker(float item_width)
 {
     bool changed = false;
     ImGui::PushItemWidth(item_width);
-    ImGuiColorEditFlags flags = ImGuiColorEditFlags_DisplayRGB |
-                                ImGuiColorEditFlags_InputRGB |
-                                ImGuiColorEditFlags_NoInputs;
-    if (ImGui::ColorEdit3("##true_color_cmyw_visual", m_rgb_color.data(), flags)) {
+    if (render_brush_color_picker("##true_color_cmyw_visual")) {
         sync_cmyw_from_rgb();
         changed = true;
     }
+    render_color_input_mode_combo();
 
     bool cmyw_changed = false;
     cmyw_changed |= ImGui::SliderFloat("Cyan", &m_cmyw_color[0], 0.f, 1.f, "%.2f");
@@ -11233,13 +11371,11 @@ bool GLGizmoTrueColorPainting::render_rgbk_picker(float item_width)
 {
     bool changed = false;
     ImGui::PushItemWidth(item_width);
-    ImGuiColorEditFlags flags = ImGuiColorEditFlags_DisplayRGB |
-                                ImGuiColorEditFlags_InputRGB |
-                                ImGuiColorEditFlags_NoInputs;
-    if (ImGui::ColorEdit3("##true_color_rgbk_visual", m_rgb_color.data(), flags)) {
+    if (render_brush_color_picker("##true_color_rgbk_visual")) {
         sync_rgbk_from_rgb();
         changed = true;
     }
+    render_color_input_mode_combo();
 
     bool rgbk_changed = false;
     rgbk_changed |= ImGui::SliderFloat("Red", &m_rgbk_color[0], 0.f, 1.f, "%.2f");
@@ -11259,13 +11395,11 @@ bool GLGizmoTrueColorPainting::render_rgbw_picker(float item_width)
 {
     bool changed = false;
     ImGui::PushItemWidth(item_width);
-    ImGuiColorEditFlags flags = ImGuiColorEditFlags_DisplayRGB |
-                                ImGuiColorEditFlags_InputRGB |
-                                ImGuiColorEditFlags_NoInputs;
-    if (ImGui::ColorEdit3("##true_color_rgbw_visual", m_rgb_color.data(), flags)) {
+    if (render_brush_color_picker("##true_color_rgbw_visual")) {
         sync_rgbw_from_rgb();
         changed = true;
     }
+    render_color_input_mode_combo();
 
     bool rgbw_changed = false;
     rgbw_changed |= ImGui::SliderFloat("Red", &m_rgbw_color[0], 0.f, 1.f, "%.2f");
@@ -11285,13 +11419,11 @@ bool GLGizmoTrueColorPainting::render_cmykw_picker(float item_width)
 {
     bool changed = false;
     ImGui::PushItemWidth(item_width);
-    ImGuiColorEditFlags flags = ImGuiColorEditFlags_DisplayRGB |
-                                ImGuiColorEditFlags_InputRGB |
-                                ImGuiColorEditFlags_NoInputs;
-    if (ImGui::ColorEdit3("##true_color_cmykw_visual", m_rgb_color.data(), flags)) {
+    if (render_brush_color_picker("##true_color_cmykw_visual")) {
         sync_cmykw_from_rgb();
         changed = true;
     }
+    render_color_input_mode_combo();
 
     bool cmykw_changed = false;
     cmykw_changed |= ImGui::SliderFloat("Cyan", &m_cmykw_color[0], 0.f, 1.f, "%.2f");
@@ -11312,13 +11444,11 @@ bool GLGizmoTrueColorPainting::render_rgbkw_picker(float item_width)
 {
     bool changed = false;
     ImGui::PushItemWidth(item_width);
-    ImGuiColorEditFlags flags = ImGuiColorEditFlags_DisplayRGB |
-                                ImGuiColorEditFlags_InputRGB |
-                                ImGuiColorEditFlags_NoInputs;
-    if (ImGui::ColorEdit3("##true_color_rgbkw_visual", m_rgb_color.data(), flags)) {
+    if (render_brush_color_picker("##true_color_rgbkw_visual")) {
         sync_rgbkw_from_rgb();
         changed = true;
     }
+    render_color_input_mode_combo();
 
     bool rgbkw_changed = false;
     rgbkw_changed |= ImGui::SliderFloat("Red", &m_rgbkw_color[0], 0.f, 1.f, "%.2f");
@@ -11339,13 +11469,11 @@ bool GLGizmoTrueColorPainting::render_bw_picker(float item_width)
 {
     bool changed = false;
     ImGui::PushItemWidth(item_width);
-    ImGuiColorEditFlags flags = ImGuiColorEditFlags_DisplayRGB |
-                                ImGuiColorEditFlags_InputRGB |
-                                ImGuiColorEditFlags_NoInputs;
-    if (ImGui::ColorEdit3("##true_color_bw_visual", m_rgb_color.data(), flags)) {
+    if (render_brush_color_picker("##true_color_bw_visual")) {
         sync_bw_from_rgb();
         changed = true;
     }
+    render_color_input_mode_combo();
 
     float value = std::clamp(m_bw_color[1], 0.f, 1.f);
     const bool slider_changed = ImGui::SliderFloat("Black / White", &value, 0.f, 1.f, "%.2f");
@@ -11370,13 +11498,11 @@ bool GLGizmoTrueColorPainting::render_filament_colors_picker(float item_width)
 
     bool changed = false;
     ImGui::PushItemWidth(item_width);
-    ImGuiColorEditFlags flags = ImGuiColorEditFlags_DisplayRGB |
-                                ImGuiColorEditFlags_InputRGB |
-                                ImGuiColorEditFlags_NoInputs;
-    if (ImGui::ColorEdit3("##true_color_filament_visual", m_rgb_color.data(), flags))
+    if (render_brush_color_picker("##true_color_filament_visual"))
         changed = true;
     if (ImGui::IsItemDeactivatedAfterEdit())
         sync_filament_mix_from_rgb();
+    render_color_input_mode_combo();
 
     bool mix_changed = false;
     const float swatch_size = ImGui::GetFrameHeight();
@@ -11425,6 +11551,84 @@ bool GLGizmoTrueColorPainting::render_filament_colors_picker(float item_width)
     return changed;
 }
 
+void GLGizmoTrueColorPainting::render_background_color_picker(float max_tooltip_width)
+{
+    ModelObject *object = selected_model_object();
+    if (object == nullptr)
+        return;
+
+    m_imgui->text(_L("Background color"));
+    ImGui::SameLine();
+    const ColorRGBA background = managed_color_data_background_color(object);
+    float background_vec[3] = {
+        std::clamp(background.r(), 0.f, 1.f),
+        std::clamp(background.g(), 0.f, 1.f),
+        std::clamp(background.b(), 0.f, 1.f)
+    };
+    ImGuiColorEditFlags flags = ImGuiColorEditFlags_DisplayRGB |
+                                ImGuiColorEditFlags_InputRGB |
+                                ImGuiColorEditFlags_NoInputs;
+    ImGui::PushItemWidth(m_imgui->scaled(8.f));
+    const bool changed = ImGui::ColorEdit3("##true_color_background_color", background_vec, flags);
+    ImGui::PopItemWidth();
+    if (changed) {
+        if (!m_background_color_edit_config_snapshot) {
+            Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Set color data background", UndoRedo::SnapshotType::GizmoAction);
+            m_background_color_edit_config_snapshot =
+                std::make_unique<TextureMappingBackgroundConfigSnapshot>(snapshot_texture_mapping_background_config(*object));
+        }
+        preview_texture_mapping_background_config(*object, ColorRGBA(background_vec[0], background_vec[1], background_vec[2], 1.f));
+        refresh_managed_color_data_object(m_parent, object);
+        m_parent.render();
+    }
+    if (ImGui::IsItemHovered())
+        m_imgui->tooltip(_L("Background color"), max_tooltip_width);
+
+    if (ImGui::IsItemDeactivatedAfterEdit() && m_background_color_edit_config_snapshot) {
+        const ColorRGBA selected_background(background_vec[0], background_vec[1], background_vec[2], 1.f);
+        restore_texture_mapping_background_config(*object, *m_background_color_edit_config_snapshot);
+        m_background_color_edit_config_snapshot.reset();
+        set_managed_color_data_background_color(*object, selected_background);
+        refresh_selected_object_after_background_color_change(object);
+    }
+
+    ImGui::SameLine();
+    const bool has_background_color = managed_color_data_has_background_color(object);
+    m_imgui->disabled_begin(!has_background_color);
+    if (m_imgui->button(_L("Clear")))
+        clear_selected_object_background_color();
+    m_imgui->disabled_end();
+}
+
+void GLGizmoTrueColorPainting::clear_selected_object_background_color()
+{
+    ModelObject *object = selected_model_object();
+    if (object == nullptr || !managed_color_data_has_background_color(object))
+        return;
+
+    Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Clear color data background", UndoRedo::SnapshotType::GizmoAction);
+    if (!clear_managed_color_data_background_color(*object))
+        return;
+
+    m_background_color_edit_config_snapshot.reset();
+    refresh_selected_object_after_background_color_change(object);
+}
+
+void GLGizmoTrueColorPainting::refresh_selected_object_after_background_color_change(ModelObject *object)
+{
+    if (object == nullptr)
+        return;
+
+    cancel_rgb_data_preview_conversion();
+    m_preview_rgb_data_volume_ids.clear();
+    m_preview_rgb_data_by_volume.clear();
+    m_color_picker_source_cache.clear();
+    update_selected_object_color_state();
+    init_model_triangle_selectors();
+    refresh_managed_color_data_object(m_parent, object);
+    m_parent.render();
+}
+
 void GLGizmoTrueColorPainting::on_render_input_window(float x, float y, float bottom_limit)
 {
     ModelObject *object = selected_model_object();
@@ -11444,43 +11648,8 @@ void GLGizmoTrueColorPainting::on_render_input_window(float x, float y, float bo
 
     const float slider_width = m_imgui->scaled(8.f);
     const float max_tooltip_width = ImGui::GetFontSize() * 20.f;
-    const char *mode_labels[] = {
-        "Filament colors",
-        "RGB",
-        "CMY",
-        "CMYK",
-        "CMYW",
-        "RGBK",
-        "RGBW",
-        "BW",
-        "CMYKW",
-        "RGBKW"
-    };
-    const int mode_count = int(sizeof(mode_labels) / sizeof(mode_labels[0]));
     if (rgb_data_preview_conversion_pending_for_selected_object())
         m_imgui->warning_text(_L("Generating RGBA color conversion... Please wait"), m_imgui->scaled(RawOffsetDataWarningWrapEm));
-
-    int mode = std::clamp(int(m_color_input_mode), 0, mode_count - 1);
-    if (ImGui::BeginCombo("##true_color_mode", mode_labels[mode])) {
-        for (int idx = 0; idx < mode_count; ++idx) {
-            const bool selected = idx == mode;
-            if (ImGui::Selectable(mode_labels[idx], selected)) {
-                mode = idx;
-                m_color_input_mode = ColorInputMode(mode);
-                sync_active_color_mode_from_rgb(true);
-                update_triangle_selectors_color();
-            }
-            if (selected)
-                ImGui::SetItemDefaultFocus();
-        }
-        ImGui::EndCombo();
-    }
-
-    const wxString picker_label = m_color_picker_active ? _L("Cancel color picker") : _L("Pick color from model");
-    if (m_imgui->button(picker_label)) {
-        m_color_picker_active = !m_color_picker_active;
-        m_parent.set_as_dirty();
-    }
 
     if (m_imgui->button(_L("Manage Color Data for this object")))
         open_color_data_management_dialog();
@@ -11524,6 +11693,12 @@ void GLGizmoTrueColorPainting::on_render_input_window(float x, float y, float bo
     if (color_changed)
         update_triangle_selectors_color();
 
+    const wxString picker_label = m_color_picker_active ? _L("Stop picking color from model") : _L("Pick color from model");
+    if (m_imgui->button(picker_label)) {
+        m_color_picker_active = !m_color_picker_active;
+        m_parent.set_as_dirty();
+    }
+
     ImGui::Separator();
     m_imgui->text(_L("Pen size"));
     ImGui::PushItemWidth(slider_width);
@@ -11563,6 +11738,9 @@ void GLGizmoTrueColorPainting::on_render_input_window(float x, float y, float bo
 
     if (ImGui::IsItemHovered())
         m_imgui->tooltip(_L("Section view"), max_tooltip_width);
+
+    ImGui::Separator();
+    render_background_color_picker(max_tooltip_width);
 
     GizmoImguiEnd();
     ImGuiWrapper::pop_toolbar_style();
@@ -11930,12 +12108,12 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
     if (m_imgui->button(_L("Manage Color Data for this object")))
         open_color_data_management_dialog();
 
-    if (has_rgba_data)
-        m_imgui->warning_text(_L("Image Texture projection is disabled as this object has RGBA data."));
+    // if (has_rgba_data)
+    //     m_imgui->warning_text(_L("Note: Image Texture mode is disabled as this object has RGBA data (must use RGBA data mode)"));
 
     m_imgui->text(_L("Apply to:"));
     ImGui::SameLine();
-    const char *mode_labels[] = { "Vertex colors", "Image Texture", "RGB data" };
+    const char *mode_labels[] = { "Vertex colors", "Image Texture", "RGBA data" };
     int mode = std::clamp(int(m_projection_mode), 0, 2);
     if (ImGui::BeginCombo("##projection_mode", mode_labels[mode])) {
         for (int idx = 0; idx < 3; ++idx) {
