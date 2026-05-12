@@ -24,6 +24,7 @@ This color sheet was printed with CMYK PLA:
 
 # Official links
 
+#### Github Repository: <a href="https://github.com/sentientstardust-dev/OrcaSlicer-ImageMap"><img src="https://img.shields.io/badge/OrcaSlicer--ImageMap-181717?style=flat&logo=github&logoColor=white" width="300" alt="GitHub Logo"/> </a>
 #### Gitlab Repository: <a href="https://gitlab.com/sentient_stardust/OrcaSlicer-ImageMap"><img src="https://img.shields.io/badge/OrcaSlicer--ImageMap-181717?style=flat&logo=gitlab&logoColor=white" width="200" alt="GitLab Logo"/> </a>
 #### Downloads: <a href="https://gitlab.com/sentient_stardust/orcaslicer-imagemap/-/packages"><img src="https://img.shields.io/badge/Package_Repository-gray" alt="Package Repository"/> </a>
 
@@ -38,7 +39,7 @@ This color sheet was printed with CMYK PLA:
 # OrcaSlicer-ImageMap Features
 
 ### Texture Mapping
-- **Create Images on the surface of your 3D prints** - each layer alternates through a fixed CMYK (or other) pattern, only varying the amount of overhang around the edge of your print. This creates a smooth surface, printing your image texture on the model with no additional seams.
+- **Create Images on the side surfaces of your 3D prints** - each layer alternates through a fixed CMYK (or other) pattern, only varying the amount of overhang around the edge of your print. This creates a smooth surface, printing your image texture on the model with no additional seams.
 
 ![Layer Lines in Slicer Screenshot](https://gradients.garden/gitlab_images/slicer_layer_lines.jpeg)
 
