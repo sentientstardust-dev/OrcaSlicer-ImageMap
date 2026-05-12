@@ -13,6 +13,14 @@ on:
         description: 'Build Linux and Flatpak artifacts'
         type: boolean
         default: false
+      build_windows:
+        description: 'Build Windows artifacts'
+        type: boolean
+        default: true
+      build_macos:
+        description: 'Build macOS artifacts'
+        type: boolean
+        default: true
       build_macos_x86_64:
         description: 'Build macOS x86_64 and universal artifacts'
         type: boolean
@@ -47,7 +55,7 @@ jobs:
       release-version: ${{ inputs.release_version || '' }}
     secrets: inherit
   build_windows:
-    if: ${{ !cancelled() && (github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/'))) }}
+    if: ${{ !cancelled() && (inputs.build_windows || github.event_name != 'workflow_dispatch') && (github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/'))) }}
     uses: ./.github/workflows/build_check_cache.yml
     with:
       os: ${{ vars.SELF_HOSTED && 'orca-win-server' || 'windows-latest' }}
@@ -60,7 +68,7 @@ jobs:
       fail-fast: false
       matrix:
         arch: ${{ fromJSON(((inputs.build_macos_x86_64 || false) || vars.BUILD_MACOS_X86_64 == 'true') && '["arm64","x86_64"]' || '["arm64"]') }}
-    if: ${{ !cancelled() && (github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/'))) }}
+    if: ${{ !cancelled() && (inputs.build_macos || github.event_name != 'workflow_dispatch') && (github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/'))) }}
     uses: ./.github/workflows/build_check_cache.yml
     with:
       os: ${{ vars.SELF_HOSTED && 'orca-macos-arm64' || 'macos-14' }}
@@ -72,7 +80,7 @@ jobs:
   build_macos_universal:
     name: Build macOS Universal
     needs: build_macos_arch
-    if: ${{ !cancelled() && (github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/'))) && ((inputs.build_macos_x86_64 || false) || vars.BUILD_MACOS_X86_64 == 'true') && needs.build_macos_arch.result == 'success' && !inputs.build-deps-only }}
+    if: ${{ !cancelled() && (inputs.build_macos || github.event_name != 'workflow_dispatch') && (github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/'))) && ((inputs.build_macos_x86_64 || false) || vars.BUILD_MACOS_X86_64 == 'true') && needs.build_macos_arch.result == 'success' && !inputs.build-deps-only }}
     uses: ./.github/workflows/build_orca.yml
     with:
       os: ${{ vars.SELF_HOSTED && 'orca-macos-arm64' || 'macos-14' }}
@@ -87,7 +95,7 @@ jobs:
       - build_windows
       - build_macos_arch
       - build_macos_universal
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && (inputs.publish_release || false) && !inputs.build-deps-only && needs.build_windows.result == 'success' && needs.build_macos_arch.result == 'success' && (needs.build_macos_universal.result == 'success' || needs.build_macos_universal.result == 'skipped') }}
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && (inputs.publish_release || false) && !inputs.build-deps-only && (inputs.build_windows || inputs.build_macos) && (inputs.build_windows == false || needs.build_windows.result == 'success') && (inputs.build_macos == false || needs.build_macos_arch.result == 'success') && (inputs.build_macos == false || needs.build_macos_universal.result == 'success' || needs.build_macos_universal.result == 'skipped') }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:

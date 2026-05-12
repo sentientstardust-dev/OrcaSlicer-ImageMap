@@ -382,12 +382,6 @@ jobs:
         shell: cmd
         run: '"C:/Program Files/7-Zip/7z.exe" a -tzip OrcaSlicer_Windows_${{ env.ver }}_portable.zip ${{ github.workspace }}/build/OrcaSlicer'
 
-      - name: Pack PDB
-        if: runner.os == 'Windows' && !vars.SELF_HOSTED
-        working-directory: ${{ github.workspace }}/build/src/Release
-        shell: cmd
-        run: '"C:/Program Files/7-Zip/7z.exe" a -m0=lzma2 -mx9 Debug_PDB_${{ env.ver }}_for_developers_only.7z  *.pdb'
-
       - name: Upload artifacts Win zip
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v7
@@ -401,13 +395,6 @@ jobs:
         with:
           name: OrcaSlicer_Windows_${{ env.ver }}
           path: ${{ github.workspace }}/build/OrcaSlicer*.exe
-
-      - name: Upload artifacts Win PDB
-        if: runner.os == 'Windows' && !vars.SELF_HOSTED
-        uses: actions/upload-artifact@v7
-        with:
-          name: PDB
-          path: ${{ github.workspace }}/build/src/Release/Debug_PDB_${{ env.ver }}_for_developers_only.7z
 
       - name: Upload OrcaSlicer_profile_validator Win
         if: runner.os == 'Windows' && !vars.SELF_HOSTED

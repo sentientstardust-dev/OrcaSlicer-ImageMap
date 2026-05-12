@@ -114,10 +114,14 @@ REM Set minimum CMake policy to avoid <3.5 errors
 set CMAKE_POLICY_VERSION_MINIMUM=3.5
 if "%USE_NINJA%"=="1" (
     cmake ../ -G %CMAKE_GENERATOR% -DCMAKE_BUILD_TYPE=%build_type%
+    if errorlevel 1 exit /b 1
     cmake --build . --config %build_type% --target deps
+    if errorlevel 1 exit /b 1
 ) else (
     cmake ../ -G %CMAKE_GENERATOR% -A x64 -DCMAKE_BUILD_TYPE=%build_type%
+    if errorlevel 1 exit /b 1
     cmake --build . --config %build_type% --target deps -- -m
+    if errorlevel 1 exit /b 1
 )
 @echo off
 
@@ -136,16 +140,22 @@ if defined CMAKE_C_COMPILER_LAUNCHER set "CMAKE_LAUNCHER_FLAGS=%CMAKE_LAUNCHER_F
 if defined CMAKE_CXX_COMPILER_LAUNCHER set "CMAKE_LAUNCHER_FLAGS=%CMAKE_LAUNCHER_FLAGS% -DCMAKE_CXX_COMPILER_LAUNCHER=%CMAKE_CXX_COMPILER_LAUNCHER%"
 if "%USE_NINJA%"=="1" (
     cmake .. -G %CMAKE_GENERATOR% -DORCA_TOOLS=ON %SIG_FLAG% -DCMAKE_BUILD_TYPE=%build_type% %CMAKE_LAUNCHER_FLAGS%
+    if errorlevel 1 exit /b 1
     cmake --build . --config %build_type%
+    if errorlevel 1 exit /b 1
 ) else (
     cmake .. -G %CMAKE_GENERATOR% -A x64 -DORCA_TOOLS=ON %SIG_FLAG% -DCMAKE_BUILD_TYPE=%build_type% %CMAKE_LAUNCHER_FLAGS%
+    if errorlevel 1 exit /b 1
     cmake --build . --config %build_type% --target ALL_BUILD -- -m
+    if errorlevel 1 exit /b 1
 )
 @echo off
 cd ..
 call scripts/run_gettext.bat
+if errorlevel 1 exit /b 1
 cd %build_dir%
 cmake --build . --target install --config %build_type%
+if errorlevel 1 exit /b 1
 
 :done
 @echo off
