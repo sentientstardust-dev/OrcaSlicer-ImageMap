@@ -21,12 +21,14 @@
 #include "slic3r/Utils/UndoRedo.hpp"
 #include "GLGizmosCommon.hpp"
 #include "GLGizmoUtils.hpp"
+#include "imgui/imgui_stdlib.h"
 
 
 #include <glad/gl.h>
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
@@ -46,7 +48,10 @@
 #include <wx/button.h>
 #include <wx/colordlg.h>
 #include <wx/dialog.h>
+#include <wx/dcmemory.h>
 #include <wx/filedlg.h>
+#include <wx/font.h>
+#include <wx/fontenum.h>
 #include <wx/image.h>
 #include <wx/menu.h>
 #include <wx/panel.h>
@@ -62,6 +67,9 @@ constexpr size_t SlopePreviewOverrideIdCount = size_t(EnforcerBlockerType::Extru
 constexpr float SlopeAutoPaintMaxEdgeMm = 0.03f;
 constexpr int SlopeAutoPaintMaxDepth = 13;
 constexpr float SlopeAutoPaintMaxAngleDeg = 180.f;
+constexpr float ProjectionTextRasterBaseFontSize = 200.f;
+constexpr int ProjectionTextRasterMaxDimension = 2048;
+constexpr int ProjectionTextRasterMinFontSize = 18;
 }
 
 struct ManagedRegionColorSource
@@ -509,18 +517,8 @@ static bool raw_channel_keys_are_unique(const std::vector<std::string> &keys)
     return true;
 }
 
-static bool raw_atlas_projection_layout_for_object(const ModelObject &object,
-                                                   const ImageMapRawFilamentOffsetAtlas &atlas,
-                                                   RawAtlasProjectionLayout &layout,
-                                                   std::string *error)
+static bool append_object_raw_atlas_layout(const ModelObject &object, RawAtlasProjectionLayout &layout, std::string *error)
 {
-    layout = {};
-    if (!atlas.valid()) {
-        if (error != nullptr)
-            *error = "The selected raw filament offset atlas is invalid.";
-        return false;
-    }
-
     for (const ModelVolume *volume : object.volumes) {
         if (volume == nullptr || !volume->is_model_part() || !model_volume_has_raw_atlas_texture_data(volume))
             continue;
@@ -536,6 +534,23 @@ static bool raw_atlas_projection_layout_for_object(const ModelObject &object,
             if (!add_raw_layout_channel(layout, volume_keys[channel], volume_filaments[channel], error))
                 return false;
     }
+    return true;
+}
+
+static bool raw_atlas_projection_layout_for_object(const ModelObject &object,
+                                                   const ImageMapRawFilamentOffsetAtlas &atlas,
+                                                   RawAtlasProjectionLayout &layout,
+                                                   std::string *error)
+{
+    layout = {};
+    if (!atlas.valid()) {
+        if (error != nullptr)
+            *error = "The selected raw filament offset atlas is invalid.";
+        return false;
+    }
+
+    if (!append_object_raw_atlas_layout(object, layout, error))
+        return false;
 
     const std::vector<ImageMapRawFilament> atlas_filaments =
         image_map_raw_filaments_for_channels(atlas.filaments, atlas.channels);
@@ -2967,12 +2982,14 @@ static ColorRGBA blend_projection_color(const ColorRGBA &base, const ColorRGBA &
     const float alpha = std::clamp(overlay.a(), 0.f, 1.f) * std::clamp(opacity, 0.f, 1.f);
     if (alpha <= 0.f)
         return base;
-    const float out_alpha = std::clamp(alpha + base.a() * (1.f - alpha), 0.f, 1.f);
+    const float base_alpha = std::clamp(base.a(), 0.f, 1.f);
+    const float out_alpha = std::clamp(alpha + base_alpha * (1.f - alpha), 0.f, 1.f);
     if (out_alpha <= EPSILON)
         return ColorRGBA(overlay.r(), overlay.g(), overlay.b(), 0.f);
-    return ColorRGBA(base.r() * (1.f - alpha) + overlay.r() * alpha,
-                     base.g() * (1.f - alpha) + overlay.g() * alpha,
-                     base.b() * (1.f - alpha) + overlay.b() * alpha,
+    const float base_factor = base_alpha * (1.f - alpha);
+    return ColorRGBA((overlay.r() * alpha + base.r() * base_factor) / out_alpha,
+                     (overlay.g() * alpha + base.g() * base_factor) / out_alpha,
+                     (overlay.b() * alpha + base.b() * base_factor) / out_alpha,
                      out_alpha);
 }
 
@@ -3027,6 +3044,211 @@ static bool wx_image_to_rgba(const wxImage &image, std::vector<uint8_t> &rgba, u
             int(rgb[idx * 3 + 2]) == mask_b ?
                 0 :
                 (alpha == nullptr ? 255 : alpha[idx]);
+    }
+    return true;
+}
+
+static std::vector<std::string> projection_text_font_names()
+{
+    wxArrayString faces = wxFontEnumerator::GetFacenames(wxFONTENCODING_SYSTEM);
+    std::sort(faces.begin(), faces.end());
+    std::vector<std::string> names;
+    names.reserve(faces.size());
+    for (const wxString &face : faces) {
+        if (face.empty() || face[0] == '@')
+            continue;
+        names.emplace_back(face.ToStdString());
+    }
+    const std::string code_face = wxGetApp().code_font().GetFaceName().ToStdString();
+    if (!code_face.empty() && std::find(names.begin(), names.end(), code_face) == names.end())
+        names.insert(names.begin(), code_face);
+    return names;
+}
+
+static bool projection_text_face_is_monospace_candidate(const std::string &name)
+{
+    std::string lower = name;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) {
+        return char(std::tolower(ch));
+    });
+    return lower.find("mono") != std::string::npos ||
+           lower.find("code") != std::string::npos ||
+           lower.find("courier") != std::string::npos ||
+           lower.find("consolas") != std::string::npos ||
+           lower.find("menlo") != std::string::npos ||
+           lower.find("monaco") != std::string::npos ||
+           lower.find("fixed") != std::string::npos;
+}
+
+static int projection_text_default_font_index(const std::vector<std::string> &names)
+{
+    const std::string code_face = wxGetApp().code_font().GetFaceName().ToStdString();
+    if (!code_face.empty()) {
+        const auto found = std::find(names.begin(), names.end(), code_face);
+        if (found != names.end())
+            return int(std::distance(names.begin(), found));
+    }
+    const auto found_mono = std::find_if(names.begin(), names.end(), projection_text_face_is_monospace_candidate);
+    if (found_mono != names.end())
+        return int(std::distance(names.begin(), found_mono));
+    return 0;
+}
+
+static unsigned char projection_text_channel(float value)
+{
+    return static_cast<unsigned char>(std::clamp(value, 0.f, 1.f) * 255.f + 0.5f);
+}
+
+static uint8_t projection_text_blend_channel(uint8_t foreground, uint8_t background, uint8_t alpha)
+{
+    const unsigned int alpha_u = static_cast<unsigned int>(alpha);
+    const unsigned int inv_alpha = 255u - alpha_u;
+    return uint8_t((static_cast<unsigned int>(foreground) * alpha_u +
+                    static_cast<unsigned int>(background) * inv_alpha + 127u) / 255u);
+}
+
+static bool rasterize_projection_text_rgba(const std::string          &text,
+                                           const std::string          &font_name,
+                                           float                       font_size,
+                                           const std::array<float, 3> &text_color,
+                                           const std::array<float, 3> &background_color,
+                                           bool                        transparent_background,
+                                           bool                        capitalize,
+                                           std::vector<uint8_t>       &rgba,
+                                           uint32_t                   &width,
+                                           uint32_t                   &height,
+                                           std::vector<uint8_t>       *glyph_mask,
+                                           std::string                &error)
+{
+    error.clear();
+    rgba.clear();
+    width = 0;
+    height = 0;
+
+    wxString rendered_text = from_u8(text);
+    if (capitalize)
+        rendered_text.MakeUpper();
+    if (rendered_text.empty()) {
+        error = _u8L("Enter text to preview.");
+        return false;
+    }
+
+    wxBitmap measure_bitmap(1, 1);
+    wxMemoryDC measure_dc;
+    measure_dc.SelectObject(measure_bitmap);
+
+    auto make_font = [&font_name](int point_size) {
+        wxFont font(wxFontInfo(point_size).Family(wxFONTFAMILY_TELETYPE).Weight(wxFONTWEIGHT_BOLD).Encoding(wxFONTENCODING_SYSTEM));
+        if (!font_name.empty())
+            font.SetFaceName(from_u8(font_name));
+        font.SetWeight(wxFONTWEIGHT_BOLD);
+        return font;
+    };
+    auto measure_text = [&measure_dc, &rendered_text](const wxFont &font, wxCoord &text_width, wxCoord &text_height) {
+        measure_dc.SetFont(font);
+        measure_dc.GetMultiLineTextExtent(rendered_text, &text_width, &text_height);
+    };
+    auto bitmap_axis = [](wxCoord text_width, wxCoord text_height, int point_size) {
+        const int padding = std::max(4, point_size / 4);
+        return std::max(int(text_width) + padding * 2, int(text_height) + padding * 2);
+    };
+
+    int point_size = std::clamp(int(std::lround(font_size)), ProjectionTextRasterMinFontSize, 512);
+    wxFont font = make_font(point_size);
+    if (!font.IsOk()) {
+        error = _u8L("Unable to use the selected font.");
+        measure_dc.SelectObject(wxNullBitmap);
+        return false;
+    }
+
+    wxCoord text_width = 0;
+    wxCoord text_height = 0;
+    measure_text(font, text_width, text_height);
+    if (text_width > 0 && text_height > 0 && bitmap_axis(text_width, text_height, point_size) > ProjectionTextRasterMaxDimension) {
+        const float scale = float(ProjectionTextRasterMaxDimension) / float(bitmap_axis(text_width, text_height, point_size));
+        point_size = std::max(ProjectionTextRasterMinFontSize, int(std::floor(float(point_size) * scale)));
+        for (;;) {
+            font = make_font(point_size);
+            if (!font.IsOk()) {
+                error = _u8L("Unable to use the selected font.");
+                measure_dc.SelectObject(wxNullBitmap);
+                return false;
+            }
+            measure_text(font, text_width, text_height);
+            const int axis = bitmap_axis(text_width, text_height, point_size);
+            if (axis <= ProjectionTextRasterMaxDimension || point_size <= ProjectionTextRasterMinFontSize)
+                break;
+            const int next_size = std::max(ProjectionTextRasterMinFontSize,
+                                           int(std::floor(float(point_size) *
+                                                          float(ProjectionTextRasterMaxDimension) / float(axis))));
+            point_size = next_size < point_size ? next_size : point_size - 1;
+        }
+    }
+    measure_dc.SelectObject(wxNullBitmap);
+    if (text_width <= 0 || text_height <= 0) {
+        error = _u8L("Unable to rasterize the entered text.");
+        return false;
+    }
+
+    const int padding = std::max(4, point_size / 4);
+    const int bitmap_width = int(text_width) + padding * 2;
+    const int bitmap_height = int(text_height) + padding * 2;
+    constexpr int max_axis = ProjectionTextRasterMaxDimension;
+    constexpr size_t max_pixels = size_t(max_axis) * size_t(max_axis);
+    if (bitmap_width <= 0 ||
+        bitmap_height <= 0 ||
+        bitmap_width > max_axis ||
+        bitmap_height > max_axis ||
+        size_t(bitmap_width) * size_t(bitmap_height) > max_pixels) {
+        error = _u8L("The entered text is too large to preview.");
+        return false;
+    }
+
+    wxBitmap bitmap(bitmap_width, bitmap_height);
+    wxMemoryDC dc;
+    dc.SelectObject(bitmap);
+    dc.SetFont(font);
+    dc.SetBackground(wxBrush(*wxBLACK));
+    dc.Clear();
+    dc.SetTextForeground(*wxWHITE);
+    dc.DrawLabel(rendered_text, wxRect(padding, padding, text_width, text_height), wxALIGN_CENTER);
+    dc.SelectObject(wxNullBitmap);
+
+    wxImage image = bitmap.ConvertToImage();
+    const unsigned char *mask = image.GetData();
+    if (mask == nullptr) {
+        error = _u8L("Unable to rasterize the entered text.");
+        return false;
+    }
+
+    width = uint32_t(bitmap_width);
+    height = uint32_t(bitmap_height);
+    rgba.assign(size_t(width) * size_t(height) * 4, 0);
+    if (glyph_mask != nullptr)
+        glyph_mask->assign(size_t(width) * size_t(height), 0);
+    const unsigned char tr = projection_text_channel(text_color[0]);
+    const unsigned char tg = projection_text_channel(text_color[1]);
+    const unsigned char tb = projection_text_channel(text_color[2]);
+    const unsigned char br = projection_text_channel(background_color[0]);
+    const unsigned char bg = projection_text_channel(background_color[1]);
+    const unsigned char bb = projection_text_channel(background_color[2]);
+
+    for (size_t pixel_idx = 0; pixel_idx < size_t(width) * size_t(height); ++pixel_idx) {
+        const unsigned char alpha = mask[pixel_idx * 3];
+        if (glyph_mask != nullptr)
+            (*glyph_mask)[pixel_idx] = alpha;
+        const size_t rgba_idx = pixel_idx * 4;
+        if (transparent_background) {
+            rgba[rgba_idx + 0] = tr;
+            rgba[rgba_idx + 1] = tg;
+            rgba[rgba_idx + 2] = tb;
+            rgba[rgba_idx + 3] = alpha;
+        } else {
+            rgba[rgba_idx + 0] = projection_text_blend_channel(tr, br, alpha);
+            rgba[rgba_idx + 1] = projection_text_blend_channel(tg, bg, alpha);
+            rgba[rgba_idx + 2] = projection_text_blend_channel(tb, bb, alpha);
+            rgba[rgba_idx + 3] = 255;
+        }
     }
     return true;
 }
@@ -11875,8 +12097,45 @@ void GLGizmoImageProjection::on_load(cereal::BinaryInputArchive& ar)
        m_pass_through_model,
        m_convert_existing_colors_to_raw_offsets);
 
+    try {
+        ar(m_text_mode,
+           m_projection_text,
+           m_text_font_name,
+           m_text_font_size,
+           m_text_color[0],
+           m_text_color[1],
+           m_text_color[2],
+           m_text_background_color[0],
+           m_text_background_color[1],
+           m_text_background_color[2],
+           m_text_background_transparent,
+           m_text_capitalize);
+    } catch (...) {
+        m_text_mode = false;
+        m_projection_text = "Text";
+        m_text_font_name.clear();
+        m_text_font_size = ProjectionTextRasterBaseFontSize;
+        m_text_color = { 91.f / 255.f, 102.f / 255.f, 1.f };
+        m_text_background_color = { 1.f, 1.f, 1.f };
+        m_text_background_transparent = true;
+        m_text_capitalize = true;
+    }
+
     m_projection_mode = ProjectionMode(std::clamp(mode, 0, 2));
     m_projection_mode_initialized = false;
+    m_text_font_size = ProjectionTextRasterBaseFontSize;
+    for (float &channel : m_text_color)
+        channel = std::clamp(channel, 0.f, 1.f);
+    for (float &channel : m_text_background_color)
+        channel = std::clamp(channel, 0.f, 1.f);
+    m_text_rgba.clear();
+    m_text_width = 0;
+    m_text_height = 0;
+    m_text_raw_atlas = {};
+    m_text_projection_object_id = ObjectID();
+    m_text_projection_raw_mode = false;
+    m_text_error.clear();
+    m_text_dirty = true;
     m_raw_atlas = {};
     m_raw_atlas.width = raw_width;
     m_raw_atlas.height = raw_height;
@@ -11891,7 +12150,7 @@ void GLGizmoImageProjection::on_load(cereal::BinaryInputArchive& ar)
     if (!m_raw_atlas.valid())
         m_raw_atlas = {};
     m_overlay_texture.reset();
-    m_overlay_texture_dirty = !m_image_rgba.empty();
+    m_overlay_texture_dirty = m_text_mode || !m_image_rgba.empty();
 }
 
 void GLGizmoImageProjection::on_save(cereal::BinaryOutputArchive& ar) const
@@ -11929,6 +12188,19 @@ void GLGizmoImageProjection::on_save(cereal::BinaryOutputArchive& ar) const
        m_apply_transparency_as_background,
        m_pass_through_model,
        m_convert_existing_colors_to_raw_offsets);
+
+    ar(m_text_mode,
+       m_projection_text,
+       m_text_font_name,
+       m_text_font_size,
+       m_text_color[0],
+       m_text_color[1],
+       m_text_color[2],
+       m_text_background_color[0],
+       m_text_background_color[1],
+       m_text_background_color[2],
+       m_text_background_transparent,
+       m_text_capitalize);
 }
 
 void GLGizmoImageProjection::on_render()
@@ -11950,6 +12222,12 @@ void GLGizmoImageProjection::on_set_state()
         m_parent.enable_picking(false);
         m_show_overlay = true;
         m_projection_mode_initialized = false;
+        if (m_text_mode) {
+            m_text_dirty = true;
+            m_text_raw_atlas = {};
+            m_text_projection_object_id = ObjectID();
+            m_text_projection_raw_mode = false;
+        }
     } else if (get_state() == Off) {
         m_parent.enable_picking(true);
         m_parent.toggle_model_objects_visibility(true);
@@ -12062,16 +12340,247 @@ void GLGizmoImageProjection::clear_projection_image()
     m_parent.set_as_dirty();
 }
 
+void GLGizmoImageProjection::ensure_text_font_names()
+{
+    if (m_text_font_names.empty()) {
+        m_text_font_names = projection_text_font_names();
+        if (!m_text_font_names.empty()) {
+            if (m_text_font_name.empty()) {
+                m_text_font_idx = projection_text_default_font_index(m_text_font_names);
+                m_text_font_name = m_text_font_names[size_t(m_text_font_idx)];
+            } else {
+                const auto found = std::find(m_text_font_names.begin(), m_text_font_names.end(), m_text_font_name);
+                if (found != m_text_font_names.end())
+                    m_text_font_idx = int(std::distance(m_text_font_names.begin(), found));
+                else
+                    m_text_font_idx = std::clamp(m_text_font_idx, 0, int(m_text_font_names.size()) - 1);
+            }
+        }
+    } else {
+        m_text_font_idx = std::clamp(m_text_font_idx, 0, int(m_text_font_names.size()) - 1);
+        if (m_text_font_name.empty())
+            m_text_font_name = m_text_font_names[size_t(m_text_font_idx)];
+    }
+}
+
+void GLGizmoImageProjection::mark_text_projection_dirty()
+{
+    m_text_dirty = true;
+    m_text_error.clear();
+    m_text_raw_atlas = {};
+    if (m_text_mode)
+        m_overlay_texture_dirty = true;
+    m_parent.set_as_dirty();
+    m_parent.request_extra_frame();
+}
+
+bool GLGizmoImageProjection::update_text_raw_atlas(const std::vector<uint8_t> &glyph_mask)
+{
+    m_text_raw_atlas = {};
+
+    ModelObject *object = selected_model_object();
+    if (object == nullptr || !selected_object_has_raw_atlas_texture_data() || selected_object_has_rgb_data())
+        return true;
+
+    const size_t pixel_count = size_t(m_text_width) * size_t(m_text_height);
+    if (m_text_width == 0 || m_text_height == 0 || glyph_mask.size() < pixel_count) {
+        m_text_error = _u8L("Unable to rasterize the entered text.");
+        return false;
+    }
+
+    RawAtlasProjectionLayout layout;
+    std::string raw_atlas_error;
+    if (!append_object_raw_atlas_layout(*object, layout, &raw_atlas_error)) {
+        m_text_error = raw_atlas_error.empty() ?
+            _u8L("The selected object's raw filament offset data is not compatible with text projection.") :
+            raw_atlas_error;
+        return false;
+    }
+    if (layout.filaments.empty())
+        return true;
+
+    const std::vector<ColorRGBA> raw_filament_colors = raw_filament_colors_for_projection_preview(layout.filaments);
+    const int raw_projection_mix_model = generic_solver_mix_model_for_projection_object(object);
+    RawOffsetColorConversionSolver raw_conversion_solver =
+        build_raw_offset_color_conversion_solver(raw_filament_colors, raw_projection_mix_model);
+
+    const ColorRGBA text_color(m_text_color[0], m_text_color[1], m_text_color[2], 1.f);
+    const ColorRGBA background_color(m_text_background_color[0], m_text_background_color[1], m_text_background_color[2], 1.f);
+    const std::vector<uint8_t> text_offsets =
+        raw_offset_values_from_color(raw_filament_colors, text_color, std::nullopt, raw_projection_mix_model, &raw_conversion_solver);
+    const std::vector<uint8_t> background_offsets =
+        raw_offset_values_from_color(raw_filament_colors, background_color, std::nullopt, raw_projection_mix_model, &raw_conversion_solver);
+    const size_t channel_count = layout.filaments.size();
+    if (text_offsets.size() != channel_count || background_offsets.size() != channel_count) {
+        m_text_error = _u8L("Unable to convert the selected text colors to raw filament offsets.");
+        return false;
+    }
+
+    m_text_raw_atlas.width = m_text_width;
+    m_text_raw_atlas.height = m_text_height;
+    m_text_raw_atlas.channels = uint32_t(channel_count);
+    m_text_raw_atlas.filaments = layout.filaments;
+    m_text_raw_atlas.offsets.assign(pixel_count * channel_count, 0);
+    m_text_raw_atlas.mask.assign(pixel_count, 255);
+    m_text_raw_atlas.metadata_json = raw_layout_metadata_json(m_text_width, m_text_height, layout);
+
+    for (size_t pixel_idx = 0; pixel_idx < pixel_count; ++pixel_idx) {
+        const uint8_t alpha = glyph_mask[pixel_idx];
+        m_text_raw_atlas.mask[pixel_idx] = m_text_background_transparent ? alpha : 255;
+        for (size_t channel = 0; channel < channel_count; ++channel) {
+            uint8_t value = text_offsets[channel];
+            if (!m_text_background_transparent)
+                value = projection_text_blend_channel(text_offsets[channel], background_offsets[channel], alpha);
+            m_text_raw_atlas.offsets[pixel_idx * channel_count + channel] = value;
+        }
+    }
+
+    if (!m_text_raw_atlas.valid()) {
+        m_text_raw_atlas = {};
+        m_text_error = _u8L("Unable to create raw filament offset data for the rasterized text.");
+        return false;
+    }
+
+    std::vector<uint8_t> preview =
+        image_projection_raw_atlas_simulated_preview_rgba(m_text_raw_atlas, raw_projection_mix_model);
+    if (preview.empty()) {
+        m_text_raw_atlas = {};
+        m_text_error = _u8L("Unable to preview the rasterized text as raw filament offsets.");
+        return false;
+    }
+    m_text_rgba = std::move(preview);
+    return true;
+}
+
+bool GLGizmoImageProjection::ensure_text_projection_image()
+{
+    ensure_text_font_names();
+    const ModelObject *object = selected_model_object();
+    const ObjectID object_id = object != nullptr ? object->id() : ObjectID();
+    const bool raw_mode = object != nullptr && selected_object_has_raw_atlas_texture_data() && !selected_object_has_rgb_data();
+    if (object_id != m_text_projection_object_id || raw_mode != m_text_projection_raw_mode) {
+        m_text_dirty = true;
+        m_text_raw_atlas = {};
+        if (m_text_mode)
+            m_overlay_texture.reset();
+    }
+    if (!m_text_dirty)
+        return !m_text_rgba.empty() && m_text_width != 0 && m_text_height != 0;
+
+    m_text_dirty = false;
+    m_text_projection_object_id = object_id;
+    m_text_projection_raw_mode = raw_mode;
+    std::vector<uint8_t> glyph_mask;
+    bool rasterized = rasterize_projection_text_rgba(m_projection_text,
+                                                     m_text_font_name,
+                                                     ProjectionTextRasterBaseFontSize,
+                                                     m_text_color,
+                                                     m_text_background_color,
+                                                     m_text_background_transparent,
+                                                     m_text_capitalize,
+                                                     m_text_rgba,
+                                                     m_text_width,
+                                                     m_text_height,
+                                                     &glyph_mask,
+                                                     m_text_error);
+    if (rasterized && !update_text_raw_atlas(glyph_mask)) {
+        rasterized = false;
+        m_text_rgba.clear();
+        m_text_width = 0;
+        m_text_height = 0;
+    }
+    if (m_text_mode) {
+        m_overlay_texture.reset();
+        m_overlay_texture_dirty = rasterized;
+    }
+    return rasterized;
+}
+
+void GLGizmoImageProjection::render_text_projection_controls(float max_tooltip_width)
+{
+    ensure_text_font_names();
+    bool changed = false;
+
+    m_imgui->text(_L("Text"));
+    changed |= ImGui::InputTextMultiline("##image_projection_text",
+                                         &m_projection_text,
+                                         ImVec2(m_imgui->scaled(14.f), ImGui::GetTextLineHeight() * 4.f));
+
+    if (ImGui::Checkbox("Capitalize", &m_text_capitalize))
+        changed = true;
+
+    m_imgui->text(_L("Font"));
+    ImGui::SameLine();
+    ImGui::PushItemWidth(m_imgui->scaled(14.f));
+    const char *preview = !m_text_font_names.empty() ?
+        m_text_font_names[size_t(std::clamp(m_text_font_idx, 0, int(m_text_font_names.size()) - 1))].c_str() :
+        "Monospace";
+    if (ImGui::BeginCombo("##image_projection_text_font", preview)) {
+        for (int idx = 0; idx < int(m_text_font_names.size()); ++idx) {
+            const bool selected = idx == m_text_font_idx;
+            if (ImGui::Selectable(m_text_font_names[size_t(idx)].c_str(), selected)) {
+                m_text_font_idx = idx;
+                m_text_font_name = m_text_font_names[size_t(idx)];
+                changed = true;
+            }
+            if (selected)
+                ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::PopItemWidth();
+
+    ImGuiColorEditFlags color_flags = ImGuiColorEditFlags_DisplayRGB |
+                                      ImGuiColorEditFlags_InputRGB |
+                                      ImGuiColorEditFlags_NoInputs;
+    m_imgui->text(_L("Text color"));
+    ImGui::SameLine();
+    ImGui::PushItemWidth(m_imgui->scaled(8.f));
+    if (ImGui::ColorEdit3("##image_projection_text_color", m_text_color.data(), color_flags))
+        changed = true;
+    ImGui::PopItemWidth();
+    if (ImGui::IsItemHovered())
+        m_imgui->tooltip(_L("Text color"), max_tooltip_width);
+
+    if (ImGui::Checkbox("Transparent background", &m_text_background_transparent))
+        changed = true;
+
+    if (!m_text_background_transparent) {
+        m_imgui->text(_L("Background color"));
+        ImGui::SameLine();
+        ImGui::PushItemWidth(m_imgui->scaled(8.f));
+        if (ImGui::ColorEdit3("##image_projection_text_background_color", m_text_background_color.data(), color_flags))
+            changed = true;
+        ImGui::PopItemWidth();
+        if (ImGui::IsItemHovered())
+            m_imgui->tooltip(_L("Background color"), max_tooltip_width);
+    }
+
+    if (changed) {
+        mark_text_projection_dirty();
+        ensure_text_projection_image();
+    }
+}
+
 bool GLGizmoImageProjection::ensure_overlay_texture()
 {
     if (m_overlay_texture.get_id() != 0 && !m_overlay_texture_dirty)
         return true;
-    if (m_image_rgba.empty() || m_image_width == 0 || m_image_height == 0)
+    if (m_text_mode && !ensure_text_projection_image())
         return false;
 
-    std::vector<unsigned char> raw(m_image_rgba.begin(), m_image_rgba.end());
-    if (!m_overlay_texture.load_from_raw_data(std::move(raw), m_image_width, m_image_height)) {
-        m_image_error = _u8L("Unable to display the selected image.");
+    const std::vector<uint8_t> &rgba = active_projection_rgba();
+    const uint32_t width = active_projection_width();
+    const uint32_t height = active_projection_height();
+    if (rgba.empty() || width == 0 || height == 0)
+        return false;
+
+    std::vector<unsigned char> raw(rgba.begin(), rgba.end());
+    if (!m_overlay_texture.load_from_raw_data(std::move(raw), width, height)) {
+        if (m_text_mode)
+            m_text_error = _u8L("Unable to display the rasterized text.");
+        else
+            m_image_error = _u8L("Unable to display the selected image.");
         return false;
     }
     glsafe(::glBindTexture(GL_TEXTURE_2D, m_overlay_texture.get_id()));
@@ -12088,7 +12597,9 @@ bool GLGizmoImageProjection::ensure_overlay_texture()
 GLGizmoImageProjection::OverlayRect GLGizmoImageProjection::overlay_rect() const
 {
     OverlayRect rect;
-    if (m_image_width == 0 || m_image_height == 0)
+    const uint32_t width = active_projection_width();
+    const uint32_t height = active_projection_height();
+    if (width == 0 || height == 0)
         return rect;
 
     const Size canvas_size = m_parent.get_canvas_size();
@@ -12096,15 +12607,50 @@ GLGizmoImageProjection::OverlayRect GLGizmoImageProjection::overlay_rect() const
     const float canvas_h = float(std::max(1, canvas_size.get_height()));
     const float max_w = canvas_w * 0.48f;
     const float max_h = canvas_h * 0.48f;
-    float scale = std::min(max_w / float(m_image_width), max_h / float(m_image_height));
+    float scale = std::min(max_w / float(width), max_h / float(height));
     if (!std::isfinite(scale) || scale <= 0.f)
         scale = 1.f;
 
-    rect.width = float(m_image_width) * scale;
-    rect.height = float(m_image_height) * scale;
+    rect.width = float(width) * scale;
+    rect.height = float(height) * scale;
     rect.left = (canvas_w - rect.width) * 0.5f;
     rect.top = (canvas_h - rect.height) * 0.5f;
     return rect;
+}
+
+const std::vector<uint8_t> &GLGizmoImageProjection::active_projection_rgba() const
+{
+    return m_text_mode ? m_text_rgba : m_image_rgba;
+}
+
+uint32_t GLGizmoImageProjection::active_projection_width() const
+{
+    return m_text_mode ? m_text_width : m_image_width;
+}
+
+uint32_t GLGizmoImageProjection::active_projection_height() const
+{
+    return m_text_mode ? m_text_height : m_image_height;
+}
+
+bool GLGizmoImageProjection::active_projection_empty() const
+{
+    return active_projection_rgba().empty() || active_projection_width() == 0 || active_projection_height() == 0;
+}
+
+bool GLGizmoImageProjection::active_raw_atlas_valid() const
+{
+    return m_text_mode ? m_text_raw_atlas.valid() : m_raw_atlas.valid();
+}
+
+const ImageMapRawFilamentOffsetAtlas &GLGizmoImageProjection::active_raw_atlas() const
+{
+    return m_text_mode ? m_text_raw_atlas : m_raw_atlas;
+}
+
+bool GLGizmoImageProjection::effective_apply_transparency_as_background() const
+{
+    return !m_text_mode && m_apply_transparency_as_background;
 }
 
 ModelObject *GLGizmoImageProjection::selected_model_object() const
@@ -12123,6 +12669,15 @@ void GLGizmoImageProjection::open_color_data_management_dialog()
 
     Slic3r::GUI::open_color_data_management_dialog(wxGetApp().mainframe, m_parent, object, [this]() {
         m_projection_mode_initialized = false;
+        m_text_dirty = true;
+        m_text_raw_atlas = {};
+        m_text_projection_object_id = ObjectID();
+        m_text_projection_raw_mode = false;
+        if (m_text_mode) {
+            m_overlay_texture.reset();
+            m_overlay_texture_dirty = true;
+            ensure_text_projection_image();
+        }
         update_default_projection_mode();
         m_parent.set_as_dirty();
         m_parent.request_extra_frame();
@@ -12151,7 +12706,7 @@ void GLGizmoImageProjection::update_default_projection_mode()
 
 GLGizmoImageProjection::ProjectionMode GLGizmoImageProjection::default_projection_mode() const
 {
-    if (m_raw_atlas.valid())
+    if (active_raw_atlas_valid())
         return ProjectionMode::ImageTexture;
     if (selected_object_has_rgb_data())
         return ProjectionMode::RGBData;
@@ -12161,7 +12716,7 @@ GLGizmoImageProjection::ProjectionMode GLGizmoImageProjection::default_projectio
 bool GLGizmoImageProjection::projection_mode_allowed(ProjectionMode mode) const
 {
     const bool has_rgba_data = selected_object_has_rgb_data();
-    if (m_raw_atlas.valid())
+    if (active_raw_atlas_valid())
         return mode == ProjectionMode::ImageTexture && !has_rgba_data;
     if (mode == ProjectionMode::ImageTexture)
         return !has_rgba_data;
@@ -12218,6 +12773,8 @@ bool GLGizmoImageProjection::selected_object_has_raw_atlas_texture_data() const
 
 void GLGizmoImageProjection::on_render_input_window(float x, float y, float bottom_limit)
 {
+    if (m_text_mode)
+        ensure_text_projection_image();
     update_default_projection_mode();
 
     if (m_show_overlay && ensure_overlay_texture()) {
@@ -12242,39 +12799,59 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
                                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar);
     const float max_tooltip_width = ImGui::GetFontSize() * 20.f;
 
+    if (m_imgui->button(_L("Manage Color Data for this object")))
+        open_color_data_management_dialog();
+
+    m_imgui->disabled_begin(m_text_mode);
     if (m_imgui->button(_L("Load image")))
         load_projection_image();
+    m_imgui->disabled_end();
 
     ImGui::SameLine();
-    m_imgui->disabled_begin(m_image_rgba.empty());
+    m_imgui->disabled_begin(m_text_mode || m_image_rgba.empty());
     if (m_imgui->button(_L("Clear image")))
         clear_projection_image();
     m_imgui->disabled_end();
 
-    if (!m_image_path.empty()) {
+    if (!m_text_mode && !m_image_path.empty()) {
         const size_t slash = m_image_path.find_last_of("/\\");
         ImGui::SameLine();
         m_imgui->text(from_u8(slash == std::string::npos ? m_image_path : m_image_path.substr(slash + 1)));
     }
 
-    if (!m_image_error.empty())
+    if (ImGui::Checkbox("Text mode", &m_text_mode)) {
+        if (m_text_mode)
+            m_text_dirty = true;
+        m_projection_mode_initialized = false;
+        m_overlay_texture.reset();
+        m_overlay_texture_dirty = !active_projection_empty() || m_text_mode;
+        if (m_text_mode)
+            ensure_text_projection_image();
+        update_default_projection_mode();
+        m_parent.set_as_dirty();
+        m_parent.request_extra_frame();
+    }
+
+    if (m_text_mode)
+        render_text_projection_controls(max_tooltip_width);
+
+    if (!m_text_mode && !m_image_error.empty())
         m_imgui->warning_text(from_u8(m_image_error));
+    if (m_text_mode && !m_text_error.empty())
+        m_imgui->warning_text(from_u8(m_text_error));
 
     const bool has_rgba_data = selected_object_has_rgb_data();
-    if (!m_image_rgba.empty() && !m_raw_atlas.valid() && selected_object_has_raw_atlas_texture_data() && !has_rgba_data) {
+    if (!active_projection_empty() && !active_raw_atlas_valid() && selected_object_has_raw_atlas_texture_data() && !has_rgba_data) {
         if (m_projection_mode == ProjectionMode::ImageTexture)
             m_imgui->warning_text(raw_offset_data_image_texture_projection_warning_text(), m_imgui->scaled(RawOffsetDataWarningWrapEm));
         else if (m_projection_mode == ProjectionMode::RGBData)
             m_imgui->warning_text(raw_offset_data_rgba_conversion_warning_text(), m_imgui->scaled(RawOffsetDataWarningWrapEm));
     }
 
-    if (!m_image_rgba.empty() && ImGui::Checkbox("Show image overlay", &m_show_overlay)) {
+    if (!active_projection_empty() && ImGui::Checkbox(m_text_mode ? "Show text overlay" : "Show image overlay", &m_show_overlay)) {
         m_parent.set_as_dirty();
         m_parent.request_extra_frame();
     }
-
-    if (m_imgui->button(_L("Manage Color Data for this object")))
-        open_color_data_management_dialog();
 
     // if (has_rgba_data)
     //     m_imgui->warning_text(_L("Note: Image Texture mode is disabled as this object has RGBA data (must use RGBA data mode)"));
@@ -12329,18 +12906,20 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
             m_imgui->tooltip(_L("Section view"), max_tooltip_width);
     }
 
-    ImGui::Checkbox("Apply transparent regions as background color", &m_apply_transparency_as_background);
+    if (!m_text_mode)
+        ImGui::Checkbox("Apply transparent regions as background color", &m_apply_transparency_as_background);
     ImGui::Checkbox("Pass through model", &m_pass_through_model);
 
     const bool show_raw_conversion_option =
-        m_raw_atlas.valid() &&
+        active_raw_atlas_valid() &&
         selected_model_object() != nullptr &&
         !selected_object_has_raw_atlas_texture_data();
     if (show_raw_conversion_option)
         ImGui::Checkbox("Convert existing colors to raw offset data (slow)", &m_convert_existing_colors_to_raw_offsets);
 
-    m_imgui->disabled_begin(m_image_rgba.empty() || !projection_mode_allowed(m_projection_mode));
-    if (m_imgui->button(_L("Project image onto model")) && project_image_to_selected_object()) {
+    m_imgui->disabled_begin(active_projection_empty() || !projection_mode_allowed(m_projection_mode));
+    const wxString project_label = m_text_mode ? _L("Project text onto model") : _L("Project image onto model");
+    if (m_imgui->button(project_label) && project_image_to_selected_object()) {
         m_show_overlay = false;
         m_parent.set_as_dirty();
         m_parent.request_extra_frame();
@@ -12354,21 +12933,29 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
 bool GLGizmoImageProjection::project_image_to_selected_object()
 {
     ModelObject *object = selected_model_object();
-    if (object == nullptr || m_image_rgba.empty())
+    if (m_text_mode && !ensure_text_projection_image())
+        return false;
+    if (object == nullptr || active_projection_empty())
         return false;
 
     RawAtlasProjectionLayout raw_layout;
-    if (m_raw_atlas.valid()) {
+    if (active_raw_atlas_valid()) {
         std::string raw_atlas_error;
-        if (!raw_atlas_projection_layout_for_object(*object, m_raw_atlas, raw_layout, &raw_atlas_error)) {
-            m_image_error = raw_atlas_error.empty() ?
+        if (!raw_atlas_projection_layout_for_object(*object, active_raw_atlas(), raw_layout, &raw_atlas_error)) {
+            std::string &projection_error = m_text_mode ? m_text_error : m_image_error;
+            projection_error = raw_atlas_error.empty() ?
                 _u8L("The selected raw filament offset atlas is not compatible with the selected object.") :
                 raw_atlas_error;
-            m_image_path.clear();
-            m_image_rgba.clear();
-            m_image_width = 0;
-            m_image_height = 0;
-            m_raw_atlas = {};
+            if (m_text_mode) {
+                m_text_raw_atlas = {};
+                m_text_dirty = true;
+            } else {
+                m_image_path.clear();
+                m_image_rgba.clear();
+                m_image_width = 0;
+                m_image_height = 0;
+                m_raw_atlas = {};
+            }
             m_overlay_texture.reset();
             m_overlay_texture_dirty = false;
             m_show_overlay = false;
@@ -12382,18 +12969,20 @@ bool GLGizmoImageProjection::project_image_to_selected_object()
         return false;
 
     const bool converting_raw_to_rgba_image =
-        !m_raw_atlas.valid() &&
+        !active_raw_atlas_valid() &&
         m_projection_mode == ProjectionMode::ImageTexture &&
         selected_object_has_raw_atlas_texture_data() &&
         !selected_object_has_rgb_data();
     const bool creating_rgba_data_from_raw =
-        !m_raw_atlas.valid() &&
+        !active_raw_atlas_valid() &&
         m_projection_mode == ProjectionMode::RGBData &&
         selected_object_has_raw_atlas_texture_data() &&
         !selected_object_has_rgb_data();
 
     bool changed = false;
-    Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Project image onto model", UndoRedo::SnapshotType::GizmoAction);
+    Plater::TakeSnapshot snapshot(wxGetApp().plater(),
+                                  m_text_mode ? "Project text onto model" : "Project image onto model",
+                                  UndoRedo::SnapshotType::GizmoAction);
     switch (m_projection_mode) {
     case ProjectionMode::VertexColors:
         changed = project_to_vertex_colors(object);
@@ -12411,8 +13000,10 @@ bool GLGizmoImageProjection::project_image_to_selected_object()
 
     const bool whole_image_texture_mapped_without_regions = object_is_whole_image_texture_mapped_without_regions(*object);
     const unsigned int texture_mapping_filament_id =
-        (!whole_image_texture_mapped_without_regions || m_raw_atlas.valid()) ? texture_mapping_zone_id_for_image_projection(*object) : 0;
-    if (m_raw_atlas.valid() && texture_mapping_filament_id != 0)
+        (!whole_image_texture_mapped_without_regions || active_raw_atlas_valid()) ?
+            texture_mapping_zone_id_for_image_projection(*object) :
+            0;
+    if (active_raw_atlas_valid() && texture_mapping_filament_id != 0)
         enable_texture_mapping_zone_simulated_preview(texture_mapping_filament_id);
 
     if (!whole_image_texture_mapped_without_regions) {
@@ -12433,11 +13024,11 @@ bool GLGizmoImageProjection::project_image_to_selected_object()
             context.overlay_top = rect.top;
             context.overlay_width = rect.width;
             context.overlay_height = rect.height;
-            context.image_rgba = &m_image_rgba;
-            context.image_width = m_image_width;
-            context.image_height = m_image_height;
+            context.image_rgba = &active_projection_rgba();
+            context.image_width = active_projection_width();
+            context.image_height = active_projection_height();
             context.image_opacity = m_projection_opacity;
-            context.apply_transparency_as_background = m_apply_transparency_as_background;
+            context.apply_transparency_as_background = effective_apply_transparency_as_background();
             apply_projection_section_view(context, m_c != nullptr ? m_c->object_clipper() : nullptr);
 
             project_texture_mapping_zone_to_regions(*object,
@@ -12477,11 +13068,11 @@ bool GLGizmoImageProjection::project_to_vertex_colors(ModelObject *object)
     context.overlay_top = rect.top;
     context.overlay_width = rect.width;
     context.overlay_height = rect.height;
-    context.image_rgba = &m_image_rgba;
-    context.image_width = m_image_width;
-    context.image_height = m_image_height;
+    context.image_rgba = &active_projection_rgba();
+    context.image_width = active_projection_width();
+    context.image_height = active_projection_height();
     context.image_opacity = m_projection_opacity;
-    context.apply_transparency_as_background = m_apply_transparency_as_background;
+    context.apply_transparency_as_background = effective_apply_transparency_as_background();
     apply_projection_section_view(context, m_c != nullptr ? m_c->object_clipper() : nullptr);
 
     const ProjectionVisibility visibility = m_pass_through_model ?
@@ -12627,22 +13218,24 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
     context.overlay_top = rect.top;
     context.overlay_width = rect.width;
     context.overlay_height = rect.height;
-    context.image_rgba = &m_image_rgba;
-    context.image_width = m_image_width;
-    context.image_height = m_image_height;
+    context.image_rgba = &active_projection_rgba();
+    context.image_width = active_projection_width();
+    context.image_height = active_projection_height();
     context.image_opacity = m_projection_opacity;
-    context.apply_transparency_as_background = m_apply_transparency_as_background;
+    context.apply_transparency_as_background = effective_apply_transparency_as_background();
     apply_projection_section_view(context, m_c != nullptr ? m_c->object_clipper() : nullptr);
 
     const ProjectionVisibility visibility = m_pass_through_model ?
         ProjectionVisibility() :
         build_projection_visibility(context, m_parent, object, instance_idx);
-    const bool raw_atlas_projection = m_raw_atlas.valid();
+    const bool raw_atlas_projection = active_raw_atlas_valid();
+    const ImageMapRawFilamentOffsetAtlas &raw_projection_atlas = active_raw_atlas();
     RawAtlasProjectionLayout raw_layout;
     if (raw_atlas_projection) {
         std::string raw_atlas_error;
-        if (!raw_atlas_projection_layout_for_object(*object, m_raw_atlas, raw_layout, &raw_atlas_error)) {
-            m_image_error = raw_atlas_error.empty() ?
+        if (!raw_atlas_projection_layout_for_object(*object, raw_projection_atlas, raw_layout, &raw_atlas_error)) {
+            std::string &projection_error = m_text_mode ? m_text_error : m_image_error;
+            projection_error = raw_atlas_error.empty() ?
                 _u8L("The selected raw filament offset atlas is not compatible with the selected object.") :
                 raw_atlas_error;
             return false;
@@ -12653,7 +13246,9 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
     const int raw_projection_mix_model =
         raw_atlas_projection ? generic_solver_mix_model_for_projection_object(object) : TextureMappingZone::DefaultGenericSolverMixModel;
     const RawOffsetProjectionPreviewSettings raw_projection_preview_settings =
-        raw_atlas_projection ? raw_offset_projection_preview_settings(raw_filament_colors, raw_projection_mix_model) : RawOffsetProjectionPreviewSettings();
+        raw_atlas_projection ?
+            raw_offset_projection_preview_settings(raw_filament_colors, raw_projection_mix_model) :
+            RawOffsetProjectionPreviewSettings();
     bool object_had_raw_atlas_texture = false;
     if (raw_atlas_projection) {
         for (const ModelVolume *volume : object->volumes) {
@@ -12853,7 +13448,7 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
                                 } else {
                                     if (raw_atlas_projection) {
                                         std::vector<uint8_t> atlas_raw_values =
-                                            projected_raw_offsets_at_point(context, m_raw_atlas, world_matrix, point);
+                                            projected_raw_offsets_at_point(context, raw_projection_atlas, world_matrix, point);
                                         if (atlas_raw_values.empty())
                                             continue;
                                         std::vector<uint8_t> raw_values = raw_offset_pixel_values(*volume, wrapped_x, wrapped_y);
@@ -12929,11 +13524,11 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
     context.overlay_top = rect.top;
     context.overlay_width = rect.width;
     context.overlay_height = rect.height;
-    context.image_rgba = &m_image_rgba;
-    context.image_width = m_image_width;
-    context.image_height = m_image_height;
+    context.image_rgba = &active_projection_rgba();
+    context.image_width = active_projection_width();
+    context.image_height = active_projection_height();
     context.image_opacity = m_projection_opacity;
-    context.apply_transparency_as_background = m_apply_transparency_as_background;
+    context.apply_transparency_as_background = effective_apply_transparency_as_background();
     apply_projection_section_view(context, m_c != nullptr ? m_c->object_clipper() : nullptr);
 
     const ProjectionVisibility visibility = m_pass_through_model ?
