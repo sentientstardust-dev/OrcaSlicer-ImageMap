@@ -29,6 +29,8 @@ jobs:
       ubuntu-ver: '2404'
       ubuntu-ver-str: '_Ubuntu2404'
       ORCA_UPDATER_SIG_KEY: ${{ secrets.ORCA_UPDATER_SIG_KEY }}
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      SCCACHE_CACHE_SIZE: 5G
 
     steps:
       - name: Checkout
@@ -49,6 +51,16 @@ jobs:
           cmakeVersion: "~4.3.0"  # use most recent 4.3.x version
           useLocalCache: true         # <--= Use the local cache (default is 'false').
           useCloudCache: true
+
+      - name: Restore sccache cache
+        if: ${{ !vars.SELF_HOSTED && (runner.os == 'Windows' || (runner.os == 'macOS' && !inputs.macos-combine-only)) }}
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-orcaslicer-${{ runner.os }}-${{ inputs.arch || 'default' }}-${{ github.sha }}
+          restore-keys: |
+            sccache-orcaslicer-${{ runner.os }}-${{ inputs.arch || 'default' }}-
+            sccache-orcaslicer-${{ runner.os }}-
 
       - name: Get the version and date on Ubuntu and macOS
         if: runner.os != 'Windows'
@@ -95,7 +107,10 @@ jobs:
         if: runner.os == 'macOS' && !inputs.macos-combine-only
         run: |
           if [ -z "${{ vars.SELF_HOSTED }}" ]; then
-            brew install libtool
+            brew install libtool sccache
+            echo "CMAKE_C_COMPILER_LAUNCHER=sccache" >> "$GITHUB_ENV"
+            echo "CMAKE_CXX_COMPILER_LAUNCHER=sccache" >> "$GITHUB_ENV"
+            sccache --zero-stats
             brew list
           fi
           mkdir -p ${{ github.workspace }}/deps/build/${{ inputs.arch }}
@@ -113,6 +128,10 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           ./build_release_macos.sh -s -n -x ${{ !vars.SELF_HOSTED && '-1' || '' }} -a ${{ inputs.arch }} -t 10.15
+
+      - name: Show sccache stats macOS
+        if: ${{ always() && runner.os == 'macOS' && !inputs.macos-combine-only && !vars.SELF_HOSTED }}
+        run: sccache --show-stats
 
       - name: Pack macOS app bundle ${{ inputs.arch }}
         if: runner.os == 'macOS' && !inputs.macos-combine-only
@@ -307,11 +326,20 @@ jobs:
         if: runner.os == 'Windows'
         uses: microsoft/setup-msbuild@v3
 
+      - name: setup MSVC environment
+        if: runner.os == 'Windows' && !vars.SELF_HOSTED
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Install nsis
         if: runner.os == 'Windows' && !vars.SELF_HOSTED
         run: |
           dir "C:/Program Files (x86)/Windows Kits/10/Include"
-          choco install nsis
+          choco install nsis sccache -y
+          "CMAKE_C_COMPILER_LAUNCHER=sccache" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          "CMAKE_CXX_COMPILER_LAUNCHER=sccache" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          sccache --zero-stats
 
       - name: Build slicer Win
         if: runner.os == 'Windows'
@@ -320,7 +348,11 @@ jobs:
         # env:
         #   WindowsSdkDir: 'C:\Program Files (x86)\Windows Kits\10\'
         #   WindowsSDKVersion: '10.0.26100.0\'
-        run: .\build_release_vs.bat slicer
+        run: .\build_release_vs.bat slicer ${{ !vars.SELF_HOSTED && '-x' || '' }}
+
+      - name: Show sccache stats Windows
+        if: ${{ always() && runner.os == 'Windows' && !vars.SELF_HOSTED }}
+        run: sccache --show-stats
 
       - name: Create installer Win
         if: runner.os == 'Windows' && !vars.SELF_HOSTED

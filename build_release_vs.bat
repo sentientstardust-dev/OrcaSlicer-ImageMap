@@ -131,11 +131,14 @@ cd %build_dir%
 
 echo on
 set CMAKE_POLICY_VERSION_MINIMUM=3.5
+set "CMAKE_LAUNCHER_FLAGS="
+if defined CMAKE_C_COMPILER_LAUNCHER set "CMAKE_LAUNCHER_FLAGS=%CMAKE_LAUNCHER_FLAGS% -DCMAKE_C_COMPILER_LAUNCHER=%CMAKE_C_COMPILER_LAUNCHER%"
+if defined CMAKE_CXX_COMPILER_LAUNCHER set "CMAKE_LAUNCHER_FLAGS=%CMAKE_LAUNCHER_FLAGS% -DCMAKE_CXX_COMPILER_LAUNCHER=%CMAKE_CXX_COMPILER_LAUNCHER%"
 if "%USE_NINJA%"=="1" (
-    cmake .. -G %CMAKE_GENERATOR% -DORCA_TOOLS=ON %SIG_FLAG% -DCMAKE_BUILD_TYPE=%build_type%
-    cmake --build . --config %build_type% --target ALL_BUILD
+    cmake .. -G %CMAKE_GENERATOR% -DORCA_TOOLS=ON %SIG_FLAG% -DCMAKE_BUILD_TYPE=%build_type% %CMAKE_LAUNCHER_FLAGS%
+    cmake --build . --config %build_type%
 ) else (
-    cmake .. -G %CMAKE_GENERATOR% -A x64 -DORCA_TOOLS=ON %SIG_FLAG% -DCMAKE_BUILD_TYPE=%build_type%
+    cmake .. -G %CMAKE_GENERATOR% -A x64 -DORCA_TOOLS=ON %SIG_FLAG% -DCMAKE_BUILD_TYPE=%build_type% %CMAKE_LAUNCHER_FLAGS%
     cmake --build . --config %build_type% --target ALL_BUILD -- -m
 )
 @echo off
