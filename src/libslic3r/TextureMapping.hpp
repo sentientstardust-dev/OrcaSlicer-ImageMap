@@ -103,7 +103,6 @@ struct TextureMappingZone
     static constexpr float DefaultContrastPct = 100.f;
     static constexpr bool  DefaultHighResolutionSampling = true;
     static constexpr float DefaultToneGamma = 1.f;
-    static constexpr float DefaultSaggingRatio = 0.f;
     static constexpr int   DefaultTransmissionDistanceCalibrationMode = int(TDCalibrationAbsolute);
     static constexpr bool  DefaultPreviewSimulateColors = false;
     static constexpr bool  DefaultPreviewLimitResolution = true;
@@ -146,7 +145,6 @@ struct TextureMappingZone
     float       contrast_pct = DefaultContrastPct;
     bool        high_resolution_sampling = DefaultHighResolutionSampling;
     float       tone_gamma = DefaultToneGamma;
-    float       sagging_ratio = DefaultSaggingRatio;
     int         transmission_distance_calibration_mode = DefaultTransmissionDistanceCalibrationMode;
     float       preview_opacity_pct = DefaultPreviewOpacityPct;
     bool        preview_simulate_colors = DefaultPreviewSimulateColors;
@@ -190,7 +188,6 @@ struct TextureMappingZone
         contrast_pct = DefaultContrastPct;
         high_resolution_sampling = DefaultHighResolutionSampling;
         tone_gamma = DefaultToneGamma;
-        sagging_ratio = DefaultSaggingRatio;
         transmission_distance_calibration_mode = DefaultTransmissionDistanceCalibrationMode;
         preview_opacity_pct = DefaultPreviewOpacityPct;
         preview_simulate_colors = DefaultPreviewSimulateColors;

@@ -372,11 +372,6 @@ static float normalize_tone_gamma(float value)
     return (!std::isfinite(value) || value <= 0.f) ? 1.f : std::clamp(value, 0.5f, 3.f);
 }
 
-static float normalize_sagging_ratio(float)
-{
-    return 0.f;
-}
-
 static RGB filament_color(unsigned int id, const std::vector<std::string> &filament_colours)
 {
     if (id >= 1 && size_t(id - 1) < filament_colours.size())
@@ -775,7 +770,6 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            std::abs(contrast_pct - rhs.contrast_pct) <= eps &&
            high_resolution_sampling == rhs.high_resolution_sampling &&
            std::abs(tone_gamma - rhs.tone_gamma) <= eps &&
-           std::abs(sagging_ratio - rhs.sagging_ratio) <= eps &&
            transmission_distance_calibration_mode == rhs.transmission_distance_calibration_mode &&
            std::abs(preview_opacity_pct - rhs.preview_opacity_pct) <= eps &&
            preview_simulate_colors == rhs.preview_simulate_colors &&
@@ -1023,7 +1017,6 @@ std::string TextureMappingManager::serialize_entries()
         texture["contrast_pct"] = std::clamp(finite_or(zone.contrast_pct, 100.f), 25.f, 300.f);
         texture["high_resolution_sampling"] = zone.high_resolution_sampling;
         texture["tone_gamma"] = normalize_tone_gamma(zone.tone_gamma);
-        texture["sagging_ratio"] = normalize_sagging_ratio(zone.sagging_ratio);
         texture["transmission_distance_calibration"] =
             transmission_distance_calibration_mode_name(zone.transmission_distance_calibration_mode);
         texture["preview_opacity_pct"] =
@@ -1162,7 +1155,6 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.contrast_pct = std::clamp(texture.value("contrast_pct", 100.f), 25.f, 300.f);
         zone.high_resolution_sampling = texture.value("high_resolution_sampling", true);
         zone.tone_gamma = normalize_tone_gamma(texture.value("tone_gamma", 1.f));
-        zone.sagging_ratio = normalize_sagging_ratio(texture.value("sagging_ratio", 0.f));
         zone.transmission_distance_calibration_mode = transmission_distance_calibration_mode_from_json(texture);
         zone.preview_opacity_pct =
             std::clamp(texture.value("preview_opacity_pct", TextureMappingZone::DefaultPreviewOpacityPct), 0.f, 100.f);

@@ -1445,8 +1445,6 @@ static void prime_tower_textured_path(WipeTowerWriter &writer,
     const float min_width_for_positive_spacing = layer_height * float(1. - 0.25 * PI) + 1e-4f;
     const float min_width = std::clamp(std::max(config_min_width, min_width_for_positive_spacing), 0.05f, base_width);
     float width_range = (base_width - min_width) * std::clamp(texture.global_strength, 0.f, 1.f);
-    if (texture.sagging_ratio > EPSILON)
-        width_range = std::min(width_range, layer_height * texture.sagging_ratio);
     const float base_extrusion_flow = extrusion_flow * prime_tower_flow_scale_for_width(reference_width, base_width, layer_height);
     // const float sample_step = std::clamp(base_width * 0.20f, 0.04f, 0.12f);
     const float sample_step = 0.06f;

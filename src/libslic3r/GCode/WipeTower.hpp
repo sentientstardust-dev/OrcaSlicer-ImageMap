@@ -52,7 +52,6 @@ struct PrimeTowerTextureRenderSettings
     int texture_filament_color_mode = int(TextureMappingZone::FilamentColorAny);
     float contrast_pct = 100.f;
     float tone_gamma = 1.f;
-    float sagging_ratio = 0.f;
     float global_strength = 1.f;
     float max_line_width = 0.95f;
     float min_line_width = 0.32f;

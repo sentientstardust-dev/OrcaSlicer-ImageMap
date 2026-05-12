@@ -6202,8 +6202,7 @@ static float variable_width_delta_for_overhang_range_for_gcode(float inset_stren
 static float nonlinear_visibility_width_factor_for_gcode(float desired_width_factor,
                                                          float layer_height_mm,
                                                          float stair_step_mm,
-                                                         float max_width_delta_limit_mm,
-                                                         float sagging_ratio)
+                                                         float max_width_delta_limit_mm)
 {
     const float r = clamp01f_for_gcode(desired_width_factor);
     if (!std::isfinite(layer_height_mm) ||
@@ -6237,9 +6236,7 @@ static float nonlinear_visibility_width_factor_for_gcode(float desired_width_fac
             return std::clamp(0.5f + direction * offset_mm / max_width_delta_limit_mm, 0.f, 1.f);
     }
 
-    const float effective_sagging_ratio =
-        std::max(2.f, std::isfinite(sagging_ratio) && sagging_ratio > EPSILON ? sagging_ratio : 2.f);
-    const float cx = std::clamp(1.f - std::sqrt(2.f) / effective_sagging_ratio, 0.f, 0.95f);
+    const float cx = std::clamp(1.f - std::sqrt(2.f) / 2.f, 0.f, 0.95f);
     const float c = (1.f - cx) * (1.f - cx);
     const float safe_cos = std::max(cos_n, 1e-4f);
     const float tan_n = sin_n / safe_cos;
@@ -6270,8 +6267,7 @@ static float variable_width_delta_for_visibility_range_for_gcode(float inset_str
                                                                  float transmission_distance_width_factor,
                                                                  bool  nonlinear_offset_adjustment,
                                                                  float layer_height_mm,
-                                                                 float stair_step_mm,
-                                                                 float sagging_ratio)
+                                                                 float stair_step_mm)
 {
     if (!std::isfinite(max_width_delta_limit_mm) || max_width_delta_limit_mm <= 0.f)
         return 0.f;
@@ -6285,8 +6281,7 @@ static float variable_width_delta_for_visibility_range_for_gcode(float inset_str
         desired_width_factor = nonlinear_visibility_width_factor_for_gcode(desired_width_factor,
                                                                            layer_height_mm,
                                                                            stair_step_mm,
-                                                                           max_width_delta_limit_mm,
-                                                                           sagging_ratio);
+                                                                           max_width_delta_limit_mm);
 
     const float min_width_factor = std::clamp(minimum_offset_factor, 0.f, 1.f);
     const float adjusted_width_factor =
@@ -8976,8 +8971,6 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
 
     const float global_strength_factor =
         std::clamp(float(m_config.texture_mapping_outer_wall_gradient_global_strength.value) / 100.f, 0.f, 1.f);
-    const float texture_sagging_ratio =
-        std::isfinite(zone->sagging_ratio) ? std::clamp(zone->sagging_ratio, 0.f, 6.f) : 0.f;
     if (global_strength_factor <= EPSILON)
         return std::nullopt;
 
@@ -9042,8 +9035,6 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
         const float max_width_delta_mm = std::max(0.f, base_outer_width_mm - safe_min_gradient_width_mm);
         const float effective_max_width_delta_mm = max_width_delta_mm * global_strength_factor;
         float max_width_delta_limit_mm = std::min(effective_max_width_delta_mm, 2.f * max_allowed_distance_mm);
-        if (texture_sagging_ratio > EPSILON)
-            max_width_delta_limit_mm = std::min(max_width_delta_limit_mm, layer_height_mm * texture_sagging_ratio);
         if (!std::isfinite(max_width_delta_limit_mm) || max_width_delta_limit_mm <= EPSILON)
             return std::nullopt;
 
@@ -9119,8 +9110,7 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
                                                                 state.active_component_td_width_factor,
                                                                 nonlinear_offset_adjustment,
                                                                 layer_height_mm,
-                                                                stair_step_mm,
-                                                                texture_sagging_ratio);
+                                                                stair_step_mm);
         const float width_delta_mm = std::clamp(variable_width_delta_mm, 0.f, max_width_delta_limit_mm);
         if (!std::isfinite(width_delta_mm))
             return std::nullopt;
@@ -10066,7 +10056,6 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         float                     centerline_shift_balance_mm { 0.f };
         float                     centerline_shift_balance_weight_scale { 0.f };
         float                     layer_height_mm { 0.2f };
-        float                     sagging_ratio { 0.f };
     };
 
     if (is_bridge(path.role()))
@@ -10251,8 +10240,6 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                 (!std::isfinite(zone->tone_gamma) || zone->tone_gamma <= 0.f) ?
                                     1.f :
                                     std::clamp(zone->tone_gamma, 0.5f, 3.f);
-                            const float texture_sagging_ratio =
-                                std::isfinite(zone->sagging_ratio) ? std::clamp(zone->sagging_ratio, 0.f, 6.f) : 0.f;
                             const bool reduce_outer_surface_texture =
                                 vertex_color_match_mode && zone->reduce_outer_surface_texture && !compact_offset_mode;
 
@@ -10384,13 +10371,10 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                 outer_wall_gradient_dynamic_ctx.flow_reference_width_mm = flow_reference_width_mm;
                                 outer_wall_gradient_dynamic_ctx.base_centerline_shift_mm = base_centerline_shift_mm;
                                 outer_wall_gradient_dynamic_ctx.layer_height_mm = layer_height_mm;
-                                outer_wall_gradient_dynamic_ctx.sagging_ratio = texture_sagging_ratio;
 
                                 outer_wall_gradient_segment_mods.reserve(path.polyline.points.size() - 1);
 
                                 float max_width_delta_limit_mm = std::min(effective_max_width_delta_mm, 2.f * max_allowed_distance_mm);
-                                if (texture_sagging_ratio > EPSILON)
-                                    max_width_delta_limit_mm = std::min(max_width_delta_limit_mm, layer_height_mm * texture_sagging_ratio);
                                 if (!std::isfinite(max_width_delta_limit_mm) || max_width_delta_limit_mm <= EPSILON)
                                     outer_wall_gradient_dynamic_ctx.enabled = false;
 
@@ -10497,8 +10481,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                         active_component_td_width_factor,
                                         nonlinear_offset_adjustment,
                                         layer_height_mm,
-                                        stair_step_mm,
-                                        texture_sagging_ratio);
+                                        stair_step_mm);
                                     const float width_delta_mm = std::clamp(variable_width_delta_mm, 0.f, max_width_delta_limit_mm);
                                     if (!std::isfinite(width_delta_mm) || !std::isfinite(base_outer_width_mm) || !std::isfinite(layer_height_mm)) {
                                         outer_wall_gradient_segment_mods.emplace_back(mod);
@@ -11227,10 +11210,6 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         float max_width_delta_limit_mm = std::min(
             outer_wall_gradient_dynamic_ctx.max_width_delta_mm,
             2.f * outer_wall_gradient_dynamic_ctx.inset_strength_reference_mm);
-        if (outer_wall_gradient_dynamic_ctx.sagging_ratio > EPSILON)
-            max_width_delta_limit_mm = std::min(max_width_delta_limit_mm,
-                                                outer_wall_gradient_dynamic_ctx.layer_height_mm *
-                                                    outer_wall_gradient_dynamic_ctx.sagging_ratio);
         if (!std::isfinite(max_width_delta_limit_mm) || max_width_delta_limit_mm <= EPSILON)
             return OuterWallGradientSegmentMod{};
         const float stair_step_mm = outer_wall_gradient_dynamic_ctx.nonlinear_offset_adjustment ?
@@ -11249,8 +11228,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             outer_wall_gradient_dynamic_ctx.active_component_td_width_factor,
             outer_wall_gradient_dynamic_ctx.nonlinear_offset_adjustment,
             outer_wall_gradient_dynamic_ctx.layer_height_mm,
-            stair_step_mm,
-            outer_wall_gradient_dynamic_ctx.sagging_ratio);
+            stair_step_mm);
         const float width_delta_mm = std::clamp(variable_width_delta_mm, 0.f, max_width_delta_limit_mm);
         if (!std::isfinite(width_delta_mm) ||
             !std::isfinite(outer_wall_gradient_dynamic_ctx.base_outer_width_mm) ||

@@ -3498,7 +3498,6 @@ void Print::_make_wipe_tower()
             texture.compact_offset_mode = settings_zone->compact_offset_mode;
             texture.contrast_pct = settings_zone->contrast_pct;
             texture.tone_gamma = settings_zone->tone_gamma;
-            texture.sagging_ratio = settings_zone->sagging_ratio;
             texture.filament_strengths_pct = settings_zone->filament_strengths_pct;
             texture.filament_minimum_offsets_pct = settings_zone->filament_minimum_offsets_pct;
             const size_t num_physical = m_config.filament_diameter.values.size();

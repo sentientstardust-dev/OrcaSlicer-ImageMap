@@ -81,8 +81,11 @@ struct TexturePreviewSimulationSettings
     std::vector<unsigned int> component_ids;
     std::vector<std::array<float, 3>> component_colors;
     std::vector<float> component_strength_factors;
+    std::vector<float> component_minimum_offset_factors;
     std::vector<size_t> semantic_component_indices;
     std::shared_ptr<TexturePreviewGenericMixCandidateCache> generic_mix_candidate_cache;
+    float raw_offset_base_visibility_factor = 1.f;
+    float raw_offset_visibility_range_factor = 0.f;
 };
 
 struct SurfaceGradientPreviewSettings
@@ -95,7 +98,6 @@ struct SurfaceGradientPreviewSettings
     std::vector<float> minimum_offset_factors;
     float max_component_distance_mm = 0.f;
     float max_width_delta_limit_mm = 0.f;
-    float sagging_ratio = 0.f;
     int angle_mode = int(TextureMappingZone::OffsetAngleObjectCenter);
     bool rotation_enabled = true;
     float rotations = 1.f;
@@ -296,6 +298,38 @@ ColorRGBA blend_component_colors(const std::vector<std::array<float, 3>> &colors
 float clamp01(float value)
 {
     return std::clamp(value, 0.f, 1.f);
+}
+
+float texture_preview_config_float(const char *key, float fallback)
+{
+    if (GUI::wxGetApp().preset_bundle == nullptr)
+        return fallback;
+
+    const DynamicPrintConfig &config = GUI::wxGetApp().preset_bundle->project_config;
+    if (const ConfigOptionFloat *opt = config.option<ConfigOptionFloat>(key))
+        return std::isfinite(opt->value) ? float(opt->value) : fallback;
+    return fallback;
+}
+
+std::array<float, 2> raw_offset_visibility_factors_for_texture_preview(const TextureMappingZone &zone)
+{
+    const float base_outer_width_mm =
+        std::max(0.05f, texture_preview_config_float("texture_mapping_outer_wall_gradient_max_line_width", 0.95f));
+    const float min_outer_width_mm = std::clamp(texture_preview_config_float("texture_mapping_outer_wall_gradient_min_line_width", 0.32f),
+                                                0.05f,
+                                                base_outer_width_mm);
+    const float global_strength_factor =
+        std::clamp(texture_preview_config_float("texture_mapping_outer_wall_gradient_global_strength", 100.f) / 100.f, 0.f, 1.f);
+
+    float width_range_mm =
+        std::min((base_outer_width_mm - min_outer_width_mm) * global_strength_factor,
+                 2.f * TextureMappingManager::max_component_surface_offset_mm());
+    width_range_mm = std::clamp(width_range_mm, 0.f, base_outer_width_mm);
+
+    return {
+        clamp01((base_outer_width_mm - width_range_mm) / base_outer_width_mm),
+        clamp01(width_range_mm / base_outer_width_mm)
+    };
 }
 
 float srgb_to_linear_component(float value)
@@ -1483,6 +1517,30 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
     return desired;
 }
 
+std::vector<float> raw_offset_print_width_weights_for_texture_preview(const TexturePreviewSimulationSettings &settings,
+                                                                      const std::vector<float>              &raw_weights)
+{
+    const size_t component_count = raw_weights.size();
+    std::vector<float> width_factors(component_count, 0.f);
+    for (size_t idx = 0; idx < component_count; ++idx) {
+        const float strength = idx < settings.component_strength_factors.size() ? settings.component_strength_factors[idx] : 1.f;
+        const float minimum = idx < settings.component_minimum_offset_factors.size() ? settings.component_minimum_offset_factors[idx] : 0.f;
+        const float adjusted_visibility = clamp01(minimum + clamp01(raw_weights[idx]) * strength * (1.f - minimum));
+        width_factors[idx] = clamp01(settings.raw_offset_base_visibility_factor +
+                                     settings.raw_offset_visibility_range_factor * adjusted_visibility);
+    }
+
+    const auto min_width = std::min_element(width_factors.begin(), width_factors.end());
+    if (min_width == width_factors.end())
+        return {};
+
+    std::vector<float> weights(component_count, 0.f);
+    const float shared_width = *min_width / float(component_count);
+    for (size_t idx = 0; idx < component_count; ++idx)
+        weights[idx] = clamp01(shared_width + std::max(0.f, width_factors[idx] - *min_width));
+    return weights;
+}
+
 void prepare_texture_preview_simulation_settings(TexturePreviewSimulationSettings &settings)
 {
     settings.use_fixed_color_generic_solver = texture_preview_uses_fixed_color_generic_solver(settings);
@@ -1571,6 +1629,7 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
     const bool raw_values_mode = settings.mapping_mode == int(TextureMappingZone::TextureMappingRawValues);
     settings.component_colors.reserve(settings.component_ids.size());
     settings.component_strength_factors.reserve(settings.component_ids.size());
+    settings.component_minimum_offset_factors.reserve(settings.component_ids.size());
     for (const unsigned int component_id : settings.component_ids) {
         if (component_id == 0 || size_t(component_id - 1) >= physical_colors.size()) {
             if (!raw_values_mode)
@@ -1586,7 +1645,18 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
             100.f;
         const float safe_strength_pct = std::isfinite(strength_pct) ? strength_pct : 100.f;
         settings.component_strength_factors.emplace_back(std::clamp(safe_strength_pct / 100.f, 0.f, 1.f));
+
+        const size_t minimum_offset_idx = component_id > 0 ? size_t(component_id - 1) : size_t(-1);
+        const float minimum_offset_pct = minimum_offset_idx < zone->filament_minimum_offsets_pct.size() ?
+            zone->filament_minimum_offsets_pct[minimum_offset_idx] :
+            0.f;
+        const float safe_minimum_offset_pct = std::isfinite(minimum_offset_pct) ? minimum_offset_pct : 0.f;
+        settings.component_minimum_offset_factors.emplace_back(std::clamp(safe_minimum_offset_pct / 100.f, 0.f, 1.f));
     }
+
+    const std::array<float, 2> raw_offset_visibility_factors = raw_offset_visibility_factors_for_texture_preview(*zone);
+    settings.raw_offset_base_visibility_factor = raw_offset_visibility_factors[0];
+    settings.raw_offset_visibility_range_factor = raw_offset_visibility_factors[1];
 
     return settings.component_colors.empty() ? std::nullopt : std::optional<TexturePreviewSimulationSettings>(std::move(settings));
 }
@@ -1621,6 +1691,10 @@ size_t texture_preview_simulation_signature(const ModelVolume &model_volume,
     }
     for (const float strength_factor : settings.component_strength_factors)
         mix(std::hash<int>{}(int(std::lround(strength_factor * 1000.f))));
+    for (const float minimum_offset_factor : settings.component_minimum_offset_factors)
+        mix(std::hash<int>{}(int(std::lround(minimum_offset_factor * 1000.f))));
+    mix(std::hash<int>{}(int(std::lround(settings.raw_offset_base_visibility_factor * 100000.f))));
+    mix(std::hash<int>{}(int(std::lround(settings.raw_offset_visibility_range_factor * 100000.f))));
     return signature;
 }
 
@@ -1704,6 +1778,8 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                                                                 result.width,
                                                                 result.height);
                 component_weights = map_raw_sample_to_components_for_texture_preview(raw_sample, source_raw_component_channels);
+                if (component_weights.size() == settings.component_colors.size())
+                    component_weights = raw_offset_print_width_weights_for_texture_preview(settings, component_weights);
             } else {
                 component_weights = component_weights_for_texture_preview(settings, sample_rgba);
             }
@@ -3089,13 +3165,7 @@ ColorRGBA surface_gradient_preview_color_at(const SurfaceGradientPreviewSettings
 
 float surface_gradient_preview_config_float(const char *key, float fallback)
 {
-    if (GUI::wxGetApp().preset_bundle == nullptr)
-        return fallback;
-
-    const DynamicPrintConfig &config = GUI::wxGetApp().preset_bundle->project_config;
-    if (const ConfigOptionFloat *opt = config.option<ConfigOptionFloat>(key))
-        return std::isfinite(opt->value) ? float(opt->value) : fallback;
-    return fallback;
+    return texture_preview_config_float(key, fallback);
 }
 
 std::optional<SurfaceGradientPreviewSettings> surface_gradient_preview_settings_for_zone(const ModelVolume &model_volume,
@@ -3151,8 +3221,6 @@ std::optional<SurfaceGradientPreviewSettings> surface_gradient_preview_settings_
                                     int(TextureMappingZone::OffsetFadeNone),
                                     int(TextureMappingZone::OffsetFadeOutInReversed));
     settings.limit_texture_resolution = zone.preview_limit_resolution;
-    settings.sagging_ratio = std::isfinite(zone.sagging_ratio) ? std::clamp(zone.sagging_ratio, 0.f, 6.f) : 0.f;
-
     const float base_outer_width_mm = std::max(0.05f, surface_gradient_preview_config_float("texture_mapping_outer_wall_gradient_max_line_width", 0.95f));
     const float min_outer_width_mm = std::clamp(surface_gradient_preview_config_float("texture_mapping_outer_wall_gradient_min_line_width", 0.32f),
                                                 0.05f,
@@ -3160,10 +3228,6 @@ std::optional<SurfaceGradientPreviewSettings> surface_gradient_preview_settings_
     const float global_strength_factor =
         std::clamp(surface_gradient_preview_config_float("texture_mapping_outer_wall_gradient_global_strength", 100.f) / 100.f, 0.f, 1.f);
     settings.max_width_delta_limit_mm = std::min((base_outer_width_mm - min_outer_width_mm) * global_strength_factor, 2.f * max_distance_mm);
-    if (settings.sagging_ratio > k_epsilon) {
-        constexpr float preview_layer_height_mm = 0.2f;
-        settings.max_width_delta_limit_mm = std::min(settings.max_width_delta_limit_mm, preview_layer_height_mm * settings.sagging_ratio);
-    }
     if (!std::isfinite(settings.max_width_delta_limit_mm) || settings.max_width_delta_limit_mm <= k_epsilon)
         return std::nullopt;
 
@@ -3662,6 +3726,9 @@ size_t texture_preview_settings_signature(size_t num_physical, const TextureMapp
             for (const std::string &color : opt->values)
                 signature_mix(std::hash<std::string>{}(color));
     }
+    signature_mix_float(texture_preview_config_float("texture_mapping_outer_wall_gradient_global_strength", 100.f), 100.f);
+    signature_mix_float(texture_preview_config_float("texture_mapping_outer_wall_gradient_max_line_width", 0.95f), 1000.f);
+    signature_mix_float(texture_preview_config_float("texture_mapping_outer_wall_gradient_min_line_width", 0.32f), 1000.f);
     if (texture_mgr == nullptr)
         return signature;
 
@@ -3696,7 +3763,6 @@ size_t texture_preview_settings_signature(size_t num_physical, const TextureMapp
         signature_mix(std::hash<int>{}(TextureMappingZone::DefaultGenericSolverMixModel));
         signature_mix(std::hash<int>{}(zone.preview_simulate_colors ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.preview_limit_resolution ? 1 : 0));
-        signature_mix_float(zone.sagging_ratio);
         signature_mix_float(zone.preview_opacity_pct, 100.f);
         signature_mix_float(zone.contrast_pct, 100.f);
         signature_mix_float(zone.tone_gamma);

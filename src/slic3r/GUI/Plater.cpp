@@ -5920,7 +5920,6 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 return;
             updated.texture_mapping_mode = dlg.texture_mapping_mode();
             updated.tone_gamma = dlg.tone_gamma();
-            updated.sagging_ratio = TextureMappingZone::DefaultSaggingRatio;
             updated.transmission_distance_calibration_mode = dlg.transmission_distance_calibration_mode();
             updated.preview_opacity_pct = dlg.preview_opacity_pct();
             updated.force_sequential_filaments = dlg.force_sequential_filaments();
