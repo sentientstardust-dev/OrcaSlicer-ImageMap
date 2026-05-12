@@ -366,6 +366,8 @@ modules:
       - type: file
         path: ../../version.inc
       - type: file
+        path: ../../version_number.txt
+      - type: file
         path: ../run_gettext.sh
         dest: scripts
 

@@ -53,7 +53,7 @@ jobs:
       - name: Get the version and date on Ubuntu and macOS
         if: runner.os != 'Windows'
         run: |
-          ver_pure=$(grep 'set(SoftFever_VERSION' version.inc | cut -d '"' -f2)
+          ver_pure=$(cat version_number.txt)
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             ver="PR-${{ github.event.number }}"
             git_commit_hash="${{ github.event.pull_request.head.sha }}"
@@ -79,10 +79,7 @@ jobs:
               $ver = "PR" + $prNumber
               $git_commit_hash = "${{ github.event.pull_request.head.sha }}"
           } else {
-              $versionContent = Get-Content version.inc -Raw
-              if ($versionContent -match 'set\(SoftFever_VERSION "(.*?)"\)') {
-                  $ver = $matches[1]
-              }
+              $ver = (Get-Content version_number.txt -First 1).Trim()
               $ver = "V$ver"
               $git_commit_hash = ""
           }

@@ -77,9 +77,9 @@ esac
 # ---------- version & commit ----------
 cd "$PROJECT_ROOT"
 
-VER_PURE=$(grep 'set(SoftFever_VERSION' version.inc | cut -d '"' -f2)
+VER_PURE=$(cat version_number.txt)
 if [ -z "$VER_PURE" ]; then
-    echo "Error: could not extract version from version.inc" >&2
+    echo "Error: could not extract version from version_number.txt" >&2
     exit 1
 fi
 VER="V${VER_PURE}"

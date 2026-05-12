@@ -8,6 +8,16 @@ if(NOT DEFINED ORCA_CHECK_GCODE_PLACEHOLDERS)
 endif()
 
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/libslic3r_version.h.in ${CMAKE_CURRENT_BINARY_DIR}/libslic3r_version.h @ONLY)
+set(LIBSLIC3R_VERSION_CPP "${CMAKE_CURRENT_BINARY_DIR}/libslic3r_version.cpp")
+add_custom_command(
+    OUTPUT "${LIBSLIC3R_VERSION_CPP}"
+    COMMAND ${CMAKE_COMMAND}
+        "-DINPUT=${SOFTFEVER_VERSION_FILE}"
+        "-DOUTPUT=${LIBSLIC3R_VERSION_CPP}"
+        -P "${CMAKE_SOURCE_DIR}/cmake/GenerateSoftFeverVersion.cmake"
+    DEPENDS "${SOFTFEVER_VERSION_FILE}" "${CMAKE_SOURCE_DIR}/cmake/GenerateSoftFeverVersion.cmake"
+    VERBATIM
+)
 
 if (MINGW)
     add_compile_options(-Wa,-mbig-obj)
@@ -539,6 +549,7 @@ if (MSVC AND "${CMAKE_SIZEOF_VOID_P}" STREQUAL "4") # 32 bit MSVC workaround
 endif ()
 
 encoding_check(libslic3r)
+target_sources(libslic3r PRIVATE "${LIBSLIC3R_VERSION_CPP}")
 
 target_compile_definitions(libslic3r PUBLIC -DUSE_TBB -DTBB_USE_CAPTURED_EXCEPTION=0)
 target_include_directories(libslic3r PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
