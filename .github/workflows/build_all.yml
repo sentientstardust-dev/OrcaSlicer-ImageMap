@@ -126,9 +126,9 @@ jobs:
           tag="${{ steps.release_version.outputs.tag }}"
           version="${{ steps.release_version.outputs.version }}"
           mapfile -t assets < <(find release-artifacts -type f \( \
-            -name "OrcaSlicer_Mac_*_V$version.dmg" -o \
-            -name "OrcaSlicer_Windows_V${version}_portable.zip" -o \
-            -name "OrcaSlicer_Windows_Installer_V${version}.exe" \
+            -name "OrcaSlicer-ImageMap_Mac_*_V$version.dmg" -o \
+            -name "OrcaSlicer-ImageMap_Windows_V${version}_portable.zip" -o \
+            -name "OrcaSlicer-ImageMap_Windows_Installer_V${version}.exe" \
           \) ! -name '*profile_validator*' | sort)
 
           if [ "${#assets[@]}" -eq 0 ]; then
@@ -138,11 +138,12 @@ jobs:
           fi
 
           if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --title "OrcaSlicer-ImageMap $version"
             gh release upload "$tag" "${assets[@]}" --clobber
           else
             gh release create "$tag" "${assets[@]}" \
               --target "$GITHUB_SHA" \
-              --title "OrcaSlicer $version" \
+              --title "OrcaSlicer-ImageMap $version" \
               --notes "Automated build from $GITHUB_SHA"
           fi
   unit_tests:

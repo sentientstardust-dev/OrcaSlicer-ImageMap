@@ -153,14 +153,14 @@ jobs:
         if: runner.os == 'macOS' && !inputs.macos-combine-only
         working-directory: ${{ github.workspace }}
         run: |
-          tar -czvf OrcaSlicer_Mac_bundle_${{ inputs.arch }}_${{ github.sha }}.tar.gz -C build/${{ inputs.arch }} OrcaSlicer
+          tar -czvf OrcaSlicer-ImageMap_Mac_bundle_${{ inputs.arch }}_${{ github.sha }}.tar.gz -C build/${{ inputs.arch }} OrcaSlicer
 
       - name: Upload macOS app bundle ${{ inputs.arch }}
         if: runner.os == 'macOS' && !inputs.macos-combine-only
         uses: actions/upload-artifact@v7
         with:
-          name: OrcaSlicer_Mac_bundle_${{ inputs.arch }}_${{ github.sha }}
-          path: ${{ github.workspace }}/OrcaSlicer_Mac_bundle_${{ inputs.arch }}_${{ github.sha }}.tar.gz
+          name: OrcaSlicer-ImageMap_Mac_bundle_${{ inputs.arch }}_${{ github.sha }}
+          path: ${{ github.workspace }}/OrcaSlicer-ImageMap_Mac_bundle_${{ inputs.arch }}_${{ github.sha }}.tar.gz
 
       - name: Create macOS arm64 DMG without notary
         if: runner.os == 'macOS' && !inputs.macos-combine-only && inputs.arch == 'arm64'
@@ -168,9 +168,9 @@ jobs:
         run: |
           mkdir -p ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_dmg
           rm -rf ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_dmg/*
-          cp -R ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer/OrcaSlicer.app ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_dmg/
+          cp -R ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer/OrcaSlicer.app ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_dmg/OrcaSlicer-ImageMap.app
           ln -sfn /Applications ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_dmg/Applications
-          hdiutil create -volname "OrcaSlicer" -srcfolder ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_dmg -ov -format UDZO OrcaSlicer_Mac_${{ inputs.arch }}_${{ env.ver }}.dmg
+          hdiutil create -volname "OrcaSlicer-ImageMap" -srcfolder ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_dmg -ov -format UDZO OrcaSlicer-ImageMap_Mac_${{ inputs.arch }}_${{ env.ver }}.dmg
 
           if [ -f "${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer/OrcaSlicer_profile_validator.app/Contents/MacOS/OrcaSlicer_profile_validator" ]; then
             mkdir -p ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_profile_validator_dmg
@@ -184,8 +184,8 @@ jobs:
         if: runner.os == 'macOS' && !inputs.macos-combine-only && inputs.arch == 'arm64'
         uses: actions/upload-artifact@v7
         with:
-          name: OrcaSlicer_Mac_${{ inputs.arch }}_${{ env.ver }}
-          path: ${{ github.workspace }}/OrcaSlicer_Mac_${{ inputs.arch }}_${{ env.ver }}.dmg
+          name: OrcaSlicer-ImageMap_Mac_${{ inputs.arch }}_${{ env.ver }}
+          path: ${{ github.workspace }}/OrcaSlicer-ImageMap_Mac_${{ inputs.arch }}_${{ env.ver }}.dmg
 
       - name: Upload OrcaSlicer_profile_validator macOS arm64 DMG
         if: runner.os == 'macOS' && !inputs.macos-combine-only && inputs.arch == 'arm64' && !vars.SELF_HOSTED
@@ -199,7 +199,7 @@ jobs:
         if: runner.os == 'macOS' && inputs.macos-combine-only
         uses: actions/download-artifact@v8
         with:
-          pattern: OrcaSlicer_Mac_bundle_*_${{ github.sha }}
+          pattern: OrcaSlicer-ImageMap_Mac_bundle_*_${{ github.sha }}
           path: ${{ github.workspace }}/mac_bundles
 
       - name: Extract macOS app bundles
@@ -207,8 +207,8 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           mkdir -p build/arm64 build/x86_64
-          arm_bundle=$(find "${{ github.workspace }}/mac_bundles/OrcaSlicer_Mac_bundle_arm64_${{ github.sha }}" -name '*.tar.gz' -print -quit)
-          x86_bundle=$(find "${{ github.workspace }}/mac_bundles/OrcaSlicer_Mac_bundle_x86_64_${{ github.sha }}" -name '*.tar.gz' -print -quit)
+          arm_bundle=$(find "${{ github.workspace }}/mac_bundles/OrcaSlicer-ImageMap_Mac_bundle_arm64_${{ github.sha }}" -name '*.tar.gz' -print -quit)
+          x86_bundle=$(find "${{ github.workspace }}/mac_bundles/OrcaSlicer-ImageMap_Mac_bundle_x86_64_${{ github.sha }}" -name '*.tar.gz' -print -quit)
           tar -xzvf "$arm_bundle" -C "${{ github.workspace }}/build/arm64"
           tar -xzvf "$x86_bundle" -C "${{ github.workspace }}/build/x86_64"
 
@@ -223,8 +223,8 @@ jobs:
         uses: geekyeggo/delete-artifact@v6
         with:
           name: |
-            OrcaSlicer_Mac_bundle_arm64_${{ github.sha }}
-            OrcaSlicer_Mac_bundle_x86_64_${{ github.sha }}
+            OrcaSlicer-ImageMap_Mac_bundle_arm64_${{ github.sha }}
+            OrcaSlicer-ImageMap_Mac_bundle_x86_64_${{ github.sha }}
 
  # Thanks to RaySajuuk, it's working now
       - name: Sign app and notary
@@ -256,10 +256,10 @@ jobs:
           # Create main OrcaSlicer DMG without the profile validator helper
           mkdir -p ${{ github.workspace }}/build/universal/OrcaSlicer_dmg
           rm -rf ${{ github.workspace }}/build/universal/OrcaSlicer_dmg/*
-          cp -R ${{ github.workspace }}/build/universal/OrcaSlicer/OrcaSlicer.app ${{ github.workspace }}/build/universal/OrcaSlicer_dmg/
+          cp -R ${{ github.workspace }}/build/universal/OrcaSlicer/OrcaSlicer.app ${{ github.workspace }}/build/universal/OrcaSlicer_dmg/OrcaSlicer-ImageMap.app
           ln -sfn /Applications ${{ github.workspace }}/build/universal/OrcaSlicer_dmg/Applications
-          hdiutil create -volname "OrcaSlicer" -srcfolder ${{ github.workspace }}/build/universal/OrcaSlicer_dmg -ov -format UDZO OrcaSlicer_Mac_universal_${{ env.ver }}.dmg
-          codesign --deep --force --verbose --options runtime --timestamp --entitlements ${{ github.workspace }}/scripts/disable_validation.entitlements --sign "$CERTIFICATE_ID" OrcaSlicer_Mac_universal_${{ env.ver }}.dmg
+          hdiutil create -volname "OrcaSlicer-ImageMap" -srcfolder ${{ github.workspace }}/build/universal/OrcaSlicer_dmg -ov -format UDZO OrcaSlicer-ImageMap_Mac_universal_${{ env.ver }}.dmg
+          codesign --deep --force --verbose --options runtime --timestamp --entitlements ${{ github.workspace }}/scripts/disable_validation.entitlements --sign "$CERTIFICATE_ID" OrcaSlicer-ImageMap_Mac_universal_${{ env.ver }}.dmg
           
           # Create separate OrcaSlicer_profile_validator DMG if the app exists
           if [ -f "${{ github.workspace }}/build/universal/OrcaSlicer/OrcaSlicer_profile_validator.app/Contents/MacOS/OrcaSlicer_profile_validator" ]; then
@@ -272,8 +272,8 @@ jobs:
           fi
           
           # Notarize main DMG
-          xcrun notarytool submit "OrcaSlicer_Mac_universal_${{ env.ver }}.dmg" --apple-id "${{ secrets.APPLE_DEV_ACCOUNT }}" --team-id "${{ secrets.TEAM_ID }}" --password "${{ secrets.APP_PWD }}" --wait
-          xcrun stapler staple OrcaSlicer_Mac_universal_${{ env.ver }}.dmg
+          xcrun notarytool submit "OrcaSlicer-ImageMap_Mac_universal_${{ env.ver }}.dmg" --apple-id "${{ secrets.APPLE_DEV_ACCOUNT }}" --team-id "${{ secrets.TEAM_ID }}" --password "${{ secrets.APP_PWD }}" --wait
+          xcrun stapler staple OrcaSlicer-ImageMap_Mac_universal_${{ env.ver }}.dmg
 
           # Notarize profile validator DMG if it exists
           if [ -f "OrcaSlicer_profile_validator_Mac_universal_${{ env.ver }}.dmg" ]; then
@@ -287,9 +287,9 @@ jobs:
         run: |
           mkdir -p ${{ github.workspace }}/build/universal/OrcaSlicer_dmg
           rm -rf ${{ github.workspace }}/build/universal/OrcaSlicer_dmg/*
-          cp -R ${{ github.workspace }}/build/universal/OrcaSlicer/OrcaSlicer.app ${{ github.workspace }}/build/universal/OrcaSlicer_dmg/
+          cp -R ${{ github.workspace }}/build/universal/OrcaSlicer/OrcaSlicer.app ${{ github.workspace }}/build/universal/OrcaSlicer_dmg/OrcaSlicer-ImageMap.app
           ln -sfn /Applications ${{ github.workspace }}/build/universal/OrcaSlicer_dmg/Applications
-          hdiutil create -volname "OrcaSlicer" -srcfolder ${{ github.workspace }}/build/universal/OrcaSlicer_dmg -ov -format UDZO OrcaSlicer_Mac_universal_${{ env.ver }}.dmg
+          hdiutil create -volname "OrcaSlicer-ImageMap" -srcfolder ${{ github.workspace }}/build/universal/OrcaSlicer_dmg -ov -format UDZO OrcaSlicer-ImageMap_Mac_universal_${{ env.ver }}.dmg
           
           # Create separate OrcaSlicer_profile_validator DMG if the app exists
           if [ -f "${{ github.workspace }}/build/universal/OrcaSlicer/OrcaSlicer_profile_validator.app/Contents/MacOS/OrcaSlicer_profile_validator" ]; then
@@ -304,8 +304,8 @@ jobs:
         if: runner.os == 'macOS' && inputs.macos-combine-only
         uses: actions/upload-artifact@v7
         with:
-          name: OrcaSlicer_Mac_universal_${{ env.ver }}
-          path: ${{ github.workspace }}/OrcaSlicer_Mac_universal_${{ env.ver }}.dmg
+          name: OrcaSlicer-ImageMap_Mac_universal_${{ env.ver }}
+          path: ${{ github.workspace }}/OrcaSlicer-ImageMap_Mac_universal_${{ env.ver }}.dmg
 
       - name: Upload OrcaSlicer_profile_validator DMG mac
         if: runner.os == 'macOS' && inputs.macos-combine-only && !vars.SELF_HOSTED
@@ -321,8 +321,8 @@ jobs:
         with:
           upload_url: https://uploads.github.com/repos/OrcaSlicer/OrcaSlicer/releases/137995723/assets{?name,label}
           release_id: 137995723
-          asset_path: ${{ github.workspace }}/OrcaSlicer_Mac_universal_${{ env.ver }}.dmg
-          asset_name: OrcaSlicer_Mac_universal_nightly.dmg
+          asset_path: ${{ github.workspace }}/OrcaSlicer-ImageMap_Mac_universal_${{ env.ver }}.dmg
+          asset_name: OrcaSlicer-ImageMap_Mac_universal_nightly.dmg
           asset_content_type: application/octet-stream
           max_releases: 1 # optional, if there are more releases than this matching the asset_name, the oldest ones are going to be deleted
 
@@ -375,26 +375,29 @@ jobs:
         working-directory: ${{ github.workspace }}/build
         run: |
           cpack -G NSIS
+          Get-ChildItem -Path . -Filter 'OrcaSlicer*.exe' | ForEach-Object {
+            Rename-Item -Path $_.FullName -NewName ($_.Name -replace '^OrcaSlicer_', 'OrcaSlicer-ImageMap_')
+          }
 
       - name: Pack app
         if: runner.os == 'Windows'
         working-directory: ${{ github.workspace }}/build
         shell: cmd
-        run: '"C:/Program Files/7-Zip/7z.exe" a -tzip OrcaSlicer_Windows_${{ env.ver }}_portable.zip ${{ github.workspace }}/build/OrcaSlicer'
+        run: '"C:/Program Files/7-Zip/7z.exe" a -tzip OrcaSlicer-ImageMap_Windows_${{ env.ver }}_portable.zip ${{ github.workspace }}/build/OrcaSlicer'
 
       - name: Upload artifacts Win zip
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v7
         with:
-          name: OrcaSlicer_Windows_${{ env.ver }}_portable
-          path: ${{ github.workspace }}/build/OrcaSlicer_Windows_${{ env.ver }}_portable.zip
+          name: OrcaSlicer-ImageMap_Windows_${{ env.ver }}_portable
+          path: ${{ github.workspace }}/build/OrcaSlicer-ImageMap_Windows_${{ env.ver }}_portable.zip
 
       - name: Upload artifacts Win installer
         if: runner.os == 'Windows' && !vars.SELF_HOSTED
         uses: actions/upload-artifact@v7
         with:
-          name: OrcaSlicer_Windows_${{ env.ver }}
-          path: ${{ github.workspace }}/build/OrcaSlicer*.exe
+          name: OrcaSlicer-ImageMap_Windows_${{ env.ver }}
+          path: ${{ github.workspace }}/build/OrcaSlicer-ImageMap*.exe
 
       - name: Upload OrcaSlicer_profile_validator Win
         if: runner.os == 'Windows' && !vars.SELF_HOSTED
@@ -409,8 +412,8 @@ jobs:
         with:
           upload_url: https://uploads.github.com/repos/OrcaSlicer/OrcaSlicer/releases/137995723/assets{?name,label}
           release_id: 137995723
-          asset_path: ${{ github.workspace }}/build/OrcaSlicer_Windows_${{ env.ver }}_portable.zip
-          asset_name: OrcaSlicer_Windows_nightly_portable.zip
+          asset_path: ${{ github.workspace }}/build/OrcaSlicer-ImageMap_Windows_${{ env.ver }}_portable.zip
+          asset_name: OrcaSlicer-ImageMap_Windows_nightly_portable.zip
           asset_content_type: application/x-zip-compressed
           max_releases: 1
 
@@ -420,8 +423,8 @@ jobs:
         with:
           upload_url: https://uploads.github.com/repos/OrcaSlicer/OrcaSlicer/releases/137995723/assets{?name,label}
           release_id: 137995723
-          asset_path: ${{ github.workspace }}/build/OrcaSlicer_Windows_Installer_${{ env.ver }}.exe
-          asset_name: OrcaSlicer_Windows_Installer_nightly.exe
+          asset_path: ${{ github.workspace }}/build/OrcaSlicer-ImageMap_Windows_Installer_${{ env.ver }}.exe
+          asset_name: OrcaSlicer-ImageMap_Windows_Installer_nightly.exe
           asset_content_type: application/x-msdownload
           max_releases: 1
 

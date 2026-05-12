@@ -10,7 +10,7 @@
 
 ### An OrcaSlicer Fork with Image Printing Support (via overhang modulation)
 
-[![Build all](https://github.com/OrcaSlicer/OrcaSlicer/actions/workflows/build_all.yml/badge.svg?branch=main)](https://gitlab.com/sentient_stardust/orcaslicer-imagemap/-/packages)
+[![Build all](https://github.com/OrcaSlicer/OrcaSlicer/actions/workflows/build_all.yml/badge.svg?branch=main)](https://github.com/sentientstardust-dev/OrcaSlicer-ImageMap/releases)
 
 Test print with white, beige, light and dark blue PLA:
 ![The Great Wave off Kanagawa - Katsushika Hokusai](https://gradients.garden/gitlab_images/the_great_wave2.jpeg)
@@ -26,7 +26,7 @@ This color sheet was printed with CMYK PLA:
 
 #### Github Repository: <a href="https://github.com/sentientstardust-dev/OrcaSlicer-ImageMap"><img src="https://img.shields.io/badge/OrcaSlicer--ImageMap-181717?style=flat&logo=github&logoColor=white" width="300" alt="GitHub Logo"/> </a>
 #### Gitlab Repository: <a href="https://gitlab.com/sentient_stardust/OrcaSlicer-ImageMap"><img src="https://img.shields.io/badge/OrcaSlicer--ImageMap-181717?style=flat&logo=gitlab&logoColor=white" width="200" alt="GitLab Logo"/> </a>
-#### Downloads: <a href="https://gitlab.com/sentient_stardust/orcaslicer-imagemap/-/packages"><img src="https://img.shields.io/badge/Package_Repository-gray" alt="Package Repository"/> </a>
+#### Downloads: <a href="https://github.com/sentientstardust-dev/OrcaSlicer-ImageMap/releases"><img src="https://img.shields.io/badge/Releases-gray" alt="Releases"/> </a>
 
 ## ⚠️ **IMPORTANT DISCLAIMER** ⚠️
 
@@ -83,14 +83,14 @@ Zoomed-out G-code preview:
 
 ## Beta Release Builds
 
-📥 **[Download the Latest Build](https://gitlab.com/sentient_stardust/orcaslicer-imagemap/-/packages)**  
+📥 **[Download the Latest Build](https://github.com/sentientstardust-dev/OrcaSlicer-ImageMap/releases)**  
 Explore the latest developments in OrcaSlicer-ImageMap with our builds for MacOS and Windows. Feedback is highly appreciated.
 
 # How to install
 
 ## Windows
 
-Download the **Windows Portable build**  for your preferred version from the [releases page](https://gitlab.com/sentient_stardust/orcaslicer-imagemap/-/packages).
+Download the **Windows Portable build**  for your preferred version from the [releases page](https://github.com/sentientstardust-dev/OrcaSlicer-ImageMap/releases).
 
  - 
     <details>
@@ -107,7 +107,7 @@ Download the **Windows Portable build**  for your preferred version from the [re
 
 ## Mac
 
-1. Download the DMG for your computer from the [package repository](https://gitlab.com/sentient_stardust/orcaslicer-imagemap/-/packages)
+1. Download the DMG for your computer from the [Releases](https://github.com/sentientstardust-dev/OrcaSlicer-ImageMap/releases)
 2. Drag OrcaSlicer.app to Application folder.
 3. The macos builds in this repository are not signed, so to run you also need to follow the instructions below:
 
