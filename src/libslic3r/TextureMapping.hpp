@@ -242,6 +242,7 @@ struct TextureMappingGlobalSettings
 {
     bool enabled = false;
     float angle_offset_deg = 0.f;
+    bool preserve_aspect_ratio = false;
     std::string prime_tower_color_mode = "auto";
     uint64_t prime_tower_settings_zone_uid = 0;
     std::string image_file;

@@ -3489,6 +3489,7 @@ void Print::_make_wipe_tower()
         texture.enabled = true;
         texture.generic_fallback_for_missing_channels = auto_mode;
         texture.angle_offset_deg = m_texture_mapping_global_settings.angle_offset_deg;
+        texture.preserve_aspect_ratio = m_texture_mapping_global_settings.preserve_aspect_ratio;
         if (have_settings_zone) {
             texture.settings_zone_enabled = true;
             texture.texture_mapping_mode = settings_zone->texture_mapping_mode;

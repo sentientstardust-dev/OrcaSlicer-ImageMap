@@ -635,6 +635,7 @@ std::string TextureMappingGlobalSettings::serialize() const
     const std::string normalized_mode = normalize_color_mode_name(prime_tower_color_mode);
     if (!enabled &&
         std::abs((std::isfinite(angle_offset_deg) ? angle_offset_deg : 0.f)) <= 1e-6f &&
+        !preserve_aspect_ratio &&
         normalized_mode == "auto" &&
         prime_tower_settings_zone_uid == 0 &&
         image_file.empty() &&
@@ -652,6 +653,7 @@ std::string TextureMappingGlobalSettings::serialize() const
     nlohmann::json prime_tower_texture_mapping;
     prime_tower_texture_mapping["enabled"] = enabled;
     prime_tower_texture_mapping["angle_offset_deg"] = std::clamp(std::isfinite(angle_offset_deg) ? angle_offset_deg : 0.f, 0.f, 360.f);
+    prime_tower_texture_mapping["preserve_aspect_ratio"] = preserve_aspect_ratio;
     prime_tower_texture_mapping["prime_tower_color_mode"] = normalized_mode;
     prime_tower_texture_mapping["settings_zone_uid"] = prime_tower_settings_zone_uid;
     prime_tower_texture_mapping["image_file"] = image_file;
@@ -689,6 +691,7 @@ void TextureMappingGlobalSettings::load(const std::string &serialized)
     const nlohmann::json &prime_tower_texture_mapping = *prime_tower_texture_mapping_it;
     enabled = prime_tower_texture_mapping.value("enabled", false);
     angle_offset_deg = std::clamp(prime_tower_texture_mapping.value("angle_offset_deg", 0.f), 0.f, 360.f);
+    preserve_aspect_ratio = prime_tower_texture_mapping.value("preserve_aspect_ratio", false);
     prime_tower_color_mode = normalize_color_mode_name(prime_tower_texture_mapping.value("prime_tower_color_mode", std::string("auto")));
     prime_tower_settings_zone_uid = prime_tower_texture_mapping.value("settings_zone_uid", uint64_t(0));
     image_file = prime_tower_texture_mapping.value("image_file", std::string());

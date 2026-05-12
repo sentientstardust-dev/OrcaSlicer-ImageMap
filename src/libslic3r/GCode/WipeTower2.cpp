@@ -1419,6 +1419,7 @@ static void prime_tower_textured_path(WipeTowerWriter2& writer,
     const float v = texture.z_max > texture.z_min + EPSILON ?
         std::clamp((print_z - texture.z_min) / (texture.z_max - texture.z_min), 0.f, 1.f) :
         0.f;
+    const float texture_height = texture.z_max > texture.z_min + EPSILON ? texture.z_max - texture.z_min : 0.f;
     const float base_width = std::max(0.05f, texture.max_line_width);
     const float config_min_width = std::clamp(texture.min_line_width, 0.05f, base_width);
     const float min_width_for_positive_spacing = layer_height * float(1. - 0.25 * PI) + 1e-4f;
@@ -1453,7 +1454,7 @@ static void prime_tower_textured_path(WipeTowerWriter2& writer,
             const float t1 = float(step + 1) / float(steps);
             const float mid_distance = travelled + sample_len * (0.5f * (t0 + t1));
             const float u = (mid_distance - texture_path.anchor_distance) / total_length;
-            const float visibility = texture.sample_tool_visibility(current_tool, u, v, normalization_tools);
+            const float visibility = texture.sample_tool_visibility(current_tool, u, v, normalization_tools, total_length, texture_height);
             const float target_width = base_width - (1.f - visibility) * width_range;
             const float flow_scale = prime_tower_flow_scale_for_width(base_width, target_width, layer_height);
             const float centerline_shift = 0.5f * (base_width - reference_width) + 0.5f * (base_width - target_width);

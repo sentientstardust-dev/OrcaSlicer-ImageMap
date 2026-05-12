@@ -44,6 +44,7 @@ struct PrimeTowerTextureRenderSettings
 
     bool enabled = false;
     float angle_offset_deg = 0.f;
+    bool preserve_aspect_ratio = false;
     int color_mode = Auto;
     bool generic_fallback_for_missing_channels = false;
     bool compact_offset_mode = true;
@@ -74,37 +75,48 @@ struct PrimeTowerTextureRenderSettings
         return enabled && (image_valid(false) || image_valid(true));
     }
 
-    float sample_tool_visibility(size_t tool, float u, float v) const
+    float sample_tool_visibility(size_t tool, float u, float v, float wrap_width_mm = 0.f, float height_mm = 0.f) const
     {
-        const float raw_visibility = sample_tool_visibility_raw(tool, u, v);
+        const float raw_visibility = sample_tool_visibility_raw(tool, u, v, wrap_width_mm, height_mm);
         if (!compact_offset_mode)
             return adjusted_tool_visibility(tool, raw_visibility);
 
         float max_visibility = std::clamp(raw_visibility, 0.f, 1.f);
         if (!tool_indices.empty()) {
             for (const size_t candidate_tool : tool_indices) {
-                if (candidate_tool != tool)
-                    max_visibility = std::max(max_visibility, std::clamp(sample_tool_visibility_raw(candidate_tool, u, v), 0.f, 1.f));
+                if (candidate_tool != tool) {
+                    const float candidate_visibility = sample_tool_visibility_raw(candidate_tool, u, v, wrap_width_mm, height_mm);
+                    max_visibility = std::max(max_visibility, std::clamp(candidate_visibility, 0.f, 1.f));
+                }
             }
         } else {
             for (size_t candidate_tool = 0; candidate_tool < filament_colours.size(); ++candidate_tool) {
-                if (candidate_tool != tool)
-                    max_visibility = std::max(max_visibility, std::clamp(sample_tool_visibility_raw(candidate_tool, u, v), 0.f, 1.f));
+                if (candidate_tool != tool) {
+                    const float candidate_visibility = sample_tool_visibility_raw(candidate_tool, u, v, wrap_width_mm, height_mm);
+                    max_visibility = std::max(max_visibility, std::clamp(candidate_visibility, 0.f, 1.f));
+                }
             }
         }
         return max_visibility > 1e-6f ? adjusted_tool_visibility(tool, raw_visibility / max_visibility) :
                                         adjusted_tool_visibility(tool, raw_visibility);
     }
 
-    float sample_tool_visibility(size_t tool, float u, float v, const std::vector<size_t> &normalization_tools) const
+    float sample_tool_visibility(size_t tool,
+                                 float u,
+                                 float v,
+                                 const std::vector<size_t> &normalization_tools,
+                                 float wrap_width_mm = 0.f,
+                                 float height_mm = 0.f) const
     {
-        const float raw_visibility = sample_tool_visibility_raw(tool, u, v);
+        const float raw_visibility = sample_tool_visibility_raw(tool, u, v, wrap_width_mm, height_mm);
         if (!compact_offset_mode || normalization_tools.empty())
             return adjusted_tool_visibility(tool, raw_visibility);
 
         float max_visibility = std::clamp(raw_visibility, 0.f, 1.f);
-        for (const size_t normalization_tool : normalization_tools)
-            max_visibility = std::max(max_visibility, std::clamp(sample_tool_visibility_raw(normalization_tool, u, v), 0.f, 1.f));
+        for (const size_t normalization_tool : normalization_tools) {
+            const float normalization_visibility = sample_tool_visibility_raw(normalization_tool, u, v, wrap_width_mm, height_mm);
+            max_visibility = std::max(max_visibility, std::clamp(normalization_visibility, 0.f, 1.f));
+        }
 
         return max_visibility > 1e-6f ? adjusted_tool_visibility(tool, raw_visibility / max_visibility) :
                                         adjusted_tool_visibility(tool, raw_visibility);
@@ -224,7 +236,7 @@ private:
         }
     }
 
-    float sample_tool_visibility_raw(size_t tool, float u, float v) const
+    float sample_tool_visibility_raw(size_t tool, float u, float v, float wrap_width_mm = 0.f, float height_mm = 0.f) const
     {
         if (!valid())
             return 1.f;
@@ -239,9 +251,34 @@ private:
         } else {
             use_back = back_valid;
         }
+        const float side_width_mm = front_valid && back_valid ? 0.5f * wrap_width_mm : wrap_width_mm;
+        apply_preserved_aspect_ratio(u, v, use_back, side_width_mm, height_mm);
         if (settings_zone_enabled)
             return sample_settings_zone_tool_visibility(tool, u, v, use_back);
         return sample_image_tool_visibility(tool, u, v, use_back);
+    }
+
+    void apply_preserved_aspect_ratio(float &u, float &v, bool back, float side_width_mm, float height_mm) const
+    {
+        if (!preserve_aspect_ratio || side_width_mm <= 1e-6f || height_mm <= 1e-6f)
+            return;
+        const unsigned int width = back ? image_width_back : image_width;
+        const unsigned int height = back ? image_height_back : image_height;
+        if (width == 0 || height == 0)
+            return;
+
+        const float image_aspect = float(width) / float(height);
+        const float target_aspect = side_width_mm / height_mm;
+        if (!std::isfinite(image_aspect) || !std::isfinite(target_aspect) || image_aspect <= 1e-6f || target_aspect <= 1e-6f)
+            return;
+
+        if (target_aspect > image_aspect + 1e-6f) {
+            const float visible_height = std::clamp(image_aspect / target_aspect, 0.f, 1.f);
+            v = std::clamp(v * visible_height, 0.f, 1.f);
+        } else if (image_aspect > target_aspect + 1e-6f) {
+            const float visible_width = std::clamp(target_aspect / image_aspect, 0.f, 1.f);
+            u = std::clamp(0.5f * (1.f - visible_width) + u * visible_width, 0.f, 1.f);
+        }
     }
 
     bool image_valid(bool back) const

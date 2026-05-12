@@ -1098,12 +1098,66 @@ float prime_tower_preview_anchor_distance(const Points &points, const Vec2f &cen
     return best_projection > -std::numeric_limits<float>::max() ? best_distance : fallback_distance;
 }
 
-float prime_tower_preview_texture_v(float z, float texture_z_min, float texture_z_max)
+float prime_tower_preview_preserved_texture_u(float u,
+                                              bool preserve_aspect_ratio,
+                                              unsigned int image_width,
+                                              unsigned int image_height,
+                                              float surface_width,
+                                              float surface_height)
+{
+    if (!preserve_aspect_ratio || image_width == 0 || image_height == 0 || surface_width <= prime_tower_preview_epsilon ||
+        surface_height <= prime_tower_preview_epsilon)
+        return u;
+
+    const float image_aspect = float(image_width) / float(image_height);
+    const float target_aspect = surface_width / surface_height;
+    if (!std::isfinite(image_aspect) || !std::isfinite(target_aspect) || image_aspect <= prime_tower_preview_epsilon ||
+        target_aspect <= prime_tower_preview_epsilon || image_aspect <= target_aspect + prime_tower_preview_epsilon)
+        return u;
+
+    const float visible_width = std::clamp(target_aspect / image_aspect, 0.f, 1.f);
+    return std::clamp(0.5f * (1.f - visible_width) + u * visible_width, 0.f, 1.f);
+}
+
+float prime_tower_preview_preserved_source_v(float source_v,
+                                             bool preserve_aspect_ratio,
+                                             unsigned int image_width,
+                                             unsigned int image_height,
+                                             float surface_width,
+                                             float surface_height)
+{
+    if (!preserve_aspect_ratio || image_width == 0 || image_height == 0 || surface_width <= prime_tower_preview_epsilon ||
+        surface_height <= prime_tower_preview_epsilon)
+        return source_v;
+
+    const float image_aspect = float(image_width) / float(image_height);
+    const float target_aspect = surface_width / surface_height;
+    if (!std::isfinite(image_aspect) || !std::isfinite(target_aspect) || image_aspect <= prime_tower_preview_epsilon ||
+        target_aspect <= prime_tower_preview_epsilon || target_aspect <= image_aspect + prime_tower_preview_epsilon)
+        return source_v;
+
+    const float visible_height = std::clamp(image_aspect / target_aspect, 0.f, 1.f);
+    return std::clamp(source_v * visible_height, 0.f, 1.f);
+}
+
+float prime_tower_preview_texture_v(float z,
+                                    float texture_z_min,
+                                    float texture_z_max,
+                                    bool preserve_aspect_ratio,
+                                    unsigned int image_width,
+                                    unsigned int image_height,
+                                    float surface_width)
 {
     const float v = texture_z_max > texture_z_min + prime_tower_preview_epsilon ?
         std::clamp((z - texture_z_min) / (texture_z_max - texture_z_min), 0.f, 1.f) :
         0.f;
-    return 1.f - v;
+    const float surface_height = texture_z_max > texture_z_min + prime_tower_preview_epsilon ? texture_z_max - texture_z_min : 0.f;
+    return 1.f - prime_tower_preview_preserved_source_v(v,
+                                                        preserve_aspect_ratio,
+                                                        image_width,
+                                                        image_height,
+                                                        surface_width,
+                                                        surface_height);
 }
 
 template<class Points>
@@ -1129,7 +1183,10 @@ GUI::GLModel::Geometry prime_tower_image_preview_geometry(float width,
                                                           float angle_offset_deg,
                                                           float texture_z_min,
                                                           float texture_z_max,
-                                                          int image_slot)
+                                                          int image_slot,
+                                                          bool preserve_aspect_ratio,
+                                                          unsigned int image_width,
+                                                          unsigned int image_height)
 {
     GUI::GLModel::Geometry data;
     data.format = {GUI::GLModel::Geometry::EPrimitiveType::Triangles, GUI::GLModel::Geometry::EVertexLayout::P3N3T2};
@@ -1140,6 +1197,9 @@ GUI::GLModel::Geometry prime_tower_image_preview_geometry(float width,
     const std::array<Vec2f, 4> points = {Vec2f(0.f, 0.f), Vec2f(width, 0.f), Vec2f(width, depth), Vec2f(0.f, depth)};
     const std::array<float, 4> distances = {0.f, width, width + depth, 2.f * width + depth};
     const float total_length = 2.f * (width + depth);
+    const float texture_surface_width = image_slot == 0 ? total_length : 0.5f * total_length;
+    const float texture_surface_height =
+        texture_z_max > texture_z_min + prime_tower_preview_epsilon ? texture_z_max - texture_z_min : 0.f;
     const float anchor_distance = prime_tower_preview_anchor_distance(points,
                                                                       Vec2f(width * 0.5f, depth * 0.5f),
                                                                       prime_tower_preview_anchor_angle(points, angle_offset_deg));
@@ -1157,15 +1217,33 @@ GUI::GLModel::Geometry prime_tower_image_preview_geometry(float width,
     data.reserve_vertices(16 * points.size() * (z_levels.size() - 1));
     data.reserve_indices(24 * points.size() * (z_levels.size() - 1));
 
-    auto texture_u = [anchor_distance, total_length, image_slot](float distance, float mid_distance) {
+    auto texture_u = [anchor_distance,
+                      total_length,
+                      image_slot,
+                      preserve_aspect_ratio,
+                      image_width,
+                      image_height,
+                      texture_surface_width,
+                      texture_surface_height](float distance, float mid_distance) {
         const float raw_u = (distance - anchor_distance) / total_length;
         const float mid_raw_u = (mid_distance - anchor_distance) / total_length;
         const float base = std::floor(mid_raw_u);
         if (image_slot == 0)
-            return std::clamp(raw_u - base, 0.f, 1.f);
-        return image_slot == 1 ?
+            return prime_tower_preview_preserved_texture_u(std::clamp(raw_u - base, 0.f, 1.f),
+                                                           preserve_aspect_ratio,
+                                                           image_width,
+                                                           image_height,
+                                                           texture_surface_width,
+                                                           texture_surface_height);
+        const float u = image_slot == 1 ?
             std::clamp(2.f * (raw_u - base), 0.f, 1.f) :
             std::clamp(2.f * (raw_u - base - 0.5f), 0.f, 1.f);
+        return prime_tower_preview_preserved_texture_u(u,
+                                                       preserve_aspect_ratio,
+                                                       image_width,
+                                                       image_height,
+                                                       texture_surface_width,
+                                                       texture_surface_height);
     };
 
     for (size_t side_idx = 0; side_idx < points.size(); ++side_idx) {
@@ -1225,8 +1303,20 @@ GUI::GLModel::Geometry prime_tower_image_preview_geometry(float width,
             for (size_t z_idx = 0; z_idx + 1 < z_levels.size(); ++z_idx) {
                 const float z0 = z_levels[z_idx];
                 const float z1 = z_levels[z_idx + 1];
-                const float v0 = prime_tower_preview_texture_v(z0, texture_z_min, texture_z_max);
-                const float v1 = prime_tower_preview_texture_v(z1, texture_z_min, texture_z_max);
+                const float v0 = prime_tower_preview_texture_v(z0,
+                                                               texture_z_min,
+                                                               texture_z_max,
+                                                               preserve_aspect_ratio,
+                                                               image_width,
+                                                               image_height,
+                                                               texture_surface_width);
+                const float v1 = prime_tower_preview_texture_v(z1,
+                                                               texture_z_min,
+                                                               texture_z_max,
+                                                               preserve_aspect_ratio,
+                                                               image_width,
+                                                               image_height,
+                                                               texture_surface_width);
                 const unsigned int base = unsigned(data.vertices_count());
 
                 data.add_vertex(Vec3f(p0.x(), p0.y(), z0), normal, Vec2f(u0, v0));
@@ -1516,7 +1606,10 @@ GUI::GLModel::Geometry prime_tower_mesh_image_preview_geometry(const TriangleMes
                                                                float angle_offset_deg,
                                                                float texture_z_min,
                                                                float texture_z_max,
-                                                               int image_slot)
+                                                               int image_slot,
+                                                               bool preserve_aspect_ratio,
+                                                               unsigned int image_width,
+                                                               unsigned int image_height)
 {
     GUI::GLModel::Geometry data;
     data.format = {GUI::GLModel::Geometry::EPrimitiveType::Triangles, GUI::GLModel::Geometry::EVertexLayout::P3N3T2};
@@ -1554,6 +1647,10 @@ GUI::GLModel::Geometry prime_tower_mesh_image_preview_geometry(const TriangleMes
             const float lower_raw1 = (lower.distances[point_idx] + lower_len - lower.anchor_distance) / lower.total_length;
             const float upper_raw0 = (upper.distances[point_idx] - upper.anchor_distance) / upper.total_length;
             const float upper_raw1 = (upper.distances[point_idx] + upper_len - upper.anchor_distance) / upper.total_length;
+            const float lower_surface_width = image_slot == 0 ? lower.total_length : 0.5f * lower.total_length;
+            const float upper_surface_width = image_slot == 0 ? upper.total_length : 0.5f * upper.total_length;
+            const float texture_surface_height =
+                texture_z_max > texture_z_min + prime_tower_preview_epsilon ? texture_z_max - texture_z_min : 0.f;
 
             std::vector<float> cuts = {0.f, 1.f};
             prime_tower_preview_add_raw_u_cuts(cuts, lower_raw0, lower_raw1, image_slot);
@@ -1602,12 +1699,52 @@ GUI::GLModel::Geometry prime_tower_mesh_image_preview_geometry(const TriangleMes
                 const float lower_raw_t1 = lower_raw0 + (lower_raw1 - lower_raw0) * t1;
                 const float upper_raw_t0 = upper_raw0 + (upper_raw1 - upper_raw0) * t0;
                 const float upper_raw_t1 = upper_raw0 + (upper_raw1 - upper_raw0) * t1;
-                const float u0 = prime_tower_preview_texture_u_from_raw(lower_raw_t0, mid_raw, image_slot);
-                const float u1 = prime_tower_preview_texture_u_from_raw(lower_raw_t1, mid_raw, image_slot);
-                const float u2 = prime_tower_preview_texture_u_from_raw(upper_raw_t1, mid_raw, image_slot);
-                const float u3 = prime_tower_preview_texture_u_from_raw(upper_raw_t0, mid_raw, image_slot);
-                const float v0 = prime_tower_preview_texture_v(lower.z, texture_z_min, texture_z_max);
-                const float v1 = prime_tower_preview_texture_v(upper.z, texture_z_min, texture_z_max);
+                const float u0 = prime_tower_preview_preserved_texture_u(prime_tower_preview_texture_u_from_raw(lower_raw_t0,
+                                                                                                                mid_raw,
+                                                                                                                image_slot),
+                                                                         preserve_aspect_ratio,
+                                                                         image_width,
+                                                                         image_height,
+                                                                         lower_surface_width,
+                                                                         texture_surface_height);
+                const float u1 = prime_tower_preview_preserved_texture_u(prime_tower_preview_texture_u_from_raw(lower_raw_t1,
+                                                                                                                mid_raw,
+                                                                                                                image_slot),
+                                                                         preserve_aspect_ratio,
+                                                                         image_width,
+                                                                         image_height,
+                                                                         lower_surface_width,
+                                                                         texture_surface_height);
+                const float u2 = prime_tower_preview_preserved_texture_u(prime_tower_preview_texture_u_from_raw(upper_raw_t1,
+                                                                                                                mid_raw,
+                                                                                                                image_slot),
+                                                                         preserve_aspect_ratio,
+                                                                         image_width,
+                                                                         image_height,
+                                                                         upper_surface_width,
+                                                                         texture_surface_height);
+                const float u3 = prime_tower_preview_preserved_texture_u(prime_tower_preview_texture_u_from_raw(upper_raw_t0,
+                                                                                                                mid_raw,
+                                                                                                                image_slot),
+                                                                         preserve_aspect_ratio,
+                                                                         image_width,
+                                                                         image_height,
+                                                                         upper_surface_width,
+                                                                         texture_surface_height);
+                const float v0 = prime_tower_preview_texture_v(lower.z,
+                                                               texture_z_min,
+                                                               texture_z_max,
+                                                               preserve_aspect_ratio,
+                                                               image_width,
+                                                               image_height,
+                                                               lower_surface_width);
+                const float v1 = prime_tower_preview_texture_v(upper.z,
+                                                               texture_z_min,
+                                                               texture_z_max,
+                                                               preserve_aspect_ratio,
+                                                               image_width,
+                                                               image_height,
+                                                               upper_surface_width);
                 const unsigned int base = unsigned(data.vertices_count());
 
                 data.add_vertex(p0, normal, Vec2f(u0, v0));
@@ -1661,6 +1798,7 @@ void GLWipeTowerVolume::set_prime_tower_image_preview(std::vector<unsigned char>
                                                        unsigned int image_width_back,
                                                        unsigned int image_height_back,
                                                        float angle_offset_deg,
+                                                       bool preserve_aspect_ratio,
                                                        float width,
                                                        float depth,
                                                        float height,
@@ -1686,7 +1824,16 @@ void GLWipeTowerVolume::set_prime_tower_image_preview(std::vector<unsigned char>
             return;
 
         GUI::GLModel::Geometry image_geometry =
-            prime_tower_image_preview_geometry(width, depth, height, angle_offset_deg, texture_z_min, texture_z_max, image_slot);
+            prime_tower_image_preview_geometry(width,
+                                               depth,
+                                               height,
+                                               angle_offset_deg,
+                                               texture_z_min,
+                                               texture_z_max,
+                                               image_slot,
+                                               preserve_aspect_ratio,
+                                               image_w,
+                                               image_h);
         if (image_geometry.is_empty())
             return;
 
@@ -1718,6 +1865,7 @@ void GLWipeTowerVolume::set_prime_tower_image_preview(std::vector<unsigned char>
                                                        unsigned int image_width_back,
                                                        unsigned int image_height_back,
                                                        float angle_offset_deg,
+                                                       bool preserve_aspect_ratio,
                                                        const TriangleMesh &mesh,
                                                        float texture_z_min,
                                                        float texture_z_max)
@@ -1741,7 +1889,14 @@ void GLWipeTowerVolume::set_prime_tower_image_preview(std::vector<unsigned char>
             return;
 
         GUI::GLModel::Geometry image_geometry =
-            prime_tower_mesh_image_preview_geometry(mesh, angle_offset_deg, texture_z_min, texture_z_max, image_slot);
+            prime_tower_mesh_image_preview_geometry(mesh,
+                                                    angle_offset_deg,
+                                                    texture_z_min,
+                                                    texture_z_max,
+                                                    image_slot,
+                                                    preserve_aspect_ratio,
+                                                    image_w,
+                                                    image_h);
         if (image_geometry.is_empty())
             return;
 
@@ -2082,6 +2237,7 @@ int GLVolumeCollection::load_wipe_tower_preview(
                                         prime_tower_image_back.width,
                                         prime_tower_image_back.height,
                                         texture_mapping_global_settings->angle_offset_deg,
+                                        texture_mapping_global_settings->preserve_aspect_ratio,
                                         width,
                                         depth,
                                         height,
@@ -2157,6 +2313,7 @@ int GLVolumeCollection::load_real_wipe_tower_preview(int                 obj_idx
                                         prime_tower_image_back.width,
                                         prime_tower_image_back.height,
                                         texture_mapping_global_settings->angle_offset_deg,
+                                        texture_mapping_global_settings->preserve_aspect_ratio,
                                         wt_mesh,
                                         resolved_texture_z_min,
                                         resolved_texture_z_max);

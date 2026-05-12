@@ -409,6 +409,7 @@ public:
                                         unsigned int image_width_back,
                                         unsigned int image_height_back,
                                         float angle_offset_deg,
+                                        bool preserve_aspect_ratio,
                                         float width,
                                         float depth,
                                         float height,
@@ -421,6 +422,7 @@ public:
                                         unsigned int image_width_back,
                                         unsigned int image_height_back,
                                         float angle_offset_deg,
+                                        bool preserve_aspect_ratio,
                                         const TriangleMesh &mesh,
                                         float texture_z_min,
                                         float texture_z_max);

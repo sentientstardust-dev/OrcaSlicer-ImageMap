@@ -1355,6 +1355,12 @@ public:
         m_prime_tower_mapping_enabled_checkbox->SetValue(m_global_settings.enabled);
         global_root->Add(m_prime_tower_mapping_enabled_checkbox, 0, wxEXPAND | wxALL, gap);
 
+        m_prime_tower_preserve_aspect_ratio_checkbox = new wxCheckBox(global_page, wxID_ANY, _L("Preserve aspect ratio"));
+        m_prime_tower_preserve_aspect_ratio_checkbox->SetValue(m_global_settings.preserve_aspect_ratio);
+        m_prime_tower_preserve_aspect_ratio_checkbox->SetToolTip(
+            _L("Scale the prime tower image without distortion, anchoring its bottom edge at the tower base."));
+        global_root->Add(m_prime_tower_preserve_aspect_ratio_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
         auto *prime_image_box = new wxStaticBoxSizer(wxVERTICAL, global_page, _L("Prime Tower Images"));
         wxButton *load_prime_image_button = nullptr;
         wxButton *clear_prime_image_button = nullptr;
@@ -1552,6 +1558,8 @@ public:
     {
         TextureMappingGlobalSettings settings = m_global_settings;
         settings.enabled = m_prime_tower_mapping_enabled_checkbox != nullptr && m_prime_tower_mapping_enabled_checkbox->GetValue();
+        settings.preserve_aspect_ratio =
+            m_prime_tower_preserve_aspect_ratio_checkbox != nullptr && m_prime_tower_preserve_aspect_ratio_checkbox->GetValue();
         settings.angle_offset_deg = float(std::clamp(m_prime_tower_angle_spin ? m_prime_tower_angle_spin->GetValue() : 0.0, 0.0, 360.0));
         settings.prime_tower_color_mode =
             prime_tower_color_mode_name(m_prime_tower_color_mode_choice ? m_prime_tower_color_mode_choice->GetSelection() : 0);
@@ -1805,6 +1813,7 @@ private:
     wxChoice *m_generic_solver_mode_choice {nullptr};
     wxChoice *m_generic_solver_mix_model_choice {nullptr};
     wxCheckBox *m_prime_tower_mapping_enabled_checkbox {nullptr};
+    wxCheckBox *m_prime_tower_preserve_aspect_ratio_checkbox {nullptr};
     wxStaticText *m_prime_tower_image_label {nullptr};
     wxStaticText *m_prime_tower_image_back_label {nullptr};
     wxSpinCtrlDouble *m_prime_tower_angle_spin {nullptr};
