@@ -22,6 +22,10 @@ on:
       force-build:
         required: false
         type: boolean
+      release-version:
+        required: false
+        type: string
+        default: ''
 
 jobs:
   build_deps:
@@ -137,4 +141,5 @@ jobs:
       cache-path: ${{ inputs.cache-path }}
       os: ${{ inputs.os }}
       arch: ${{ inputs.arch }}
+      release-version: ${{ inputs.release-version }}
     secrets: inherit

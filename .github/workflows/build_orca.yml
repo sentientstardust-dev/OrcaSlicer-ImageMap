@@ -17,6 +17,10 @@ on:
           required: false
           type: boolean
           default: false
+        release-version:
+          required: false
+          type: string
+          default: ''
 
 jobs:
   build_orca:
@@ -65,7 +69,13 @@ jobs:
       - name: Get the version and date on Ubuntu and macOS
         if: runner.os != 'Windows'
         run: |
-          ver_pure=$(cat version_number.txt)
+          ver_pure="${{ inputs.release-version }}"
+          ver_pure=$(printf '%s' "$ver_pure" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^[vV]//')
+          if [ -n "$ver_pure" ]; then
+            printf '%s\n' "$ver_pure" > version_number.txt
+          else
+            ver_pure=$(sed -n '1{s/^[[:space:]]*//;s/[[:space:]]*$//;s/^[vV]//;p;q;}' version_number.txt)
+          fi
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             ver="PR-${{ github.event.number }}"
             git_commit_hash="${{ github.event.pull_request.head.sha }}"
@@ -86,12 +96,18 @@ jobs:
           $ref = "${{ github.ref }}"
           $eventName = "${{ github.event_name }}"
           $prNumber = "${{ github.event.number }}"
+          $versionInput = "${{ inputs.release-version }}".Trim() -replace '^[vV]', ''
 
           if ($eventName -eq 'pull_request') {
               $ver = "PR" + $prNumber
               $git_commit_hash = "${{ github.event.pull_request.head.sha }}"
           } else {
-              $ver = (Get-Content version_number.txt -First 1).Trim()
+              if ($versionInput) {
+                  Set-Content -Path version_number.txt -Value $versionInput -Encoding utf8
+                  $ver = $versionInput
+              } else {
+                  $ver = (Get-Content version_number.txt -First 1).Trim()
+              }
               $ver = "V$ver"
               $git_commit_hash = ""
           }
@@ -377,7 +393,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: OrcaSlicer_Windows_${{ env.ver }}_portable
-          path: ${{ github.workspace }}/build/OrcaSlicer
+          path: ${{ github.workspace }}/build/OrcaSlicer_Windows_${{ env.ver }}_portable.zip
 
       - name: Upload artifacts Win installer
         if: runner.os == 'Windows' && !vars.SELF_HOSTED

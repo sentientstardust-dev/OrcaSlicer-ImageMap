@@ -17,6 +17,19 @@ on:
         description: 'Build macOS x86_64 and universal artifacts'
         type: boolean
         default: false
+      release_version:
+        description: 'Version number to build and publish, for example 1.0.9. Defaults to version_number.txt'
+        type: string
+        required: false
+        default: ''
+      publish_release:
+        description: 'Publish Windows and macOS artifacts to a GitHub release'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
@@ -31,6 +44,7 @@ jobs:
     with:
       os: ${{ vars.SELF_HOSTED && 'orca-lnx-server' || 'ubuntu-24.04' }}
       build-deps-only: ${{ inputs.build-deps-only || false }}
+      release-version: ${{ inputs.release_version || '' }}
     secrets: inherit
   build_windows:
     if: ${{ !cancelled() && (github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/'))) }}
@@ -39,6 +53,7 @@ jobs:
       os: ${{ vars.SELF_HOSTED && 'orca-win-server' || 'windows-latest' }}
       build-deps-only: ${{ inputs.build-deps-only || false }}
       force-build: false
+      release-version: ${{ inputs.release_version || '' }}
     secrets: inherit
   build_macos_arch:
     strategy:
@@ -52,6 +67,7 @@ jobs:
       arch: ${{ matrix.arch }}
       build-deps-only: ${{ inputs.build-deps-only || false }}
       force-build: false
+      release-version: ${{ inputs.release_version || '' }}
     secrets: inherit
   build_macos_universal:
     name: Build macOS Universal
@@ -62,7 +78,65 @@ jobs:
       os: ${{ vars.SELF_HOSTED && 'orca-macos-arm64' || 'macos-14' }}
       arch: universal
       macos-combine-only: true
+      release-version: ${{ inputs.release_version || '' }}
     secrets: inherit
+  publish_release:
+    name: Publish Release
+    runs-on: ubuntu-24.04
+    needs:
+      - build_windows
+      - build_macos_arch
+      - build_macos_universal
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && (inputs.publish_release || false) && !inputs.build-deps-only && needs.build_windows.result == 'success' && needs.build_macos_arch.result == 'success' && (needs.build_macos_universal.result == 'success' || needs.build_macos_universal.result == 'skipped') }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          lfs: 'false'
+      - name: Get release version
+        id: release_version
+        run: |
+          version="${{ inputs.release_version }}"
+          version=$(printf '%s' "$version" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^[vV]//')
+          if [ -z "$version" ]; then
+            version=$(sed -n '1{s/^[[:space:]]*//;s/[[:space:]]*$//;s/^[vV]//;p;q;}' version_number.txt)
+          fi
+          if ! printf '%s\n' "$version" | grep -Eq '^[0-9]+(\.[0-9]+){2}([-.+][A-Za-z0-9][A-Za-z0-9.-]*)?$'; then
+            echo "Invalid release version: $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release-artifacts
+      - name: Publish GitHub release
+        run: |
+          tag="${{ steps.release_version.outputs.tag }}"
+          version="${{ steps.release_version.outputs.version }}"
+          mapfile -t assets < <(find release-artifacts -type f \( \
+            -name "OrcaSlicer_Mac_*_V$version.dmg" -o \
+            -name "OrcaSlicer_Windows_V${version}_portable.zip" -o \
+            -name "OrcaSlicer_Windows_Installer_V${version}.exe" \
+          \) ! -name '*profile_validator*' | sort)
+
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No release assets found for version $version" >&2
+            find release-artifacts -type f | sort >&2
+            exit 1
+          fi
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" \
+              --target "$GITHUB_SHA" \
+              --title "OrcaSlicer $version" \
+              --notes "Automated build from $GITHUB_SHA"
+          fi
   unit_tests:
     name: Unit Tests
     runs-on: ${{ vars.SELF_HOSTED && 'orca-lnx-server' || 'ubuntu-24.04' }}
@@ -142,7 +216,13 @@ jobs:
     - uses: actions/checkout@v6
     - name: Get the version and date
       run: |
-        ver_pure=$(cat version_number.txt)
+        ver_pure="${{ inputs.release_version }}"
+        ver_pure=$(printf '%s' "$ver_pure" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^[vV]//')
+        if [ -n "$ver_pure" ]; then
+          printf '%s\n' "$ver_pure" > version_number.txt
+        else
+          ver_pure=$(sed -n '1{s/^[[:space:]]*//;s/[[:space:]]*$//;s/^[vV]//;p;q;}' version_number.txt)
+        fi
         if [[ "${{ github.event_name }}" == "pull_request" ]]; then
           ver="PR-${{ github.event.number }}"
           git_commit_hash="${{ github.event.pull_request.head.sha }}"
