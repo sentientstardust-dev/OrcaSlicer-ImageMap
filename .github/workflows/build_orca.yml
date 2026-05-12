@@ -130,6 +130,39 @@ jobs:
           name: OrcaSlicer_Mac_bundle_${{ inputs.arch }}_${{ github.sha }}
           path: ${{ github.workspace }}/OrcaSlicer_Mac_bundle_${{ inputs.arch }}_${{ github.sha }}.tar.gz
 
+      - name: Create macOS arm64 DMG without notary
+        if: runner.os == 'macOS' && !inputs.macos-combine-only && inputs.arch == 'arm64'
+        working-directory: ${{ github.workspace }}
+        run: |
+          mkdir -p ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_dmg
+          rm -rf ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_dmg/*
+          cp -R ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer/OrcaSlicer.app ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_dmg/
+          ln -sfn /Applications ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_dmg/Applications
+          hdiutil create -volname "OrcaSlicer" -srcfolder ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_dmg -ov -format UDZO OrcaSlicer_Mac_${{ inputs.arch }}_${{ env.ver }}.dmg
+
+          if [ -f "${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer/OrcaSlicer_profile_validator.app/Contents/MacOS/OrcaSlicer_profile_validator" ]; then
+            mkdir -p ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_profile_validator_dmg
+            rm -rf ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_profile_validator_dmg/*
+            cp -R ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer/OrcaSlicer_profile_validator.app ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_profile_validator_dmg/
+            ln -sfn /Applications ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_profile_validator_dmg/Applications
+            hdiutil create -volname "OrcaSlicer Profile Validator" -srcfolder ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_profile_validator_dmg -ov -format UDZO OrcaSlicer_profile_validator_Mac_${{ inputs.arch }}_${{ env.ver }}.dmg
+          fi
+
+      - name: Upload macOS arm64 DMG
+        if: runner.os == 'macOS' && !inputs.macos-combine-only && inputs.arch == 'arm64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: OrcaSlicer_Mac_${{ inputs.arch }}_${{ env.ver }}
+          path: ${{ github.workspace }}/OrcaSlicer_Mac_${{ inputs.arch }}_${{ env.ver }}.dmg
+
+      - name: Upload OrcaSlicer_profile_validator macOS arm64 DMG
+        if: runner.os == 'macOS' && !inputs.macos-combine-only && inputs.arch == 'arm64' && !vars.SELF_HOSTED
+        uses: actions/upload-artifact@v7
+        with:
+          name: OrcaSlicer_profile_validator_Mac_${{ inputs.arch }}_DMG_${{ env.ver }}
+          path: ${{ github.workspace }}/OrcaSlicer_profile_validator_Mac_${{ inputs.arch }}_${{ env.ver }}.dmg
+          if-no-files-found: ignore
+
       - name: Download macOS app bundles
         if: runner.os == 'macOS' && inputs.macos-combine-only
         uses: actions/download-artifact@v8
@@ -217,7 +250,7 @@ jobs:
           fi
 
       - name: Create DMG without notary
-        if: github.ref != 'refs/heads/main' && runner.os == 'macOS' && inputs.macos-combine-only
+        if: ${{ runner.os == 'macOS' && inputs.macos-combine-only && !(github.repository == 'OrcaSlicer/OrcaSlicer' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))) }}
         working-directory: ${{ github.workspace }}
         run: |
           mkdir -p ${{ github.workspace }}/build/universal/OrcaSlicer_dmg
