@@ -377,6 +377,8 @@ public:
 
 protected:
     bool on_init() override;
+    void on_load(cereal::BinaryInputArchive& ar) override;
+    void on_save(cereal::BinaryOutputArchive& ar) const override;
     void on_render() override;
     void on_render_input_window(float x, float y, float bottom_limit) override;
     std::string on_get_name() const override;

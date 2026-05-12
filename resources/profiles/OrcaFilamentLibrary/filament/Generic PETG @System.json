@@ -7,5 +7,14 @@
 	"setting_id": "OGFSA04",
 	"filament_id": "OGFG99",
 	"instantiation": "true",
+	"enable_pressure_advance": [
+		"1"
+	],
+	"pressure_advance": [
+		"0.02"
+	],
+	"adaptive_pressure_advance": [
+		"0"
+	],
 	"compatible_printers": []
 }

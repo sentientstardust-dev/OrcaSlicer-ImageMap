@@ -39,6 +39,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <cereal/types/string.hpp>
+#include <cereal/types/vector.hpp>
 #include <boost/log/trivial.hpp>
 #include <nlohmann/json.hpp>
 #include <wx/button.h>
@@ -11837,6 +11839,96 @@ GLGizmoImageProjection::GLGizmoImageProjection(GLCanvas3D& parent, const std::st
 bool GLGizmoImageProjection::on_init()
 {
     return true;
+}
+
+void GLGizmoImageProjection::on_load(cereal::BinaryInputArchive& ar)
+{
+    int mode = int(ProjectionMode::RGBData);
+    uint32_t raw_width = 0;
+    uint32_t raw_height = 0;
+    uint32_t raw_channels = 0;
+    std::vector<unsigned int> raw_filament_slots;
+    std::vector<std::string> raw_filament_colors;
+    std::vector<std::string> raw_filament_hexes;
+    std::vector<uint8_t> raw_offsets;
+    std::vector<uint8_t> raw_mask;
+    std::string raw_metadata_json;
+
+    ar(mode,
+       m_image_path,
+       m_image_error,
+       m_image_rgba,
+       m_image_width,
+       m_image_height,
+       raw_width,
+       raw_height,
+       raw_channels,
+       raw_filament_slots,
+       raw_filament_colors,
+       raw_filament_hexes,
+       raw_offsets,
+       raw_mask,
+       raw_metadata_json,
+       m_show_overlay,
+       m_projection_opacity,
+       m_apply_transparency_as_background,
+       m_pass_through_model,
+       m_convert_existing_colors_to_raw_offsets);
+
+    m_projection_mode = ProjectionMode(std::clamp(mode, 0, 2));
+    m_projection_mode_initialized = false;
+    m_raw_atlas = {};
+    m_raw_atlas.width = raw_width;
+    m_raw_atlas.height = raw_height;
+    m_raw_atlas.channels = raw_channels;
+    const size_t filament_count = std::min({ raw_filament_slots.size(), raw_filament_colors.size(), raw_filament_hexes.size() });
+    m_raw_atlas.filaments.reserve(filament_count);
+    for (size_t idx = 0; idx < filament_count; ++idx)
+        m_raw_atlas.filaments.push_back({ raw_filament_slots[idx], raw_filament_colors[idx], raw_filament_hexes[idx] });
+    m_raw_atlas.offsets = std::move(raw_offsets);
+    m_raw_atlas.mask = std::move(raw_mask);
+    m_raw_atlas.metadata_json = std::move(raw_metadata_json);
+    if (!m_raw_atlas.valid())
+        m_raw_atlas = {};
+    m_overlay_texture.reset();
+    m_overlay_texture_dirty = !m_image_rgba.empty();
+}
+
+void GLGizmoImageProjection::on_save(cereal::BinaryOutputArchive& ar) const
+{
+    const int mode = int(m_projection_mode);
+    std::vector<unsigned int> raw_filament_slots;
+    std::vector<std::string> raw_filament_colors;
+    std::vector<std::string> raw_filament_hexes;
+    raw_filament_slots.reserve(m_raw_atlas.filaments.size());
+    raw_filament_colors.reserve(m_raw_atlas.filaments.size());
+    raw_filament_hexes.reserve(m_raw_atlas.filaments.size());
+    for (const ImageMapRawFilament &filament : m_raw_atlas.filaments) {
+        raw_filament_slots.push_back(filament.slot);
+        raw_filament_colors.push_back(filament.color);
+        raw_filament_hexes.push_back(filament.hex);
+    }
+
+    ar(mode,
+       m_image_path,
+       m_image_error,
+       m_image_rgba,
+       m_image_width,
+       m_image_height,
+       m_raw_atlas.width,
+       m_raw_atlas.height,
+       m_raw_atlas.channels,
+       raw_filament_slots,
+       raw_filament_colors,
+       raw_filament_hexes,
+       m_raw_atlas.offsets,
+       m_raw_atlas.mask,
+       m_raw_atlas.metadata_json,
+       m_show_overlay,
+       m_projection_opacity,
+       m_apply_transparency_as_background,
+       m_pass_through_model,
+       m_convert_existing_colors_to_raw_offsets);
 }
 
 void GLGizmoImageProjection::on_render()
