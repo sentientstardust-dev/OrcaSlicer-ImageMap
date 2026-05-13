@@ -14,6 +14,7 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND}
         "-DINPUT=${SOFTFEVER_VERSION_FILE}"
         "-DOUTPUT=${LIBSLIC3R_VERSION_CPP}"
+        "-DGIT_COMMIT_HASH=${GIT_COMMIT_HASH}"
         -P "${CMAKE_SOURCE_DIR}/cmake/GenerateSoftFeverVersion.cmake"
     DEPENDS "${SOFTFEVER_VERSION_FILE}" "${CMAKE_SOURCE_DIR}/cmake/GenerateSoftFeverVersion.cmake"
     VERBATIM

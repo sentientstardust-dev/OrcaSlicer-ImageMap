@@ -5,10 +5,9 @@
 #define SLIC3R_APP_KEY "@SLIC3R_APP_KEY@"
 #define SLIC3R_VERSION "@SLIC3R_VERSION@"
 namespace Slic3r { const char* softfever_version(); }
+namespace Slic3r { const char* git_commit_hash(); }
 #define SoftFever_VERSION (Slic3r::softfever_version())
-#ifndef GIT_COMMIT_HASH
-    #define GIT_COMMIT_HASH "0000000" // 0000000 means uninitialized
-#endif
+#define GIT_COMMIT_HASH (Slic3r::git_commit_hash())
 #define SLIC3R_BUILD_ID "@SLIC3R_BUILD_ID@"
 //#define SLIC3R_RC_VERSION "@SLIC3R_VERSION@"
 #define BBL_INTERNAL_TESTING @BBL_INTERNAL_TESTING@
