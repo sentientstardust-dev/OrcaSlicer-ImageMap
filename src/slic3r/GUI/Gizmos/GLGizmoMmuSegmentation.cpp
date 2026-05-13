@@ -13424,7 +13424,8 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
                                                                      raw_values);
                             raw_seeded_pixels[raw_seed_idx] = 1;
                         }
-                        if (m_pass_through_model ||
+                        const bool sample_visible =
+                            m_pass_through_model ||
                             (projection_point_allowed_by_camera_facing(context,
                                                                        world_matrix,
                                                                        world_normal_matrix,
@@ -13436,7 +13437,10 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
                                                          context,
                                                          world_matrix,
                                                          point,
-                                                         projection_visibility_triangle_key(volume_idx, tri_idx)))) {
+                                                         projection_visibility_triangle_key(volume_idx, tri_idx)));
+                        if (!sample_visible && !rewrite_texture_base)
+                            continue;
+                        if (sample_visible) {
                             if (std::optional<ColorRGBA> projected = projected_image_color_at_point(context, world_matrix, point)) {
                                 const bool transparent_sample =
                                     !context.apply_transparency_as_background &&
