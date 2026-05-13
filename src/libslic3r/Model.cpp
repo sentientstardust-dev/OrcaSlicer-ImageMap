@@ -3354,14 +3354,16 @@ size_t ModelVolume::split(unsigned int max_extruders)
         else
             this->object->volumes.insert(this->object->volumes.begin() + (++ivolume), new ModelVolume(object, *this, std::move(mesh)));
 
-        this->object->volumes[ivolume]->set_offset(Vec3d::Zero());
-        this->object->volumes[ivolume]->center_geometry_after_creation();
-        this->object->volumes[ivolume]->translate(offset);
-        this->object->volumes[ivolume]->name = name + "_" + std::to_string(idx + 1);
+        ModelVolume *split_volume = this->object->volumes[ivolume];
+        const Vec3d local_center = split_volume->mesh().bounding_box().center();
+        split_volume->set_offset(Vec3d::Zero());
+        split_volume->center_geometry_after_creation();
+        split_volume->set_offset(offset + split_volume->get_matrix_no_offset() * local_center);
+        split_volume->name = name + "_" + std::to_string(idx + 1);
         //BBS: always set the extruder id the same as original
-        this->object->volumes[ivolume]->config.set("extruder", this->extruder_id());
+        split_volume->config.set("extruder", this->extruder_id());
         //this->object->volumes[ivolume]->config.set("extruder", auto_extruder_id(max_extruders, extruder_counter));
-        this->object->volumes[ivolume]->m_is_splittable = 0;
+        split_volume->m_is_splittable = 0;
         ++ idx;
     }
 

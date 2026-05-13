@@ -3,6 +3,7 @@
 #include "Geometry.hpp"
 #include "libslic3r.h"
 #include "Model.hpp"
+#include "ModelTextureDataRemap.hpp"
 #include "TriangleMeshSlicer.hpp"
 #include "TriangleSelector.hpp"
 #include "ObjectID.hpp"
@@ -45,10 +46,55 @@ static void apply_tolerance(ModelVolume* vol)
     vol->set_offset(vol->get_offset() + rot_norm * z_offset);
 }
 
-static void add_cut_volume(TriangleMesh& mesh, ModelObject* object, const ModelVolume* src_volume, const Transform3d& cut_matrix, const std::string& suffix = {}, ModelVolumeType type = ModelVolumeType::MODEL_PART)
+static void apply_cut_texture_data(ModelVolume *volume, const SimplifyTextureDataSnapshot *source_snapshot, const Transform3d &cut_matrix)
+{
+    if (volume == nullptr || source_snapshot == nullptr || source_snapshot->source == SimplifyColorSource::None ||
+        volume->mesh().empty())
+        return;
+
+    SimplifyTextureDataSnapshot snapshot = *source_snapshot;
+    transform_simplify_texture_data_snapshot(snapshot, cut_matrix);
+    transform_simplify_texture_data_snapshot(snapshot, translation_transform(-volume->get_offset()));
+
+    SimplifyTextureDataResult result = remap_simplify_texture_data(snapshot, volume->mesh().its);
+    apply_simplify_texture_data_result(*volume, std::move(result));
+}
+
+static bool volume_has_remappable_color_data(const ModelVolume &volume)
+{
+    const indexed_triangle_set &its = volume.mesh().its;
+    if (its.vertices.empty() || its.indices.empty())
+        return false;
+
+    if (!volume.texture_mapping_color_facets.empty())
+        return true;
+
+    const bool has_valid_uvs = volume.imported_texture_uv_valid.size() == its.indices.size() &&
+                               volume.imported_texture_uvs_per_face.size() >= its.indices.size() * 6;
+    const bool has_rgba_texture = volume.imported_texture_width > 0 && volume.imported_texture_height > 0 &&
+                                  volume.imported_texture_rgba.size() >=
+                                      size_t(volume.imported_texture_width) * size_t(volume.imported_texture_height) * 4;
+    const bool has_raw_texture = volume.imported_texture_width > 0 && volume.imported_texture_height > 0 &&
+                                 volume.imported_texture_raw_channels > 0 &&
+                                 volume.imported_texture_raw_filament_offsets.size() >=
+                                     size_t(volume.imported_texture_width) * size_t(volume.imported_texture_height) *
+                                         size_t(volume.imported_texture_raw_channels);
+    if (has_valid_uvs && (has_rgba_texture || has_raw_texture))
+        return true;
+
+    return volume.imported_vertex_colors_rgba.size() == its.vertices.size();
+}
+
+static ModelVolume* add_cut_volume(TriangleMesh                      &mesh,
+                                   ModelObject                       *object,
+                                   const ModelVolume                 *src_volume,
+                                   const Transform3d                 &cut_matrix,
+                                   const std::string                 &suffix = {},
+                                   ModelVolumeType                    type = ModelVolumeType::MODEL_PART,
+                                   const SimplifyTextureDataSnapshot *source_snapshot = nullptr)
 {
     if (mesh.empty())
-        return;
+        return nullptr;
 
     mesh.transform(cut_matrix);
     ModelVolume* vol = object->add_volume(mesh);
@@ -61,20 +107,31 @@ static void add_cut_volume(TriangleMesh& mesh, ModelObject* object, const ModelV
     assert(vol->config.id() != src_volume->config.id());
     vol->set_material(src_volume->material_id(), *src_volume->material());
     vol->cut_info = src_volume->cut_info;
+    apply_cut_texture_data(vol, source_snapshot, cut_matrix);
+    return vol;
 }
 
 static void process_volume_cut( ModelVolume* volume, const Transform3d& instance_matrix, const Transform3d& cut_matrix,
-                                ModelObjectCutAttributes attributes, TriangleMesh& upper_mesh, TriangleMesh& lower_mesh)
+                                ModelObjectCutAttributes attributes, TriangleMesh& upper_mesh, TriangleMesh& lower_mesh,
+                                SimplifyTextureDataSnapshot *source_snapshot = nullptr,
+                                const SimplifyTextureDataSnapshot *volume_snapshot = nullptr)
 {
     const auto volume_matrix = volume->get_matrix();
 
     const Transformation cut_transformation = Transformation(cut_matrix);
-    const Transform3d invert_cut_matrix = cut_transformation.get_rotation_matrix().inverse() * translation_transform(-1 * cut_transformation.get_offset());
+    const Transform3d invert_cut_matrix =
+        cut_transformation.get_rotation_matrix().inverse() * translation_transform(-1 * cut_transformation.get_offset());
+    const Transform3d source_to_cut_matrix = invert_cut_matrix * instance_matrix * volume_matrix;
+
+    if (source_snapshot != nullptr) {
+        *source_snapshot = volume_snapshot != nullptr ? *volume_snapshot : snapshot_simplify_texture_data(*volume);
+        transform_simplify_texture_data_snapshot(*source_snapshot, source_to_cut_matrix);
+    }
 
     // Transform the mesh by the combined transformation matrix.
     // Flip the triangles in case the composite transformation is left handed.
     TriangleMesh mesh(volume->mesh());
-    mesh.transform(invert_cut_matrix * instance_matrix * volume_matrix, true);
+    mesh.transform(source_to_cut_matrix, true);
 
     indexed_triangle_set upper_its, lower_its;
     cut_mesh(mesh.its, 0.0f, &upper_its, &lower_its);
@@ -86,7 +143,8 @@ static void process_volume_cut( ModelVolume* volume, const Transform3d& instance
 
 static void process_connector_cut(  ModelVolume* volume, const Transform3d& instance_matrix, const Transform3d& cut_matrix,
                                     ModelObjectCutAttributes attributes, ModelObject* upper, ModelObject* lower,
-                                    std::vector<ModelObject*>& dowels)
+                                    std::vector<ModelObject*>& dowels,
+                                    const SimplifyTextureDataSnapshot *volume_snapshot = nullptr)
 {
     assert(volume->cut_info.is_connector);
     volume->cut_info.set_processed();
@@ -143,15 +201,16 @@ static void process_connector_cut(  ModelVolume* volume, const Transform3d& inst
 
         // Perform cut
         TriangleMesh upper_mesh, lower_mesh;
-        process_volume_cut(volume, Transform3d::Identity(), cut_matrix, attributes, upper_mesh, lower_mesh);
+        SimplifyTextureDataSnapshot source_snapshot;
+        process_volume_cut(volume, Transform3d::Identity(), cut_matrix, attributes, upper_mesh, lower_mesh, &source_snapshot, volume_snapshot);
 
         // add small Z offset to better preview
         upper_mesh.translate((-0.05 * Vec3d::UnitZ()).cast<float>());
         lower_mesh.translate((0.05 * Vec3d::UnitZ()).cast<float>());
 
         // Add cut parts to the related objects
-        add_cut_volume(upper_mesh, upper, volume, cut_matrix, "_A", volume->type());
-        add_cut_volume(lower_mesh, lower, volume, cut_matrix, "_B", volume->type());
+        add_cut_volume(upper_mesh, upper, volume, cut_matrix, "_A", volume->type(), &source_snapshot);
+        add_cut_volume(lower_mesh, lower, volume, cut_matrix, "_B", volume->type(), &source_snapshot);
     }
 }
 
@@ -179,28 +238,30 @@ static void process_modifier_cut(ModelVolume* volume, const Transform3d& instanc
 }
 
 static void process_solid_part_cut(ModelVolume* volume, const Transform3d& instance_matrix, const Transform3d& cut_matrix,
-                            ModelObjectCutAttributes attributes, ModelObject* upper, ModelObject* lower)
+                            ModelObjectCutAttributes attributes, ModelObject* upper, ModelObject* lower,
+                            const SimplifyTextureDataSnapshot *volume_snapshot = nullptr)
 {
     // Perform cut
     TriangleMesh upper_mesh, lower_mesh;
-    process_volume_cut(volume, instance_matrix, cut_matrix, attributes, upper_mesh, lower_mesh);
+    SimplifyTextureDataSnapshot source_snapshot;
+    process_volume_cut(volume, instance_matrix, cut_matrix, attributes, upper_mesh, lower_mesh, &source_snapshot, volume_snapshot);
 
     // Add required cut parts to the objects
 
     if (attributes.has(ModelObjectCutAttribute::KeepAsParts)) {
-        add_cut_volume(upper_mesh, upper, volume, cut_matrix, "_A");
+        add_cut_volume(upper_mesh, upper, volume, cut_matrix, "_A", ModelVolumeType::MODEL_PART, &source_snapshot);
         if (!lower_mesh.empty()) {
-            add_cut_volume(lower_mesh, upper, volume, cut_matrix, "_B");
+            add_cut_volume(lower_mesh, upper, volume, cut_matrix, "_B", ModelVolumeType::MODEL_PART, &source_snapshot);
             upper->volumes.back()->cut_info.is_from_upper = false;
         }
         return;
     }
 
     if (attributes.has(ModelObjectCutAttribute::KeepUpper))
-        add_cut_volume(upper_mesh, upper, volume, cut_matrix);
+        add_cut_volume(upper_mesh, upper, volume, cut_matrix, {}, ModelVolumeType::MODEL_PART, &source_snapshot);
 
     if (attributes.has(ModelObjectCutAttribute::KeepLower) && !lower_mesh.empty())
-        add_cut_volume(lower_mesh, lower, volume, cut_matrix);
+        add_cut_volume(lower_mesh, lower, volume, cut_matrix, {}, ModelVolumeType::MODEL_PART, &source_snapshot);
 }
 
 static void reset_instance_transformation(ModelObject* object, size_t src_instance_idx, 
@@ -321,16 +382,17 @@ const ModelObjectPtrs& Cut::perform_with_plane()
     const Transform3d       inverse_cut_matrix = cut_transformation.get_rotation_matrix().inverse() * translation_transform(-1. * cut_transformation.get_offset());
 
     for (ModelVolume* volume : mo->volumes) {
+        SimplifyTextureDataSnapshot volume_snapshot = snapshot_simplify_texture_data(*volume);
         volume->reset_extra_facets();
 
         if (!volume->is_model_part()) {
             if (volume->cut_info.is_processed)
                 process_modifier_cut(volume, instance_matrix, inverse_cut_matrix, m_attributes, upper, lower);
             else
-                process_connector_cut(volume, instance_matrix, m_cut_matrix, m_attributes, upper, lower, dowels);
+                process_connector_cut(volume, instance_matrix, m_cut_matrix, m_attributes, upper, lower, dowels, &volume_snapshot);
         }
         else if (!volume->mesh().empty())
-            process_solid_part_cut(volume, instance_matrix, m_cut_matrix, m_attributes, upper, lower);
+            process_solid_part_cut(volume, instance_matrix, m_cut_matrix, m_attributes, upper, lower, &volume_snapshot);
     }
 
     // Post-process cut parts
@@ -406,6 +468,18 @@ static void distribute_modifiers_from_object(ModelObject* from_obj, const int in
 static void merge_solid_parts_inside_object(ModelObjectPtrs& objects)
 {
     for (ModelObject* mo : objects) {
+        bool has_remappable_color_data = false;
+        for (const ModelVolume* mv : mo->volumes) {
+            if (mv->is_model_part() && !mv->is_cut_connector() && volume_has_remappable_color_data(*mv)) {
+                has_remappable_color_data = true;
+                break;
+            }
+        }
+        if (has_remappable_color_data) {
+            mo->sort_volumes(true);
+            continue;
+        }
+
         TriangleMesh mesh;
         // Merge all SolidPart but not Connectors
         for (const ModelVolume* mv : mo->volumes) {
@@ -664,4 +738,3 @@ const ModelObjectPtrs& Cut::perform_with_groove(const Groove& groove, const Tran
 }
 
 } // namespace Slic3r
-

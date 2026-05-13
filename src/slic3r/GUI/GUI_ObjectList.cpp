@@ -6019,6 +6019,18 @@ void ObjectList::fix_through_cgal()
     std::vector<std::string>                           succes_models;
     //                   model_name     failing reason
     std::vector<std::pair<std::string, std::string>>   failed_models;
+    ModelRepairColorRemapStats                         color_remap_stats;
+
+    auto merge_color_remap_stats = [&color_remap_stats](const ModelRepairColorRemapStats &stats) {
+        color_remap_stats.had_color_data |= stats.had_color_data;
+        color_remap_stats.remap_requested |= stats.remap_requested;
+        color_remap_stats.remap_skipped |= stats.remap_skipped;
+        color_remap_stats.remap_canceled |= stats.remap_canceled;
+        color_remap_stats.remap_failed |= stats.remap_failed;
+        color_remap_stats.used_fallback_rgba |= stats.used_fallback_rgba;
+        color_remap_stats.volumes_remapped += stats.volumes_remapped;
+        color_remap_stats.volumes_cleared += stats.volumes_cleared;
+    };
 
     std::vector<int> obj_idxs, vol_idxs;
     get_selection_indexes(obj_idxs, vol_idxs);
@@ -6052,7 +6064,7 @@ void ObjectList::fix_through_cgal()
 
     auto plater = wxGetApp().plater();
 
-    auto fix_and_update_progress = [this, plater, model_names](const int obj_idx, const int vol_idx,
+    auto fix_and_update_progress = [this, plater, model_names, &merge_color_remap_stats](const int obj_idx, const int vol_idx,
                                           int model_idx,
                                           ProgressDialog& progress_dlg,
                                           std::vector<std::string>& succes_models,
@@ -6075,7 +6087,10 @@ void ObjectList::fix_through_cgal()
         plater->clear_before_change_mesh(obj_idx);
         const size_t volumes_before = object(obj_idx)->volumes.size();
         std::string res;
-        if (!fix_model_with_cgal_gui(*(object(obj_idx)), vol_idx, progress_dlg, msg, res))
+        ModelRepairColorRemapStats remap_stats;
+        const bool repair_finished = fix_model_with_cgal_gui(*(object(obj_idx)), vol_idx, progress_dlg, msg, res, &remap_stats);
+        merge_color_remap_stats(remap_stats);
+        if (!repair_finished)
             return false;
         //wxGetApp().plater()->changed_mesh(obj_idx);
         object(obj_idx)->ensure_on_bed();
@@ -6096,7 +6111,7 @@ void ObjectList::fix_through_cgal()
         update_item_error_icon(obj_idx, vol_idx);
         update_info_items(obj_idx);
 
-        return true;
+        return !remap_stats.remap_canceled;
     };
 
     Plater::TakeSnapshot snapshot(plater, "Repairing model object");
@@ -6142,6 +6157,14 @@ void ObjectList::fix_through_cgal()
         for (auto& model : failed_models)
             msg += bullet_suf + from_u8(model.first) + ": " + _(model.second);
     }
+    if (color_remap_stats.used_fallback_rgba)
+        msg += "\n\n" + _L("Some image textures could not be regenerated after repair; texture colors were preserved as RGBA data.");
+    if (color_remap_stats.remap_failed && color_remap_stats.volumes_cleared > 0)
+        msg += "\n\n" + _L("Some color data could not be remapped after repair and was cleared.");
+    if (color_remap_stats.remap_skipped && color_remap_stats.volumes_cleared > 0)
+        msg += "\n\n" + _L("Color remapping was skipped; stale color data was cleared from repaired parts.");
+    if (color_remap_stats.remap_canceled && color_remap_stats.volumes_cleared > 0)
+        msg += "\n\n" + _L("Color remapping was canceled; stale color data was cleared from repaired parts.");
     if (msg.IsEmpty())
         msg = _L("Repairing was canceled");
     plater->get_notification_manager()->push_notification(NotificationType::CgalFinished, NotificationManager::NotificationLevel::PrintInfoShortNotificationLevel, into_u8(msg));

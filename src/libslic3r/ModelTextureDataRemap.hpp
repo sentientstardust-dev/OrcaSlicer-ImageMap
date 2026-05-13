@@ -63,6 +63,8 @@ using SimplifyTextureProgressFn = std::function<void(int)>;
 
 SimplifyTextureDataSnapshot snapshot_simplify_texture_data(const ModelVolume &volume);
 
+void transform_simplify_texture_data_snapshot(SimplifyTextureDataSnapshot &snapshot, const Transform3d &transform);
+
 SimplifyTextureDataResult remap_simplify_texture_data(const SimplifyTextureDataSnapshot &snapshot,
                                                        const indexed_triangle_set       &simplified_mesh,
                                                        const SimplifyTextureCancelFn    &throw_on_cancel = {},

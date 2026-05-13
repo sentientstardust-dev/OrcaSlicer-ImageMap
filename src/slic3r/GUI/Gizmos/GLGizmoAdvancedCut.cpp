@@ -12,9 +12,11 @@
 #include <algorithm>
 
 #include "slic3r/GUI/GUI_App.hpp"
+#include "slic3r/GUI/NotificationManager.hpp"
 #include "slic3r/GUI/Plater.hpp"
 #include "libslic3r/AppConfig.hpp"
 #include "../GUI/MsgDialog.hpp"
+#include "FixModelByCgal.hpp"
 
 #include <imgui/imgui_internal.h>
 
@@ -662,6 +664,7 @@ void GLGizmoAdvancedCut::perform_cut(const Selection& selection)
         {
             bool is_showed_dialog = false;
             bool user_fix_model   = false;
+            ModelRepairPromptState repair_prompt_state;
             for (size_t i = 0; i < new_objects.size(); i++) {
                 for (size_t j = 0; j < new_objects[i]->volumes.size(); j++) {
                     if (its_num_open_edges(new_objects[i]->volumes[j]->mesh().its) > 0) {
@@ -681,13 +684,38 @@ void GLGizmoAdvancedCut::perform_cut(const Selection& selection)
                         // model_name     failing reason
                         std::vector<std::pair<std::string, std::string>> failed_models;
                         auto                                             plater = wxGetApp().plater();
-                        auto fix_and_update_progress = [this, plater](ModelObject *model_object, const int vol_idx, const string &model_name, ProgressDialog &progress_dlg,
-                                                                      std::vector<std::string> &succes_models, std::vector<std::pair<std::string, std::string>> &failed_models) {
+                        auto fix_and_update_progress =
+                            [this, plater, &repair_prompt_state](ModelObject *model_object, const int vol_idx, const string &model_name,
+                                                                 ProgressDialog &progress_dlg, std::vector<std::string> &succes_models,
+                                                                 std::vector<std::pair<std::string, std::string>> &failed_models) {
                             wxString msg = _L("Repairing model object");
                             msg += ": " + from_u8(model_name) + "\n";
                             std::string res;
-                            if (!fix_model_with_cgal_gui(*model_object, vol_idx, progress_dlg, msg, res)) return false;
-                            return true;
+                            ModelRepairColorRemapStats remap_stats;
+                            if (!fix_model_with_cgal_gui(
+                                    *model_object, vol_idx, progress_dlg, msg, res, &remap_stats, &repair_prompt_state))
+                                return false;
+                            if (remap_stats.used_fallback_rgba)
+                                plater->get_notification_manager()->push_notification(
+                                    NotificationType::CustomNotification,
+                                    NotificationManager::NotificationLevel::PrintInfoNotificationLevel,
+                                    _u8L("Some image textures could not be regenerated after repair; texture colors were preserved as RGBA data."));
+                            if (remap_stats.remap_failed && remap_stats.volumes_cleared > 0)
+                                plater->get_notification_manager()->push_notification(
+                                    NotificationType::CustomNotification,
+                                    NotificationManager::NotificationLevel::PrintInfoNotificationLevel,
+                                    _u8L("Some color data could not be remapped after repair and was cleared."));
+                            if (remap_stats.remap_skipped && remap_stats.volumes_cleared > 0)
+                                plater->get_notification_manager()->push_notification(
+                                    NotificationType::CustomNotification,
+                                    NotificationManager::NotificationLevel::PrintInfoNotificationLevel,
+                                    _u8L("Color remapping was skipped; stale color data was cleared from repaired parts."));
+                            if (remap_stats.remap_canceled && remap_stats.volumes_cleared > 0)
+                                plater->get_notification_manager()->push_notification(
+                                    NotificationType::CustomNotification,
+                                    NotificationManager::NotificationLevel::PrintInfoNotificationLevel,
+                                    _u8L("Color remapping was canceled; stale color data was cleared from repaired parts."));
+                            return !remap_stats.remap_canceled;
                         };
                         ProgressDialog progress_dlg(_L("Repairing model object"), "", 100, find_toplevel_parent(plater), wxPD_AUTO_HIDE | wxPD_APP_MODAL | wxPD_CAN_ABORT, true);
 
