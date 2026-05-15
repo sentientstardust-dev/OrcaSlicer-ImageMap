@@ -167,6 +167,29 @@ Currently builds are not available for linux, you must build this yourself
 - If you want to print with custom colors and not just preset modes (CMYK, RGBW, etc.), select the Generic Solver option. This mode attempts to recreate the colors in your object’s image texture using whatever filaments you assign.
     - If you want to make sure a filament is used on a certain part of your image, set it to a hex color code picked from of that area. Keep in mind if you set your filament color too far from the actual filament, it can affect colors on other parts of your print
 
+# Converting textured models to obj in blender
+<details>
+<summary>How to convert other 3d model formats to obj (so they can be loaded in ImageMap):</summary>
+
+- Step 1: Import your model in blender using File -> Import (and selecting the file type that corresponds to your model)
+- Step 2 (optional): Change the viewport shading mode to 'Material Preview'  in the top right of the viewport, to check that your model textures are loaded properly.
+- Step 3A: Unpack the image textures from your model using File -> External Data -> Unpack Resources. This should work, but often runs into errors when I try to use it, so if it doesn't work go to step 3B. Otherwise skip to step 4.
+- <details>
+    <summary>Step 3B: If you couldn't automatically unpack the model textures, expand this and follow these instructions instead of 3A</summary>
+
+    - Change the editor type to "Image Editor" by clicking the dropdown in the top left of the viewport.
+    - Next click the small picture icon dropdown in the top middle of the screen. It should show a list of image filenames, i.e. Image_0, Image_1, etc.
+    - For each image file that looks like it could be a model texture (has similar colors to your model), repeat this step:
+        - Select the image from the dropdown and then go to "Image -> Save As" in the top bar. Save the image in the folder you are going to export your obj model to
+        - There will often be other kinds of image data here you don't need to unpack (specular maps, etc.). if you're not sure which ones you need it doesn't do any harm to export all of them
+    </details>
+
+- Step 4: After unpacking your model images, you can now export the obj. Go to File -> Export and select "Wavefront (.obj)"
+    - Set Materials -> Path Mode in the export dialog to "Copy"
+    - You can also check that the Up Axis is set to "Y" and UV Coordinates are enabled in this export dialog (but these should be already set by default)
+- Step 5: Your model is now converted to obj. You can now open ImageMap and use File -> Import -> "Import 3MF/STL/STEP/SVG/OBJ/AMF..." to load this obj file with its color image texture.
+</details>
+
 # How to Compile
 
 All updated build instructions for Windows, macOS, and Linux are now available on the official [OrcaSlicer Wiki - How to build](https://www.orcaslicer.com/wiki/how_to_build) page.
