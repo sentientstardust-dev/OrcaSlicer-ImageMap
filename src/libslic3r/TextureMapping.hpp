@@ -272,6 +272,13 @@ struct TextureMappingGlobalSettings
     static bool is_generic_solver_color_mode(const std::string &mode);
 };
 
+struct TextureMappingColorMatch
+{
+    unsigned int filament_id = 0;
+    std::string  expected_color_name;
+    float        perceptual_distance = 0.f;
+};
+
 class TextureMappingManager
 {
 public:
@@ -325,6 +332,10 @@ public:
     static bool auto_adjust_texture_component_ids(TextureMappingZone            &zone,
                                                   size_t                         num_physical,
                                                   const std::vector<std::string> &filament_colours);
+    static std::vector<TextureMappingColorMatch> texture_component_color_matches(const TextureMappingZone      &zone,
+                                                                                 size_t                         num_physical,
+                                                                                 const std::vector<std::string> &filament_colours);
+    static float poor_color_match_distance();
 
     static std::vector<float> default_offset_distances(size_t component_count, float reference_width_mm = 0.4f);
     static std::vector<float> default_offset_angles(size_t component_count);

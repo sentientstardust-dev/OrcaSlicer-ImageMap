@@ -7314,11 +7314,13 @@ static const GCodeUVTextureTriangleCache &uv_texture_triangle_cache_for_gcode(
     return it->second;
 }
 
-static float color_distance_sq_for_gcode(const std::array<float, 3> &lhs, const std::array<float, 3> &rhs)
+static float perceptual_color_distance_sq_for_gcode(const std::array<float, 3> &lhs, const std::array<float, 3> &rhs)
 {
-    const float dr = lhs[0] - rhs[0];
-    const float dg = lhs[1] - rhs[1];
-    const float db = lhs[2] - rhs[2];
+    const std::array<float, 3> lhs_oklab = oklab_from_srgb_for_gcode(lhs);
+    const std::array<float, 3> rhs_oklab = oklab_from_srgb_for_gcode(rhs);
+    const float dr = lhs_oklab[0] - rhs_oklab[0];
+    const float dg = lhs_oklab[1] - rhs_oklab[1];
+    const float db = lhs_oklab[2] - rhs_oklab[2];
     return dr * dr + dg * dg + db * db;
 }
 
@@ -7337,7 +7339,7 @@ static std::vector<size_t> best_matching_component_indices_for_semantic_colors_f
     do {
         float error = 0.f;
         for (size_t role_idx = 0; role_idx < semantic_colors.size(); ++role_idx)
-            error += color_distance_sq_for_gcode(component_colors[permutation[role_idx]], semantic_colors[role_idx]);
+            error += perceptual_color_distance_sq_for_gcode(component_colors[permutation[role_idx]], semantic_colors[role_idx]);
 
         if (error < best_error) {
             best_error = error;

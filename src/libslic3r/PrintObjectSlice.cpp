@@ -248,6 +248,71 @@ static std::vector<std::string> collect_texture_mapping_vertex_color_match_warni
     };
 }
 
+static std::vector<std::string> collect_texture_mapping_filament_color_match_warnings(const PrintObject &print_object)
+{
+    const Print *print = print_object.print();
+    if (print == nullptr)
+        return {};
+
+    const ModelObject *model_object = print_object.model_object();
+    if (model_object == nullptr)
+        return {};
+
+    const size_t num_physical = print->config().filament_colour.size();
+    if (num_physical == 0)
+        return {};
+
+    std::vector<std::string> warnings;
+    std::set<unsigned int> seen_zone_ids;
+    for (const ModelVolume *volume : model_object->volumes) {
+        if (volume == nullptr)
+            continue;
+
+        const std::vector<int> used_extruders = volume->get_extruders();
+        for (const int filament_id : used_extruders) {
+            if (filament_id <= 0)
+                continue;
+
+            const unsigned int filament_id_u = unsigned(filament_id);
+            if (seen_zone_ids.find(filament_id_u) != seen_zone_ids.end())
+                continue;
+            seen_zone_ids.insert(filament_id_u);
+
+            const TextureMappingZone *zone = print->texture_mapping_manager().zone_from_id(filament_id_u);
+            if (zone == nullptr || !zone->enabled || zone->deleted || !zone->is_image_texture())
+                continue;
+
+            const std::vector<TextureMappingColorMatch> matches =
+                TextureMappingManager::texture_component_color_matches(*zone, num_physical, print->config().filament_colour.values);
+            if (matches.empty())
+                continue;
+
+            std::vector<std::string> poor_matches;
+            for (const TextureMappingColorMatch &match : matches) {
+                if (match.perceptual_distance <= TextureMappingManager::poor_color_match_distance())
+                    continue;
+                poor_matches.emplace_back("F" + std::to_string(match.filament_id) + " for " + match.expected_color_name);
+            }
+            if (poor_matches.empty())
+                continue;
+
+            std::string detail;
+            for (size_t idx = 0; idx < poor_matches.size(); ++idx) {
+                if (idx > 0)
+                    detail += ", ";
+                detail += poor_matches[idx];
+            }
+
+            warnings.emplace_back(
+                L("Filaments used in Texture Mapping zone ") +
+                std::to_string(filament_id_u) + L(" do not appear to match the expected colors: ") + detail +
+                L("."));
+        }
+    }
+
+    return warnings;
+}
+
 static const char *vertex_color_mode_name_for_error(int filament_color_mode)
 {
     switch (filament_color_mode) {
@@ -1403,6 +1468,8 @@ void PrintObject::slice_volumes()
     for (const std::string &warning_msg : collect_texture_mapping_outer_wall_gradient_line_width_warnings(*this))
         this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, warning_msg);
     for (const std::string &warning_msg : collect_texture_mapping_vertex_color_match_warnings(*this))
+        this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, warning_msg);
+    for (const std::string &warning_msg : collect_texture_mapping_filament_color_match_warnings(*this))
         this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, warning_msg);
     for (const std::string &error_msg : collect_texture_mapping_vertex_color_mode_mismatch_errors(*this))
         this->active_step_add_warning(PrintStateBase::WarningLevel::CRITICAL, error_msg);

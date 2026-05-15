@@ -82,6 +82,7 @@ std::array<float, 3> mix_color_solver_components(const std::vector<std::array<fl
 std::array<float, 3> mix_color_solver_components(const std::vector<std::array<float, 3>> &component_colors,
                                                  const std::vector<float>                &weights,
                                                  ColorSolverMixModel                       mix_model);
+std::array<float, 3> color_solver_oklab_from_srgb(const std::array<float, 3> &rgb);
 
 std::string color_solver_candidate_cache_key(const std::vector<std::array<float, 3>> &component_colors,
                                              ColorSolverMixModel                       mix_model,

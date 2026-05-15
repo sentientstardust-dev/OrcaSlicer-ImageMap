@@ -362,6 +362,11 @@ std::array<float, 3> mix_color_solver_components(const std::vector<std::array<fl
     return pigment_painter::mix_srgb(component_colors, safe_weights);
 }
 
+std::array<float, 3> color_solver_oklab_from_srgb(const std::array<float, 3> &rgb)
+{
+    return oklab_from_srgb(rgb);
+}
+
 std::string color_solver_candidate_cache_key(const std::vector<std::array<float, 3>> &component_colors,
                                              ColorSolverMixModel                       mix_model,
                                              int                                       total_units)

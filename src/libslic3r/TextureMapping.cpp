@@ -22,6 +22,7 @@ namespace {
 constexpr unsigned int TextureMappingZoneIdBase = 99;
 constexpr unsigned int MaxTextureMappingZoneId = 255;
 constexpr const char *TextureMappingGapDisplayColor = "#8C8C8C";
+constexpr float TextureMappingPoorColorMatchDistance = 0.22f;
 
 struct RGB {
     int r = 0;
@@ -379,11 +380,22 @@ static RGB filament_color(unsigned int id, const std::vector<std::string> &filam
     return {};
 }
 
-static float color_distance_sq(const RGB &lhs, const RGB &rhs)
+static std::array<float, 3> rgb_to_srgb01(const RGB &color)
 {
-    const float dr = float(lhs.r - rhs.r);
-    const float dg = float(lhs.g - rhs.g);
-    const float db = float(lhs.b - rhs.b);
+    return {
+        float(std::clamp(color.r, 0, 255)) / 255.f,
+        float(std::clamp(color.g, 0, 255)) / 255.f,
+        float(std::clamp(color.b, 0, 255)) / 255.f
+    };
+}
+
+static float perceptual_color_distance_sq(const RGB &lhs, const RGB &rhs)
+{
+    const std::array<float, 3> lhs_oklab = color_solver_oklab_from_srgb(rgb_to_srgb01(lhs));
+    const std::array<float, 3> rhs_oklab = color_solver_oklab_from_srgb(rgb_to_srgb01(rhs));
+    const float dr = lhs_oklab[0] - rhs_oklab[0];
+    const float dg = lhs_oklab[1] - rhs_oklab[1];
+    const float db = lhs_oklab[2] - rhs_oklab[2];
     return dr * dr + dg * dg + db * db;
 }
 
@@ -401,6 +413,24 @@ static std::vector<RGB> semantic_colors(int filament_color_mode)
     case int(TextureMappingZone::FilamentColorBW):   return {{0, 0, 0}, {255, 255, 255}};
     case int(TextureMappingZone::FilamentColorCMYKW): return {{0, 255, 255}, {255, 0, 255}, {255, 255, 0}, {0, 0, 0}, {255, 255, 255}};
     case int(TextureMappingZone::FilamentColorRGBKW): return {{255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {0, 0, 0}, {255, 255, 255}};
+    default:                                         return {};
+    }
+}
+
+static std::vector<std::string> semantic_color_names(int filament_color_mode)
+{
+    switch (clamp_int(filament_color_mode,
+                      int(TextureMappingZone::FilamentColorAny),
+                      int(TextureMappingZone::FilamentColorRGBKW))) {
+    case int(TextureMappingZone::FilamentColorRGB):  return {"Red", "Green", "Blue"};
+    case int(TextureMappingZone::FilamentColorCMY):  return {"Cyan", "Magenta", "Yellow"};
+    case int(TextureMappingZone::FilamentColorCMYK): return {"Cyan", "Magenta", "Yellow", "Black"};
+    case int(TextureMappingZone::FilamentColorCMYW): return {"Cyan", "Magenta", "Yellow", "White"};
+    case int(TextureMappingZone::FilamentColorRGBK): return {"Red", "Green", "Blue", "Black"};
+    case int(TextureMappingZone::FilamentColorRGBW): return {"Red", "Green", "Blue", "White"};
+    case int(TextureMappingZone::FilamentColorBW):   return {"Black", "White"};
+    case int(TextureMappingZone::FilamentColorCMYKW): return {"Cyan", "Magenta", "Yellow", "Black", "White"};
+    case int(TextureMappingZone::FilamentColorRGBKW): return {"Red", "Green", "Blue", "Black", "White"};
     default:                                         return {};
     }
 }
@@ -1412,7 +1442,7 @@ std::vector<unsigned int> TextureMappingManager::effective_texture_component_ids
         for (unsigned int id = 1; id <= num_physical; ++id) {
             if (id < used.size() && used[id])
                 continue;
-            const float distance = color_distance_sq(filament_color(id, filament_colours), target);
+            const float distance = perceptual_color_distance_sq(filament_color(id, filament_colours), target);
             if (distance < best_distance) {
                 best_distance = distance;
                 best_id = id;
@@ -1448,7 +1478,7 @@ std::vector<unsigned int> TextureMappingManager::effective_texture_component_ids
             const unsigned int id = selected[i];
             if (selected_used[i] || id < 1 || id > num_physical)
                 continue;
-            const float distance = color_distance_sq(filament_color(id, filament_colours), role);
+            const float distance = perceptual_color_distance_sq(filament_color(id, filament_colours), role);
             if (distance < best_distance) {
                 best_distance = distance;
                 best_selected = i;
@@ -1500,6 +1530,42 @@ bool TextureMappingManager::auto_adjust_texture_component_ids(TextureMappingZone
     zone.component_ids = encoded;
     zone.component_weights = normalize_weights(zone.component_weights, adjusted.size());
     return true;
+}
+
+std::vector<TextureMappingColorMatch> TextureMappingManager::texture_component_color_matches(
+    const TextureMappingZone      &zone,
+    size_t                         num_physical,
+    const std::vector<std::string> &filament_colours)
+{
+    if (!zone.enabled || zone.deleted || !zone.is_image_texture() || num_physical == 0)
+        return {};
+
+    const size_t expected = expected_component_count(zone.texture_mapping_mode, zone.filament_color_mode);
+    if (expected == 0)
+        return {};
+
+    const std::vector<RGB> roles = semantic_colors(zone.filament_color_mode);
+    const std::vector<std::string> role_names = semantic_color_names(zone.filament_color_mode);
+    if (roles.size() != expected || role_names.size() != expected)
+        return {};
+
+    const std::vector<unsigned int> component_ids = effective_texture_component_ids(zone, num_physical, filament_colours);
+    const size_t count = std::min(expected, component_ids.size());
+    std::vector<TextureMappingColorMatch> matches;
+    matches.reserve(count);
+    for (size_t idx = 0; idx < count; ++idx) {
+        const unsigned int id = component_ids[idx];
+        if (id < 1 || id > num_physical)
+            continue;
+        const float distance = std::sqrt(perceptual_color_distance_sq(filament_color(id, filament_colours), roles[idx]));
+        matches.push_back({id, role_names[idx], distance});
+    }
+    return matches;
+}
+
+float TextureMappingManager::poor_color_match_distance()
+{
+    return TextureMappingPoorColorMatchDistance;
 }
 
 float TextureMappingManager::max_component_surface_offset_mm(float reference_width_mm)
