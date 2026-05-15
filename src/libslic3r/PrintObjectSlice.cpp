@@ -1,14 +1,18 @@
 #include <boost/log/trivial.hpp>
 
 #include <algorithm>
+#include <cmath>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <set>
+#include <sstream>
 
 #include <tbb/parallel_for.h>
 
 #include "ClipperUtils.hpp"
 #include "ElephantFootCompensation.hpp"
+#include "ImageMapRawFilamentOffsetAtlas.hpp"
 #include "I18N.hpp"
 #include "Layer.hpp"
 #include "MultiMaterialSegmentation.hpp"
@@ -164,6 +168,99 @@ static std::vector<std::string> collect_texture_mapping_outer_wall_gradient_line
 
         if (warned_min_line_width && warned_gradient_width_range)
             break;
+    }
+
+    return warnings;
+}
+
+static bool model_volume_has_raw_offset_texture_data(const ModelVolume *volume)
+{
+    return volume != nullptr &&
+           volume->imported_texture_width > 0 &&
+           volume->imported_texture_height > 0 &&
+           volume->imported_texture_raw_channels > 0 &&
+           volume->imported_texture_raw_filament_offsets.size() >=
+               size_t(volume->imported_texture_width) *
+                   size_t(volume->imported_texture_height) *
+                   size_t(volume->imported_texture_raw_channels);
+}
+
+static std::string format_texture_mapping_line_width_mm(double value)
+{
+    std::ostringstream stream;
+    stream << std::fixed << std::setprecision(3) << value;
+    std::string formatted = stream.str();
+    while (formatted.size() > 1 && formatted.back() == '0')
+        formatted.pop_back();
+    if (!formatted.empty() && formatted.back() == '.')
+        formatted.pop_back();
+    return formatted + " mm";
+}
+
+static bool texture_mapping_line_width_differs(double lhs, double rhs)
+{
+    return std::abs(lhs - rhs) > 0.001;
+}
+
+static std::vector<std::string> collect_texture_mapping_raw_atlas_line_width_warnings(const PrintObject &print_object)
+{
+    const Print *print = print_object.print();
+    if (print == nullptr)
+        return {};
+
+    const ModelObject *model_object = print_object.model_object();
+    if (model_object == nullptr)
+        return {};
+
+    const double active_max_line_width_mm =
+        std::max(0.05, print->config().texture_mapping_outer_wall_gradient_max_line_width.value);
+    const double active_min_line_width_mm =
+        std::clamp(print->config().texture_mapping_outer_wall_gradient_min_line_width.value, 0.05, active_max_line_width_mm);
+
+    std::vector<std::string> warnings;
+    std::set<std::string> seen;
+    for (const ModelVolume *volume : model_object->volumes) {
+        if (!model_volume_has_raw_offset_texture_data(volume))
+            continue;
+
+        const ImageMapRawExpectedLineWidth expected =
+            image_map_raw_expected_line_width_from_metadata_json(volume->imported_texture_raw_metadata_json);
+        if (!expected.valid || !expected.warn_if_differs)
+            continue;
+        if (!texture_mapping_line_width_differs(active_min_line_width_mm, expected.min_mm) &&
+            !texture_mapping_line_width_differs(active_max_line_width_mm, expected.max_mm))
+            continue;
+
+        const std::vector<int> used_extruders = volume->get_extruders();
+        for (const int filament_id : used_extruders) {
+            if (filament_id <= 0)
+                continue;
+
+            const unsigned int filament_id_u = unsigned(filament_id);
+            const TextureMappingZone *zone = print->texture_mapping_manager().zone_from_id(filament_id_u);
+            if (zone == nullptr ||
+                !zone->enabled ||
+                zone->deleted ||
+                !zone->is_image_texture() ||
+                zone->texture_mapping_mode != int(TextureMappingZone::TextureMappingRawValues))
+                continue;
+
+            std::ostringstream key_stream;
+            key_stream << filament_id_u << "|" << std::fixed << std::setprecision(3) << expected.min_mm << "|" << expected.max_mm;
+            const std::string key = key_stream.str();
+            if (!seen.insert(key).second)
+                continue;
+
+            warnings.emplace_back(
+                L("Texture mapping zone ") + std::to_string(filament_id_u) +
+                L(" uses a raw filament offset atlas authored for line widths ") +
+                format_texture_mapping_line_width_mm(expected.min_mm) + " - " +
+                format_texture_mapping_line_width_mm(expected.max_mm) +
+                L(", but current texture mapping settings use ") +
+                format_texture_mapping_line_width_mm(active_min_line_width_mm) + " - " +
+                format_texture_mapping_line_width_mm(active_max_line_width_mm) +
+                L(". Update the texture mapping minimum/maximum outer wall line width or regenerate the raw offset atlas."));
+        }
     }
 
     return warnings;
@@ -1466,6 +1563,8 @@ void PrintObject::slice_volumes()
 
     this->apply_conical_overhang();
     for (const std::string &warning_msg : collect_texture_mapping_outer_wall_gradient_line_width_warnings(*this))
+        this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, warning_msg);
+    for (const std::string &warning_msg : collect_texture_mapping_raw_atlas_line_width_warnings(*this))
         this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, warning_msg);
     for (const std::string &warning_msg : collect_texture_mapping_vertex_color_match_warnings(*this))
         this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, warning_msg);

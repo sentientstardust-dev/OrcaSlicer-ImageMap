@@ -102,6 +102,41 @@ static std::string standard_hex_for_color_code(const std::string &color)
     return "#FFFFFF";
 }
 
+static ImageMapRawExpectedLineWidth expected_line_width_from_json(const nlohmann::json &root)
+{
+    ImageMapRawExpectedLineWidth expected;
+    const auto it = root.find("expected_line_width_mm");
+    if (it == root.end() || !it->is_object())
+        return expected;
+    const nlohmann::json &entry = *it;
+    const auto min_it = entry.find("min");
+    const auto max_it = entry.find("max");
+    if (min_it == entry.end() || max_it == entry.end() || !min_it->is_number() || !max_it->is_number())
+        return expected;
+    expected.min_mm = min_it->get<double>();
+    expected.max_mm = max_it->get<double>();
+    if (!std::isfinite(expected.min_mm) || !std::isfinite(expected.max_mm) || expected.min_mm <= 0.0 || expected.max_mm <= 0.0 ||
+        expected.max_mm < expected.min_mm) {
+        expected = {};
+        return expected;
+    }
+    const auto warn_it = entry.find("warn_if_differs");
+    expected.warn_if_differs = warn_it != entry.end() && warn_it->is_boolean() ? warn_it->get<bool>() : false;
+    expected.valid = true;
+    return expected;
+}
+
+static ImageMapRawExpectedLineWidth expected_line_width_from_metadata_json(const std::string &metadata_json)
+{
+    try {
+        const nlohmann::json root = nlohmann::json::parse(metadata_json);
+        if (root.is_object())
+            return expected_line_width_from_json(root);
+    } catch (...) {
+    }
+    return {};
+}
+
 static nlohmann::json atlas_metadata_json(const ImageMapRawFilamentOffsetAtlas &atlas, uint32_t header_rows)
 {
     const uint32_t region_count = (atlas.channels + 2u) / 3u;
@@ -120,6 +155,15 @@ static nlohmann::json atlas_metadata_json(const ImageMapRawFilamentOffsetAtlas &
         if (!filament.hex.empty())
             entry["hex"] = filament.hex;
         root["filaments"].push_back(std::move(entry));
+    }
+    const ImageMapRawExpectedLineWidth expected =
+        atlas.expected_line_width_mm.valid ? atlas.expected_line_width_mm : expected_line_width_from_metadata_json(atlas.metadata_json);
+    if (expected.valid) {
+        root["expected_line_width_mm"] = {
+            { "min", expected.min_mm },
+            { "max", expected.max_mm },
+            { "warn_if_differs", expected.warn_if_differs }
+        };
     }
     root["regions"] = nlohmann::json::array();
     for (uint32_t region_idx = 0; region_idx < region_count; ++region_idx) {
@@ -237,6 +281,11 @@ std::vector<ImageMapRawFilament> image_map_raw_filaments_from_metadata_json(cons
     return image_map_raw_filaments_for_channels(filaments, channels);
 }
 
+ImageMapRawExpectedLineWidth image_map_raw_expected_line_width_from_metadata_json(const std::string &metadata_json)
+{
+    return expected_line_width_from_metadata_json(metadata_json);
+}
+
 std::vector<std::string> image_map_raw_filament_channel_keys(const std::vector<ImageMapRawFilament> &filaments)
 {
     std::vector<std::string> keys;
@@ -320,6 +369,7 @@ bool decode_image_map_raw_filament_offset_atlas(const std::vector<uint8_t> &rgba
     decoded.offsets.assign(size_t(decoded.width) * size_t(decoded.height) * size_t(decoded.channels), 0);
     decoded.mask.assign(size_t(decoded.width) * size_t(decoded.height), 255);
     decoded.metadata_json = metadata;
+    decoded.expected_line_width_mm = expected_line_width_from_json(root);
 
     const nlohmann::json filaments = root.value("filaments", nlohmann::json::array());
     if (filaments.is_array()) {
