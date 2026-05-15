@@ -20,6 +20,18 @@ This color sheet was printed with CMYK PLA:
 ![CMYW Test Sheet](https://gradients.garden/gitlab_images/cmyw_test_sheet.jpeg)
 (test sheet image Designed by Freepik)
 
+<details>
+<summary>More example prints</summary>
+
+Grayscale:
+![Grayscale test](https://gradients.garden/gitlab_images/grayscale_test_1.jpeg)
+
+CMYK:
+![Van Gogh Art Cube](https://gradients.garden/gitlab_images/artcube2.jpeg)
+
+
+</details>
+
 <h3>
 
 # Official links
@@ -74,10 +86,14 @@ Zoomed-out G-code preview:
 
 ![2D Gradients](https://gradients.garden/gitlab_images/slicergradients.jpeg)
 
-### Paintable regions
-- Texture mapping and gradients integrate with OrcaSlicer color painting, so if you wanted you could have texture mapping only on one part of the model, and a solid filament color or gradient somewhere else.
+### Works with Filament Painting
+- Texture mapping and gradients integrate with OrcaSlicer filament region painting, so you can have texture mapping on one part of the model, and a solid filament color or gradient somewhere else.
 
-### RGB Color Painting
+### Simplify/Repair/Cut Textured Models
+- When using these model utilities, image textures are remapped to the resulting mesh, allowing you to keep your textures.
+
+![Color Cut Tool 1](https://gradients.garden/gitlab_images/color_cut_tool_1.jpeg)
+![Color Cut Tool 1](https://gradients.garden/gitlab_images/color_cut_tool_2.jpeg)
 
 # Download
 
@@ -135,6 +151,21 @@ Download the **Windows Portable build**  for your preferred version from the [re
 ## Linux
 
 Currently builds are not available for linux, you must build this yourself
+
+# Tips and advice for printing with image textures:
+### Filament
+- In my test prints shown above I used PLA with transmission distances of around 2-4
+    - Avoid using filament with higher TD values, such as filaments labelled 'translucent' or 'transparent', as they are likely to lead to washed out/pale colors (this technique works by overhanging filament sagging and blocking the layer below, so if you use filament that is too translucent the color below will still be visible).
+    - On the other hand, filament that is very opaque can cause horizontal lines to be too visible, so I recommend filaments with middle ground TD values
+    - If you don’t have a TD measurement device you can look up community sourced filament TD values on filamentcolors.xyz or 3dfilamentprofiles.com
+### Overhang amount
+- The range between the minimum and maximum outer wall line width in Multimaterial settings determines the maximum overhang amount, which will affect the strength of your colors (essentially, larger range -> stronger colors). 
+    - The default min/max values are 0.32-0.95 for a 0.4mm nozzle, if you use a different size nozzle you should change these values accordingly.
+    - With smaller nozzles than 0.4mm you won't be able to achieve as much overhang, so might have to use opaque filament to avoid faded colors.
+    - When adjusting these limits keep in mind that they are bounded by what is physically possible with your nozzle. Setting them too large or small could cause print instability, bad results, or even damage your printer. Change at your own risk - if you don't know what you're doing, leave them at their defaults.
+### Color mode
+- If you want to print with custom colors and not just preset modes (CMYK, RGBW, etc.), select the Generic Solver option. This mode attempts to recreate the colors in your object’s image texture using whatever filaments you assign.
+    - If you want to make sure a filament is used on a certain part of your image, set it to a hex color code picked from of that area. Keep in mind if you set your filament color too far from the actual filament, it can affect colors on other parts of your print
 
 # How to Compile
 
