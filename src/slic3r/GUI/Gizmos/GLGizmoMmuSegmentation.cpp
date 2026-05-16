@@ -13380,19 +13380,23 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
                     for (int x_px = min_x; x_px <= max_x; ++x_px) {
                         const Vec2f pixel(float(x_px) + 0.5f, float(y_px) + 0.5f);
                         Vec3f barycentric = Vec3f::Zero();
-                        if (generated_texture) {
-                            if (!barycentric_weights_2d(pixel, pixel_uvs[0], pixel_uvs[1], pixel_uvs[2], barycentric))
-                                continue;
-                            if (barycentric.x() < -1e-4f || barycentric.y() < -1e-4f || barycentric.z() < -1e-4f)
-                                barycentric = normalized_nonnegative_barycentric(barycentric);
-                        } else {
-                            if (!conservative_barycentric_weights_2d(pixel,
-                                                                      pixel_uvs[0],
-                                                                      pixel_uvs[1],
-                                                                      pixel_uvs[2],
-                                                                      float(padding_px) + 0.7072f,
-                                                                      barycentric))
-                                continue;
+                        if (!conservative_barycentric_weights_2d(pixel,
+                                                                  pixel_uvs[0],
+                                                                  pixel_uvs[1],
+                                                                  pixel_uvs[2],
+                                                                  float(padding_px) + 0.7072f,
+                                                                  barycentric))
+                            continue;
+
+                        Vec3f projection_barycentric = barycentric;
+                        bool projection_sample = true;
+                        if (generated_texture && padding_px > 0) {
+                            projection_sample = conservative_barycentric_weights_2d(pixel,
+                                                                                    pixel_uvs[0],
+                                                                                    pixel_uvs[1],
+                                                                                    pixel_uvs[2],
+                                                                                    0.7072f,
+                                                                                    projection_barycentric);
                         }
 
                         const Vec3f point = vertices[0] * barycentric.x() +
@@ -13424,24 +13428,29 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
                                                                      raw_values);
                             raw_seeded_pixels[raw_seed_idx] = 1;
                         }
+                        const Vec3f projection_point = vertices[0] * projection_barycentric.x() +
+                                                       vertices[1] * projection_barycentric.y() +
+                                                       vertices[2] * projection_barycentric.z();
                         const bool sample_visible =
-                            m_pass_through_model ||
-                            (projection_point_allowed_by_camera_facing(context,
-                                                                       world_matrix,
-                                                                       world_normal_matrix,
-                                                                       vertex_normals,
-                                                                       tri,
-                                                                       point,
-                                                                       barycentric) &&
-                             projection_point_is_visible(visibility,
-                                                         context,
-                                                         world_matrix,
-                                                         point,
-                                                         projection_visibility_triangle_key(volume_idx, tri_idx)));
+                            projection_sample &&
+                            (m_pass_through_model ||
+                             (projection_point_allowed_by_camera_facing(context,
+                                                                        world_matrix,
+                                                                        world_normal_matrix,
+                                                                        vertex_normals,
+                                                                        tri,
+                                                                        projection_point,
+                                                                        projection_barycentric) &&
+                              projection_point_is_visible(visibility,
+                                                          context,
+                                                          world_matrix,
+                                                          projection_point,
+                                                          projection_visibility_triangle_key(volume_idx, tri_idx))));
                         if (!sample_visible && !rewrite_texture_base)
                             continue;
                         if (sample_visible) {
-                            if (std::optional<ColorRGBA> projected = projected_image_color_at_point(context, world_matrix, point)) {
+                            if (std::optional<ColorRGBA> projected =
+                                    projected_image_color_at_point(context, world_matrix, projection_point)) {
                                 const bool transparent_sample =
                                     !context.apply_transparency_as_background &&
                                     !projection_overlay_has_paintable_alpha(*projected, context);

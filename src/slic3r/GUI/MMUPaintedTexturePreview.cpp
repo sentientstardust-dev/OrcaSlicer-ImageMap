@@ -191,23 +191,47 @@ std::array<Vec2f, 3> unwrap_triangle_uvs(const Vec2f &uv0, const Vec2f &uv1, con
             use_u_axis ? out[1].x() : out[1].y(),
             use_u_axis ? out[2].x() : out[2].y()
         };
-        const float value_min = std::min({ values[0], values[1], values[2] });
-        const float value_max = std::max({ values[0], values[1], values[2] });
-        if (value_max - value_min <= 0.5f)
+
+        if (!std::all_of(values.begin(), values.end(), [](float value) { return std::isfinite(value); }))
             return;
 
-        for (float &value : values)
-            if (value < 0.5f)
-                value += 1.f;
+        auto span = [](const std::array<float, 3> &v) {
+            return std::max({ v[0], v[1], v[2] }) - std::min({ v[0], v[1], v[2] });
+        };
+
+        const bool has_repeat_evidence = std::any_of(values.begin(), values.end(), [](float value) {
+            constexpr float eps = 1e-6f;
+            return value < -eps || value > 1.f + eps;
+        });
+        const float original_span = span(values);
+        if (!has_repeat_evidence || original_span <= 0.5f)
+            return;
+
+        std::array<float, 3> best = values;
+        float best_span = original_span;
+        for (size_t anchor = 0; anchor < values.size(); ++anchor) {
+            std::array<float, 3> candidate = values;
+            for (size_t i = 0; i < candidate.size(); ++i) {
+                const float delta = values[i] - values[anchor];
+                candidate[i] = values[anchor] + delta - std::round(delta);
+            }
+            const float candidate_span = span(candidate);
+            if (candidate_span + 1e-6f < best_span) {
+                best = candidate;
+                best_span = candidate_span;
+            }
+        }
+        if (best_span >= original_span - 1e-6f)
+            return;
 
         if (use_u_axis) {
-            out[0].x() = values[0];
-            out[1].x() = values[1];
-            out[2].x() = values[2];
+            out[0].x() = best[0];
+            out[1].x() = best[1];
+            out[2].x() = best[2];
         } else {
-            out[0].y() = values[0];
-            out[1].y() = values[1];
-            out[2].y() = values[2];
+            out[0].y() = best[0];
+            out[1].y() = best[1];
+            out[2].y() = best[2];
         }
     };
 
