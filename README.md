@@ -10,7 +10,7 @@
 
 ### An OrcaSlicer Fork with Image Printing Support (via overhang modulation)
 
-[![Build all](https://github.com/OrcaSlicer/OrcaSlicer/actions/workflows/build_all.yml/badge.svg?branch=main)](https://github.com/sentientstardust-dev/OrcaSlicer-ImageMap/releases)
+[![Build all](https://github.com/sentientstardust-dev/OrcaSlicer-ImageMap/actions/workflows/build_all.yml/badge.svg?branch=main)](https://github.com/sentientstardust-dev/OrcaSlicer-ImageMap/releases)
 
 Test print with white, beige, light and dark blue PLA:
 ![The Great Wave off Kanagawa - Katsushika Hokusai](https://gradients.garden/gitlab_images/the_great_wave2.jpeg)
