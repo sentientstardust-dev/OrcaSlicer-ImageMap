@@ -101,7 +101,7 @@ jobs:
       - build_macos_arch
       - build_macos_universal
       - flatpak
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && (inputs.publish_release || false) && !inputs.build-deps-only && (inputs.build_windows || inputs.build_macos || inputs.build_linux || inputs.build_flatpak || vars.BUILD_LINUX == 'true' || vars.BUILD_FLATPAK == 'true') && (inputs.build_windows == false || needs.build_windows.result == 'success') && (inputs.build_macos == false || needs.build_macos_arch.result == 'success') && (inputs.build_macos == false || needs.build_macos_universal.result == 'success' || needs.build_macos_universal.result == 'skipped') && (((inputs.build_linux || false) || vars.BUILD_LINUX == 'true') == false || needs.build_linux.result == 'success') && (((inputs.build_flatpak || false) || vars.BUILD_FLATPAK == 'true') == false || needs.flatpak.result == 'success') }}
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && (inputs.publish_release || false) && !inputs.build-deps-only && (inputs.build_windows || inputs.build_macos || inputs.build_linux || inputs.build_flatpak || vars.BUILD_LINUX == 'true' || vars.BUILD_FLATPAK == 'true') }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:

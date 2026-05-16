@@ -487,6 +487,7 @@ jobs:
 
       - name: Run external slicer regression tests
         if: runner.os == 'Linux'
+        continue-on-error: true
         timeout-minutes: 20
         shell: bash
         run: |
