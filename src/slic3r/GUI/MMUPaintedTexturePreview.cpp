@@ -688,10 +688,48 @@ std::vector<std::string> raw_filament_color_mode_channel_keys_for_texture_previe
     return keys;
 }
 
+std::array<float, 3> raw_filament_channel_color_for_texture_preview(const ImageMapRawFilament &filament, size_t channel_idx)
+{
+    const std::string key = image_map_raw_filament_channel_key(filament, channel_idx);
+    if (key == "C")
+        return { { 0.f, 1.f, 1.f } };
+    if (key == "M")
+        return { { 1.f, 0.f, 1.f } };
+    if (key == "Y")
+        return { { 1.f, 1.f, 0.f } };
+    if (key == "K")
+        return { { 0.f, 0.f, 0.f } };
+    if (key == "W")
+        return { { 1.f, 1.f, 1.f } };
+    if (key == "R")
+        return { { 1.f, 0.f, 0.f } };
+    if (key == "G")
+        return { { 0.f, 1.f, 0.f } };
+    if (key == "B")
+        return { { 0.f, 0.f, 1.f } };
+    if (!filament.hex.empty()) {
+        const std::optional<ColorRGBA> parsed = parse_texture_mapping_color_hex_for_preview(filament.hex);
+        if (parsed)
+            return { { parsed->r(), parsed->g(), parsed->b() } };
+    }
+    return { { 1.f, 1.f, 1.f } };
+}
+
+float raw_filament_color_distance_sq_for_texture_preview(const std::array<float, 3> &lhs, const std::array<float, 3> &rhs)
+{
+    const std::array<float, 3> lhs_oklab = oklab_from_srgb(lhs);
+    const std::array<float, 3> rhs_oklab = oklab_from_srgb(rhs);
+    const float dl = lhs_oklab[0] - rhs_oklab[0];
+    const float da = lhs_oklab[1] - rhs_oklab[1];
+    const float db = lhs_oklab[2] - rhs_oklab[2];
+    return dl * dl + da * da + db * db;
+}
+
 std::vector<size_t> raw_component_source_channels_for_texture_preview(const std::string &metadata_json,
                                                                       unsigned int source_channels,
                                                                       int filament_color_mode,
-                                                                      size_t component_count)
+                                                                      size_t component_count,
+                                                                      const std::vector<std::array<float, 3>> &component_colors)
 {
     if (source_channels == 0 || component_count == 0)
         return {};
@@ -704,16 +742,18 @@ std::vector<size_t> raw_component_source_channels_for_texture_preview(const std:
         return {};
 
     std::vector<std::string> source_keys(static_cast<size_t>(source_channels));
-    std::vector<uint8_t> used(static_cast<size_t>(source_channels), 0);
+    std::vector<std::array<float, 3>> source_colors(static_cast<size_t>(source_channels));
     for (size_t channel = 0; channel < filaments.size(); ++channel) {
         const std::string key = image_map_raw_filament_channel_key(filaments[channel], channel);
         if (key.size() == 1 && image_map_raw_filament_is_standard_color(key))
             source_keys[channel] = key;
+        source_colors[channel] = raw_filament_channel_color_for_texture_preview(filaments[channel], channel);
     }
 
     const std::vector<std::string> target_keys =
         raw_filament_color_mode_channel_keys_for_texture_preview(filament_color_mode, component_count);
     if (!target_keys.empty()) {
+        std::vector<uint8_t> used(static_cast<size_t>(source_channels), 0);
         for (size_t component_idx = 0; component_idx < target_keys.size(); ++component_idx) {
             for (size_t channel = 0; channel < source_keys.size(); ++channel) {
                 if (used[channel] == 0 && source_keys[channel] == target_keys[component_idx]) {
@@ -723,19 +763,65 @@ std::vector<size_t> raw_component_source_channels_for_texture_preview(const std:
                 }
             }
         }
+
+        const float max_match_distance_sq =
+            TextureMappingManager::poor_color_match_distance() * TextureMappingManager::poor_color_match_distance();
+        for (size_t component_idx = 0; component_idx < target_keys.size(); ++component_idx) {
+            if (mapping[component_idx] != sentinel)
+                continue;
+            const std::array<float, 3> target_color =
+                raw_filament_channel_color_for_texture_preview({ 0, target_keys[component_idx], std::string() }, component_idx);
+            size_t best_channel = size_t(source_channels);
+            float best_distance_sq = std::numeric_limits<float>::max();
+            for (size_t channel = 0; channel < source_colors.size(); ++channel) {
+                if (used[channel] != 0)
+                    continue;
+                const float distance_sq = raw_filament_color_distance_sq_for_texture_preview(source_colors[channel], target_color);
+                if (distance_sq < best_distance_sq) {
+                    best_distance_sq = distance_sq;
+                    best_channel = channel;
+                }
+            }
+            if (best_channel < source_colors.size() && best_distance_sq <= max_match_distance_sq) {
+                mapping[component_idx] = best_channel;
+                used[best_channel] = 1;
+            }
+        }
+        return mapping;
     }
 
-    size_t next_source = 0;
-    for (size_t component_idx = 0; component_idx < mapping.size(); ++component_idx) {
-        if (mapping[component_idx] != sentinel)
-            continue;
-        while (next_source < source_keys.size() && used[next_source] != 0)
-            ++next_source;
-        if (next_source >= source_keys.size())
-            continue;
-        mapping[component_idx] = next_source;
-        used[next_source] = 1;
-        ++next_source;
+    if (component_colors.size() == component_count) {
+        struct RawColorMatchCandidate {
+            float  distance_sq { 0.f };
+            size_t component_idx { 0 };
+            size_t source_channel { 0 };
+        };
+
+        std::vector<RawColorMatchCandidate> candidates;
+        candidates.reserve(component_count * size_t(source_channels));
+        for (size_t channel = 0; channel < filaments.size(); ++channel) {
+            for (size_t component_idx = 0; component_idx < component_count; ++component_idx) {
+                candidates.push_back({
+                    raw_filament_color_distance_sq_for_texture_preview(component_colors[component_idx], source_colors[channel]),
+                    component_idx,
+                    channel
+                });
+            }
+        }
+
+        std::sort(candidates.begin(), candidates.end(), [](const RawColorMatchCandidate &lhs, const RawColorMatchCandidate &rhs) {
+            return lhs.distance_sq < rhs.distance_sq;
+        });
+
+        std::vector<uint8_t> used_components(component_count, 0);
+        std::vector<uint8_t> used_sources(static_cast<size_t>(source_channels), 0);
+        for (const RawColorMatchCandidate &candidate : candidates) {
+            if (used_components[candidate.component_idx] != 0 || used_sources[candidate.source_channel] != 0)
+                continue;
+            mapping[candidate.component_idx] = candidate.source_channel;
+            used_components[candidate.component_idx] = 1;
+            used_sources[candidate.source_channel] = 1;
+        }
     }
 
     const bool has_mapping = std::any_of(mapping.begin(), mapping.end(), [sentinel](size_t value) { return value != sentinel; });
@@ -2184,7 +2270,8 @@ const GUI::GLTexture *simulated_texture_preview_texture_for_filament(const Model
             raw_component_source_channels_for_texture_preview(model_volume.imported_texture_raw_metadata_json,
                                                               source_raw_channels,
                                                               simulation_settings.filament_color_mode,
-                                                              simulation_settings.component_colors.size());
+                                                              simulation_settings.component_colors.size(),
+                                                              simulation_settings.component_colors);
         std::shared_ptr<TexturePreviewSimulationJobState> job_state = entry.pending_job_state;
         entry.pending_future = std::async(std::launch::async,
                                           [simulation_signature,

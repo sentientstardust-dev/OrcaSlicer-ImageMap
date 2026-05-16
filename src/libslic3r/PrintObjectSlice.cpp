@@ -1,6 +1,8 @@
 #include <boost/log/trivial.hpp>
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <cmath>
 #include <iomanip>
 #include <limits>
@@ -11,6 +13,7 @@
 #include <tbb/parallel_for.h>
 
 #include "ClipperUtils.hpp"
+#include "ColorSolver.hpp"
 #include "ElephantFootCompensation.hpp"
 #include "ImageMapRawFilamentOffsetAtlas.hpp"
 #include "I18N.hpp"
@@ -202,6 +205,148 @@ static bool texture_mapping_line_width_differs(double lhs, double rhs)
     return std::abs(lhs - rhs) > 0.001;
 }
 
+static int texture_mapping_hex_digit(char ch)
+{
+    return ch >= '0' && ch <= '9' ? ch - '0' :
+           ch >= 'a' && ch <= 'f' ? ch - 'a' + 10 :
+           ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
+}
+
+static bool parse_texture_mapping_hex_rgb(const std::string &hex, std::array<float, 3> &rgb)
+{
+    const size_t hash_pos = hex.find('#');
+    const size_t start = hash_pos == std::string::npos ? 0 : hash_pos + 1;
+    if (start + 6 > hex.size())
+        return false;
+
+    int values[3] = { 0, 0, 0 };
+    for (size_t channel = 0; channel < 3; ++channel) {
+        const int hi = texture_mapping_hex_digit(hex[start + channel * 2]);
+        const int lo = texture_mapping_hex_digit(hex[start + channel * 2 + 1]);
+        if (hi < 0 || lo < 0)
+            return false;
+        values[channel] = hi * 16 + lo;
+    }
+
+    rgb = {
+        float(values[0]) / 255.f,
+        float(values[1]) / 255.f,
+        float(values[2]) / 255.f
+    };
+    return true;
+}
+
+static std::array<float, 3> raw_texture_standard_channel_rgb(const std::string &key)
+{
+    if (key == "C")
+        return { { 0.f, 1.f, 1.f } };
+    if (key == "M")
+        return { { 1.f, 0.f, 1.f } };
+    if (key == "Y")
+        return { { 1.f, 1.f, 0.f } };
+    if (key == "K")
+        return { { 0.f, 0.f, 0.f } };
+    if (key == "W")
+        return { { 1.f, 1.f, 1.f } };
+    if (key == "R")
+        return { { 1.f, 0.f, 0.f } };
+    if (key == "G")
+        return { { 0.f, 1.f, 0.f } };
+    if (key == "B")
+        return { { 0.f, 0.f, 1.f } };
+    return { { 1.f, 1.f, 1.f } };
+}
+
+static float texture_mapping_oklab_distance(const std::array<float, 3> &lhs, const std::array<float, 3> &rhs)
+{
+    const std::array<float, 3> lhs_oklab = color_solver_oklab_from_srgb(lhs);
+    const std::array<float, 3> rhs_oklab = color_solver_oklab_from_srgb(rhs);
+    const float dl = lhs_oklab[0] - rhs_oklab[0];
+    const float da = lhs_oklab[1] - rhs_oklab[1];
+    const float db = lhs_oklab[2] - rhs_oklab[2];
+    return std::sqrt(dl * dl + da * da + db * db);
+}
+
+static std::string join_texture_mapping_labels(const std::vector<std::string> &labels)
+{
+    std::string out;
+    for (size_t idx = 0; idx < labels.size(); ++idx) {
+        if (idx > 0)
+            out += ", ";
+        out += labels[idx];
+    }
+    return out;
+}
+
+static std::vector<std::string> raw_filament_color_mode_channel_keys_for_warning(int filament_color_mode, size_t component_count)
+{
+    std::vector<std::string> keys;
+    switch (std::clamp(filament_color_mode, int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorRGBKW))) {
+    case int(TextureMappingZone::FilamentColorRGB):
+        keys = { "R", "G", "B" };
+        break;
+    case int(TextureMappingZone::FilamentColorCMY):
+        keys = { "C", "M", "Y" };
+        break;
+    case int(TextureMappingZone::FilamentColorCMYK):
+        keys = { "C", "M", "Y", "K" };
+        break;
+    case int(TextureMappingZone::FilamentColorCMYW):
+        keys = { "C", "M", "Y", "W" };
+        break;
+    case int(TextureMappingZone::FilamentColorRGBK):
+        keys = { "R", "G", "B", "K" };
+        break;
+    case int(TextureMappingZone::FilamentColorRGBW):
+        keys = { "R", "G", "B", "W" };
+        break;
+    case int(TextureMappingZone::FilamentColorBW):
+        keys = { "K", "W" };
+        break;
+    case int(TextureMappingZone::FilamentColorCMYKW):
+        keys = { "C", "M", "Y", "K", "W" };
+        break;
+    case int(TextureMappingZone::FilamentColorRGBKW):
+        keys = { "R", "G", "B", "K", "W" };
+        break;
+    default:
+        break;
+    }
+    if (keys.size() > component_count)
+        keys.resize(component_count);
+    return keys;
+}
+
+struct RawTextureChannelWarningInfo
+{
+    size_t channel { 0 };
+    std::string key;
+    std::string label;
+    std::array<float, 3> rgb { { 1.f, 1.f, 1.f } };
+};
+
+static std::vector<RawTextureChannelWarningInfo> raw_texture_channel_warning_infos(const ModelVolume &volume)
+{
+    const std::vector<ImageMapRawFilament> filaments =
+        image_map_raw_filaments_from_metadata_json(volume.imported_texture_raw_metadata_json, volume.imported_texture_raw_channels);
+    std::vector<RawTextureChannelWarningInfo> infos;
+    infos.reserve(filaments.size());
+    for (size_t channel = 0; channel < filaments.size(); ++channel) {
+        const ImageMapRawFilament &filament = filaments[channel];
+        const std::string key = image_map_raw_filament_channel_key(filament, channel);
+        std::string label = key;
+        std::array<float, 3> rgb = raw_texture_standard_channel_rgb(key);
+        if (key.size() != 1 || !image_map_raw_filament_is_standard_color(key)) {
+            const unsigned int slot = filament.slot != 0 ? filament.slot : unsigned(channel + 1);
+            label = filament.hex.empty() ? "slot " + std::to_string(slot) : "slot " + std::to_string(slot) + " " + filament.hex;
+            if (!filament.hex.empty())
+                parse_texture_mapping_hex_rgb(filament.hex, rgb);
+        }
+        infos.push_back({ channel, key, label, rgb });
+    }
+    return infos;
+}
+
 static std::vector<std::string> collect_texture_mapping_raw_atlas_line_width_warnings(const PrintObject &print_object)
 {
     const Print *print = print_object.print();
@@ -241,8 +386,7 @@ static std::vector<std::string> collect_texture_mapping_raw_atlas_line_width_war
             if (zone == nullptr ||
                 !zone->enabled ||
                 zone->deleted ||
-                !zone->is_image_texture() ||
-                zone->texture_mapping_mode != int(TextureMappingZone::TextureMappingRawValues))
+                !zone->is_image_texture())
                 continue;
 
             std::ostringstream key_stream;
@@ -260,6 +404,210 @@ static std::vector<std::string> collect_texture_mapping_raw_atlas_line_width_war
                 format_texture_mapping_line_width_mm(active_min_line_width_mm) + " - " +
                 format_texture_mapping_line_width_mm(active_max_line_width_mm) +
                 L(". Update the texture mapping minimum/maximum outer wall line width or regenerate the raw offset atlas."));
+        }
+    }
+
+    return warnings;
+}
+
+static std::vector<std::string> collect_texture_mapping_raw_atlas_channel_warnings(const PrintObject &print_object)
+{
+    const Print *print = print_object.print();
+    if (print == nullptr)
+        return {};
+
+    const ModelObject *model_object = print_object.model_object();
+    if (model_object == nullptr)
+        return {};
+
+    const size_t num_physical = print->config().filament_colour.size();
+    if (num_physical == 0)
+        return {};
+
+    std::vector<std::string> warnings;
+    std::set<std::string> seen;
+    for (const ModelVolume *volume : model_object->volumes) {
+        if (!model_volume_has_raw_offset_texture_data(volume))
+            continue;
+
+        const std::vector<RawTextureChannelWarningInfo> atlas_channels = raw_texture_channel_warning_infos(*volume);
+        if (atlas_channels.empty())
+            continue;
+
+        const std::vector<int> used_extruders = volume->get_extruders();
+        for (const int filament_id : used_extruders) {
+            if (filament_id <= 0)
+                continue;
+
+            const unsigned int filament_id_u = unsigned(filament_id);
+            const TextureMappingZone *zone = print->texture_mapping_manager().zone_from_id(filament_id_u);
+            if (zone == nullptr ||
+                !zone->enabled ||
+                zone->deleted ||
+                !zone->is_image_texture())
+                continue;
+
+            const std::vector<unsigned int> component_ids = TextureMappingManager::selected_component_ids(*zone, num_physical);
+            if (component_ids.empty())
+                continue;
+
+            const int filament_color_mode = std::clamp(zone->filament_color_mode,
+                                                       int(TextureMappingZone::FilamentColorAny),
+                                                       int(TextureMappingZone::FilamentColorRGBKW));
+            const std::string zone_key =
+                std::to_string(filament_id_u) + "|" + std::to_string(filament_color_mode) + "|" + std::to_string(volume->id().id);
+            if (seen.find(zone_key) != seen.end())
+                continue;
+
+            const std::vector<std::string> target_keys =
+                raw_filament_color_mode_channel_keys_for_warning(filament_color_mode, component_ids.size());
+            if (!target_keys.empty()) {
+                std::vector<std::string> atlas_labels;
+                std::vector<std::string> missing;
+                std::vector<std::string> unused;
+                atlas_labels.reserve(atlas_channels.size());
+                for (const RawTextureChannelWarningInfo &channel : atlas_channels)
+                    atlas_labels.push_back(channel.label);
+                std::vector<size_t> target_to_channel(target_keys.size(), size_t(-1));
+                std::vector<uint8_t> used_channels(atlas_channels.size(), 0);
+                for (size_t target_idx = 0; target_idx < target_keys.size(); ++target_idx) {
+                    for (size_t channel_idx = 0; channel_idx < atlas_channels.size(); ++channel_idx) {
+                        if (used_channels[channel_idx] == 0 && atlas_channels[channel_idx].key == target_keys[target_idx]) {
+                            target_to_channel[target_idx] = channel_idx;
+                            used_channels[channel_idx] = 1;
+                            break;
+                        }
+                    }
+                }
+
+                const float max_match_distance = TextureMappingManager::poor_color_match_distance();
+                for (size_t target_idx = 0; target_idx < target_keys.size(); ++target_idx) {
+                    if (target_to_channel[target_idx] != size_t(-1))
+                        continue;
+                    const std::array<float, 3> target_rgb = raw_texture_standard_channel_rgb(target_keys[target_idx]);
+                    size_t best_channel = atlas_channels.size();
+                    float best_distance = std::numeric_limits<float>::max();
+                    for (size_t channel_idx = 0; channel_idx < atlas_channels.size(); ++channel_idx) {
+                        if (used_channels[channel_idx] != 0)
+                            continue;
+                        const float distance = texture_mapping_oklab_distance(target_rgb, atlas_channels[channel_idx].rgb);
+                        if (distance < best_distance) {
+                            best_distance = distance;
+                            best_channel = channel_idx;
+                        }
+                    }
+                    if (best_channel < atlas_channels.size() && best_distance <= max_match_distance) {
+                        target_to_channel[target_idx] = best_channel;
+                        used_channels[best_channel] = 1;
+                    }
+                }
+
+                for (size_t target_idx = 0; target_idx < target_keys.size(); ++target_idx) {
+                    if (target_to_channel[target_idx] == size_t(-1))
+                        missing.push_back(target_keys[target_idx]);
+                }
+                for (size_t channel_idx = 0; channel_idx < atlas_channels.size(); ++channel_idx) {
+                    if (used_channels[channel_idx] == 0)
+                        unused.push_back(atlas_channels[channel_idx].label);
+                }
+
+                if (missing.empty() && unused.empty())
+                    continue;
+
+                seen.insert(zone_key);
+                std::string message =
+                    L("Texture mapping zone ") + std::to_string(filament_id_u) +
+                    L(" uses raw atlas channels [") + join_texture_mapping_labels(atlas_labels) +
+                    L("], but slicing is using channels [") + join_texture_mapping_labels(target_keys) + L("].");
+                if (!missing.empty())
+                    message += L(" Missing channels will use 0 offset/minimum line width: ") + join_texture_mapping_labels(missing) + ".";
+                if (!unused.empty())
+                    message += L(" Unused atlas channels will be ignored: ") + join_texture_mapping_labels(unused) + ".";
+                warnings.emplace_back(std::move(message));
+                continue;
+            }
+
+            struct GenericRawAtlasCandidate {
+                float distance { 0.f };
+                size_t component_idx { 0 };
+                size_t channel_idx { 0 };
+            };
+
+            std::vector<std::array<float, 3>> component_colors;
+            std::vector<std::string> component_labels;
+            component_colors.reserve(component_ids.size());
+            component_labels.reserve(component_ids.size());
+            for (const unsigned int component_id : component_ids) {
+                if (component_id < 1 || component_id > num_physical)
+                    continue;
+                std::array<float, 3> rgb;
+                if (!parse_texture_mapping_hex_rgb(print->config().filament_colour.get_at(size_t(component_id - 1)), rgb))
+                    continue;
+                component_colors.push_back(rgb);
+                component_labels.push_back("F" + std::to_string(component_id));
+            }
+            if (component_colors.empty())
+                continue;
+
+            std::vector<GenericRawAtlasCandidate> candidates;
+            candidates.reserve(component_colors.size() * atlas_channels.size());
+            for (size_t component_idx = 0; component_idx < component_colors.size(); ++component_idx) {
+                for (size_t channel_idx = 0; channel_idx < atlas_channels.size(); ++channel_idx) {
+                    candidates.push_back({
+                        texture_mapping_oklab_distance(component_colors[component_idx], atlas_channels[channel_idx].rgb),
+                        component_idx,
+                        channel_idx
+                    });
+                }
+            }
+            std::sort(candidates.begin(), candidates.end(), [](const GenericRawAtlasCandidate &lhs, const GenericRawAtlasCandidate &rhs) {
+                return lhs.distance < rhs.distance;
+            });
+
+            std::vector<size_t> component_to_channel(component_colors.size(), size_t(-1));
+            std::vector<uint8_t> used_components(component_colors.size(), 0);
+            std::vector<uint8_t> used_channels(atlas_channels.size(), 0);
+            for (const GenericRawAtlasCandidate &candidate : candidates) {
+                if (used_components[candidate.component_idx] != 0 || used_channels[candidate.channel_idx] != 0)
+                    continue;
+                component_to_channel[candidate.component_idx] = candidate.channel_idx;
+                used_components[candidate.component_idx] = 1;
+                used_channels[candidate.channel_idx] = 1;
+            }
+
+            std::vector<std::string> poor_matches;
+            std::vector<std::string> missing_components;
+            std::vector<std::string> unused_channels;
+            for (size_t component_idx = 0; component_idx < component_to_channel.size(); ++component_idx) {
+                const size_t channel_idx = component_to_channel[component_idx];
+                if (channel_idx == size_t(-1)) {
+                    missing_components.push_back(component_labels[component_idx]);
+                    continue;
+                }
+                const float distance = texture_mapping_oklab_distance(component_colors[component_idx], atlas_channels[channel_idx].rgb);
+                if (distance > TextureMappingManager::poor_color_match_distance())
+                    poor_matches.push_back(component_labels[component_idx] + " to " + atlas_channels[channel_idx].label);
+            }
+            for (size_t channel_idx = 0; channel_idx < atlas_channels.size(); ++channel_idx) {
+                if (used_channels[channel_idx] == 0)
+                    unused_channels.push_back(atlas_channels[channel_idx].label);
+            }
+
+            if (poor_matches.empty() && missing_components.empty() && unused_channels.empty())
+                continue;
+
+            seen.insert(zone_key);
+            std::string message =
+                L("Texture mapping zone ") + std::to_string(filament_id_u) +
+                L(" uses Generic Solver with a raw filament offset atlas whose channel colors may not match the selected filaments.");
+            if (!poor_matches.empty())
+                message += L(" Poor color matches: ") + join_texture_mapping_labels(poor_matches) + ".";
+            if (!missing_components.empty())
+                message += L(" Unmatched filaments will use 0 offset/minimum line width: ") +
+                           join_texture_mapping_labels(missing_components) + ".";
+            if (!unused_channels.empty())
+                message += L(" Unused atlas channels will be ignored: ") + join_texture_mapping_labels(unused_channels) + ".";
+            warnings.emplace_back(std::move(message));
         }
     }
 
@@ -343,71 +691,6 @@ static std::vector<std::string> collect_texture_mapping_vertex_color_match_warni
           "Texture color matching will be skipped for this object. "
           "(This importer path currently expects a PNG image texture.)")
     };
-}
-
-static std::vector<std::string> collect_texture_mapping_filament_color_match_warnings(const PrintObject &print_object)
-{
-    const Print *print = print_object.print();
-    if (print == nullptr)
-        return {};
-
-    const ModelObject *model_object = print_object.model_object();
-    if (model_object == nullptr)
-        return {};
-
-    const size_t num_physical = print->config().filament_colour.size();
-    if (num_physical == 0)
-        return {};
-
-    std::vector<std::string> warnings;
-    std::set<unsigned int> seen_zone_ids;
-    for (const ModelVolume *volume : model_object->volumes) {
-        if (volume == nullptr)
-            continue;
-
-        const std::vector<int> used_extruders = volume->get_extruders();
-        for (const int filament_id : used_extruders) {
-            if (filament_id <= 0)
-                continue;
-
-            const unsigned int filament_id_u = unsigned(filament_id);
-            if (seen_zone_ids.find(filament_id_u) != seen_zone_ids.end())
-                continue;
-            seen_zone_ids.insert(filament_id_u);
-
-            const TextureMappingZone *zone = print->texture_mapping_manager().zone_from_id(filament_id_u);
-            if (zone == nullptr || !zone->enabled || zone->deleted || !zone->is_image_texture())
-                continue;
-
-            const std::vector<TextureMappingColorMatch> matches =
-                TextureMappingManager::texture_component_color_matches(*zone, num_physical, print->config().filament_colour.values);
-            if (matches.empty())
-                continue;
-
-            std::vector<std::string> poor_matches;
-            for (const TextureMappingColorMatch &match : matches) {
-                if (match.perceptual_distance <= TextureMappingManager::poor_color_match_distance())
-                    continue;
-                poor_matches.emplace_back("F" + std::to_string(match.filament_id) + " for " + match.expected_color_name);
-            }
-            if (poor_matches.empty())
-                continue;
-
-            std::string detail;
-            for (size_t idx = 0; idx < poor_matches.size(); ++idx) {
-                if (idx > 0)
-                    detail += ", ";
-                detail += poor_matches[idx];
-            }
-
-            warnings.emplace_back(
-                L("Filaments used in Texture Mapping zone ") +
-                std::to_string(filament_id_u) + L(" do not appear to match the expected colors: ") + detail +
-                L("."));
-        }
-    }
-
-    return warnings;
 }
 
 static const char *vertex_color_mode_name_for_error(int filament_color_mode)
@@ -1566,9 +1849,9 @@ void PrintObject::slice_volumes()
         this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, warning_msg);
     for (const std::string &warning_msg : collect_texture_mapping_raw_atlas_line_width_warnings(*this))
         this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, warning_msg);
-    for (const std::string &warning_msg : collect_texture_mapping_vertex_color_match_warnings(*this))
+    for (const std::string &warning_msg : collect_texture_mapping_raw_atlas_channel_warnings(*this))
         this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, warning_msg);
-    for (const std::string &warning_msg : collect_texture_mapping_filament_color_match_warnings(*this))
+    for (const std::string &warning_msg : collect_texture_mapping_vertex_color_match_warnings(*this))
         this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, warning_msg);
     for (const std::string &error_msg : collect_texture_mapping_vertex_color_mode_mismatch_errors(*this))
         this->active_step_add_warning(PrintStateBase::WarningLevel::CRITICAL, error_msg);

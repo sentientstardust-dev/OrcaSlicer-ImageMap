@@ -2025,6 +2025,7 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     // BBS
     m_curr_print = print;
     m_warned_texture_mapping_filament_count_mismatch = false;
+    m_warned_texture_mapping_color_match_zone_ids.clear();
     m_generic_solver_mix_candidate_cache.clear();
     m_uv_texture_triangle_cache.clear();
     ScopeGuard clear_generic_solver_mix_candidate_cache([this]() {
@@ -6982,6 +6983,43 @@ static std::array<float, 4> raw_offset_preview_rgba_for_gcode(const std::vector<
     };
 }
 
+static float raw_filament_color_distance_sq_for_gcode(const std::array<float, 3> &lhs, const std::array<float, 3> &rhs)
+{
+    const std::array<float, 3> lhs_oklab = oklab_from_srgb_for_gcode(lhs);
+    const std::array<float, 3> rhs_oklab = oklab_from_srgb_for_gcode(rhs);
+    const float dl = lhs_oklab[0] - rhs_oklab[0];
+    const float da = lhs_oklab[1] - rhs_oklab[1];
+    const float db = lhs_oklab[2] - rhs_oklab[2];
+    return dl * dl + da * da + db * db;
+}
+
+static std::array<float, 3> raw_filament_channel_color_for_gcode(const ImageMapRawFilament &filament, size_t channel_idx)
+{
+    const std::string key = image_map_raw_filament_channel_key(filament, channel_idx);
+    if (key == "C")
+        return { { 0.f, 1.f, 1.f } };
+    if (key == "M")
+        return { { 1.f, 0.f, 1.f } };
+    if (key == "Y")
+        return { { 1.f, 1.f, 0.f } };
+    if (key == "K")
+        return { { 0.f, 0.f, 0.f } };
+    if (key == "W")
+        return { { 1.f, 1.f, 1.f } };
+    if (key == "R")
+        return { { 1.f, 0.f, 0.f } };
+    if (key == "G")
+        return { { 0.f, 1.f, 0.f } };
+    if (key == "B")
+        return { { 0.f, 0.f, 1.f } };
+    if (!filament.hex.empty()) {
+        const std::optional<std::array<float, 4>> parsed = parse_texture_mapping_color_hex_for_gcode(filament.hex);
+        if (parsed)
+            return { { (*parsed)[0], (*parsed)[1], (*parsed)[2] } };
+    }
+    return { { 1.f, 1.f, 1.f } };
+}
+
 static std::vector<std::string> raw_filament_color_mode_channel_keys_for_gcode(int filament_color_mode, size_t component_count)
 {
     std::vector<std::string> keys;
@@ -7024,7 +7062,8 @@ static std::vector<std::string> raw_filament_color_mode_channel_keys_for_gcode(i
 static std::vector<size_t> raw_component_source_channels_for_gcode(const std::string &metadata_json,
                                                                    uint32_t source_channels,
                                                                    int filament_color_mode,
-                                                                   size_t component_count)
+                                                                   size_t component_count,
+                                                                   const std::vector<std::array<float, 3>> &component_colors)
 {
     if (source_channels == 0 || component_count == 0)
         return {};
@@ -7037,16 +7076,18 @@ static std::vector<size_t> raw_component_source_channels_for_gcode(const std::st
         return {};
 
     std::vector<std::string> source_keys(static_cast<size_t>(source_channels));
-    std::vector<uint8_t> used(static_cast<size_t>(source_channels), 0);
+    std::vector<std::array<float, 3>> source_colors(static_cast<size_t>(source_channels));
     for (size_t channel = 0; channel < filaments.size(); ++channel) {
         const std::string key = image_map_raw_filament_channel_key(filaments[channel], channel);
         if (key.size() == 1 && image_map_raw_filament_is_standard_color(key))
             source_keys[channel] = key;
+        source_colors[channel] = raw_filament_channel_color_for_gcode(filaments[channel], channel);
     }
 
     const std::vector<std::string> target_keys =
         raw_filament_color_mode_channel_keys_for_gcode(filament_color_mode, component_count);
     if (!target_keys.empty()) {
+        std::vector<uint8_t> used(static_cast<size_t>(source_channels), 0);
         for (size_t component_idx = 0; component_idx < target_keys.size(); ++component_idx) {
             for (size_t channel = 0; channel < source_keys.size(); ++channel) {
                 if (used[channel] == 0 && source_keys[channel] == target_keys[component_idx]) {
@@ -7056,19 +7097,64 @@ static std::vector<size_t> raw_component_source_channels_for_gcode(const std::st
                 }
             }
         }
+
+        const float max_match_distance_sq =
+            TextureMappingManager::poor_color_match_distance() * TextureMappingManager::poor_color_match_distance();
+        for (size_t component_idx = 0; component_idx < target_keys.size(); ++component_idx) {
+            if (mapping[component_idx] != sentinel)
+                continue;
+            const std::array<float, 3> target_color =
+                raw_filament_channel_color_for_gcode({ 0, target_keys[component_idx], std::string() }, component_idx);
+            size_t best_channel = size_t(source_channels);
+            float best_distance_sq = std::numeric_limits<float>::max();
+            for (size_t channel = 0; channel < source_colors.size(); ++channel) {
+                if (used[channel] != 0)
+                    continue;
+                const float distance_sq = raw_filament_color_distance_sq_for_gcode(source_colors[channel], target_color);
+                if (distance_sq < best_distance_sq) {
+                    best_distance_sq = distance_sq;
+                    best_channel = channel;
+                }
+            }
+            if (best_channel < source_colors.size() && best_distance_sq <= max_match_distance_sq) {
+                mapping[component_idx] = best_channel;
+                used[best_channel] = 1;
+            }
+        }
+        return mapping;
     }
 
-    size_t next_source = 0;
-    for (size_t component_idx = 0; component_idx < mapping.size(); ++component_idx) {
-        if (mapping[component_idx] != sentinel)
-            continue;
-        while (next_source < source_keys.size() && used[next_source] != 0)
-            ++next_source;
-        if (next_source >= source_keys.size())
-            continue;
-        mapping[component_idx] = next_source;
-        used[next_source] = 1;
-        ++next_source;
+    if (component_colors.size() == component_count) {
+        struct RawColorMatchCandidate {
+            float  distance_sq { 0.f };
+            size_t component_idx { 0 };
+            size_t source_channel { 0 };
+        };
+
+        std::vector<RawColorMatchCandidate> candidates;
+        candidates.reserve(component_count * size_t(source_channels));
+        for (size_t channel = 0; channel < filaments.size(); ++channel) {
+            for (size_t component_idx = 0; component_idx < component_count; ++component_idx)
+                candidates.push_back({
+                    raw_filament_color_distance_sq_for_gcode(component_colors[component_idx], source_colors[channel]),
+                    component_idx,
+                    channel
+                });
+        }
+
+        std::sort(candidates.begin(), candidates.end(), [](const RawColorMatchCandidate &lhs, const RawColorMatchCandidate &rhs) {
+            return lhs.distance_sq < rhs.distance_sq;
+        });
+
+        std::vector<uint8_t> used_components(component_count, 0);
+        std::vector<uint8_t> used_sources(static_cast<size_t>(source_channels), 0);
+        for (const RawColorMatchCandidate &candidate : candidates) {
+            if (used_components[candidate.component_idx] != 0 || used_sources[candidate.source_channel] != 0)
+                continue;
+            mapping[candidate.component_idx] = candidate.source_channel;
+            used_components[candidate.component_idx] = 1;
+            used_sources[candidate.source_channel] = 1;
+        }
     }
 
     const bool has_mapping = std::any_of(mapping.begin(), mapping.end(), [sentinel](size_t value) { return value != sentinel; });
@@ -7918,7 +8004,8 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                 raw_component_source_channels_for_gcode(volume->imported_texture_raw_metadata_json,
                                                         volume->imported_texture_raw_channels,
                                                         filament_color_mode,
-                                                        component_count);
+                                                        component_count,
+                                                        component_colors);
             const bool use_raw_uv_texture =
                 raw_component_source_channels.size() == component_count &&
                 volume->imported_texture_raw_filament_offsets.size() >=
@@ -8168,7 +8255,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                 desired[component_idx] = clamp01f_for_gcode(sample.raw_component_weights[component_idx]);
             for (const float value : desired)
                 raw_activity = std::max(raw_activity, value);
-            if (raw_activity <= EPSILON)
+            if (raw_activity <= EPSILON && !sample.raw_component_weights_from_texture)
                 std::fill(desired.begin(), desired.end(), 1.f);
         } else {
             std::array<float, 3> target = {
@@ -10110,6 +10197,28 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                         m_curr_print->active_step_add_warning(
                             PrintStateBase::WarningLevel::NON_CRITICAL,
                             _(L("A texture mapping zone has a filament count that does not match its selected color mode. Slicing will choose fallback filaments for the missing or extra color channels.")));
+                    }
+                    if (m_warned_texture_mapping_color_match_zone_ids.insert(texture_zone_id).second) {
+                        const std::vector<TextureMappingColorMatch> matches =
+                            TextureMappingManager::texture_component_color_matches(*zone, num_physical, m_config.filament_colour.values);
+                        std::vector<std::string> poor_matches;
+                        for (const TextureMappingColorMatch &match : matches) {
+                            if (match.perceptual_distance <= TextureMappingManager::poor_color_match_distance())
+                                continue;
+                            poor_matches.emplace_back("F" + std::to_string(match.filament_id) + " for " + match.expected_color_name);
+                        }
+                        if (!poor_matches.empty()) {
+                            std::string detail;
+                            for (size_t idx = 0; idx < poor_matches.size(); ++idx) {
+                                if (idx > 0)
+                                    detail += ", ";
+                                detail += poor_matches[idx];
+                            }
+                            m_curr_print->active_step_add_warning(
+                                PrintStateBase::WarningLevel::NON_CRITICAL,
+                                L("Filaments used in Texture Mapping zone ") + std::to_string(texture_zone_id) +
+                                    L(" do not appear to match the expected colors: ") + detail + L("."));
+                        }
                     }
 
                     const std::vector<unsigned int> effective_component_ids =

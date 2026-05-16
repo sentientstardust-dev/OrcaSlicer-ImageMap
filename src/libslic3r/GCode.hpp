@@ -559,6 +559,7 @@ private:
     std::map<const PrintObject*, GCodeUVTextureTriangleCache> m_uv_texture_triangle_cache;
     std::map<std::string, GCodeGenericMixCandidateSet> m_generic_solver_mix_candidate_cache;
     bool                                m_warned_texture_mapping_filament_count_mismatch { false };
+    std::set<unsigned int>              m_warned_texture_mapping_color_match_zone_ids;
 
     /* Origin of print coordinates expressed in unscaled G-code coordinates.
        This affects the input arguments supplied to the extrude*() and travel_to()

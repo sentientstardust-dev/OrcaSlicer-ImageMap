@@ -1544,6 +1544,12 @@ std::vector<TextureMappingColorMatch> TextureMappingManager::texture_component_c
     if (expected == 0)
         return {};
 
+    const int filament_color_mode = clamp_int(zone.filament_color_mode,
+                                              int(TextureMappingZone::FilamentColorAny),
+                                              int(TextureMappingZone::FilamentColorRGBKW));
+    if (filament_color_mode == int(TextureMappingZone::FilamentColorBW))
+        return {};
+
     const std::vector<RGB> roles = semantic_colors(zone.filament_color_mode);
     const std::vector<std::string> role_names = semantic_color_names(zone.filament_color_mode);
     if (roles.size() != expected || role_names.size() != expected)
