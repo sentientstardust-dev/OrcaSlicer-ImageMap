@@ -17,6 +17,7 @@
 #include "TextureMapping.hpp"
 #include "ColorSolver.hpp"
 #include "ImageMapRawFilamentOffsetAtlas.hpp"
+#include "TriangleSelector.hpp"
 #include "Utils.hpp"
 #include "ClipperUtils.hpp"
 #include "libslic3r.h"
@@ -32,8 +33,11 @@
 #include <chrono>
 #include <functional>
 #include <iostream>
+#include <iomanip>
 #include <limits>
 #include <optional>
+#include <set>
+#include <sstream>
 #include <math.h>
 #include <stdlib.h>
 #include <string>
@@ -2003,6 +2007,7 @@ namespace DoExport {
 } // namespace DoExport
 
 static bool print_has_raw_offset_texture_zone_without_raw_data_for_gcode(const Print &print);
+static std::vector<std::string> collect_raw_atlas_warnings_for_gcode(const Print &print);
 
 bool GCode::is_BBL_Printer()
 {
@@ -2051,6 +2056,8 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
             _(L("An object is assigned to a Raw filament offset texture mapping zone, but it does not contain raw filament "
                 "offset atlas data. Slicing will interpret its regular RGB texture channels as raw offsets.")));
     }
+    for (const std::string &warning_msg : collect_raw_atlas_warnings_for_gcode(*print))
+        print->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, warning_msg);
 
     // check if any custom gcode contains keywords used by the gcode processor to
     // produce time estimation and gcode toolpaths
@@ -7211,6 +7218,327 @@ static bool print_has_raw_offset_texture_zone_without_raw_data_for_gcode(const P
         }
     }
     return false;
+}
+
+static void append_image_texture_zone_id_for_raw_atlas_warning_for_gcode(const TextureMappingManager &texture_mgr,
+                                                                         int                          filament_id,
+                                                                         std::vector<unsigned int>   &zone_ids)
+{
+    if (filament_id <= 0)
+        return;
+
+    const unsigned int filament_id_u = unsigned(filament_id);
+    const TextureMappingZone *zone = texture_mgr.zone_from_id(filament_id_u);
+    if (zone == nullptr || !zone->enabled || zone->deleted || !zone->is_image_texture())
+        return;
+    if (std::find(zone_ids.begin(), zone_ids.end(), filament_id_u) == zone_ids.end())
+        zone_ids.emplace_back(filament_id_u);
+}
+
+static std::vector<unsigned int> image_texture_zone_ids_for_raw_atlas_warning_for_gcode(const Print &print, const PrintObject &print_object)
+{
+    const ModelObject *model_object = print_object.model_object();
+    if (model_object == nullptr)
+        return {};
+
+    const TextureMappingManager &texture_mgr = print.texture_mapping_manager();
+    std::vector<unsigned int> zone_ids;
+    for (const ModelVolume *volume : model_object->volumes) {
+        if (volume == nullptr)
+            continue;
+
+        for (const int filament_id : volume->get_extruders())
+            append_image_texture_zone_id_for_raw_atlas_warning_for_gcode(texture_mgr, filament_id, zone_ids);
+
+        if (volume->mmu_segmentation_facets.empty())
+            continue;
+
+        const std::vector<bool> &used_states = volume->mmu_segmentation_facets.get_data().used_states;
+        for (size_t state_idx = static_cast<size_t>(EnforcerBlockerType::Extruder1); state_idx < used_states.size(); ++state_idx)
+            if (used_states[state_idx])
+                append_image_texture_zone_id_for_raw_atlas_warning_for_gcode(texture_mgr, int(state_idx), zone_ids);
+    }
+    return zone_ids;
+}
+
+static std::string format_texture_mapping_line_width_mm_for_gcode(double value)
+{
+    std::ostringstream stream;
+    stream << std::fixed << std::setprecision(3) << value;
+    std::string formatted = stream.str();
+    while (formatted.size() > 1 && formatted.back() == '0')
+        formatted.pop_back();
+    if (!formatted.empty() && formatted.back() == '.')
+        formatted.pop_back();
+    return formatted + " mm";
+}
+
+static std::string join_texture_mapping_labels_for_gcode(const std::vector<std::string> &labels)
+{
+    std::string out;
+    for (size_t idx = 0; idx < labels.size(); ++idx) {
+        if (idx > 0)
+            out += ", ";
+        out += labels[idx];
+    }
+    return out;
+}
+
+struct RawAtlasChannelWarningInfoForGCode
+{
+    std::string key;
+    std::string label;
+    std::array<float, 3> rgb { { 1.f, 1.f, 1.f } };
+};
+
+static std::vector<RawAtlasChannelWarningInfoForGCode> raw_atlas_channel_warning_infos_for_gcode(const ModelVolume &volume)
+{
+    const std::vector<ImageMapRawFilament> filaments =
+        image_map_raw_filaments_from_metadata_json(volume.imported_texture_raw_metadata_json, volume.imported_texture_raw_channels);
+    std::vector<RawAtlasChannelWarningInfoForGCode> infos;
+    infos.reserve(filaments.size());
+    for (size_t channel = 0; channel < filaments.size(); ++channel) {
+        const ImageMapRawFilament &filament = filaments[channel];
+        const std::string key = image_map_raw_filament_channel_key(filament, channel);
+        std::string label = key;
+        if (key.size() != 1 || !image_map_raw_filament_is_standard_color(key)) {
+            const unsigned int slot = filament.slot != 0 ? filament.slot : unsigned(channel + 1);
+            label = filament.hex.empty() ? "slot " + std::to_string(slot) : "slot " + std::to_string(slot) + " " + filament.hex;
+        }
+        infos.push_back({ key, label, raw_filament_channel_color_for_gcode(filament, channel) });
+    }
+    return infos;
+}
+
+static std::vector<std::string> collect_raw_atlas_warnings_for_gcode(const Print &print)
+{
+    const double active_max_line_width_mm =
+        std::max(0.05, print.config().texture_mapping_outer_wall_gradient_max_line_width.value);
+    const double active_min_line_width_mm =
+        std::clamp(print.config().texture_mapping_outer_wall_gradient_min_line_width.value, 0.05, active_max_line_width_mm);
+    const float poor_match_distance_sq =
+        TextureMappingManager::poor_color_match_distance() * TextureMappingManager::poor_color_match_distance();
+
+    std::vector<std::string> warnings;
+    std::set<std::string> seen;
+    for (const PrintObject *print_object : print.objects()) {
+        if (print_object == nullptr || print_object->model_object() == nullptr)
+            continue;
+
+        const std::vector<unsigned int> used_texture_zone_ids =
+            image_texture_zone_ids_for_raw_atlas_warning_for_gcode(print, *print_object);
+        if (used_texture_zone_ids.empty())
+            continue;
+
+        for (const ModelVolume *volume : print_object->model_object()->volumes) {
+            if (!model_volume_has_raw_offset_texture_data_for_gcode(volume))
+                continue;
+
+            const ImageMapRawExpectedLineWidth expected =
+                image_map_raw_expected_line_width_from_metadata_json(volume->imported_texture_raw_metadata_json);
+            if (expected.valid && expected.warn_if_differs &&
+                (std::abs(active_min_line_width_mm - expected.min_mm) > 0.001 ||
+                 std::abs(active_max_line_width_mm - expected.max_mm) > 0.001)) {
+                for (const unsigned int zone_id : used_texture_zone_ids) {
+                    std::ostringstream key_stream;
+                    key_stream << "width|" << print_object->id().id << "|" << volume->id().id << "|" << zone_id << "|" <<
+                        std::fixed << std::setprecision(3) << expected.min_mm << "|" << expected.max_mm;
+                    if (!seen.insert(key_stream.str()).second)
+                        continue;
+
+                    warnings.emplace_back(
+                        _(L("Texture mapping zone ")) + std::to_string(zone_id) +
+                        _(L(" uses a raw filament offset atlas designed for line widths ")) +
+                        format_texture_mapping_line_width_mm_for_gcode(expected.min_mm) + " - " +
+                        format_texture_mapping_line_width_mm_for_gcode(expected.max_mm) +
+                        _(L(", but current texture mapping settings use ")) +
+                        format_texture_mapping_line_width_mm_for_gcode(active_min_line_width_mm) + " - " +
+                        format_texture_mapping_line_width_mm_for_gcode(active_max_line_width_mm) +
+                        _(L(". Update the texture mapping minimum/maximum outer wall line width or regenerate the raw offset atlas.")));
+                }
+            }
+
+            const std::vector<RawAtlasChannelWarningInfoForGCode> atlas_channels =
+                raw_atlas_channel_warning_infos_for_gcode(*volume);
+            if (atlas_channels.empty())
+                continue;
+
+            for (const unsigned int zone_id : used_texture_zone_ids) {
+                const TextureMappingZone *zone = print.texture_mapping_manager().zone_from_id(zone_id);
+                if (zone == nullptr || !zone->enabled || zone->deleted || !zone->is_image_texture())
+                    continue;
+
+                const std::vector<unsigned int> component_ids =
+                    TextureMappingManager::effective_texture_component_ids(*zone,
+                                                                           print.config().filament_colour.size(),
+                                                                           print.config().filament_colour.values);
+                if (component_ids.empty())
+                    continue;
+
+                const int filament_color_mode = std::clamp(zone->filament_color_mode,
+                                                           int(TextureMappingZone::FilamentColorAny),
+                                                           int(TextureMappingZone::FilamentColorRGBKW));
+                std::ostringstream zone_key_stream;
+                zone_key_stream << "channels|" << print_object->id().id << "|" << volume->id().id << "|" << zone_id << "|" <<
+                    filament_color_mode;
+                if (seen.find(zone_key_stream.str()) != seen.end())
+                    continue;
+
+                const std::vector<std::string> target_keys =
+                    raw_filament_color_mode_channel_keys_for_gcode(filament_color_mode, component_ids.size());
+                if (!target_keys.empty()) {
+                    std::vector<std::string> atlas_labels;
+                    std::vector<std::string> missing;
+                    std::vector<std::string> unused;
+                    atlas_labels.reserve(atlas_channels.size());
+                    for (const RawAtlasChannelWarningInfoForGCode &channel : atlas_channels)
+                        atlas_labels.push_back(channel.label);
+
+                    std::vector<size_t> target_to_channel(target_keys.size(), size_t(-1));
+                    std::vector<uint8_t> used_channels(atlas_channels.size(), 0);
+                    for (size_t target_idx = 0; target_idx < target_keys.size(); ++target_idx) {
+                        for (size_t channel_idx = 0; channel_idx < atlas_channels.size(); ++channel_idx) {
+                            if (used_channels[channel_idx] == 0 && atlas_channels[channel_idx].key == target_keys[target_idx]) {
+                                target_to_channel[target_idx] = channel_idx;
+                                used_channels[channel_idx] = 1;
+                                break;
+                            }
+                        }
+                    }
+                    for (size_t target_idx = 0; target_idx < target_keys.size(); ++target_idx) {
+                        if (target_to_channel[target_idx] != size_t(-1))
+                            continue;
+                        const std::array<float, 3> target_rgb =
+                            raw_filament_channel_color_for_gcode({ 0, target_keys[target_idx], std::string() }, target_idx);
+                        size_t best_channel = atlas_channels.size();
+                        float best_distance_sq = std::numeric_limits<float>::max();
+                        for (size_t channel_idx = 0; channel_idx < atlas_channels.size(); ++channel_idx) {
+                            if (used_channels[channel_idx] != 0)
+                                continue;
+                            const float distance_sq =
+                                raw_filament_color_distance_sq_for_gcode(target_rgb, atlas_channels[channel_idx].rgb);
+                            if (distance_sq < best_distance_sq) {
+                                best_distance_sq = distance_sq;
+                                best_channel = channel_idx;
+                            }
+                        }
+                        if (best_channel < atlas_channels.size() && best_distance_sq <= poor_match_distance_sq) {
+                            target_to_channel[target_idx] = best_channel;
+                            used_channels[best_channel] = 1;
+                        }
+                    }
+
+                    for (size_t target_idx = 0; target_idx < target_keys.size(); ++target_idx)
+                        if (target_to_channel[target_idx] == size_t(-1))
+                            missing.push_back(target_keys[target_idx]);
+                    for (size_t channel_idx = 0; channel_idx < atlas_channels.size(); ++channel_idx)
+                        if (used_channels[channel_idx] == 0)
+                            unused.push_back(atlas_channels[channel_idx].label);
+
+                    if (missing.empty() && unused.empty())
+                        continue;
+
+                    seen.insert(zone_key_stream.str());
+                    std::string message =
+                        _(L("Object has raw atlas data with channels [")) + join_texture_mapping_labels_for_gcode(atlas_labels) +
+                        _(L("], but texture mapping zone ")) + std::to_string(zone_id) + _(L(" uses [")) + join_texture_mapping_labels_for_gcode(target_keys) + "].";
+                    if (!missing.empty())
+                        message += _(L(" Missing channels will use 0 offset/minimum line width: [")) +
+                                   join_texture_mapping_labels_for_gcode(missing) + "].";
+                    if (!unused.empty())
+                        message += _(L(" Unused atlas channels will be ignored: [")) +
+                                   join_texture_mapping_labels_for_gcode(unused) + "].";
+                    warnings.emplace_back(std::move(message));
+                    continue;
+                }
+
+                struct GenericRawAtlasCandidateForGCode {
+                    float distance_sq { 0.f };
+                    size_t component_idx { 0 };
+                    size_t channel_idx { 0 };
+                };
+
+                std::vector<std::array<float, 3>> component_colors;
+                std::vector<std::string> component_labels;
+                component_colors.reserve(component_ids.size());
+                component_labels.reserve(component_ids.size());
+                for (const unsigned int component_id : component_ids) {
+                    if (component_id < 1 || component_id > print.config().filament_colour.size())
+                        continue;
+                    const std::optional<std::array<float, 4>> parsed =
+                        parse_texture_mapping_color_hex_for_gcode(print.config().filament_colour.get_at(size_t(component_id - 1)));
+                    if (!parsed)
+                        continue;
+                    component_colors.push_back({ { (*parsed)[0], (*parsed)[1], (*parsed)[2] } });
+                    component_labels.push_back("F" + std::to_string(component_id));
+                }
+                if (component_colors.empty())
+                    continue;
+
+                std::vector<GenericRawAtlasCandidateForGCode> candidates;
+                candidates.reserve(component_colors.size() * atlas_channels.size());
+                for (size_t component_idx = 0; component_idx < component_colors.size(); ++component_idx)
+                    for (size_t channel_idx = 0; channel_idx < atlas_channels.size(); ++channel_idx)
+                        candidates.push_back({
+                            raw_filament_color_distance_sq_for_gcode(component_colors[component_idx], atlas_channels[channel_idx].rgb),
+                            component_idx,
+                            channel_idx
+                        });
+                std::sort(candidates.begin(), candidates.end(), [](const GenericRawAtlasCandidateForGCode &lhs,
+                                                                    const GenericRawAtlasCandidateForGCode &rhs) {
+                    return lhs.distance_sq < rhs.distance_sq;
+                });
+
+                std::vector<size_t> component_to_channel(component_colors.size(), size_t(-1));
+                std::vector<uint8_t> used_components(component_colors.size(), 0);
+                std::vector<uint8_t> used_channels(atlas_channels.size(), 0);
+                for (const GenericRawAtlasCandidateForGCode &candidate : candidates) {
+                    if (used_components[candidate.component_idx] != 0 || used_channels[candidate.channel_idx] != 0)
+                        continue;
+                    component_to_channel[candidate.component_idx] = candidate.channel_idx;
+                    used_components[candidate.component_idx] = 1;
+                    used_channels[candidate.channel_idx] = 1;
+                }
+
+                std::vector<std::string> poor_matches;
+                std::vector<std::string> missing_components;
+                std::vector<std::string> unused_channels;
+                for (size_t component_idx = 0; component_idx < component_to_channel.size(); ++component_idx) {
+                    const size_t channel_idx = component_to_channel[component_idx];
+                    if (channel_idx == size_t(-1)) {
+                        missing_components.push_back(component_labels[component_idx]);
+                        continue;
+                    }
+                    const float distance_sq =
+                        raw_filament_color_distance_sq_for_gcode(component_colors[component_idx], atlas_channels[channel_idx].rgb);
+                    if (distance_sq > poor_match_distance_sq)
+                        poor_matches.push_back(component_labels[component_idx] + " to " + atlas_channels[channel_idx].label);
+                }
+                for (size_t channel_idx = 0; channel_idx < atlas_channels.size(); ++channel_idx)
+                    if (used_channels[channel_idx] == 0)
+                        unused_channels.push_back(atlas_channels[channel_idx].label);
+
+                if (poor_matches.empty() && missing_components.empty() && unused_channels.empty())
+                    continue;
+
+                seen.insert(zone_key_stream.str());
+                std::string message =
+                    _(L("Texture mapping zone ")) + std::to_string(zone_id) +
+                    _(L("'s filament colors may not match "
+                        "the selected filaments in an object's raw offset atlas data."));
+                if (!poor_matches.empty())
+                    message += _(L(" Poor color matches: ")) + join_texture_mapping_labels_for_gcode(poor_matches) + ".";
+                if (!missing_components.empty())
+                    message += _(L(" Unmatched filaments will use 0 offset/minimum line width: ")) +
+                               join_texture_mapping_labels_for_gcode(missing_components) + ".";
+                if (!unused_channels.empty())
+                    message += _(L(" Unused atlas channels will be ignored: ")) +
+                               join_texture_mapping_labels_for_gcode(unused_channels) + ".";
+                warnings.emplace_back(std::move(message));
+            }
+        }
+    }
+    return warnings;
 }
 
 static std::array<Vec2f, 3> unwrap_triangle_uvs_for_sampling_for_gcode(const Vec2f &uv0,

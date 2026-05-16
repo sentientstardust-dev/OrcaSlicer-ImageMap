@@ -399,6 +399,7 @@ struct RawAtlasProjectionLayout
     std::vector<ImageMapRawFilament> filaments;
     std::vector<std::string>         channel_keys;
     std::vector<size_t>              atlas_to_target_channel;
+    ImageMapRawExpectedLineWidth     expected_line_width_mm;
 };
 
 static bool model_volume_has_raw_atlas_texture_data(const ModelVolume *volume)
@@ -525,6 +526,10 @@ static bool append_object_raw_atlas_layout(const ModelObject &object, RawAtlasPr
         const std::vector<ImageMapRawFilament> volume_filaments =
             image_map_raw_filaments_from_metadata_json(volume->imported_texture_raw_metadata_json, volume->imported_texture_raw_channels);
         const std::vector<std::string> volume_keys = image_map_raw_filament_channel_keys(volume_filaments);
+        const ImageMapRawExpectedLineWidth expected =
+            image_map_raw_expected_line_width_from_metadata_json(volume->imported_texture_raw_metadata_json);
+        if (expected.valid && !layout.expected_line_width_mm.valid)
+            layout.expected_line_width_mm = expected;
         if (!raw_channel_keys_are_unique(volume_keys)) {
             if (error != nullptr)
                 *error = "The selected object's existing raw filament offset metadata has duplicate channels.";
@@ -551,6 +556,8 @@ static bool raw_atlas_projection_layout_for_object(const ModelObject &object,
 
     if (!append_object_raw_atlas_layout(object, layout, error))
         return false;
+    if (atlas.expected_line_width_mm.valid)
+        layout.expected_line_width_mm = atlas.expected_line_width_mm;
 
     const std::vector<ImageMapRawFilament> atlas_filaments =
         image_map_raw_filaments_for_channels(atlas.filaments, atlas.channels);
@@ -596,6 +603,13 @@ static std::string raw_layout_metadata_json(uint32_t width, uint32_t height, con
         if (!filament.hex.empty())
             entry["hex"] = filament.hex;
         root["filaments"].push_back(std::move(entry));
+    }
+    if (layout.expected_line_width_mm.valid) {
+        root["expected_line_width_mm"] = {
+            { "min", layout.expected_line_width_mm.min_mm },
+            { "max", layout.expected_line_width_mm.max_mm },
+            { "warn_if_differs", layout.expected_line_width_mm.warn_if_differs }
+        };
     }
     return root.dump();
 }
@@ -12147,6 +12161,7 @@ void GLGizmoImageProjection::on_load(cereal::BinaryInputArchive& ar)
     m_raw_atlas.offsets = std::move(raw_offsets);
     m_raw_atlas.mask = std::move(raw_mask);
     m_raw_atlas.metadata_json = std::move(raw_metadata_json);
+    m_raw_atlas.expected_line_width_mm = image_map_raw_expected_line_width_from_metadata_json(m_raw_atlas.metadata_json);
     if (!m_raw_atlas.valid())
         m_raw_atlas = {};
     m_overlay_texture.reset();
