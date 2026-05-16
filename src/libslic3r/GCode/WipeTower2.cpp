@@ -1735,6 +1735,13 @@ std::vector<WipeTower::ToolChangeResult> WipeTower2::prime(
 	// If false, the last priming are will be large enough to wipe the last extruder sufficiently.
     bool 						/*last_wipe_inside_wipe_tower*/)
 {
+    if (tools.empty())
+        return {};
+
+    auto wipe_volume_for = [this](size_t old_tool, size_t new_tool) {
+        return old_tool < wipe_volumes.size() && new_tool < wipe_volumes[old_tool].size() ? wipe_volumes[old_tool][new_tool] : 0.f;
+    };
+
 	this->set_layer(initial_layer_print_height, initial_layer_print_height, tools.size(), true, false);
 	m_current_tool 		= tools.front();
     
@@ -1786,7 +1793,8 @@ std::vector<WipeTower::ToolChangeResult> WipeTower2::prime(
         toolchange_Load(writer, cleaning_box); // Prime the tool.
         if (idx_tool + 1 == tools.size()) {
             // Last tool should not be unloaded, but it should be wiped enough to become of a pure color.
-            toolchange_Wipe(writer, cleaning_box, wipe_volumes[tools[idx_tool-1]][tool], false);
+            const float final_wipe_volume = idx_tool > 0 ? wipe_volume_for(tools[idx_tool-1], tool) : 0.f;
+            toolchange_Wipe(writer, cleaning_box, final_wipe_volume, false);
         } else {
             // Ram the hot material out of the melt zone, retract the filament into the cooling tubes and let it cool.
             //writer.travel(writer.x(), writer.y() + m_perimeter_width, 7200);
