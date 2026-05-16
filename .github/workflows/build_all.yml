@@ -10,7 +10,11 @@ on:
         type: boolean
         default: false
       build_linux:
-        description: 'Build Linux and Flatpak artifacts'
+        description: 'Build Linux AppImage artifacts'
+        type: boolean
+        default: false
+      build_flatpak:
+        description: 'Build Linux Flatpak artifacts'
         type: boolean
         default: false
       build_windows:
@@ -31,7 +35,7 @@ on:
         required: false
         default: ''
       publish_release:
-        description: 'Publish Windows and macOS artifacts to a GitHub release'
+        description: 'Publish selected Windows, macOS, and Linux artifacts to a GitHub release'
         type: boolean
         default: true
 
@@ -92,10 +96,12 @@ jobs:
     name: Publish Release
     runs-on: ubuntu-24.04
     needs:
+      - build_linux
       - build_windows
       - build_macos_arch
       - build_macos_universal
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && (inputs.publish_release || false) && !inputs.build-deps-only && (inputs.build_windows || inputs.build_macos) && (inputs.build_windows == false || needs.build_windows.result == 'success') && (inputs.build_macos == false || needs.build_macos_arch.result == 'success') && (inputs.build_macos == false || needs.build_macos_universal.result == 'success' || needs.build_macos_universal.result == 'skipped') }}
+      - flatpak
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && (inputs.publish_release || false) && !inputs.build-deps-only && (inputs.build_windows || inputs.build_macos || inputs.build_linux || inputs.build_flatpak || vars.BUILD_LINUX == 'true' || vars.BUILD_FLATPAK == 'true') && (inputs.build_windows == false || needs.build_windows.result == 'success') && (inputs.build_macos == false || needs.build_macos_arch.result == 'success') && (inputs.build_macos == false || needs.build_macos_universal.result == 'success' || needs.build_macos_universal.result == 'skipped') && (((inputs.build_linux || false) || vars.BUILD_LINUX == 'true') == false || needs.build_linux.result == 'success') && (((inputs.build_flatpak || false) || vars.BUILD_FLATPAK == 'true') == false || needs.flatpak.result == 'success') }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -128,7 +134,9 @@ jobs:
           mapfile -t assets < <(find release-artifacts -type f \( \
             -name "OrcaSlicer-ImageMap_Mac_*_V$version.dmg" -o \
             -name "OrcaSlicer-ImageMap_Windows_V${version}_portable.zip" -o \
-            -name "OrcaSlicer-ImageMap_Windows_Installer_V${version}.exe" \
+            -name "OrcaSlicer-ImageMap_Windows_Installer_V${version}.exe" -o \
+            -name "OrcaSlicer_Linux_AppImage*_V${version}.AppImage" -o \
+            -name "OrcaSlicer-Linux-flatpak_V${version}_*.flatpak" \
           \) ! -name '*profile_validator*' | sort)
 
           if [ "${#assets[@]}" -eq 0 ]; then
@@ -211,7 +219,7 @@ jobs:
             runner: ubuntu-24.04
           - arch: aarch64
             runner: ubuntu-24.04-arm
-    if: ${{ !cancelled() && (github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/'))) && !vars.SELF_HOSTED && ((inputs.build_linux || false) || vars.BUILD_LINUX == 'true') }}
+    if: ${{ !cancelled() && (github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/'))) && !vars.SELF_HOSTED && !inputs.build-deps-only && ((inputs.build_flatpak || false) || vars.BUILD_FLATPAK == 'true') }}
 
     runs-on: ${{ matrix.variant.runner }}
     env:

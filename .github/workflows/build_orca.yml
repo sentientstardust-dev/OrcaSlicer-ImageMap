@@ -34,7 +34,7 @@ jobs:
       ubuntu-ver-str: '_Ubuntu2404'
       ORCA_UPDATER_SIG_KEY: ${{ secrets.ORCA_UPDATER_SIG_KEY }}
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
-      SCCACHE_CACHE_SIZE: 5G
+      SCCACHE_CACHE_SIZE: 2G
 
     steps:
       - name: Checkout
@@ -57,7 +57,7 @@ jobs:
           useCloudCache: true
 
       - name: Restore sccache cache
-        if: ${{ !vars.SELF_HOSTED && (runner.os == 'Windows' || (runner.os == 'macOS' && !inputs.macos-combine-only)) }}
+        if: ${{ !vars.SELF_HOSTED && (runner.os == 'Windows' || runner.os == 'Linux' || (runner.os == 'macOS' && !inputs.macos-combine-only)) }}
         uses: actions/cache@v5
         with:
           path: ${{ env.SCCACHE_DIR }}
@@ -444,6 +444,15 @@ jobs:
         if: runner.os == 'Linux' && !vars.SELF_HOSTED
         uses: ./.github/actions/apt-install-deps
 
+      - name: Install sccache Linux
+        if: runner.os == 'Linux' && !vars.SELF_HOSTED
+        shell: bash
+        run: |
+          sudo apt install -y sccache
+          echo "CMAKE_C_COMPILER_LAUNCHER=sccache" >> "$GITHUB_ENV"
+          echo "CMAKE_CXX_COMPILER_LAUNCHER=sccache" >> "$GITHUB_ENV"
+          sccache --zero-stats
+
         # Tests must built at the same time as the slicer;
         # if you untangle them feel free to separate them here too
       - name: Build slicer and tests
@@ -455,6 +464,14 @@ jobs:
           mv -n ./build/OrcaSlicer_Linux_V${{ env.ver_pure }}.AppImage ./build/OrcaSlicer_Linux_AppImage${{ env.ubuntu-ver-str }}_${{ env.ver }}.AppImage
           chmod +x ./build/OrcaSlicer_Linux_AppImage${{ env.ubuntu-ver-str }}_${{ env.ver }}.AppImage
           tar -cvpf build_tests.tar build/tests
+
+      - name: Show sccache stats Linux
+        if: ${{ always() && runner.os == 'Linux' && !vars.SELF_HOSTED }}
+        shell: bash
+        run: |
+          if command -v sccache >/dev/null 2>&1; then
+            sccache --show-stats
+          fi
 
         # Use tar because upload-artifacts won't always preserve directory structure
         # and doesn't preserve file permissions
