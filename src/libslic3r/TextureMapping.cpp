@@ -797,6 +797,8 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            compact_offset_mode == rhs.compact_offset_mode &&
            use_legacy_fixed_color_mode == rhs.use_legacy_fixed_color_mode &&
            high_speed_image_texture_sampling == rhs.high_speed_image_texture_sampling &&
+           minimum_visibility_offset_enabled == rhs.minimum_visibility_offset_enabled &&
+           std::abs(minimum_visibility_offset_pct - rhs.minimum_visibility_offset_pct) <= eps &&
            generic_solver_lookup_mode == rhs.generic_solver_lookup_mode &&
            generic_solver_mode == rhs.generic_solver_mode &&
            generic_solver_mix_model == rhs.generic_solver_mix_model &&
@@ -1044,6 +1046,9 @@ std::string TextureMappingManager::serialize_entries()
         texture["compact_offset_mode"] = zone.compact_offset_mode;
         texture["use_legacy_fixed_color_mode"] = zone.use_legacy_fixed_color_mode;
         texture["high_speed_image_texture_sampling"] = zone.high_speed_image_texture_sampling;
+        texture["minimum_visibility_offset_enabled"] = zone.minimum_visibility_offset_enabled;
+        texture["minimum_visibility_offset_pct"] =
+            std::clamp(finite_or(zone.minimum_visibility_offset_pct, TextureMappingZone::DefaultMinimumVisibilityOffsetPct), 0.f, 100.f);
         texture["generic_solver_lookup"] = generic_solver_lookup_mode_name(zone.generic_solver_lookup_mode);
         texture["generic_solver_mode"] = generic_solver_mode_name(zone.generic_solver_mode);
         texture["generic_solver_mix_model"] = generic_solver_mix_model_name(zone.generic_solver_mix_model);
@@ -1174,6 +1179,13 @@ void TextureMappingManager::load_entries(const std::string &serialized,
             texture.value("use_legacy_fixed_color_mode", TextureMappingZone::DefaultUseLegacyFixedColorMode);
         zone.high_speed_image_texture_sampling =
             texture.value("high_speed_image_texture_sampling", TextureMappingZone::DefaultHighSpeedImageTextureSampling);
+        zone.minimum_visibility_offset_enabled =
+            texture.value("minimum_visibility_offset_enabled", TextureMappingZone::DefaultMinimumVisibilityOffsetEnabled);
+        zone.minimum_visibility_offset_pct =
+            std::clamp(finite_or(texture.value("minimum_visibility_offset_pct", TextureMappingZone::DefaultMinimumVisibilityOffsetPct),
+                                 TextureMappingZone::DefaultMinimumVisibilityOffsetPct),
+                       0.f,
+                       100.f);
         zone.generic_solver_lookup_mode =
             generic_solver_lookup_mode_from_name(texture.value("generic_solver_lookup", std::string("closest_mix")));
         const auto generic_solver_mode_it = texture.find("generic_solver_mode");

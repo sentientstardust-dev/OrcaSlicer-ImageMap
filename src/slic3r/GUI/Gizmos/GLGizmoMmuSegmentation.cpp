@@ -140,6 +140,17 @@ struct TrueColorRgbDataConversionResult
     bool                                               canceled = false;
 };
 
+struct ColorAutoPaintPreviewTask
+{
+    const ModelObject *object = nullptr;
+    const ModelVolume *volume = nullptr;
+    TriangleSelector::TriangleSplittingData selector_data;
+    std::vector<ColorRGBA> ebt_colors;
+    Transform3d trafo_no_translate = Transform3d::Identity();
+    EnforcerBlockerType max_ebt = EnforcerBlockerType::NONE;
+    bool valid = false;
+};
+
 struct GLGizmoTrueColorPainting::RgbDataConversionState
 {
     std::atomic_bool                  cancel { false };
@@ -192,10 +203,19 @@ void GLGizmoMmuSegmentation::on_opening()
         show_notification_extruders_limit_exceeded();
 }
 
+GLGizmoMmuSegmentation::~GLGizmoMmuSegmentation()
+{
+    cancel_color_auto_paint_preview_worker();
+}
+
 void GLGizmoMmuSegmentation::on_shutdown()
 {
     m_show_slope_auto_paint_overlay = false;
     m_slope_auto_paint_preview_active = false;
+    m_show_color_auto_paint_overlay = false;
+    m_color_auto_paint_preview_active = false;
+    cancel_color_auto_paint_preview_worker();
+    m_color_auto_paint_preview_selectors.clear();
     m_parent.use_slope(false);
     m_parent.toggle_model_objects_visibility(true);
 }
@@ -307,6 +327,20 @@ static wxString slope_auto_paint_filament_label(unsigned int filament_id)
     return is_texture_mapping_filament_id(filament_id) ?
         wxString::Format(_L("Filament %u (Texture Mapping)"), filament_id) :
         wxString::Format(_L("Filament %u"), filament_id);
+}
+
+static std::vector<ColorRGBA> mmu_segmentation_selector_colors_for_volume(const ModelVolume &volume,
+                                                                          const std::vector<ColorRGBA> &extruder_colors)
+{
+    if (extruder_colors.empty())
+        return {};
+
+    const unsigned int extruder_id = volume.extruder_id() > 0 ? unsigned(volume.extruder_id()) : 1u;
+    const size_t extruder_color_idx = extruder_color_index_for_filament_id(extruder_id, extruder_colors.size());
+    std::vector<ColorRGBA> colors;
+    colors.emplace_back(extruder_colors[extruder_color_idx]);
+    colors.insert(colors.end(), extruder_colors.begin(), extruder_colors.end());
+    return colors;
 }
 
 static bool slope_auto_paint_matches_normal(const SlopeAutoPaintSettings &settings, float world_normal_z)
@@ -3747,6 +3781,126 @@ static ColorRGBA sample_volume_color_source(const ModelVolume       &volume,
     }
 
     return fallback_color != nullptr ? *fallback_color : ColorRGBA(1.f, 1.f, 1.f, 1.f);
+}
+
+static ColorRGBA composite_color_over_background(const ColorRGBA &color, const ColorRGBA &background)
+{
+    const float alpha = std::clamp(color.a(), 0.f, 1.f);
+    return ColorRGBA(color.r() * alpha + background.r() * (1.f - alpha),
+                     color.g() * alpha + background.g() * (1.f - alpha),
+                     color.b() * alpha + background.b() * (1.f - alpha),
+                     1.f);
+}
+
+static std::optional<ColorRGBA> sample_color_auto_paint_source(const ModelObject       *object,
+                                                               const ModelVolume       &volume,
+                                                               const VolumeColorSource &source,
+                                                               size_t                   tri_idx,
+                                                               const Vec3f             &point,
+                                                               const Vec3f             &barycentric)
+{
+    const ColorRGBA configured_background =
+        configured_texture_mapping_background_color_for_volume(volume).value_or(managed_color_data_background_color(object));
+
+    if (source.rgb_background_color) {
+        ColorRGBA color = *source.rgb_background_color;
+        if (std::optional<ColorRGBA> sampled = sample_rgb_color_facets(source.rgb_facets,
+                                                                       source.rgb_by_source_triangle,
+                                                                       int(tri_idx),
+                                                                       point))
+            color = *sampled;
+        ColorRGBA background = *source.rgb_background_color;
+        background.a(1.f);
+        return composite_color_over_background(color, background);
+    }
+
+    const indexed_triangle_set &its = volume.mesh().its;
+    if (model_volume_has_bakeable_image_texture_data(&volume) && tri_idx < volume.imported_texture_uv_valid.size()) {
+        const size_t uv_offset = tri_idx * 6;
+        if (volume.imported_texture_uv_valid[tri_idx] != 0 && uv_offset + 5 < volume.imported_texture_uvs_per_face.size()) {
+            const Vec2f uv0(volume.imported_texture_uvs_per_face[uv_offset + 0], volume.imported_texture_uvs_per_face[uv_offset + 1]);
+            const Vec2f uv1(volume.imported_texture_uvs_per_face[uv_offset + 2], volume.imported_texture_uvs_per_face[uv_offset + 3]);
+            const Vec2f uv2(volume.imported_texture_uvs_per_face[uv_offset + 4], volume.imported_texture_uvs_per_face[uv_offset + 5]);
+            return composite_color_over_background(sample_texture_rgba_for_face_bake(volume.imported_texture_rgba,
+                                                                                     volume.imported_texture_width,
+                                                                                     volume.imported_texture_height,
+                                                                                     uv0,
+                                                                                     uv1,
+                                                                                     uv2,
+                                                                                     barycentric),
+                                                   configured_background);
+        }
+    }
+
+    if (volume.imported_vertex_colors_rgba.size() == its.vertices.size() && tri_idx < its.indices.size()) {
+        const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
+        if (tri[0] >= 0 && tri[1] >= 0 && tri[2] >= 0 &&
+            size_t(tri[0]) < volume.imported_vertex_colors_rgba.size() &&
+            size_t(tri[1]) < volume.imported_vertex_colors_rgba.size() &&
+            size_t(tri[2]) < volume.imported_vertex_colors_rgba.size()) {
+            const ColorRGBA c0 = unpack_vertex_color_rgba_for_conversion(volume.imported_vertex_colors_rgba[size_t(tri[0])]);
+            const ColorRGBA c1 = unpack_vertex_color_rgba_for_conversion(volume.imported_vertex_colors_rgba[size_t(tri[1])]);
+            const ColorRGBA c2 = unpack_vertex_color_rgba_for_conversion(volume.imported_vertex_colors_rgba[size_t(tri[2])]);
+            const ColorRGBA sampled(c0.r() * barycentric.x() + c1.r() * barycentric.y() + c2.r() * barycentric.z(),
+                                    c0.g() * barycentric.x() + c1.g() * barycentric.y() + c2.g() * barycentric.z(),
+                                    c0.b() * barycentric.x() + c1.b() * barycentric.y() + c2.b() * barycentric.z(),
+                                    c0.a() * barycentric.x() + c1.a() * barycentric.y() + c2.a() * barycentric.z());
+            return composite_color_over_background(sampled, configured_background);
+        }
+    }
+
+    return std::nullopt;
+}
+
+static std::array<float, 3> color_auto_paint_oklab(const ColorRGBA &color)
+{
+    return color_solver_oklab_from_srgb({ std::clamp(color.r(), 0.f, 1.f),
+                                          std::clamp(color.g(), 0.f, 1.f),
+                                          std::clamp(color.b(), 0.f, 1.f) });
+}
+
+static float color_auto_paint_max_oklab_distance()
+{
+    static const float max_distance = []() {
+        const std::array<ColorRGBA, 8> corners = {
+            ColorRGBA(0.f, 0.f, 0.f, 1.f),
+            ColorRGBA(0.f, 0.f, 1.f, 1.f),
+            ColorRGBA(0.f, 1.f, 0.f, 1.f),
+            ColorRGBA(0.f, 1.f, 1.f, 1.f),
+            ColorRGBA(1.f, 0.f, 0.f, 1.f),
+            ColorRGBA(1.f, 0.f, 1.f, 1.f),
+            ColorRGBA(1.f, 1.f, 0.f, 1.f),
+            ColorRGBA(1.f, 1.f, 1.f, 1.f)
+        };
+        float distance = 0.f;
+        for (const ColorRGBA &lhs : corners) {
+            const std::array<float, 3> lhs_oklab = color_auto_paint_oklab(lhs);
+            for (const ColorRGBA &rhs : corners) {
+                const std::array<float, 3> rhs_oklab = color_auto_paint_oklab(rhs);
+                const float dl = lhs_oklab[0] - rhs_oklab[0];
+                const float da = lhs_oklab[1] - rhs_oklab[1];
+                const float db = lhs_oklab[2] - rhs_oklab[2];
+                distance = std::max(distance, std::sqrt(dl * dl + da * da + db * db));
+            }
+        }
+        return std::max(distance, 1.f);
+    }();
+    return max_distance;
+}
+
+static bool color_auto_paint_matches_target(const ColorRGBA &sample, const ColorAutoPaintSettings &settings)
+{
+    const float tolerance_pct = std::clamp(settings.tolerance_pct, 0.f, 100.f);
+    if (tolerance_pct >= 100.f)
+        return true;
+
+    const std::array<float, 3> sample_oklab = color_auto_paint_oklab(sample);
+    const std::array<float, 3> target_oklab = color_auto_paint_oklab(settings.target_color);
+    const float dl = sample_oklab[0] - target_oklab[0];
+    const float da = sample_oklab[1] - target_oklab[1];
+    const float db = sample_oklab[2] - target_oklab[2];
+    const float tolerance = tolerance_pct * 0.01f * color_auto_paint_max_oklab_distance();
+    return dl * dl + da * da + db * db <= tolerance * tolerance;
 }
 
 static bool snapshot_has_bakeable_image_texture_data(const TrueColorRgbDataConversionVolumeSnapshot &snapshot)
@@ -8646,6 +8800,70 @@ bool GLGizmoMmuSegmentation::should_render_triangle_texture_preview() const
     return !m_slope_auto_paint_preview_active;
 }
 
+void GLGizmoMmuSegmentation::render_extra_triangle_overlays(int mesh_id,
+                                                            const Transform3d &matrix,
+                                                            const Transform3d &view_matrix,
+                                                            const Transform3d &projection_matrix,
+                                                            const std::array<float, 2> &z_range,
+                                                            const std::array<float, 4> &clipping_plane) const
+{
+    (void)view_matrix;
+    (void)projection_matrix;
+    (void)z_range;
+    (void)clipping_plane;
+    if (!m_color_auto_paint_preview_active ||
+        mesh_id < 0 ||
+        size_t(mesh_id) >= m_color_auto_paint_preview_selectors.size() ||
+        m_color_auto_paint_preview_selectors[size_t(mesh_id)] == nullptr)
+        return;
+
+    GLShaderProgram *shader = wxGetApp().get_current_shader();
+    if (shader == nullptr)
+        return;
+
+    const size_t target_color_idx =
+        extruder_color_index_for_filament_id(m_color_auto_paint_preview_settings.target_filament_id, m_extruders_colors.size());
+    ColorRGBA highlight_color = m_extruders_colors.empty() ?
+        ColorRGBA(0.15f, 0.65f, 0.6f, 1.f) :
+        m_extruders_colors[target_color_idx];
+    highlight_color.a(0.95f);
+    const Matrix3f normal_matrix = static_cast<Matrix3f>(matrix.matrix().block(0, 0, 3, 3).inverse().transpose().cast<float>());
+    const std::array<float, 4> empty_mask { 0.f, 0.f, 0.f, 0.f };
+
+    GLint depth_func = GL_LESS;
+    GLfloat polygon_offset_factor = 0.f;
+    GLfloat polygon_offset_units = 0.f;
+    GLboolean polygon_offset_fill_enabled = glIsEnabled(GL_POLYGON_OFFSET_FILL);
+    glsafe(::glGetIntegerv(GL_DEPTH_FUNC, &depth_func));
+    glsafe(::glGetFloatv(GL_POLYGON_OFFSET_FACTOR, &polygon_offset_factor));
+    glsafe(::glGetFloatv(GL_POLYGON_OFFSET_UNITS, &polygon_offset_units));
+
+    shader->set_uniform("slope.actived", true);
+    shader->set_uniform("slope.volume_world_normal_matrix", normal_matrix);
+    shader->set_uniform("slope.normal_z", 0.f);
+    shader->set_uniform("slope.preview_mode", 4);
+    shader->set_uniform("slope.top_z", 1.f);
+    shader->set_uniform("slope.bottom_z", -1.f);
+    shader->set_uniform("slope.highlight_color", highlight_color);
+    shader->set_uniform("slope.override_all", true);
+    shader->set_uniform("slope.current_state", 0);
+    shader->set_uniform("slope.base_state", 1);
+    shader->set_uniform("slope.override_mask0", empty_mask);
+    shader->set_uniform("slope.override_mask1", empty_mask);
+    shader->set_uniform("slope.override_mask2", empty_mask);
+    shader->set_uniform("slope.override_mask3", empty_mask);
+
+    glsafe(::glDepthFunc(GL_LEQUAL));
+    glsafe(::glEnable(GL_POLYGON_OFFSET_FILL));
+    glsafe(::glPolygonOffset(-1.f, -1.f));
+    m_color_auto_paint_preview_selectors[size_t(mesh_id)]->render(m_imgui, matrix);
+    glsafe(::glPolygonOffset(polygon_offset_factor, polygon_offset_units));
+    if (!polygon_offset_fill_enabled)
+        glsafe(::glDisable(GL_POLYGON_OFFSET_FILL));
+    glsafe(::glDepthFunc(depth_func));
+    shader->set_uniform("slope.actived", false);
+}
+
 void GLGizmoMmuSegmentation::render_slope_auto_paint_overlay()
 {
     if (!m_show_slope_auto_paint_overlay)
@@ -8742,6 +8960,7 @@ void GLGizmoMmuSegmentation::render_slope_auto_paint_overlay()
         changed |= render_angle(_L("Angle from bottom"), "##slope_bottom_angle", m_slope_auto_paint_settings.bottom_angle_deg);
 
     ImGui::Separator();
+    m_imgui->text(_L("Mask:"));
     bool override_all = m_slope_auto_paint_settings.override_all;
     if (m_imgui->bbl_checkbox(_L("All"), override_all)) {
         if (override_all) {
@@ -8831,6 +9050,10 @@ void GLGizmoMmuSegmentation::open_slope_auto_paint_overlay()
     if (m_c->selection_info()->model_object() == nullptr)
         return;
 
+    m_show_color_auto_paint_overlay = false;
+    m_color_auto_paint_overlay_positioned = false;
+    clear_color_auto_paint_preview();
+
     m_slope_auto_paint_settings = SlopeAutoPaintSettings();
     m_slope_auto_paint_settings.target_filament_id = m_selected_extruder_idx < m_display_filament_ids.size() ?
         m_display_filament_ids[m_selected_extruder_idx] :
@@ -8909,15 +9132,456 @@ bool GLGizmoMmuSegmentation::apply_slope_auto_paint(const SlopeAutoPaintSettings
                                                              EnforcerBlockerType current_state, float world_normal_z) {
                                                              if (!slope_auto_paint_matches_normal(settings, world_normal_z))
                                                                  return false;
-                                                             const unsigned int current_filament_id = current_state == EnforcerBlockerType::NONE ?
-                                                                 base_filament_id :
-                                                                 static_cast<unsigned int>(current_state);
+                                                             const unsigned int current_filament_id =
+                                                                 current_state == EnforcerBlockerType::NONE ?
+                                                                     base_filament_id :
+                                                                     static_cast<unsigned int>(current_state);
                                                              return settings.override_all || override_ids.count(current_filament_id) != 0;
                                                          },
                                                          SlopeAutoPaintMaxEdgeMm,
                                                          SlopeAutoPaintMaxDepth,
                                                          preview);
         selector_gui->request_update_render_data(true);
+        changed |= selector_changed;
+    }
+
+    return changed;
+}
+
+void GLGizmoMmuSegmentation::render_color_auto_paint_overlay()
+{
+    if (!m_show_color_auto_paint_overlay)
+        return;
+
+    if (!selected_object_has_color_auto_paint_source()) {
+        m_show_color_auto_paint_overlay = false;
+        clear_color_auto_paint_preview();
+        return;
+    }
+
+    std::vector<unsigned int> filament_ids = m_display_filament_ids;
+    if (filament_ids.empty())
+        filament_ids.emplace_back(1u);
+
+    std::vector<std::string> filament_labels;
+    std::vector<ColorRGBA> filament_colors;
+    filament_labels.reserve(filament_ids.size());
+    filament_colors.reserve(filament_ids.size());
+    for (const unsigned int filament_id : filament_ids) {
+        filament_labels.emplace_back(into_u8(slope_auto_paint_filament_label(filament_id)));
+        const size_t color_idx = extruder_color_index_for_filament_id(filament_id, m_extruders_colors.size());
+        filament_colors.emplace_back(m_extruders_colors.empty() ? ColorRGBA(0.15f, 0.65f, 0.6f, 1.f) : m_extruders_colors[color_idx]);
+    }
+
+    if (std::find(filament_ids.begin(), filament_ids.end(), m_color_auto_paint_settings.target_filament_id) == filament_ids.end())
+        m_color_auto_paint_settings.target_filament_id = filament_ids.front();
+
+    if (!m_color_auto_paint_overlay_positioned) {
+        const Size canvas_size = m_parent.get_canvas_size();
+        const float window_width = m_imgui->scaled(22.f);
+        const float window_x = std::max(m_imgui->scaled(8.f),
+                                        float(canvas_size.get_width()) - window_width - m_imgui->scaled(24.f));
+        ImGui::SetNextWindowPos(ImVec2(window_x, m_parent.get_main_toolbar_height() + m_imgui->scaled(16.f)),
+                                ImGuiCond_Always);
+        m_color_auto_paint_overlay_positioned = true;
+    }
+
+    m_imgui->push_common_window_style(m_parent.get_scale());
+    ImGui::SetNextWindowSize(ImVec2(m_imgui->scaled(22.f), 0.f), ImGuiCond_FirstUseEver);
+    bool open = true;
+    const int flags = ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse;
+    m_imgui->begin(_L("Paint by color"), &open, flags);
+
+    bool changed = false;
+    const float label_width = m_imgui->scaled(7.5f);
+    const float item_width = m_imgui->scaled(11.f);
+
+    size_t target_idx = 0;
+    for (size_t idx = 0; idx < filament_ids.size(); ++idx) {
+        if (filament_ids[idx] == m_color_auto_paint_settings.target_filament_id) {
+            target_idx = idx;
+            break;
+        }
+    }
+    const size_t old_target_idx = target_idx;
+    ImGui::AlignTextToFramePadding();
+    m_imgui->text(_L("Paint with"));
+    ImGui::SameLine(label_width);
+    ImGui::PushItemWidth(item_width);
+    render_extruders_combo("##color_auto_paint_target", filament_labels, filament_colors, target_idx);
+    ImGui::PopItemWidth();
+    if (target_idx != old_target_idx && target_idx < filament_ids.size()) {
+        m_color_auto_paint_settings.target_filament_id = filament_ids[target_idx];
+        changed = true;
+    }
+
+    std::array<float, 3> target_color = {
+        std::clamp(m_color_auto_paint_settings.target_color.r(), 0.f, 1.f),
+        std::clamp(m_color_auto_paint_settings.target_color.g(), 0.f, 1.f),
+        std::clamp(m_color_auto_paint_settings.target_color.b(), 0.f, 1.f)
+    };
+    ImGui::AlignTextToFramePadding();
+    m_imgui->text(_L("Color"));
+    ImGui::SameLine(label_width);
+    ImGui::PushItemWidth(item_width);
+    ImGuiColorEditFlags color_flags = ImGuiColorEditFlags_DisplayRGB |
+                                      ImGuiColorEditFlags_InputRGB |
+                                      ImGuiColorEditFlags_NoInputs;
+    if (ImGui::ColorEdit3("##color_auto_paint_picker", target_color.data(), color_flags)) {
+        m_color_auto_paint_settings.target_color = ColorRGBA(target_color[0], target_color[1], target_color[2], 1.f);
+        changed = true;
+    }
+    ImGui::PopItemWidth();
+
+    ImGui::AlignTextToFramePadding();
+    m_imgui->text(_L("Tolerance"));
+    ImGui::SameLine(label_width);
+    ImGui::PushItemWidth(item_width);
+    if (ImGui::SliderFloat("##color_auto_paint_tolerance", &m_color_auto_paint_settings.tolerance_pct, 0.f, 100.f, "%.0f%%")) {
+        m_color_auto_paint_settings.tolerance_pct = std::clamp(m_color_auto_paint_settings.tolerance_pct, 0.f, 100.f);
+        changed = true;
+    }
+    ImGui::PopItemWidth();
+
+    ImGui::Separator();
+    m_imgui->text(_L("Mask:"));
+    bool override_all = m_color_auto_paint_settings.override_all;
+    if (m_imgui->bbl_checkbox(_L("All"), override_all)) {
+        if (override_all) {
+            m_color_auto_paint_settings.override_all = true;
+            m_color_auto_paint_settings.override_filament_ids.clear();
+            changed = true;
+        } else {
+            override_all = true;
+        }
+    }
+
+    const float row_height = ImGui::GetTextLineHeightWithSpacing();
+    const float override_height = std::min(row_height * (float(filament_ids.size()) + 0.5f), row_height * 6.5f);
+    ImGui::BeginChild("##color_auto_paint_override_scroll", ImVec2(0.f, override_height), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    for (size_t idx = 0; idx < filament_ids.size(); ++idx) {
+        const unsigned int filament_id = filament_ids[idx];
+        const bool currently_selected = !m_color_auto_paint_settings.override_all &&
+            std::find(m_color_auto_paint_settings.override_filament_ids.begin(),
+                      m_color_auto_paint_settings.override_filament_ids.end(),
+                      filament_id) != m_color_auto_paint_settings.override_filament_ids.end();
+        bool selected = currently_selected;
+        ImGui::PushID(int(filament_id));
+        if (ImGui::Checkbox("##override", &selected)) {
+            if (selected) {
+                if (m_color_auto_paint_settings.override_all) {
+                    m_color_auto_paint_settings.override_all = false;
+                    m_color_auto_paint_settings.override_filament_ids.clear();
+                }
+                if (std::find(m_color_auto_paint_settings.override_filament_ids.begin(),
+                              m_color_auto_paint_settings.override_filament_ids.end(),
+                              filament_id) == m_color_auto_paint_settings.override_filament_ids.end())
+                    m_color_auto_paint_settings.override_filament_ids.emplace_back(filament_id);
+            } else {
+                auto &override_ids = m_color_auto_paint_settings.override_filament_ids;
+                override_ids.erase(std::remove(override_ids.begin(), override_ids.end(), filament_id), override_ids.end());
+                if (override_ids.empty())
+                    m_color_auto_paint_settings.override_all = true;
+            }
+            changed = true;
+        }
+        ImGui::SameLine();
+        ImGuiColorEditFlags swatch_flags = ImGuiColorEditFlags_NoAlpha | ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel |
+                                           ImGuiColorEditFlags_NoPicker | ImGuiColorEditFlags_NoTooltip;
+        ImGui::ColorButton("##swatch", ImGuiWrapper::to_ImVec4(filament_colors[idx]), swatch_flags,
+                           ImVec2(ImGui::GetTextLineHeight() * 1.5f, ImGui::GetTextLineHeight()));
+        ImGui::SameLine();
+        ImGui::Text("%s", filament_labels[idx].c_str());
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+
+    if (changed) {
+        update_color_auto_paint_preview(m_color_auto_paint_settings);
+    } else if (!m_color_auto_paint_preview_active && !m_color_auto_paint_preview_update_pending) {
+        update_color_auto_paint_preview(m_color_auto_paint_settings);
+    }
+
+    ImGui::Separator();
+    bool close_overlay = false;
+    const bool preview_processing = m_color_auto_paint_preview_update_pending || m_color_auto_paint_preview_worker_running;
+    m_imgui->push_confirm_button_style();
+    m_imgui->disabled_begin(preview_processing);
+    if (m_imgui->bbl_button(_L("Apply"))) {
+        m_color_auto_paint_preview_update_pending = false;
+        ++m_color_auto_paint_preview_generation;
+        Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Paint by color", UndoRedo::SnapshotType::GizmoAction);
+        if (apply_color_auto_paint(m_color_auto_paint_settings, false)) {
+            update_model_object();
+            m_parent.set_as_dirty();
+        }
+        close_overlay = true;
+    }
+    m_imgui->disabled_end();
+    m_imgui->pop_confirm_button_style();
+    ImGui::SameLine();
+    m_imgui->push_cancel_button_style();
+    if (m_imgui->bbl_button(_L("Cancel")))
+        close_overlay = true;
+    m_imgui->pop_cancel_button_style();
+    if (preview_processing) {
+        ImGui::SameLine();
+        m_imgui->text(_L("Processing..."));
+    }
+
+    m_imgui->end();
+    m_imgui->pop_common_window_style();
+
+    if (!open || close_overlay) {
+        m_show_color_auto_paint_overlay = false;
+        m_color_auto_paint_overlay_positioned = false;
+        clear_color_auto_paint_preview();
+    }
+}
+
+void GLGizmoMmuSegmentation::open_color_auto_paint_overlay()
+{
+    if (m_c->selection_info()->model_object() == nullptr || !selected_object_has_color_auto_paint_source())
+        return;
+
+    m_show_slope_auto_paint_overlay = false;
+    m_slope_auto_paint_overlay_positioned = false;
+    clear_slope_auto_paint_preview();
+
+    m_color_auto_paint_settings = ColorAutoPaintSettings();
+    m_color_auto_paint_settings.target_filament_id = m_selected_extruder_idx < m_display_filament_ids.size() ?
+        m_display_filament_ids[m_selected_extruder_idx] :
+        1u;
+    if (!m_display_filament_ids.empty() &&
+        std::find(m_display_filament_ids.begin(), m_display_filament_ids.end(), m_color_auto_paint_settings.target_filament_id) ==
+            m_display_filament_ids.end())
+        m_color_auto_paint_settings.target_filament_id = m_display_filament_ids.front();
+    const size_t color_idx =
+        extruder_color_index_for_filament_id(m_color_auto_paint_settings.target_filament_id, m_extruders_colors.size());
+    if (!m_extruders_colors.empty()) {
+        m_color_auto_paint_settings.target_color = m_extruders_colors[color_idx];
+        m_color_auto_paint_settings.target_color.a(1.f);
+    }
+
+    m_show_color_auto_paint_overlay = true;
+    m_color_auto_paint_overlay_positioned = false;
+    update_color_auto_paint_preview(m_color_auto_paint_settings);
+}
+
+bool GLGizmoMmuSegmentation::apply_color_auto_paint_to_selector(const ModelObject &object,
+                                                                const ModelVolume &volume,
+                                                                TriangleSelector &selector,
+                                                                const Transform3d &trafo_no_translate,
+                                                                const ColorAutoPaintSettings &settings,
+                                                                bool clear_non_matching) const
+{
+    const VolumeColorSource source = build_volume_color_source(volume);
+    const std::unordered_set<unsigned int> override_ids(settings.override_filament_ids.begin(), settings.override_filament_ids.end());
+    const unsigned int base_filament_id = volume.extruder_id() > 0 ? static_cast<unsigned int>(volume.extruder_id()) : 1u;
+
+    return selector.apply_state_by_triangle_sampler(
+        trafo_no_translate,
+        static_cast<EnforcerBlockerType>(settings.target_filament_id),
+        [&object, &volume, &source, &settings, &override_ids, base_filament_id](
+            EnforcerBlockerType current_state, size_t source_triangle, const Vec3f &point, const Vec3f &barycentric) {
+            const unsigned int current_filament_id = current_state == EnforcerBlockerType::NONE ?
+                base_filament_id :
+                static_cast<unsigned int>(current_state);
+            if (!settings.override_all && override_ids.count(current_filament_id) == 0)
+                return false;
+
+            const std::optional<ColorRGBA> color =
+                sample_color_auto_paint_source(&object, volume, source, source_triangle, point, barycentric);
+            return color && color_auto_paint_matches_target(*color, settings);
+        },
+        SlopeAutoPaintMaxEdgeMm,
+        SlopeAutoPaintMaxDepth,
+        clear_non_matching);
+}
+
+void GLGizmoMmuSegmentation::update_color_auto_paint_preview(const ColorAutoPaintSettings &settings)
+{
+    m_color_auto_paint_requested_settings = settings;
+    m_color_auto_paint_preview_update_pending = true;
+    ++m_color_auto_paint_preview_generation;
+    start_color_auto_paint_preview_worker();
+    m_parent.schedule_extra_frame(0);
+}
+
+void GLGizmoMmuSegmentation::start_color_auto_paint_preview_worker()
+{
+    if (m_color_auto_paint_preview_worker_running)
+        return;
+
+    if (m_color_auto_paint_preview_thread.joinable())
+        m_color_auto_paint_preview_thread.join();
+
+    ModelObject *mo = m_c->selection_info()->model_object();
+    const Selection &selection = m_parent.get_selection();
+    const bool active = mo != nullptr &&
+                        !m_triangle_selectors.empty() &&
+                        selection.get_instance_idx() >= 0 &&
+                        selection.get_instance_idx() < int(mo->instances.size()) &&
+                        selected_object_has_color_auto_paint_source();
+    if (!active) {
+        m_color_auto_paint_preview_selectors.clear();
+        m_color_auto_paint_preview_active = false;
+        m_color_auto_paint_preview_update_pending = false;
+        m_parent.set_as_dirty();
+        m_parent.schedule_extra_frame(0);
+        return;
+    }
+
+    const Transform3d instance_trafo_not_translate = m_parent.get_canvas_type() == GLCanvas3D::CanvasAssembleView ?
+        mo->instances[selection.get_instance_idx()]->get_assemble_transformation().get_matrix_no_offset() :
+        mo->instances[selection.get_instance_idx()]->get_transformation().get_matrix_no_offset();
+
+    std::vector<ColorAutoPaintPreviewTask> tasks;
+    int selector_idx = -1;
+    for (const ModelVolume *mv : mo->volumes) {
+        if (!mv->is_model_part())
+            continue;
+
+        ++selector_idx;
+        ColorAutoPaintPreviewTask task;
+        if (selector_idx < 0 ||
+            size_t(selector_idx) >= m_triangle_selectors.size() ||
+            m_triangle_selectors[size_t(selector_idx)] == nullptr) {
+            tasks.emplace_back(std::move(task));
+            continue;
+        }
+
+        std::vector<ColorRGBA> ebt_colors = mmu_segmentation_selector_colors_for_volume(*mv, m_extruders_colors);
+        if (ebt_colors.empty()) {
+            tasks.emplace_back(std::move(task));
+            continue;
+        }
+
+        task.object = mo;
+        task.volume = mv;
+        task.selector_data = m_triangle_selectors[size_t(selector_idx)]->serialize();
+        task.ebt_colors = std::move(ebt_colors);
+        task.trafo_no_translate = instance_trafo_not_translate * mv->get_matrix_no_offset();
+        task.max_ebt = (EnforcerBlockerType)std::min(m_extruders_colors.size(), (size_t)EnforcerBlockerType::ExtruderMax);
+        task.valid = true;
+        tasks.emplace_back(std::move(task));
+    }
+
+    const uint64_t generation = m_color_auto_paint_preview_generation;
+    const ColorAutoPaintSettings settings = m_color_auto_paint_requested_settings;
+    m_color_auto_paint_preview_worker_running = true;
+    m_color_auto_paint_preview_thread = std::thread([this, generation, settings, tasks = std::move(tasks)]() mutable {
+        auto selectors = std::make_shared<std::vector<std::unique_ptr<TriangleSelectorPatch>>>();
+        selectors->reserve(tasks.size());
+        for (const ColorAutoPaintPreviewTask &task : tasks) {
+            if (!task.valid || task.object == nullptr || task.volume == nullptr) {
+                selectors->emplace_back();
+                continue;
+            }
+
+            std::unique_ptr<TriangleSelectorPatch> preview_selector =
+                std::make_unique<TriangleSelectorPatch>(task.volume->mesh(), task.volume, task.ebt_colors, 0.2f);
+            preview_selector->deserialize(task.selector_data, false, task.max_ebt);
+            preview_selector->set_none_state_rendered(false);
+            preview_selector->set_texture_preview_needed(false);
+            preview_selector->set_wireframe_needed(false);
+            apply_color_auto_paint_to_selector(*task.object,
+                                               *task.volume,
+                                               *preview_selector,
+                                               task.trafo_no_translate,
+                                               settings,
+                                               true);
+            preview_selector->request_update_render_data(true);
+            selectors->emplace_back(std::move(preview_selector));
+        }
+
+        wxGetApp().CallAfter([this, generation, settings, selectors]() mutable {
+            finish_color_auto_paint_preview_update(generation, settings, true, std::move(*selectors));
+        });
+    });
+}
+
+void GLGizmoMmuSegmentation::finish_color_auto_paint_preview_update(
+    uint64_t generation,
+    const ColorAutoPaintSettings &settings,
+    bool active,
+    std::vector<std::unique_ptr<TriangleSelectorPatch>> &&selectors)
+{
+    if (m_color_auto_paint_preview_thread.joinable())
+        m_color_auto_paint_preview_thread.join();
+    m_color_auto_paint_preview_worker_running = false;
+
+    if (generation == m_color_auto_paint_preview_generation && m_show_color_auto_paint_overlay) {
+        m_color_auto_paint_preview_selectors = std::move(selectors);
+        m_color_auto_paint_preview_settings = settings;
+        m_color_auto_paint_preview_active = active;
+        m_color_auto_paint_preview_update_pending = false;
+        m_parent.set_as_dirty();
+        m_parent.schedule_extra_frame(0);
+    }
+
+    if (m_color_auto_paint_preview_update_pending && m_show_color_auto_paint_overlay)
+        start_color_auto_paint_preview_worker();
+}
+
+void GLGizmoMmuSegmentation::cancel_color_auto_paint_preview_worker()
+{
+    ++m_color_auto_paint_preview_generation;
+    m_color_auto_paint_preview_update_pending = false;
+    if (m_color_auto_paint_preview_thread.joinable())
+        m_color_auto_paint_preview_thread.join();
+    m_color_auto_paint_preview_worker_running = false;
+}
+
+void GLGizmoMmuSegmentation::clear_color_auto_paint_preview()
+{
+    ++m_color_auto_paint_preview_generation;
+    m_color_auto_paint_preview_active = false;
+    m_color_auto_paint_preview_update_pending = false;
+    m_color_auto_paint_preview_selectors.clear();
+    m_parent.set_as_dirty();
+    m_parent.schedule_extra_frame(0);
+}
+
+bool GLGizmoMmuSegmentation::apply_color_auto_paint(const ColorAutoPaintSettings &settings, bool preview)
+{
+    if (preview) {
+        update_color_auto_paint_preview(settings);
+        return false;
+    }
+
+    ModelObject *mo = m_c->selection_info()->model_object();
+    if (mo == nullptr || m_triangle_selectors.empty())
+        return false;
+
+    const Selection &selection = m_parent.get_selection();
+    if (selection.get_instance_idx() < 0 || selection.get_instance_idx() >= int(mo->instances.size()))
+        return false;
+
+    const Transform3d instance_trafo_not_translate = m_parent.get_canvas_type() == GLCanvas3D::CanvasAssembleView ?
+        mo->instances[selection.get_instance_idx()]->get_assemble_transformation().get_matrix_no_offset() :
+        mo->instances[selection.get_instance_idx()]->get_transformation().get_matrix_no_offset();
+
+    bool changed = false;
+    int selector_idx = -1;
+    for (const ModelVolume *mv : mo->volumes) {
+        if (!mv->is_model_part())
+            continue;
+
+        ++selector_idx;
+        if (selector_idx < 0 || size_t(selector_idx) >= m_triangle_selectors.size() ||
+            m_triangle_selectors[size_t(selector_idx)] == nullptr)
+            continue;
+
+        const Transform3d trafo_matrix_not_translate = instance_trafo_not_translate * mv->get_matrix_no_offset();
+        const bool selector_changed =
+            apply_color_auto_paint_to_selector(*mo,
+                                               *mv,
+                                               *m_triangle_selectors[size_t(selector_idx)],
+                                               trafo_matrix_not_translate,
+                                               settings,
+                                               false);
+        m_triangle_selectors[size_t(selector_idx)]->request_update_render_data(true);
         changed |= selector_changed;
     }
 
@@ -9490,6 +10154,25 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
     if (ImGui::IsItemHovered())
         m_imgui->tooltip(_L("Paint color regions by surface slope with a live preview."), max_tooltip_width);
 
+    const bool can_paint_by_color = selected_object_has_color_auto_paint_source();
+    m_imgui->disabled_begin(!can_paint_by_color);
+    if (m_imgui->button(_L("Paint by color"))) {
+        if (m_show_color_auto_paint_overlay) {
+            m_show_color_auto_paint_overlay = false;
+            m_color_auto_paint_overlay_positioned = false;
+            clear_color_auto_paint_preview();
+        } else {
+            open_color_auto_paint_overlay();
+        }
+    }
+    if (ImGui::IsItemHovered()) {
+        if (can_paint_by_color)
+            m_imgui->tooltip(_L("Paint color regions by matching the visible source color with a live preview."), max_tooltip_width);
+        else
+            m_imgui->tooltip(_L("This object does not have RGBA, image texture, or vertex color data."), max_tooltip_width);
+    }
+    m_imgui->disabled_end();
+
     ImGui::Separator();
 
     const bool has_painted_regions = selected_object_has_painted_regions();
@@ -9624,6 +10307,7 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
     ImGuiWrapper::pop_toolbar_style();
 
     render_slope_auto_paint_overlay();
+    render_color_auto_paint_overlay();
 }
 
 
@@ -9676,6 +10360,10 @@ void GLGizmoMmuSegmentation::init_model_triangle_selectors()
     const ModelObject *mo = m_c->selection_info()->model_object();
     m_triangle_selectors.clear();
     m_slope_auto_paint_preview_active = false;
+    m_color_auto_paint_preview_active = false;
+    ++m_color_auto_paint_preview_generation;
+    m_color_auto_paint_preview_update_pending = false;
+    m_color_auto_paint_preview_selectors.clear();
     m_volumes_extruder_idxs.clear();
 
     // Don't continue when extruders colors are not initialized
@@ -9828,6 +10516,24 @@ bool GLGizmoMmuSegmentation::selected_object_has_painted_regions() const
 
     for (const ModelVolume *volume : object->volumes) {
         if (volume != nullptr && volume->is_model_part() && !volume->mmu_segmentation_facets.empty())
+            return true;
+    }
+    return false;
+}
+
+bool GLGizmoMmuSegmentation::selected_object_has_color_auto_paint_source() const
+{
+    const ModelObject *object = m_c->selection_info()->model_object();
+    if (object == nullptr)
+        return false;
+
+    for (const ModelVolume *volume : object->volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+        const indexed_triangle_set &its = volume->mesh().its;
+        if (!volume->texture_mapping_color_facets.empty() ||
+            model_volume_has_bakeable_image_texture_data(volume) ||
+            volume->imported_vertex_colors_rgba.size() == its.vertices.size())
             return true;
     }
     return false;
@@ -10420,7 +11126,7 @@ PainterGizmoType GLGizmoTrueColorPainting::get_painter_type() const
 
 std::string GLGizmoTrueColorPainting::on_get_name() const
 {
-    return _u8L("True Color Painting");
+    return _u8L("RGB Color Painting");
 }
 
 bool GLGizmoTrueColorPainting::on_is_selectable() const

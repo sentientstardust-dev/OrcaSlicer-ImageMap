@@ -1,3 +1,5 @@
+// original author: sentientstardust
+
 #include "ImageMapRawFilamentOffsetAtlas.hpp"
 
 #include <algorithm>

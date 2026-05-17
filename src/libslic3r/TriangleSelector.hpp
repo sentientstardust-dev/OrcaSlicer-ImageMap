@@ -358,6 +358,15 @@ public:
                                             float max_world_edge,
                                             int max_depth,
                                             bool clear_non_matching);
+    bool apply_state_by_triangle_sampler(const Transform3d &trafo_no_translate,
+                                         EnforcerBlockerType new_state,
+                                         const std::function<bool(EnforcerBlockerType,
+                                                                  size_t,
+                                                                  const Vec3f &,
+                                                                  const Vec3f &)> &predicate,
+                                         float max_world_edge,
+                                         int max_depth,
+                                         bool clear_non_matching);
 
     // Clear everything and make the tree empty.
     void reset();
@@ -514,6 +523,17 @@ private:
                                                       float max_world_edge_sqr,
                                                       int max_depth,
                                                       bool clear_non_matching);
+    bool apply_state_by_triangle_sampler_recursive(int facet_idx,
+                                                   const Vec3i32 &neighbors,
+                                                   const Transform3f &trafo,
+                                                   EnforcerBlockerType new_state,
+                                                   const std::function<bool(EnforcerBlockerType,
+                                                                            size_t,
+                                                                            const Vec3f &,
+                                                                            const Vec3f &)> &predicate,
+                                                   float max_world_edge_sqr,
+                                                   int max_depth,
+                                                   bool clear_non_matching);
     void remove_useless_children(int facet_idx); // No hidden meaning. Triangles are meant.
     bool is_facet_clipped(int facet_idx, const ClippingPlane &clp) const;
     int  push_triangle(int a, int b, int c, int source_triangle, EnforcerBlockerType state = EnforcerBlockerType{0});

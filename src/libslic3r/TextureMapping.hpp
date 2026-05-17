@@ -97,6 +97,8 @@ struct TextureMappingZone
     static constexpr bool  DefaultCompactOffsetMode = true;
     static constexpr bool  DefaultUseLegacyFixedColorMode = false;
     static constexpr bool  DefaultHighSpeedImageTextureSampling = true;
+    static constexpr bool  DefaultMinimumVisibilityOffsetEnabled = false;
+    static constexpr float DefaultMinimumVisibilityOffsetPct = 30.f;
     static constexpr int   DefaultGenericSolverLookupMode = int(GenericSolverClosestMix);
     static constexpr int   DefaultGenericSolverMode = int(GenericSolverV2);
     static constexpr int   DefaultGenericSolverMixModel = int(GenericSolverPigmentPainter);
@@ -139,6 +141,8 @@ struct TextureMappingZone
     bool        compact_offset_mode = DefaultCompactOffsetMode;
     bool        use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
     bool        high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;
+    bool        minimum_visibility_offset_enabled = DefaultMinimumVisibilityOffsetEnabled;
+    float       minimum_visibility_offset_pct = DefaultMinimumVisibilityOffsetPct;
     int         generic_solver_lookup_mode = DefaultGenericSolverLookupMode;
     int         generic_solver_mode = DefaultGenericSolverMode;
     int         generic_solver_mix_model = DefaultGenericSolverMixModel;
@@ -182,6 +186,8 @@ struct TextureMappingZone
         compact_offset_mode = DefaultCompactOffsetMode;
         use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
         high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;
+        minimum_visibility_offset_enabled = DefaultMinimumVisibilityOffsetEnabled;
+        minimum_visibility_offset_pct = DefaultMinimumVisibilityOffsetPct;
         generic_solver_lookup_mode = DefaultGenericSolverLookupMode;
         generic_solver_mode = DefaultGenericSolverMode;
         generic_solver_mix_model = DefaultGenericSolverMixModel;

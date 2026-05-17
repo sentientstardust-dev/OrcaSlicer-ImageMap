@@ -254,6 +254,12 @@ protected:
     virtual void render_triangles(const Selection& selection) const;
     virtual void set_render_triangle_slope_uniforms(GLShaderProgram *shader, const ModelVolume *model_volume, const Matrix3f &normal_matrix) const;
     virtual bool should_render_triangle_texture_preview() const { return true; }
+    virtual void render_extra_triangle_overlays(int mesh_id,
+                                                const Transform3d &matrix,
+                                                const Transform3d &view_matrix,
+                                                const Transform3d &projection_matrix,
+                                                const std::array<float, 2> &z_range,
+                                                const std::array<float, 4> &clipping_plane) const {}
     void render_cursor();
     void render_cursor_circle();
     void render_cursor_sphere(const Transform3d& trafo) const;

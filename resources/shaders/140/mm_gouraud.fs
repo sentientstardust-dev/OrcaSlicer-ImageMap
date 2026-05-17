@@ -176,6 +176,14 @@ void main()
                 color = color * 0.5 + LightRed * 0.5;
                 alpha = 1.0;
             }
+        } else if (slope.preview_mode == 4) {
+            float preview_luma = dot(slope.highlight_color.rgb, vec3(0.2126, 0.7152, 0.0722));
+            vec3 preview_accent = preview_luma > 0.75 ? vec3(0.02, 0.08, 0.24) : vec3(1.0, 1.0, 1.0);
+            float preview_check = slopePreviewChecker(world_pos.xyz, transformed_normal);
+            vec3 preview_color_a = slope.highlight_color.rgb * 0.78 + preview_accent * 0.22;
+            vec3 preview_color_b = slope.highlight_color.rgb * 0.25 + preview_accent * 0.75;
+            color = mix(preview_color_a, preview_color_b, preview_check);
+            alpha = max(alpha, slope.highlight_color.a);
         } else {
             int effective_state = slope.current_state == 0 ? slope.base_state : slope.current_state;
             if (slopeOverrideMatches(effective_state) && slopePreviewMatches(smooth_world_normal_z)) {

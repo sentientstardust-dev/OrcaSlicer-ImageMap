@@ -1079,6 +1079,8 @@ public:
                                         bool compact_offset_mode,
                                         bool use_legacy_fixed_color_mode,
                                         bool high_speed_image_texture_sampling,
+                                        bool minimum_visibility_offset_enabled,
+                                        float minimum_visibility_offset_pct,
                                         int generic_solver_lookup_mode,
                                         int generic_solver_mode,
                                         int generic_solver_mix_model,
@@ -1349,6 +1351,27 @@ public:
         m_generic_solver_lookup_choice->SetToolTip(_L("Controls how the fallback Generic Solver picks from precomputed filament color mixes."));
         generic_solver_row->Add(m_generic_solver_lookup_choice, 1, wxALIGN_CENTER_VERTICAL);
         experimental_box->Add(generic_solver_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        auto *minimum_visibility_offset_row = new wxBoxSizer(wxHORIZONTAL);
+        m_minimum_visibility_offset_checkbox = new wxCheckBox(experimental_page, wxID_ANY, _L("Minimum visibility offset"));
+        m_minimum_visibility_offset_checkbox->SetValue(minimum_visibility_offset_enabled);
+        minimum_visibility_offset_row->Add(m_minimum_visibility_offset_checkbox, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        m_minimum_visibility_offset_spin = new wxSpinCtrl(experimental_page,
+                                                          wxID_ANY,
+                                                          wxEmptyString,
+                                                          wxDefaultPosition,
+                                                          wxSize(FromDIP(70), -1),
+                                                          wxSP_ARROW_KEYS | wxALIGN_RIGHT,
+                                                          0,
+                                                          100,
+                                                          std::clamp(int(std::lround(minimum_visibility_offset_pct)), 0, 100));
+        minimum_visibility_offset_row->Add(m_minimum_visibility_offset_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+        m_minimum_visibility_offset_units = new wxStaticText(experimental_page, wxID_ANY, _L("%"));
+        minimum_visibility_offset_row->Add(m_minimum_visibility_offset_units, 0, wxALIGN_CENTER_VERTICAL);
+        m_minimum_visibility_offset_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+            update_minimum_visibility_offset_visibility(true);
+        });
+        experimental_box->Add(minimum_visibility_offset_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        update_minimum_visibility_offset_visibility(false);
         experimental_root->Add(experimental_box, 0, wxEXPAND | wxALL, gap);
 
         m_prime_tower_mapping_enabled_checkbox = new wxCheckBox(global_page, wxID_ANY, _L("Enable prime tower image mapping"));
@@ -1531,6 +1554,18 @@ public:
     bool compact_offset_mode() const { return m_compact_offset_mode_checkbox && m_compact_offset_mode_checkbox->GetValue(); }
     bool use_legacy_fixed_color_mode() const { return m_use_legacy_fixed_color_mode_checkbox && m_use_legacy_fixed_color_mode_checkbox->GetValue(); }
     bool high_speed_image_texture_sampling() const { return m_high_speed_image_texture_sampling_checkbox == nullptr || m_high_speed_image_texture_sampling_checkbox->GetValue(); }
+    bool minimum_visibility_offset_enabled() const
+    {
+        return m_minimum_visibility_offset_checkbox && m_minimum_visibility_offset_checkbox->GetValue();
+    }
+
+    float minimum_visibility_offset_pct() const
+    {
+        const int value = m_minimum_visibility_offset_spin != nullptr ?
+            m_minimum_visibility_offset_spin->GetValue() :
+            int(TextureMappingZone::DefaultMinimumVisibilityOffsetPct);
+        return float(std::clamp(value, 0, 100));
+    }
     int generic_solver_lookup_mode() const
     {
         return m_generic_solver_lookup_choice ?
@@ -1791,6 +1826,22 @@ private:
         }
     }
 
+    void update_minimum_visibility_offset_visibility(bool fit_dialog)
+    {
+        const bool enabled = m_minimum_visibility_offset_checkbox != nullptr && m_minimum_visibility_offset_checkbox->GetValue();
+        if (m_minimum_visibility_offset_spin != nullptr)
+            m_minimum_visibility_offset_spin->Show(enabled);
+        if (m_minimum_visibility_offset_units != nullptr)
+            m_minimum_visibility_offset_units->Show(enabled);
+        if (!fit_dialog)
+            return;
+        update_options_book_min_size();
+        if (GetSizer() != nullptr) {
+            Layout();
+            Fit();
+        }
+    }
+
     wxChoice *m_options_tab_choice {nullptr};
     wxSimplebook *m_options_book {nullptr};
     wxChoice *m_texture_mapping_mode_choice {nullptr};
@@ -1809,6 +1860,9 @@ private:
     wxCheckBox *m_compact_offset_mode_checkbox {nullptr};
     wxCheckBox *m_use_legacy_fixed_color_mode_checkbox {nullptr};
     wxCheckBox *m_high_speed_image_texture_sampling_checkbox {nullptr};
+    wxCheckBox *m_minimum_visibility_offset_checkbox {nullptr};
+    wxSpinCtrl *m_minimum_visibility_offset_spin {nullptr};
+    wxStaticText *m_minimum_visibility_offset_units {nullptr};
     wxChoice *m_generic_solver_lookup_choice {nullptr};
     wxChoice *m_generic_solver_mode_choice {nullptr};
     wxChoice *m_generic_solver_mix_model_choice {nullptr};
@@ -5913,6 +5967,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.compact_offset_mode,
                                                     updated.use_legacy_fixed_color_mode,
                                                     updated.high_speed_image_texture_sampling,
+                                                    updated.minimum_visibility_offset_enabled,
+                                                    updated.minimum_visibility_offset_pct,
                                                     updated.generic_solver_lookup_mode,
                                                     updated.generic_solver_mode,
                                                     updated.generic_solver_mix_model,
@@ -5945,6 +6001,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.compact_offset_mode = dlg.compact_offset_mode();
             updated.use_legacy_fixed_color_mode = dlg.use_legacy_fixed_color_mode();
             updated.high_speed_image_texture_sampling = dlg.high_speed_image_texture_sampling();
+            updated.minimum_visibility_offset_enabled = dlg.minimum_visibility_offset_enabled();
+            updated.minimum_visibility_offset_pct = dlg.minimum_visibility_offset_pct();
             updated.generic_solver_lookup_mode = dlg.generic_solver_lookup_mode();
             updated.generic_solver_mode = dlg.generic_solver_mode();
             updated.generic_solver_mix_model = dlg.generic_solver_mix_model();

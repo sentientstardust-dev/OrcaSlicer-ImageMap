@@ -1489,7 +1489,7 @@ std::string get_name_from_gizmo_etype(GLGizmosManager::EType type)
     case GLGizmosManager::EType::MmSegmentation:
         return "Color Region Painting";
     case GLGizmosManager::EType::TrueColorPainting:
-        return "True Color Painting";
+        return "RGB Color Painting";
     case GLGizmosManager::EType::ImageProjection:
         return "Project image to model surface";
     case GLGizmosManager::EType::FuzzySkin:

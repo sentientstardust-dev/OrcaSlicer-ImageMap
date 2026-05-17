@@ -164,8 +164,9 @@ void GLGizmoPainterBase::render_triangles(const Selection& selection) const
 
         const Camera& camera = wxGetApp().plater()->get_camera();
         const Transform3d& view_matrix = camera.get_view_matrix();
+        const Transform3d& projection_matrix = camera.get_projection_matrix();
         shader->set_uniform("view_model_matrix", view_matrix * trafo_matrix);
-        shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+        shader->set_uniform("projection_matrix", projection_matrix);
         const Matrix3d view_normal_matrix = view_matrix.matrix().block(0, 0, 3, 3) * trafo_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
         shader->set_uniform("view_normal_matrix", view_normal_matrix);
 
@@ -178,10 +179,16 @@ void GLGizmoPainterBase::render_triangles(const Selection& selection) const
         if (should_render_triangle_texture_preview())
             m_triangle_selectors[mesh_id]->render_texture_preview(trafo_matrix,
                                                                   view_matrix,
-                                                                  camera.get_projection_matrix(),
+                                                                  projection_matrix,
                                                                   clp_data.z_range,
                                                                   clp_data.clp_dataf);
         shader->start_using();
+        render_extra_triangle_overlays(mesh_id,
+                                       trafo_matrix,
+                                       view_matrix,
+                                       projection_matrix,
+                                       clp_data.z_range,
+                                       clp_data.clp_dataf);
 
         if (is_left_handed)
             glsafe(::glFrontFace(GL_CCW));

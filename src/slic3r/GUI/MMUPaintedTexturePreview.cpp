@@ -78,6 +78,7 @@ struct TexturePreviewSimulationSettings
     int generic_solver_lookup_mode = int(TextureMappingZone::GenericSolverClosestMix);
     int generic_solver_mode = int(TextureMappingZone::GenericSolverV2);
     int generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
+    float minimum_visibility_offset_factor = 0.f;
     std::vector<unsigned int> component_ids;
     std::vector<std::array<float, 3>> component_colors;
     std::vector<float> component_strength_factors;
@@ -322,6 +323,28 @@ ColorRGBA blend_component_colors(const std::vector<std::array<float, 3>> &colors
 float clamp01(float value)
 {
     return std::clamp(value, 0.f, 1.f);
+}
+
+float apply_minimum_visibility_offset(float value, float offset)
+{
+    const float safe_value = clamp01(value);
+    const float safe_offset = clamp01(offset);
+    if (safe_offset <= k_epsilon)
+        return safe_value;
+    if (safe_value <= safe_offset)
+        return 0.f;
+    const float denominator = 1.f - safe_offset;
+    if (denominator <= k_epsilon)
+        return 0.f;
+    return clamp01((safe_value - safe_offset) / denominator);
+}
+
+void apply_minimum_visibility_offset(std::vector<float> &weights, float offset)
+{
+    if (offset <= k_epsilon)
+        return;
+    for (float &weight : weights)
+        weight = apply_minimum_visibility_offset(weight, offset);
 }
 
 float texture_preview_config_float(const char *key, float fallback)
@@ -1624,6 +1647,7 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
 
     for (size_t idx = 0; idx < desired.size() && idx < settings.component_strength_factors.size(); ++idx)
         desired[idx] = clamp01(desired[idx] * settings.component_strength_factors[idx]);
+    apply_minimum_visibility_offset(desired, settings.minimum_visibility_offset_factor);
     return desired;
 }
 
@@ -1636,9 +1660,16 @@ std::vector<float> raw_offset_print_width_weights_for_texture_preview(const Text
         const float strength = idx < settings.component_strength_factors.size() ? settings.component_strength_factors[idx] : 1.f;
         const float minimum = idx < settings.component_minimum_offset_factors.size() ? settings.component_minimum_offset_factors[idx] : 0.f;
         const float adjusted_visibility = clamp01(minimum + clamp01(raw_weights[idx]) * strength * (1.f - minimum));
+        if (settings.minimum_visibility_offset_factor > k_epsilon) {
+            width_factors[idx] = apply_minimum_visibility_offset(adjusted_visibility, settings.minimum_visibility_offset_factor);
+            continue;
+        }
         width_factors[idx] = clamp01(settings.raw_offset_base_visibility_factor +
                                      settings.raw_offset_visibility_range_factor * adjusted_visibility);
     }
+
+    if (settings.minimum_visibility_offset_factor > k_epsilon)
+        return width_factors;
 
     const auto min_width = std::min_element(width_factors.begin(), width_factors.end());
     if (min_width == width_factors.end())
@@ -1732,6 +1763,13 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
                                               int(TextureMappingZone::GenericSolverLegacy),
                                               int(TextureMappingZone::GenericSolverV2));
     settings.generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
+    settings.minimum_visibility_offset_factor = zone->minimum_visibility_offset_enabled ?
+        std::clamp((std::isfinite(zone->minimum_visibility_offset_pct) ?
+                        zone->minimum_visibility_offset_pct :
+                        TextureMappingZone::DefaultMinimumVisibilityOffsetPct) / 100.f,
+                   0.f,
+                   1.f) :
+        0.f;
     settings.component_ids = TextureMappingManager::effective_texture_component_ids(*zone, num_physical, physical_colors);
     if (settings.component_ids.empty())
         return std::nullopt;
@@ -1792,6 +1830,7 @@ size_t texture_preview_simulation_signature(const ModelVolume &model_volume,
     mix(std::hash<int>{}(settings.generic_solver_mix_model));
     mix(std::hash<int>{}(int(std::lround(settings.contrast_pct * 100.f))));
     mix(std::hash<int>{}(int(std::lround(settings.tone_gamma * 1000.f))));
+    mix(std::hash<int>{}(int(std::lround(settings.minimum_visibility_offset_factor * 100000.f))));
     for (const unsigned int id : settings.component_ids)
         mix(std::hash<unsigned int>{}(id));
     for (const auto &color : settings.component_colors) {
@@ -1896,7 +1935,10 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
             float activity = 0.f;
             for (const float weight : component_weights)
                 activity = std::max(activity, clamp01(weight));
-            if (use_raw_offsets && activity <= k_epsilon && !component_weights.empty()) {
+            if (use_raw_offsets &&
+                activity <= k_epsilon &&
+                settings.minimum_visibility_offset_factor <= k_epsilon &&
+                !component_weights.empty()) {
                 std::fill(component_weights.begin(), component_weights.end(), 1.f);
                 activity = 1.f;
             }
@@ -3869,6 +3911,8 @@ size_t texture_preview_settings_signature(size_t num_physical, const TextureMapp
         signature_mix(std::hash<int>{}(zone.nonlinear_offset_adjustment ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.compact_offset_mode ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.use_legacy_fixed_color_mode ? 1 : 0));
+        signature_mix(std::hash<int>{}(zone.minimum_visibility_offset_enabled ? 1 : 0));
+        signature_mix_float(zone.minimum_visibility_offset_pct, 100.f);
         signature_mix(std::hash<int>{}(zone.generic_solver_lookup_mode));
         signature_mix(std::hash<int>{}(zone.generic_solver_mode));
         signature_mix(std::hash<int>{}(TextureMappingZone::DefaultGenericSolverMixModel));

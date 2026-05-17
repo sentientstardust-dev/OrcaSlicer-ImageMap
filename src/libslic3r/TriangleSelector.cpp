@@ -20,6 +20,38 @@ static Vec3f normalized_or_default(const Vec3f &normal, const Vec3f &fallback)
     return len > float(EPSILON) ? normal / len : fallback;
 }
 
+static Vec3f barycentric_for_triangle_sample(const indexed_triangle_set &its, int tri_idx, const Vec3f &point)
+{
+    if (tri_idx < 0 || tri_idx >= int(its.indices.size()))
+        return Vec3f(1.f / 3.f, 1.f / 3.f, 1.f / 3.f);
+
+    const stl_triangle_vertex_indices &source_indices = its.indices[size_t(tri_idx)];
+    if (source_indices[0] < 0 || source_indices[1] < 0 || source_indices[2] < 0 ||
+        source_indices[0] >= int(its.vertices.size()) ||
+        source_indices[1] >= int(its.vertices.size()) ||
+        source_indices[2] >= int(its.vertices.size()))
+        return Vec3f(1.f / 3.f, 1.f / 3.f, 1.f / 3.f);
+
+    const Vec3f &a = its.vertices[size_t(source_indices[0])];
+    const Vec3f &b = its.vertices[size_t(source_indices[1])];
+    const Vec3f &c = its.vertices[size_t(source_indices[2])];
+    const Vec3f v0 = b - a;
+    const Vec3f v1 = c - a;
+    const Vec3f v2 = point - a;
+    const float d00 = v0.dot(v0);
+    const float d01 = v0.dot(v1);
+    const float d11 = v1.dot(v1);
+    const float d20 = v2.dot(v0);
+    const float d21 = v2.dot(v1);
+    const float denom = d00 * d11 - d01 * d01;
+    if (std::abs(denom) <= float(EPSILON))
+        return Vec3f(1.f / 3.f, 1.f / 3.f, 1.f / 3.f);
+
+    const float v = (d11 * d20 - d01 * d21) / denom;
+    const float w = (d00 * d21 - d01 * d20) / denom;
+    return Vec3f(1.f - v - w, v, w);
+}
+
 static std::vector<std::array<Vec3f, 3>> its_corner_normals(const indexed_triangle_set &its)
 {
     constexpr float crease_dot = 0.5f;
@@ -1244,6 +1276,131 @@ bool TriangleSelector::apply_state_by_smooth_world_normal(const Transform3d &tra
                                                                 max_world_edge_sqr,
                                                                 max_depth,
                                                                 clear_non_matching);
+    }
+
+    if (changed) {
+        for (int facet_idx = 0; facet_idx < m_orig_size_indices; ++facet_idx)
+            if (m_triangles[size_t(facet_idx)].valid() && m_triangles[size_t(facet_idx)].is_split())
+                remove_useless_children(facet_idx);
+    }
+
+    return changed;
+}
+
+bool TriangleSelector::apply_state_by_triangle_sampler_recursive(
+    int facet_idx,
+    const Vec3i32 &neighbors,
+    const Transform3f &trafo,
+    EnforcerBlockerType new_state,
+    const std::function<bool(EnforcerBlockerType, size_t, const Vec3f &, const Vec3f &)> &predicate,
+    float max_world_edge_sqr,
+    int max_depth,
+    bool clear_non_matching)
+{
+    if (facet_idx < 0 || facet_idx >= int(m_triangles.size()) || !m_triangles[size_t(facet_idx)].valid())
+        return false;
+
+    Triangle *tr = &m_triangles[size_t(facet_idx)];
+    if (tr->is_split()) {
+        bool changed = false;
+        const int child_count = tr->number_of_split_sides() + 1;
+        for (int child_idx = 0; child_idx < child_count; ++child_idx) {
+            changed |= apply_state_by_triangle_sampler_recursive(tr->children[size_t(child_idx)],
+                                                                 child_neighbors(*tr, neighbors, child_idx),
+                                                                 trafo,
+                                                                 new_state,
+                                                                 predicate,
+                                                                 max_world_edge_sqr,
+                                                                 max_depth,
+                                                                 clear_non_matching);
+            tr = &m_triangles[size_t(facet_idx)];
+        }
+        return changed;
+    }
+
+    const EnforcerBlockerType current_state = tr->get_state();
+    std::array<Vec3f, 4> sample_points;
+    sample_points[0] = m_vertices[size_t(tr->verts_idxs[0])].v;
+    sample_points[1] = m_vertices[size_t(tr->verts_idxs[1])].v;
+    sample_points[2] = m_vertices[size_t(tr->verts_idxs[2])].v;
+    sample_points[3] = (sample_points[0] + sample_points[1] + sample_points[2]) / 3.f;
+
+    std::array<bool, 4> matches;
+    int match_count = 0;
+    for (size_t sample_idx = 0; sample_idx < sample_points.size(); ++sample_idx) {
+        const Vec3f barycentric = barycentric_for_triangle_sample(m_mesh.its, tr->source_triangle, sample_points[sample_idx]);
+        matches[sample_idx] = predicate(current_state, size_t(std::max(tr->source_triangle, 0)), sample_points[sample_idx], barycentric);
+        if (matches[sample_idx])
+            ++match_count;
+    }
+
+    if (match_count == 0) {
+        const EnforcerBlockerType next_state = clear_non_matching ? EnforcerBlockerType::NONE : current_state;
+        if (next_state != current_state) {
+            tr->set_state(next_state);
+            return true;
+        }
+        return false;
+    }
+    if (match_count == int(matches.size())) {
+        if (current_state != new_state) {
+            tr->set_state(new_state);
+            return true;
+        }
+        return false;
+    }
+
+    if (max_depth > 0 && triangle_max_world_edge_sqr(*tr, trafo) > max_world_edge_sqr &&
+        split_triangle_for_world_edge_limit(facet_idx, neighbors, trafo, max_world_edge_sqr)) {
+        bool changed = false;
+        tr = &m_triangles[size_t(facet_idx)];
+        const int child_count = tr->number_of_split_sides() + 1;
+        for (int child_idx = 0; child_idx < child_count; ++child_idx) {
+            changed |= apply_state_by_triangle_sampler_recursive(tr->children[size_t(child_idx)],
+                                                                 child_neighbors(*tr, neighbors, child_idx),
+                                                                 trafo,
+                                                                 new_state,
+                                                                 predicate,
+                                                                 max_world_edge_sqr,
+                                                                 max_depth - 1,
+                                                                 clear_non_matching);
+            tr = &m_triangles[size_t(facet_idx)];
+        }
+        return changed;
+    }
+
+    const EnforcerBlockerType next_state = matches[3] ? new_state : (clear_non_matching ? EnforcerBlockerType::NONE : current_state);
+    if (next_state != current_state) {
+        tr->set_state(next_state);
+        return true;
+    }
+    return false;
+}
+
+bool TriangleSelector::apply_state_by_triangle_sampler(
+    const Transform3d &trafo_no_translate,
+    EnforcerBlockerType new_state,
+    const std::function<bool(EnforcerBlockerType, size_t, const Vec3f &, const Vec3f &)> &predicate,
+    float max_world_edge,
+    int max_depth,
+    bool clear_non_matching)
+{
+    if (!predicate)
+        return false;
+
+    const Transform3f trafo = trafo_no_translate.cast<float>();
+    const float max_world_edge_sqr = std::max(max_world_edge, float(EPSILON)) * std::max(max_world_edge, float(EPSILON));
+    bool changed = false;
+
+    for (int facet_idx = 0; facet_idx < m_orig_size_indices; ++facet_idx) {
+        changed |= apply_state_by_triangle_sampler_recursive(facet_idx,
+                                                             m_neighbors[size_t(facet_idx)],
+                                                             trafo,
+                                                             new_state,
+                                                             predicate,
+                                                             max_world_edge_sqr,
+                                                             max_depth,
+                                                             clear_non_matching);
     }
 
     if (changed) {
