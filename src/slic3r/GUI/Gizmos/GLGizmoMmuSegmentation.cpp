@@ -14707,13 +14707,21 @@ void GLGizmoMmuSegmentation::remap_filament_assignments()
             continue;
 
         state_map[src_state] = static_cast<EnforcerBlockerType>(dst_state);
-        if (src_state == 1)
-            state_map[0] = static_cast<EnforcerBlockerType>(dst_state);
 
         any_change = true;
     }
     if (!any_change)
         return;
+
+    auto remapped_filament_id = [this, n_extr](unsigned int filament_id) {
+        for (size_t src = 0; src < n_extr; ++src) {
+            if (m_display_filament_ids[src] != filament_id)
+                continue;
+            const size_t dst = m_extruder_remap[src];
+            return dst < m_display_filament_ids.size() ? m_display_filament_ids[dst] : filament_id;
+        }
+        return filament_id;
+    };
 
     Plater::TakeSnapshot snapshot(wxGetApp().plater(),
                                   "Remap filament assignments",
@@ -14724,6 +14732,11 @@ void GLGizmoMmuSegmentation::remap_filament_assignments()
     ModelObject* mo = m_c->selection_info()->model_object();
     if (!mo) return;
 
+    const ConfigOption *object_opt = mo->config.option("extruder");
+    const int object_extruder_id = object_opt != nullptr ? object_opt->getInt() : 1;
+    const unsigned int object_base_filament_id = object_extruder_id > 0 ? unsigned(object_extruder_id) : 1u;
+    bool volume_extruder_changed = false;
+
     for (ModelVolume* mv : mo->volumes) {
         if (!mv->is_model_part()) continue;
         ++idx;
@@ -14731,10 +14744,30 @@ void GLGizmoMmuSegmentation::remap_filament_assignments()
         if (!ts) continue;
         ts->remap_triangle_state(state_map);
         ts->request_update_render_data(true);
+
+        const ConfigOption *vol_opt = mv->config.option("extruder");
+        const bool has_volume_extruder = vol_opt != nullptr && vol_opt->getInt() != 0;
+        const int base_extruder_id = has_volume_extruder ? vol_opt->getInt() : int(object_base_filament_id);
+        const unsigned int base_filament_id = base_extruder_id > 0 ? unsigned(base_extruder_id) : 1u;
+        const unsigned int new_base_filament_id = remapped_filament_id(base_filament_id);
+        if (new_base_filament_id != base_filament_id && new_base_filament_id <= MAX_EBT) {
+            if (has_volume_extruder)
+                mv->config.set("extruder", int(new_base_filament_id));
+            else
+                mo->config.set("extruder", int(new_base_filament_id));
+            if (idx >= 0 && idx < int(m_volumes_extruder_idxs.size()))
+                m_volumes_extruder_idxs[size_t(idx)] = int(new_base_filament_id);
+            volume_extruder_changed = true;
+        }
+
         updated = true;
     }
 
     if (updated) {
+        if (volume_extruder_changed) {
+            update_triangle_selectors_colors();
+            wxGetApp().obj_list()->update_objects_list_filament_column(std::max<size_t>(1, m_extruders_colors.size()));
+        }
         wxGetApp().plater()->get_notification_manager()->push_notification(
             _L("Filament remapping finished.").ToStdString());
         update_model_object();
