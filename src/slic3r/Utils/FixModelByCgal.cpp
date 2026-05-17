@@ -95,6 +95,11 @@ bool color_snapshot_is_valid(const SimplifyTextureDataSnapshot &snapshot)
     return snapshot.source != SimplifyColorSource::None;
 }
 
+bool snapshot_has_mesh_bound_data(const SimplifyTextureDataSnapshot &snapshot)
+{
+    return snapshot.source != SimplifyColorSource::None || snapshot.region_painting_present;
+}
+
 bool volume_may_change_during_repair(const ModelVolume &volume, const ModelRepairOptions &options)
 {
     return options.weld_same_position_vertices ||
@@ -130,6 +135,12 @@ bool volume_has_remappable_color_data(const ModelVolume &volume)
     return volume.imported_vertex_colors_rgba.size() == its.vertices.size();
 }
 
+bool volume_has_transferable_region_painting(const ModelVolume &volume)
+{
+    const indexed_triangle_set &its = volume.mesh().its;
+    return !its.vertices.empty() && !its.indices.empty() && model_volume_region_painting_needs_remap(volume);
+}
+
 bool target_has_remappable_color_data(const ModelObject &model_object, int volume_idx)
 {
     const size_t start_volume = volume_idx == -1 ? 0 : size_t(volume_idx);
@@ -138,6 +149,19 @@ bool target_has_remappable_color_data(const ModelObject &model_object, int volum
     for (size_t idx = start_volume; idx < end_volume; ++idx) {
         const ModelVolume *volume = model_object.volumes[idx];
         if (volume != nullptr && volume_has_remappable_color_data(*volume))
+            return true;
+    }
+    return false;
+}
+
+bool target_has_transferable_region_painting(const ModelObject &model_object, int volume_idx)
+{
+    const size_t start_volume = volume_idx == -1 ? 0 : size_t(volume_idx);
+    const size_t end_volume =
+        volume_idx == -1 ? model_object.volumes.size() : std::min(model_object.volumes.size(), size_t(volume_idx) + 1);
+    for (size_t idx = start_volume; idx < end_volume; ++idx) {
+        const ModelVolume *volume = model_object.volumes[idx];
+        if (volume != nullptr && volume_has_transferable_region_painting(*volume))
             return true;
     }
     return false;
@@ -154,7 +178,7 @@ ColorSnapshotByVolume collect_color_snapshots(ModelObject &model_object, int vol
         if (volume == nullptr || !volume_may_change_during_repair(*volume, options))
             continue;
         SimplifyTextureDataSnapshot snapshot = snapshot_simplify_texture_data(*volume);
-        if (color_snapshot_is_valid(snapshot))
+        if (snapshot_has_mesh_bound_data(snapshot))
             snapshots.emplace(volume, std::move(snapshot));
     }
     return snapshots;
@@ -163,7 +187,9 @@ ColorSnapshotByVolume collect_color_snapshots(ModelObject &model_object, int vol
 bool ask_repair_options(GUI::ProgressDialog           &progress_dialog,
                         ModelRepairOptions            &options,
                         ModelRepairColorRemapChoice   &color_remap_choice,
-                        bool                           show_color_remap_option)
+                        bool                          &region_painting_remap,
+                        bool                           show_color_remap_option,
+                        bool                           show_region_painting_remap_option)
 {
     wxDialog dialog(&progress_dialog, wxID_ANY, _L("Repair options"), wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
     auto *top_sizer = new wxBoxSizer(wxVERTICAL);
@@ -186,6 +212,13 @@ bool ask_repair_options(GUI::ProgressDialog           &progress_dialog,
         top_sizer->Add(remap_colors_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 12);
     }
 
+    wxCheckBox *remap_region_painting_checkbox = nullptr;
+    if (show_region_painting_remap_option) {
+        remap_region_painting_checkbox = new wxCheckBox(&dialog, wxID_ANY, _L("Remap region painting to repaired mesh"));
+        remap_region_painting_checkbox->SetValue(region_painting_remap);
+        top_sizer->Add(remap_region_painting_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 12);
+    }
+
     wxSizer *buttons = dialog.CreateSeparatedButtonSizer(wxOK | wxCANCEL);
     if (buttons != nullptr)
         top_sizer->Add(buttons, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 12);
@@ -200,6 +233,8 @@ bool ask_repair_options(GUI::ProgressDialog           &progress_dialog,
     options.split_before_repair = split_checkbox->GetValue();
     if (remap_colors_checkbox != nullptr)
         color_remap_choice = remap_colors_checkbox->GetValue() ? ModelRepairColorRemapChoice::Remap : ModelRepairColorRemapChoice::Skip;
+    if (remap_region_painting_checkbox != nullptr)
+        region_painting_remap = remap_region_painting_checkbox->GetValue();
     return true;
 }
 
@@ -248,14 +283,25 @@ void merge_color_remap_stats(ModelRepairColorRemapStats &dst, const ModelRepairC
     dst.remap_canceled |= src.remap_canceled;
     dst.remap_failed |= src.remap_failed;
     dst.used_fallback_rgba |= src.used_fallback_rgba;
+    dst.had_region_painting |= src.had_region_painting;
+    dst.region_remap_requested |= src.region_remap_requested;
+    dst.region_remap_skipped |= src.region_remap_skipped;
+    dst.region_remap_failed |= src.region_remap_failed;
     dst.volumes_remapped += src.volumes_remapped;
     dst.volumes_cleared += src.volumes_cleared;
+    dst.region_volumes_remapped += src.region_volumes_remapped;
+    dst.region_volumes_cleared += src.region_volumes_cleared;
 }
 
-void clear_remappable_color_data(ModelVolume &volume, ModelRepairColorRemapStats &stats)
+void clear_remappable_data(ModelVolume &volume, const SimplifyTextureDataSnapshot &snapshot, ModelRepairColorRemapStats &stats)
 {
-    apply_simplify_texture_data_result(volume, SimplifyTextureDataResult());
-    ++stats.volumes_cleared;
+    SimplifyTextureDataResult result;
+    result.region_painting_touched = snapshot.region_painting_present;
+    apply_simplify_texture_data_result(volume, std::move(result));
+    if (color_snapshot_is_valid(snapshot))
+        ++stats.volumes_cleared;
+    if (snapshot.region_painting_present)
+        ++stats.region_volumes_cleared;
 }
 
 bool result_preserved_color(const SimplifyTextureDataSnapshot &snapshot, const SimplifyTextureDataResult &result)
@@ -276,21 +322,24 @@ bool result_preserved_color(const SimplifyTextureDataSnapshot &snapshot, const S
 
 bool remap_or_clear_color_data(ModelVolume                         &volume,
                                const SimplifyTextureDataSnapshot   &snapshot,
-                               bool                                 remap_requested,
+                               bool                                 remap_color_requested,
+                               bool                                 remap_region_painting_requested,
                                std::atomic<bool>                   &cancel_requested,
                                const std::function<void(int)>      &status_fn,
                                ModelRepairColorRemapStats          &stats)
 {
-    if (!color_snapshot_is_valid(snapshot))
+    if (!snapshot_has_mesh_bound_data(snapshot))
         return false;
 
-    if (!remap_requested) {
+    if (color_snapshot_is_valid(snapshot) && !remap_color_requested)
         stats.remap_skipped = true;
-        clear_remappable_color_data(volume, stats);
-        return false;
-    }
+    if (snapshot.region_painting_transfer_needed && !remap_region_painting_requested)
+        stats.region_remap_skipped = true;
 
     try {
+        SimplifyTextureDataRemapOptions options;
+        options.remap_color_data = remap_color_requested;
+        options.remap_region_painting = remap_region_painting_requested;
         SimplifyTextureDataResult result = remap_simplify_texture_data(
             snapshot,
             volume.mesh().its,
@@ -298,25 +347,42 @@ bool remap_or_clear_color_data(ModelVolume                         &volume,
                 if (cancel_requested)
                     throw ColorRemapCanceledException();
             },
-            status_fn);
+            status_fn,
+            options);
 
         stats.used_fallback_rgba |= result.used_fallback_rgba;
         stats.remap_failed |= result.remap_failed && !result.used_fallback_rgba;
+        stats.region_remap_failed |= result.region_painting_remap_failed;
         const bool preserved = result_preserved_color(snapshot, result);
+        const bool region_preserved = result.region_painting_touched && result.region_painting_valid;
         apply_simplify_texture_data_result(volume, std::move(result));
-        if (preserved) {
-            ++stats.volumes_remapped;
+        if (color_snapshot_is_valid(snapshot)) {
+            if (preserved)
+                ++stats.volumes_remapped;
+            else if (remap_color_requested) {
+                stats.remap_failed = true;
+                ++stats.volumes_cleared;
+            } else {
+                ++stats.volumes_cleared;
+            }
+        }
+        if (snapshot.region_painting_present) {
+            if (region_preserved)
+                ++stats.region_volumes_remapped;
+            else
+                ++stats.region_volumes_cleared;
+        }
+        if (preserved || region_preserved) {
             return true;
-        } else {
-            stats.remap_failed = true;
-            ++stats.volumes_cleared;
         }
     } catch (ColorRemapCanceledException &) {
         stats.remap_canceled = true;
         throw;
     } catch (std::exception &) {
         stats.remap_failed = true;
-        clear_remappable_color_data(volume, stats);
+        if (snapshot.region_painting_transfer_needed)
+            stats.region_remap_failed = true;
+        clear_remappable_data(volume, snapshot, stats);
     }
     return false;
 }
@@ -365,10 +431,13 @@ bool fix_model_with_cgal_gui(ModelObject                &model_object,
 
     if (!active_prompt_state.repair_options_selected) {
         const bool show_color_remap_option = target_has_remappable_color_data(model_object, volume_idx);
+        const bool show_region_painting_remap_option = target_has_transferable_region_painting(model_object, volume_idx);
         if (!ask_repair_options(progress_dialog,
                                 active_prompt_state.repair_options,
                                 active_prompt_state.color_remap_choice,
-                                show_color_remap_option)) {
+                                active_prompt_state.region_painting_remap,
+                                show_color_remap_option,
+                                show_region_painting_remap_option)) {
             active_prompt_state.repair_options_canceled = true;
             return false;
         }
@@ -379,15 +448,23 @@ bool fix_model_with_cgal_gui(ModelObject                &model_object,
 
     ColorSnapshotByVolume color_snapshots = collect_color_snapshots(model_object, volume_idx, repair_options);
     ModelRepairColorRemapChoice color_remap_choice = active_prompt_state.color_remap_choice;
+    const bool region_painting_remap_requested = active_prompt_state.region_painting_remap;
     if (!color_snapshots.empty()) {
-        local_color_stats.had_color_data = true;
+        bool had_transferable_region_painting = false;
+        for (const auto &snapshot_pair : color_snapshots) {
+            local_color_stats.had_color_data |= color_snapshot_is_valid(snapshot_pair.second);
+            local_color_stats.had_region_painting |= snapshot_pair.second.region_painting_present;
+            had_transferable_region_painting |= snapshot_pair.second.region_painting_transfer_needed;
+        }
         if (color_remap_choice == ModelRepairColorRemapChoice::Cancel) {
             if (color_remap_stats)
                 merge_color_remap_stats(*color_remap_stats, local_color_stats);
             return false;
         }
-        local_color_stats.remap_requested = color_remap_choice == ModelRepairColorRemapChoice::Remap;
-        local_color_stats.remap_skipped = color_remap_choice == ModelRepairColorRemapChoice::Skip;
+        local_color_stats.remap_requested = local_color_stats.had_color_data && color_remap_choice == ModelRepairColorRemapChoice::Remap;
+        local_color_stats.remap_skipped = local_color_stats.had_color_data && color_remap_choice == ModelRepairColorRemapChoice::Skip;
+        local_color_stats.region_remap_requested = had_transferable_region_painting && region_painting_remap_requested;
+        local_color_stats.region_remap_skipped = had_transferable_region_painting && !region_painting_remap_requested;
     }
 
     // Orca: Synchronization primitives for progress updates between worker thread and GUI.
@@ -407,6 +484,7 @@ bool fix_model_with_cgal_gui(ModelObject                &model_object,
     bool   success = false;
     size_t ivolume = 0;
     const bool remap_requested = color_remap_choice == ModelRepairColorRemapChoice::Remap;
+    const bool remap_region_painting_requested = region_painting_remap_requested;
 
     // Orca: Lambda for updating progress from worker thread.
     auto on_progress = [&mtx, &condition, &ivolume, &model_object, &progress](RepairProgressStage stage, const char *msg, unsigned prcnt) {
@@ -445,6 +523,7 @@ bool fix_model_with_cgal_gui(ModelObject                &model_object,
                                       &fix_result,
                                       &local_color_stats,
                                       remap_requested,
+                                      remap_region_painting_requested,
                                       repair_options,
                                       color_snapshots = std::move(color_snapshots)]() {
         try {
@@ -518,12 +597,18 @@ bool fix_model_with_cgal_gui(ModelObject                &model_object,
                 else if (pre_split_weld_changed && color_snapshot != nullptr && !color_part_states.empty())
                     color_part_states.front() = ColorRemapPartState::Pending;
 
-                auto clear_pending_color_parts = [&model_object, &local_color_stats, ivolume, part_end, &color_part_states]() {
+                auto clear_pending_color_parts = [&model_object,
+                                                  &local_color_stats,
+                                                  ivolume,
+                                                  part_end,
+                                                  &color_part_states,
+                                                  color_snapshot]() {
                     for (size_t part_idx = ivolume; part_idx <= part_end && part_idx < model_object.volumes.size(); ++part_idx) {
                         ColorRemapPartState &state = color_part_states[part_idx - ivolume];
                         if (state != ColorRemapPartState::Pending)
                             continue;
-                        clear_remappable_color_data(*model_object.volumes[part_idx], local_color_stats);
+                        if (color_snapshot != nullptr)
+                            clear_remappable_data(*model_object.volumes[part_idx], *color_snapshot, local_color_stats);
                         state = ColorRemapPartState::Cleared;
                     }
                 };
@@ -557,6 +642,7 @@ bool fix_model_with_cgal_gui(ModelObject                &model_object,
                                 *part_volume,
                                 *color_snapshot,
                                 remap_requested,
+                                remap_region_painting_requested,
                                 cancel_requested,
                                 [on_progress](int percent) {
                                     const int clamped_percent = std::clamp(percent, 0, 100);

@@ -47,6 +47,11 @@ struct RgbaFacetLookup
     std::unordered_map<int, std::vector<size_t>> by_triangle;
 };
 
+struct RegionFacetLookup
+{
+    std::vector<std::unordered_map<int, std::vector<size_t>>> by_state_and_triangle;
+};
+
 struct FastTriangleProjection
 {
     bool enabled = false;
@@ -84,6 +89,18 @@ static ColorRGBA unpack_rgba(uint32_t packed)
                      float((packed >> 16) & 0xFFu) / 255.f,
                      float((packed >> 8) & 0xFFu) / 255.f,
                      float(packed & 0xFFu) / 255.f);
+}
+
+static unsigned int effective_region_state(unsigned int state, unsigned int base_filament_id)
+{
+    if (state == 0 || state == base_filament_id || state > unsigned(EnforcerBlockerType::ExtruderMax))
+        return 0;
+    return state;
+}
+
+static unsigned int volume_base_region_filament_id(const ModelVolume &volume)
+{
+    return unsigned(std::max(volume.extruder_id(), 1));
 }
 
 static bool valid_triangle_vertices(const indexed_triangle_set &its, size_t tri_idx, std::array<Vec3f, 3> &vertices)
@@ -405,6 +422,19 @@ static bool volume_has_valid_image_texture(const ModelVolume &volume)
                             volume.imported_texture_rgba.size() >=
                                 size_t(volume.imported_texture_width) * size_t(volume.imported_texture_height) * 4;
     return valid_rgba || volume_has_valid_raw_atlas(volume);
+}
+
+static bool region_painting_data_needs_remap(const ModelVolume &volume)
+{
+    if (volume.mmu_segmentation_facets.empty())
+        return false;
+
+    const unsigned int base_filament_id = volume_base_region_filament_id(volume);
+    const auto &used_states = volume.mmu_segmentation_facets.get_data().used_states;
+    for (size_t state_idx = 0; state_idx < used_states.size(); ++state_idx)
+        if (used_states[state_idx] && effective_region_state(unsigned(state_idx), base_filament_id) != 0)
+            return true;
+    return false;
 }
 
 static std::array<Vec2f, 3> source_triangle_uvs(const SimplifyTextureDataSnapshot &snapshot, size_t tri_idx, bool *valid = nullptr)
@@ -779,6 +809,20 @@ static RgbaFacetLookup make_rgba_facet_lookup(const SimplifyTextureDataSnapshot 
     return lookup;
 }
 
+static RegionFacetLookup make_region_facet_lookup(const SimplifyTextureDataSnapshot &snapshot)
+{
+    RegionFacetLookup lookup;
+    lookup.by_state_and_triangle.resize(snapshot.region_facets_per_type.size());
+    for (size_t state_idx = 0; state_idx < snapshot.region_facets_per_type.size(); ++state_idx) {
+        const auto &facets = snapshot.region_facets_per_type[state_idx];
+        auto &by_triangle = lookup.by_state_and_triangle[state_idx];
+        by_triangle.reserve(facets.size());
+        for (size_t facet_idx = 0; facet_idx < facets.size(); ++facet_idx)
+            by_triangle[facets[facet_idx].source_triangle].emplace_back(facet_idx);
+    }
+    return lookup;
+}
+
 static ColorRGBA rgb_metadata_background_color(const std::string &metadata)
 {
     const std::string key = "\"background_color\":\"#";
@@ -841,6 +885,45 @@ static ColorRGBA sample_rgba_facets_at_source(const SimplifyTextureDataSnapshot 
         }
     }
     return unpack_rgba(best_rgba);
+}
+
+static unsigned int sample_region_state_at_source(const SimplifyTextureDataSnapshot &snapshot,
+                                                  const RegionFacetLookup           &lookup,
+                                                  size_t                             source_triangle,
+                                                  const Vec3f                       &point)
+{
+    float best_distance = std::numeric_limits<float>::max();
+    unsigned int best_state = 0;
+    bool found_candidate = false;
+    for (size_t state_idx = 0; state_idx < snapshot.region_facets_per_type.size(); ++state_idx) {
+        if (state_idx >= lookup.by_state_and_triangle.size())
+            continue;
+        const auto range_it = lookup.by_state_and_triangle[state_idx].find(int(source_triangle));
+        if (range_it == lookup.by_state_and_triangle[state_idx].end())
+            continue;
+
+        const auto &facets = snapshot.region_facets_per_type[state_idx];
+        for (const size_t facet_idx : range_it->second) {
+            if (facet_idx >= facets.size())
+                continue;
+            const TriangleSelector::FacetStateTriangle &facet = facets[facet_idx];
+            const Vec3f bary = barycentric_weights_3d(point, facet.vertices);
+            const float min_weight = std::min({ bary.x(), bary.y(), bary.z() });
+            const unsigned int state = effective_region_state(unsigned(state_idx), unsigned(snapshot.region_base_filament_id));
+            if (min_weight >= -1e-4f)
+                return state;
+
+            const Vec3f safe = normalized_nonnegative_barycentric(bary);
+            const Vec3f closest = facet.vertices[0] * safe.x() + facet.vertices[1] * safe.y() + facet.vertices[2] * safe.z();
+            const float distance = (closest - point).squaredNorm();
+            if (distance < best_distance) {
+                best_distance = distance;
+                best_state = state;
+                found_candidate = true;
+            }
+        }
+    }
+    return found_candidate ? best_state : 0;
 }
 
 static ColorRGBA sample_vertex_color_at_source(const SimplifyTextureDataSnapshot &snapshot, size_t source_triangle, const Vec3f &barycentric)
@@ -912,6 +995,83 @@ static int texture_mapping_depth_from_span(float span, float target_span, int ma
     if (!std::isfinite(span) || !std::isfinite(target_span) || span <= target_span || target_span <= RemapEpsilon)
         return 0;
     return std::clamp(int(std::ceil(std::log2(span / target_span))), 0, max_depth);
+}
+
+static void region_append_nibble(std::vector<bool> &bits, unsigned int code)
+{
+    for (int bit = 0; bit < 4; ++bit)
+        bits.emplace_back((code & (1u << bit)) != 0u);
+}
+
+static void region_append_leaf(TriangleSelector::TriangleSplittingData &data, unsigned int state)
+{
+    state = std::min<unsigned int>(state, unsigned(EnforcerBlockerType::ExtruderMax));
+    if (state < data.used_states.size())
+        data.used_states[state] = true;
+
+    if (state >= 3u) {
+        region_append_nibble(data.bitstream, 0b1100u);
+        state -= 3u;
+        while (state >= 15u) {
+            region_append_nibble(data.bitstream, 0b1111u);
+            state -= 15u;
+        }
+        region_append_nibble(data.bitstream, state);
+    } else {
+        region_append_nibble(data.bitstream, state << 2);
+    }
+}
+
+static std::array<std::array<Vec3f, 3>, 4> region_split_triangle(const std::array<Vec3f, 3> &vertices)
+{
+    const Vec3f ab = 0.5f * (vertices[0] + vertices[1]);
+    const Vec3f bc = 0.5f * (vertices[1] + vertices[2]);
+    const Vec3f ca = 0.5f * (vertices[2] + vertices[0]);
+    return { std::array<Vec3f, 3>{ vertices[0], ab, ca },
+             std::array<Vec3f, 3>{ ab, vertices[1], bc },
+             std::array<Vec3f, 3>{ bc, vertices[2], ca },
+             std::array<Vec3f, 3>{ ab, bc, ca } };
+}
+
+using RegionPaintingSampler = std::function<unsigned int(size_t, const Vec3f &, const Vec3f &)>;
+
+static bool region_append_sampled_triangle(TriangleSelector::TriangleSplittingData &data,
+                                           const RegionPaintingSampler             &sampler,
+                                           size_t                                   target_triangle,
+                                           const std::array<Vec3f, 3>              &vertices,
+                                           const std::array<Vec3f, 3>              &barycentrics,
+                                           int                                      depth,
+                                           int                                      min_depth,
+                                           int                                      max_depth)
+{
+    const Vec3f centroid = (vertices[0] + vertices[1] + vertices[2]) / 3.f;
+    const Vec3f centroid_bary = (barycentrics[0] + barycentrics[1] + barycentrics[2]) / 3.f;
+    const unsigned int s0 = sampler(target_triangle, vertices[0], barycentrics[0]);
+    const unsigned int s1 = sampler(target_triangle, vertices[1], barycentrics[1]);
+    const unsigned int s2 = sampler(target_triangle, vertices[2], barycentrics[2]);
+    const unsigned int sc = sampler(target_triangle, centroid, centroid_bary);
+    const bool states_differ = s0 != s1 || s1 != s2 || s2 != sc;
+
+    if (depth < max_depth && (depth < min_depth || states_differ)) {
+        region_append_nibble(data.bitstream, 3u);
+        const std::array<std::array<Vec3f, 3>, 4> child_vertices = region_split_triangle(vertices);
+        const std::array<std::array<Vec3f, 3>, 4> child_barycentrics = region_split_triangle(barycentrics);
+        bool has_non_base = false;
+        for (int child_idx = 3; child_idx >= 0; --child_idx) {
+            has_non_base |= region_append_sampled_triangle(data,
+                                                           sampler,
+                                                           target_triangle,
+                                                           child_vertices[size_t(child_idx)],
+                                                           child_barycentrics[size_t(child_idx)],
+                                                           depth + 1,
+                                                           min_depth,
+                                                           max_depth);
+        }
+        return has_non_base;
+    }
+
+    region_append_leaf(data, sc);
+    return sc != 0;
 }
 
 static SimplifyTextureDataResult remap_rgba_from_snapshot(const SimplifyTextureDataSnapshot &snapshot,
@@ -994,6 +1154,110 @@ static SimplifyTextureDataResult remap_rgba_from_snapshot(const SimplifyTextureD
         result.rgba_data = std::move(annotation);
     }
     return result;
+}
+
+static void remap_region_painting_from_snapshot(const SimplifyTextureDataSnapshot &snapshot,
+                                                const indexed_triangle_set       &simplified_mesh,
+                                                const SimplifyTextureCancelFn    &throw_on_cancel,
+                                                const SimplifyTextureProgressFn  &status_fn,
+                                                SimplifyTextureDataResult        &result)
+{
+    result.region_painting_touched = snapshot.region_painting_present;
+    if (!snapshot.region_painting_present) {
+        set_progress(status_fn, 100);
+        return;
+    }
+
+    if (!snapshot.region_painting_transfer_needed) {
+        set_progress(status_fn, 100);
+        return;
+    }
+
+    if (simplified_mesh.indices.empty() || snapshot.source_mesh.indices.empty() || snapshot.region_facets_per_type.empty()) {
+        result.region_painting_remap_failed = true;
+        set_progress(status_fn, 100);
+        return;
+    }
+
+    set_progress(status_fn, 0);
+    AABBMesh source_aabb(snapshot.source_mesh);
+    RegionFacetLookup region_lookup = make_region_facet_lookup(snapshot);
+    std::vector<FastTriangleProjection> projection_cache(simplified_mesh.indices.size());
+    std::vector<uint8_t> projection_cache_valid(simplified_mesh.indices.size(), 0);
+
+    const int max_depth = 4;
+    const float target_span = std::max(mesh_max_axis_span(simplified_mesh) / 120.f, 0.3f);
+    const std::array<Vec3f, 3> root_barycentrics = {
+        Vec3f(1.f, 0.f, 0.f),
+        Vec3f(0.f, 1.f, 0.f),
+        Vec3f(0.f, 0.f, 1.f)
+    };
+
+    RegionPaintingSampler sampler = [&](size_t target_triangle, const Vec3f &point, const Vec3f &target_barycentric) {
+        size_t source_triangle = 0;
+        Vec3f source_barycentric = Vec3f(1.f / 3.f, 1.f / 3.f, 1.f / 3.f);
+        bool source_projected = false;
+        if (target_triangle < projection_cache.size()) {
+            if (projection_cache_valid[target_triangle] == 0) {
+                std::array<Vec3f, 3> target_vertices;
+                if (valid_triangle_vertices(simplified_mesh, target_triangle, target_vertices))
+                    projection_cache[target_triangle] = make_fast_triangle_projection(snapshot, source_aabb, target_vertices);
+                projection_cache_valid[target_triangle] = 1;
+            }
+            source_projected = projected_source_from_fast_triangle(projection_cache[target_triangle],
+                                                                   target_barycentric,
+                                                                   source_triangle,
+                                                                   source_barycentric);
+        }
+        if (!source_projected && !project_to_source(snapshot, source_aabb, point, source_triangle, source_barycentric))
+            return 0u;
+
+        std::array<Vec3f, 3> source_vertices;
+        if (!valid_triangle_vertices(snapshot.source_mesh, source_triangle, source_vertices))
+            return 0u;
+        const Vec3f source_point = source_vertices[0] * source_barycentric.x() +
+                                   source_vertices[1] * source_barycentric.y() +
+                                   source_vertices[2] * source_barycentric.z();
+        return sample_region_state_at_source(snapshot, region_lookup, source_triangle, source_point);
+    };
+
+    TriangleSelector::TriangleSplittingData data;
+    data.triangles_to_split.reserve(simplified_mesh.indices.size());
+    size_t sample_counter = 0;
+    for (size_t tri_idx = 0; tri_idx < simplified_mesh.indices.size(); ++tri_idx) {
+        if ((++sample_counter & 255u) == 0) {
+            check_cancel(throw_on_cancel);
+            set_progress(status_fn, int((uint64_t(tri_idx) * 100u) / std::max<size_t>(simplified_mesh.indices.size(), 1)));
+        }
+
+        std::array<Vec3f, 3> vertices;
+        if (!valid_triangle_vertices(simplified_mesh, tri_idx, vertices))
+            continue;
+
+        const size_t bitstream_start = data.bitstream.size();
+        const int min_depth = texture_mapping_depth_from_span(triangle_max_edge_length(vertices), target_span, max_depth);
+        const bool has_non_base = region_append_sampled_triangle(data,
+                                                                 sampler,
+                                                                 tri_idx,
+                                                                 vertices,
+                                                                 root_barycentrics,
+                                                                 0,
+                                                                 min_depth,
+                                                                 max_depth);
+        if (has_non_base)
+            data.triangles_to_split.emplace_back(int(tri_idx), int(bitstream_start));
+        else
+            data.bitstream.resize(bitstream_start);
+    }
+
+    check_cancel(throw_on_cancel);
+    set_progress(status_fn, 100);
+    data.triangles_to_split.shrink_to_fit();
+    data.bitstream.shrink_to_fit();
+    if (!data.triangles_to_split.empty()) {
+        result.region_painting_data = std::move(data);
+        result.region_painting_valid = true;
+    }
 }
 
 static bool refresh_result_preview_from_raw(SimplifyTextureDataResult &result)
@@ -1204,6 +1468,11 @@ static void touch_imported_texture(ModelVolume &volume)
 
 } // namespace
 
+bool model_volume_region_painting_needs_remap(const ModelVolume &volume)
+{
+    return region_painting_data_needs_remap(volume);
+}
+
 SimplifyTextureDataSnapshot snapshot_simplify_texture_data(const ModelVolume &volume)
 {
     SimplifyTextureDataSnapshot snapshot;
@@ -1211,17 +1480,22 @@ SimplifyTextureDataSnapshot snapshot_simplify_texture_data(const ModelVolume &vo
     if (its.vertices.empty() || its.indices.empty())
         return snapshot;
 
+    bool found_color_source = false;
     if (!volume.texture_mapping_color_facets.empty()) {
         snapshot.source = SimplifyColorSource::RgbaData;
         snapshot.source_mesh = its;
         snapshot.rgba_metadata_json = volume.texture_mapping_color_facets.metadata_json();
         volume.texture_mapping_color_facets.get_facet_triangles(volume, snapshot.rgba_facets);
         if (!snapshot.rgba_facets.empty())
-            return snapshot;
-        snapshot = SimplifyTextureDataSnapshot();
+            found_color_source = true;
+        else {
+            snapshot.source = SimplifyColorSource::None;
+            snapshot.source_mesh = indexed_triangle_set();
+            snapshot.rgba_metadata_json.clear();
+        }
     }
 
-    if (volume_has_valid_image_texture(volume)) {
+    if (!found_color_source && volume_has_valid_image_texture(volume)) {
         snapshot.source = SimplifyColorSource::ImageTexture;
         snapshot.source_mesh = its;
         snapshot.texture_rgba.assign(volume.imported_texture_rgba.begin(), volume.imported_texture_rgba.end());
@@ -1235,21 +1509,45 @@ SimplifyTextureDataSnapshot snapshot_simplify_texture_data(const ModelVolume &vo
         snapshot.texture_raw_metadata_json = volume.imported_texture_raw_metadata_json;
         snapshot.uv_map_generator_version = volume.uv_map_generator_version;
         if (snapshot_has_valid_rgba_texture(snapshot) || snapshot_has_valid_raw_atlas(snapshot))
-            return snapshot;
-        snapshot = SimplifyTextureDataSnapshot();
+            found_color_source = true;
+        else {
+            snapshot.source = SimplifyColorSource::None;
+            snapshot.source_mesh = indexed_triangle_set();
+            snapshot.texture_rgba.clear();
+            snapshot.texture_uvs_per_face.clear();
+            snapshot.texture_uv_valid.clear();
+            snapshot.texture_raw_filament_offsets.clear();
+            snapshot.texture_width = 0;
+            snapshot.texture_height = 0;
+            snapshot.texture_raw_channels = 0;
+            snapshot.texture_raw_metadata_json.clear();
+            snapshot.uv_map_generator_version = 0;
+        }
     }
 
-    if (!volume.imported_vertex_colors_rgba.empty() && volume.imported_vertex_colors_rgba.size() == its.vertices.size()) {
+    if (!found_color_source &&
+        !volume.imported_vertex_colors_rgba.empty() &&
+        volume.imported_vertex_colors_rgba.size() == its.vertices.size()) {
         snapshot.source = SimplifyColorSource::VertexColors;
         snapshot.source_mesh = its;
         snapshot.vertex_colors_rgba.assign(volume.imported_vertex_colors_rgba.begin(), volume.imported_vertex_colors_rgba.end());
+        found_color_source = true;
+    }
+
+    snapshot.region_painting_present = !volume.mmu_segmentation_facets.empty();
+    snapshot.region_base_filament_id = int(volume_base_region_filament_id(volume));
+    snapshot.region_painting_transfer_needed = region_painting_data_needs_remap(volume);
+    if (snapshot.region_painting_transfer_needed) {
+        if (!found_color_source)
+            snapshot.source_mesh = its;
+        volume.mmu_segmentation_facets.get_facet_triangles(volume, snapshot.region_facets_per_type);
     }
     return snapshot;
 }
 
 void transform_simplify_texture_data_snapshot(SimplifyTextureDataSnapshot &snapshot, const Transform3d &transform)
 {
-    if (snapshot.source == SimplifyColorSource::None)
+    if (snapshot.source == SimplifyColorSource::None && !snapshot.region_painting_transfer_needed)
         return;
 
     if (!snapshot.source_mesh.vertices.empty() && !snapshot.source_mesh.indices.empty()) {
@@ -1263,50 +1561,93 @@ void transform_simplify_texture_data_snapshot(SimplifyTextureDataSnapshot &snaps
             for (Vec3f &vertex : facet.vertices)
                 vertex = (transform * vertex.cast<double>()).cast<float>();
     }
+
+    for (auto &facets : snapshot.region_facets_per_type)
+        for (TriangleSelector::FacetStateTriangle &facet : facets)
+            for (Vec3f &vertex : facet.vertices)
+                vertex = (transform * vertex.cast<double>()).cast<float>();
 }
 
 SimplifyTextureDataResult remap_simplify_texture_data(const SimplifyTextureDataSnapshot &snapshot,
                                                        const indexed_triangle_set       &simplified_mesh,
                                                        const SimplifyTextureCancelFn    &throw_on_cancel,
-                                                       const SimplifyTextureProgressFn  &status_fn)
+                                                       const SimplifyTextureProgressFn  &status_fn,
+                                                       const SimplifyTextureDataRemapOptions &options)
 {
-    if (snapshot.source == SimplifyColorSource::None || simplified_mesh.indices.empty()) {
+    const bool has_color_data = snapshot.source != SimplifyColorSource::None;
+    const bool remap_color = has_color_data && options.remap_color_data && !simplified_mesh.indices.empty();
+    const bool remap_region = snapshot.region_painting_present &&
+                              options.remap_region_painting &&
+                              snapshot.region_painting_transfer_needed &&
+                              !simplified_mesh.indices.empty();
+
+    if (!remap_color && !remap_region) {
         set_progress(status_fn, 100);
         SimplifyTextureDataResult result;
-        result.source = snapshot.source;
+        result.source = options.remap_color_data ? snapshot.source : SimplifyColorSource::None;
+        result.region_painting_touched = snapshot.region_painting_present;
         return result;
     }
 
-    switch (snapshot.source) {
-    case SimplifyColorSource::RgbaData:
-        return remap_rgba_from_snapshot(snapshot, simplified_mesh, throw_on_cancel, status_fn);
-    case SimplifyColorSource::ImageTexture: {
-        SimplifyTextureDataResult result = remap_image_texture_from_snapshot(snapshot, simplified_mesh, throw_on_cancel, status_fn);
-        if (result.source == SimplifyColorSource::ImageTexture)
-            return result;
-        SimplifyTextureDataSnapshot fallback_snapshot = snapshot;
-        limit_snapshot_texture_resolution(fallback_snapshot);
-        if (!snapshot_has_valid_rgba_texture(fallback_snapshot) && snapshot_has_valid_raw_atlas(fallback_snapshot)) {
-            ImageMapRawFilamentOffsetAtlas atlas;
-            atlas.width = fallback_snapshot.texture_width;
-            atlas.height = fallback_snapshot.texture_height;
-            atlas.channels = fallback_snapshot.texture_raw_channels;
-            atlas.offsets = fallback_snapshot.texture_raw_filament_offsets;
-            atlas.metadata_json = fallback_snapshot.texture_raw_metadata_json;
-            atlas.filaments = image_map_raw_filaments_from_metadata_json(atlas.metadata_json, atlas.channels);
-            fallback_snapshot.texture_rgba = image_map_raw_filament_offset_preview_rgba(atlas);
+    auto scaled_progress = [&status_fn](int offset, int span) {
+        return [status_fn, offset, span](int percent) {
+            set_progress(status_fn, offset + int(std::round(float(std::clamp(percent, 0, 100)) * float(span) / 100.f)));
+        };
+    };
+
+    const bool split_progress = remap_color && snapshot.region_painting_present;
+    SimplifyTextureDataResult result;
+    if (remap_color) {
+        const SimplifyTextureProgressFn color_progress = split_progress ? scaled_progress(0, 80) : status_fn;
+        switch (snapshot.source) {
+        case SimplifyColorSource::RgbaData:
+            result = remap_rgba_from_snapshot(snapshot, simplified_mesh, throw_on_cancel, color_progress);
+            break;
+        case SimplifyColorSource::ImageTexture: {
+            result = remap_image_texture_from_snapshot(snapshot, simplified_mesh, throw_on_cancel, color_progress);
+            if (result.source == SimplifyColorSource::ImageTexture)
+                break;
+            SimplifyTextureDataSnapshot fallback_snapshot = snapshot;
+            limit_snapshot_texture_resolution(fallback_snapshot);
+            if (!snapshot_has_valid_rgba_texture(fallback_snapshot) && snapshot_has_valid_raw_atlas(fallback_snapshot)) {
+                ImageMapRawFilamentOffsetAtlas atlas;
+                atlas.width = fallback_snapshot.texture_width;
+                atlas.height = fallback_snapshot.texture_height;
+                atlas.channels = fallback_snapshot.texture_raw_channels;
+                atlas.offsets = fallback_snapshot.texture_raw_filament_offsets;
+                atlas.metadata_json = fallback_snapshot.texture_raw_metadata_json;
+                atlas.filaments = image_map_raw_filaments_from_metadata_json(atlas.metadata_json, atlas.channels);
+                fallback_snapshot.texture_rgba = image_map_raw_filament_offset_preview_rgba(atlas);
+            }
+            result = remap_rgba_from_snapshot(fallback_snapshot, simplified_mesh, throw_on_cancel, color_progress);
+            result.remap_failed = true;
+            result.used_fallback_rgba = result.source == SimplifyColorSource::RgbaData && result.rgba_data != nullptr;
+            break;
         }
-        result = remap_rgba_from_snapshot(fallback_snapshot, simplified_mesh, throw_on_cancel, status_fn);
-        result.remap_failed = true;
-        result.used_fallback_rgba = result.source == SimplifyColorSource::RgbaData && result.rgba_data != nullptr;
-        return result;
+        case SimplifyColorSource::VertexColors:
+            result = remap_vertex_colors_from_snapshot(snapshot, simplified_mesh, throw_on_cancel, color_progress);
+            break;
+        case SimplifyColorSource::None:
+            break;
+        }
+    } else {
+        result.source = SimplifyColorSource::None;
     }
-    case SimplifyColorSource::VertexColors:
-        return remap_vertex_colors_from_snapshot(snapshot, simplified_mesh, throw_on_cancel, status_fn);
-    case SimplifyColorSource::None:
-        break;
+
+    if (snapshot.region_painting_present) {
+        SimplifyTextureProgressFn region_progress = status_fn;
+        if (split_progress)
+            region_progress = scaled_progress(80, 20);
+        if (options.remap_region_painting)
+            remap_region_painting_from_snapshot(snapshot, simplified_mesh, throw_on_cancel, region_progress, result);
+        else {
+            result.region_painting_touched = true;
+            set_progress(region_progress, 100);
+        }
     }
-    return SimplifyTextureDataResult();
+
+    set_progress(status_fn, 100);
+    return result;
 }
 
 void apply_simplify_texture_data_result(ModelVolume &volume, SimplifyTextureDataResult &&result)
@@ -1351,6 +1692,16 @@ void apply_simplify_texture_data_result(ModelVolume &volume, SimplifyTextureData
         volume.imported_vertex_colors_rgba.set_new_unique_id();
         touch_imported_texture(volume);
         break;
+    }
+
+    if (result.region_painting_touched) {
+        if (result.region_painting_valid && !result.region_painting_data.triangles_to_split.empty()) {
+            TriangleSelector selector(volume.mesh());
+            selector.deserialize(result.region_painting_data);
+            volume.mmu_segmentation_facets.set(selector);
+        } else {
+            volume.mmu_segmentation_facets.reset();
+        }
     }
 }
 

@@ -6028,8 +6028,14 @@ void ObjectList::fix_through_cgal()
         color_remap_stats.remap_canceled |= stats.remap_canceled;
         color_remap_stats.remap_failed |= stats.remap_failed;
         color_remap_stats.used_fallback_rgba |= stats.used_fallback_rgba;
+        color_remap_stats.had_region_painting |= stats.had_region_painting;
+        color_remap_stats.region_remap_requested |= stats.region_remap_requested;
+        color_remap_stats.region_remap_skipped |= stats.region_remap_skipped;
+        color_remap_stats.region_remap_failed |= stats.region_remap_failed;
         color_remap_stats.volumes_remapped += stats.volumes_remapped;
         color_remap_stats.volumes_cleared += stats.volumes_cleared;
+        color_remap_stats.region_volumes_remapped += stats.region_volumes_remapped;
+        color_remap_stats.region_volumes_cleared += stats.region_volumes_cleared;
     };
 
     std::vector<int> obj_idxs, vol_idxs;
@@ -6165,6 +6171,12 @@ void ObjectList::fix_through_cgal()
         msg += "\n\n" + _L("Color remapping was skipped; stale color data was cleared from repaired parts.");
     if (color_remap_stats.remap_canceled && color_remap_stats.volumes_cleared > 0)
         msg += "\n\n" + _L("Color remapping was canceled; stale color data was cleared from repaired parts.");
+    if (color_remap_stats.region_remap_failed && color_remap_stats.region_volumes_cleared > 0)
+        msg += "\n\n" + _L("Some region painting could not be remapped after repair and was cleared.");
+    if (color_remap_stats.region_remap_skipped && color_remap_stats.region_volumes_cleared > 0)
+        msg += "\n\n" + _L("Region painting remapping was skipped; stale region painting was cleared from repaired parts.");
+    if (color_remap_stats.region_remap_requested && color_remap_stats.remap_canceled && color_remap_stats.region_volumes_cleared > 0)
+        msg += "\n\n" + _L("Region painting remapping was canceled; stale region painting was cleared from repaired parts.");
     if (msg.IsEmpty())
         msg = _L("Repairing was canceled");
     plater->get_notification_manager()->push_notification(NotificationType::CgalFinished, NotificationManager::NotificationLevel::PrintInfoShortNotificationLevel, into_u8(msg));

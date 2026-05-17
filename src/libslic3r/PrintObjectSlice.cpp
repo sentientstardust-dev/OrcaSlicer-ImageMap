@@ -240,14 +240,12 @@ static std::vector<std::string> collect_texture_mapping_vertex_color_match_warni
     if (has_uv_texture_reference_but_no_image)
         return {
             L("Image Texture Mapping is used on this object and OBJ UVs were found, but the texture image could not be loaded. "
-              "Texture color matching will be skipped for this object. "
-              "(This importer path currently expects a PNG image texture.)")
+              "Texture color matching will be skipped for this object.")
         };
 
     return {
         L("Image Texture Mapping is used on this object, but no imported vertex colors or OBJ UV texture data were found. "
-          "Texture color matching will be skipped for this object. "
-          "(This importer path currently expects a PNG image texture.)")
+          "Texture color matching will be skipped for this object.")
     };
 }
 

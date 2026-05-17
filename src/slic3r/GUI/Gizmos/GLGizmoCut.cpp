@@ -3395,6 +3395,21 @@ void GLGizmoCut3D::perform_cut(const Selection& selection)
                                     NotificationType::CustomNotification,
                                     NotificationManager::NotificationLevel::PrintInfoNotificationLevel,
                                     _u8L("Color remapping was canceled; stale color data was cleared from repaired parts."));
+                            if (remap_stats.region_remap_failed && remap_stats.region_volumes_cleared > 0)
+                                plater->get_notification_manager()->push_notification(
+                                    NotificationType::CustomNotification,
+                                    NotificationManager::NotificationLevel::PrintInfoNotificationLevel,
+                                    _u8L("Some region painting could not be remapped after repair and was cleared."));
+                            if (remap_stats.region_remap_skipped && remap_stats.region_volumes_cleared > 0)
+                                plater->get_notification_manager()->push_notification(
+                                    NotificationType::CustomNotification,
+                                    NotificationManager::NotificationLevel::PrintInfoNotificationLevel,
+                                    _u8L("Region painting remapping was skipped; stale region painting was cleared from repaired parts."));
+                            if (remap_stats.region_remap_requested && remap_stats.remap_canceled && remap_stats.region_volumes_cleared > 0)
+                                plater->get_notification_manager()->push_notification(
+                                    NotificationType::CustomNotification,
+                                    NotificationManager::NotificationLevel::PrintInfoNotificationLevel,
+                                    _u8L("Region painting remapping was canceled; stale region painting was cleared from repaired parts."));
                             return !remap_stats.remap_canceled;
                         };
                         ProgressDialog progress_dlg(_L("Repairing model object"), "", 100, find_toplevel_parent(plater), wxPD_AUTO_HIDE | wxPD_APP_MODAL | wxPD_CAN_ABORT, true);

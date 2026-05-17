@@ -19331,14 +19331,13 @@ void Plater::clear_before_change_mesh(int obj_idx)
 {
     ModelObject* mo = model().objects[obj_idx];
 
-    // If there are custom supports/seams/mmu/fuzzy skin segmentation, remove them. Fixed mesh
+    // If there are custom supports/seams/fuzzy skin segmentation, remove them. Fixed mesh
     // may be different and they would make no sense.
     bool paint_removed = false;
     for (ModelVolume* mv : mo->volumes) {
-        paint_removed |= ! mv->supported_facets.empty() || ! mv->seam_facets.empty() || ! mv->mmu_segmentation_facets.empty() || !mv->fuzzy_skin_facets.empty();
+        paint_removed |= ! mv->supported_facets.empty() || ! mv->seam_facets.empty() || !mv->fuzzy_skin_facets.empty();
         mv->supported_facets.reset();
         mv->seam_facets.reset();
-        mv->mmu_segmentation_facets.reset();
         mv->fuzzy_skin_facets.reset();
     }
     if (paint_removed) {
@@ -19346,7 +19345,7 @@ void Plater::clear_before_change_mesh(int obj_idx)
         get_notification_manager()->push_notification(
                     NotificationType::CustomSupportsAndSeamRemovedAfterRepair,
                     NotificationManager::NotificationLevel::PrintInfoNotificationLevel,
-                    _u8L("Custom supports and color region painting were removed before repairing."));
+                    _u8L("Custom supports and seam painting were removed before repairing."));
     }
 }
 

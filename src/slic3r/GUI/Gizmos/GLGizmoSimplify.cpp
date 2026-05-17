@@ -195,6 +195,7 @@ void GLGizmoSimplify::on_render_input_window(float x, float y, float bottom_limi
 
         m_volume = act_volume;
         m_configuration.decimate_ratio = 50.; // default value
+        m_configuration.remap_region_painting = true;
         m_configuration.fix_count_by_ratio(m_volume->mesh().its.indices.size());
         init_model(m_volume->mesh().its);
 
@@ -343,6 +344,10 @@ void GLGizmoSimplify::on_render_input_window(float x, float y, float bottom_limi
     m_imgui->disabled_end(); // use_count
 
     m_imgui->bbl_checkbox(_L("Show wireframe").c_str(), m_show_wireframe);
+    if (model_volume_region_painting_needs_remap(*m_volume)) {
+        if (m_imgui->bbl_checkbox(_L("Remap region painting to simplified mesh").c_str(), m_configuration.remap_region_painting))
+            start_process = true;
+    }
     const wxString skip_color_conversion_label = color_conversion_in_progress ?
         _L("Skip color conversion (in progress)") :
         _L("Skip color conversion");
@@ -551,12 +556,14 @@ void GLGizmoSimplify::process()
         // Initialize.
         uint32_t triangle_count = 0;
         float    max_error = std::numeric_limits<float>::max();
+        bool     remap_region_painting = true;
         {
             std::lock_guard lk(m_state_mutex);
             if (m_state.config.use_count)
                 triangle_count = m_state.config.wanted_count;
             if (! m_state.config.use_count)
                 max_error = m_state.config.max_error;
+            remap_region_painting = m_state.config.remap_region_painting;
             m_state.progress = 0.f;
             m_state.result.reset();
             m_state.color_conversion_in_progress = false;
@@ -574,12 +581,15 @@ void GLGizmoSimplify::process()
             set_color_conversion_in_progress(true);
             try {
                 throw_on_color_conversion_stop();
+                SimplifyTextureDataRemapOptions remap_options;
+                remap_options.remap_region_painting = remap_region_painting;
                 texture_result =
                     remap_simplify_texture_data(texture_snapshot, *its, throw_on_color_conversion_stop, [&statusfn](int percent) {
                         statusfn(90.f + float(std::clamp(percent, 0, 100)) * 0.1f);
-                    });
+                    }, remap_options);
             } catch (SimplifyColorConversionSkippedException &) {
                 texture_result = SimplifyTextureDataResult();
+                texture_result.region_painting_touched = texture_snapshot.region_painting_present;
             } catch (...) {
                 set_color_conversion_in_progress(false);
                 throw;

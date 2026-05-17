@@ -19,8 +19,14 @@ struct ModelRepairColorRemapStats
     bool   remap_canceled    = false;
     bool   remap_failed      = false;
     bool   used_fallback_rgba = false;
+    bool   had_region_painting = false;
+    bool   region_remap_requested = false;
+    bool   region_remap_skipped = false;
+    bool   region_remap_failed = false;
     size_t volumes_remapped  = 0;
     size_t volumes_cleared   = 0;
+    size_t region_volumes_remapped = 0;
+    size_t region_volumes_cleared = 0;
 };
 
 struct ModelRepairOptions
@@ -42,6 +48,7 @@ struct ModelRepairPromptState
     bool repair_options_canceled = false;
     ModelRepairOptions repair_options;
     ModelRepairColorRemapChoice color_remap_choice = ModelRepairColorRemapChoice::Remap;
+    bool region_painting_remap = true;
 };
 
 // Return false if fixing was canceled. fix_result is empty on success.

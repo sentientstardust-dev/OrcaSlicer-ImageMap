@@ -48,7 +48,8 @@ static void apply_tolerance(ModelVolume* vol)
 
 static void apply_cut_texture_data(ModelVolume *volume, const SimplifyTextureDataSnapshot *source_snapshot, const Transform3d &cut_matrix)
 {
-    if (volume == nullptr || source_snapshot == nullptr || source_snapshot->source == SimplifyColorSource::None ||
+    if (volume == nullptr || source_snapshot == nullptr ||
+        (source_snapshot->source == SimplifyColorSource::None && !source_snapshot->region_painting_present) ||
         volume->mesh().empty())
         return;
 
@@ -65,6 +66,9 @@ static bool volume_has_remappable_color_data(const ModelVolume &volume)
     const indexed_triangle_set &its = volume.mesh().its;
     if (its.vertices.empty() || its.indices.empty())
         return false;
+
+    if (model_volume_region_painting_needs_remap(volume))
+        return true;
 
     if (!volume.texture_mapping_color_facets.empty())
         return true;
@@ -481,9 +485,12 @@ static void merge_solid_parts_inside_object(ModelObjectPtrs& objects)
         }
 
         TriangleMesh mesh;
+        const ModelVolume *merged_volume_source = nullptr;
         // Merge all SolidPart but not Connectors
         for (const ModelVolume* mv : mo->volumes) {
             if (mv->is_model_part() && !mv->is_cut_connector()) {
+                if (merged_volume_source == nullptr)
+                    merged_volume_source = mv;
                 TriangleMesh m = mv->mesh();
                 m.transform(mv->get_matrix());
                 mesh.merge(m);
@@ -492,6 +499,14 @@ static void merge_solid_parts_inside_object(ModelObjectPtrs& objects)
         if (!mesh.empty()) {
             ModelVolume* new_volume = mo->add_volume(mesh);
             new_volume->name = mo->name;
+            if (merged_volume_source != nullptr) {
+                new_volume->config.assign_config(merged_volume_source->config);
+                if (ModelMaterial *material = merged_volume_source->material())
+                    new_volume->set_material(merged_volume_source->material_id(), *material);
+                else
+                    new_volume->set_material_id(merged_volume_source->material_id());
+                new_volume->cut_info = merged_volume_source->cut_info;
+            }
             // Delete all merged SolidPart but not Connectors
             for (int i = int(mo->volumes.size()) - 2; i >= 0; --i) {
                 const ModelVolume* mv = mo->volumes[i];

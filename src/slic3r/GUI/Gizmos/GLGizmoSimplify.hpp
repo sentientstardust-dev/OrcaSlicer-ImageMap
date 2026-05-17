@@ -62,11 +62,13 @@ private:
         float    decimate_ratio = 50.f; // in percent
         uint32_t wanted_count = 0; // initialize by percents
         float max_error = 1.; // maximal quadric error
+        bool remap_region_painting = true;
 
         void fix_count_by_ratio(size_t triangle_count);
         bool operator==(const Configuration& rhs) {
             return (use_count == rhs.use_count && decimate_ratio == rhs.decimate_ratio
-                && wanted_count == rhs.wanted_count && max_error == rhs.max_error);
+                && wanted_count == rhs.wanted_count && max_error == rhs.max_error
+                && remap_region_painting == rhs.remap_region_painting);
         }
         bool operator!=(const Configuration& rhs) {
             return ! (*this == rhs);

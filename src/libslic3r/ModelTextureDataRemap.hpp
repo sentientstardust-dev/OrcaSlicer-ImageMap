@@ -38,6 +38,10 @@ struct SimplifyTextureDataSnapshot
     std::string texture_raw_metadata_json;
     int uv_map_generator_version { 0 };
     std::vector<uint32_t> vertex_colors_rgba;
+    bool region_painting_present { false };
+    bool region_painting_transfer_needed { false };
+    int region_base_filament_id { 1 };
+    std::vector<std::vector<TriangleSelector::FacetStateTriangle>> region_facets_per_type;
 };
 
 struct SimplifyTextureDataResult
@@ -56,10 +60,22 @@ struct SimplifyTextureDataResult
     std::string texture_raw_metadata_json;
     int uv_map_generator_version { 0 };
     std::vector<uint32_t> vertex_colors_rgba;
+    bool region_painting_touched { false };
+    bool region_painting_valid { false };
+    bool region_painting_remap_failed { false };
+    TriangleSelector::TriangleSplittingData region_painting_data;
+};
+
+struct SimplifyTextureDataRemapOptions
+{
+    bool remap_color_data { true };
+    bool remap_region_painting { true };
 };
 
 using SimplifyTextureCancelFn = std::function<void()>;
 using SimplifyTextureProgressFn = std::function<void(int)>;
+
+bool model_volume_region_painting_needs_remap(const ModelVolume &volume);
 
 SimplifyTextureDataSnapshot snapshot_simplify_texture_data(const ModelVolume &volume);
 
@@ -68,7 +84,8 @@ void transform_simplify_texture_data_snapshot(SimplifyTextureDataSnapshot &snaps
 SimplifyTextureDataResult remap_simplify_texture_data(const SimplifyTextureDataSnapshot &snapshot,
                                                        const indexed_triangle_set       &simplified_mesh,
                                                        const SimplifyTextureCancelFn    &throw_on_cancel = {},
-                                                       const SimplifyTextureProgressFn  &status_fn = {});
+                                                       const SimplifyTextureProgressFn  &status_fn = {},
+                                                       const SimplifyTextureDataRemapOptions &options = SimplifyTextureDataRemapOptions());
 
 void apply_simplify_texture_data_result(ModelVolume &volume, SimplifyTextureDataResult &&result);
 
