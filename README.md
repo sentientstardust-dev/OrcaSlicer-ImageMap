@@ -173,6 +173,7 @@ Currently builds are not available for linux, you must build this yourself
 
 - Step 1: Import your model in blender using File -> Import (and selecting the file type that corresponds to your model)
 - Step 2 (optional): Change the viewport shading mode to 'Material Preview'  in the top right of the viewport, to check that your model textures are loaded properly.
+    - If your model has vertex colors doing this won't show them (this is fine). In this case you can skip past step 3 as there won't be any textures to unpack.
 - Step 3A: Unpack the image textures from your model using File -> External Data -> Unpack Resources. This should work, but often runs into errors when I try to use it, so if it doesn't work go to step 3B. Otherwise skip to step 4.
 - <details>
     <summary>Step 3B: If you couldn't automatically unpack the model textures, expand this and follow these instructions instead of 3A</summary>
@@ -183,11 +184,16 @@ Currently builds are not available for linux, you must build this yourself
         - Select the image from the dropdown and then go to "Image -> Save As" in the top bar. Save the image in the folder you are going to export your obj model to
         - There will often be other kinds of image data here you don't need to unpack (specular maps, etc.). if you're not sure which ones you need it doesn't do any harm to export all of them
     </details>
-
-- Step 4: After unpacking your model images, you can now export the obj. Go to File -> Export and select "Wavefront (.obj)"
+- Step 4 (optional): Triangulate your mesh.
+  - If your model contains large n-gons, the slicer won't be able to import it. This step converts all faces into triangles to solve the issue
+  - 4.1 - Click on your object, then go to the Modifiers tab on the right panel (blue spanner icon).
+  - 4.2 - Click 'Add Modifier', and add a Generate -> Triangulate modifier.
+  - 4.3 - Click the down arrow to the right of the new Triangulate modifier, and click 'Apply'
+- Step 5: After unpacking your model images and/or triangulating the model, you can now export the obj. Go to File -> Export and select "Wavefront (.obj)"
     - Set Materials -> Path Mode in the export dialog to "Copy"
+    - If your model uses vertex colors instead of textures, make sure "Colors" is enabled in the Geometry tab
     - You can also check that the Up Axis is set to "Y" and UV Coordinates are enabled in this export dialog (but these should be already set by default)
-- Step 5: Your model is now converted to obj. You can now open ImageMap and use File -> Import -> "Import 3MF/STL/STEP/SVG/OBJ/AMF..." to load this obj file with its color image texture.
+- Step 6: Your model is now converted to obj. You can now open ImageMap and use File -> Import -> "Import 3MF/STL/STEP/SVG/OBJ/AMF..." to load this obj file with its color image texture.
 </details>
 
 # How to Compile
