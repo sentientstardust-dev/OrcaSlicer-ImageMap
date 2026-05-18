@@ -3497,6 +3497,9 @@ void Print::_make_wipe_tower()
                 settings_zone->filament_color_mode :
                 prime_tower_texture_mapping_color_mode_for_print(texture.color_mode);
             texture.compact_offset_mode = settings_zone->compact_offset_mode;
+            texture.generic_solver_lookup_mode = settings_zone->generic_solver_lookup_mode;
+            texture.generic_solver_mode = settings_zone->generic_solver_mode;
+            texture.generic_solver_mix_model = settings_zone->generic_solver_mix_model;
             texture.contrast_pct = settings_zone->contrast_pct;
             texture.tone_gamma = settings_zone->tone_gamma;
             texture.filament_strengths_pct = settings_zone->filament_strengths_pct;

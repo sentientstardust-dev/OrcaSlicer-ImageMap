@@ -14,6 +14,7 @@
 
 #include "libslic3r/Point.hpp"
 #include "libslic3r/Polygon.hpp"
+#include "libslic3r/ColorSolver.hpp"
 #include "libslic3r/TextureMapping.hpp"
 #include "libslic3r/Polyline.hpp"
 #include "libslic3r/TriangleMesh.hpp"
@@ -51,6 +52,9 @@ struct PrimeTowerTextureRenderSettings
     bool settings_zone_enabled = false;
     int texture_mapping_mode = int(TextureMappingZone::TextureMappingFilamentBlending);
     int texture_filament_color_mode = int(TextureMappingZone::FilamentColorAny);
+    int generic_solver_lookup_mode = TextureMappingZone::DefaultGenericSolverLookupMode;
+    int generic_solver_mode = TextureMappingZone::DefaultGenericSolverMode;
+    int generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
     float contrast_pct = 100.f;
     float tone_gamma = 1.f;
     float global_strength = 1.f;
@@ -77,7 +81,7 @@ struct PrimeTowerTextureRenderSettings
 
     float sample_tool_visibility(size_t tool, float u, float v, float wrap_width_mm = 0.f, float height_mm = 0.f) const
     {
-        const float raw_visibility = sample_tool_visibility_raw(tool, u, v, wrap_width_mm, height_mm);
+        const float raw_visibility = sample_tool_visibility_raw(tool, u, v, nullptr, wrap_width_mm, height_mm);
         if (!compact_offset_mode)
             return adjusted_tool_visibility(tool, raw_visibility);
 
@@ -85,14 +89,14 @@ struct PrimeTowerTextureRenderSettings
         if (!tool_indices.empty()) {
             for (const size_t candidate_tool : tool_indices) {
                 if (candidate_tool != tool) {
-                    const float candidate_visibility = sample_tool_visibility_raw(candidate_tool, u, v, wrap_width_mm, height_mm);
+                    const float candidate_visibility = sample_tool_visibility_raw(candidate_tool, u, v, nullptr, wrap_width_mm, height_mm);
                     max_visibility = std::max(max_visibility, std::clamp(candidate_visibility, 0.f, 1.f));
                 }
             }
         } else {
             for (size_t candidate_tool = 0; candidate_tool < filament_colours.size(); ++candidate_tool) {
                 if (candidate_tool != tool) {
-                    const float candidate_visibility = sample_tool_visibility_raw(candidate_tool, u, v, wrap_width_mm, height_mm);
+                    const float candidate_visibility = sample_tool_visibility_raw(candidate_tool, u, v, nullptr, wrap_width_mm, height_mm);
                     max_visibility = std::max(max_visibility, std::clamp(candidate_visibility, 0.f, 1.f));
                 }
             }
@@ -108,13 +112,14 @@ struct PrimeTowerTextureRenderSettings
                                  float wrap_width_mm = 0.f,
                                  float height_mm = 0.f) const
     {
-        const float raw_visibility = sample_tool_visibility_raw(tool, u, v, wrap_width_mm, height_mm);
+        const float raw_visibility = sample_tool_visibility_raw(tool, u, v, &normalization_tools, wrap_width_mm, height_mm);
         if (!compact_offset_mode || normalization_tools.empty())
             return adjusted_tool_visibility(tool, raw_visibility);
 
         float max_visibility = std::clamp(raw_visibility, 0.f, 1.f);
         for (const size_t normalization_tool : normalization_tools) {
-            const float normalization_visibility = sample_tool_visibility_raw(normalization_tool, u, v, wrap_width_mm, height_mm);
+            const float normalization_visibility =
+                sample_tool_visibility_raw(normalization_tool, u, v, &normalization_tools, wrap_width_mm, height_mm);
             max_visibility = std::max(max_visibility, std::clamp(normalization_visibility, 0.f, 1.f));
         }
 
@@ -140,6 +145,9 @@ struct PrimeTowerTextureRenderSettings
             if (!tools.empty())
                 return tools;
         }
+
+        if (color_mode == GenericSolver || color_mode == Auto)
+            return generic_solver_tool_candidates();
 
         const std::vector<std::array<float, 3>> ideals = color_mode_ideals(color_mode);
         if (ideals.empty())
@@ -191,6 +199,8 @@ struct PrimeTowerTextureRenderSettings
     }
 
 private:
+    mutable ColorSolverCandidateCache m_color_solver_candidate_cache;
+
     static std::vector<std::array<float, 3>> color_mode_ideals(int mode)
     {
         switch (mode) {
@@ -236,7 +246,12 @@ private:
         }
     }
 
-    float sample_tool_visibility_raw(size_t tool, float u, float v, float wrap_width_mm = 0.f, float height_mm = 0.f) const
+    float sample_tool_visibility_raw(size_t                     tool,
+                                     float                      u,
+                                     float                      v,
+                                     const std::vector<size_t> *solver_tools,
+                                     float                      wrap_width_mm = 0.f,
+                                     float                      height_mm = 0.f) const
     {
         if (!valid())
             return 1.f;
@@ -254,8 +269,8 @@ private:
         const float side_width_mm = front_valid && back_valid ? 0.5f * wrap_width_mm : wrap_width_mm;
         apply_preserved_aspect_ratio(u, v, use_back, side_width_mm, height_mm);
         if (settings_zone_enabled)
-            return sample_settings_zone_tool_visibility(tool, u, v, use_back);
-        return sample_image_tool_visibility(tool, u, v, use_back);
+            return sample_settings_zone_tool_visibility(tool, u, v, use_back, solver_tools);
+        return sample_image_tool_visibility(tool, u, v, use_back, solver_tools);
     }
 
     void apply_preserved_aspect_ratio(float &u, float &v, bool back, float side_width_mm, float height_mm) const
@@ -290,30 +305,52 @@ private:
                 image_rgba.size() >= size_t(image_width) * size_t(image_height) * 4;
     }
 
-    std::array<float, 3> sample_image_rgb(float u, float v, bool back) const
+    std::array<float, 4> sample_image_rgba(float u, float v, bool back) const
     {
         const std::vector<uint8_t> &rgba = back ? image_rgba_back : image_rgba;
         const unsigned int width = back ? image_width_back : image_width;
         const unsigned int height = back ? image_height_back : image_height;
         if (width == 0 || height == 0 || rgba.size() < size_t(width) * size_t(height) * 4)
-            return {1.f, 1.f, 1.f};
+            return {1.f, 1.f, 1.f, 1.f};
 
-        const float x = u * float(width);
-        const float y = (1.f - v) * float(height - 1);
-        const unsigned int ix = std::min<unsigned int>(width - 1, unsigned(std::floor(x)));
-        const unsigned int iy = std::min<unsigned int>(height - 1, unsigned(std::floor(y)));
-        const size_t offset = (size_t(iy) * size_t(width) + size_t(ix)) * 4;
-        const float r = float(rgba[offset + 0]) / 255.f;
-        const float g = float(rgba[offset + 1]) / 255.f;
-        const float b = float(rgba[offset + 2]) / 255.f;
-        return {r, g, b};
+        const float x = std::clamp(u, 0.f, 1.f) * float(width > 1 ? width - 1 : 0);
+        const float y = std::clamp(1.f - v, 0.f, 1.f) * float(height > 1 ? height - 1 : 0);
+        const unsigned int x0 = std::min<unsigned int>(width - 1, unsigned(std::floor(x)));
+        const unsigned int y0 = std::min<unsigned int>(height - 1, unsigned(std::floor(y)));
+        const unsigned int x1 = std::min<unsigned int>(width - 1, x0 + 1);
+        const unsigned int y1 = std::min<unsigned int>(height - 1, y0 + 1);
+        const float tx = x - float(x0);
+        const float ty = y - float(y0);
+        auto sample_channel = [&rgba, width](unsigned int sx, unsigned int sy, size_t channel) {
+            const size_t idx = (size_t(sy) * size_t(width) + size_t(sx)) * 4 + channel;
+            return float(rgba[idx]) / 255.f;
+        };
+
+        std::array<float, 4> out{};
+        for (size_t channel = 0; channel < out.size(); ++channel) {
+            const float c00 = sample_channel(x0, y0, channel);
+            const float c10 = sample_channel(x1, y0, channel);
+            const float c01 = sample_channel(x0, y1, channel);
+            const float c11 = sample_channel(x1, y1, channel);
+            const float cx0 = c00 + (c10 - c00) * tx;
+            const float cx1 = c01 + (c11 - c01) * tx;
+            out[channel] = std::clamp(cx0 + (cx1 - cx0) * ty, 0.f, 1.f);
+        }
+        return out;
     }
 
-    float sample_image_tool_visibility(size_t tool, float u, float v, bool back) const
+    std::array<float, 3> sample_image_rgb(float u, float v, bool back) const
+    {
+        const std::array<float, 4> rgba = sample_image_rgba(u, v, back);
+        return {rgba[0], rgba[1], rgba[2]};
+    }
+
+    float sample_image_tool_visibility(size_t tool, float u, float v, bool back, const std::vector<size_t> *solver_tools = nullptr) const
     {
         const std::array<float, 3> rgb = sample_image_rgb(u, v, back);
-        return color_mode == GenericSolver || color_mode == Auto ? generic_visibility(tool, rgb[0], rgb[1], rgb[2]) :
-                                                                   fixed_mode_visibility(tool, rgb[0], rgb[1], rgb[2]);
+        if (color_mode == GenericSolver || color_mode == Auto)
+            return generic_solver_tool_visibility(tool, rgb[0], rgb[1], rgb[2], solver_tools);
+        return fixed_mode_visibility(tool, rgb[0], rgb[1], rgb[2]);
     }
 
     static std::array<float, 3> parse_color(const std::string &hex)
@@ -355,6 +392,60 @@ private:
         return tool < filament_colours.size() ? parse_color(filament_colours[tool]) : std::array<float, 3>{1.f, 1.f, 1.f};
     }
 
+    std::vector<float> generic_solver_weights(const std::vector<std::array<float, 3>> &component_colors,
+                                              const std::array<float, 3>              &target) const
+    {
+        if (component_colors.empty())
+            return {};
+        const ColorSolverCandidateSet &candidates =
+            color_solver_candidates(m_color_solver_candidate_cache,
+                                    component_colors,
+                                    color_solver_mix_model_from_index(generic_solver_mix_model));
+        return solve_color_solver_weights_for_target(candidates,
+                                                     target,
+                                                     color_solver_lookup_mode_from_index(generic_solver_lookup_mode),
+                                                     color_solver_mode_from_index(generic_solver_mode));
+    }
+
+    std::vector<size_t> generic_solver_tool_candidates(const std::vector<size_t> *preferred_tools = nullptr) const
+    {
+        std::vector<size_t> tools;
+        if (preferred_tools != nullptr && !preferred_tools->empty()) {
+            tools.reserve(preferred_tools->size());
+            for (const size_t tool : *preferred_tools)
+                if (tool < filament_colours.size() && std::find(tools.begin(), tools.end(), tool) == tools.end())
+                    tools.emplace_back(tool);
+        } else if (!tool_indices.empty()) {
+            tools.reserve(tool_indices.size());
+            for (const size_t tool : tool_indices) {
+                if (tool < filament_colours.size() && std::find(tools.begin(), tools.end(), tool) == tools.end())
+                    tools.emplace_back(tool);
+            }
+        } else {
+            tools.reserve(filament_colours.size());
+            for (size_t tool = 0; tool < filament_colours.size(); ++tool)
+                tools.emplace_back(tool);
+        }
+        return tools;
+    }
+
+    float generic_solver_tool_visibility(size_t tool, float r, float g, float b, const std::vector<size_t> *solver_tools = nullptr) const
+    {
+        const std::vector<size_t> tools = generic_solver_tool_candidates(solver_tools);
+        std::vector<std::array<float, 3>> component_colors;
+        component_colors.reserve(tools.size());
+        for (const size_t candidate_tool : tools)
+            component_colors.emplace_back(tool_color(candidate_tool));
+
+        const std::vector<float> weights = generic_solver_weights(component_colors, {r, g, b});
+        if (weights.size() == tools.size()) {
+            for (size_t idx = 0; idx < tools.size(); ++idx)
+                if (tools[idx] == tool)
+                    return std::clamp(weights[idx], 0.f, 1.f);
+        }
+        return generic_visibility(tool, r, g, b);
+    }
+
     float generic_visibility(size_t tool, float r, float g, float b) const
     {
         const std::array<float, 3> target{r, g, b};
@@ -370,6 +461,22 @@ private:
     }
 
     std::vector<float> generic_component_weights(float r, float g, float b) const
+    {
+        std::vector<std::array<float, 3>> component_colors;
+        component_colors.reserve(component_ids.size());
+        for (size_t idx = 0; idx < component_ids.size(); ++idx) {
+            const unsigned int id = component_ids[idx];
+            if (id == 0 || id > filament_colours.size())
+                return generic_component_weights_fallback(r, g, b);
+            component_colors.emplace_back(tool_color(size_t(id - 1)));
+        }
+        std::vector<float> weights = generic_solver_weights(component_colors, {r, g, b});
+        if (weights.size() == component_ids.size())
+            return weights;
+        return generic_component_weights_fallback(r, g, b);
+    }
+
+    std::vector<float> generic_component_weights_fallback(float r, float g, float b) const
     {
         std::vector<float> weights(component_ids.size(), 0.f);
         for (size_t idx = 0; idx < component_ids.size(); ++idx) {
@@ -498,12 +605,16 @@ private:
                    std::clamp(value, 0.f, 1.f);
     }
 
-    float sample_settings_zone_tool_visibility(size_t tool, float u, float v, bool back) const
+    float sample_settings_zone_tool_visibility(size_t                     tool,
+                                               float                      u,
+                                               float                      v,
+                                               bool                       back,
+                                               const std::vector<size_t> *solver_tools = nullptr) const
     {
         const unsigned int physical_id = unsigned(tool + 1);
         const auto component_it = std::find(component_ids.begin(), component_ids.end(), physical_id);
         if (component_it == component_ids.end())
-            return sample_image_tool_visibility(tool, u, v, back);
+            return sample_image_tool_visibility(tool, u, v, back, solver_tools);
         const size_t component_idx = size_t(component_it - component_ids.begin());
 
         std::array<float, 3> rgb = sample_image_rgb(u, v, back);
@@ -524,7 +635,7 @@ private:
                 weights = generic_component_weights(rgb[0], rgb[1], rgb[2]);
         }
         if (weights.size() != component_ids.size() || component_idx >= weights.size())
-            return sample_image_tool_visibility(tool, u, v, back);
+            return sample_image_tool_visibility(tool, u, v, back, solver_tools);
 
         apply_contrast(weights, std::clamp(contrast_pct, 25.f, 300.f) / 100.f, mapped_count);
         return std::clamp(weights[component_idx], 0.f, 1.f);
@@ -642,8 +753,8 @@ private:
             }
         }
         if (generic_fallback_for_missing_channels && best_distance > 0.35f)
-            return generic_visibility(tool, r, g, b);
-        return best < weights.size() ? std::clamp(weights[best], 0.f, 1.f) : generic_visibility(tool, r, g, b);
+            return generic_solver_tool_visibility(tool, r, g, b);
+        return best < weights.size() ? std::clamp(weights[best], 0.f, 1.f) : generic_solver_tool_visibility(tool, r, g, b);
     }
 };
 

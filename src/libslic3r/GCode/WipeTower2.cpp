@@ -1457,7 +1457,7 @@ static void prime_tower_textured_path(WipeTowerWriter2& writer,
             const float visibility = texture.sample_tool_visibility(current_tool, u, v, normalization_tools, total_length, texture_height);
             const float target_width = base_width - (1.f - visibility) * width_range;
             const float flow_scale = prime_tower_flow_scale_for_width(base_width, target_width, layer_height);
-            const float centerline_shift = 0.5f * (base_width - reference_width) + 0.5f * (base_width - target_width);
+            const float centerline_shift = 0.5f * (reference_width - target_width);
             const Vec2f p0 = a + delta * t0 - outward * centerline_shift;
             const Vec2f p1 = a + delta * t1 - outward * centerline_shift;
             if (!have_shifted_pos || (p0 - shifted_pos).norm() > 0.001f) {
