@@ -73,6 +73,10 @@ struct TexturePreviewSimulationSettings
     bool compact_offset_mode = false;
     bool use_legacy_fixed_color_mode = false;
     bool use_fixed_color_generic_solver = false;
+    bool dithering_enabled = false;
+    int dithering_method = TextureMappingZone::DefaultDitheringMethod;
+    float dithering_resolution_mm = TextureMappingZone::DefaultDitheringResolutionMm;
+    float halftone_dot_size_mm = TextureMappingZone::DefaultHalftoneDotSizeMm;
     float contrast_pct = 100.f;
     float tone_gamma = 1.f;
     int generic_solver_lookup_mode = int(TextureMappingZone::GenericSolverClosestMix);
@@ -1435,6 +1439,199 @@ void apply_texture_contrast_to_mapped_components(std::vector<float> &component_w
     }
 }
 
+std::array<float, 3> apply_texture_contrast_to_rgb(const std::array<float, 3> &rgb, float contrast_factor)
+{
+    const float clamped_contrast = std::clamp(contrast_factor, 0.25f, 3.f);
+    if (std::abs(clamped_contrast - 1.f) <= 1e-5f)
+        return { clamp01(rgb[0]), clamp01(rgb[1]), clamp01(rgb[2]) };
+
+    const float mean = (clamp01(rgb[0]) + clamp01(rgb[1]) + clamp01(rgb[2])) / 3.f;
+    return {
+        clamp01(mean + (clamp01(rgb[0]) - mean) * clamped_contrast),
+        clamp01(mean + (clamp01(rgb[1]) - mean) * clamped_contrast),
+        clamp01(mean + (clamp01(rgb[2]) - mean) * clamped_contrast)
+    };
+}
+
+struct TexturePreviewBinaryDitherCandidate
+{
+    uint32_t mask { 0 };
+    std::array<float, 3> rgb { { 1.f, 1.f, 1.f } };
+    std::array<float, 3> oklab { { 1.f, 0.f, 0.f } };
+};
+
+std::vector<float> binary_component_visibility_weights_for_texture_preview(const TexturePreviewSimulationSettings &settings,
+                                                                           uint32_t                                mask)
+{
+    const size_t component_count = settings.component_colors.size();
+    std::vector<float> weights(component_count, 0.f);
+    for (size_t component_idx = 0; component_idx < component_count; ++component_idx) {
+        const float strength = component_idx < settings.component_strength_factors.size() ?
+            std::clamp(settings.component_strength_factors[component_idx], 0.f, 1.f) :
+            1.f;
+        const float minimum = component_idx < settings.component_minimum_offset_factors.size() ?
+            std::clamp(settings.component_minimum_offset_factors[component_idx], 0.f, 1.f) :
+            0.f;
+        const bool active = (mask & (uint32_t(1) << component_idx)) != 0;
+        weights[component_idx] = std::clamp(minimum + (active ? strength * (1.f - minimum) : 0.f), 0.f, 1.f);
+    }
+    return weights;
+}
+
+std::vector<TexturePreviewBinaryDitherCandidate> binary_dither_candidates_for_texture_preview(
+    const TexturePreviewSimulationSettings &settings)
+{
+    std::vector<TexturePreviewBinaryDitherCandidate> candidates;
+    const size_t component_count = settings.component_colors.size();
+    if (component_count == 0 || component_count > 16)
+        return candidates;
+
+    const uint32_t mask_end = uint32_t(1) << component_count;
+    candidates.reserve(size_t(mask_end - 1));
+    for (uint32_t mask = 1; mask < mask_end; ++mask) {
+        TexturePreviewBinaryDitherCandidate candidate;
+        candidate.mask = mask;
+        std::vector<float> weights = binary_component_visibility_weights_for_texture_preview(settings, mask);
+        float total_weight = 0.f;
+        for (const float weight : weights)
+            total_weight += weight;
+        if (total_weight <= k_epsilon) {
+            for (size_t component_idx = 0; component_idx < component_count; ++component_idx)
+                if ((mask & (uint32_t(1) << component_idx)) != 0)
+                    weights[component_idx] = 1.f;
+        }
+        candidate.rgb = mix_color_solver_components(settings.component_colors,
+                                                    weights,
+                                                    color_solver_mix_model_from_index(settings.generic_solver_mix_model));
+        candidate.oklab = oklab_from_srgb(candidate.rgb);
+        candidates.emplace_back(candidate);
+    }
+    return candidates;
+}
+
+std::array<float, 3> texture_preview_target_oklab(const TexturePreviewSimulationSettings &settings,
+                                                  const std::array<float, 4>            &sample_rgba)
+{
+    std::array<float, 3> target = {
+        clamp01(sample_rgba[0]),
+        clamp01(sample_rgba[1]),
+        clamp01(sample_rgba[2])
+    };
+    if (std::abs(settings.tone_gamma - 1.f) > 1e-5f) {
+        target[0] = apply_texture_tone_gamma(target[0], settings.tone_gamma);
+        target[1] = apply_texture_tone_gamma(target[1], settings.tone_gamma);
+        target[2] = apply_texture_tone_gamma(target[2], settings.tone_gamma);
+    }
+    target = apply_texture_contrast_to_rgb(target, std::clamp(settings.contrast_pct, 25.f, 300.f) / 100.f);
+    return oklab_from_srgb(target);
+}
+
+struct TexturePreviewBinaryDitherNearestResult {
+    size_t best_idx { size_t(-1) };
+    size_t second_idx { size_t(-1) };
+    float best_error { std::numeric_limits<float>::max() };
+    float second_error { std::numeric_limits<float>::max() };
+};
+
+TexturePreviewBinaryDitherNearestResult nearest_binary_dither_candidates_for_texture_preview(
+    const std::vector<TexturePreviewBinaryDitherCandidate> &candidates,
+    const std::array<float, 3>                             &target_oklab)
+{
+    TexturePreviewBinaryDitherNearestResult result;
+    const std::array<float, 3> axis_weights = generic_solver_v2_axis_weights(target_oklab);
+    for (size_t idx = 0; idx < candidates.size(); ++idx) {
+        const std::array<float, 3> &candidate = candidates[idx].oklab;
+        const float dl = candidate[0] - target_oklab[0];
+        const float da = candidate[1] - target_oklab[1];
+        const float db = candidate[2] - target_oklab[2];
+        const float error = axis_weights[0] * dl * dl + axis_weights[1] * da * da + axis_weights[2] * db * db;
+        if (error < result.best_error) {
+            result.second_error = result.best_error;
+            result.second_idx = result.best_idx;
+            result.best_error = error;
+            result.best_idx = idx;
+        } else if (error < result.second_error) {
+            result.second_error = error;
+            result.second_idx = idx;
+        }
+    }
+    return result;
+}
+
+size_t nearest_binary_dither_candidate_for_texture_preview(const std::vector<TexturePreviewBinaryDitherCandidate> &candidates,
+                                                           const std::array<float, 3>                             &target_oklab)
+{
+    return nearest_binary_dither_candidates_for_texture_preview(candidates, target_oklab).best_idx;
+}
+
+float binary_dither_alternate_fraction_for_texture_preview(const std::vector<TexturePreviewBinaryDitherCandidate> &candidates,
+                                                          const std::array<float, 3>                             &target_oklab,
+                                                          size_t                                                  base_idx,
+                                                          size_t                                                  alternate_idx)
+{
+    if (base_idx >= candidates.size() || alternate_idx >= candidates.size() || base_idx == alternate_idx)
+        return 0.f;
+
+    const std::array<float, 3> axis_weights = generic_solver_v2_axis_weights(target_oklab);
+    const std::array<float, 3> &base = candidates[base_idx].oklab;
+    const std::array<float, 3> &alternate = candidates[alternate_idx].oklab;
+    float numerator = 0.f;
+    float denominator = 0.f;
+    for (size_t axis = 0; axis < 3; ++axis) {
+        const float delta = alternate[axis] - base[axis];
+        numerator += axis_weights[axis] * (target_oklab[axis] - base[axis]) * delta;
+        denominator += axis_weights[axis] * delta * delta;
+    }
+    if (!std::isfinite(numerator) || !std::isfinite(denominator) || denominator <= 1e-12f)
+        return 0.f;
+    return std::clamp(numerator / denominator, 0.f, 1.f);
+}
+
+size_t thresholded_binary_dither_candidate_for_texture_preview(const std::vector<TexturePreviewBinaryDitherCandidate> &candidates,
+                                                               const std::array<float, 3>                             &target_oklab,
+                                                               float                                                   threshold)
+{
+    const TexturePreviewBinaryDitherNearestResult nearest =
+        nearest_binary_dither_candidates_for_texture_preview(candidates, target_oklab);
+    if (nearest.best_idx >= candidates.size())
+        return size_t(-1);
+    if (nearest.second_idx >= candidates.size())
+        return nearest.best_idx;
+
+    const float alternate_fraction =
+        binary_dither_alternate_fraction_for_texture_preview(candidates, target_oklab, nearest.best_idx, nearest.second_idx);
+    return std::clamp(threshold, 0.f, 1.f) < alternate_fraction ? nearest.second_idx : nearest.best_idx;
+}
+
+float ordered_bayer_threshold_for_texture_preview(int x, int y)
+{
+    static constexpr int matrix[8][8] = {
+        { 0, 48, 12, 60, 3, 51, 15, 63 },
+        { 32, 16, 44, 28, 35, 19, 47, 31 },
+        { 8, 56, 4, 52, 11, 59, 7, 55 },
+        { 40, 24, 36, 20, 43, 27, 39, 23 },
+        { 2, 50, 14, 62, 1, 49, 13, 61 },
+        { 34, 18, 46, 30, 33, 17, 45, 29 },
+        { 10, 58, 6, 54, 9, 57, 5, 53 },
+        { 42, 26, 38, 22, 41, 25, 37, 21 }
+    };
+    const int bx = ((x % 8) + 8) % 8;
+    const int by = ((y % 8) + 8) % 8;
+    return (float(matrix[by][bx]) + 0.5f) / 64.f - 0.5f;
+}
+
+float halftone_threshold_for_texture_preview(int x, int y, float dot_size_mm)
+{
+    const float period_px =
+        std::clamp(std::clamp(dot_size_mm, 0.08f, 2.f) / TextureMappingZone::DefaultDitheringResolutionMm, 2.f, 64.f);
+    const float u = float(x) / period_px - std::floor(float(x) / period_px);
+    const float v = float(y) / period_px - std::floor(float(y) / period_px);
+    const float dx = u - 0.5f;
+    const float dy = v - 0.5f;
+    const float radius_area = (dx * dx + dy * dy) / 0.5f;
+    return std::clamp(radius_area, 0.f, 1.f) - 0.5f;
+}
+
 std::vector<float> optimized_primary_component_weights_for_target(const std::array<float, 3>              &target_rgb,
                                                                   size_t                                   component_count,
                                                                   int                                      filament_color_mode,
@@ -1587,6 +1784,14 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
     const size_t component_count = settings.component_colors.size();
     if (component_count == 0)
         return {};
+
+    if (settings.dithering_enabled && settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues)) {
+        const std::vector<TexturePreviewBinaryDitherCandidate> candidates = binary_dither_candidates_for_texture_preview(settings);
+        const std::array<float, 3> target_oklab = texture_preview_target_oklab(settings, sample_rgba);
+        const size_t candidate_idx = nearest_binary_dither_candidate_for_texture_preview(candidates, target_oklab);
+        if (candidate_idx < candidates.size())
+            return binary_component_visibility_weights_for_texture_preview(settings, candidates[candidate_idx].mask);
+    }
 
     std::array<float, 3> target = {
         clamp01(sample_rgba[0]),
@@ -1750,7 +1955,15 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
                                               int(TextureMappingZone::FilamentColorRGBKW));
     settings.force_sequential_filaments = zone->force_sequential_filaments;
     settings.limit_texture_resolution = zone->preview_limit_resolution;
-    settings.compact_offset_mode = zone->compact_offset_mode;
+    settings.dithering_enabled =
+        zone->dithering_enabled &&
+        settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues);
+    settings.dithering_method = std::clamp(zone->dithering_method,
+                                           int(TextureMappingZone::DitheringClosest),
+                                           int(TextureMappingZone::DitheringHalftone));
+    settings.dithering_resolution_mm = std::clamp(zone->dithering_resolution_mm, 0.04f, 0.25f);
+    settings.halftone_dot_size_mm = std::clamp(zone->halftone_dot_size_mm, 0.08f, 2.f);
+    settings.compact_offset_mode = zone->compact_offset_mode || settings.dithering_enabled;
     settings.use_legacy_fixed_color_mode = zone->use_legacy_fixed_color_mode;
     settings.contrast_pct = std::clamp(zone->contrast_pct, 25.f, 300.f);
     settings.tone_gamma = (!std::isfinite(zone->tone_gamma) || zone->tone_gamma <= 0.f) ?
@@ -1825,6 +2038,12 @@ size_t texture_preview_simulation_signature(const ModelVolume &model_volume,
     mix(std::hash<int>{}(settings.limit_texture_resolution ? 1 : 0));
     mix(std::hash<int>{}(settings.compact_offset_mode ? 1 : 0));
     mix(std::hash<int>{}(settings.use_legacy_fixed_color_mode ? 1 : 0));
+    mix(std::hash<int>{}(settings.dithering_enabled ? 1 : 0));
+    mix(std::hash<int>{}(settings.dithering_method));
+    if (settings.dithering_method == int(TextureMappingZone::DitheringHalftone))
+        mix(std::hash<int>{}(int(std::lround(settings.halftone_dot_size_mm * 1000.f))));
+    else
+        mix(std::hash<int>{}(int(std::lround(settings.dithering_resolution_mm * 1000.f))));
     mix(std::hash<int>{}(settings.generic_solver_lookup_mode));
     mix(std::hash<int>{}(settings.generic_solver_mode));
     mix(std::hash<int>{}(settings.generic_solver_mix_model));
@@ -1876,9 +2095,18 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
     const bool use_raw_offsets =
         source_raw_component_channels.size() == settings.component_colors.size() &&
         source_raw_offsets.size() >= size_t(width) * size_t(height) * size_t(source_raw_channels);
+    const bool use_binary_dithering =
+        settings.dithering_enabled &&
+        settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
+        !use_raw_offsets;
+    const std::vector<TexturePreviewBinaryDitherCandidate> binary_dither_candidates =
+        use_binary_dithering ? binary_dither_candidates_for_texture_preview(settings) :
+                               std::vector<TexturePreviewBinaryDitherCandidate>{};
 
     std::unordered_map<unsigned int, std::array<unsigned char, 4>> simulated_color_cache;
     simulated_color_cache.reserve(std::min(size_t(result.width) * size_t(result.height), size_t(65536)));
+    std::vector<std::array<float, 3>> floyd_error_current(result.width, { { 0.f, 0.f, 0.f } });
+    std::vector<std::array<float, 3>> floyd_error_next(result.width, { { 0.f, 0.f, 0.f } });
 
     for (unsigned int y = 0; y < result.height; ++y) {
         for (unsigned int x = 0; x < result.width; ++x) {
@@ -1900,8 +2128,8 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                 texture_preview_rgb_cache_key(source_rgb);
             const size_t idx = (size_t(y) * size_t(result.width) + size_t(x)) * 4;
 
-            auto cached_color = !use_raw_offsets ? simulated_color_cache.find(cache_key) : simulated_color_cache.end();
-            if (!use_raw_offsets && cached_color != simulated_color_cache.end()) {
+            auto cached_color = !use_raw_offsets && !use_binary_dithering ? simulated_color_cache.find(cache_key) : simulated_color_cache.end();
+            if (!use_raw_offsets && !use_binary_dithering && cached_color != simulated_color_cache.end()) {
                 result.rgba[idx + 0] = cached_color->second[0];
                 result.rgba[idx + 1] = cached_color->second[1];
                 result.rgba[idx + 2] = cached_color->second[2];
@@ -1930,7 +2158,57 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                 if (component_weights.size() == settings.component_colors.size())
                     component_weights = raw_offset_print_width_weights_for_texture_preview(settings, component_weights);
             } else {
-                component_weights = component_weights_for_texture_preview(settings, sample_rgba);
+                if (use_binary_dithering && !binary_dither_candidates.empty()) {
+                    std::array<float, 3> target_oklab = texture_preview_target_oklab(settings, sample_rgba);
+                    const int clamped_method = std::clamp(settings.dithering_method,
+                                                          int(TextureMappingZone::DitheringClosest),
+                                                          int(TextureMappingZone::DitheringHalftone));
+                    if (clamped_method == int(TextureMappingZone::DitheringFloydSteinberg)) {
+                        for (size_t axis = 0; axis < 3; ++axis)
+                            target_oklab[axis] += floyd_error_current[x][axis];
+                    }
+
+                    bool thresholded_dither = false;
+                    float threshold = 0.f;
+                    if (clamped_method == int(TextureMappingZone::DitheringOrderedBayer)) {
+                        thresholded_dither = true;
+                        threshold = ordered_bayer_threshold_for_texture_preview(int(x), int(y)) + 0.5f;
+                    } else if (clamped_method == int(TextureMappingZone::DitheringHalftone)) {
+                        thresholded_dither = true;
+                        threshold = halftone_threshold_for_texture_preview(int(x), int(y), settings.halftone_dot_size_mm) + 0.5f;
+                    }
+
+                    const size_t candidate_idx =
+                        thresholded_dither ?
+                            thresholded_binary_dither_candidate_for_texture_preview(binary_dither_candidates, target_oklab, threshold) :
+                            nearest_binary_dither_candidate_for_texture_preview(binary_dither_candidates, target_oklab);
+                    if (candidate_idx < binary_dither_candidates.size()) {
+                        const TexturePreviewBinaryDitherCandidate &candidate = binary_dither_candidates[candidate_idx];
+                        component_weights = binary_component_visibility_weights_for_texture_preview(settings, candidate.mask);
+                        if (clamped_method == int(TextureMappingZone::DitheringFloydSteinberg)) {
+                            const std::array<float, 3> error = {
+                                target_oklab[0] - candidate.oklab[0],
+                                target_oklab[1] - candidate.oklab[1],
+                                target_oklab[2] - candidate.oklab[2]
+                            };
+                            auto add_error = [&error](std::array<float, 3> &dst, float factor) {
+                                for (size_t axis = 0; axis < 3; ++axis)
+                                    dst[axis] += error[axis] * factor;
+                            };
+                            if (x + 1 < result.width)
+                                add_error(floyd_error_current[x + 1], 7.f / 16.f);
+                            if (y + 1 < result.height) {
+                                if (x > 0)
+                                    add_error(floyd_error_next[x - 1], 3.f / 16.f);
+                                add_error(floyd_error_next[x], 5.f / 16.f);
+                                if (x + 1 < result.width)
+                                    add_error(floyd_error_next[x + 1], 1.f / 16.f);
+                            }
+                        }
+                    }
+                } else {
+                    component_weights = component_weights_for_texture_preview(settings, sample_rgba);
+                }
             }
             float activity = 0.f;
             for (const float weight : component_weights)
@@ -1955,12 +2233,19 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                 to_u8(simulated_rgb[2]),
                 255
             };
-            if (!use_raw_offsets)
+            if (!use_raw_offsets && !use_binary_dithering)
                 simulated_color_cache.emplace(cache_key, out_rgba);
             result.rgba[idx + 0] = out_rgba[0];
             result.rgba[idx + 1] = out_rgba[1];
             result.rgba[idx + 2] = out_rgba[2];
             result.rgba[idx + 3] = out_rgba[3];
+        }
+        if (use_binary_dithering &&
+            std::clamp(settings.dithering_method,
+                       int(TextureMappingZone::DitheringClosest),
+                       int(TextureMappingZone::DitheringHalftone)) == int(TextureMappingZone::DitheringFloydSteinberg)) {
+            floyd_error_current.swap(floyd_error_next);
+            std::fill(floyd_error_next.begin(), floyd_error_next.end(), std::array<float, 3>{ { 0.f, 0.f, 0.f } });
         }
     }
 
@@ -3911,6 +4196,12 @@ size_t texture_preview_settings_signature(size_t num_physical, const TextureMapp
         signature_mix(std::hash<int>{}(zone.nonlinear_offset_adjustment ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.compact_offset_mode ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.use_legacy_fixed_color_mode ? 1 : 0));
+        signature_mix(std::hash<int>{}(zone.dithering_enabled ? 1 : 0));
+        signature_mix(std::hash<int>{}(zone.dithering_method));
+        if (zone.dithering_method == int(TextureMappingZone::DitheringHalftone))
+            signature_mix_float(zone.halftone_dot_size_mm, 1000.f);
+        else
+            signature_mix_float(zone.dithering_resolution_mm, 1000.f);
         signature_mix(std::hash<int>{}(zone.minimum_visibility_offset_enabled ? 1 : 0));
         signature_mix_float(zone.minimum_visibility_offset_pct, 100.f);
         signature_mix(std::hash<int>{}(zone.generic_solver_lookup_mode));

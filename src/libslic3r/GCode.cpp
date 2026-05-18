@@ -6054,6 +6054,26 @@ static float overhang_filament_minimum_offset_factor_for_gcode(const TextureMapp
     return std::clamp(minimum_offset_pct / 100.f, 0.f, 1.f);
 }
 
+static std::vector<float> overhang_component_strength_factors_for_gcode(const TextureMappingZone &zone,
+                                                                        const std::vector<unsigned int> &component_ids)
+{
+    std::vector<float> factors;
+    factors.reserve(component_ids.size());
+    for (const unsigned int id : component_ids)
+        factors.emplace_back(overhang_filament_strength_factor_for_gcode(zone, id));
+    return factors;
+}
+
+static std::vector<float> overhang_component_minimum_offset_factors_for_gcode(const TextureMappingZone &zone,
+                                                                              const std::vector<unsigned int> &component_ids)
+{
+    std::vector<float> factors;
+    factors.reserve(component_ids.size());
+    for (const unsigned int id : component_ids)
+        factors.emplace_back(overhang_filament_minimum_offset_factor_for_gcode(zone, id));
+    return factors;
+}
+
 struct TransmissionDistanceCalibrationContextForGCode {
     bool               enabled { false };
     int                mode { int(TextureMappingZone::TDCalibrationNone) };
@@ -6878,6 +6898,190 @@ static void apply_texture_contrast_to_mapped_components_for_gcode(std::vector<fl
         const float safe_weight = clamp01f_for_gcode(component_weights[idx]);
         component_weights[idx] = clamp01f_for_gcode(mean_weight + (safe_weight - mean_weight) * contrast_factor);
     }
+}
+
+static std::array<float, 3> apply_texture_contrast_to_rgb_for_gcode(const std::array<float, 3> &rgb, float contrast_factor)
+{
+    const float clamped_contrast = std::clamp(contrast_factor, 0.25f, 3.f);
+    if (std::abs(clamped_contrast - 1.f) <= 1e-5f)
+        return {clamp01f_for_gcode(rgb[0]), clamp01f_for_gcode(rgb[1]), clamp01f_for_gcode(rgb[2])};
+
+    const float mean = (clamp01f_for_gcode(rgb[0]) + clamp01f_for_gcode(rgb[1]) + clamp01f_for_gcode(rgb[2])) / 3.f;
+    return {
+        clamp01f_for_gcode(mean + (clamp01f_for_gcode(rgb[0]) - mean) * clamped_contrast),
+        clamp01f_for_gcode(mean + (clamp01f_for_gcode(rgb[1]) - mean) * clamped_contrast),
+        clamp01f_for_gcode(mean + (clamp01f_for_gcode(rgb[2]) - mean) * clamped_contrast)
+    };
+}
+
+struct GCodeBinaryDitherCandidate {
+    uint32_t             mask { 0 };
+    std::array<float, 3> rgb { { 1.f, 1.f, 1.f } };
+    std::array<float, 3> oklab { { 1.f, 0.f, 0.f } };
+};
+
+static std::vector<GCodeBinaryDitherCandidate> binary_dither_candidates_for_gcode(
+    const std::vector<std::array<float, 3>> &component_colors,
+    const std::vector<float>                &component_strength_factors,
+    const std::vector<float>                &component_minimum_offset_factors,
+    int                                      generic_solver_mix_model)
+{
+    std::vector<GCodeBinaryDitherCandidate> candidates;
+    const size_t component_count = component_colors.size();
+    if (component_count == 0 || component_count > 16)
+        return candidates;
+
+    const uint32_t mask_end = uint32_t(1) << component_count;
+    candidates.reserve(size_t(mask_end - 1));
+    for (uint32_t mask = 1; mask < mask_end; ++mask) {
+        std::vector<float> mix_weights(component_count, 0.f);
+        float total_weight = 0.f;
+        for (size_t component_idx = 0; component_idx < component_count; ++component_idx) {
+            const float strength = component_idx < component_strength_factors.size() ?
+                std::clamp(component_strength_factors[component_idx], 0.f, 1.f) :
+                1.f;
+            const float minimum = component_idx < component_minimum_offset_factors.size() ?
+                std::clamp(component_minimum_offset_factors[component_idx], 0.f, 1.f) :
+                0.f;
+            const bool active = (mask & (uint32_t(1) << component_idx)) != 0;
+            mix_weights[component_idx] = std::clamp(minimum + (active ? strength * (1.f - minimum) : 0.f), 0.f, 1.f);
+            total_weight += mix_weights[component_idx];
+        }
+        if (total_weight <= EPSILON) {
+            for (size_t component_idx = 0; component_idx < component_count; ++component_idx)
+                if ((mask & (uint32_t(1) << component_idx)) != 0)
+                    mix_weights[component_idx] = 1.f;
+        }
+
+        GCodeBinaryDitherCandidate candidate;
+        candidate.mask = mask;
+        candidate.rgb = mix_color_solver_components(component_colors,
+                                                    mix_weights,
+                                                    color_solver_mix_model_from_index(generic_solver_mix_model));
+        candidate.oklab = oklab_from_srgb_for_gcode(candidate.rgb);
+        candidates.emplace_back(candidate);
+    }
+    return candidates;
+}
+
+struct GCodeBinaryDitherNearestResult {
+    size_t best_idx { size_t(-1) };
+    size_t second_idx { size_t(-1) };
+    float  best_error { std::numeric_limits<float>::max() };
+    float  second_error { std::numeric_limits<float>::max() };
+};
+
+static GCodeBinaryDitherNearestResult nearest_binary_dither_candidates_for_gcode(
+    const std::vector<GCodeBinaryDitherCandidate> &candidates,
+    const std::array<float, 3>                    &target_oklab)
+{
+    GCodeBinaryDitherNearestResult result;
+    const std::array<float, 3> axis_weights = generic_solver_v2_axis_weights_for_gcode(target_oklab);
+    for (size_t idx = 0; idx < candidates.size(); ++idx) {
+        const std::array<float, 3> &candidate = candidates[idx].oklab;
+        const float dl = candidate[0] - target_oklab[0];
+        const float da = candidate[1] - target_oklab[1];
+        const float db = candidate[2] - target_oklab[2];
+        const float error = axis_weights[0] * dl * dl + axis_weights[1] * da * da + axis_weights[2] * db * db;
+        if (error < result.best_error) {
+            result.second_error = result.best_error;
+            result.second_idx = result.best_idx;
+            result.best_error = error;
+            result.best_idx = idx;
+        } else if (error < result.second_error) {
+            result.second_error = error;
+            result.second_idx = idx;
+        }
+    }
+    return result;
+}
+
+static size_t nearest_binary_dither_candidate_for_gcode(const std::vector<GCodeBinaryDitherCandidate> &candidates,
+                                                        const std::array<float, 3>                    &target_oklab)
+{
+    return nearest_binary_dither_candidates_for_gcode(candidates, target_oklab).best_idx;
+}
+
+static float binary_dither_alternate_fraction_for_gcode(const std::vector<GCodeBinaryDitherCandidate> &candidates,
+                                                        const std::array<float, 3>                    &target_oklab,
+                                                        size_t                                         base_idx,
+                                                        size_t                                         alternate_idx)
+{
+    if (base_idx >= candidates.size() || alternate_idx >= candidates.size() || base_idx == alternate_idx)
+        return 0.f;
+
+    const std::array<float, 3> axis_weights = generic_solver_v2_axis_weights_for_gcode(target_oklab);
+    const std::array<float, 3> &base = candidates[base_idx].oklab;
+    const std::array<float, 3> &alternate = candidates[alternate_idx].oklab;
+    float numerator = 0.f;
+    float denominator = 0.f;
+    for (size_t axis = 0; axis < 3; ++axis) {
+        const float delta = alternate[axis] - base[axis];
+        numerator += axis_weights[axis] * (target_oklab[axis] - base[axis]) * delta;
+        denominator += axis_weights[axis] * delta * delta;
+    }
+    if (!std::isfinite(numerator) || !std::isfinite(denominator) || denominator <= 1e-12f)
+        return 0.f;
+    return std::clamp(numerator / denominator, 0.f, 1.f);
+}
+
+static size_t thresholded_binary_dither_candidate_for_gcode(const std::vector<GCodeBinaryDitherCandidate> &candidates,
+                                                            const std::array<float, 3>                    &target_oklab,
+                                                            float                                          threshold)
+{
+    const GCodeBinaryDitherNearestResult nearest = nearest_binary_dither_candidates_for_gcode(candidates, target_oklab);
+    if (nearest.best_idx >= candidates.size())
+        return size_t(-1);
+    if (nearest.second_idx >= candidates.size())
+        return nearest.best_idx;
+
+    const float alternate_fraction =
+        binary_dither_alternate_fraction_for_gcode(candidates, target_oklab, nearest.best_idx, nearest.second_idx);
+    return std::clamp(threshold, 0.f, 1.f) < alternate_fraction ? nearest.second_idx : nearest.best_idx;
+}
+
+static float ordered_bayer_threshold_for_gcode(int x, int y)
+{
+    static constexpr int matrix[8][8] = {
+        { 0, 48, 12, 60, 3, 51, 15, 63 },
+        { 32, 16, 44, 28, 35, 19, 47, 31 },
+        { 8, 56, 4, 52, 11, 59, 7, 55 },
+        { 40, 24, 36, 20, 43, 27, 39, 23 },
+        { 2, 50, 14, 62, 1, 49, 13, 61 },
+        { 34, 18, 46, 30, 33, 17, 45, 29 },
+        { 10, 58, 6, 54, 9, 57, 5, 53 },
+        { 42, 26, 38, 22, 41, 25, 37, 21 }
+    };
+    const int bx = ((x % 8) + 8) % 8;
+    const int by = ((y % 8) + 8) % 8;
+    return (float(matrix[by][bx]) + 0.5f) / 64.f - 0.5f;
+}
+
+static float halftone_threshold_for_gcode(float x_mm, float y_mm, float dot_size_mm)
+{
+    const float period = std::clamp(dot_size_mm, 0.08f, 2.f);
+    const float u = x_mm / period - std::floor(x_mm / period);
+    const float v = y_mm / period - std::floor(y_mm / period);
+    const float dx = u - 0.5f;
+    const float dy = v - 0.5f;
+    const float radius_area = (dx * dx + dy * dy) / 0.5f;
+    return std::clamp(radius_area, 0.f, 1.f) - 0.5f;
+}
+
+static float dither_pitch_for_gcode(float base_outer_width_mm,
+                                    int   dithering_method,
+                                    float dithering_resolution_mm,
+                                    float halftone_dot_size_mm)
+{
+    const float high_res_step_mm = std::clamp(base_outer_width_mm * 0.20f, 0.04f, 0.12f);
+    const int clamped_method = std::clamp(dithering_method,
+                                          int(TextureMappingZone::DitheringClosest),
+                                          int(TextureMappingZone::DitheringHalftone));
+    if (clamped_method == int(TextureMappingZone::DitheringHalftone)) {
+        const float dot_sample_step_mm = std::clamp(std::clamp(halftone_dot_size_mm, 0.08f, 2.f) * 0.25f, 0.04f, 0.08f);
+        return std::min(high_res_step_mm, dot_sample_step_mm);
+    }
+    return std::min(high_res_step_mm, std::clamp(dithering_resolution_mm, 0.04f, 0.25f));
 }
 
 static float wrap_repeat01_for_gcode(float uv)
@@ -8003,6 +8207,12 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                                                                                 int                                       generic_solver_mode,
                                                                                 int                                       generic_solver_mix_model,
                                                                                 bool                                      use_legacy_fixed_color_mode,
+                                                                                bool                                      dithering_enabled,
+                                                                                int                                       dithering_method,
+                                                                                float                                     dither_pitch_mm,
+                                                                                float                                     halftone_dot_size_mm,
+                                                                                const std::vector<float>                 &component_strength_factors,
+                                                                                const std::vector<float>                 &component_minimum_offset_factors,
                                                                                 std::map<std::string, GCodeGenericMixCandidateSet> *generic_mix_candidate_cache,
                                                                                 std::map<const PrintObject*, GCodeUVTextureTriangleCache> *uv_texture_triangle_cache,
                                                                                 float                                     texture_contrast_pct,
@@ -8039,6 +8249,10 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
     const float contrast_factor = std::clamp(texture_contrast_pct, 25.f, 300.f) / 100.f;
     const float tone_gamma =
         (!std::isfinite(texture_tone_gamma) || texture_tone_gamma <= 0.f) ? 1.f : std::clamp(texture_tone_gamma, 0.5f, 3.f);
+    const float physical_sample_pitch_mm =
+        dithering_enabled && !raw_values_mode && std::isfinite(dither_pitch_mm) && dither_pitch_mm > EPSILON ?
+            dither_pitch_mm :
+            (high_resolution_texture_sampling ? 0.08f : 0.16f);
 
     struct TextureSampleData {
         std::array<float, 4> rgba { { 0.f, 0.f, 0.f, 1.f } };
@@ -8170,7 +8384,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
         if (!std::isfinite(segment_length_mm) || segment_length_mm <= EPSILON)
             return false;
 
-        const float sample_pitch_mm = high_resolution_texture_sampling ? 0.08f : 0.16f;
+        const float sample_pitch_mm = physical_sample_pitch_mm;
         const int sample_count = std::clamp(int(std::ceil(segment_length_mm / std::max(float(EPSILON), sample_pitch_mm))), 1, 2000);
         const float sample_weight = std::max(0.05f, float(segment_length_mm) / float(sample_count));
         for (int sample_idx = 0; sample_idx < sample_count; ++sample_idx) {
@@ -8216,8 +8430,9 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
         if (!std::isfinite(tri_area_mm2))
             return;
 
-        const float world_sample_pitch_mm = high_resolution_texture_sampling ? 0.08f : 0.16f;
-        const int max_bary_steps = high_resolution_texture_sampling ? 80 : 40;
+        const float world_sample_pitch_mm = physical_sample_pitch_mm;
+        const int max_bary_steps =
+            dithering_enabled && !raw_values_mode ? 160 : (high_resolution_texture_sampling ? 80 : 40);
         const int bary_steps = std::clamp(int(std::ceil(max_world_edge_mm / world_sample_pitch_mm)), 1, max_bary_steps);
         const int sample_count = bary_steps * (bary_steps + 1) / 2;
         if (sample_count <= 0)
@@ -8376,8 +8591,9 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                     return false;
 
                 const float uv_texels_per_step = high_resolution_texture_sampling ? 8.f : 18.f;
-                const float world_sample_pitch_mm = high_resolution_texture_sampling ? 0.08f : 0.16f;
-                const int max_bary_steps = high_resolution_texture_sampling ? 80 : 40;
+                const float world_sample_pitch_mm = physical_sample_pitch_mm;
+                const int max_bary_steps =
+                    dithering_enabled && !raw_values_mode ? 160 : (high_resolution_texture_sampling ? 80 : 40);
                 const int uv_steps = std::clamp(int(std::ceil(tri.max_uv_edge_texel / uv_texels_per_step)), 1, max_bary_steps);
                 const int world_steps = std::clamp(int(std::ceil(tri.max_world_edge_mm / world_sample_pitch_mm)), 1, max_bary_steps);
                 const int bary_steps = std::max(uv_steps, world_steps);
@@ -8518,6 +8734,158 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
     if (samples.empty())
         return VertexColorOverhangWeightField{};
 
+    std::vector<uint32_t> binary_dither_masks;
+    const bool can_binary_dither =
+        dithering_enabled &&
+        !raw_values_mode &&
+        component_count > 0 &&
+        std::isfinite(dither_pitch_mm) &&
+        dither_pitch_mm > EPSILON;
+    if (can_binary_dither) {
+        bool has_raw_samples = false;
+        for (const WeightedTextureSample &sample : samples) {
+            if (sample.raw_component_weights_from_texture || sample.raw_component_weights.size() == component_count) {
+                has_raw_samples = true;
+                break;
+            }
+        }
+
+        const std::vector<GCodeBinaryDitherCandidate> binary_candidates =
+            has_raw_samples ?
+                std::vector<GCodeBinaryDitherCandidate>{} :
+                binary_dither_candidates_for_gcode(component_colors,
+                                                   component_strength_factors,
+                                                   component_minimum_offset_factors,
+                                                   generic_solver_mix_model);
+        if (!binary_candidates.empty()) {
+            struct BinaryDitherCell {
+                int                  x { 0 };
+                int                  y { 0 };
+                float                weight { 0.f };
+                std::array<float, 3> target_oklab { { 0.f, 0.f, 0.f } };
+                std::vector<size_t>  sample_indices;
+            };
+
+            auto sample_target_oklab = [tone_gamma, contrast_factor](const WeightedTextureSample &sample) {
+                std::array<float, 3> target = {
+                    clamp01f_for_gcode(sample.rgba[0]),
+                    clamp01f_for_gcode(sample.rgba[1]),
+                    clamp01f_for_gcode(sample.rgba[2])
+                };
+                if (std::abs(tone_gamma - 1.f) > 1e-5f) {
+                    target[0] = apply_texture_tone_gamma_for_gcode(target[0], tone_gamma);
+                    target[1] = apply_texture_tone_gamma_for_gcode(target[1], tone_gamma);
+                    target[2] = apply_texture_tone_gamma_for_gcode(target[2], tone_gamma);
+                }
+                target = apply_texture_contrast_to_rgb_for_gcode(target, contrast_factor);
+                return oklab_from_srgb_for_gcode(target);
+            };
+
+            std::vector<BinaryDitherCell> cells;
+            std::map<std::pair<int, int>, size_t> cell_index_by_coord;
+            for (size_t sample_idx = 0; sample_idx < samples.size(); ++sample_idx) {
+                const WeightedTextureSample &sample = samples[sample_idx];
+                if (sample.weight <= EPSILON)
+                    continue;
+
+                const int cell_x = int(std::floor((sample.x_mm - min_x_mm) / dither_pitch_mm));
+                const int cell_y = int(std::floor((sample.y_mm - min_y_mm) / dither_pitch_mm));
+                const std::pair<int, int> key(cell_x, cell_y);
+                auto cell_it = cell_index_by_coord.find(key);
+                if (cell_it == cell_index_by_coord.end()) {
+                    cell_it = cell_index_by_coord.emplace(key, cells.size()).first;
+                    BinaryDitherCell cell;
+                    cell.x = cell_x;
+                    cell.y = cell_y;
+                    cells.emplace_back(std::move(cell));
+                }
+
+                BinaryDitherCell &cell = cells[cell_it->second];
+                const std::array<float, 3> target_oklab = sample_target_oklab(sample);
+                const float sample_weight = std::max(sample.weight, 0.f);
+                for (size_t axis = 0; axis < 3; ++axis)
+                    cell.target_oklab[axis] += target_oklab[axis] * sample_weight;
+                cell.weight += sample_weight;
+                cell.sample_indices.emplace_back(sample_idx);
+            }
+
+            if (!cells.empty()) {
+                for (BinaryDitherCell &cell : cells)
+                    if (cell.weight > EPSILON)
+                        for (float &value : cell.target_oklab)
+                            value /= cell.weight;
+
+                std::vector<size_t> order(cells.size(), 0);
+                std::iota(order.begin(), order.end(), size_t(0));
+                std::sort(order.begin(), order.end(), [&cells](size_t lhs, size_t rhs) {
+                    if (cells[lhs].y != cells[rhs].y)
+                        return cells[lhs].y < cells[rhs].y;
+                    return cells[lhs].x < cells[rhs].x;
+                });
+
+                binary_dither_masks.assign(samples.size(), 0);
+                const int clamped_dither_method =
+                    std::clamp(dithering_method,
+                               int(TextureMappingZone::DitheringClosest),
+                               int(TextureMappingZone::DitheringHalftone));
+                std::map<std::pair<int, int>, std::array<float, 3>> floyd_error;
+                for (const size_t cell_idx : order) {
+                    BinaryDitherCell &cell = cells[cell_idx];
+                    std::array<float, 3> target_oklab = cell.target_oklab;
+                    if (clamped_dither_method == int(TextureMappingZone::DitheringFloydSteinberg)) {
+                        const auto error_it = floyd_error.find({cell.x, cell.y});
+                        if (error_it != floyd_error.end())
+                            for (size_t axis = 0; axis < 3; ++axis)
+                                target_oklab[axis] += error_it->second[axis];
+                    }
+
+                    bool thresholded_dither = false;
+                    float threshold = 0.f;
+                    if (clamped_dither_method == int(TextureMappingZone::DitheringOrderedBayer)) {
+                        thresholded_dither = true;
+                        threshold = ordered_bayer_threshold_for_gcode(cell.x, cell.y) + 0.5f;
+                    } else if (clamped_dither_method == int(TextureMappingZone::DitheringHalftone)) {
+                        const float x_mm = min_x_mm + (float(cell.x) + 0.5f) * dither_pitch_mm;
+                        const float y_mm = min_y_mm + (float(cell.y) + 0.5f) * dither_pitch_mm;
+                        thresholded_dither = true;
+                        threshold = halftone_threshold_for_gcode(x_mm, y_mm, halftone_dot_size_mm) + 0.5f;
+                    }
+
+                    const size_t candidate_idx =
+                        thresholded_dither ?
+                            thresholded_binary_dither_candidate_for_gcode(binary_candidates, target_oklab, threshold) :
+                            nearest_binary_dither_candidate_for_gcode(binary_candidates, target_oklab);
+                    if (candidate_idx >= binary_candidates.size())
+                        continue;
+
+                    const GCodeBinaryDitherCandidate &candidate = binary_candidates[candidate_idx];
+                    for (const size_t sample_idx : cell.sample_indices)
+                        if (sample_idx < binary_dither_masks.size())
+                            binary_dither_masks[sample_idx] = candidate.mask;
+
+                    if (clamped_dither_method == int(TextureMappingZone::DitheringFloydSteinberg)) {
+                        std::array<float, 3> error = {
+                            target_oklab[0] - candidate.oklab[0],
+                            target_oklab[1] - candidate.oklab[1],
+                            target_oklab[2] - candidate.oklab[2]
+                        };
+                        auto add_error = [&floyd_error, &cell_index_by_coord, &error](int x, int y, float factor) {
+                            if (cell_index_by_coord.find({x, y}) == cell_index_by_coord.end())
+                                return;
+                            std::array<float, 3> &dst = floyd_error[{x, y}];
+                            for (size_t axis = 0; axis < 3; ++axis)
+                                dst[axis] += error[axis] * factor;
+                        };
+                        add_error(cell.x + 1, cell.y, 7.f / 16.f);
+                        add_error(cell.x - 1, cell.y + 1, 3.f / 16.f);
+                        add_error(cell.x, cell.y + 1, 5.f / 16.f);
+                        add_error(cell.x + 1, cell.y + 1, 1.f / 16.f);
+                    }
+                }
+            }
+        }
+    }
+
     const std::vector<std::array<float, 3>> fixed_color_solver_component_colors =
         fixed_color_generic_solver_component_colors_for_gcode(filament_color_mode);
     const bool use_fixed_color_generic_solver =
@@ -8560,6 +8928,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
     weight_field.sample_weight.resize(sample_count);
     weight_field.sample_component_weights.assign(sample_count * component_count, 0.f);
     weight_field.raw_component_weights_from_texture = false;
+    weight_field.binary_dithered = !binary_dither_masks.empty();
 
     std::vector<float> fallback_acc(component_count, 0.f);
     float fallback_weight = 0.f;
@@ -8577,7 +8946,12 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
         std::vector<float> desired(component_count, 0.f);
         size_t mapped_component_count = component_count;
         const bool has_raw_component_weights = sample.raw_component_weights.size() == component_count;
-        if (has_raw_component_weights) {
+        const bool has_binary_dither = sample_idx < binary_dither_masks.size() && binary_dither_masks[sample_idx] != 0;
+        if (has_binary_dither) {
+            const uint32_t mask = binary_dither_masks[sample_idx];
+            for (size_t component_idx = 0; component_idx < component_count; ++component_idx)
+                desired[component_idx] = (mask & (uint32_t(1) << component_idx)) != 0 ? 1.f : 0.f;
+        } else if (has_raw_component_weights) {
             float raw_activity = 0.f;
             for (size_t component_idx = 0; component_idx < component_count; ++component_idx)
                 desired[component_idx] = clamp01f_for_gcode(sample.raw_component_weights[component_idx]);
@@ -8626,7 +9000,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
             }
         }
 
-        if (!has_raw_component_weights && std::abs(contrast_factor - 1.f) > 1e-5f)
+        if (!has_binary_dither && !has_raw_component_weights && std::abs(contrast_factor - 1.f) > 1e-5f)
             apply_texture_contrast_to_mapped_components_for_gcode(desired, contrast_factor, mapped_component_count);
 
         for (size_t component_idx = 0; component_idx < component_count; ++component_idx) {
@@ -8694,6 +9068,68 @@ static std::vector<float> sample_vertex_color_weight_field_components_for_gcode(
     const float gy_unclamped = (y_mm - weight_field.min_y_mm) / std::max(weight_field.bucket_height_mm, 1e-6f);
     const int cx = std::clamp(int(std::floor(gx_unclamped)), 0, weight_field.bucket_width - 1);
     const int cy = std::clamp(int(std::floor(gy_unclamped)), 0, weight_field.bucket_height - 1);
+
+    if (weight_field.binary_dithered) {
+        float nearest_d2 = std::numeric_limits<float>::max();
+        size_t nearest_sample_idx = size_t(-1);
+        const int nearest_ring_limit = std::min(16, std::max(weight_field.bucket_width, weight_field.bucket_height));
+        for (int ring = 0; ring <= nearest_ring_limit; ++ring) {
+            const int min_x = std::max(0, cx - ring);
+            const int max_x = std::min(weight_field.bucket_width - 1, cx + ring);
+            const int min_y = std::max(0, cy - ring);
+            const int max_y = std::min(weight_field.bucket_height - 1, cy + ring);
+
+            auto visit_bucket = [&weight_field, x_mm, y_mm, &nearest_d2, &nearest_sample_idx](int bx, int by) {
+                if (bx < 0 || by < 0 || bx >= weight_field.bucket_width || by >= weight_field.bucket_height)
+                    return;
+                const size_t bucket_idx = size_t(by) * size_t(weight_field.bucket_width) + size_t(bx);
+                if (bucket_idx >= weight_field.buckets.size())
+                    return;
+                for (const uint32_t sample_idx_u32 : weight_field.buckets[bucket_idx]) {
+                    const size_t sample_idx = size_t(sample_idx_u32);
+                    if (sample_idx >= weight_field.sample_x_mm.size() || sample_idx >= weight_field.sample_y_mm.size())
+                        continue;
+                    const float dx = x_mm - weight_field.sample_x_mm[sample_idx];
+                    const float dy = y_mm - weight_field.sample_y_mm[sample_idx];
+                    const float d2 = dx * dx + dy * dy;
+                    if (d2 >= nearest_d2)
+                        continue;
+                    const size_t value_idx = sample_idx * weight_field.component_count;
+                    if (value_idx + weight_field.component_count > weight_field.sample_component_weights.size())
+                        continue;
+                    nearest_d2 = d2;
+                    nearest_sample_idx = sample_idx;
+                }
+            };
+
+            if (ring == 0) {
+                visit_bucket(cx, cy);
+            } else {
+                for (int x = min_x; x <= max_x; ++x) {
+                    visit_bucket(x, min_y);
+                    if (max_y != min_y)
+                        visit_bucket(x, max_y);
+                }
+                for (int y = min_y + 1; y <= max_y - 1; ++y) {
+                    visit_bucket(min_x, y);
+                    if (max_x != min_x)
+                        visit_bucket(max_x, y);
+                }
+            }
+
+            if (nearest_sample_idx != size_t(-1))
+                break;
+        }
+
+        if (nearest_sample_idx != size_t(-1)) {
+            std::vector<float> values(weight_field.component_count, 0.f);
+            const size_t value_idx = nearest_sample_idx * weight_field.component_count;
+            for (size_t component_idx = 0; component_idx < weight_field.component_count; ++component_idx)
+                values[component_idx] = clamp01f_for_gcode(weight_field.sample_component_weights[value_idx + component_idx]);
+            return values;
+        }
+        return fallback;
+    }
 
     const float sigma_scale = high_resolution_texture_sampling ? 0.45f : 0.7f;
     const float min_sigma_mm = high_resolution_texture_sampling ? 0.04f : 0.06f;
@@ -9171,7 +9607,21 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
                                                int(TextureMappingZone::GenericSolverLegacy),
                                                int(TextureMappingZone::GenericSolverV2));
     const int generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
-    const bool compact_offset_mode = zone->compact_offset_mode;
+    const bool dithering_enabled =
+        zone->dithering_enabled &&
+        zone->texture_mapping_mode != int(TextureMappingZone::TextureMappingRawValues);
+    const int dithering_method = std::clamp(zone->dithering_method,
+                                            int(TextureMappingZone::DitheringClosest),
+                                            int(TextureMappingZone::DitheringHalftone));
+    const float seam_texture_base_width_mm =
+        std::max(0.05f, float(m_config.texture_mapping_outer_wall_gradient_max_line_width.value));
+    const float dither_pitch_mm =
+        dither_pitch_for_gcode(seam_texture_base_width_mm,
+                               dithering_method,
+                               zone->dithering_resolution_mm,
+                               zone->halftone_dot_size_mm);
+    const float halftone_dot_size_mm = std::clamp(zone->halftone_dot_size_mm, 0.08f, 2.f);
+    const bool compact_offset_mode = zone->compact_offset_mode || dithering_enabled;
     const bool nonlinear_offset_adjustment = zone->nonlinear_offset_adjustment;
     const bool use_legacy_fixed_color_mode = zone->use_legacy_fixed_color_mode;
     const float texture_contrast_pct = std::clamp(zone->contrast_pct, 25.f, 300.f);
@@ -9179,8 +9629,11 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
         (!std::isfinite(zone->tone_gamma) || zone->tone_gamma <= 0.f) ?
             1.f :
             std::clamp(zone->tone_gamma, 0.5f, 3.f);
-    const bool high_resolution_texture_sampling = zone->high_resolution_sampling;
+    const bool high_resolution_texture_sampling = zone->high_resolution_sampling || dithering_enabled;
     const bool high_speed_image_texture_sampling = zone->high_speed_image_texture_sampling;
+    const std::vector<float> component_strength_factors = overhang_component_strength_factors_for_gcode(*zone, component_ids);
+    const std::vector<float> component_minimum_offset_factors =
+        overhang_component_minimum_offset_factors_for_gcode(*zone, component_ids);
 
     std::vector<std::array<float, 3>> component_colors;
     component_colors.reserve(component_ids.size());
@@ -9225,6 +9678,17 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
     component_key_stream << "|gl" << generic_solver_lookup_mode;
     component_key_stream << "|gm" << generic_solver_mode;
     component_key_stream << "|gx" << generic_solver_mix_model;
+    component_key_stream << "|de" << (dithering_enabled ? 1 : 0);
+    component_key_stream << "|dm" << dithering_method;
+    component_key_stream << "|dp" << int(std::lround(dither_pitch_mm * 1000.f));
+    if (dithering_method == int(TextureMappingZone::DitheringHalftone))
+        component_key_stream << "|hdt" << int(std::lround(halftone_dot_size_mm * 1000.f));
+    else
+        component_key_stream << "|hrz" << int(std::lround(std::clamp(zone->dithering_resolution_mm, 0.04f, 0.25f) * 1000.f));
+    for (const float strength_factor : component_strength_factors)
+        component_key_stream << "|st" << int(std::lround(std::clamp(strength_factor, 0.f, 1.f) * 1000.f));
+    for (const float minimum_offset_factor : component_minimum_offset_factors)
+        component_key_stream << "|mo" << int(std::lround(std::clamp(minimum_offset_factor, 0.f, 1.f) * 1000.f));
     component_key_stream << "|lf" << (use_legacy_fixed_color_mode ? 1 : 0);
     component_key_stream << "|ct" << int(std::lround(texture_contrast_pct));
     component_key_stream << "|tg" << int(std::lround(texture_tone_gamma * 100.f));
@@ -9293,6 +9757,12 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
                                                                                   generic_solver_mode,
                                                                                   generic_solver_mix_model,
                                                                                   use_legacy_fixed_color_mode,
+                                                                                  dithering_enabled,
+                                                                                  dithering_method,
+                                                                                  dither_pitch_mm,
+                                                                                  halftone_dot_size_mm,
+                                                                                  component_strength_factors,
+                                                                                  component_minimum_offset_factors,
                                                                                   &m_generic_solver_mix_candidate_cache,
                                                                                   &m_uv_texture_triangle_cache,
                                                                                   texture_contrast_pct,
@@ -10450,6 +10920,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         bool                      enabled { false };
         bool                      vertex_color_match_mode { false };
         bool                      high_resolution_texture_sampling { false };
+        bool                      dithering_enabled { false };
         bool                      nonlinear_offset_adjustment { false };
         bool                      compact_offset_mode { false };
         bool                      object_center_mode { false };
@@ -10468,6 +10939,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         float                     active_component_minimum_offset_factor { 0.f };
         float                     active_component_td_width_factor { 1.f };
         float                     base_outer_width_mm { 0.4f };
+        float                     dither_pitch_mm { 0.08f };
         float                     flow_reference_width_mm { 0.4f };
         float                     base_centerline_shift_mm { 0.f };
         float                     centerline_shift_balance_mm { 0.f };
@@ -10653,10 +11125,22 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                 !vertex_color_match_mode &&
                                 zone->offset_angle_mode != int(TextureMappingZone::OffsetAngleSurfaceNormal);
                             const bool use_layer_aware_weighting = m_layer != nullptr;
-                            const bool high_resolution_texture_sampling = zone->high_resolution_sampling;
+                            const bool raw_texture_mapping_mode =
+                                zone->texture_mapping_mode == int(TextureMappingZone::TextureMappingRawValues);
+                            const bool dithering_enabled = zone->dithering_enabled && !raw_texture_mapping_mode;
+                            const int dithering_method = std::clamp(zone->dithering_method,
+                                                                    int(TextureMappingZone::DitheringClosest),
+                                                                    int(TextureMappingZone::DitheringHalftone));
+                            const float dither_pitch_mm =
+                                dither_pitch_for_gcode(base_outer_width_mm,
+                                                       dithering_method,
+                                                       zone->dithering_resolution_mm,
+                                                       zone->halftone_dot_size_mm);
+                            const float halftone_dot_size_mm = std::clamp(zone->halftone_dot_size_mm, 0.08f, 2.f);
+                            const bool high_resolution_texture_sampling = zone->high_resolution_sampling || dithering_enabled;
                             const bool high_speed_image_texture_sampling = zone->high_speed_image_texture_sampling;
                             const bool nonlinear_offset_adjustment = zone->nonlinear_offset_adjustment;
-                            const bool compact_offset_mode = zone->compact_offset_mode;
+                            const bool compact_offset_mode = zone->compact_offset_mode || dithering_enabled;
                             const float layer_sample_z_mm = use_layer_aware_weighting ? float(m_layer->print_z) : 0.f;
                             const float layer_sample_falloff_mm = high_resolution_texture_sampling ?
                                 std::max(0.03f, layer_height_mm * 0.5f) :
@@ -10682,8 +11166,6 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                             const bool reduce_outer_surface_texture =
                                 vertex_color_match_mode && zone->reduce_outer_surface_texture && !compact_offset_mode;
 
-                            const bool raw_texture_mapping_mode =
-                                zone->texture_mapping_mode == int(TextureMappingZone::TextureMappingRawValues);
                             std::vector<std::array<float, 3>> component_colors;
                             component_colors.reserve(component_ids.size());
                             bool missing_component_color = false;
@@ -10710,6 +11192,10 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                                                                     component_ids,
                                                                                     component_colors,
                                                                                     texture_filament_color_mode);
+                            const std::vector<float> component_strength_factors =
+                                overhang_component_strength_factors_for_gcode(*zone, component_ids);
+                            const std::vector<float> component_minimum_offset_factors =
+                                overhang_component_minimum_offset_factors_for_gcode(*zone, component_ids);
                             size_t previous_component_idx = size_t(-1);
                             if (current_layer_index > 0) {
                                 const unsigned int previous_component_id =
@@ -10740,6 +11226,17 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                     component_key_stream << "|gl" << generic_solver_lookup_mode;
                                     component_key_stream << "|gm" << generic_solver_mode;
                                     component_key_stream << "|gx" << generic_solver_mix_model;
+                                    component_key_stream << "|de" << (dithering_enabled ? 1 : 0);
+                                    component_key_stream << "|dm" << dithering_method;
+                                    component_key_stream << "|dp" << int(std::lround(dither_pitch_mm * 1000.f));
+                                    if (dithering_method == int(TextureMappingZone::DitheringHalftone))
+                                        component_key_stream << "|hdt" << int(std::lround(halftone_dot_size_mm * 1000.f));
+                                    else
+                                        component_key_stream << "|hrz" << int(std::lround(std::clamp(zone->dithering_resolution_mm, 0.04f, 0.25f) * 1000.f));
+                                    for (const float strength_factor : component_strength_factors)
+                                        component_key_stream << "|st" << int(std::lround(std::clamp(strength_factor, 0.f, 1.f) * 1000.f));
+                                    for (const float minimum_offset_factor : component_minimum_offset_factors)
+                                        component_key_stream << "|mo" << int(std::lround(std::clamp(minimum_offset_factor, 0.f, 1.f) * 1000.f));
                                     component_key_stream << "|lf" << (use_legacy_fixed_color_mode ? 1 : 0);
                                     component_key_stream << "|ct" << int(std::lround(texture_contrast_pct));
                                     component_key_stream << "|tg" << int(std::lround(texture_tone_gamma * 100.f));
@@ -10761,6 +11258,12 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                                                                                          generic_solver_mode,
                                                                                                          generic_solver_mix_model,
                                                                                                          use_legacy_fixed_color_mode,
+                                                                                                         dithering_enabled,
+                                                                                                         dithering_method,
+                                                                                                         dither_pitch_mm,
+                                                                                                         halftone_dot_size_mm,
+                                                                                                         component_strength_factors,
+                                                                                                         component_minimum_offset_factors,
                                                                                                          generic_mix_candidate_cache,
                                                                                                          &m_uv_texture_triangle_cache,
                                                                                                          texture_contrast_pct,
@@ -10789,6 +11292,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                 outer_wall_gradient_dynamic_ctx.enabled = true;
                                 outer_wall_gradient_dynamic_ctx.vertex_color_match_mode = vertex_color_match_mode;
                                 outer_wall_gradient_dynamic_ctx.high_resolution_texture_sampling = high_resolution_texture_sampling;
+                                outer_wall_gradient_dynamic_ctx.dithering_enabled = dithering_enabled;
                                 outer_wall_gradient_dynamic_ctx.nonlinear_offset_adjustment = nonlinear_offset_adjustment;
                                 outer_wall_gradient_dynamic_ctx.compact_offset_mode = compact_offset_mode;
                                 outer_wall_gradient_dynamic_ctx.object_center_mode = object_center_mode;
@@ -10807,6 +11311,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                 outer_wall_gradient_dynamic_ctx.active_component_minimum_offset_factor = active_component_minimum_offset_factor;
                                 outer_wall_gradient_dynamic_ctx.active_component_td_width_factor = active_component_td_width_factor;
                                 outer_wall_gradient_dynamic_ctx.base_outer_width_mm = base_outer_width_mm;
+                                outer_wall_gradient_dynamic_ctx.dither_pitch_mm = dither_pitch_mm;
                                 outer_wall_gradient_dynamic_ctx.flow_reference_width_mm = flow_reference_width_mm;
                                 outer_wall_gradient_dynamic_ctx.base_centerline_shift_mm = base_centerline_shift_mm;
                                 outer_wall_gradient_dynamic_ctx.layer_height_mm = layer_height_mm;
@@ -11827,9 +12332,13 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                         (outer_wall_gradient_dynamic_ctx.object_center_mode ||
                          outer_wall_gradient_dynamic_ctx.vertex_color_match_mode);
                     if (dynamic_line_modulation) {
+                        const double high_res_modulation_step_mm =
+                            outer_wall_gradient_dynamic_ctx.dithering_enabled ?
+                                std::clamp(double(outer_wall_gradient_dynamic_ctx.dither_pitch_mm), 0.04, 0.12) :
+                                std::clamp(double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm) * 0.20, 0.04, 0.12);
                         const double modulation_step_mm = outer_wall_gradient_dynamic_ctx.vertex_color_match_mode ?
                             (outer_wall_gradient_dynamic_ctx.high_resolution_texture_sampling ?
-                                std::clamp(double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm) * 0.20, 0.04, 0.12) :
+                                high_res_modulation_step_mm :
                                 std::clamp(double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm) * 0.35, 0.05, 0.25)) :
                             std::clamp(double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm) * 2.0, 0.40, 1.20);
                         const double modulation_step_scaled = scale_(modulation_step_mm);
@@ -12162,7 +12671,9 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             if (high_res_dynamic_subsegments) {
                 const Line parent_line(pre_processed_point.p, processed_point.p);
                 const double modulation_step_mm =
-                    std::clamp(double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm) * 0.20, 0.04, 0.12);
+                    outer_wall_gradient_dynamic_ctx.dithering_enabled ?
+                        std::clamp(double(outer_wall_gradient_dynamic_ctx.dither_pitch_mm), 0.04, 0.12) :
+                        std::clamp(double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm) * 0.20, 0.04, 0.12);
                 const double modulation_step_scaled = scale_(modulation_step_mm);
                 const int subsegment_count =
                     std::clamp(int(std::ceil(parent_line.length() / std::max(modulation_step_scaled, EPSILON))), 1, 10000);
