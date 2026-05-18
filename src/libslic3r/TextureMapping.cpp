@@ -603,11 +603,12 @@ static std::string dithering_method_name(int mode)
 {
     switch (clamp_int(mode,
                       int(TextureMappingZone::DitheringClosest),
-                      int(TextureMappingZone::DitheringHalftone))) {
-    case int(TextureMappingZone::DitheringClosest):      return "closest";
-    case int(TextureMappingZone::DitheringOrderedBayer): return "ordered_bayer";
-    case int(TextureMappingZone::DitheringHalftone):     return "halftone";
-    default:                                            return "floyd_steinberg";
+                      int(TextureMappingZone::DitheringHalftoneIncreasedDetail))) {
+    case int(TextureMappingZone::DitheringClosest):                 return "closest";
+    case int(TextureMappingZone::DitheringOrderedBayer):            return "ordered_bayer";
+    case int(TextureMappingZone::DitheringHalftone):                return "halftone";
+    case int(TextureMappingZone::DitheringHalftoneIncreasedDetail): return "halftone_increased_detail";
+    default:                                                       return "floyd_steinberg";
     }
 }
 
@@ -620,6 +621,8 @@ static int dithering_method_from_name(std::string name)
         return int(TextureMappingZone::DitheringOrderedBayer);
     if (name == "halftone")
         return int(TextureMappingZone::DitheringHalftone);
+    if (name == "halftone_increased_detail" || name == "halftone_detail" || name == "halftone_high_detail")
+        return int(TextureMappingZone::DitheringHalftoneIncreasedDetail);
     return int(TextureMappingZone::DitheringFloydSteinberg);
 }
 
@@ -1254,7 +1257,7 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.transmission_distance_calibration_mode = transmission_distance_calibration_mode_from_json(texture);
         zone.preview_opacity_pct =
             std::clamp(texture.value("preview_opacity_pct", TextureMappingZone::DefaultPreviewOpacityPct), 0.f, 100.f);
-        zone.preview_simulate_colors = texture.value("simulate_preview_colors", false);
+        zone.preview_simulate_colors = texture.value("simulate_preview_colors", TextureMappingZone::DefaultPreviewSimulateColors);
         zone.preview_limit_resolution = texture.value("limit_preview_resolution", true);
         zone.auto_adjust_filament_selection = texture.value("auto_adjust_filaments", true);
         zone.filament_strengths_pct = normalize_strengths(floats_from_json(texture.value("strength_pct", nlohmann::json::array())));

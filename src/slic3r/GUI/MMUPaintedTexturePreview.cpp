@@ -77,6 +77,7 @@ struct TexturePreviewSimulationSettings
     int dithering_method = TextureMappingZone::DefaultDitheringMethod;
     float dithering_resolution_mm = TextureMappingZone::DefaultDitheringResolutionMm;
     float halftone_dot_size_mm = TextureMappingZone::DefaultHalftoneDotSizeMm;
+    float texture_preview_mm_per_pixel = TextureMappingZone::DefaultDitheringResolutionMm;
     float contrast_pct = 100.f;
     float tone_gamma = 1.f;
     int generic_solver_lookup_mode = int(TextureMappingZone::GenericSolverClosestMix);
@@ -245,11 +246,94 @@ std::array<Vec2f, 3> unwrap_triangle_uvs(const Vec2f &uv0, const Vec2f &uv1, con
     return out;
 }
 
+float estimated_texture_preview_mm_per_pixel(const ModelVolume &model_volume)
+{
+    const unsigned int width = model_volume.imported_texture_width;
+    const unsigned int height = model_volume.imported_texture_height;
+    if (width == 0 || height == 0)
+        return TextureMappingZone::DefaultDitheringResolutionMm;
+
+    const indexed_triangle_set &its = model_volume.mesh().its;
+    if (its.indices.empty() || its.vertices.empty())
+        return TextureMappingZone::DefaultDitheringResolutionMm;
+
+    double world_area_mm2 = 0.0;
+    double uv_area_px2 = 0.0;
+    const size_t triangle_count = std::min(its.indices.size(), model_volume.imported_texture_uv_valid.size());
+    for (size_t tri_idx = 0; tri_idx < triangle_count; ++tri_idx) {
+        if (model_volume.imported_texture_uv_valid[tri_idx] == 0)
+            continue;
+
+        const size_t uv_offset = tri_idx * 6;
+        if (uv_offset + 5 >= model_volume.imported_texture_uvs_per_face.size())
+            continue;
+
+        const stl_triangle_vertex_indices &indices = its.indices[tri_idx];
+        if (indices[0] < 0 || indices[1] < 0 || indices[2] < 0 ||
+            size_t(indices[0]) >= its.vertices.size() ||
+            size_t(indices[1]) >= its.vertices.size() ||
+            size_t(indices[2]) >= its.vertices.size())
+            continue;
+
+        const Vec3d p0 = its.vertices[size_t(indices[0])].cast<double>();
+        const Vec3d p1 = its.vertices[size_t(indices[1])].cast<double>();
+        const Vec3d p2 = its.vertices[size_t(indices[2])].cast<double>();
+        const double tri_area_mm2 = 0.5 * (p1 - p0).cross(p2 - p0).norm();
+        if (!std::isfinite(tri_area_mm2) || tri_area_mm2 <= double(k_epsilon))
+            continue;
+
+        const std::array<Vec2f, 3> uv = unwrap_triangle_uvs(
+            Vec2f(model_volume.imported_texture_uvs_per_face[uv_offset + 0], model_volume.imported_texture_uvs_per_face[uv_offset + 1]),
+            Vec2f(model_volume.imported_texture_uvs_per_face[uv_offset + 2], model_volume.imported_texture_uvs_per_face[uv_offset + 3]),
+            Vec2f(model_volume.imported_texture_uvs_per_face[uv_offset + 4], model_volume.imported_texture_uvs_per_face[uv_offset + 5]));
+        const Vec2d t0(double(uv[0].x()) * double(width), double(uv[0].y()) * double(height));
+        const Vec2d t1(double(uv[1].x()) * double(width), double(uv[1].y()) * double(height));
+        const Vec2d t2(double(uv[2].x()) * double(width), double(uv[2].y()) * double(height));
+        const Vec2d e0 = t1 - t0;
+        const Vec2d e1 = t2 - t0;
+        const double tri_uv_area_px2 = 0.5 * std::abs(e0.x() * e1.y() - e0.y() * e1.x());
+        if (!std::isfinite(tri_uv_area_px2) || tri_uv_area_px2 <= double(k_epsilon))
+            continue;
+
+        world_area_mm2 += tri_area_mm2;
+        uv_area_px2 += tri_uv_area_px2;
+    }
+
+    if (world_area_mm2 <= double(k_epsilon) || uv_area_px2 <= double(k_epsilon))
+        return TextureMappingZone::DefaultDitheringResolutionMm;
+
+    const double mm_per_pixel = std::sqrt(world_area_mm2 / uv_area_px2);
+    if (!std::isfinite(mm_per_pixel) || mm_per_pixel <= 0.0)
+        return TextureMappingZone::DefaultDitheringResolutionMm;
+
+    return std::clamp(float(mm_per_pixel), 0.005f, 5.f);
+}
+
 bool barycentric_weights(const Vec3f &point, const Vec3f &p0, const Vec3f &p1, const Vec3f &p2, Vec3f &weights)
 {
     const Vec3f edge_0 = p1 - p0;
     const Vec3f edge_1 = p2 - p0;
     const Vec3f delta = point - p0;
+    const float d00 = edge_0.dot(edge_0);
+    const float d01 = edge_0.dot(edge_1);
+    const float d11 = edge_1.dot(edge_1);
+    const float d20 = delta.dot(edge_0);
+    const float d21 = delta.dot(edge_1);
+    const float denom = d00 * d11 - d01 * d01;
+    if (std::abs(denom) <= k_epsilon)
+        return false;
+
+    weights.y() = (d11 * d20 - d01 * d21) / denom;
+    weights.z() = (d00 * d21 - d01 * d20) / denom;
+    weights.x() = 1.f - weights.y() - weights.z();
+    return std::isfinite(weights.x()) && std::isfinite(weights.y()) && std::isfinite(weights.z());
+}
+
+bool barycentric_weights_2d(const Vec2f &point, const Vec2f &p0, const Vec2f &p1, const Vec2f &p2, Vec3f &weights)
+{
+    const Vec2f edge_0 = p1 - p0;
+    const Vec2f edge_1 = p2 - p0;
+    const Vec2f delta = point - p0;
     const float d00 = edge_0.dot(edge_0);
     const float d01 = edge_0.dot(edge_1);
     const float d11 = edge_1.dot(edge_1);
@@ -586,6 +670,12 @@ std::array<unsigned int, 2> limited_simulated_texture_preview_size(unsigned int 
     return { limited_width, limited_height };
 }
 
+std::array<unsigned char, 4> sample_texture_preview_rgba_bilinear_at_source(const std::vector<unsigned char> &rgba,
+                                                                            unsigned int width,
+                                                                            unsigned int height,
+                                                                            double src_x_unclamped,
+                                                                            double src_y_unclamped);
+
 std::array<unsigned int, 2> simulated_texture_preview_size(unsigned int width,
                                                            unsigned int height,
                                                            const TexturePreviewSimulationSettings &settings,
@@ -635,12 +725,22 @@ std::array<unsigned char, 4> sample_texture_preview_rgba_bilinear(const std::vec
                                                                   unsigned int preview_width,
                                                                   unsigned int preview_height)
 {
-    const double src_x = std::clamp((double(preview_x) + 0.5) * double(width) / double(std::max(1u, preview_width)) - 0.5,
-                                    0.0,
-                                    double(width - 1));
-    const double src_y = std::clamp((double(preview_y) + 0.5) * double(height) / double(std::max(1u, preview_height)) - 0.5,
-                                    0.0,
-                                    double(height - 1));
+    const double src_x = (double(preview_x) + 0.5) * double(width) / double(std::max(1u, preview_width)) - 0.5;
+    const double src_y = (double(preview_y) + 0.5) * double(height) / double(std::max(1u, preview_height)) - 0.5;
+    return sample_texture_preview_rgba_bilinear_at_source(rgba, width, height, src_x, src_y);
+}
+
+std::array<unsigned char, 4> sample_texture_preview_rgba_bilinear_at_source(const std::vector<unsigned char> &rgba,
+                                                                            unsigned int width,
+                                                                            unsigned int height,
+                                                                            double src_x_unclamped,
+                                                                            double src_y_unclamped)
+{
+    if (width == 0 || height == 0 || rgba.size() < size_t(width) * size_t(height) * 4)
+        return { 0, 0, 0, 255 };
+
+    const double src_x = std::clamp(src_x_unclamped, 0.0, double(width - 1));
+    const double src_y = std::clamp(src_y_unclamped, 0.0, double(height - 1));
     const unsigned int x0 = std::min(width - 1, unsigned(std::floor(src_x)));
     const unsigned int y0 = std::min(height - 1, unsigned(std::floor(src_y)));
     const unsigned int x1 = std::min(width - 1, x0 + 1);
@@ -1478,6 +1578,38 @@ std::vector<float> binary_component_visibility_weights_for_texture_preview(const
     return weights;
 }
 
+std::vector<float> halftone_component_visibility_weights_for_texture_preview(const TexturePreviewSimulationSettings &settings,
+                                                                             uint32_t                                mask)
+{
+    std::vector<float> weights = binary_component_visibility_weights_for_texture_preview(settings, mask);
+    if (mask == 0) {
+        std::fill(weights.begin(), weights.end(), 1.f);
+        return weights;
+    }
+
+    float total_weight = 0.f;
+    for (const float weight : weights)
+        total_weight += std::max(0.f, weight);
+    if (total_weight > k_epsilon)
+        return weights;
+
+    for (size_t component_idx = 0; component_idx < weights.size() && component_idx < 31; ++component_idx)
+        if ((mask & (uint32_t(1) << component_idx)) != 0)
+            weights[component_idx] = 1.f;
+    return weights;
+}
+
+ColorRGBA halftone_preview_color_from_mask(const TexturePreviewSimulationSettings &settings, uint32_t mask)
+{
+    const std::vector<float> weights = halftone_component_visibility_weights_for_texture_preview(settings, mask);
+    if (settings.component_colors.empty() || weights.empty())
+        return { 0.f, 0.f, 0.f, 1.f };
+
+    const std::array<float, 3> rgb =
+        mix_color_solver_components(settings.component_colors, weights, ColorSolverMixModel::PigmentPainter);
+    return { clamp01(rgb[0]), clamp01(rgb[1]), clamp01(rgb[2]), 1.f };
+}
+
 std::vector<TexturePreviewBinaryDitherCandidate> binary_dither_candidates_for_texture_preview(
     const TexturePreviewSimulationSettings &settings)
 {
@@ -1620,21 +1752,127 @@ float ordered_bayer_threshold_for_texture_preview(int x, int y)
     return (float(matrix[by][bx]) + 0.5f) / 64.f - 0.5f;
 }
 
-float halftone_threshold_for_texture_preview(int x, int y, float dot_size_mm)
+bool is_halftone_dithering_method_for_texture_preview(int method)
 {
-    const float period_px =
-        std::clamp(std::clamp(dot_size_mm,
-                              TextureMappingZone::MinHalftoneDotSizeMm,
-                              TextureMappingZone::MaxHalftoneDotSizeMm) /
-                       TextureMappingZone::DefaultDitheringResolutionMm,
-                   2.f,
-                   TextureMappingZone::MaxHalftoneDotSizeMm / TextureMappingZone::DefaultDitheringResolutionMm);
-    const float u = float(x) / period_px - std::floor(float(x) / period_px);
-    const float v = float(y) / period_px - std::floor(float(y) / period_px);
+    const int clamped_method = std::clamp(method,
+                                          int(TextureMappingZone::DitheringClosest),
+                                          int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+    return clamped_method == int(TextureMappingZone::DitheringHalftone) ||
+           clamped_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail);
+}
+
+float halftone_screen_angle_deg_for_texture_preview(int filament_color_mode, size_t component_idx)
+{
+    const int clamped_mode =
+        std::clamp(filament_color_mode, int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorRGBKW));
+    if (component_idx < 3) {
+        static constexpr float primary_angles[3] = {15.f, 75.f, 0.f};
+        return primary_angles[component_idx];
+    }
+
+    switch (clamped_mode) {
+    case int(TextureMappingZone::FilamentColorCMYK):
+    case int(TextureMappingZone::FilamentColorRGBK):
+    case int(TextureMappingZone::FilamentColorCMYKW):
+    case int(TextureMappingZone::FilamentColorRGBKW):
+        if (component_idx == 3)
+            return 45.f;
+        if (component_idx == 4)
+            return 90.f;
+        break;
+    case int(TextureMappingZone::FilamentColorCMYW):
+    case int(TextureMappingZone::FilamentColorRGBW):
+        if (component_idx == 3)
+            return 90.f;
+        break;
+    case int(TextureMappingZone::FilamentColorBW):
+        if (component_idx == 0)
+            return 45.f;
+        if (component_idx == 1)
+            return 90.f;
+        break;
+    default:
+        break;
+    }
+
+    static constexpr float fallback_angles[] = {15.f, 75.f, 0.f, 45.f, 90.f, 30.f, 60.f, 105.f, 120.f, 150.f};
+    return fallback_angles[component_idx % (sizeof(fallback_angles) / sizeof(fallback_angles[0]))];
+}
+
+float halftone_threshold_for_texture_preview(float x_mm, float y_mm, float dot_size_mm)
+{
+    const float period = std::clamp(dot_size_mm,
+                                    TextureMappingZone::MinHalftoneDotSizeMm,
+                                    TextureMappingZone::MaxHalftoneDotSizeMm);
+    const float u = x_mm / period - std::floor(x_mm / period);
+    const float v = y_mm / period - std::floor(y_mm / period);
     const float dx = u - 0.5f;
     const float dy = v - 0.5f;
     const float radius_area = (dx * dx + dy * dy) / 0.5f;
     return std::clamp(radius_area, 0.f, 1.f) - 0.5f;
+}
+
+bool halftone_screen_on_for_texture_preview(float coverage,
+                                            float surface_x_mm,
+                                            float surface_y_mm,
+                                            float dot_size_mm,
+                                            float angle_deg)
+{
+    const float safe_coverage = clamp01(coverage);
+    if (safe_coverage <= k_epsilon)
+        return false;
+    if (safe_coverage >= 1.f - k_epsilon)
+        return true;
+    if (!std::isfinite(surface_x_mm) || !std::isfinite(surface_y_mm))
+        return safe_coverage >= 0.5f;
+
+    constexpr float pi = 3.14159265358979323846f;
+    const float radians = angle_deg * pi / 180.f;
+    const float c = std::cos(radians);
+    const float s = std::sin(radians);
+    const float x = c * surface_x_mm + s * surface_y_mm;
+    const float y = -s * surface_x_mm + c * surface_y_mm;
+    return halftone_threshold_for_texture_preview(x, y, dot_size_mm) + 0.5f < safe_coverage;
+}
+
+bool texture_preview_uses_halftone_dithering(const TexturePreviewSimulationSettings &settings)
+{
+    return settings.dithering_enabled &&
+           settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
+           is_halftone_dithering_method_for_texture_preview(settings.dithering_method);
+}
+
+int halftone_surface_axis_for_texture_preview(const Vec3f &normal)
+{
+    const Vec3f abs_normal(std::abs(normal.x()), std::abs(normal.y()), std::abs(normal.z()));
+    if (abs_normal.x() >= abs_normal.y() && abs_normal.x() >= abs_normal.z())
+        return 0;
+    if (abs_normal.y() >= abs_normal.x() && abs_normal.y() >= abs_normal.z())
+        return 1;
+    return 2;
+}
+
+Vec2f halftone_surface_coords_for_texture_preview(const Vec3f &point, int axis)
+{
+    if (axis == 0)
+        return Vec2f(point.y(), point.z());
+    if (axis == 1)
+        return Vec2f(point.x(), point.z());
+    return Vec2f(point.x(), point.y());
+}
+
+Vec2f halftone_surface_coords_for_texture_preview(const Vec3f &point, const Vec3f &normal)
+{
+    return halftone_surface_coords_for_texture_preview(point, halftone_surface_axis_for_texture_preview(normal));
+}
+
+float halftone_surface_plane_coord_for_texture_preview(const Vec3f &point, int axis)
+{
+    if (axis == 0)
+        return point.x();
+    if (axis == 1)
+        return point.y();
+    return point.z();
 }
 
 std::vector<float> optimized_primary_component_weights_for_target(const std::array<float, 3>              &target_rgb,
@@ -1784,7 +2022,8 @@ std::vector<float> optimized_primary_component_weights_for_target(const std::arr
 }
 
 std::vector<float> component_weights_for_texture_preview(const TexturePreviewSimulationSettings &settings,
-                                                         const std::array<float, 4>            &sample_rgba)
+                                                         const std::array<float, 4>            &sample_rgba,
+                                                         bool                                    apply_visibility_adjustments = true)
 {
     const size_t component_count = settings.component_colors.size();
     if (component_count == 0)
@@ -1792,7 +2031,8 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
 
     if (settings.dithering_enabled &&
         settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
-        settings.dithering_method != int(TextureMappingZone::DitheringHalftone)) {
+        settings.dithering_method != int(TextureMappingZone::DitheringHalftone) &&
+        settings.dithering_method != int(TextureMappingZone::DitheringHalftoneIncreasedDetail)) {
         const std::vector<TexturePreviewBinaryDitherCandidate> candidates = binary_dither_candidates_for_texture_preview(settings);
         const std::array<float, 3> target_oklab = texture_preview_target_oklab(settings, sample_rgba);
         const size_t candidate_idx = nearest_binary_dither_candidate_for_texture_preview(candidates, target_oklab);
@@ -1857,9 +2097,11 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
                 value = clamp01(value / max_weight);
     }
 
-    for (size_t idx = 0; idx < desired.size() && idx < settings.component_strength_factors.size(); ++idx)
-        desired[idx] = clamp01(desired[idx] * settings.component_strength_factors[idx]);
-    apply_minimum_visibility_offset(desired, settings.minimum_visibility_offset_factor);
+    if (apply_visibility_adjustments) {
+        for (size_t idx = 0; idx < desired.size() && idx < settings.component_strength_factors.size(); ++idx)
+            desired[idx] = clamp01(desired[idx] * settings.component_strength_factors[idx]);
+        apply_minimum_visibility_offset(desired, settings.minimum_visibility_offset_factor);
+    }
     return desired;
 }
 
@@ -1967,7 +2209,7 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
         settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues);
     settings.dithering_method = std::clamp(zone->dithering_method,
                                            int(TextureMappingZone::DitheringClosest),
-                                           int(TextureMappingZone::DitheringHalftone));
+                                           int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
     settings.dithering_resolution_mm = std::clamp(zone->dithering_resolution_mm,
                                                   TextureMappingZone::MinDitheringResolutionMm,
                                                   TextureMappingZone::MaxDitheringResolutionMm);
@@ -1975,7 +2217,9 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
                                                TextureMappingZone::MinHalftoneDotSizeMm,
                                                TextureMappingZone::MaxHalftoneDotSizeMm);
     const bool halftone_dithering_enabled =
-        settings.dithering_enabled && settings.dithering_method == int(TextureMappingZone::DitheringHalftone);
+        settings.dithering_enabled &&
+        (settings.dithering_method == int(TextureMappingZone::DitheringHalftone) ||
+         settings.dithering_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
     settings.compact_offset_mode =
         halftone_dithering_enabled ? false : zone->compact_offset_mode || settings.dithering_enabled;
     settings.use_legacy_fixed_color_mode = zone->use_legacy_fixed_color_mode;
@@ -2054,10 +2298,12 @@ size_t texture_preview_simulation_signature(const ModelVolume &model_volume,
     mix(std::hash<int>{}(settings.use_legacy_fixed_color_mode ? 1 : 0));
     mix(std::hash<int>{}(settings.dithering_enabled ? 1 : 0));
     mix(std::hash<int>{}(settings.dithering_method));
-    if (settings.dithering_method == int(TextureMappingZone::DitheringHalftone))
+    if (settings.dithering_method == int(TextureMappingZone::DitheringHalftone) ||
+        settings.dithering_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail))
         mix(std::hash<int>{}(int(std::lround(settings.halftone_dot_size_mm * 1000.f))));
     else
         mix(std::hash<int>{}(int(std::lround(settings.dithering_resolution_mm * 1000.f))));
+    mix(std::hash<int>{}(int(std::lround(settings.texture_preview_mm_per_pixel * 100000.f))));
     mix(std::hash<int>{}(settings.generic_solver_lookup_mode));
     mix(std::hash<int>{}(settings.generic_solver_mode));
     mix(std::hash<int>{}(settings.generic_solver_mix_model));
@@ -2113,20 +2359,120 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
         settings.dithering_enabled &&
         settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
         settings.dithering_method != int(TextureMappingZone::DitheringHalftone) &&
+        settings.dithering_method != int(TextureMappingZone::DitheringHalftoneIncreasedDetail) &&
         !use_raw_offsets;
+    const bool use_halftone_dithering =
+        settings.dithering_enabled &&
+        settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
+        is_halftone_dithering_method_for_texture_preview(settings.dithering_method) &&
+        !use_raw_offsets;
+    const bool halftone_increased_detail =
+        settings.dithering_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail);
+    const float preview_mm_per_source_pixel =
+        std::clamp(settings.texture_preview_mm_per_pixel, 0.005f, 5.f);
     const std::vector<TexturePreviewBinaryDitherCandidate> binary_dither_candidates =
         use_binary_dithering ? binary_dither_candidates_for_texture_preview(settings) :
                                std::vector<TexturePreviewBinaryDitherCandidate>{};
 
     std::unordered_map<unsigned int, std::array<unsigned char, 4>> simulated_color_cache;
     simulated_color_cache.reserve(std::min(size_t(result.width) * size_t(result.height), size_t(65536)));
+    std::unordered_map<uint64_t, float> halftone_cell_tone_cache;
+    if (use_halftone_dithering && !halftone_increased_detail)
+        halftone_cell_tone_cache.reserve(std::min(size_t(result.width) * size_t(result.height), size_t(65536)));
     std::vector<std::array<float, 3>> floyd_error_current(result.width, { { 0.f, 0.f, 0.f } });
     std::vector<std::array<float, 3>> floyd_error_next(result.width, { { 0.f, 0.f, 0.f } });
 
+    auto halftone_cell_cache_key = [](size_t component_idx, int cell_x, int cell_y) {
+        uint64_t key = 1469598103934665603ull;
+        auto mix = [&key](uint64_t value) {
+            key ^= value;
+            key *= 1099511628211ull;
+        };
+        mix(uint64_t(component_idx));
+        mix(uint64_t(uint32_t(cell_x)));
+        mix(uint64_t(uint32_t(cell_y)));
+        return key;
+    };
+
+    auto component_coverage_at_source = [&](double src_x, double src_y, size_t component_idx) {
+        const std::array<unsigned char, 4> source_rgba_sample =
+            sample_texture_preview_rgba_bilinear_at_source(source_rgba, width, height, src_x, src_y);
+        const ColorRGBA blended_source_color =
+            composite_texture_mapping_color_over_background_for_preview(ColorRGBA(float(source_rgba_sample[0]) / 255.f,
+                                                                                  float(source_rgba_sample[1]) / 255.f,
+                                                                                  float(source_rgba_sample[2]) / 255.f,
+                                                                                  float(source_rgba_sample[3]) / 255.f),
+                                                                        background_color);
+        const std::array<float, 4> sampled_rgba = {
+            blended_source_color.r(),
+            blended_source_color.g(),
+            blended_source_color.b(),
+            1.f
+        };
+        const std::vector<float> coverage = component_weights_for_texture_preview(settings, sampled_rgba, false);
+        return component_idx < coverage.size() ? clamp01(coverage[component_idx]) : 0.f;
+    };
+
+    auto halftone_cell_coverage = [&](size_t component_idx,
+                                      float  surface_x_mm,
+                                      float  surface_y_mm,
+                                      float  angle_deg,
+                                      float  current_coverage) {
+        if (halftone_increased_detail)
+            return current_coverage;
+
+        const float period = std::clamp(settings.halftone_dot_size_mm,
+                                        TextureMappingZone::MinHalftoneDotSizeMm,
+                                        TextureMappingZone::MaxHalftoneDotSizeMm);
+        if (!std::isfinite(surface_x_mm) || !std::isfinite(surface_y_mm) || period <= k_epsilon)
+            return current_coverage;
+
+        constexpr float pi = 3.14159265358979323846f;
+        const float radians = angle_deg * pi / 180.f;
+        const float c = std::cos(radians);
+        const float s = std::sin(radians);
+        const float screen_x = c * surface_x_mm + s * surface_y_mm;
+        const float screen_y = -s * surface_x_mm + c * surface_y_mm;
+        const int cell_x = int(std::floor(screen_x / period));
+        const int cell_y = int(std::floor(screen_y / period));
+        const uint64_t key = halftone_cell_cache_key(component_idx, cell_x, cell_y);
+        const auto cached = halftone_cell_tone_cache.find(key);
+        if (cached != halftone_cell_tone_cache.end())
+            return cached->second;
+
+        const float center_screen_x = (float(cell_x) + 0.5f) * period;
+        const float center_screen_y = (float(cell_y) + 0.5f) * period;
+        const float smooth_radius = period * 0.35f;
+        const bool use_smoothing_samples = smooth_radius / preview_mm_per_source_pixel >= 1.5f;
+        const std::array<Vec2f, 5> offsets = {
+            Vec2f(0.f, 0.f),
+            Vec2f(smooth_radius, 0.f),
+            Vec2f(-smooth_radius, 0.f),
+            Vec2f(0.f, smooth_radius),
+            Vec2f(0.f, -smooth_radius)
+        };
+        const size_t sample_count = use_smoothing_samples ? offsets.size() : size_t(1);
+        float total = 0.f;
+        for (size_t sample_idx = 0; sample_idx < sample_count; ++sample_idx) {
+            const float sample_screen_x = center_screen_x + offsets[sample_idx].x();
+            const float sample_screen_y = center_screen_y + offsets[sample_idx].y();
+            const float sample_surface_x = c * sample_screen_x - s * sample_screen_y;
+            const float sample_surface_y = s * sample_screen_x + c * sample_screen_y;
+            const double src_x = double(sample_surface_x) / double(preview_mm_per_source_pixel) - 0.5;
+            const double src_y = double(sample_surface_y) / double(preview_mm_per_source_pixel) - 0.5;
+            total += component_coverage_at_source(src_x, src_y, component_idx);
+        }
+        const float coverage = clamp01(total / float(sample_count));
+        halftone_cell_tone_cache.emplace(key, coverage);
+        return coverage;
+    };
+
     for (unsigned int y = 0; y < result.height; ++y) {
         for (unsigned int x = 0; x < result.width; ++x) {
+            const double src_x = (double(x) + 0.5) * double(width) / double(std::max(1u, result.width)) - 0.5;
+            const double src_y = (double(y) + 0.5) * double(height) / double(std::max(1u, result.height)) - 0.5;
             const std::array<unsigned char, 4> source_rgba_sample =
-                sample_texture_preview_rgba_bilinear(source_rgba, width, height, x, y, result.width, result.height);
+                sample_texture_preview_rgba_bilinear_at_source(source_rgba, width, height, src_x, src_y);
             const ColorRGBA blended_source_color =
                 composite_texture_mapping_color_over_background_for_preview(ColorRGBA(float(source_rgba_sample[0]) / 255.f,
                                                                                       float(source_rgba_sample[1]) / 255.f,
@@ -2143,8 +2489,10 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                 texture_preview_rgb_cache_key(source_rgb);
             const size_t idx = (size_t(y) * size_t(result.width) + size_t(x)) * 4;
 
-            auto cached_color = !use_raw_offsets && !use_binary_dithering ? simulated_color_cache.find(cache_key) : simulated_color_cache.end();
-            if (!use_raw_offsets && !use_binary_dithering && cached_color != simulated_color_cache.end()) {
+            auto cached_color = !use_raw_offsets && !use_binary_dithering && !use_halftone_dithering ?
+                simulated_color_cache.find(cache_key) :
+                simulated_color_cache.end();
+            if (!use_raw_offsets && !use_binary_dithering && !use_halftone_dithering && cached_color != simulated_color_cache.end()) {
                 result.rgba[idx + 0] = cached_color->second[0];
                 result.rgba[idx + 1] = cached_color->second[1];
                 result.rgba[idx + 2] = cached_color->second[2];
@@ -2173,11 +2521,33 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                 if (component_weights.size() == settings.component_colors.size())
                     component_weights = raw_offset_print_width_weights_for_texture_preview(settings, component_weights);
             } else {
-                if (use_binary_dithering && !binary_dither_candidates.empty()) {
+                if (use_halftone_dithering) {
+                    const std::vector<float> continuous_coverage =
+                        component_weights_for_texture_preview(settings, sample_rgba, false);
+                    uint32_t mask = 0;
+                    const float surface_x_mm = float((src_x + 0.5) * double(preview_mm_per_source_pixel));
+                    const float surface_y_mm = float((src_y + 0.5) * double(preview_mm_per_source_pixel));
+                    for (size_t component_idx = 0; component_idx < settings.component_colors.size() && component_idx < 31; ++component_idx) {
+                        const float angle_deg =
+                            halftone_screen_angle_deg_for_texture_preview(settings.filament_color_mode, component_idx);
+                        const float current_coverage = component_idx < continuous_coverage.size() ?
+                            clamp01(continuous_coverage[component_idx]) :
+                            0.f;
+                        const float coverage =
+                            halftone_cell_coverage(component_idx, surface_x_mm, surface_y_mm, angle_deg, current_coverage);
+                        if (halftone_screen_on_for_texture_preview(coverage,
+                                                                   surface_x_mm,
+                                                                   surface_y_mm,
+                                                                   settings.halftone_dot_size_mm,
+                                                                   angle_deg))
+                            mask |= uint32_t(1) << component_idx;
+                    }
+                    component_weights = halftone_component_visibility_weights_for_texture_preview(settings, mask);
+                } else if (use_binary_dithering && !binary_dither_candidates.empty()) {
                     std::array<float, 3> target_oklab = texture_preview_target_oklab(settings, sample_rgba);
                     const int clamped_method = std::clamp(settings.dithering_method,
                                                           int(TextureMappingZone::DitheringClosest),
-                                                          int(TextureMappingZone::DitheringHalftone));
+                                                          int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
                     if (clamped_method == int(TextureMappingZone::DitheringFloydSteinberg)) {
                         for (size_t axis = 0; axis < 3; ++axis)
                             target_oklab[axis] += floyd_error_current[x][axis];
@@ -2188,9 +2558,6 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                     if (clamped_method == int(TextureMappingZone::DitheringOrderedBayer)) {
                         thresholded_dither = true;
                         threshold = ordered_bayer_threshold_for_texture_preview(int(x), int(y)) + 0.5f;
-                    } else if (clamped_method == int(TextureMappingZone::DitheringHalftone)) {
-                        thresholded_dither = true;
-                        threshold = halftone_threshold_for_texture_preview(int(x), int(y), settings.halftone_dot_size_mm) + 0.5f;
                     }
 
                     const size_t candidate_idx =
@@ -2239,7 +2606,9 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
             const std::array<float, 3> simulated_rgb = activity > k_epsilon ?
                 mix_color_solver_components(settings.component_colors,
                                             component_weights,
-                                            color_solver_mix_model_from_index(settings.generic_solver_mix_model)) :
+                                            use_halftone_dithering ?
+                                                ColorSolverMixModel::PigmentPainter :
+                                                color_solver_mix_model_from_index(settings.generic_solver_mix_model)) :
                 std::array<float, 3>{ sample_rgba[0], sample_rgba[1], sample_rgba[2] };
 
             const std::array<unsigned char, 4> out_rgba = {
@@ -2248,7 +2617,7 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                 to_u8(simulated_rgb[2]),
                 255
             };
-            if (!use_raw_offsets && !use_binary_dithering)
+            if (!use_raw_offsets && !use_binary_dithering && !use_halftone_dithering)
                 simulated_color_cache.emplace(cache_key, out_rgba);
             result.rgba[idx + 0] = out_rgba[0];
             result.rgba[idx + 1] = out_rgba[1];
@@ -2258,7 +2627,7 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
         if (use_binary_dithering &&
             std::clamp(settings.dithering_method,
                        int(TextureMappingZone::DitheringClosest),
-                       int(TextureMappingZone::DitheringHalftone)) == int(TextureMappingZone::DitheringFloydSteinberg)) {
+                       int(TextureMappingZone::DitheringHalftoneIncreasedDetail)) == int(TextureMappingZone::DitheringFloydSteinberg)) {
             floyd_error_current.swap(floyd_error_next);
             std::fill(floyd_error_next.begin(), floyd_error_next.end(), std::array<float, 3>{ { 0.f, 0.f, 0.f } });
         }
@@ -2589,6 +2958,7 @@ const GUI::GLTexture *simulated_texture_preview_texture_for_filament(const Model
         texture_preview_simulation_settings_for_filament(filament_id, num_physical, texture_mgr, physical_colors);
     if (!settings.has_value())
         return &fallback_texture;
+    settings->texture_preview_mm_per_pixel = estimated_texture_preview_mm_per_pixel(model_volume);
 
     const ColorRGBA background_color = texture_mapping_background_color_for_preview(model_volume);
     const size_t simulation_signature = texture_preview_simulation_signature(model_volume, source_texture_signature, *settings);
@@ -3126,6 +3496,270 @@ bool build_texture_mapping_color_preview_model_for_state(
     return true;
 }
 
+float image_texture_halftone_preview_step_mm(const TexturePreviewSimulationSettings &settings)
+{
+    const float dot_size = std::clamp(settings.halftone_dot_size_mm,
+                                      TextureMappingZone::MinHalftoneDotSizeMm,
+                                      TextureMappingZone::MaxHalftoneDotSizeMm);
+    return std::clamp(dot_size * 0.125f, 0.18f, 0.75f);
+}
+
+int image_texture_halftone_preview_max_subdivision_steps(size_t triangle_count)
+{
+    if (triangle_count <= 200)
+        return 96;
+    if (triangle_count <= 2000)
+        return 48;
+    return 24;
+}
+
+uint64_t image_texture_halftone_cell_cache_key(size_t component_idx, int axis, int plane_bucket, int cell_x, int cell_y)
+{
+    uint64_t key = 1469598103934665603ull;
+    auto mix = [&key](uint64_t value) {
+        key ^= value;
+        key *= 1099511628211ull;
+    };
+    mix(uint64_t(component_idx));
+    mix(uint64_t(uint32_t(axis)));
+    mix(uint64_t(uint32_t(plane_bucket)));
+    mix(uint64_t(uint32_t(cell_x)));
+    mix(uint64_t(uint32_t(cell_y)));
+    return key;
+}
+
+bool build_image_texture_halftone_preview_geometry_for_state(
+    const indexed_triangle_set                              &its,
+    const std::vector<unsigned char>                        &source_rgba,
+    unsigned int                                             width,
+    unsigned int                                             height,
+    const std::vector<float>                                &texture_uvs_per_face,
+    const std::vector<uint8_t>                              &texture_uv_valid,
+    const std::vector<TriangleSelector::FacetStateTriangle> &state_triangles,
+    const TexturePreviewSimulationSettings                  &settings,
+    const ColorRGBA                                         &background_color,
+    const Transform3d                                       &world_matrix,
+    GUI::GLModel::Geometry                                  &geometry)
+{
+    if (state_triangles.empty() ||
+        width == 0 ||
+        height == 0 ||
+        source_rgba.size() < size_t(width) * size_t(height) * 4 ||
+        texture_uv_valid.size() < its.indices.size() ||
+        texture_uvs_per_face.size() < its.indices.size() * 6)
+        return false;
+
+    geometry.format = { GUI::GLModel::Geometry::EPrimitiveType::Triangles, GUI::GLModel::Geometry::EVertexLayout::P3N3C4 };
+    geometry.reserve_vertices(state_triangles.size() * 12);
+    geometry.reserve_indices(state_triangles.size() * 12);
+
+    const bool halftone_increased_detail =
+        settings.dithering_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail);
+    const float period = std::clamp(settings.halftone_dot_size_mm,
+                                    TextureMappingZone::MinHalftoneDotSizeMm,
+                                    TextureMappingZone::MaxHalftoneDotSizeMm);
+    const float target_step_mm = image_texture_halftone_preview_step_mm(settings);
+    const int max_subdivision_steps = image_texture_halftone_preview_max_subdivision_steps(state_triangles.size());
+    std::unordered_map<uint64_t, float> halftone_cell_tone_cache;
+    if (!halftone_increased_detail)
+        halftone_cell_tone_cache.reserve(std::min(state_triangles.size() * size_t(8), size_t(65536)));
+
+    auto source_coverage_at_uv = [&](const Vec2f &uv, size_t component_idx) {
+        const std::array<unsigned char, 4> source_rgba_sample =
+            sample_texture_preview_rgba_bilinear_at_source(source_rgba,
+                                                           width,
+                                                           height,
+                                                           double(uv.x()) * double(width) - 0.5,
+                                                           double(uv.y()) * double(height) - 0.5);
+        const ColorRGBA blended_source_color =
+            composite_texture_mapping_color_over_background_for_preview(ColorRGBA(float(source_rgba_sample[0]) / 255.f,
+                                                                                  float(source_rgba_sample[1]) / 255.f,
+                                                                                  float(source_rgba_sample[2]) / 255.f,
+                                                                                  float(source_rgba_sample[3]) / 255.f),
+                                                                        background_color);
+        const std::array<float, 4> sampled_rgba = {
+            blended_source_color.r(),
+            blended_source_color.g(),
+            blended_source_color.b(),
+            1.f
+        };
+        const std::vector<float> coverage = component_weights_for_texture_preview(settings, sampled_rgba, false);
+        return component_idx < coverage.size() ? clamp01(coverage[component_idx]) : 0.f;
+    };
+
+    auto interpolate_point = [](const std::array<Vec3f, 3> &vertices, const Vec3f &barycentric) {
+        return vertices[0] * barycentric.x() + vertices[1] * barycentric.y() + vertices[2] * barycentric.z();
+    };
+    auto interpolate_uv = [](const std::array<Vec2f, 3> &uvs, const Vec3f &barycentric) {
+        return uvs[0] * barycentric.x() + uvs[1] * barycentric.y() + uvs[2] * barycentric.z();
+    };
+    auto bary_from_lattice = [](int i, int j, int steps) {
+        const float inv_steps = 1.f / float(std::max(1, steps));
+        return Vec3f(1.f - float(i + j) * inv_steps, float(i) * inv_steps, float(j) * inv_steps);
+    };
+    auto bary_reasonable_for_uv = [](const Vec3f &barycentric) {
+        return barycentric.x() >= -0.25f && barycentric.y() >= -0.25f && barycentric.z() >= -0.25f &&
+               barycentric.x() <= 1.25f && barycentric.y() <= 1.25f && barycentric.z() <= 1.25f;
+    };
+
+    unsigned int vertex_index = 0;
+    for (const TriangleSelector::FacetStateTriangle &triangle : state_triangles) {
+        if (triangle.source_triangle < 0)
+            continue;
+
+        const size_t source_triangle = size_t(triangle.source_triangle);
+        if (source_triangle >= its.indices.size() ||
+            source_triangle >= texture_uv_valid.size() ||
+            texture_uv_valid[source_triangle] == 0)
+            continue;
+
+        const size_t uv_offset = source_triangle * 6;
+        if (uv_offset + 5 >= texture_uvs_per_face.size())
+            continue;
+
+        const stl_triangle_vertex_indices &source_indices = its.indices[source_triangle];
+        if (source_indices[0] < 0 || source_indices[1] < 0 || source_indices[2] < 0)
+            continue;
+        if (size_t(source_indices[0]) >= its.vertices.size() ||
+            size_t(source_indices[1]) >= its.vertices.size() ||
+            size_t(source_indices[2]) >= its.vertices.size())
+            continue;
+
+        const Vec3f source_p0 = its.vertices[size_t(source_indices[0])].cast<float>();
+        const Vec3f source_p1 = its.vertices[size_t(source_indices[1])].cast<float>();
+        const Vec3f source_p2 = its.vertices[size_t(source_indices[2])].cast<float>();
+        const std::array<Vec2f, 3> source_uvs = unwrap_triangle_uvs(
+            Vec2f(texture_uvs_per_face[uv_offset + 0], texture_uvs_per_face[uv_offset + 1]),
+            Vec2f(texture_uvs_per_face[uv_offset + 2], texture_uvs_per_face[uv_offset + 3]),
+            Vec2f(texture_uvs_per_face[uv_offset + 4], texture_uvs_per_face[uv_offset + 5]));
+
+        Vec3f normal = (triangle.vertices[1] - triangle.vertices[0]).cross(triangle.vertices[2] - triangle.vertices[0]);
+        const float normal_len = normal.norm();
+        if (normal_len <= k_epsilon)
+            continue;
+        normal /= normal_len;
+        const Vec3f offset = normal * k_preview_offset;
+
+        const std::array<Vec3f, 3> leaf_vertices = { triangle.vertices[0], triangle.vertices[1], triangle.vertices[2] };
+        std::array<Vec2f, 3> leaf_uvs;
+        bool valid_leaf = true;
+        for (size_t vertex_idx = 0; vertex_idx < leaf_vertices.size(); ++vertex_idx) {
+            Vec3f barycentric = Vec3f::Zero();
+            if (!barycentric_weights(leaf_vertices[vertex_idx], source_p0, source_p1, source_p2, barycentric)) {
+                valid_leaf = false;
+                break;
+            }
+            leaf_uvs[vertex_idx] = interpolate_uv(source_uvs, barycentric);
+        }
+        if (!valid_leaf)
+            continue;
+
+        const std::array<Vec3f, 3> world_vertices = {
+            (world_matrix * leaf_vertices[0].cast<double>()).cast<float>(),
+            (world_matrix * leaf_vertices[1].cast<double>()).cast<float>(),
+            (world_matrix * leaf_vertices[2].cast<double>()).cast<float>()
+        };
+        Vec3f world_normal = (world_vertices[1] - world_vertices[0]).cross(world_vertices[2] - world_vertices[0]);
+        const float world_normal_len = world_normal.norm();
+        if (world_normal_len <= k_epsilon)
+            world_normal = normal;
+        else
+            world_normal /= world_normal_len;
+
+        const int surface_axis = halftone_surface_axis_for_texture_preview(world_normal);
+        const std::array<Vec2f, 3> surface_vertices = {
+            halftone_surface_coords_for_texture_preview(world_vertices[0], surface_axis),
+            halftone_surface_coords_for_texture_preview(world_vertices[1], surface_axis),
+            halftone_surface_coords_for_texture_preview(world_vertices[2], surface_axis)
+        };
+        const float max_edge_mm = std::max({ (world_vertices[1] - world_vertices[0]).norm(),
+                                             (world_vertices[2] - world_vertices[1]).norm(),
+                                             (world_vertices[0] - world_vertices[2]).norm() });
+        if (!std::isfinite(max_edge_mm) || max_edge_mm <= k_epsilon)
+            continue;
+        const int steps = std::clamp(int(std::ceil(max_edge_mm / std::max(target_step_mm, k_epsilon))), 1, max_subdivision_steps);
+
+        auto color_at_bary = [&](const Vec3f &barycentric) {
+            const Vec2f uv = interpolate_uv(leaf_uvs, barycentric);
+            const Vec3f world_point = interpolate_point(world_vertices, barycentric);
+            const Vec2f surface_coord = halftone_surface_coords_for_texture_preview(world_point, surface_axis);
+            const float plane_coord = halftone_surface_plane_coord_for_texture_preview(world_point, surface_axis);
+            uint32_t mask = 0;
+            for (size_t component_idx = 0; component_idx < settings.component_colors.size() && component_idx < 31; ++component_idx) {
+                const float angle_deg =
+                    halftone_screen_angle_deg_for_texture_preview(settings.filament_color_mode, component_idx);
+                float coverage = source_coverage_at_uv(uv, component_idx);
+                if (!halftone_increased_detail && period > k_epsilon) {
+                    constexpr float pi = 3.14159265358979323846f;
+                    const float radians = angle_deg * pi / 180.f;
+                    const float c = std::cos(radians);
+                    const float s = std::sin(radians);
+                    const float screen_x = c * surface_coord.x() + s * surface_coord.y();
+                    const float screen_y = -s * surface_coord.x() + c * surface_coord.y();
+                    const int cell_x = int(std::floor(screen_x / period));
+                    const int cell_y = int(std::floor(screen_y / period));
+                    const float plane_bucket_size = std::max(0.5f, period * 0.5f);
+                    const int plane_bucket = int(std::floor(plane_coord / plane_bucket_size));
+                    const uint64_t key =
+                        image_texture_halftone_cell_cache_key(component_idx, surface_axis, plane_bucket, cell_x, cell_y);
+                    const auto cached = halftone_cell_tone_cache.find(key);
+                    if (cached != halftone_cell_tone_cache.end()) {
+                        coverage = cached->second;
+                    } else {
+                        const float center_screen_x = (float(cell_x) + 0.5f) * period;
+                        const float center_screen_y = (float(cell_y) + 0.5f) * period;
+                        const Vec2f center_surface(c * center_screen_x - s * center_screen_y,
+                                                   s * center_screen_x + c * center_screen_y);
+                        Vec3f center_bary = Vec3f::Zero();
+                        Vec2f center_uv = uv;
+                        if (barycentric_weights_2d(center_surface,
+                                                   surface_vertices[0],
+                                                   surface_vertices[1],
+                                                   surface_vertices[2],
+                                                   center_bary) &&
+                            bary_reasonable_for_uv(center_bary))
+                            center_uv = interpolate_uv(leaf_uvs, center_bary);
+                        coverage = source_coverage_at_uv(center_uv, component_idx);
+                        halftone_cell_tone_cache.emplace(key, coverage);
+                    }
+                }
+                if (halftone_screen_on_for_texture_preview(coverage,
+                                                           surface_coord.x(),
+                                                           surface_coord.y(),
+                                                           period,
+                                                           angle_deg))
+                    mask |= uint32_t(1) << component_idx;
+            }
+            return halftone_preview_color_from_mask(settings, mask);
+        };
+
+        auto emit_subtriangle = [&](const Vec3f &b0, const Vec3f &b1, const Vec3f &b2) {
+            const Vec3f centroid_bary = (b0 + b1 + b2) / 3.f;
+            const ColorRGBA color = color_at_bary(centroid_bary);
+            geometry.add_vertex(interpolate_point(leaf_vertices, b0) + offset, normal, color);
+            geometry.add_vertex(interpolate_point(leaf_vertices, b1) + offset, normal, color);
+            geometry.add_vertex(interpolate_point(leaf_vertices, b2) + offset, normal, color);
+            geometry.add_triangle(vertex_index, vertex_index + 1, vertex_index + 2);
+            vertex_index += 3;
+        };
+
+        for (int i = 0; i < steps; ++i) {
+            for (int j = 0; j < steps - i; ++j) {
+                const Vec3f b0 = bary_from_lattice(i, j, steps);
+                const Vec3f b1 = bary_from_lattice(i + 1, j, steps);
+                const Vec3f b2 = bary_from_lattice(i, j + 1, steps);
+                emit_subtriangle(b0, b1, b2);
+                if (j < steps - i - 1) {
+                    const Vec3f b3 = bary_from_lattice(i + 1, j + 1, steps);
+                    emit_subtriangle(b1, b3, b2);
+                }
+            }
+        }
+    }
+
+    return !geometry.is_empty();
+}
+
 size_t texture_preview_state_triangles_signature(const std::vector<TriangleSelector::FacetStateTriangle> &state_triangles)
 {
     size_t signature = 1469598103934665603ull;
@@ -3208,6 +3842,24 @@ size_t texture_preview_color_facets_source_signature(const ModelVolume          
     mix(background_signature_component(background.r()));
     mix(background_signature_component(background.g()));
     mix(background_signature_component(background.b()));
+    return signature;
+}
+
+size_t texture_preview_image_halftone_source_signature(const ModelVolume                                      &model_volume,
+                                                       const std::vector<TriangleSelector::FacetStateTriangle> &state_triangles,
+                                                       const Transform3d                                      &world_matrix)
+{
+    size_t signature = model_volume_texture_preview_signature(model_volume);
+    auto mix = [&signature](size_t value) {
+        signature ^= value + 0x9e3779b97f4a7c15ull + (signature << 6) + (signature >> 2);
+    };
+    mix(reinterpret_cast<size_t>(model_volume.mesh_ptr().get()));
+    mix(model_volume.mesh().its.vertices.size());
+    mix(model_volume.mesh().its.indices.size());
+    mix(texture_preview_state_triangles_signature(state_triangles));
+    for (int row = 0; row < 4; ++row)
+        for (int col = 0; col < 4; ++col)
+            mix(std::hash<int>{}(int(std::lround(world_matrix(row, col) * 1000000.0))));
     return signature;
 }
 
@@ -3345,6 +3997,68 @@ bool build_simulated_texture_mapping_color_preview_model_for_state(
                                                                                                                &settings,
                                                                                                                background_color,
                                                                                                                result.geometry);
+                                                        return result;
+                                                    },
+                                                    out_model);
+}
+
+bool build_simulated_image_texture_halftone_preview_model_for_state(
+    const ModelVolume                                      &model_volume,
+    const std::vector<TriangleSelector::FacetStateTriangle> &state_triangles,
+    unsigned int                                            filament_id,
+    const TexturePreviewSimulationSettings                  &simulation_settings,
+    const Transform3d                                      &world_matrix,
+    size_t                                                   preview_owner_key,
+    GUI::GLModel                                            &out_model)
+{
+    if (!model_volume_has_texture_preview_data(model_volume) ||
+        state_triangles.empty() ||
+        !texture_preview_uses_halftone_dithering(simulation_settings))
+        return false;
+
+    const size_t source_signature =
+        texture_preview_image_halftone_source_signature(model_volume, state_triangles, world_matrix);
+    const size_t simulation_signature = texture_preview_simulation_signature(model_volume, source_signature, simulation_settings);
+    const size_t cache_key = texture_preview_vertex_color_simulation_cache_key(model_volume, filament_id, 3u, preview_owner_key);
+    std::shared_ptr<const TriangleMesh> mesh = model_volume.mesh_ptr();
+    std::vector<unsigned char> source_rgba(model_volume.imported_texture_rgba.begin(),
+                                           model_volume.imported_texture_rgba.end());
+    std::vector<float> texture_uvs_per_face(model_volume.imported_texture_uvs_per_face.begin(),
+                                            model_volume.imported_texture_uvs_per_face.end());
+    std::vector<uint8_t> texture_uv_valid(model_volume.imported_texture_uv_valid.begin(),
+                                          model_volume.imported_texture_uv_valid.end());
+    const unsigned int width = model_volume.imported_texture_width;
+    const unsigned int height = model_volume.imported_texture_height;
+    std::vector<TriangleSelector::FacetStateTriangle> triangles = state_triangles;
+    const ColorRGBA background_color = texture_mapping_background_color_for_preview(model_volume);
+    TexturePreviewSimulationSettings settings = simulation_settings;
+    return consume_or_queue_vertex_color_simulation(cache_key,
+                                                    simulation_signature,
+                                                    [simulation_signature,
+                                                     mesh = std::move(mesh),
+                                                     source_rgba = std::move(source_rgba),
+                                                     width,
+                                                     height,
+                                                     texture_uvs_per_face = std::move(texture_uvs_per_face),
+                                                     texture_uv_valid = std::move(texture_uv_valid),
+                                                     triangles = std::move(triangles),
+                                                     background_color,
+                                                     world_matrix,
+                                                     settings = std::move(settings)]() mutable {
+                                                        TexturePreviewVertexColorSimulationResult result;
+                                                        result.signature = simulation_signature;
+                                                        prepare_texture_preview_simulation_settings(settings);
+                                                        build_image_texture_halftone_preview_geometry_for_state(mesh->its,
+                                                                                                                source_rgba,
+                                                                                                                width,
+                                                                                                                height,
+                                                                                                                texture_uvs_per_face,
+                                                                                                                texture_uv_valid,
+                                                                                                                triangles,
+                                                                                                                settings,
+                                                                                                                background_color,
+                                                                                                                world_matrix,
+                                                                                                                result.geometry);
                                                         return result;
                                                     },
                                                     out_model);
@@ -3877,6 +4591,16 @@ bool texture_preview_simulation_enabled_for_filament(unsigned int               
     return texture_preview_simulation_settings_for_filament(filament_id, num_physical, texture_mgr, physical_colors).has_value();
 }
 
+bool texture_preview_halftone_simulation_enabled_for_filament(unsigned int                 filament_id,
+                                                              size_t                       num_physical,
+                                                              const TextureMappingManager *texture_mgr)
+{
+    const std::vector<std::string> physical_colors = physical_filament_colors_for_texture_preview(num_physical);
+    std::optional<TexturePreviewSimulationSettings> settings =
+        texture_preview_simulation_settings_for_filament(filament_id, num_physical, texture_mgr, physical_colors);
+    return settings.has_value() && texture_preview_uses_halftone_dithering(*settings);
+}
+
 bool texture_preview_simulation_enabled_for_all_filaments(const std::vector<unsigned int> &filament_ids,
                                                           size_t                          num_physical,
                                                           const TextureMappingManager    *texture_mgr)
@@ -3913,11 +4637,16 @@ bool build_mmu_texture_preview_models(
     if (!model_volume_has_texture_preview_data(model_volume))
         return false;
 
+    const std::vector<std::string> physical_colors = physical_filament_colors_for_texture_preview(num_physical);
     bool built_any = false;
     for (size_t state_id = 0; state_id < triangles_per_type.size(); ++state_id) {
         const unsigned int filament_id = filament_id_for_state(state_id, base_filament_id);
         const TextureMappingZone *zone = zone_for_filament(filament_id, num_physical, texture_mgr);
         if (zone == nullptr || !is_image_zone(*zone))
+            continue;
+        std::optional<TexturePreviewSimulationSettings> simulation_settings =
+            texture_preview_simulation_settings_for_filament(filament_id, num_physical, texture_mgr, physical_colors);
+        if (simulation_settings && texture_preview_uses_halftone_dithering(*simulation_settings))
             continue;
 
         GUI::GLModel model;
@@ -3995,12 +4724,23 @@ bool build_mmu_vertex_color_preview_models(
             const bool has_texture_mapping_color_preview =
                 has_texture_mapping_color_override || model_volume_has_texture_mapping_color_preview_data(model_volume);
             const bool has_texture_preview = model_volume_has_texture_preview_data(model_volume);
-            if (!has_texture_mapping_color_preview && (has_texture_preview || !model_volume_has_vertex_color_preview_data(model_volume)))
-                continue;
-
             std::optional<TexturePreviewSimulationSettings> simulation_settings =
                 texture_preview_simulation_settings_for_filament(filament_id, num_physical, texture_mgr, physical_colors);
-            if (has_texture_mapping_color_preview) {
+            const bool has_image_halftone_preview =
+                has_texture_preview &&
+                !has_texture_mapping_color_preview &&
+                simulation_settings &&
+                texture_preview_uses_halftone_dithering(*simulation_settings);
+            if (has_image_halftone_preview) {
+                if (!build_simulated_image_texture_halftone_preview_model_for_state(model_volume,
+                                                                                    triangles_per_type[state_id],
+                                                                                    filament_id,
+                                                                                    *simulation_settings,
+                                                                                    world_matrix,
+                                                                                    preview_owner_key,
+                                                                                    model))
+                    continue;
+            } else if (has_texture_mapping_color_preview) {
                 const ColorFacetsAnnotation *preview_override =
                     has_texture_mapping_color_override ? texture_mapping_color_facets_override : nullptr;
                 if (simulation_settings) {
@@ -4026,6 +4766,8 @@ bool build_mmu_vertex_color_preview_models(
                         continue;
                 }
             } else {
+                if (has_texture_preview || !model_volume_has_vertex_color_preview_data(model_volume))
+                    continue;
                 if (simulation_settings) {
                     if (!build_simulated_vertex_color_preview_model_for_state(model_volume,
                                                                               triangles_per_type[state_id],
@@ -4213,7 +4955,8 @@ size_t texture_preview_settings_signature(size_t num_physical, const TextureMapp
         signature_mix(std::hash<int>{}(zone.use_legacy_fixed_color_mode ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.dithering_enabled ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.dithering_method));
-        if (zone.dithering_method == int(TextureMappingZone::DitheringHalftone))
+        if (zone.dithering_method == int(TextureMappingZone::DitheringHalftone) ||
+            zone.dithering_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail))
             signature_mix_float(zone.halftone_dot_size_mm, 1000.f);
         else
             signature_mix_float(zone.dithering_resolution_mm, 1000.f);
