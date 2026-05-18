@@ -71,6 +71,9 @@ void clear_texture_preview_simulation_cache();
 bool texture_preview_simulation_enabled_for_filament(unsigned int                 filament_id,
                                                      size_t                       num_physical,
                                                      const TextureMappingManager *texture_mgr);
+bool texture_preview_halftone_simulation_enabled_for_filament(unsigned int                 filament_id,
+                                                              size_t                       num_physical,
+                                                              const TextureMappingManager *texture_mgr);
 bool texture_preview_simulation_enabled_for_all_filaments(const std::vector<unsigned int> &filament_ids,
                                                           size_t                          num_physical,
                                                           const TextureMappingManager    *texture_mgr);

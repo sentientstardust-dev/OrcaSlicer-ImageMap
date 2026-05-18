@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -32,6 +33,7 @@ struct TextureMappingOffsetWeightField {
     std::vector<std::vector<uint32_t>> buckets;
     std::vector<float> fallback_weights;
     bool raw_component_weights_from_texture { false };
+    bool binary_dithered { false };
 
     bool empty() const
     {
@@ -50,6 +52,9 @@ struct TextureMappingOffsetContext {
     bool                            object_center_mode { false };
     bool                            high_resolution_texture_sampling { false };
     bool                            compact_offset_mode { false };
+    bool                            dithering_enabled { false };
+    bool                            halftone_dithering_enabled { false };
+    bool                            halftone_increased_detail_enabled { false };
     bool                            nonlinear_offset_adjustment { false };
     Point                           object_center;
     unsigned int                    active_component_id { 0 };
@@ -61,6 +66,9 @@ struct TextureMappingOffsetContext {
     float                           inset_strength_reference_mm { 0.f };
     float                           fade_factor { 1.f };
     float                           max_width_delta_mm { 0.f };
+    float                           dither_pitch_mm { TextureMappingZone::DefaultDitheringResolutionMm };
+    float                           halftone_dot_size_mm { TextureMappingZone::DefaultHalftoneDotSizeMm };
+    float                           active_halftone_angle_deg { 0.f };
     float                           active_component_strength_factor { 1.f };
     float                           active_component_minimum_offset_factor { 0.f };
     float                           active_component_td_width_factor { 1.f };
@@ -87,7 +95,9 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
 float texture_mapping_offset_surface_inset_mm(const TextureMappingOffsetContext &context,
                                               const Point                       &point,
                                               double                             inward_x,
-                                              double                             inward_y);
+                                              double                             inward_y,
+                                              float                              surface_u_mm = std::numeric_limits<float>::quiet_NaN(),
+                                              float                              surface_v_mm = std::numeric_limits<float>::quiet_NaN());
 
 } // namespace Slic3r
 

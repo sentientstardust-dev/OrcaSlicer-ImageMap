@@ -1085,6 +1085,10 @@ public:
                                         int generic_solver_lookup_mode,
                                         int generic_solver_mode,
                                         int generic_solver_mix_model,
+                                        bool dithering_enabled,
+                                        int dithering_method,
+                                        float dithering_resolution_mm,
+                                        float halftone_dot_size_mm,
                                         const TextureMappingManager &texture_mapping_zones,
                                         const TextureMappingGlobalSettings &global_settings,
                                         const TextureMappingPrimeTowerImage &prime_tower_image,
@@ -1312,6 +1316,76 @@ public:
         m_compact_offset_mode_checkbox->SetToolTip(
             _L("Normalizes sampled filament offsets so the strongest active color uses the full maximum line width."));
         experimental_box->Add(m_compact_offset_mode_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        auto *dithering_row = new wxBoxSizer(wxHORIZONTAL);
+        m_dithering_enabled_checkbox = new wxCheckBox(experimental_page, wxID_ANY, _L("Enable dithering"));
+        m_dithering_enabled_checkbox->SetValue(dithering_enabled);
+        dithering_row->Add(m_dithering_enabled_checkbox, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        wxArrayString dithering_choices;
+        dithering_choices.Add(_L("Closest combination (no dithering)"));
+        dithering_choices.Add(_L("Floyd-Steinberg"));
+        dithering_choices.Add(_L("Ordered Bayer"));
+        dithering_choices.Add(_L("Halftone"));
+        dithering_choices.Add(_L("Halftone (increased detail)"));
+        m_dithering_method_choice = new wxChoice(experimental_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, dithering_choices);
+        m_dithering_method_choice->SetSelection(std::clamp(dithering_method,
+                                                           int(TextureMappingZone::DitheringClosest),
+                                                           int(TextureMappingZone::DitheringHalftoneIncreasedDetail)));
+        dithering_row->Add(m_dithering_method_choice, 1, wxALIGN_CENTER_VERTICAL);
+        m_dithering_enabled_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+            update_dithering_options_visibility(true);
+        });
+        m_dithering_method_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) {
+            update_dithering_options_visibility(true);
+        });
+        experimental_box->Add(dithering_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        m_dithering_resolution_panel = new wxPanel(experimental_page, wxID_ANY);
+        auto *dithering_resolution_row = new wxBoxSizer(wxHORIZONTAL);
+        m_dithering_resolution_panel->SetSizer(dithering_resolution_row);
+        dithering_resolution_row->Add(new wxStaticText(m_dithering_resolution_panel, wxID_ANY, _L("Horizontal resolution")),
+                                      0,
+                                      wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                                      gap);
+        m_dithering_resolution_spin =
+            new wxSpinCtrlDouble(m_dithering_resolution_panel,
+                                 wxID_ANY,
+                                 wxEmptyString,
+                                 wxDefaultPosition,
+                                 wxSize(FromDIP(84), -1),
+                                 wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER,
+                                 double(TextureMappingZone::MinDitheringResolutionMm),
+                                 double(TextureMappingZone::MaxDitheringResolutionMm),
+                                 std::clamp(double(dithering_resolution_mm),
+                                            double(TextureMappingZone::MinDitheringResolutionMm),
+                                            double(TextureMappingZone::MaxDitheringResolutionMm)),
+                                 0.01);
+        m_dithering_resolution_spin->SetDigits(2);
+        dithering_resolution_row->Add(m_dithering_resolution_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+        dithering_resolution_row->Add(new wxStaticText(m_dithering_resolution_panel, wxID_ANY, _L("mm")), 0, wxALIGN_CENTER_VERTICAL);
+        experimental_box->Add(m_dithering_resolution_panel, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        m_halftone_dot_size_panel = new wxPanel(experimental_page, wxID_ANY);
+        auto *halftone_dot_size_row = new wxBoxSizer(wxHORIZONTAL);
+        m_halftone_dot_size_panel->SetSizer(halftone_dot_size_row);
+        halftone_dot_size_row->Add(new wxStaticText(m_halftone_dot_size_panel, wxID_ANY, _L("Halftone dot size")),
+                                   0,
+                                   wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                                   gap);
+        m_halftone_dot_size_spin =
+            new wxSpinCtrlDouble(m_halftone_dot_size_panel,
+                                 wxID_ANY,
+                                 wxEmptyString,
+                                 wxDefaultPosition,
+                                 wxSize(FromDIP(96), -1),
+                                 wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER,
+                                 double(TextureMappingZone::MinHalftoneDotSizeMm),
+                                 double(TextureMappingZone::MaxHalftoneDotSizeMm),
+                                 std::clamp(double(halftone_dot_size_mm),
+                                            double(TextureMappingZone::MinHalftoneDotSizeMm),
+                                            double(TextureMappingZone::MaxHalftoneDotSizeMm)),
+                                 0.1);
+        m_halftone_dot_size_spin->SetDigits(2);
+        halftone_dot_size_row->Add(m_halftone_dot_size_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+        halftone_dot_size_row->Add(new wxStaticText(m_halftone_dot_size_panel, wxID_ANY, _L("mm")), 0, wxALIGN_CENTER_VERTICAL);
+        experimental_box->Add(m_halftone_dot_size_panel, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
         m_use_legacy_fixed_color_mode_checkbox = new wxCheckBox(experimental_page, wxID_ANY, _L("Use legacy fixed color mode"));
         m_use_legacy_fixed_color_mode_checkbox->SetValue(use_legacy_fixed_color_mode);
         experimental_box->Add(m_use_legacy_fixed_color_mode_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
@@ -1375,6 +1449,7 @@ public:
             update_minimum_visibility_offset_visibility(true);
         });
         experimental_box->Add(minimum_visibility_offset_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        update_dithering_options_visibility(false);
         update_minimum_visibility_offset_visibility(false);
         experimental_root->Add(experimental_box, 0, wxEXPAND | wxALL, gap);
 
@@ -1556,9 +1631,34 @@ public:
     bool seam_hiding() const { return m_seam_hiding_checkbox && m_seam_hiding_checkbox->GetValue(); }
     bool nonlinear_offset_adjustment() const { return m_nonlinear_offset_adjustment_checkbox && m_nonlinear_offset_adjustment_checkbox->GetValue(); }
     bool perimeter_path_modulation() const { return m_perimeter_path_modulation_checkbox && m_perimeter_path_modulation_checkbox->GetValue(); }
-    bool compact_offset_mode() const { return m_compact_offset_mode_checkbox && m_compact_offset_mode_checkbox->GetValue(); }
+    bool compact_offset_mode() const { return dithering_enabled() || (m_compact_offset_mode_checkbox && m_compact_offset_mode_checkbox->GetValue()); }
     bool use_legacy_fixed_color_mode() const { return m_use_legacy_fixed_color_mode_checkbox && m_use_legacy_fixed_color_mode_checkbox->GetValue(); }
     bool high_speed_image_texture_sampling() const { return m_high_speed_image_texture_sampling_checkbox == nullptr || m_high_speed_image_texture_sampling_checkbox->GetValue(); }
+    bool dithering_enabled() const { return m_dithering_enabled_checkbox && m_dithering_enabled_checkbox->GetValue(); }
+    int dithering_method() const
+    {
+        return m_dithering_method_choice ?
+            std::clamp(m_dithering_method_choice->GetSelection(),
+                       int(TextureMappingZone::DitheringClosest),
+                       int(TextureMappingZone::DitheringHalftoneIncreasedDetail)) :
+            TextureMappingZone::DefaultDitheringMethod;
+    }
+    float dithering_resolution_mm() const
+    {
+        return float(std::clamp(m_dithering_resolution_spin != nullptr ?
+                                    m_dithering_resolution_spin->GetValue() :
+                                    double(TextureMappingZone::DefaultDitheringResolutionMm),
+                                double(TextureMappingZone::MinDitheringResolutionMm),
+                                double(TextureMappingZone::MaxDitheringResolutionMm)));
+    }
+    float halftone_dot_size_mm() const
+    {
+        return float(std::clamp(m_halftone_dot_size_spin != nullptr ?
+                                    m_halftone_dot_size_spin->GetValue() :
+                                    double(TextureMappingZone::DefaultHalftoneDotSizeMm),
+                                double(TextureMappingZone::MinHalftoneDotSizeMm),
+                                double(TextureMappingZone::MaxHalftoneDotSizeMm)));
+    }
     bool minimum_visibility_offset_enabled() const
     {
         return m_minimum_visibility_offset_checkbox && m_minimum_visibility_offset_checkbox->GetValue();
@@ -1814,6 +1914,19 @@ private:
         m_options_book->SetMinSize(wxSize(FromDIP(420), max_height));
     }
 
+    void layout_current_options_page()
+    {
+        if (m_options_book == nullptr)
+            return;
+        const int selection = m_options_book->GetSelection();
+        if (selection >= 0 && selection < int(m_options_book->GetPageCount())) {
+            wxWindow *page = m_options_book->GetPage(size_t(selection));
+            if (page != nullptr)
+                page->Layout();
+        }
+        m_options_book->Layout();
+    }
+
     void update_strength_offsets_visibility(bool fit_dialog)
     {
         if (m_strength_offsets_toggle_button != nullptr)
@@ -1847,6 +1960,38 @@ private:
         }
     }
 
+    void update_dithering_options_visibility(bool fit_dialog)
+    {
+        const bool enabled = m_dithering_enabled_checkbox != nullptr && m_dithering_enabled_checkbox->GetValue();
+        const int method = m_dithering_method_choice != nullptr ?
+            std::clamp(m_dithering_method_choice->GetSelection(),
+                       int(TextureMappingZone::DitheringClosest),
+                       int(TextureMappingZone::DitheringHalftoneIncreasedDetail)) :
+            TextureMappingZone::DefaultDitheringMethod;
+        const bool halftone = enabled &&
+            (method == int(TextureMappingZone::DitheringHalftone) ||
+             method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+        if (m_dithering_method_choice != nullptr)
+            m_dithering_method_choice->Enable(enabled);
+        if (m_dithering_resolution_panel != nullptr)
+            m_dithering_resolution_panel->Show(enabled && !halftone);
+        if (m_halftone_dot_size_panel != nullptr)
+            m_halftone_dot_size_panel->Show(halftone);
+        if (m_compact_offset_mode_checkbox != nullptr) {
+            if (enabled)
+                m_compact_offset_mode_checkbox->SetValue(true);
+            m_compact_offset_mode_checkbox->Enable(!enabled);
+        }
+        layout_current_options_page();
+        if (!fit_dialog)
+            return;
+        update_options_book_min_size();
+        if (GetSizer() != nullptr) {
+            Layout();
+            Fit();
+        }
+    }
+
     wxChoice *m_options_tab_choice {nullptr};
     wxSimplebook *m_options_book {nullptr};
     wxChoice *m_texture_mapping_mode_choice {nullptr};
@@ -1864,6 +2009,12 @@ private:
     wxCheckBox *m_nonlinear_offset_adjustment_checkbox {nullptr};
     wxCheckBox *m_perimeter_path_modulation_checkbox {nullptr};
     wxCheckBox *m_compact_offset_mode_checkbox {nullptr};
+    wxCheckBox *m_dithering_enabled_checkbox {nullptr};
+    wxChoice *m_dithering_method_choice {nullptr};
+    wxPanel *m_dithering_resolution_panel {nullptr};
+    wxSpinCtrlDouble *m_dithering_resolution_spin {nullptr};
+    wxPanel *m_halftone_dot_size_panel {nullptr};
+    wxSpinCtrlDouble *m_halftone_dot_size_spin {nullptr};
     wxCheckBox *m_use_legacy_fixed_color_mode_checkbox {nullptr};
     wxCheckBox *m_high_speed_image_texture_sampling_checkbox {nullptr};
     wxCheckBox *m_minimum_visibility_offset_checkbox {nullptr};
@@ -5979,6 +6130,10 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.generic_solver_lookup_mode,
                                                     updated.generic_solver_mode,
                                                     updated.generic_solver_mix_model,
+                                                    updated.dithering_enabled,
+                                                    updated.dithering_method,
+                                                    updated.dithering_resolution_mm,
+                                                    updated.halftone_dot_size_mm,
                                                     bundle->texture_mapping_zones,
                                                     bundle->texture_mapping_global_settings,
                                                     wxGetApp().model().texture_mapping_prime_tower_image,
@@ -6009,6 +6164,12 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.compact_offset_mode = dlg.compact_offset_mode();
             updated.use_legacy_fixed_color_mode = dlg.use_legacy_fixed_color_mode();
             updated.high_speed_image_texture_sampling = dlg.high_speed_image_texture_sampling();
+            updated.dithering_enabled = dlg.dithering_enabled();
+            updated.dithering_method = dlg.dithering_method();
+            updated.dithering_resolution_mm = dlg.dithering_resolution_mm();
+            updated.halftone_dot_size_mm = dlg.halftone_dot_size_mm();
+            if (updated.dithering_enabled)
+                updated.compact_offset_mode = true;
             updated.minimum_visibility_offset_enabled = dlg.minimum_visibility_offset_enabled();
             updated.minimum_visibility_offset_pct = dlg.minimum_visibility_offset_pct();
             updated.generic_solver_lookup_mode = dlg.generic_solver_lookup_mode();

@@ -73,6 +73,14 @@ struct TextureMappingZone
         GenericSolverPigmentPainter = 0
     };
 
+    enum DitheringMethod : uint8_t {
+        DitheringClosest = 0,
+        DitheringFloydSteinberg = 1,
+        DitheringOrderedBayer = 2,
+        DitheringHalftone = 3,
+        DitheringHalftoneIncreasedDetail = 4
+    };
+
     enum TransmissionDistanceCalibrationMode : uint8_t {
         TDCalibrationNone = 0,
         TDCalibrationAbsolute = 1,
@@ -103,11 +111,19 @@ struct TextureMappingZone
     static constexpr int   DefaultGenericSolverLookupMode = int(GenericSolverClosestMix);
     static constexpr int   DefaultGenericSolverMode = int(GenericSolverV2);
     static constexpr int   DefaultGenericSolverMixModel = int(GenericSolverPigmentPainter);
+    static constexpr bool  DefaultDitheringEnabled = false;
+    static constexpr int   DefaultDitheringMethod = int(DitheringHalftone);
+    static constexpr float MinDitheringResolutionMm = 0.04f;
+    static constexpr float MaxDitheringResolutionMm = 10.f;
+    static constexpr float DefaultDitheringResolutionMm = 0.08f;
+    static constexpr float MinHalftoneDotSizeMm = 0.08f;
+    static constexpr float MaxHalftoneDotSizeMm = 50.f;
+    static constexpr float DefaultHalftoneDotSizeMm = 0.8f;
     static constexpr float DefaultContrastPct = 100.f;
     static constexpr bool  DefaultHighResolutionSampling = true;
     static constexpr float DefaultToneGamma = 1.f;
     static constexpr int   DefaultTransmissionDistanceCalibrationMode = int(TDCalibrationAbsolute);
-    static constexpr bool  DefaultPreviewSimulateColors = false;
+    static constexpr bool  DefaultPreviewSimulateColors = true;
     static constexpr bool  DefaultPreviewLimitResolution = true;
     static constexpr bool  DefaultAutoAdjustFilamentSelection = true;
 
@@ -148,6 +164,10 @@ struct TextureMappingZone
     int         generic_solver_lookup_mode = DefaultGenericSolverLookupMode;
     int         generic_solver_mode = DefaultGenericSolverMode;
     int         generic_solver_mix_model = DefaultGenericSolverMixModel;
+    bool        dithering_enabled = DefaultDitheringEnabled;
+    int         dithering_method = DefaultDitheringMethod;
+    float       dithering_resolution_mm = DefaultDitheringResolutionMm;
+    float       halftone_dot_size_mm = DefaultHalftoneDotSizeMm;
     float       contrast_pct = DefaultContrastPct;
     bool        high_resolution_sampling = DefaultHighResolutionSampling;
     float       tone_gamma = DefaultToneGamma;
@@ -194,6 +214,10 @@ struct TextureMappingZone
         generic_solver_lookup_mode = DefaultGenericSolverLookupMode;
         generic_solver_mode = DefaultGenericSolverMode;
         generic_solver_mix_model = DefaultGenericSolverMixModel;
+        dithering_enabled = DefaultDitheringEnabled;
+        dithering_method = DefaultDitheringMethod;
+        dithering_resolution_mm = DefaultDitheringResolutionMm;
+        halftone_dot_size_mm = DefaultHalftoneDotSizeMm;
         contrast_pct = DefaultContrastPct;
         high_resolution_sampling = DefaultHighResolutionSampling;
         tone_gamma = DefaultToneGamma;

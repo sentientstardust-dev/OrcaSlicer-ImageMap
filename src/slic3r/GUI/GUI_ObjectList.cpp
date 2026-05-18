@@ -91,6 +91,51 @@ static int filaments_count()
     return count;
 }
 
+static PresetBundle *refresh_texture_mapping_zones_for_object_list(size_t physical_filaments_count)
+{
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    if (bundle == nullptr)
+        return nullptr;
+
+    const ConfigOptionStrings *colors = bundle->project_config.option<ConfigOptionStrings>("filament_colour", false);
+    if (colors == nullptr)
+        return bundle;
+
+    std::vector<std::string> physical_colors = colors->values;
+    physical_colors.resize(physical_filaments_count, "#26A69A");
+    const std::string serialized = bundle->project_config.has("texture_mapping_definitions") ?
+        bundle->project_config.opt_string("texture_mapping_definitions") :
+        std::string();
+    bundle->texture_mapping_zones.load_entries(serialized, physical_colors);
+    return bundle;
+}
+
+static size_t physical_filaments_count_for_object_list(size_t fallback_count)
+{
+    size_t count = std::max<size_t>(fallback_count, 1);
+    if (wxGetApp().preset_bundle != nullptr)
+        count = std::min(count, size_t(std::max(wxGetApp().filaments_cnt(), 1)));
+    return count;
+}
+
+static bool filament_id_available_for_object_list(int filament_id_1based, size_t physical_filaments_count)
+{
+    if (filament_id_1based <= 0)
+        return false;
+    if (size_t(filament_id_1based) <= physical_filaments_count)
+        return true;
+    return wxGetApp().preset_bundle != nullptr &&
+           wxGetApp().preset_bundle->texture_mapping_zones.is_texture_mapping_zone_id(unsigned(filament_id_1based));
+}
+
+static size_t total_filaments_count_for_object_list(size_t physical_filaments_count)
+{
+    size_t count = physical_filaments_count;
+    if (PresetBundle *bundle = refresh_texture_mapping_zones_for_object_list(physical_filaments_count); bundle != nullptr)
+        count = std::max(count, bundle->texture_mapping_zones.total_filaments(physical_filaments_count));
+    return count;
+}
+
 static void take_snapshot(const std::string& snapshot_name)
 {
     Plater* plater = wxGetApp().plater();
@@ -703,6 +748,9 @@ ModelConfig& ObjectList::get_item_config(const wxDataViewItem& item) const
 
 void ObjectList::update_filament_values_for_items(const size_t filaments_count)
 {
+    const size_t physical_filaments_count = physical_filaments_count_for_object_list(filaments_count);
+    refresh_texture_mapping_zones_for_object_list(physical_filaments_count);
+
     for (size_t i = 0; i < m_objects->size(); ++i)
     {
         wxDataViewItem item = m_objects_model->GetItemById(i);
@@ -710,7 +758,8 @@ void ObjectList::update_filament_values_for_items(const size_t filaments_count)
 
         auto object = (*m_objects)[i];
         wxString extruder;
-        if (!object->config.has("extruder") || size_t(object->config.extruder()) > filaments_count) {
+        if (!object->config.has("extruder") ||
+            !filament_id_available_for_object_list(object->config.extruder(), physical_filaments_count)) {
             extruder = "1";
             object->config.set_key_value("extruder", new ConfigOptionInt(1));
         }
@@ -721,7 +770,7 @@ void ObjectList::update_filament_values_for_items(const size_t filaments_count)
 
         static const char *keys[] = {"support_filament", "support_interface_filament"};
         for (auto key : keys)
-            if (object->config.has(key) && object->config.opt_int(key) > filaments_count)
+            if (object->config.has(key) && !filament_id_available_for_object_list(object->config.opt_int(key), physical_filaments_count))
                 object->config.erase(key);
 
         if (object->volumes.size() > 1) {
@@ -729,7 +778,7 @@ void ObjectList::update_filament_values_for_items(const size_t filaments_count)
                 item = m_objects_model->GetItemByVolumeId(i, id);
                 if (!item) continue;
                 if (!object->volumes[id]->config.has("extruder") ||
-                    size_t(object->volumes[id]->config.extruder()) > filaments_count) {
+                    !filament_id_available_for_object_list(object->volumes[id]->config.extruder(), physical_filaments_count)) {
                     extruder = wxString::Format("%d", object->config.extruder());
                 }
                 else {
@@ -739,7 +788,8 @@ void ObjectList::update_filament_values_for_items(const size_t filaments_count)
                 m_objects_model->SetExtruder(extruder, item);
 
                 for (auto key : keys)
-                    if (object->volumes[id]->config.has(key) && object->volumes[id]->config.opt_int(key) > filaments_count)
+                    if (object->volumes[id]->config.has(key) &&
+                        !filament_id_available_for_object_list(object->volumes[id]->config.opt_int(key), physical_filaments_count))
                         object->volumes[id]->config.erase(key);
             }
         }
@@ -1009,6 +1059,10 @@ void ObjectList::update_objects_list_filament_column(size_t filaments_count)
     if (printer_technology() == ptSLA)
         filaments_count = 1;
 
+    const size_t total_filaments_count = printer_technology() == ptSLA ?
+        filaments_count :
+        total_filaments_count_for_object_list(filaments_count);
+
     m_prevent_update_filament_in_config = true;
 
     // BBS: update extruder values even when filaments_count is 1, because it may be reduced from value greater than 1
@@ -1018,7 +1072,7 @@ void ObjectList::update_objects_list_filament_column(size_t filaments_count)
     update_filament_colors();
 
     // set show/hide for this column
-    set_filament_column_hidden(filaments_count == 1);
+    set_filament_column_hidden(total_filaments_count == 1);
     //a workaround for a wrong last column width updating under OSX
     auto em = em_unit(this);
     GetColumn(colEditing)->SetWidth(m_columns_width[colEditing]*em);
@@ -1028,6 +1082,10 @@ void ObjectList::update_objects_list_filament_column(size_t filaments_count)
 
 void ObjectList::update_objects_list_filament_column_when_delete_filament(size_t filament_id, size_t filaments_count, int replace_filament_id)
 {
+    const size_t total_filaments_count = printer_technology() == ptSLA ?
+        1 :
+        total_filaments_count_for_object_list(filaments_count);
+
     m_prevent_update_filament_in_config = true;
 
     // BBS: update extruder values even when filaments_count is 1, because it may be reduced from value greater than 1
@@ -1037,7 +1095,7 @@ void ObjectList::update_objects_list_filament_column_when_delete_filament(size_t
     update_filament_colors();
 
     // set show/hide for this column
-    set_filament_column_hidden(filaments_count == 1);
+    set_filament_column_hidden(total_filaments_count == 1);
     // a workaround for a wrong last column width updating under OSX
     GetColumn(colEditing)->SetWidth(25);
 

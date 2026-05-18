@@ -68,6 +68,7 @@ struct VertexColorOverhangWeightField {
     std::vector<std::vector<uint32_t>> buckets;
     std::vector<float> fallback_weights;
     bool raw_component_weights_from_texture { false };
+    bool binary_dithered { false };
 
     bool empty() const
     {

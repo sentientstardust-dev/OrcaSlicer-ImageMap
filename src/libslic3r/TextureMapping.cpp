@@ -599,6 +599,33 @@ static int generic_solver_mix_model_from_name(std::string)
     return TextureMappingZone::DefaultGenericSolverMixModel;
 }
 
+static std::string dithering_method_name(int mode)
+{
+    switch (clamp_int(mode,
+                      int(TextureMappingZone::DitheringClosest),
+                      int(TextureMappingZone::DitheringHalftoneIncreasedDetail))) {
+    case int(TextureMappingZone::DitheringClosest):                 return "closest";
+    case int(TextureMappingZone::DitheringOrderedBayer):            return "ordered_bayer";
+    case int(TextureMappingZone::DitheringHalftone):                return "halftone";
+    case int(TextureMappingZone::DitheringHalftoneIncreasedDetail): return "halftone_increased_detail";
+    default:                                                       return "floyd_steinberg";
+    }
+}
+
+static int dithering_method_from_name(std::string name)
+{
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    if (name == "closest" || name == "closest_combination")
+        return int(TextureMappingZone::DitheringClosest);
+    if (name == "ordered_bayer" || name == "bayer")
+        return int(TextureMappingZone::DitheringOrderedBayer);
+    if (name == "halftone")
+        return int(TextureMappingZone::DitheringHalftone);
+    if (name == "halftone_increased_detail" || name == "halftone_detail" || name == "halftone_high_detail")
+        return int(TextureMappingZone::DitheringHalftoneIncreasedDetail);
+    return int(TextureMappingZone::DitheringFloydSteinberg);
+}
+
 static std::string transmission_distance_calibration_mode_name(int mode)
 {
     switch (clamp_int(mode,
@@ -803,6 +830,10 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            generic_solver_lookup_mode == rhs.generic_solver_lookup_mode &&
            generic_solver_mode == rhs.generic_solver_mode &&
            generic_solver_mix_model == rhs.generic_solver_mix_model &&
+           dithering_enabled == rhs.dithering_enabled &&
+           dithering_method == rhs.dithering_method &&
+           std::abs(dithering_resolution_mm - rhs.dithering_resolution_mm) <= eps &&
+           std::abs(halftone_dot_size_mm - rhs.halftone_dot_size_mm) <= eps &&
            std::abs(contrast_pct - rhs.contrast_pct) <= eps &&
            high_resolution_sampling == rhs.high_resolution_sampling &&
            std::abs(tone_gamma - rhs.tone_gamma) <= eps &&
@@ -1054,6 +1085,16 @@ std::string TextureMappingManager::serialize_entries()
         texture["generic_solver_lookup"] = generic_solver_lookup_mode_name(zone.generic_solver_lookup_mode);
         texture["generic_solver_mode"] = generic_solver_mode_name(zone.generic_solver_mode);
         texture["generic_solver_mix_model"] = generic_solver_mix_model_name(zone.generic_solver_mix_model);
+        texture["dithering_enabled"] = zone.dithering_enabled;
+        texture["dithering_method"] = dithering_method_name(zone.dithering_method);
+        texture["dithering_resolution_mm"] =
+            std::clamp(finite_or(zone.dithering_resolution_mm, TextureMappingZone::DefaultDitheringResolutionMm),
+                       TextureMappingZone::MinDitheringResolutionMm,
+                       TextureMappingZone::MaxDitheringResolutionMm);
+        texture["halftone_dot_size_mm"] =
+            std::clamp(finite_or(zone.halftone_dot_size_mm, TextureMappingZone::DefaultHalftoneDotSizeMm),
+                       TextureMappingZone::MinHalftoneDotSizeMm,
+                       TextureMappingZone::MaxHalftoneDotSizeMm);
         texture["contrast_pct"] = std::clamp(finite_or(zone.contrast_pct, 100.f), 25.f, 300.f);
         texture["high_resolution_sampling"] = zone.high_resolution_sampling;
         texture["tone_gamma"] = normalize_tone_gamma(zone.tone_gamma);
@@ -1201,13 +1242,26 @@ void TextureMappingManager::load_entries(const std::string &serialized,
                      int(TextureMappingZone::GenericSolverV2));
         zone.generic_solver_mix_model =
             generic_solver_mix_model_from_name(texture.value("generic_solver_mix_model", std::string("pigment_painter")));
+        zone.dithering_enabled = texture.value("dithering_enabled", TextureMappingZone::DefaultDitheringEnabled);
+        zone.dithering_method = dithering_method_from_name(
+            texture.value("dithering_method", dithering_method_name(TextureMappingZone::DefaultDitheringMethod)));
+        zone.dithering_resolution_mm =
+            std::clamp(texture.value("dithering_resolution_mm", TextureMappingZone::DefaultDitheringResolutionMm),
+                       TextureMappingZone::MinDitheringResolutionMm,
+                       TextureMappingZone::MaxDitheringResolutionMm);
+        zone.halftone_dot_size_mm =
+            std::clamp(texture.value("halftone_dot_size_mm", TextureMappingZone::DefaultHalftoneDotSizeMm),
+                       TextureMappingZone::MinHalftoneDotSizeMm,
+                       TextureMappingZone::MaxHalftoneDotSizeMm);
+        if (zone.dithering_enabled)
+            zone.compact_offset_mode = true;
         zone.contrast_pct = std::clamp(texture.value("contrast_pct", 100.f), 25.f, 300.f);
         zone.high_resolution_sampling = texture.value("high_resolution_sampling", true);
         zone.tone_gamma = normalize_tone_gamma(texture.value("tone_gamma", 1.f));
         zone.transmission_distance_calibration_mode = transmission_distance_calibration_mode_from_json(texture);
         zone.preview_opacity_pct =
             std::clamp(texture.value("preview_opacity_pct", TextureMappingZone::DefaultPreviewOpacityPct), 0.f, 100.f);
-        zone.preview_simulate_colors = texture.value("simulate_preview_colors", false);
+        zone.preview_simulate_colors = texture.value("simulate_preview_colors", TextureMappingZone::DefaultPreviewSimulateColors);
         zone.preview_limit_resolution = texture.value("limit_preview_resolution", true);
         zone.auto_adjust_filament_selection = texture.value("auto_adjust_filaments", true);
         zone.filament_strengths_pct = normalize_strengths(floats_from_json(texture.value("strength_pct", nlohmann::json::array())));

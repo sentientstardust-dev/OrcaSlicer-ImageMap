@@ -667,6 +667,8 @@ void GLVolume::simple_render(GLShaderProgram* shader,
         const bool base_uses_surface_gradient_preview =
             filament_state_uses_surface_gradient_preview(base_filament_id, num_physical, texture_mgr);
         const bool base_uses_image_texture_preview = base_uses_texture_preview && !base_uses_surface_gradient_preview;
+        const bool base_uses_halftone_texture_preview =
+            texture_preview_halftone_simulation_enabled_for_filament(base_filament_id, num_physical, texture_mgr);
         const bool has_surface_gradient_preview_state =
             base_uses_surface_gradient_preview ||
             (has_mmu_segmentation &&
@@ -681,6 +683,7 @@ void GLVolume::simple_render(GLShaderProgram* shader,
             !has_mmu_segmentation &&
             !has_texture_mapping_color_preview_data &&
             base_uses_image_texture_preview &&
+            !base_uses_halftone_texture_preview &&
             model_volume_has_complete_texture_preview_data(*model_volume) &&
             GUI::GLModel::Geometry::has_tex_coord(model.get_geometry().format);
         if (!has_mmu_segmentation && !base_uses_texture_preview)
@@ -713,7 +716,7 @@ void GLVolume::simple_render(GLShaderProgram* shader,
                                     (preview_visual_signature << 6) + (preview_visual_signature >> 2);
         preview_visual_signature ^= model_volume_texture_mapping_color_preview_signature(*model_volume) + 0x9e3779b97f4a7c15ull +
                                     (preview_visual_signature << 6) + (preview_visual_signature >> 2);
-        if (has_surface_gradient_preview_state) {
+        if (has_surface_gradient_preview_state || has_texture_preview_data) {
             for (int row = 0; row < 4; ++row) {
                 for (int col = 0; col < 4; ++col) {
                     preview_visual_signature ^= std::hash<int>{}(int(std::lround(preview_world_matrix(row, col) * 1000000.0))) +
@@ -771,10 +774,7 @@ void GLVolume::simple_render(GLShaderProgram* shader,
                                                  mmuseg_texture_preview_colors,
                                                  mmuseg_texture_preview_filament_ids);
             }
-            if (has_texture_preview_state &&
-                (has_active_texture_mapping_color_preview_data ||
-                !has_texture_preview_data ||
-                has_surface_gradient_preview_state)) {
+            if (has_texture_preview_state) {
                 build_mmu_vertex_color_preview_models(*model_volume,
                                                       triangles_per_type,
                                                       state_colors,
@@ -893,6 +893,8 @@ void GLVolume::render_mmu_texture_preview(const Transform3d &view_matrix,
     const bool base_uses_surface_gradient_preview =
         filament_state_uses_surface_gradient_preview(base_filament_id, num_physical, texture_mgr);
     const bool base_uses_image_texture_preview = base_uses_texture_preview && !base_uses_surface_gradient_preview;
+    const bool base_uses_halftone_texture_preview =
+        texture_preview_halftone_simulation_enabled_for_filament(base_filament_id, num_physical, texture_mgr);
 
     const bool has_mmu_segmentation = !model_volume->mmu_segmentation_facets.empty();
     const bool has_texture_mapping_color_preview_data = model_volume_has_texture_mapping_color_preview_data(*model_volume);
@@ -900,6 +902,7 @@ void GLVolume::render_mmu_texture_preview(const Transform3d &view_matrix,
         !has_mmu_segmentation &&
         !has_texture_mapping_color_preview_data &&
         base_uses_image_texture_preview &&
+        !base_uses_halftone_texture_preview &&
         model_volume_has_complete_texture_preview_data(*model_volume) &&
         GUI::GLModel::Geometry::has_tex_coord(model.get_geometry().format);
 
