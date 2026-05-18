@@ -79,7 +79,10 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     const PrintObject       &print_object,
     const Layer             &layer,
     const TextureMappingZone &zone,
-    unsigned int             texture_zone_id);
+    unsigned int             texture_zone_id,
+    unsigned int             active_component_id_override = 0,
+    std::optional<float>     base_outer_width_mm_override = std::nullopt,
+    std::optional<float>     layer_height_mm_override = std::nullopt);
 
 float texture_mapping_offset_surface_inset_mm(const TextureMappingOffsetContext &context,
                                               const Point                       &point,

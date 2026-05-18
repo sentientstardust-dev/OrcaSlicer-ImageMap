@@ -15,6 +15,7 @@
 #include "ShortestPath.hpp"
 #include "Print.hpp"
 #include "TextureMapping.hpp"
+#include "TextureMappingOffset.hpp"
 #include "ColorSolver.hpp"
 #include "ImageMapRawFilamentOffsetAtlas.hpp"
 #include "TriangleSelector.hpp"
@@ -5649,30 +5650,6 @@ static std::unique_ptr<EdgeGrid::Grid> calculate_layer_edge_grid(const Layer& la
     return out;
 }
 
-static std::vector<unsigned int> decode_offset_component_ids_for_gcode(const TextureMappingZone &zone, size_t num_physical)
-{
-    std::vector<unsigned int> out;
-    for (const char c : zone.component_ids) {
-        if (c < '1' || c > '9')
-            continue;
-        const unsigned int id = unsigned(c - '0');
-        if (id == 0 || id > num_physical)
-            continue;
-        if (std::find(out.begin(), out.end(), id) == out.end())
-            out.emplace_back(id);
-    }
-
-    if (out.empty()) {
-        if (zone.component_a >= 1 && zone.component_a <= num_physical)
-            out.emplace_back(zone.component_a);
-        if (zone.component_b >= 1 && zone.component_b <= num_physical &&
-            std::find(out.begin(), out.end(), zone.component_b) == out.end()) {
-            out.emplace_back(zone.component_b);
-        }
-    }
-    return out;
-}
-
 static float normalize_angle_deg_for_gcode(float angle)
 {
     float normalized = std::fmod(angle, 360.f);
@@ -5998,60 +5975,9 @@ static float repeated_rotation_progress_for_gcode(float progress01, float repeat
     return clamp01f_for_gcode(local);
 }
 
-static float offset_fade_factor_for_gcode(int fade_mode, float progress01)
-{
-    const float p = clamp01f_for_gcode(progress01);
-    switch (fade_mode) {
-    case int(TextureMappingZone::OffsetFadeInUp):
-        return p;
-    case int(TextureMappingZone::OffsetFadeOutUp):
-        return 1.f - p;
-    case int(TextureMappingZone::OffsetFadeInOut):
-        return 1.f - std::abs(2.f * p - 1.f);
-    case int(TextureMappingZone::OffsetFadeOutIn):
-        return std::abs(2.f * p - 1.f);
-    case int(TextureMappingZone::OffsetFadeOutInReversed):
-        return 2.f * p - 1.f;
-    default:
-        return 1.f;
-    }
-}
-
 static bool has_explicit_offset_gradient_profile_for_gcode(const TextureMappingZone &zone)
 {
     return zone.has_custom_offset_settings();
-}
-
-static float overhang_filament_strength_factor_for_gcode(const TextureMappingZone &zone, unsigned int physical_filament_id)
-{
-    if (physical_filament_id == 0)
-        return 1.f;
-
-    const size_t idx = size_t(physical_filament_id - 1);
-    if (idx >= zone.filament_strengths_pct.size())
-        return 1.f;
-
-    const float strength_pct = zone.filament_strengths_pct[idx];
-    if (!std::isfinite(strength_pct))
-        return 1.f;
-
-    return std::clamp(strength_pct / 100.f, 0.f, 1.f);
-}
-
-static float overhang_filament_minimum_offset_factor_for_gcode(const TextureMappingZone &zone, unsigned int physical_filament_id)
-{
-    if (physical_filament_id == 0)
-        return 0.f;
-
-    const size_t idx = size_t(physical_filament_id - 1);
-    if (idx >= zone.filament_minimum_offsets_pct.size())
-        return 0.f;
-
-    const float minimum_offset_pct = zone.filament_minimum_offsets_pct[idx];
-    if (!std::isfinite(minimum_offset_pct))
-        return 0.f;
-
-    return std::clamp(minimum_offset_pct / 100.f, 0.f, 1.f);
 }
 
 struct TransmissionDistanceCalibrationContextForGCode {
@@ -9148,7 +9074,7 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
     if (layer_object == nullptr || object_layer_count <= 0 || (upper_layer == nullptr && lower_layer == nullptr))
         return std::nullopt;
 
-    std::vector<unsigned int> component_ids = decode_offset_component_ids_for_gcode(*zone, num_physical);
+    std::vector<unsigned int> component_ids = decode_texture_mapping_offset_component_ids(*zone, num_physical);
     if (vertex_color_match_mode) {
         const std::vector<unsigned int> effective_component_ids =
             TextureMappingManager::effective_texture_component_ids(*zone, num_physical, m_config.filament_colour.values);
@@ -9310,7 +9236,7 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
         }
 
         const float signed_fade_factor =
-            offset_fade_factor_for_gcode(zone->offset_fade_mode, z_progress);
+            texture_mapping_offset_fade_factor(zone->offset_fade_mode, z_progress);
         const float fade_factor = std::abs(signed_fade_factor);
         if (fade_factor <= EPSILON)
             return std::nullopt;
@@ -9322,8 +9248,8 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
             active_component_id,
             active_component_idx,
             weight_field,
-            overhang_filament_strength_factor_for_gcode(*zone, active_component_id),
-            overhang_filament_minimum_offset_factor_for_gcode(*zone, active_component_id),
+            texture_mapping_offset_filament_strength_factor(*zone, active_component_id),
+            texture_mapping_offset_filament_minimum_offset_factor(*zone, active_component_id),
             transmission_distance_width_factor_for_gcode(td_calibration_context, active_component_idx, previous_component_idx),
             signed_fade_factor,
             fade_factor
@@ -10450,29 +10376,18 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         bool                      enabled { false };
         bool                      vertex_color_match_mode { false };
         bool                      high_resolution_texture_sampling { false };
-        bool                      nonlinear_offset_adjustment { false };
-        bool                      compact_offset_mode { false };
         bool                      object_center_mode { false };
         Point                     object_center;
-        unsigned int              active_component_id { 0 };
-        size_t                    active_component_idx { size_t(-1) };
-        const VertexColorOverhangWeightField *vertex_color_weight_field { nullptr };
-        std::vector<unsigned int> component_ids;
-        std::vector<float>        component_distances_mm;
-        std::vector<float>        rotated_angles;
         float                     inset_strength_reference_mm { 0.f };
-        float                     fade_factor { 0.f };
         float                     signed_fade_factor { 1.f };
         float                     max_width_delta_mm { 0.f };
-        float                     active_component_strength_factor { 1.f };
-        float                     active_component_minimum_offset_factor { 0.f };
-        float                     active_component_td_width_factor { 1.f };
         float                     base_outer_width_mm { 0.4f };
         float                     flow_reference_width_mm { 0.4f };
         float                     base_centerline_shift_mm { 0.f };
         float                     centerline_shift_balance_mm { 0.f };
         float                     centerline_shift_balance_weight_scale { 0.f };
         float                     layer_height_mm { 0.2f };
+        TextureMappingOffsetContext offset_context;
     };
 
     if (is_bridge(path.role()))
@@ -10517,7 +10432,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                 (vertex_color_match_mode ||
                  is_2d_offset_gradient_row_for_gcode(*zone) ||
                  has_explicit_offset_gradient_profile_for_gcode(*zone))) {
-                std::vector<unsigned int> component_ids = decode_offset_component_ids_for_gcode(*zone, num_physical);
+                std::vector<unsigned int> component_ids = decode_texture_mapping_offset_component_ids(*zone, num_physical);
                 if (vertex_color_match_mode) {
                     if (!m_warned_texture_mapping_filament_count_mismatch &&
                         TextureMappingManager::component_count_mismatch(*zone, num_physical)) {
@@ -10577,51 +10492,15 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                             std::accumulate(reference_nozzles.begin(), reference_nozzles.end(), 0.f) / float(reference_nozzles.size());
                         const float max_allowed_distance_mm = TextureMappingManager::max_component_surface_offset_mm(reference_nozzle);
 
-                        std::vector<float> distances_mm = TextureMappingManager::effective_offset_distances(*zone, component_ids.size(), reference_nozzle);
-                        std::vector<float> angles_deg = TextureMappingManager::effective_offset_angles(*zone, component_ids.size());
-                        if (distances_mm.size() != component_ids.size())
-                            distances_mm.assign(component_ids.size(), 0.f);
-                        if (angles_deg.size() != component_ids.size())
-                            angles_deg = TextureMappingManager::default_offset_angles(component_ids.size());
-                        for (float &a : angles_deg)
-                            a = normalize_angle_deg_for_gcode(a);
-
-                        bool has_nonzero_distance = false;
-                        if (vertex_color_match_mode) {
-                            distances_mm.assign(component_ids.size(), max_allowed_distance_mm);
-                            has_nonzero_distance = max_allowed_distance_mm > EPSILON;
-                        } else {
-                            for (float &d : distances_mm) {
-                                d = std::clamp(d, 0.f, max_allowed_distance_mm);
-                                has_nonzero_distance = has_nonzero_distance || (d > EPSILON);
-                            }
-                        }
-
-                        if (has_nonzero_distance) {
+                        if (max_allowed_distance_mm > EPSILON) {
                             const PrintObject *layer_object = m_layer ? m_layer->object() : nullptr;
                             const int object_layer_count = layer_object ? int(layer_object->layer_count()) : 0;
                             const int current_layer_index = m_layer ? int(m_layer->id()) : 0;
                             const float z_progress = object_layer_count > 1 ?
                                 std::clamp(float(current_layer_index) / float(object_layer_count - 1), 0.f, 1.f) : 0.f;
 
-                            float rotation_deg = 0.f;
-                            if (zone->offset_rotation_enabled) {
-                                const float repeated = repeated_rotation_progress_for_gcode(z_progress, std::max(1.f, zone->offset_repeats), zone->offset_reverse_repeats);
-                                const float direction = zone->offset_clockwise ? -1.f : 1.f;
-                                rotation_deg = direction * 360.f * zone->offset_rotations * repeated;
-                            }
-
-                            const float signed_fade_factor = offset_fade_factor_for_gcode(zone->offset_fade_mode, z_progress);
+                            const float signed_fade_factor = texture_mapping_offset_fade_factor(zone->offset_fade_mode, z_progress);
                             const float fade_factor = std::abs(signed_fade_factor);
-
-                            std::vector<float> rotated_angles = angles_deg;
-                            for (float &a : rotated_angles)
-                                a = normalize_angle_deg_for_gcode(a + rotation_deg);
-
-                            const size_t active_component_idx = size_t(active_component_it - component_ids.begin());
-                            const float active_component_strength_factor = overhang_filament_strength_factor_for_gcode(*zone, active_component_id);
-                            const float active_component_minimum_offset_factor = overhang_filament_minimum_offset_factor_for_gcode(*zone, active_component_id);
-                            const float max_component_distance_mm = *std::max_element(distances_mm.begin(), distances_mm.end());
                             const float path_outer_width_mm = std::max(
                                 0.01f,
                                 path.width > EPSILON ? path.width : float(m_config.outer_wall_line_width.get_abs_value(reference_nozzle)));
@@ -10652,136 +10531,23 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                             const bool object_center_mode =
                                 !vertex_color_match_mode &&
                                 zone->offset_angle_mode != int(TextureMappingZone::OffsetAngleSurfaceNormal);
-                            const bool use_layer_aware_weighting = m_layer != nullptr;
                             const bool high_resolution_texture_sampling = zone->high_resolution_sampling;
-                            const bool high_speed_image_texture_sampling = zone->high_speed_image_texture_sampling;
-                            const bool nonlinear_offset_adjustment = zone->nonlinear_offset_adjustment;
                             const bool compact_offset_mode = zone->compact_offset_mode;
-                            const float layer_sample_z_mm = use_layer_aware_weighting ? float(m_layer->print_z) : 0.f;
-                            const float layer_sample_falloff_mm = high_resolution_texture_sampling ?
-                                std::max(0.03f, layer_height_mm * 0.5f) :
-                                std::max(0.12f, layer_height_mm * 1.5f);
-                            const int texture_filament_color_mode = std::clamp(
-                                zone->filament_color_mode,
-                                int(TextureMappingZone::FilamentColorAny),
-                                int(TextureMappingZone::FilamentColorRGBKW));
-                            const bool texture_force_sequential_filaments = zone->force_sequential_filaments;
-                            const int generic_solver_lookup_mode = std::clamp(zone->generic_solver_lookup_mode,
-                                                                              int(TextureMappingZone::GenericSolverClosestMix),
-                                                                              int(TextureMappingZone::GenericSolverBlendClosestTwo));
-                            const int generic_solver_mode = std::clamp(zone->generic_solver_mode,
-                                                                       int(TextureMappingZone::GenericSolverLegacy),
-                                                                       int(TextureMappingZone::GenericSolverV2));
-                            const int generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
-                            const bool use_legacy_fixed_color_mode = zone->use_legacy_fixed_color_mode;
-                            const float texture_contrast_pct = std::clamp(zone->contrast_pct, 25.f, 300.f);
-                            const float texture_tone_gamma =
-                                (!std::isfinite(zone->tone_gamma) || zone->tone_gamma <= 0.f) ?
-                                    1.f :
-                                    std::clamp(zone->tone_gamma, 0.5f, 3.f);
                             const bool reduce_outer_surface_texture =
                                 vertex_color_match_mode && zone->reduce_outer_surface_texture && !compact_offset_mode;
 
-                            const bool raw_texture_mapping_mode =
-                                zone->texture_mapping_mode == int(TextureMappingZone::TextureMappingRawValues);
-                            std::vector<std::array<float, 3>> component_colors;
-                            component_colors.reserve(component_ids.size());
-                            bool missing_component_color = false;
-                            for (const unsigned int id : component_ids) {
-                                if (id < 1 || id > m_config.filament_colour.values.size()) {
-                                    if (raw_texture_mapping_mode)
-                                        component_colors.push_back({ 0.f, 0.f, 0.f });
-                                    else
-                                        missing_component_color = true;
-                                    continue;
-                                }
-                                ColorRGB decoded;
-                                if (!decode_color(m_config.filament_colour.get_at(size_t(id - 1)), decoded)) {
-                                    if (raw_texture_mapping_mode)
-                                        component_colors.push_back({ 0.f, 0.f, 0.f });
-                                    else
-                                        missing_component_color = true;
-                                    continue;
-                                }
-                                component_colors.push_back({ decoded.r(), decoded.g(), decoded.b() });
+                            std::optional<TextureMappingOffsetContext> offset_context;
+                            if (layer_object != nullptr && m_layer != nullptr) {
+                                offset_context = build_texture_mapping_offset_context_for_layer(*layer_object,
+                                                                                                *m_layer,
+                                                                                                *zone,
+                                                                                                texture_zone_id,
+                                                                                                active_component_id,
+                                                                                                base_outer_width_mm,
+                                                                                                layer_height_mm);
                             }
-                            const TransmissionDistanceCalibrationContextForGCode td_calibration_context =
-                                transmission_distance_calibration_context_for_gcode(*zone,
-                                                                                    component_ids,
-                                                                                    component_colors,
-                                                                                    texture_filament_color_mode);
-                            size_t previous_component_idx = size_t(-1);
-                            if (current_layer_index > 0) {
-                                const unsigned int previous_component_id =
-                                    texture_mgr.resolve_zone_component(texture_zone_id, num_physical, current_layer_index - 1);
-                                const auto previous_component_it =
-                                    std::find(component_ids.begin(), component_ids.end(), previous_component_id);
-                                if (previous_component_it != component_ids.end())
-                                    previous_component_idx = size_t(previous_component_it - component_ids.begin());
-                            }
-                            const float active_component_td_width_factor =
-                                transmission_distance_width_factor_for_gcode(td_calibration_context,
-                                                                             active_component_idx,
-                                                                             previous_component_idx);
-
-                            const VertexColorOverhangWeightField *vertex_color_weight_field = nullptr;
-                            auto *generic_mix_candidate_cache = &m_generic_solver_mix_candidate_cache;
-                            if (vertex_color_match_mode && layer_object != nullptr) {
-                                if (!missing_component_color && component_colors.size() == component_ids.size() && !component_colors.empty()) {
-                                    std::ostringstream component_key_stream;
-                                    for (size_t idx = 0; idx < component_ids.size(); ++idx) {
-                                        if (idx > 0)
-                                            component_key_stream << '/';
-                                        component_key_stream << component_ids[idx];
-                                    }
-                                    component_key_stream << (raw_texture_mapping_mode ? "|raw" : "|blend");
-                                    component_key_stream << "|fc" << texture_filament_color_mode;
-                                    component_key_stream << "|fs" << (texture_force_sequential_filaments ? 1 : 0);
-                                    component_key_stream << "|gl" << generic_solver_lookup_mode;
-                                    component_key_stream << "|gm" << generic_solver_mode;
-                                    component_key_stream << "|gx" << generic_solver_mix_model;
-                                    component_key_stream << "|lf" << (use_legacy_fixed_color_mode ? 1 : 0);
-                                    component_key_stream << "|ct" << int(std::lround(texture_contrast_pct));
-                                    component_key_stream << "|tg" << int(std::lround(texture_tone_gamma * 100.f));
-                                    component_key_stream << "|hr" << (high_resolution_texture_sampling ? 1 : 0);
-                                    component_key_stream << "|hs" << (high_speed_image_texture_sampling ? 1 : 0);
-                                    if (m_layer != nullptr)
-                                        component_key_stream << "|L" << m_layer->id();
-                                    const auto cache_key = std::make_tuple(layer_object, texture_zone_id, component_key_stream.str());
-                                    auto cache_it = m_vertex_color_overhang_weight_field_cache.find(cache_key);
-                                    if (cache_it == m_vertex_color_overhang_weight_field_cache.end()) {
-                                        cache_it = m_vertex_color_overhang_weight_field_cache
-                                                       .emplace(cache_key,
-                                                                build_vertex_color_weight_field_for_gcode(*layer_object,
-                                                                                                         component_colors,
-                                                                                                         raw_texture_mapping_mode,
-                                                                                                         texture_filament_color_mode,
-                                                                                                         texture_force_sequential_filaments,
-                                                                                                         generic_solver_lookup_mode,
-                                                                                                         generic_solver_mode,
-                                                                                                         generic_solver_mix_model,
-                                                                                                         use_legacy_fixed_color_mode,
-                                                                                                         generic_mix_candidate_cache,
-                                                                                                         &m_uv_texture_triangle_cache,
-                                                                                                         texture_contrast_pct,
-                                                                                                         texture_tone_gamma,
-                                                                                                         use_layer_aware_weighting,
-                                                                                                         layer_sample_z_mm,
-                                                                                                         layer_sample_falloff_mm,
-                                                                                                         high_resolution_texture_sampling,
-                                                                                                         high_speed_image_texture_sampling))
-                                                       .first;
-                                    }
-                                    if (!cache_it->second.empty())
-                                        vertex_color_weight_field = &cache_it->second;
-                                }
-                            }
-
-                            const bool has_vertex_color_weight_field =
-                                vertex_color_weight_field != nullptr && !vertex_color_weight_field->empty();
-
-                            if (fade_factor > EPSILON && max_component_distance_mm > EPSILON && effective_max_width_delta_mm > EPSILON &&
-                                (!vertex_color_match_mode || has_vertex_color_weight_field)) {
+                            if (fade_factor > EPSILON && effective_max_width_delta_mm > EPSILON &&
+                                offset_context) {
                                 Point object_center = layer_object ? layer_object->bounding_box().center() :
                                     Point(coord_t((int64_t(path.first_point().x()) + int64_t(path.last_point().x())) / 2),
                                           coord_t((int64_t(path.first_point().y()) + int64_t(path.last_point().y())) / 2));
@@ -10789,27 +10555,16 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                 outer_wall_gradient_dynamic_ctx.enabled = true;
                                 outer_wall_gradient_dynamic_ctx.vertex_color_match_mode = vertex_color_match_mode;
                                 outer_wall_gradient_dynamic_ctx.high_resolution_texture_sampling = high_resolution_texture_sampling;
-                                outer_wall_gradient_dynamic_ctx.nonlinear_offset_adjustment = nonlinear_offset_adjustment;
-                                outer_wall_gradient_dynamic_ctx.compact_offset_mode = compact_offset_mode;
                                 outer_wall_gradient_dynamic_ctx.object_center_mode = object_center_mode;
                                 outer_wall_gradient_dynamic_ctx.object_center = object_center;
-                                outer_wall_gradient_dynamic_ctx.active_component_id = active_component_id;
-                                outer_wall_gradient_dynamic_ctx.active_component_idx = active_component_idx;
-                                outer_wall_gradient_dynamic_ctx.vertex_color_weight_field = vertex_color_weight_field;
-                                outer_wall_gradient_dynamic_ctx.component_ids = component_ids;
-                                outer_wall_gradient_dynamic_ctx.component_distances_mm = distances_mm;
-                                outer_wall_gradient_dynamic_ctx.rotated_angles = rotated_angles;
                                 outer_wall_gradient_dynamic_ctx.inset_strength_reference_mm = max_allowed_distance_mm;
-                                outer_wall_gradient_dynamic_ctx.fade_factor = fade_factor;
                                 outer_wall_gradient_dynamic_ctx.signed_fade_factor = signed_fade_factor;
                                 outer_wall_gradient_dynamic_ctx.max_width_delta_mm = effective_max_width_delta_mm;
-                                outer_wall_gradient_dynamic_ctx.active_component_strength_factor = active_component_strength_factor;
-                                outer_wall_gradient_dynamic_ctx.active_component_minimum_offset_factor = active_component_minimum_offset_factor;
-                                outer_wall_gradient_dynamic_ctx.active_component_td_width_factor = active_component_td_width_factor;
                                 outer_wall_gradient_dynamic_ctx.base_outer_width_mm = base_outer_width_mm;
                                 outer_wall_gradient_dynamic_ctx.flow_reference_width_mm = flow_reference_width_mm;
                                 outer_wall_gradient_dynamic_ctx.base_centerline_shift_mm = base_centerline_shift_mm;
                                 outer_wall_gradient_dynamic_ctx.layer_height_mm = layer_height_mm;
+                                outer_wall_gradient_dynamic_ctx.offset_context = std::move(*offset_context);
 
                                 outer_wall_gradient_segment_mods.reserve(path.polyline.points.size() - 1);
 
@@ -10863,65 +10618,13 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                     double outward_y = 0.0;
                                     resolve_segment_shift_outward_normal_for_gcode(m_layer, mid_point, dx, dy, len, radial_x, radial_y, outward_x, outward_y);
 
-                                    double theta_direction_x = outward_x;
-                                    double theta_direction_y = outward_y;
-                                    if (object_center_mode) {
-                                        const double radial_len = std::hypot(radial_x, radial_y);
-                                        if (radial_len > EPSILON) {
-                                            theta_direction_x = radial_x / radial_len;
-                                            theta_direction_y = radial_y / radial_len;
-                                        }
-                                    }
-
-                                    const float theta_deg = normalize_angle_deg_for_gcode(float(Geometry::rad2deg(std::atan2(theta_direction_y, theta_direction_x))));
-                                    float inset_strength = 0.f;
-                                    if (vertex_color_match_mode) {
-                                        if (vertex_color_weight_field != nullptr &&
-                                            active_component_idx < component_ids.size() &&
-                                            !vertex_color_weight_field->empty()) {
-                                            const float mid_x_mm = 0.5f * (unscale<float>(line.a.x()) + unscale<float>(line.b.x()));
-                                            const float mid_y_mm = 0.5f * (unscale<float>(line.a.y()) + unscale<float>(line.b.y()));
-                                            const float desired_strength = sample_vertex_color_weight_field_for_gcode(
-                                                *vertex_color_weight_field,
-                                                mid_x_mm,
-                                                mid_y_mm,
-                                                active_component_idx,
-                                                high_resolution_texture_sampling,
-                                                compact_offset_mode);
-                                            inset_strength = std::clamp(1.f - desired_strength, 0.f, 1.f);
-                                        }
-                                    } else {
-                                        float raw_inset_mm = 0.f;
-                                        for (size_t i = 0; i < component_ids.size(); ++i) {
-                                            if (i == active_component_idx)
-                                                continue;
-                                            const float influence = component_angular_influence_for_gcode(component_ids[i],
-                                                                                                            theta_deg,
-                                                                                                            component_ids,
-                                                                                                            rotated_angles);
-                                            raw_inset_mm += distances_mm[i] * influence;
-                                        }
-                                        inset_strength = std::clamp(raw_inset_mm / std::max(max_allowed_distance_mm, float(EPSILON)), 0.f, 1.f);
-                                    }
-                                    inset_strength = std::clamp(inset_strength * fade_factor, 0.f, 1.f);
-                                    const float stair_step_mm = nonlinear_offset_adjustment ?
-                                        local_surface_stair_step_distance_for_gcode(m_layer,
-                                                                                   mid_point,
-                                                                                   outward_x,
-                                                                                   outward_y,
-                                                                                   base_outer_width_mm,
-                                                                                   max_allowed_distance_mm) :
-                                        std::numeric_limits<float>::quiet_NaN();
-                                    const float variable_width_delta_mm = variable_width_delta_for_visibility_range_for_gcode(
-                                        inset_strength,
-                                        max_width_delta_limit_mm,
-                                        active_component_minimum_offset_factor,
-                                        active_component_strength_factor,
-                                        active_component_td_width_factor,
-                                        nonlinear_offset_adjustment,
-                                        layer_height_mm,
-                                        stair_step_mm);
-                                    const float width_delta_mm = std::clamp(variable_width_delta_mm, 0.f, max_width_delta_limit_mm);
+                                    const float width_delta_mm = std::clamp(
+                                        texture_mapping_offset_surface_inset_mm(outer_wall_gradient_dynamic_ctx.offset_context,
+                                                                               mid_point,
+                                                                               -outward_x,
+                                                                               -outward_y),
+                                        0.f,
+                                        max_width_delta_limit_mm);
                                     if (!std::isfinite(width_delta_mm) || !std::isfinite(base_outer_width_mm) || !std::isfinite(layer_height_mm)) {
                                         outer_wall_gradient_segment_mods.emplace_back(mod);
                                         continue;
@@ -11599,76 +11302,18 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                                        outward_x,
                                                        outward_y);
 
-        double theta_direction_x = outward_x;
-        double theta_direction_y = outward_y;
-        if (outer_wall_gradient_dynamic_ctx.object_center_mode) {
-            const double radial_len = std::hypot(radial_x, radial_y);
-            if (radial_len > EPSILON) {
-                theta_direction_x = radial_x / radial_len;
-                theta_direction_y = radial_y / radial_len;
-            }
-        }
-
-        const float theta_deg = normalize_angle_deg_for_gcode(float(Geometry::rad2deg(std::atan2(theta_direction_y, theta_direction_x))));
-        float inset_strength = 0.f;
-        if (outer_wall_gradient_dynamic_ctx.vertex_color_match_mode) {
-            if (outer_wall_gradient_dynamic_ctx.vertex_color_weight_field != nullptr &&
-                !outer_wall_gradient_dynamic_ctx.vertex_color_weight_field->empty() &&
-                outer_wall_gradient_dynamic_ctx.active_component_idx <
-                    outer_wall_gradient_dynamic_ctx.vertex_color_weight_field->component_count) {
-                const float mid_x_mm = 0.5f * (unscale<float>(line.a.x()) + unscale<float>(line.b.x()));
-                const float mid_y_mm = 0.5f * (unscale<float>(line.a.y()) + unscale<float>(line.b.y()));
-                const float desired_strength = sample_vertex_color_weight_field_for_gcode(
-                    *outer_wall_gradient_dynamic_ctx.vertex_color_weight_field,
-                    mid_x_mm,
-                    mid_y_mm,
-                    outer_wall_gradient_dynamic_ctx.active_component_idx,
-                    outer_wall_gradient_dynamic_ctx.high_resolution_texture_sampling,
-                    outer_wall_gradient_dynamic_ctx.compact_offset_mode);
-                inset_strength = std::clamp(1.f - desired_strength, 0.f, 1.f);
-            }
-        } else {
-            float raw_inset_mm = 0.f;
-            const size_t component_count = std::min(outer_wall_gradient_dynamic_ctx.component_ids.size(),
-                                                    outer_wall_gradient_dynamic_ctx.component_distances_mm.size());
-            for (size_t i = 0; i < component_count; ++i) {
-                if (i == outer_wall_gradient_dynamic_ctx.active_component_idx)
-                    continue;
-                const float influence = component_angular_influence_for_gcode(outer_wall_gradient_dynamic_ctx.component_ids[i],
-                                                                               theta_deg,
-                                                                               outer_wall_gradient_dynamic_ctx.component_ids,
-                                                                               outer_wall_gradient_dynamic_ctx.rotated_angles);
-                raw_inset_mm += outer_wall_gradient_dynamic_ctx.component_distances_mm[i] * influence;
-            }
-            inset_strength = std::clamp(
-                raw_inset_mm / std::max(outer_wall_gradient_dynamic_ctx.inset_strength_reference_mm, float(EPSILON)),
-                0.f,
-                1.f);
-        }
-        inset_strength = std::clamp(inset_strength * outer_wall_gradient_dynamic_ctx.fade_factor, 0.f, 1.f);
         float max_width_delta_limit_mm = std::min(
             outer_wall_gradient_dynamic_ctx.max_width_delta_mm,
             2.f * outer_wall_gradient_dynamic_ctx.inset_strength_reference_mm);
         if (!std::isfinite(max_width_delta_limit_mm) || max_width_delta_limit_mm <= EPSILON)
             return OuterWallGradientSegmentMod{};
-        const float stair_step_mm = outer_wall_gradient_dynamic_ctx.nonlinear_offset_adjustment ?
-            local_surface_stair_step_distance_for_gcode(surface_layer,
-                                                       mid_point,
-                                                       outward_x,
-                                                       outward_y,
-                                                       outer_wall_gradient_dynamic_ctx.base_outer_width_mm,
-                                                       outer_wall_gradient_dynamic_ctx.inset_strength_reference_mm) :
-            std::numeric_limits<float>::quiet_NaN();
-        const float variable_width_delta_mm = variable_width_delta_for_visibility_range_for_gcode(
-            inset_strength,
-            max_width_delta_limit_mm,
-            outer_wall_gradient_dynamic_ctx.active_component_minimum_offset_factor,
-            outer_wall_gradient_dynamic_ctx.active_component_strength_factor,
-            outer_wall_gradient_dynamic_ctx.active_component_td_width_factor,
-            outer_wall_gradient_dynamic_ctx.nonlinear_offset_adjustment,
-            outer_wall_gradient_dynamic_ctx.layer_height_mm,
-            stair_step_mm);
-        const float width_delta_mm = std::clamp(variable_width_delta_mm, 0.f, max_width_delta_limit_mm);
+        const float width_delta_mm = std::clamp(
+            texture_mapping_offset_surface_inset_mm(outer_wall_gradient_dynamic_ctx.offset_context,
+                                                   mid_point,
+                                                   -outward_x,
+                                                   -outward_y),
+            0.f,
+            max_width_delta_limit_mm);
         if (!std::isfinite(width_delta_mm) ||
             !std::isfinite(outer_wall_gradient_dynamic_ctx.base_outer_width_mm) ||
             !std::isfinite(outer_wall_gradient_dynamic_ctx.layer_height_mm))

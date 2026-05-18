@@ -461,8 +461,6 @@ std::vector<std::array<float, 3>> fixed_color_generic_solver_component_colors(in
         return { { { 1.f, 0.f, 0.f } }, { { 0.f, 1.f, 0.f } }, { { 0.f, 0.f, 1.f } }, { { 0.f, 0.f, 0.f } } };
     case int(TextureMappingZone::FilamentColorRGBW):
         return { { { 1.f, 0.f, 0.f } }, { { 0.f, 1.f, 0.f } }, { { 0.f, 0.f, 1.f } }, { { 1.f, 1.f, 1.f } } };
-    case int(TextureMappingZone::FilamentColorBW):
-        return { { { 0.f, 0.f, 0.f } }, { { 1.f, 1.f, 1.f } } };
     case int(TextureMappingZone::FilamentColorCMYKW):
         return { { { 0.f, 1.f, 1.f } }, { { 1.f, 0.f, 1.f } }, { { 1.f, 1.f, 0.f } }, { { 0.f, 0.f, 0.f } }, { { 1.f, 1.f, 1.f } } };
     case int(TextureMappingZone::FilamentColorRGBKW):
@@ -476,7 +474,7 @@ std::vector<size_t> best_matching_component_indices_for_semantic_colors(
     const std::vector<std::array<float, 3>> &component_colors,
     const std::vector<std::array<float, 3>> &semantic_colors)
 {
-    if (component_colors.size() != semantic_colors.size() || component_colors.empty() || component_colors.size() > 8)
+    if (component_colors.size() != semantic_colors.size() || component_colors.empty())
         return {};
 
     std::vector<size_t> permutation(component_colors.size(), 0);
@@ -947,7 +945,8 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
     float texture_tone_gamma,
     float layer_z_mm,
     float layer_z_falloff_mm,
-    bool high_resolution_texture_sampling)
+    bool high_resolution_texture_sampling,
+    bool high_speed_image_texture_sampling)
 {
     TextureMappingOffsetWeightField weight_field;
     if (component_colors.empty())
@@ -1002,11 +1001,6 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
                                                             const std::array<float, 4> &rgba) {
         if (accumulate_layer_plane_triangle_samples(p0, p1, p2, layer_z_mm, safe_layer_z_falloff_mm, high_resolution_texture_sampling,
                 [&rgba](const Vec3f &) { return TextureSampleData{ rgba, {}, false }; }, accumulate_sample))
-            return;
-
-        const float min_z = std::min({ float(p0.z()), float(p1.z()), float(p2.z()) });
-        const float max_z = std::max({ float(p0.z()), float(p1.z()), float(p2.z()) });
-        if (layer_z_mm < min_z - 4.f * safe_layer_z_falloff_mm || layer_z_mm > max_z + 4.f * safe_layer_z_falloff_mm)
             return;
 
         const float max_world_edge_mm = std::max({ float((p1 - p0).norm()), float((p2 - p1).norm()), float((p0 - p2).norm()) });
@@ -1168,10 +1162,13 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
                         }, accumulate_sample))
                     continue;
 
-                const float min_z = std::min({ float(p0.z()), float(p1.z()), float(p2.z()) });
-                const float max_z = std::max({ float(p0.z()), float(p1.z()), float(p2.z()) });
-                if (layer_z_mm < min_z - 4.f * safe_layer_z_falloff_mm || layer_z_mm > max_z + 4.f * safe_layer_z_falloff_mm)
-                    continue;
+                if (high_speed_image_texture_sampling) {
+                    const float min_z = std::min({ float(p0.z()), float(p1.z()), float(p2.z()) });
+                    const float max_z = std::max({ float(p0.z()), float(p1.z()), float(p2.z()) });
+                    const float z_margin = std::max(1e-4f, safe_layer_z_falloff_mm * 8.f + float(EPSILON));
+                    if (layer_z_mm < min_z - z_margin || layer_z_mm > max_z + z_margin)
+                        continue;
+                }
 
                 const float max_world_edge_mm = std::max({ float((p1 - p0).norm()), float((p2 - p1).norm()), float((p0 - p2).norm()) });
                 const double tri_area_mm2 = 0.5 * ((p1 - p0).cross(p2 - p0)).norm();
@@ -1219,8 +1216,6 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
             if (!world_pos.allFinite())
                 continue;
             const float dz = std::abs(float(world_pos.z()) - layer_z_mm);
-            if (dz > 4.f * safe_layer_z_falloff_mm)
-                continue;
             const float z_norm = dz / safe_layer_z_falloff_mm;
             const float sample_weight = std::exp(-0.5f * z_norm * z_norm);
             if (!std::isfinite(sample_weight) || sample_weight <= EPSILON)
@@ -1414,6 +1409,64 @@ std::vector<float> sample_weight_field_components(const TextureMappingOffsetWeig
         std::vector<float> values(weight_field.component_count, 0.f);
         for (size_t component_idx = 0; component_idx < weight_field.component_count; ++component_idx)
             values[component_idx] = clamp01f(weighted_sum[component_idx] / total_weight);
+        return values;
+    }
+
+    float nearest_d2 = std::numeric_limits<float>::max();
+    size_t nearest_sample_idx = size_t(-1);
+    const int nearest_ring_limit = std::min(std::max(max_ring + 2, 4), std::max(weight_field.bucket_width, weight_field.bucket_height));
+    for (int ring = 0; ring <= nearest_ring_limit; ++ring) {
+        const int min_x = std::max(0, cx - ring);
+        const int max_x = std::min(weight_field.bucket_width - 1, cx + ring);
+        const int min_y = std::max(0, cy - ring);
+        const int max_y = std::min(weight_field.bucket_height - 1, cy + ring);
+
+        auto visit_bucket = [&weight_field, x_mm, y_mm, &nearest_d2, &nearest_sample_idx](int bx, int by) {
+            if (bx < 0 || by < 0 || bx >= weight_field.bucket_width || by >= weight_field.bucket_height)
+                return;
+            const size_t bucket_idx = size_t(by) * size_t(weight_field.bucket_width) + size_t(bx);
+            if (bucket_idx >= weight_field.buckets.size())
+                return;
+            for (const uint32_t sample_idx_u32 : weight_field.buckets[bucket_idx]) {
+                const size_t sample_idx = size_t(sample_idx_u32);
+                if (sample_idx >= weight_field.sample_x_mm.size() || sample_idx >= weight_field.sample_y_mm.size())
+                    continue;
+                const float dx = x_mm - weight_field.sample_x_mm[sample_idx];
+                const float dy = y_mm - weight_field.sample_y_mm[sample_idx];
+                const float d2 = dx * dx + dy * dy;
+                if (d2 >= nearest_d2)
+                    continue;
+                const size_t value_idx = sample_idx * weight_field.component_count;
+                if (value_idx + weight_field.component_count > weight_field.sample_component_weights.size())
+                    continue;
+                nearest_d2 = d2;
+                nearest_sample_idx = sample_idx;
+            }
+        };
+
+        if (ring == 0) {
+            visit_bucket(cx, cy);
+        } else {
+            for (int x = min_x; x <= max_x; ++x) {
+                visit_bucket(x, min_y);
+                if (max_y != min_y)
+                    visit_bucket(x, max_y);
+            }
+            for (int y = min_y + 1; y <= max_y - 1; ++y) {
+                visit_bucket(min_x, y);
+                if (max_x != min_x)
+                    visit_bucket(max_x, y);
+            }
+        }
+        if (nearest_d2 < std::numeric_limits<float>::max() && ring >= 2)
+            break;
+    }
+
+    if (nearest_sample_idx != size_t(-1)) {
+        std::vector<float> values(weight_field.component_count, 0.f);
+        const size_t value_idx = nearest_sample_idx * weight_field.component_count;
+        for (size_t component_idx = 0; component_idx < weight_field.component_count; ++component_idx)
+            values[component_idx] = clamp01f(weight_field.sample_component_weights[value_idx + component_idx]);
         return values;
     }
     return fallback;
@@ -1877,7 +1930,10 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     const PrintObject       &print_object,
     const Layer             &layer,
     const TextureMappingZone &zone,
-    unsigned int             texture_zone_id)
+    unsigned int             texture_zone_id,
+    unsigned int             active_component_id_override,
+    std::optional<float>     base_outer_width_mm_override,
+    std::optional<float>     layer_height_mm_override)
 {
     const Print *print = print_object.print();
     if (print == nullptr)
@@ -1905,7 +1961,8 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     const float z_progress = object_layer_count > 1 ?
         std::clamp(float(layer_index) / float(object_layer_count - 1), 0.f, 1.f) :
         0.f;
-    const unsigned int active_component_id =
+    const unsigned int active_component_id = active_component_id_override != 0 ?
+        active_component_id_override :
         texture_mgr.resolve_zone_component(texture_zone_id, num_physical, layer_index);
     const auto active_component_it = std::find(component_ids.begin(), component_ids.end(), active_component_id);
     if (active_component_it == component_ids.end())
@@ -2005,13 +2062,16 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     if (global_strength_factor <= EPSILON)
         return std::nullopt;
 
-    const float base_outer_width_mm =
+    const float base_outer_width_mm = base_outer_width_mm_override ?
+        std::max(0.05f, *base_outer_width_mm_override) :
         std::max(0.05f, float(print_config.texture_mapping_outer_wall_gradient_max_line_width.value));
     const float config_min_gradient_width_mm = std::clamp(
         float(print_config.texture_mapping_outer_wall_gradient_min_line_width.value),
         0.05f,
         base_outer_width_mm);
-    const float layer_height_mm = std::max(0.01f, float(layer.height));
+    const float layer_height_mm = layer_height_mm_override ?
+        std::max(0.01f, *layer_height_mm_override) :
+        std::max(0.01f, float(layer.height));
     const float min_width_for_positive_spacing_mm = layer_height_mm * float(1. - 0.25 * PI) + 1e-4f;
     const float safe_min_gradient_width_mm = std::clamp(
         std::max(config_min_gradient_width_mm, min_width_for_positive_spacing_mm),
@@ -2041,7 +2101,8 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
                                                            texture_tone_gamma,
                                                            float(layer.print_z),
                                                            layer_sample_falloff_mm,
-                                                           zone.high_resolution_sampling);
+                                                           zone.high_resolution_sampling,
+                                                           zone.high_speed_image_texture_sampling);
         if (weight_field.empty())
             return std::nullopt;
     }
