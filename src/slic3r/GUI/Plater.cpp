@@ -1346,10 +1346,12 @@ public:
                                  wxEmptyString,
                                  wxDefaultPosition,
                                  wxSize(FromDIP(84), -1),
-                                 wxSP_ARROW_KEYS | wxALIGN_RIGHT,
-                                 0.04,
-                                 0.25,
-                                 std::clamp(double(dithering_resolution_mm), 0.04, 0.25),
+                                 wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER,
+                                 double(TextureMappingZone::MinDitheringResolutionMm),
+                                 double(TextureMappingZone::MaxDitheringResolutionMm),
+                                 std::clamp(double(dithering_resolution_mm),
+                                            double(TextureMappingZone::MinDitheringResolutionMm),
+                                            double(TextureMappingZone::MaxDitheringResolutionMm)),
                                  0.01);
         m_dithering_resolution_spin->SetDigits(2);
         dithering_resolution_row->Add(m_dithering_resolution_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
@@ -1367,12 +1369,14 @@ public:
                                  wxID_ANY,
                                  wxEmptyString,
                                  wxDefaultPosition,
-                                 wxSize(FromDIP(84), -1),
-                                 wxSP_ARROW_KEYS | wxALIGN_RIGHT,
-                                 0.08,
-                                 2.0,
-                                 std::clamp(double(halftone_dot_size_mm), 0.08, 2.0),
-                                 0.01);
+                                 wxSize(FromDIP(96), -1),
+                                 wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER,
+                                 double(TextureMappingZone::MinHalftoneDotSizeMm),
+                                 double(TextureMappingZone::MaxHalftoneDotSizeMm),
+                                 std::clamp(double(halftone_dot_size_mm),
+                                            double(TextureMappingZone::MinHalftoneDotSizeMm),
+                                            double(TextureMappingZone::MaxHalftoneDotSizeMm)),
+                                 0.1);
         m_halftone_dot_size_spin->SetDigits(2);
         halftone_dot_size_row->Add(m_halftone_dot_size_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
         halftone_dot_size_row->Add(new wxStaticText(m_halftone_dot_size_panel, wxID_ANY, _L("mm")), 0, wxALIGN_CENTER_VERTICAL);
@@ -1638,16 +1642,16 @@ public:
         return float(std::clamp(m_dithering_resolution_spin != nullptr ?
                                     m_dithering_resolution_spin->GetValue() :
                                     double(TextureMappingZone::DefaultDitheringResolutionMm),
-                                0.04,
-                                0.25));
+                                double(TextureMappingZone::MinDitheringResolutionMm),
+                                double(TextureMappingZone::MaxDitheringResolutionMm)));
     }
     float halftone_dot_size_mm() const
     {
         return float(std::clamp(m_halftone_dot_size_spin != nullptr ?
                                     m_halftone_dot_size_spin->GetValue() :
                                     double(TextureMappingZone::DefaultHalftoneDotSizeMm),
-                                0.08,
-                                2.0));
+                                double(TextureMappingZone::MinHalftoneDotSizeMm),
+                                double(TextureMappingZone::MaxHalftoneDotSizeMm)));
     }
     bool minimum_visibility_offset_enabled() const
     {
@@ -1904,6 +1908,19 @@ private:
         m_options_book->SetMinSize(wxSize(FromDIP(420), max_height));
     }
 
+    void layout_current_options_page()
+    {
+        if (m_options_book == nullptr)
+            return;
+        const int selection = m_options_book->GetSelection();
+        if (selection >= 0 && selection < int(m_options_book->GetPageCount())) {
+            wxWindow *page = m_options_book->GetPage(size_t(selection));
+            if (page != nullptr)
+                page->Layout();
+        }
+        m_options_book->Layout();
+    }
+
     void update_strength_offsets_visibility(bool fit_dialog)
     {
         if (m_strength_offsets_toggle_button != nullptr)
@@ -1957,6 +1974,7 @@ private:
                 m_compact_offset_mode_checkbox->SetValue(true);
             m_compact_offset_mode_checkbox->Enable(!enabled);
         }
+        layout_current_options_page();
         if (!fit_dialog)
             return;
         update_options_book_min_size();

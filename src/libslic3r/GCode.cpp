@@ -7059,13 +7059,75 @@ static float ordered_bayer_threshold_for_gcode(int x, int y)
 
 static float halftone_threshold_for_gcode(float x_mm, float y_mm, float dot_size_mm)
 {
-    const float period = std::clamp(dot_size_mm, 0.08f, 2.f);
+    const float period = std::clamp(dot_size_mm,
+                                    TextureMappingZone::MinHalftoneDotSizeMm,
+                                    TextureMappingZone::MaxHalftoneDotSizeMm);
     const float u = x_mm / period - std::floor(x_mm / period);
     const float v = y_mm / period - std::floor(y_mm / period);
     const float dx = u - 0.5f;
     const float dy = v - 0.5f;
     const float radius_area = (dx * dx + dy * dy) / 0.5f;
     return std::clamp(radius_area, 0.f, 1.f) - 0.5f;
+}
+
+static float halftone_screen_angle_deg_for_gcode(int filament_color_mode, size_t component_idx)
+{
+    const int clamped_mode =
+        std::clamp(filament_color_mode, int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorRGBKW));
+    if (component_idx < 3) {
+        static constexpr float primary_angles[3] = {15.f, 75.f, 0.f};
+        return primary_angles[component_idx];
+    }
+
+    switch (clamped_mode) {
+    case int(TextureMappingZone::FilamentColorCMYK):
+    case int(TextureMappingZone::FilamentColorRGBK):
+    case int(TextureMappingZone::FilamentColorCMYKW):
+    case int(TextureMappingZone::FilamentColorRGBKW):
+        if (component_idx == 3)
+            return 45.f;
+        if (component_idx == 4)
+            return 90.f;
+        break;
+    case int(TextureMappingZone::FilamentColorCMYW):
+    case int(TextureMappingZone::FilamentColorRGBW):
+        if (component_idx == 3)
+            return 90.f;
+        break;
+    case int(TextureMappingZone::FilamentColorBW):
+        if (component_idx == 0)
+            return 45.f;
+        if (component_idx == 1)
+            return 90.f;
+        break;
+    default:
+        break;
+    }
+
+    static constexpr float fallback_angles[] = {15.f, 75.f, 0.f, 45.f, 90.f, 30.f, 60.f, 105.f, 120.f, 150.f};
+    return fallback_angles[component_idx % (sizeof(fallback_angles) / sizeof(fallback_angles[0]))];
+}
+
+static bool halftone_screen_on_for_gcode(float  coverage,
+                                         float  surface_u_mm,
+                                         float  surface_v_mm,
+                                         float  dot_size_mm,
+                                         float  angle_deg)
+{
+    const float safe_coverage = clamp01f_for_gcode(coverage);
+    if (safe_coverage <= EPSILON)
+        return false;
+    if (safe_coverage >= 1.f - EPSILON)
+        return true;
+    if (!std::isfinite(surface_u_mm) || !std::isfinite(surface_v_mm))
+        return safe_coverage >= 0.5f;
+
+    const float radians = angle_deg * float(PI) / 180.f;
+    const float c = std::cos(radians);
+    const float s = std::sin(radians);
+    const float x = c * surface_u_mm + s * surface_v_mm;
+    const float y = -s * surface_u_mm + c * surface_v_mm;
+    return halftone_threshold_for_gcode(x, y, dot_size_mm) + 0.5f < safe_coverage;
 }
 
 static float dither_pitch_for_gcode(float base_outer_width_mm,
@@ -7078,10 +7140,26 @@ static float dither_pitch_for_gcode(float base_outer_width_mm,
                                           int(TextureMappingZone::DitheringClosest),
                                           int(TextureMappingZone::DitheringHalftone));
     if (clamped_method == int(TextureMappingZone::DitheringHalftone)) {
-        const float dot_sample_step_mm = std::clamp(std::clamp(halftone_dot_size_mm, 0.08f, 2.f) * 0.25f, 0.04f, 0.08f);
+        const float dot_sample_step_mm =
+            std::clamp(std::clamp(halftone_dot_size_mm,
+                                  TextureMappingZone::MinHalftoneDotSizeMm,
+                                  TextureMappingZone::MaxHalftoneDotSizeMm) *
+                           0.25f,
+                       0.04f,
+                       0.08f);
         return std::min(high_res_step_mm, dot_sample_step_mm);
     }
-    return std::min(high_res_step_mm, std::clamp(dithering_resolution_mm, 0.04f, 0.25f));
+    return std::min(high_res_step_mm,
+                    std::clamp(dithering_resolution_mm,
+                               TextureMappingZone::MinDitheringResolutionMm,
+                               TextureMappingZone::MaxDitheringResolutionMm));
+}
+
+static float dither_cell_size_for_gcode(float dithering_resolution_mm)
+{
+    return std::clamp(dithering_resolution_mm,
+                      TextureMappingZone::MinDitheringResolutionMm,
+                      TextureMappingZone::MaxDitheringResolutionMm);
 }
 
 static float wrap_repeat01_for_gcode(float uv)
@@ -8210,6 +8288,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                                                                                 bool                                      dithering_enabled,
                                                                                 int                                       dithering_method,
                                                                                 float                                     dither_pitch_mm,
+                                                                                float                                     dither_cell_size_mm,
                                                                                 float                                     halftone_dot_size_mm,
                                                                                 const std::vector<float>                 &component_strength_factors,
                                                                                 const std::vector<float>                 &component_minimum_offset_factors,
@@ -8224,6 +8303,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                                                                                 bool                                      high_speed_image_texture_sampling)
 {
     VertexColorOverhangWeightField weight_field;
+    (void) halftone_dot_size_mm;
     if (component_colors.empty())
         return weight_field;
     const size_t component_count = component_colors.size();
@@ -8734,13 +8814,16 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
     if (samples.empty())
         return VertexColorOverhangWeightField{};
 
+    const int clamped_binary_dither_method =
+        std::clamp(dithering_method, int(TextureMappingZone::DitheringClosest), int(TextureMappingZone::DitheringHalftone));
     std::vector<uint32_t> binary_dither_masks;
     const bool can_binary_dither =
         dithering_enabled &&
         !raw_values_mode &&
+        clamped_binary_dither_method != int(TextureMappingZone::DitheringHalftone) &&
         component_count > 0 &&
-        std::isfinite(dither_pitch_mm) &&
-        dither_pitch_mm > EPSILON;
+        std::isfinite(dither_cell_size_mm) &&
+        dither_cell_size_mm > EPSILON;
     if (can_binary_dither) {
         bool has_raw_samples = false;
         for (const WeightedTextureSample &sample : samples) {
@@ -8788,8 +8871,8 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                 if (sample.weight <= EPSILON)
                     continue;
 
-                const int cell_x = int(std::floor((sample.x_mm - min_x_mm) / dither_pitch_mm));
-                const int cell_y = int(std::floor((sample.y_mm - min_y_mm) / dither_pitch_mm));
+                const int cell_x = int(std::floor((sample.x_mm - min_x_mm) / dither_cell_size_mm));
+                const int cell_y = int(std::floor((sample.y_mm - min_y_mm) / dither_cell_size_mm));
                 const std::pair<int, int> key(cell_x, cell_y);
                 auto cell_it = cell_index_by_coord.find(key);
                 if (cell_it == cell_index_by_coord.end()) {
@@ -8824,15 +8907,11 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                 });
 
                 binary_dither_masks.assign(samples.size(), 0);
-                const int clamped_dither_method =
-                    std::clamp(dithering_method,
-                               int(TextureMappingZone::DitheringClosest),
-                               int(TextureMappingZone::DitheringHalftone));
                 std::map<std::pair<int, int>, std::array<float, 3>> floyd_error;
                 for (const size_t cell_idx : order) {
                     BinaryDitherCell &cell = cells[cell_idx];
                     std::array<float, 3> target_oklab = cell.target_oklab;
-                    if (clamped_dither_method == int(TextureMappingZone::DitheringFloydSteinberg)) {
+                    if (clamped_binary_dither_method == int(TextureMappingZone::DitheringFloydSteinberg)) {
                         const auto error_it = floyd_error.find({cell.x, cell.y});
                         if (error_it != floyd_error.end())
                             for (size_t axis = 0; axis < 3; ++axis)
@@ -8841,14 +8920,9 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
 
                     bool thresholded_dither = false;
                     float threshold = 0.f;
-                    if (clamped_dither_method == int(TextureMappingZone::DitheringOrderedBayer)) {
+                    if (clamped_binary_dither_method == int(TextureMappingZone::DitheringOrderedBayer)) {
                         thresholded_dither = true;
                         threshold = ordered_bayer_threshold_for_gcode(cell.x, cell.y) + 0.5f;
-                    } else if (clamped_dither_method == int(TextureMappingZone::DitheringHalftone)) {
-                        const float x_mm = min_x_mm + (float(cell.x) + 0.5f) * dither_pitch_mm;
-                        const float y_mm = min_y_mm + (float(cell.y) + 0.5f) * dither_pitch_mm;
-                        thresholded_dither = true;
-                        threshold = halftone_threshold_for_gcode(x_mm, y_mm, halftone_dot_size_mm) + 0.5f;
                     }
 
                     const size_t candidate_idx =
@@ -8863,7 +8937,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                         if (sample_idx < binary_dither_masks.size())
                             binary_dither_masks[sample_idx] = candidate.mask;
 
-                    if (clamped_dither_method == int(TextureMappingZone::DitheringFloydSteinberg)) {
+                    if (clamped_binary_dither_method == int(TextureMappingZone::DitheringFloydSteinberg)) {
                         std::array<float, 3> error = {
                             target_oklab[0] - candidate.oklab[0],
                             target_oklab[1] - candidate.oklab[1],
@@ -9613,6 +9687,8 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
     const int dithering_method = std::clamp(zone->dithering_method,
                                             int(TextureMappingZone::DitheringClosest),
                                             int(TextureMappingZone::DitheringHalftone));
+    const bool halftone_dithering_enabled =
+        dithering_enabled && dithering_method == int(TextureMappingZone::DitheringHalftone);
     const float seam_texture_base_width_mm =
         std::max(0.05f, float(m_config.texture_mapping_outer_wall_gradient_max_line_width.value));
     const float dither_pitch_mm =
@@ -9620,8 +9696,11 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
                                dithering_method,
                                zone->dithering_resolution_mm,
                                zone->halftone_dot_size_mm);
-    const float halftone_dot_size_mm = std::clamp(zone->halftone_dot_size_mm, 0.08f, 2.f);
-    const bool compact_offset_mode = zone->compact_offset_mode || dithering_enabled;
+    const float dither_cell_size_mm = dither_cell_size_for_gcode(zone->dithering_resolution_mm);
+    const float halftone_dot_size_mm = std::clamp(zone->halftone_dot_size_mm,
+                                                  TextureMappingZone::MinHalftoneDotSizeMm,
+                                                  TextureMappingZone::MaxHalftoneDotSizeMm);
+    const bool compact_offset_mode = halftone_dithering_enabled ? false : zone->compact_offset_mode || dithering_enabled;
     const bool nonlinear_offset_adjustment = zone->nonlinear_offset_adjustment;
     const bool use_legacy_fixed_color_mode = zone->use_legacy_fixed_color_mode;
     const float texture_contrast_pct = std::clamp(zone->contrast_pct, 25.f, 300.f);
@@ -9684,7 +9763,7 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
     if (dithering_method == int(TextureMappingZone::DitheringHalftone))
         component_key_stream << "|hdt" << int(std::lround(halftone_dot_size_mm * 1000.f));
     else
-        component_key_stream << "|hrz" << int(std::lround(std::clamp(zone->dithering_resolution_mm, 0.04f, 0.25f) * 1000.f));
+        component_key_stream << "|hrz" << int(std::lround(dither_cell_size_mm * 1000.f));
     for (const float strength_factor : component_strength_factors)
         component_key_stream << "|st" << int(std::lround(std::clamp(strength_factor, 0.f, 1.f) * 1000.f));
     for (const float minimum_offset_factor : component_minimum_offset_factors)
@@ -9760,6 +9839,7 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
                                                                                   dithering_enabled,
                                                                                   dithering_method,
                                                                                   dither_pitch_mm,
+                                                                                  dither_cell_size_mm,
                                                                                   halftone_dot_size_mm,
                                                                                   component_strength_factors,
                                                                                   component_minimum_offset_factors,
@@ -10916,11 +10996,17 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         float  balance_weight { 0.f };
     };
 
+    struct OuterWallGradientSurfaceCoord {
+        float u_mm { std::numeric_limits<float>::quiet_NaN() };
+        float v_mm { std::numeric_limits<float>::quiet_NaN() };
+    };
+
     struct OuterWallGradientDynamicContext {
         bool                      enabled { false };
         bool                      vertex_color_match_mode { false };
         bool                      high_resolution_texture_sampling { false };
         bool                      dithering_enabled { false };
+        bool                      halftone_dithering_enabled { false };
         bool                      nonlinear_offset_adjustment { false };
         bool                      compact_offset_mode { false };
         bool                      object_center_mode { false };
@@ -10940,6 +11026,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         float                     active_component_td_width_factor { 1.f };
         float                     base_outer_width_mm { 0.4f };
         float                     dither_pitch_mm { 0.08f };
+        float                     halftone_dot_size_mm { TextureMappingZone::DefaultHalftoneDotSizeMm };
+        float                     active_halftone_angle_deg { 0.f };
         float                     flow_reference_width_mm { 0.4f };
         float                     base_centerline_shift_mm { 0.f };
         float                     centerline_shift_balance_mm { 0.f };
@@ -10965,6 +11053,53 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
     };
     auto can_emit_sloped_extrusion = [](const Vec3d &dest, double dE) {
         return dest.allFinite() && std::isfinite(dE);
+    };
+
+    const bool halftone_path_closed = path.polyline.points.size() > 2 && path.polyline.is_closed();
+    std::vector<double> halftone_source_cumulative_mm(path.polyline.points.size(), 0.0);
+    for (size_t point_idx = 1; point_idx < path.polyline.points.size(); ++point_idx)
+        halftone_source_cumulative_mm[point_idx] =
+            halftone_source_cumulative_mm[point_idx - 1] +
+            Line(path.polyline.points[point_idx - 1], path.polyline.points[point_idx]).length() * SCALING_FACTOR;
+    const double halftone_total_path_mm = halftone_source_cumulative_mm.empty() ? 0.0 : halftone_source_cumulative_mm.back();
+    double halftone_anchor_mm = 0.0;
+    if (halftone_path_closed && path.polyline.points.size() > 1 && halftone_total_path_mm > EPSILON) {
+        const size_t end_idx = path.polyline.points.size() - 1;
+        size_t best_idx = 0;
+        for (size_t point_idx = 1; point_idx < end_idx; ++point_idx) {
+            const Point &candidate = path.polyline.points[point_idx];
+            const Point &best = path.polyline.points[best_idx];
+            if (candidate.x() < best.x() || (candidate.x() == best.x() && candidate.y() < best.y()))
+                best_idx = point_idx;
+        }
+        halftone_anchor_mm = halftone_source_cumulative_mm[best_idx];
+    }
+    float halftone_surface_v_mm = m_layer != nullptr ? float(m_layer->print_z) : float(m_nominal_z);
+    if (!std::isfinite(halftone_surface_v_mm))
+        halftone_surface_v_mm = 0.f;
+    auto halftone_surface_u_for_source_distance = [&](double source_distance_mm) {
+        if (!std::isfinite(source_distance_mm))
+            source_distance_mm = 0.0;
+        if (halftone_path_closed && halftone_total_path_mm > EPSILON) {
+            double u = std::fmod(source_distance_mm - halftone_anchor_mm, halftone_total_path_mm);
+            if (u < 0.0)
+                u += halftone_total_path_mm;
+            return float(u);
+        }
+        return float(std::max(0.0, source_distance_mm));
+    };
+    auto halftone_surface_coord_for_source_distance = [&](double source_distance_mm) {
+        OuterWallGradientSurfaceCoord coord;
+        coord.u_mm = halftone_surface_u_for_source_distance(source_distance_mm);
+        coord.v_mm = halftone_surface_v_mm;
+        return coord;
+    };
+    auto halftone_source_distance_for_segment_fraction = [&](size_t segment_idx, double fraction) {
+        if (segment_idx + 1 >= halftone_source_cumulative_mm.size())
+            return 0.0;
+        const double start_mm = halftone_source_cumulative_mm[segment_idx];
+        const double end_mm = halftone_source_cumulative_mm[segment_idx + 1];
+        return start_mm + (end_mm - start_mm) * std::clamp(fraction, 0.0, 1.0);
     };
 
     std::vector<OuterWallGradientSegmentMod> outer_wall_gradient_segment_mods;
@@ -11131,16 +11266,22 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                             const int dithering_method = std::clamp(zone->dithering_method,
                                                                     int(TextureMappingZone::DitheringClosest),
                                                                     int(TextureMappingZone::DitheringHalftone));
+                            const bool halftone_dithering_enabled =
+                                dithering_enabled && dithering_method == int(TextureMappingZone::DitheringHalftone);
                             const float dither_pitch_mm =
                                 dither_pitch_for_gcode(base_outer_width_mm,
                                                        dithering_method,
                                                        zone->dithering_resolution_mm,
                                                        zone->halftone_dot_size_mm);
-                            const float halftone_dot_size_mm = std::clamp(zone->halftone_dot_size_mm, 0.08f, 2.f);
+                            const float dither_cell_size_mm = dither_cell_size_for_gcode(zone->dithering_resolution_mm);
+                            const float halftone_dot_size_mm = std::clamp(zone->halftone_dot_size_mm,
+                                                                          TextureMappingZone::MinHalftoneDotSizeMm,
+                                                                          TextureMappingZone::MaxHalftoneDotSizeMm);
                             const bool high_resolution_texture_sampling = zone->high_resolution_sampling || dithering_enabled;
                             const bool high_speed_image_texture_sampling = zone->high_speed_image_texture_sampling;
                             const bool nonlinear_offset_adjustment = zone->nonlinear_offset_adjustment;
-                            const bool compact_offset_mode = zone->compact_offset_mode || dithering_enabled;
+                            const bool compact_offset_mode =
+                                halftone_dithering_enabled ? false : zone->compact_offset_mode || dithering_enabled;
                             const float layer_sample_z_mm = use_layer_aware_weighting ? float(m_layer->print_z) : 0.f;
                             const float layer_sample_falloff_mm = high_resolution_texture_sampling ?
                                 std::max(0.03f, layer_height_mm * 0.5f) :
@@ -11232,7 +11373,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                     if (dithering_method == int(TextureMappingZone::DitheringHalftone))
                                         component_key_stream << "|hdt" << int(std::lround(halftone_dot_size_mm * 1000.f));
                                     else
-                                        component_key_stream << "|hrz" << int(std::lround(std::clamp(zone->dithering_resolution_mm, 0.04f, 0.25f) * 1000.f));
+                                        component_key_stream << "|hrz" << int(std::lround(dither_cell_size_mm * 1000.f));
                                     for (const float strength_factor : component_strength_factors)
                                         component_key_stream << "|st" << int(std::lround(std::clamp(strength_factor, 0.f, 1.f) * 1000.f));
                                     for (const float minimum_offset_factor : component_minimum_offset_factors)
@@ -11261,6 +11402,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                                                                                          dithering_enabled,
                                                                                                          dithering_method,
                                                                                                          dither_pitch_mm,
+                                                                                                         dither_cell_size_mm,
                                                                                                          halftone_dot_size_mm,
                                                                                                          component_strength_factors,
                                                                                                          component_minimum_offset_factors,
@@ -11293,6 +11435,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                 outer_wall_gradient_dynamic_ctx.vertex_color_match_mode = vertex_color_match_mode;
                                 outer_wall_gradient_dynamic_ctx.high_resolution_texture_sampling = high_resolution_texture_sampling;
                                 outer_wall_gradient_dynamic_ctx.dithering_enabled = dithering_enabled;
+                                outer_wall_gradient_dynamic_ctx.halftone_dithering_enabled = halftone_dithering_enabled;
                                 outer_wall_gradient_dynamic_ctx.nonlinear_offset_adjustment = nonlinear_offset_adjustment;
                                 outer_wall_gradient_dynamic_ctx.compact_offset_mode = compact_offset_mode;
                                 outer_wall_gradient_dynamic_ctx.object_center_mode = object_center_mode;
@@ -11312,6 +11455,9 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                 outer_wall_gradient_dynamic_ctx.active_component_td_width_factor = active_component_td_width_factor;
                                 outer_wall_gradient_dynamic_ctx.base_outer_width_mm = base_outer_width_mm;
                                 outer_wall_gradient_dynamic_ctx.dither_pitch_mm = dither_pitch_mm;
+                                outer_wall_gradient_dynamic_ctx.halftone_dot_size_mm = halftone_dot_size_mm;
+                                outer_wall_gradient_dynamic_ctx.active_halftone_angle_deg =
+                                    halftone_screen_angle_deg_for_gcode(texture_filament_color_mode, active_component_idx);
                                 outer_wall_gradient_dynamic_ctx.flow_reference_width_mm = flow_reference_width_mm;
                                 outer_wall_gradient_dynamic_ctx.base_centerline_shift_mm = base_centerline_shift_mm;
                                 outer_wall_gradient_dynamic_ctx.layer_height_mm = layer_height_mm;
@@ -11340,6 +11486,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                            clamped_shift_coord_for_gcode(shift_y, shift_scaled, max_shift_coord, mod.shift_dy);
                                 };
 
+                                size_t texture_path_segment_idx = 0;
                                 for (const Line &line : path.polyline.lines()) {
                                     if (!outer_wall_gradient_dynamic_ctx.enabled)
                                         break;
@@ -11353,6 +11500,10 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                     const double dy = by - ay;
                                     const double len = std::hypot(dx, dy);
                                     mod.length_mm = unscale<double>(len);
+                                    const OuterWallGradientSurfaceCoord surface_coord =
+                                        halftone_surface_coord_for_source_distance(
+                                            halftone_source_distance_for_segment_fraction(texture_path_segment_idx, 0.5));
+                                    ++texture_path_segment_idx;
                                     if (len <= EPSILON) {
                                         outer_wall_gradient_segment_mods.emplace_back(mod);
                                         continue;
@@ -11386,13 +11537,23 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                             !vertex_color_weight_field->empty()) {
                                             const float mid_x_mm = 0.5f * (unscale<float>(line.a.x()) + unscale<float>(line.b.x()));
                                             const float mid_y_mm = 0.5f * (unscale<float>(line.a.y()) + unscale<float>(line.b.y()));
-                                            const float desired_strength = sample_vertex_color_weight_field_for_gcode(
+                                            float desired_strength = sample_vertex_color_weight_field_for_gcode(
                                                 *vertex_color_weight_field,
                                                 mid_x_mm,
                                                 mid_y_mm,
                                                 active_component_idx,
                                                 high_resolution_texture_sampling,
-                                                compact_offset_mode);
+                                                compact_offset_mode && !halftone_dithering_enabled);
+                                            if (halftone_dithering_enabled)
+                                                desired_strength = halftone_screen_on_for_gcode(desired_strength,
+                                                                                                surface_coord.u_mm,
+                                                                                                surface_coord.v_mm,
+                                                                                                halftone_dot_size_mm,
+                                                                                                halftone_screen_angle_deg_for_gcode(
+                                                                                                    texture_filament_color_mode,
+                                                                                                    active_component_idx)) ?
+                                                    1.f :
+                                                    0.f;
                                             inset_strength = std::clamp(1.f - desired_strength, 0.f, 1.f);
                                         }
                                     } else {
@@ -12071,7 +12232,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
 
     const Layer *surface_layer = m_layer;
 
-    auto dynamic_modulation_for_line = [&outer_wall_gradient_dynamic_ctx, surface_layer](const Line &line) {
+    auto dynamic_modulation_for_line =
+        [&outer_wall_gradient_dynamic_ctx, surface_layer](const Line &line, const OuterWallGradientSurfaceCoord &surface_coord) {
         OuterWallGradientSegmentMod mod;
         if (!outer_wall_gradient_dynamic_ctx.enabled)
             return mod;
@@ -12123,13 +12285,22 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                     outer_wall_gradient_dynamic_ctx.vertex_color_weight_field->component_count) {
                 const float mid_x_mm = 0.5f * (unscale<float>(line.a.x()) + unscale<float>(line.b.x()));
                 const float mid_y_mm = 0.5f * (unscale<float>(line.a.y()) + unscale<float>(line.b.y()));
-                const float desired_strength = sample_vertex_color_weight_field_for_gcode(
+                float desired_strength = sample_vertex_color_weight_field_for_gcode(
                     *outer_wall_gradient_dynamic_ctx.vertex_color_weight_field,
                     mid_x_mm,
                     mid_y_mm,
                     outer_wall_gradient_dynamic_ctx.active_component_idx,
                     outer_wall_gradient_dynamic_ctx.high_resolution_texture_sampling,
-                    outer_wall_gradient_dynamic_ctx.compact_offset_mode);
+                    outer_wall_gradient_dynamic_ctx.compact_offset_mode &&
+                        !outer_wall_gradient_dynamic_ctx.halftone_dithering_enabled);
+                if (outer_wall_gradient_dynamic_ctx.halftone_dithering_enabled)
+                    desired_strength = halftone_screen_on_for_gcode(desired_strength,
+                                                                    surface_coord.u_mm,
+                                                                    surface_coord.v_mm,
+                                                                    outer_wall_gradient_dynamic_ctx.halftone_dot_size_mm,
+                                                                    outer_wall_gradient_dynamic_ctx.active_halftone_angle_deg) ?
+                        1.f :
+                        0.f;
                 inset_strength = std::clamp(1.f - desired_strength, 0.f, 1.f);
             }
         } else {
@@ -12366,7 +12537,12 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                 continue;
                             }
 
-                            const OuterWallGradientSegmentMod sub_mod = dynamic_modulation_for_line(sub_line);
+                            const OuterWallGradientSurfaceCoord surface_coord =
+                                halftone_surface_coord_for_source_distance(
+                                    halftone_source_distance_for_segment_fraction(
+                                        segment_idx,
+                                        (double(sub_idx) - 0.5) / double(subsegment_count)));
+                            const OuterWallGradientSegmentMod sub_mod = dynamic_modulation_for_line(sub_line, surface_coord);
                             const Point target_point = make_shifted_point(sub_line.b, sub_mod.shift_dx, sub_mod.shift_dy);
                             const Vec2d target_xy = this->point_to_gcode(target_point);
                             if (!is_reasonable_quantized_gcode_point_for_gcode(target_xy)) {
@@ -12546,11 +12722,14 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         gcode += m_writer.set_speed(last_set_speed, "", comment);
         Point prev_point_model = new_points[0].p;
         if (outer_wall_gradient_modulated_path && new_points.size() > 1) {
+            const Line first_line(new_points[0].p, new_points[1].p);
+            const OuterWallGradientSurfaceCoord first_surface_coord =
+                halftone_surface_coord_for_source_distance(first_line.length() * SCALING_FACTOR * 0.5);
             const OuterWallGradientSegmentMod first_mod =
                 (outer_wall_gradient_dynamic_ctx.enabled &&
                  (outer_wall_gradient_dynamic_ctx.object_center_mode ||
                   outer_wall_gradient_dynamic_ctx.vertex_color_match_mode)) ?
-                    dynamic_modulation_for_line(Line(new_points[0].p, new_points[1].p)) :
+                    dynamic_modulation_for_line(first_line, first_surface_coord) :
                     segment_modulation_at(0);
             prev_point_model = make_shifted_point(prev_point_model, first_mod.shift_dx, first_mod.shift_dy);
         }
@@ -12566,17 +12745,27 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             pre_fan_enabled = true;
 
         double path_length = 0.;
+        double source_path_length_mm = 0.;
         for (size_t i = 1; i < new_points.size(); i++) {
             std::string tempDescription = description;
             const ProcessedPoint &processed_point = new_points[i];
             const ProcessedPoint &pre_processed_point = new_points[i-1];
+            const Line parent_source_line(pre_processed_point.p, processed_point.p);
+            const double parent_source_length_mm = parent_source_line.length() * SCALING_FACTOR;
+            const double safe_parent_source_length_mm =
+                std::isfinite(parent_source_length_mm) ? std::max(0.0, parent_source_length_mm) : 0.0;
+            const double segment_source_start_mm = source_path_length_mm;
+            if (std::isfinite(parent_source_length_mm))
+                source_path_length_mm += parent_source_length_mm;
             const bool dynamic_line_modulation =
                 outer_wall_gradient_dynamic_ctx.enabled &&
                 (outer_wall_gradient_dynamic_ctx.object_center_mode ||
                  outer_wall_gradient_dynamic_ctx.vertex_color_match_mode);
+            const OuterWallGradientSurfaceCoord segment_surface_coord =
+                halftone_surface_coord_for_source_distance(segment_source_start_mm + safe_parent_source_length_mm * 0.5);
             const OuterWallGradientSegmentMod segment_mod =
                 dynamic_line_modulation ?
-                    dynamic_modulation_for_line(Line(pre_processed_point.p, processed_point.p)) :
+                    dynamic_modulation_for_line(parent_source_line, segment_surface_coord) :
                     segment_modulation_at(i - 1);
             const Point processed_target_point = make_shifted_point(processed_point.p, segment_mod.shift_dx, segment_mod.shift_dy);
             Vec2d p = this->point_to_gcode_quantized(processed_target_point);
@@ -12687,7 +12876,11 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                         Point(coord_t(std::llround(double(parent_line.a.x()) + (double(parent_line.b.x()) - double(parent_line.a.x())) * t)),
                               coord_t(std::llround(double(parent_line.a.y()) + (double(parent_line.b.y()) - double(parent_line.a.y())) * t)));
                     const Line sub_line(sub_a, sub_b);
-                    const OuterWallGradientSegmentMod sub_mod = dynamic_modulation_for_line(sub_line);
+                    const OuterWallGradientSurfaceCoord sub_surface_coord =
+                        halftone_surface_coord_for_source_distance(
+                            segment_source_start_mm + safe_parent_source_length_mm *
+                                ((double(sub_idx) - 0.5) / double(subsegment_count)));
+                    const OuterWallGradientSegmentMod sub_mod = dynamic_modulation_for_line(sub_line, sub_surface_coord);
                     const Point sub_target_point = make_shifted_point(sub_line.b, sub_mod.shift_dx, sub_mod.shift_dy);
                     Vec2d sub_p = this->point_to_gcode_quantized(sub_target_point);
                     if (!is_reasonable_quantized_gcode_point_for_gcode(sub_p)) {

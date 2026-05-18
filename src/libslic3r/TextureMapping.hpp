@@ -110,9 +110,13 @@ struct TextureMappingZone
     static constexpr int   DefaultGenericSolverMode = int(GenericSolverV2);
     static constexpr int   DefaultGenericSolverMixModel = int(GenericSolverPigmentPainter);
     static constexpr bool  DefaultDitheringEnabled = false;
-    static constexpr int   DefaultDitheringMethod = int(DitheringFloydSteinberg);
+    static constexpr int   DefaultDitheringMethod = int(DitheringHalftone);
+    static constexpr float MinDitheringResolutionMm = 0.04f;
+    static constexpr float MaxDitheringResolutionMm = 10.f;
     static constexpr float DefaultDitheringResolutionMm = 0.08f;
-    static constexpr float DefaultHalftoneDotSizeMm = 0.32f;
+    static constexpr float MinHalftoneDotSizeMm = 0.08f;
+    static constexpr float MaxHalftoneDotSizeMm = 50.f;
+    static constexpr float DefaultHalftoneDotSizeMm = 0.8f;
     static constexpr float DefaultContrastPct = 100.f;
     static constexpr bool  DefaultHighResolutionSampling = true;
     static constexpr float DefaultToneGamma = 1.f;

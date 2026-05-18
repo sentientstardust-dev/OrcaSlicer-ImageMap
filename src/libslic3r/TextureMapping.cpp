@@ -1083,9 +1083,13 @@ std::string TextureMappingManager::serialize_entries()
         texture["dithering_enabled"] = zone.dithering_enabled;
         texture["dithering_method"] = dithering_method_name(zone.dithering_method);
         texture["dithering_resolution_mm"] =
-            std::clamp(finite_or(zone.dithering_resolution_mm, TextureMappingZone::DefaultDitheringResolutionMm), 0.04f, 0.25f);
+            std::clamp(finite_or(zone.dithering_resolution_mm, TextureMappingZone::DefaultDitheringResolutionMm),
+                       TextureMappingZone::MinDitheringResolutionMm,
+                       TextureMappingZone::MaxDitheringResolutionMm);
         texture["halftone_dot_size_mm"] =
-            std::clamp(finite_or(zone.halftone_dot_size_mm, TextureMappingZone::DefaultHalftoneDotSizeMm), 0.08f, 2.f);
+            std::clamp(finite_or(zone.halftone_dot_size_mm, TextureMappingZone::DefaultHalftoneDotSizeMm),
+                       TextureMappingZone::MinHalftoneDotSizeMm,
+                       TextureMappingZone::MaxHalftoneDotSizeMm);
         texture["contrast_pct"] = std::clamp(finite_or(zone.contrast_pct, 100.f), 25.f, 300.f);
         texture["high_resolution_sampling"] = zone.high_resolution_sampling;
         texture["tone_gamma"] = normalize_tone_gamma(zone.tone_gamma);
@@ -1235,9 +1239,13 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.dithering_method = dithering_method_from_name(
             texture.value("dithering_method", dithering_method_name(TextureMappingZone::DefaultDitheringMethod)));
         zone.dithering_resolution_mm =
-            std::clamp(texture.value("dithering_resolution_mm", TextureMappingZone::DefaultDitheringResolutionMm), 0.04f, 0.25f);
+            std::clamp(texture.value("dithering_resolution_mm", TextureMappingZone::DefaultDitheringResolutionMm),
+                       TextureMappingZone::MinDitheringResolutionMm,
+                       TextureMappingZone::MaxDitheringResolutionMm);
         zone.halftone_dot_size_mm =
-            std::clamp(texture.value("halftone_dot_size_mm", TextureMappingZone::DefaultHalftoneDotSizeMm), 0.08f, 2.f);
+            std::clamp(texture.value("halftone_dot_size_mm", TextureMappingZone::DefaultHalftoneDotSizeMm),
+                       TextureMappingZone::MinHalftoneDotSizeMm,
+                       TextureMappingZone::MaxHalftoneDotSizeMm);
         if (zone.dithering_enabled)
             zone.compact_offset_mode = true;
         zone.contrast_pct = std::clamp(texture.value("contrast_pct", 100.f), 25.f, 300.f);

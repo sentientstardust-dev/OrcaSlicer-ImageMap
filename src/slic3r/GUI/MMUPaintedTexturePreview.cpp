@@ -1623,7 +1623,12 @@ float ordered_bayer_threshold_for_texture_preview(int x, int y)
 float halftone_threshold_for_texture_preview(int x, int y, float dot_size_mm)
 {
     const float period_px =
-        std::clamp(std::clamp(dot_size_mm, 0.08f, 2.f) / TextureMappingZone::DefaultDitheringResolutionMm, 2.f, 64.f);
+        std::clamp(std::clamp(dot_size_mm,
+                              TextureMappingZone::MinHalftoneDotSizeMm,
+                              TextureMappingZone::MaxHalftoneDotSizeMm) /
+                       TextureMappingZone::DefaultDitheringResolutionMm,
+                   2.f,
+                   TextureMappingZone::MaxHalftoneDotSizeMm / TextureMappingZone::DefaultDitheringResolutionMm);
     const float u = float(x) / period_px - std::floor(float(x) / period_px);
     const float v = float(y) / period_px - std::floor(float(y) / period_px);
     const float dx = u - 0.5f;
@@ -1785,7 +1790,9 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
     if (component_count == 0)
         return {};
 
-    if (settings.dithering_enabled && settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues)) {
+    if (settings.dithering_enabled &&
+        settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
+        settings.dithering_method != int(TextureMappingZone::DitheringHalftone)) {
         const std::vector<TexturePreviewBinaryDitherCandidate> candidates = binary_dither_candidates_for_texture_preview(settings);
         const std::array<float, 3> target_oklab = texture_preview_target_oklab(settings, sample_rgba);
         const size_t candidate_idx = nearest_binary_dither_candidate_for_texture_preview(candidates, target_oklab);
@@ -1961,9 +1968,16 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
     settings.dithering_method = std::clamp(zone->dithering_method,
                                            int(TextureMappingZone::DitheringClosest),
                                            int(TextureMappingZone::DitheringHalftone));
-    settings.dithering_resolution_mm = std::clamp(zone->dithering_resolution_mm, 0.04f, 0.25f);
-    settings.halftone_dot_size_mm = std::clamp(zone->halftone_dot_size_mm, 0.08f, 2.f);
-    settings.compact_offset_mode = zone->compact_offset_mode || settings.dithering_enabled;
+    settings.dithering_resolution_mm = std::clamp(zone->dithering_resolution_mm,
+                                                  TextureMappingZone::MinDitheringResolutionMm,
+                                                  TextureMappingZone::MaxDitheringResolutionMm);
+    settings.halftone_dot_size_mm = std::clamp(zone->halftone_dot_size_mm,
+                                               TextureMappingZone::MinHalftoneDotSizeMm,
+                                               TextureMappingZone::MaxHalftoneDotSizeMm);
+    const bool halftone_dithering_enabled =
+        settings.dithering_enabled && settings.dithering_method == int(TextureMappingZone::DitheringHalftone);
+    settings.compact_offset_mode =
+        halftone_dithering_enabled ? false : zone->compact_offset_mode || settings.dithering_enabled;
     settings.use_legacy_fixed_color_mode = zone->use_legacy_fixed_color_mode;
     settings.contrast_pct = std::clamp(zone->contrast_pct, 25.f, 300.f);
     settings.tone_gamma = (!std::isfinite(zone->tone_gamma) || zone->tone_gamma <= 0.f) ?
@@ -2098,6 +2112,7 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
     const bool use_binary_dithering =
         settings.dithering_enabled &&
         settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
+        settings.dithering_method != int(TextureMappingZone::DitheringHalftone) &&
         !use_raw_offsets;
     const std::vector<TexturePreviewBinaryDitherCandidate> binary_dither_candidates =
         use_binary_dithering ? binary_dither_candidates_for_texture_preview(settings) :
