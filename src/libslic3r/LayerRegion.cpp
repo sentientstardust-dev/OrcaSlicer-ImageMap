@@ -8,15 +8,340 @@
 #include "BoundingBox.hpp"
 #include "SVG.hpp"
 #include "TextureMapping.hpp"
+#include "TextureMappingOffset.hpp"
 #include "Algorithm/RegionExpansion.hpp"
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include <string>
 #include <map>
+#include <optional>
 
 #include <boost/log/trivial.hpp>
 #include <boost/algorithm/clamp.hpp>
 
 namespace Slic3r {
+
+struct PerimeterPathBoundarySample {
+    Point  point;
+    double inward_x { 0.0 };
+    double inward_y { 0.0 };
+    float  inset_mm { 0.f };
+};
+
+static bool perimeter_texture_expolygons_contain_point(const ExPolygons &expolygons, const Point &point)
+{
+    return std::any_of(expolygons.begin(), expolygons.end(), [&point](const ExPolygon &expolygon) {
+        return expolygon.contains(point, true);
+    });
+}
+
+static std::vector<ExPolygons> perimeter_texture_build_erode_ladder(const ExPolygon &source,
+                                                                    float            max_inset_mm,
+                                                                    float           &step_mm)
+{
+    step_mm = std::clamp(max_inset_mm / 10.f, 0.025f, 0.08f);
+    const int level_count = std::clamp(int(std::ceil(max_inset_mm / std::max(step_mm, 1e-4f))) + 1, 1, 96);
+    std::vector<ExPolygons> ladder(static_cast<size_t>(level_count));
+    ladder.front().push_back(source);
+    for (int level = 1; level < level_count; ++level) {
+        const float distance_scaled = float(scale_(double(step_mm) * double(level)));
+        ladder[size_t(level)] = offset_ex(source, -distance_scaled);
+        if (ladder[size_t(level)].empty()) {
+            for (int fill = level + 1; fill < level_count; ++fill)
+                ladder[size_t(fill)].clear();
+            break;
+        }
+    }
+    return ladder;
+}
+
+static float perimeter_texture_safe_inset_for_sample(const ExPolygon              &source,
+                                                     const std::vector<ExPolygons> &erode_ladder,
+                                                     float                         erode_step_mm,
+                                                     const PerimeterPathBoundarySample &sample,
+                                                     float                         desired_mm,
+                                                     float                         max_inset_mm)
+{
+    const float clamped_desired = std::clamp(desired_mm, 0.f, max_inset_mm);
+    if (clamped_desired <= EPSILON)
+        return 0.f;
+
+    auto point_at_inset = [&sample](float inset_mm) {
+        const double inset_scaled = scale_(double(inset_mm));
+        return Point(coord_t(std::llround(double(sample.point.x()) + sample.inward_x * inset_scaled)),
+                     coord_t(std::llround(double(sample.point.y()) + sample.inward_y * inset_scaled)));
+    };
+
+    auto inset_allowed = [&](float inset_mm) {
+        const Point candidate = point_at_inset(inset_mm);
+        if (!source.contains(candidate, true))
+            return false;
+        const size_t level = std::min(erode_ladder.empty() ? size_t(0) :
+                                          size_t(std::floor(std::max(0.f, inset_mm - 0.01f) / std::max(erode_step_mm, 1e-4f))),
+                                      erode_ladder.empty() ? size_t(0) : erode_ladder.size() - 1);
+        if (level > 0) {
+            if (level >= erode_ladder.size() || erode_ladder[level].empty())
+                return false;
+            if (!perimeter_texture_expolygons_contain_point(erode_ladder[level], candidate))
+                return false;
+        }
+        return true;
+    };
+
+    if (inset_allowed(clamped_desired))
+        return clamped_desired;
+
+    float low = 0.f;
+    float high = clamped_desired;
+    for (int i = 0; i < 10; ++i) {
+        const float mid = 0.5f * (low + high);
+        if (inset_allowed(mid))
+            low = mid;
+        else
+            high = mid;
+    }
+    return low;
+}
+
+static std::vector<PerimeterPathBoundarySample> perimeter_texture_sample_polygon_boundary(
+    const Polygon                    &polygon,
+    const TextureMappingOffsetContext &context,
+    const ExPolygon                  &source)
+{
+    std::vector<PerimeterPathBoundarySample> samples;
+    const Points &points = polygon.points;
+    if (points.size() < 3)
+        return samples;
+
+    float erode_step_mm = 0.f;
+    const std::vector<ExPolygons> erode_ladder =
+        perimeter_texture_build_erode_ladder(source, context.max_width_delta_mm, erode_step_mm);
+    const double pitch_scaled = scale_(context.high_resolution_texture_sampling ? 0.08 : 0.16);
+
+    for (size_t idx = 0; idx < points.size(); ++idx) {
+        const Point &a = points[idx];
+        const Point &b = points[(idx + 1) % points.size()];
+        const double dx = double(b.x()) - double(a.x());
+        const double dy = double(b.y()) - double(a.y());
+        const double len = std::hypot(dx, dy);
+        if (!std::isfinite(len) || len <= EPSILON)
+            continue;
+
+        const double inward_x = -dy / len;
+        const double inward_y = dx / len;
+        const int sample_count = std::clamp(int(std::ceil(len / std::max(pitch_scaled, 1.0))), 1, 4096);
+        for (int sample_idx = 0; sample_idx < sample_count; ++sample_idx) {
+            const double t = double(sample_idx) / double(sample_count);
+            PerimeterPathBoundarySample sample;
+            sample.point = Point(coord_t(std::llround(double(a.x()) + dx * t)),
+                                 coord_t(std::llround(double(a.y()) + dy * t)));
+            sample.inward_x = inward_x;
+            sample.inward_y = inward_y;
+            const float desired_mm = texture_mapping_offset_surface_inset_mm(context, sample.point, inward_x, inward_y);
+            sample.inset_mm = perimeter_texture_safe_inset_for_sample(source,
+                                                                      erode_ladder,
+                                                                      erode_step_mm,
+                                                                      sample,
+                                                                      desired_mm,
+                                                                      context.max_width_delta_mm);
+            samples.emplace_back(sample);
+        }
+    }
+
+    if (samples.size() < 3)
+        return {};
+
+    auto sample_distance_mm = [](const PerimeterPathBoundarySample &lhs, const PerimeterPathBoundarySample &rhs) {
+        const double dx = double(lhs.point.x()) - double(rhs.point.x());
+        const double dy = double(lhs.point.y()) - double(rhs.point.y());
+        return unscale<float>(std::hypot(dx, dy));
+    };
+
+    auto smooth_insets = [&samples, &sample_distance_mm](float radius_mm) {
+        if (samples.size() < 3)
+            return;
+        radius_mm = std::clamp(radius_mm, 0.05f, 1.5f);
+        std::vector<float> smoothed(samples.size(), 0.f);
+        for (size_t idx = 0; idx < samples.size(); ++idx) {
+            float weighted_sum = samples[idx].inset_mm;
+            float weight_sum = 1.f;
+            float distance_mm = 0.f;
+            for (size_t step = 1; step < samples.size(); ++step) {
+                const size_t prev = (idx + samples.size() - step) % samples.size();
+                const size_t next_prev = (prev + 1) % samples.size();
+                distance_mm += sample_distance_mm(samples[prev], samples[next_prev]);
+                if (distance_mm > radius_mm)
+                    break;
+                const float weight = 1.f - distance_mm / radius_mm;
+                weighted_sum += samples[prev].inset_mm * weight;
+                weight_sum += weight;
+            }
+            distance_mm = 0.f;
+            for (size_t step = 1; step < samples.size(); ++step) {
+                const size_t next = (idx + step) % samples.size();
+                const size_t prev_next = next == 0 ? samples.size() - 1 : next - 1;
+                distance_mm += sample_distance_mm(samples[prev_next], samples[next]);
+                if (distance_mm > radius_mm)
+                    break;
+                const float weight = 1.f - distance_mm / radius_mm;
+                weighted_sum += samples[next].inset_mm * weight;
+                weight_sum += weight;
+            }
+            smoothed[idx] = weight_sum > EPSILON ? std::min(samples[idx].inset_mm, weighted_sum / weight_sum) : samples[idx].inset_mm;
+        }
+        for (size_t idx = 0; idx < samples.size(); ++idx)
+            samples[idx].inset_mm = smoothed[idx];
+    };
+
+    smooth_insets(std::max(0.30f, 1.15f * context.base_outer_width_mm));
+
+    for (int pass = 0; pass < 4; ++pass) {
+        for (size_t idx = 0; idx < samples.size(); ++idx) {
+            const size_t prev = idx == 0 ? samples.size() - 1 : idx - 1;
+            const float limit = sample_distance_mm(samples[idx], samples[prev]) * 0.35f + 0.015f;
+            if (samples[idx].inset_mm > samples[prev].inset_mm + limit)
+                samples[idx].inset_mm = samples[prev].inset_mm + limit;
+        }
+        for (size_t idx = samples.size(); idx-- > 0;) {
+            const size_t next = (idx + 1) % samples.size();
+            const float limit = sample_distance_mm(samples[idx], samples[next]) * 0.35f + 0.015f;
+            if (samples[idx].inset_mm > samples[next].inset_mm + limit)
+                samples[idx].inset_mm = samples[next].inset_mm + limit;
+        }
+    }
+
+    smooth_insets(std::max(0.20f, 0.45f * context.base_outer_width_mm));
+
+    return samples;
+}
+
+static Polygon perimeter_texture_moved_polygon_from_samples(const std::vector<PerimeterPathBoundarySample> &samples)
+{
+    Polygon polygon;
+    polygon.points.reserve(samples.size());
+    Point last_point;
+    bool has_last = false;
+    for (const PerimeterPathBoundarySample &sample : samples) {
+        const double inset_scaled = scale_(double(sample.inset_mm));
+        Point moved(coord_t(std::llround(double(sample.point.x()) + sample.inward_x * inset_scaled)),
+                    coord_t(std::llround(double(sample.point.y()) + sample.inward_y * inset_scaled)));
+        if (!has_last || moved != last_point) {
+            polygon.points.emplace_back(moved);
+            last_point = moved;
+            has_last = true;
+        }
+    }
+    if (polygon.points.size() > 1 && polygon.points.front() == polygon.points.back())
+        polygon.points.pop_back();
+    remove_same_neighbor(polygon);
+    return polygon;
+}
+
+static ExPolygons perimeter_texture_modulated_expolygon(const ExPolygon &source,
+                                                        const TextureMappingOffsetContext &context,
+                                                        bool &ok)
+{
+    ok = false;
+    if (source.empty() || source.contour.points.size() < 3)
+        return {};
+
+    const double source_area = std::abs(source.area());
+    if (!std::isfinite(source_area) || source_area <= 0.0)
+        return {};
+
+    const std::vector<PerimeterPathBoundarySample> contour_samples =
+        perimeter_texture_sample_polygon_boundary(source.contour, context, source);
+    if (contour_samples.size() < 3)
+        return {};
+
+    bool has_meaningful_inset = false;
+    for (const PerimeterPathBoundarySample &sample : contour_samples) {
+        if (sample.inset_mm > 0.002f) {
+            has_meaningful_inset = true;
+            break;
+        }
+    }
+    std::vector<std::vector<PerimeterPathBoundarySample>> hole_samples;
+    hole_samples.reserve(source.holes.size());
+    for (const Polygon &hole : source.holes) {
+        hole_samples.emplace_back(perimeter_texture_sample_polygon_boundary(hole, context, source));
+        if (hole_samples.back().size() < 3)
+            return {};
+        for (const PerimeterPathBoundarySample &sample : hole_samples.back()) {
+            if (sample.inset_mm > 0.002f) {
+                has_meaningful_inset = true;
+                break;
+            }
+        }
+    }
+    if (!has_meaningful_inset) {
+        ok = true;
+        return ExPolygons{ source };
+    }
+
+    ExPolygon moved;
+    moved.contour = perimeter_texture_moved_polygon_from_samples(contour_samples);
+    if (moved.contour.points.size() < 3)
+        return {};
+    moved.contour.make_counter_clockwise();
+    moved.holes.reserve(hole_samples.size());
+    for (const std::vector<PerimeterPathBoundarySample> &samples : hole_samples) {
+        Polygon hole = perimeter_texture_moved_polygon_from_samples(samples);
+        if (hole.points.size() < 3)
+            return {};
+        hole.make_clockwise();
+        moved.holes.emplace_back(std::move(hole));
+    }
+
+    ExPolygons simplified = moved.simplify(scale_(0.006));
+    if (simplified.empty())
+        return {};
+
+    ExPolygons source_only;
+    source_only.emplace_back(source);
+    ExPolygons clipped = intersection_ex(simplified, source_only);
+    if (clipped.empty())
+        return {};
+    remove_same_neighbor(clipped);
+
+    const double clipped_area = area(clipped);
+    if (!std::isfinite(clipped_area) || clipped_area <= source_area * 0.10)
+        return {};
+    if (clipped_area > source_area * 1.002)
+        return {};
+
+    ok = true;
+    return clipped;
+}
+
+static SurfaceCollection perimeter_path_modulated_surfaces(const LayerRegion      &layer_region,
+                                                           const SurfaceCollection &slices,
+                                                           const TextureMappingZone &zone,
+                                                           unsigned int             texture_zone_id)
+{
+    const Layer *layer = layer_region.layer();
+    if (layer == nullptr || layer->object() == nullptr)
+        return slices;
+
+    std::optional<TextureMappingOffsetContext> context =
+        build_texture_mapping_offset_context_for_layer(*layer->object(), *layer, zone, texture_zone_id);
+    if (!context)
+        return slices;
+
+    SurfaceCollection out;
+    out.surfaces.reserve(slices.surfaces.size());
+    for (const Surface &surface : slices.surfaces) {
+        bool ok = false;
+        ExPolygons modulated = perimeter_texture_modulated_expolygon(surface.expolygon, *context, ok);
+        if (ok && !modulated.empty())
+            out.append(std::move(modulated), surface);
+        else
+            out.surfaces.emplace_back(surface);
+    }
+    return out;
+}
 
 static bool region_uses_overhang_texture_mapping(const Print &print, const PrintRegionConfig &region_config)
 {
@@ -26,6 +351,26 @@ static bool region_uses_overhang_texture_mapping(const Print &print, const Print
 
     const TextureMappingZone *zone = print.texture_mapping_manager().zone_from_id(unsigned(filament_id));
     return zone != nullptr && zone->enabled && !zone->deleted && (zone->is_2d_gradient() || zone->is_image_texture());
+}
+
+static const TextureMappingZone *perimeter_path_modulation_zone_for_region(const Print              &print,
+                                                                           const PrintRegionConfig &region_config,
+                                                                           unsigned int            &texture_zone_id)
+{
+    const int filament_id = region_config.wall_filament.value;
+    if (filament_id <= 0)
+        return nullptr;
+
+    texture_zone_id = unsigned(filament_id);
+    const TextureMappingZone *zone = print.texture_mapping_manager().zone_from_id(texture_zone_id);
+    if (zone == nullptr ||
+        !zone->enabled ||
+        zone->deleted ||
+        !zone->perimeter_path_modulation ||
+        (!zone->is_2d_gradient() && !zone->is_image_texture()))
+        return nullptr;
+
+    return zone;
 }
 
 Flow LayerRegion::flow(FlowRole role) const
@@ -93,9 +438,20 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         (this->layer()->id() >= size_t(region_config.bottom_shell_layers.value) &&
          this->layer()->print_z >= region_config.bottom_shell_thickness - EPSILON);
 
+    SurfaceCollection modulated_slices;
+    const SurfaceCollection *perimeter_slices = &slices;
+    unsigned int perimeter_texture_zone_id = 0;
+    bool use_perimeter_path_modulation = false;
+    if (const TextureMappingZone *zone =
+            perimeter_path_modulation_zone_for_region(*this->layer()->object()->print(), region_config, perimeter_texture_zone_id)) {
+        modulated_slices = perimeter_path_modulated_surfaces(*this, slices, *zone, perimeter_texture_zone_id);
+        perimeter_slices = &modulated_slices;
+        use_perimeter_path_modulation = true;
+    }
+
     PerimeterGenerator g(
         // input:
-        &slices,
+        perimeter_slices,
         &compatible_regions,
         this->layer()->height,
         this->layer()->slice_z,
@@ -125,6 +481,15 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
 
     g.layer_id              = (int)this->layer()->id();
     g.ext_perimeter_flow    = this->flow(frExternalPerimeter);
+    if (use_perimeter_path_modulation) {
+        const Flow normal_ext_perimeter_flow = g.ext_perimeter_flow;
+        const float texture_external_width_mm =
+            std::max(0.05f, float(print_config.texture_mapping_outer_wall_gradient_max_line_width.value));
+        const float min_width_for_positive_spacing_mm =
+            std::max(0.01f, float(this->layer()->height) * float(1. - 0.25 * PI) + 1e-4f);
+        g.ext_perimeter_flow = normal_ext_perimeter_flow.with_width(std::max(texture_external_width_mm, min_width_for_positive_spacing_mm));
+        g.ext_perimeter_flow.set_spacing(std::min(g.ext_perimeter_flow.spacing(), normal_ext_perimeter_flow.spacing()));
+    }
     g.overhang_flow         = this->bridging_flow(frPerimeter, object_config.thick_bridges);
     g.solid_infill_flow     = this->flow(frSolidInfill);
 

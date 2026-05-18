@@ -1169,6 +1169,7 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "texture_mapping_outer_wall_gradient_max_line_width"
             || opt_key == "texture_mapping_outer_wall_gradient_min_line_width"
             || opt_key == "texture_mapping_definitions"
+            || opt_key == "texture_mapping_background_color"
             || opt_key == "texture_mapping_global_settings") {
             steps.emplace_back(posSlice);
 		} else if (
@@ -1423,7 +1424,6 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "support_interface_flow_ratio"
             || opt_key == "brim_flow_ratio"
             || opt_key == "filament_flow_ratio"
-            || opt_key == "texture_mapping_background_color"
             || opt_key == "scarf_joint_flow_ratio"
             || opt_key == "spiral_starting_flow_ratio"
             || opt_key == "spiral_finishing_flow_ratio") {

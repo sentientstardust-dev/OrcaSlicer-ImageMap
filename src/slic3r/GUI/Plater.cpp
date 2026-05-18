@@ -1076,6 +1076,7 @@ public:
                                         bool reduce_outer_surface_texture,
                                         bool seam_hiding,
                                         bool nonlinear_offset_adjustment,
+                                        bool perimeter_path_modulation,
                                         bool compact_offset_mode,
                                         bool use_legacy_fixed_color_mode,
                                         bool high_speed_image_texture_sampling,
@@ -1303,6 +1304,9 @@ public:
         m_nonlinear_offset_adjustment_checkbox->SetToolTip(
             _L("Adjusts line-width offsets using a surface-visibility model derived from Kuipers et al. 2018."));
         experimental_box->Add(m_nonlinear_offset_adjustment_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        m_perimeter_path_modulation_checkbox = new wxCheckBox(experimental_page, wxID_ANY, _L("Use perimeter path modulation"));
+        m_perimeter_path_modulation_checkbox->SetValue(perimeter_path_modulation);
+        experimental_box->Add(m_perimeter_path_modulation_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
         m_compact_offset_mode_checkbox = new wxCheckBox(experimental_page, wxID_ANY, _L("Compact Offset Mode"));
         m_compact_offset_mode_checkbox->SetValue(compact_offset_mode);
         m_compact_offset_mode_checkbox->SetToolTip(
@@ -1551,6 +1555,7 @@ public:
     bool reduce_outer_surface_texture() const { return m_reduce_outer_surface_texture_checkbox && m_reduce_outer_surface_texture_checkbox->GetValue(); }
     bool seam_hiding() const { return m_seam_hiding_checkbox && m_seam_hiding_checkbox->GetValue(); }
     bool nonlinear_offset_adjustment() const { return m_nonlinear_offset_adjustment_checkbox && m_nonlinear_offset_adjustment_checkbox->GetValue(); }
+    bool perimeter_path_modulation() const { return m_perimeter_path_modulation_checkbox && m_perimeter_path_modulation_checkbox->GetValue(); }
     bool compact_offset_mode() const { return m_compact_offset_mode_checkbox && m_compact_offset_mode_checkbox->GetValue(); }
     bool use_legacy_fixed_color_mode() const { return m_use_legacy_fixed_color_mode_checkbox && m_use_legacy_fixed_color_mode_checkbox->GetValue(); }
     bool high_speed_image_texture_sampling() const { return m_high_speed_image_texture_sampling_checkbox == nullptr || m_high_speed_image_texture_sampling_checkbox->GetValue(); }
@@ -1857,6 +1862,7 @@ private:
     wxCheckBox *m_reduce_outer_surface_texture_checkbox {nullptr};
     wxCheckBox *m_seam_hiding_checkbox {nullptr};
     wxCheckBox *m_nonlinear_offset_adjustment_checkbox {nullptr};
+    wxCheckBox *m_perimeter_path_modulation_checkbox {nullptr};
     wxCheckBox *m_compact_offset_mode_checkbox {nullptr};
     wxCheckBox *m_use_legacy_fixed_color_mode_checkbox {nullptr};
     wxCheckBox *m_high_speed_image_texture_sampling_checkbox {nullptr};
@@ -5964,6 +5970,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.reduce_outer_surface_texture,
                                                     updated.seam_hiding,
                                                     updated.nonlinear_offset_adjustment,
+                                                    updated.perimeter_path_modulation,
                                                     updated.compact_offset_mode,
                                                     updated.use_legacy_fixed_color_mode,
                                                     updated.high_speed_image_texture_sampling,
@@ -5998,6 +6005,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.reduce_outer_surface_texture = dlg.reduce_outer_surface_texture();
             updated.seam_hiding = dlg.seam_hiding();
             updated.nonlinear_offset_adjustment = dlg.nonlinear_offset_adjustment();
+            updated.perimeter_path_modulation = dlg.perimeter_path_modulation();
             updated.compact_offset_mode = dlg.compact_offset_mode();
             updated.use_legacy_fixed_color_mode = dlg.use_legacy_fixed_color_mode();
             updated.high_speed_image_texture_sampling = dlg.high_speed_image_texture_sampling();

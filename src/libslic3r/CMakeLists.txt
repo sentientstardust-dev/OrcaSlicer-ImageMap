@@ -474,6 +474,8 @@ set(lisbslic3r_sources
     TriangleSelector.hpp
     TriangleSetSampling.cpp
     TriangleSetSampling.hpp
+    TextureMappingOffset.cpp
+    TextureMappingOffset.hpp
     TextureMapping.cpp
     TextureMapping.hpp
     TriangulateWall.cpp

@@ -512,6 +512,7 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
             || opt_key == "texture_mapping_outer_wall_gradient_min_line_width"
             || opt_key == "texture_mapping_definitions"
             || opt_key == "texture_mapping_global_settings") {
+            osteps.emplace_back(posPerimeters);
             steps.emplace_back(psWipeTower);
             steps.emplace_back(psSkirtBrim);
         } else if (
