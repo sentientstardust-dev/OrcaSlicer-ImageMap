@@ -328,7 +328,11 @@ modules:
     post-install:
 
       - | # Desktop integration files
-        install -Dm644 -t /app/share/icons/hicolor/scalable/apps/ resources/images/OrcaSlicer.svg
+        install -Dm644 resources/images/OrcaSlicer_32px.png /app/share/icons/hicolor/32x32/apps/OrcaSlicer.png
+        install -Dm644 resources/images/OrcaSlicer_64.png /app/share/icons/hicolor/64x64/apps/OrcaSlicer.png
+        install -Dm644 resources/images/OrcaSlicer_128px.png /app/share/icons/hicolor/128x128/apps/OrcaSlicer.png
+        install -Dm644 resources/images/OrcaSlicer_192px.png /app/share/icons/hicolor/192x192/apps/OrcaSlicer.png
+        install -Dm644 resources/images/OrcaSlicer.png /app/share/icons/hicolor/256x256/apps/OrcaSlicer.png
         install -Dm644 ${FLATPAK_ID}.metainfo.xml /app/share/metainfo/${FLATPAK_ID}.metainfo.xml
         desktop-file-edit --set-key=Exec --set-value="entrypoint %U" /app/share/applications/${FLATPAK_ID}.desktop
         install -Dm755 entrypoint /app/bin

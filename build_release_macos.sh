@@ -237,6 +237,7 @@ function build_slicer() {
             resources_path=$(readlink ./OrcaSlicer.app/Contents/Resources)
             rm ./OrcaSlicer.app/Contents/Resources
             cp -R "$resources_path" ./OrcaSlicer.app/Contents/Resources
+            plutil -replace CFBundleIconFile -string "images/OrcaSlicer.icns" ./OrcaSlicer.app/Contents/Info.plist
             # delete .DS_Store file
             find ./OrcaSlicer.app/ -name '.DS_Store' -delete
             
