@@ -46,6 +46,11 @@ struct TextureMappingZone
         TextureMappingRawValues = 1
     };
 
+    enum ModulationMode : uint8_t {
+        ModulationLineWidth = 0,
+        ModulationPerimeterPath = 1
+    };
+
     enum FilamentColorMode : uint8_t {
         FilamentColorAny = 0,
         FilamentColorRGB = 1,
@@ -102,7 +107,8 @@ struct TextureMappingZone
     static constexpr bool  DefaultReduceOuterSurfaceTexture = false;
     static constexpr bool  DefaultSeamHiding = false;
     static constexpr bool  DefaultNonlinearOffsetAdjustment = false;
-    static constexpr bool  DefaultPerimeterPathModulation = false;
+    static constexpr int   DefaultModulationMode = int(ModulationLineWidth);
+    static constexpr bool  DefaultRecolorSmallPerimeterLoops = true;
     static constexpr bool  DefaultCompactOffsetMode = true;
     static constexpr bool  DefaultUseLegacyFixedColorMode = false;
     static constexpr bool  DefaultHighSpeedImageTextureSampling = true;
@@ -155,7 +161,8 @@ struct TextureMappingZone
     bool        reduce_outer_surface_texture = DefaultReduceOuterSurfaceTexture;
     bool        seam_hiding = DefaultSeamHiding;
     bool        nonlinear_offset_adjustment = DefaultNonlinearOffsetAdjustment;
-    bool        perimeter_path_modulation = DefaultPerimeterPathModulation;
+    int         modulation_mode = DefaultModulationMode;
+    bool        recolor_small_perimeter_loops = DefaultRecolorSmallPerimeterLoops;
     bool        compact_offset_mode = DefaultCompactOffsetMode;
     bool        use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
     bool        high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;
@@ -182,6 +189,7 @@ struct TextureMappingZone
 
     bool is_image_texture() const { return surface_pattern == int(ImageTexture); }
     bool is_2d_gradient() const { return surface_pattern == int(Gradient2D); }
+    bool uses_perimeter_path_modulation() const { return modulation_mode == int(ModulationPerimeterPath); }
 
     void reset_offset_settings()
     {
@@ -205,7 +213,8 @@ struct TextureMappingZone
         reduce_outer_surface_texture = DefaultReduceOuterSurfaceTexture;
         seam_hiding = DefaultSeamHiding;
         nonlinear_offset_adjustment = DefaultNonlinearOffsetAdjustment;
-        perimeter_path_modulation = DefaultPerimeterPathModulation;
+        modulation_mode = DefaultModulationMode;
+        recolor_small_perimeter_loops = DefaultRecolorSmallPerimeterLoops;
         compact_offset_mode = DefaultCompactOffsetMode;
         use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
         high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;

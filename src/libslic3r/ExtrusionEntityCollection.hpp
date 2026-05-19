@@ -31,15 +31,17 @@ public:
 
     ExtrusionEntitiesPtr entities;     // we own these entities
     bool no_sort;
-    ExtrusionEntityCollection(): no_sort(false) {}
-    ExtrusionEntityCollection(const ExtrusionEntityCollection &other) : no_sort(other.no_sort), is_reverse(other.is_reverse) { this->append(other.entities); }
-    ExtrusionEntityCollection(ExtrusionEntityCollection &&other) : entities(std::move(other.entities)), no_sort(other.no_sort), is_reverse(other.is_reverse) {}
+    int texture_mapping_extruder_override;
+    ExtrusionEntityCollection(): no_sort(false), texture_mapping_extruder_override(-1) {}
+    ExtrusionEntityCollection(const ExtrusionEntityCollection &other) : no_sort(other.no_sort), texture_mapping_extruder_override(other.texture_mapping_extruder_override), is_reverse(other.is_reverse) { this->append(other.entities); }
+    ExtrusionEntityCollection(ExtrusionEntityCollection &&other) : entities(std::move(other.entities)), no_sort(other.no_sort), texture_mapping_extruder_override(other.texture_mapping_extruder_override), is_reverse(other.is_reverse) {}
     explicit ExtrusionEntityCollection(const ExtrusionPaths &paths);
     ExtrusionEntityCollection& operator=(const ExtrusionEntityCollection &other);
     ExtrusionEntityCollection& operator=(ExtrusionEntityCollection &&other)
     {
         this->entities = std::move(other.entities);
         this->no_sort  = other.no_sort;
+        this->texture_mapping_extruder_override = other.texture_mapping_extruder_override;
         is_reverse     = other.is_reverse;
         return *this;
     }

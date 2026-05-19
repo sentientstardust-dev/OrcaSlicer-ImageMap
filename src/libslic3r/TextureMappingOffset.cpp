@@ -1772,10 +1772,10 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
     return weight_field;
 }
 
-std::vector<float> sample_weight_field_components(const TextureMappingOffsetWeightField &weight_field,
-                                                  float x_mm,
-                                                  float y_mm,
-                                                  bool high_resolution_texture_sampling)
+std::vector<float> sample_weight_field_components_impl(const TextureMappingOffsetWeightField &weight_field,
+                                                       float x_mm,
+                                                       float y_mm,
+                                                       bool high_resolution_texture_sampling)
 {
     std::vector<float> fallback = weight_field.fallback_weights;
     if (fallback.size() < weight_field.component_count)
@@ -2369,6 +2369,14 @@ float component_angular_influence(unsigned int active_component_id,
     return 0.f;
 }
 
+}
+
+std::vector<float> sample_weight_field_components(const TextureMappingOffsetWeightField &weight_field,
+                                                  float x_mm,
+                                                  float y_mm,
+                                                  bool high_resolution_texture_sampling)
+{
+    return sample_weight_field_components_impl(weight_field, x_mm, y_mm, high_resolution_texture_sampling);
 }
 
 std::vector<unsigned int> decode_texture_mapping_offset_component_ids(const TextureMappingZone &zone, size_t num_physical)

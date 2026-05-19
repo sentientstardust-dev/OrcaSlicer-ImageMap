@@ -108,6 +108,10 @@ unsigned int LayerTools::solid_infill_filament(const PrintRegion &region) const
 // Returns a zero based extruder this eec should be printed with, according to PrintRegion config or extruder_override if overriden.
 unsigned int LayerTools::extruder(const ExtrusionEntityCollection &extrusions, const PrintRegion &region) const
 {
+    if (extrusions.texture_mapping_extruder_override >= 0 &&
+        (this->num_physical_filaments == 0 || unsigned(extrusions.texture_mapping_extruder_override) < this->num_physical_filaments))
+        return unsigned(extrusions.texture_mapping_extruder_override);
+
 	assert(region.config().wall_filament.value > 0);
 	assert(region.config().sparse_infill_filament.value > 0);
 	assert(region.config().solid_infill_filament.value > 0);
@@ -782,16 +786,41 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
             const PrintRegion &region = layerm->region();
 
             if (! layerm->perimeters.entities.empty()) {
+                bool has_non_texture_override_perimeters = false;
                 bool something_nonoverriddable = true;
 
                 if (m_print_config_ptr) { // in this case print->config().print_sequence != PrintSequence::ByObject (see ToolOrdering constructors)
                     something_nonoverriddable = false;
-                    for (const auto& eec : layerm->perimeters.entities) // let's check if there are nonoverriddable entities
-                        if (!layer_tools.wiping_extrusions().is_overriddable_and_mark(dynamic_cast<const ExtrusionEntityCollection&>(*eec), *m_print_config_ptr, object, region))
+                    for (const auto& eec : layerm->perimeters.entities) {
+                        const auto *collection = dynamic_cast<const ExtrusionEntityCollection*>(eec);
+                        if (collection == nullptr)
+                            continue;
+                        if (collection->texture_mapping_extruder_override >= 0 &&
+                            (layer_tools.num_physical_filaments == 0 || unsigned(collection->texture_mapping_extruder_override) < layer_tools.num_physical_filaments)) {
+                            append_layer_filament(unsigned(collection->texture_mapping_extruder_override) + 1);
+                            if (layerCount == 0)
+                                firstLayerExtruders.emplace_back(collection->texture_mapping_extruder_override + 1);
+                            continue;
+                        }
+                        has_non_texture_override_perimeters = true;
+                        if (!layer_tools.wiping_extrusions().is_overriddable_and_mark(*collection, *m_print_config_ptr, object, region))
                             something_nonoverriddable = true;
+                    }
+                } else {
+                    for (const auto& eec : layerm->perimeters.entities) {
+                        const auto *collection = dynamic_cast<const ExtrusionEntityCollection*>(eec);
+                        if (collection != nullptr &&
+                            collection->texture_mapping_extruder_override >= 0 &&
+                            (layer_tools.num_physical_filaments == 0 || unsigned(collection->texture_mapping_extruder_override) < layer_tools.num_physical_filaments)) {
+                            append_layer_filament(unsigned(collection->texture_mapping_extruder_override) + 1);
+                            if (layerCount == 0)
+                                firstLayerExtruders.emplace_back(collection->texture_mapping_extruder_override + 1);
+                        } else
+                            has_non_texture_override_perimeters = true;
+                    }
                 }
 
-                if (something_nonoverriddable){
+                if (has_non_texture_override_perimeters && something_nonoverriddable){
                     const unsigned int filament_id = (extruder_override == 0) ? region.config().wall_filament.value : extruder_override;
                     append_layer_filament(filament_id);
                     if (layerCount == 0) {

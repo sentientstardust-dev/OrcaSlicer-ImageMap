@@ -524,6 +524,23 @@ static int mapping_mode_from_name(const std::string &name)
         int(TextureMappingZone::TextureMappingFilamentBlending);
 }
 
+static std::string modulation_mode_name(int mode)
+{
+    return clamp_int(mode,
+                     int(TextureMappingZone::ModulationLineWidth),
+                     int(TextureMappingZone::ModulationPerimeterPath)) ==
+               int(TextureMappingZone::ModulationPerimeterPath) ?
+        std::string("perimeter_path") :
+        std::string("line_width");
+}
+
+static int modulation_mode_from_name(const std::string &name)
+{
+    return name == "perimeter_path" ?
+        int(TextureMappingZone::ModulationPerimeterPath) :
+        int(TextureMappingZone::ModulationLineWidth);
+}
+
 static std::string color_model_name(int mode)
 {
     switch (clamp_int(mode, int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorRGBKW))) {
@@ -821,7 +838,8 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            reduce_outer_surface_texture == rhs.reduce_outer_surface_texture &&
            seam_hiding == rhs.seam_hiding &&
            nonlinear_offset_adjustment == rhs.nonlinear_offset_adjustment &&
-           perimeter_path_modulation == rhs.perimeter_path_modulation &&
+           modulation_mode == rhs.modulation_mode &&
+           recolor_small_perimeter_loops == rhs.recolor_small_perimeter_loops &&
            compact_offset_mode == rhs.compact_offset_mode &&
            use_legacy_fixed_color_mode == rhs.use_legacy_fixed_color_mode &&
            high_speed_image_texture_sampling == rhs.high_speed_image_texture_sampling &&
@@ -1075,7 +1093,8 @@ std::string TextureMappingManager::serialize_entries()
         texture["reduce_outer_surface_texture"] = zone.reduce_outer_surface_texture;
         texture["hide_seams"] = zone.seam_hiding;
         texture["nonlinear_offset_adjustment"] = zone.nonlinear_offset_adjustment;
-        texture["perimeter_path_modulation"] = zone.perimeter_path_modulation;
+        texture["modulation_mode"] = modulation_mode_name(zone.modulation_mode);
+        texture["recolor_small_perimeter_loops"] = zone.recolor_small_perimeter_loops;
         texture["compact_offset_mode"] = zone.compact_offset_mode;
         texture["use_legacy_fixed_color_mode"] = zone.use_legacy_fixed_color_mode;
         texture["high_speed_image_texture_sampling"] = zone.high_speed_image_texture_sampling;
@@ -1217,8 +1236,11 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.reduce_outer_surface_texture = texture.value("reduce_outer_surface_texture", false);
         zone.seam_hiding = texture.value("hide_seams", false);
         zone.nonlinear_offset_adjustment = texture.value("nonlinear_offset_adjustment", false);
-        zone.perimeter_path_modulation =
-            texture.value("perimeter_path_modulation", TextureMappingZone::DefaultPerimeterPathModulation);
+        zone.modulation_mode =
+            modulation_mode_from_name(texture.value("modulation_mode",
+                                                    modulation_mode_name(TextureMappingZone::DefaultModulationMode)));
+        zone.recolor_small_perimeter_loops =
+            texture.value("recolor_small_perimeter_loops", TextureMappingZone::DefaultRecolorSmallPerimeterLoops);
         zone.compact_offset_mode = texture.value("compact_offset_mode", TextureMappingZone::DefaultCompactOffsetMode);
         zone.use_legacy_fixed_color_mode =
             texture.value("use_legacy_fixed_color_mode", TextureMappingZone::DefaultUseLegacyFixedColorMode);

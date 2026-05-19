@@ -1076,7 +1076,8 @@ public:
                                         bool reduce_outer_surface_texture,
                                         bool seam_hiding,
                                         bool nonlinear_offset_adjustment,
-                                        bool perimeter_path_modulation,
+                                        int modulation_mode,
+                                        bool recolor_small_perimeter_loops,
                                         bool compact_offset_mode,
                                         bool use_legacy_fixed_color_mode,
                                         bool high_speed_image_texture_sampling,
@@ -1308,9 +1309,21 @@ public:
         m_nonlinear_offset_adjustment_checkbox->SetToolTip(
             _L("Adjusts line-width offsets using a surface-visibility model derived from Kuipers et al. 2018."));
         experimental_box->Add(m_nonlinear_offset_adjustment_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
-        m_perimeter_path_modulation_checkbox = new wxCheckBox(experimental_page, wxID_ANY, _L("Use perimeter path modulation"));
-        m_perimeter_path_modulation_checkbox->SetValue(perimeter_path_modulation);
-        experimental_box->Add(m_perimeter_path_modulation_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        auto *modulation_mode_row = new wxBoxSizer(wxHORIZONTAL);
+        modulation_mode_row->Add(new wxStaticText(experimental_page, wxID_ANY, _L("Modulation mode:")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        wxArrayString modulation_mode_choices;
+        modulation_mode_choices.Add(_L("Line width modulation"));
+        modulation_mode_choices.Add(_L("Perimeter path modulation"));
+        m_modulation_mode_choice = new wxChoice(experimental_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, modulation_mode_choices);
+        m_modulation_mode_choice->SetSelection(std::clamp(modulation_mode,
+                                                          int(TextureMappingZone::ModulationLineWidth),
+                                                          int(TextureMappingZone::ModulationPerimeterPath)));
+        modulation_mode_row->Add(m_modulation_mode_choice, 1, wxALIGN_CENTER_VERTICAL);
+        experimental_box->Add(modulation_mode_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        m_recolor_small_perimeter_loops_checkbox =
+            new wxCheckBox(experimental_page, wxID_ANY, _L("Recolor small/reduced width perimeter loops"));
+        m_recolor_small_perimeter_loops_checkbox->SetValue(recolor_small_perimeter_loops);
+        experimental_box->Add(m_recolor_small_perimeter_loops_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
         m_compact_offset_mode_checkbox = new wxCheckBox(experimental_page, wxID_ANY, _L("Compact Offset Mode"));
         m_compact_offset_mode_checkbox->SetValue(compact_offset_mode);
         m_compact_offset_mode_checkbox->SetToolTip(
@@ -1630,8 +1643,16 @@ public:
     bool reduce_outer_surface_texture() const { return m_reduce_outer_surface_texture_checkbox && m_reduce_outer_surface_texture_checkbox->GetValue(); }
     bool seam_hiding() const { return m_seam_hiding_checkbox && m_seam_hiding_checkbox->GetValue(); }
     bool nonlinear_offset_adjustment() const { return m_nonlinear_offset_adjustment_checkbox && m_nonlinear_offset_adjustment_checkbox->GetValue(); }
-    bool perimeter_path_modulation() const { return m_perimeter_path_modulation_checkbox && m_perimeter_path_modulation_checkbox->GetValue(); }
+    int modulation_mode() const
+    {
+        return m_modulation_mode_choice ?
+            std::clamp(m_modulation_mode_choice->GetSelection(),
+                       int(TextureMappingZone::ModulationLineWidth),
+                       int(TextureMappingZone::ModulationPerimeterPath)) :
+            TextureMappingZone::DefaultModulationMode;
+    }
     bool compact_offset_mode() const { return dithering_enabled() || (m_compact_offset_mode_checkbox && m_compact_offset_mode_checkbox->GetValue()); }
+    bool recolor_small_perimeter_loops() const { return m_recolor_small_perimeter_loops_checkbox == nullptr || m_recolor_small_perimeter_loops_checkbox->GetValue(); }
     bool use_legacy_fixed_color_mode() const { return m_use_legacy_fixed_color_mode_checkbox && m_use_legacy_fixed_color_mode_checkbox->GetValue(); }
     bool high_speed_image_texture_sampling() const { return m_high_speed_image_texture_sampling_checkbox == nullptr || m_high_speed_image_texture_sampling_checkbox->GetValue(); }
     bool dithering_enabled() const { return m_dithering_enabled_checkbox && m_dithering_enabled_checkbox->GetValue(); }
@@ -2007,7 +2028,8 @@ private:
     wxCheckBox *m_reduce_outer_surface_texture_checkbox {nullptr};
     wxCheckBox *m_seam_hiding_checkbox {nullptr};
     wxCheckBox *m_nonlinear_offset_adjustment_checkbox {nullptr};
-    wxCheckBox *m_perimeter_path_modulation_checkbox {nullptr};
+    wxChoice *m_modulation_mode_choice {nullptr};
+    wxCheckBox *m_recolor_small_perimeter_loops_checkbox {nullptr};
     wxCheckBox *m_compact_offset_mode_checkbox {nullptr};
     wxCheckBox *m_dithering_enabled_checkbox {nullptr};
     wxChoice *m_dithering_method_choice {nullptr};
@@ -6121,7 +6143,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.reduce_outer_surface_texture,
                                                     updated.seam_hiding,
                                                     updated.nonlinear_offset_adjustment,
-                                                    updated.perimeter_path_modulation,
+                                                    updated.modulation_mode,
+                                                    updated.recolor_small_perimeter_loops,
                                                     updated.compact_offset_mode,
                                                     updated.use_legacy_fixed_color_mode,
                                                     updated.high_speed_image_texture_sampling,
@@ -6160,7 +6183,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.reduce_outer_surface_texture = dlg.reduce_outer_surface_texture();
             updated.seam_hiding = dlg.seam_hiding();
             updated.nonlinear_offset_adjustment = dlg.nonlinear_offset_adjustment();
-            updated.perimeter_path_modulation = dlg.perimeter_path_modulation();
+            updated.modulation_mode = dlg.modulation_mode();
+            updated.recolor_small_perimeter_loops = dlg.recolor_small_perimeter_loops();
             updated.compact_offset_mode = dlg.compact_offset_mode();
             updated.use_legacy_fixed_color_mode = dlg.use_legacy_fixed_color_mode();
             updated.high_speed_image_texture_sampling = dlg.high_speed_image_texture_sampling();

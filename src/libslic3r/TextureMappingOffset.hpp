@@ -92,6 +92,11 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     std::optional<float>     base_outer_width_mm_override = std::nullopt,
     std::optional<float>     layer_height_mm_override = std::nullopt);
 
+std::vector<float> sample_weight_field_components(const TextureMappingOffsetWeightField &weight_field,
+                                                  float                                  x_mm,
+                                                  float                                  y_mm,
+                                                  bool                                   high_resolution_texture_sampling);
+
 float texture_mapping_offset_surface_inset_mm(const TextureMappingOffsetContext &context,
                                               const Point                       &point,
                                               double                             inward_x,

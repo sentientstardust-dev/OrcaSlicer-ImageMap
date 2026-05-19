@@ -4132,6 +4132,7 @@ const std::string PrintStatistics::TotalFilamentUsedWipeTowerValueMask = "; tota
 //extrusions
 #define JSON_EXTRUSION_ENTITY_TYPE             "entity_type"
 #define JSON_EXTRUSION_NO_SORT                 "no_sort"
+#define JSON_EXTRUSION_TEXTURE_MAPPING_EXTRUDER_OVERRIDE "texture_mapping_extruder_override"
 #define JSON_EXTRUSION_PATHS                   "paths"
 #define JSON_EXTRUSION_ENTITIES                "entities"
 #define JSON_EXTRUSION_TYPE_PATH               "path"
@@ -4285,6 +4286,8 @@ static bool convert_extrusion_to_json(json& entity_json, json& entity_paths_json
     else {
         //recursive collections
         entity_json[JSON_EXTRUSION_NO_SORT] = collection->no_sort;
+        if (collection->texture_mapping_extruder_override >= 0)
+            entity_json[JSON_EXTRUSION_TEXTURE_MAPPING_EXTRUDER_OVERRIDE] = collection->texture_mapping_extruder_override;
         for (const ExtrusionEntity* recursive_extrusion_entity : collection->entities) {
             json recursive_entity_json, recursive_entity_paths_json = json::array();
             bool ret = convert_extrusion_to_json(recursive_entity_json, recursive_entity_paths_json, recursive_extrusion_entity);
@@ -4566,6 +4569,8 @@ static bool convert_extrusion_from_json(const json& entity_json, ExtrusionEntity
             return false;
         }
         collection->no_sort = entity_json[JSON_EXTRUSION_NO_SORT];
+        collection->texture_mapping_extruder_override =
+            entity_json.value(JSON_EXTRUSION_TEXTURE_MAPPING_EXTRUDER_OVERRIDE, -1);
         int entities_count = entity_json[JSON_EXTRUSION_ENTITIES].size();
         for (int entity_index = 0; entity_index < entities_count; entity_index++)
         {

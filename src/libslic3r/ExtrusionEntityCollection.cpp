@@ -31,6 +31,7 @@ ExtrusionEntityCollection& ExtrusionEntityCollection::operator=(const ExtrusionE
     for (size_t i = 0; i < this->entities.size(); ++i)
         this->entities[i] = this->entities[i]->clone();
     this->no_sort       = other.no_sort;
+    this->texture_mapping_extruder_override = other.texture_mapping_extruder_override;
     return *this;
 }
 
@@ -38,6 +39,7 @@ void ExtrusionEntityCollection::swap(ExtrusionEntityCollection &c)
 {
     std::swap(this->entities, c.entities);
     std::swap(this->no_sort, c.no_sort);
+    std::swap(this->texture_mapping_extruder_override, c.texture_mapping_extruder_override);
 }
 
 void ExtrusionEntityCollection::clear()
