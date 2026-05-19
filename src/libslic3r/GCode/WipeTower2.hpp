@@ -59,7 +59,7 @@ public:
                          int                       texture_mapping_wall_tool = -1);
 
 	// Iterates through prepared m_plan, generates ToolChangeResults and appends them to "result"
-	void generate(std::vector<std::vector<WipeTower::ToolChangeResult>> &result);
+	void generate(std::vector<std::vector<WipeTower::ToolChangeResult>> &result, WipeTower::ProgressCallback progress_callback = {});
     void set_prime_tower_texture(const PrimeTowerTextureRenderSettings &settings) { m_prime_tower_texture = settings; }
 
     float get_depth() const { return m_wipe_tower_depth; }

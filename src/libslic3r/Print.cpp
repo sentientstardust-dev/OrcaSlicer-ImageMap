@@ -2531,6 +2531,7 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
 
 
     if (this->set_started(psWipeTower)) {
+        this->set_status(72, L("Checking extruder printable area limits"));
         {
             std::vector<std::set<int>> geometric_unprintables(m_config.nozzle_diameter.size());
             for (PrintObject* obj : m_objects) {
@@ -2544,6 +2545,7 @@ void Print::process(long long *time_cost_with_cache, bool use_cache)
             this->set_geometric_unprintable_filaments(geometric_unprintables);
         }
 
+        this->set_status(73, L("Optimizing filament order"));
         m_wipe_tower_data.clear();
         m_tool_ordering.clear();
         if (this->has_wipe_tower()) {
@@ -3407,12 +3409,15 @@ void Print::_make_wipe_tower()
 
     const bool is_wipe_tower_type2 = this->wipe_tower_type() == WipeTowerType::Type2;
     // Let the ToolOrdering class know there will be initial priming extrusions at the start of the print.
+    this->set_status(73, L("Optimizing filament order"));
     m_wipe_tower_data.tool_ordering = ToolOrdering(*this, (unsigned int) -1, is_wipe_tower_type2);
     m_wipe_tower_data.tool_ordering.sort_and_build_data(*this, (unsigned int)-1, is_wipe_tower_type2);
 
     if (!m_wipe_tower_data.tool_ordering.has_wipe_tower())
         // Don't generate any wipe tower.
         return;
+
+    this->set_status(74, L("Planning wipe tower layers"));
 
     // Check whether there are any layers in m_tool_ordering, which are marked with has_wipe_tower,
     // they print neither object, nor support. These layers are above the raft and below the object, and they
@@ -3557,7 +3562,17 @@ void Print::_make_wipe_tower()
             texture.enabled = false;
         return texture;
     };
+    const bool prime_tower_texture_requested =
+        m_texture_mapping_global_settings.effective_enabled(m_texture_mapping_prime_tower_image, m_texture_mapping_prime_tower_image_back);
+    if (prime_tower_texture_requested)
+        this->set_status(74, L("Preparing wipe tower texture"));
     const PrimeTowerTextureRenderSettings prime_tower_texture = build_prime_tower_texture();
+    WipeTower::ProgressCallback wipe_tower_progress;
+    if (prime_tower_texture.valid()) {
+        wipe_tower_progress = [this](size_t current, size_t total) {
+            this->set_status(74, Slic3r::format(L("Generating wipe tower (%1%/%2% layers)"), current, total));
+        };
+    }
     const std::vector<size_t> prime_tower_texture_component_tools = prime_tower_texture.component_tools_for_layer_sequence();
     auto prime_tower_texture_layer_tools = [&prime_tower_texture, &prime_tower_texture_component_tools](const LayerTools &layer_tools) {
         std::vector<unsigned int> tools;
@@ -3597,6 +3612,7 @@ void Print::_make_wipe_tower()
     };
 
     if (!is_wipe_tower_type2) {
+        this->set_status(74, L("Planning wipe tower layers"));
         // in BBL machine, wipe tower is only use to prime extruder. So just use a global wipe volume.
         WipeTower wipe_tower(m_config, m_plate_index, m_origin, m_wipe_tower_data.tool_ordering.first_extruder(),
                              m_wipe_tower_data.tool_ordering.empty() ? 0.f : m_wipe_tower_data.tool_ordering.back().print_z, m_wipe_tower_data.tool_ordering.all_extruders());
@@ -3702,7 +3718,8 @@ void Print::_make_wipe_tower()
 
         // Generate the wipe tower layers.
         m_wipe_tower_data.tool_changes.reserve(m_wipe_tower_data.tool_ordering.layer_tools().size());
-        wipe_tower.generate_new(m_wipe_tower_data.tool_changes);
+        this->set_status(74, L("Estimating wipe tower purge layout"));
+        wipe_tower.generate_new(m_wipe_tower_data.tool_changes, wipe_tower_progress);
         m_wipe_tower_data.depth      = wipe_tower.get_depth();
         m_wipe_tower_data.brim_width = wipe_tower.get_brim_width();
         m_wipe_tower_data.bbx = wipe_tower.get_bbx();
@@ -3738,6 +3755,7 @@ void Print::_make_wipe_tower()
                                                   m_wipe_tower_data.brim_width, {scale_(origin.x()), scale_(origin.y())});
         m_fake_wipe_tower.outer_wall = wipe_tower.get_outer_wall();
     } else {
+        this->set_status(74, L("Planning wipe tower layers"));
         // Get wiping matrix to get number of extruders and convert vector<double> to vector<float>:
         std::vector<float> flush_matrix(cast<float>(m_config.flush_volumes_matrix.values));
         // Extract purging volumes for each extruder pair:
@@ -3815,7 +3833,8 @@ void Print::_make_wipe_tower()
 
         // Generate the wipe tower layers.
         m_wipe_tower_data.tool_changes.reserve(m_wipe_tower_data.tool_ordering.layer_tools().size());
-        wipe_tower.generate(m_wipe_tower_data.tool_changes);
+        this->set_status(74, L("Estimating wipe tower purge layout"));
+        wipe_tower.generate(m_wipe_tower_data.tool_changes, wipe_tower_progress);
         m_wipe_tower_data.depth             = wipe_tower.get_depth();
         m_wipe_tower_data.z_and_depth_pairs = wipe_tower.get_z_and_depth_pairs();
         m_wipe_tower_data.brim_width        = wipe_tower.get_brim_width();

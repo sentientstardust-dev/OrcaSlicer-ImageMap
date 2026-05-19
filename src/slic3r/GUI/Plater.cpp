@@ -1078,6 +1078,8 @@ public:
                                         bool nonlinear_offset_adjustment,
                                         int modulation_mode,
                                         bool recolor_small_perimeter_loops,
+                                        bool recolor_top_visible_perimeter_sections,
+                                        int top_visible_perimeter_recolor_aggressiveness,
                                         bool compact_offset_mode,
                                         bool use_legacy_fixed_color_mode,
                                         bool high_speed_image_texture_sampling,
@@ -1320,10 +1322,32 @@ public:
                                                           int(TextureMappingZone::ModulationPerimeterPath)));
         modulation_mode_row->Add(m_modulation_mode_choice, 1, wxALIGN_CENTER_VERTICAL);
         experimental_box->Add(modulation_mode_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        m_modulation_mode_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) { update_modulation_mode_options_visibility(false); });
         m_recolor_small_perimeter_loops_checkbox =
             new wxCheckBox(experimental_page, wxID_ANY, _L("Recolor small/reduced width perimeter loops"));
         m_recolor_small_perimeter_loops_checkbox->SetValue(recolor_small_perimeter_loops);
         experimental_box->Add(m_recolor_small_perimeter_loops_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        m_recolor_top_visible_perimeter_sections_checkbox =
+            new wxCheckBox(experimental_page, wxID_ANY, _L("Recolor top-visible perimeter sections"));
+        m_recolor_top_visible_perimeter_sections_checkbox->SetValue(recolor_top_visible_perimeter_sections);
+        experimental_box->Add(m_recolor_top_visible_perimeter_sections_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        m_recolor_top_visible_perimeter_sections_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) { update_modulation_mode_options_visibility(false); });
+        auto *top_visible_recolor_row = new wxBoxSizer(wxHORIZONTAL);
+        m_top_visible_perimeter_recolor_aggressiveness_label =
+            new wxStaticText(experimental_page, wxID_ANY, _L("Top-visible recolor sensitivity:"));
+        top_visible_recolor_row->Add(m_top_visible_perimeter_recolor_aggressiveness_label, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        wxArrayString top_visible_recolor_choices;
+        top_visible_recolor_choices.Add(_L("Conservative"));
+        top_visible_recolor_choices.Add(_L("Balanced"));
+        top_visible_recolor_choices.Add(_L("Aggressive"));
+        m_top_visible_perimeter_recolor_aggressiveness_choice =
+            new wxChoice(experimental_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, top_visible_recolor_choices);
+        m_top_visible_perimeter_recolor_aggressiveness_choice->SetSelection(
+            std::clamp(top_visible_perimeter_recolor_aggressiveness,
+                       int(TextureMappingZone::TopVisibleRecolorConservative),
+                       int(TextureMappingZone::TopVisibleRecolorAggressive)));
+        top_visible_recolor_row->Add(m_top_visible_perimeter_recolor_aggressiveness_choice, 1, wxALIGN_CENTER_VERTICAL);
+        experimental_box->Add(top_visible_recolor_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
         m_compact_offset_mode_checkbox = new wxCheckBox(experimental_page, wxID_ANY, _L("Compact Offset Mode"));
         m_compact_offset_mode_checkbox->SetValue(compact_offset_mode);
         m_compact_offset_mode_checkbox->SetToolTip(
@@ -1464,6 +1488,7 @@ public:
         experimental_box->Add(minimum_visibility_offset_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
         update_dithering_options_visibility(false);
         update_minimum_visibility_offset_visibility(false);
+        update_modulation_mode_options_visibility(false);
         experimental_root->Add(experimental_box, 0, wxEXPAND | wxALL, gap);
 
         m_prime_tower_mapping_enabled_checkbox = new wxCheckBox(global_page, wxID_ANY, _L("Enable prime tower image mapping"));
@@ -1653,6 +1678,15 @@ public:
     }
     bool compact_offset_mode() const { return dithering_enabled() || (m_compact_offset_mode_checkbox && m_compact_offset_mode_checkbox->GetValue()); }
     bool recolor_small_perimeter_loops() const { return m_recolor_small_perimeter_loops_checkbox == nullptr || m_recolor_small_perimeter_loops_checkbox->GetValue(); }
+    bool recolor_top_visible_perimeter_sections() const { return m_recolor_top_visible_perimeter_sections_checkbox == nullptr || m_recolor_top_visible_perimeter_sections_checkbox->GetValue(); }
+    int top_visible_perimeter_recolor_aggressiveness() const
+    {
+        return m_top_visible_perimeter_recolor_aggressiveness_choice ?
+            std::clamp(m_top_visible_perimeter_recolor_aggressiveness_choice->GetSelection(),
+                       int(TextureMappingZone::TopVisibleRecolorConservative),
+                       int(TextureMappingZone::TopVisibleRecolorAggressive)) :
+            TextureMappingZone::DefaultTopVisiblePerimeterRecolorAggressiveness;
+    }
     bool use_legacy_fixed_color_mode() const { return m_use_legacy_fixed_color_mode_checkbox && m_use_legacy_fixed_color_mode_checkbox->GetValue(); }
     bool high_speed_image_texture_sampling() const { return m_high_speed_image_texture_sampling_checkbox == nullptr || m_high_speed_image_texture_sampling_checkbox->GetValue(); }
     bool dithering_enabled() const { return m_dithering_enabled_checkbox && m_dithering_enabled_checkbox->GetValue(); }
@@ -1981,6 +2015,31 @@ private:
         }
     }
 
+    void update_modulation_mode_options_visibility(bool fit_dialog)
+    {
+        const bool perimeter_path_mode = modulation_mode() == int(TextureMappingZone::ModulationPerimeterPath);
+        if (m_recolor_small_perimeter_loops_checkbox != nullptr)
+            m_recolor_small_perimeter_loops_checkbox->Enable(perimeter_path_mode);
+        if (m_recolor_top_visible_perimeter_sections_checkbox != nullptr)
+            m_recolor_top_visible_perimeter_sections_checkbox->Enable(perimeter_path_mode);
+        const bool top_visible_enabled =
+            perimeter_path_mode &&
+            m_recolor_top_visible_perimeter_sections_checkbox != nullptr &&
+            m_recolor_top_visible_perimeter_sections_checkbox->GetValue();
+        if (m_top_visible_perimeter_recolor_aggressiveness_label != nullptr)
+            m_top_visible_perimeter_recolor_aggressiveness_label->Enable(top_visible_enabled);
+        if (m_top_visible_perimeter_recolor_aggressiveness_choice != nullptr)
+            m_top_visible_perimeter_recolor_aggressiveness_choice->Enable(top_visible_enabled);
+        layout_current_options_page();
+        if (!fit_dialog)
+            return;
+        update_options_book_min_size();
+        if (GetSizer() != nullptr) {
+            Layout();
+            Fit();
+        }
+    }
+
     void update_dithering_options_visibility(bool fit_dialog)
     {
         const bool enabled = m_dithering_enabled_checkbox != nullptr && m_dithering_enabled_checkbox->GetValue();
@@ -2030,6 +2089,9 @@ private:
     wxCheckBox *m_nonlinear_offset_adjustment_checkbox {nullptr};
     wxChoice *m_modulation_mode_choice {nullptr};
     wxCheckBox *m_recolor_small_perimeter_loops_checkbox {nullptr};
+    wxCheckBox *m_recolor_top_visible_perimeter_sections_checkbox {nullptr};
+    wxStaticText *m_top_visible_perimeter_recolor_aggressiveness_label {nullptr};
+    wxChoice *m_top_visible_perimeter_recolor_aggressiveness_choice {nullptr};
     wxCheckBox *m_compact_offset_mode_checkbox {nullptr};
     wxCheckBox *m_dithering_enabled_checkbox {nullptr};
     wxChoice *m_dithering_method_choice {nullptr};
@@ -6145,6 +6207,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.nonlinear_offset_adjustment,
                                                     updated.modulation_mode,
                                                     updated.recolor_small_perimeter_loops,
+                                                    updated.recolor_top_visible_perimeter_sections,
+                                                    updated.top_visible_perimeter_recolor_aggressiveness,
                                                     updated.compact_offset_mode,
                                                     updated.use_legacy_fixed_color_mode,
                                                     updated.high_speed_image_texture_sampling,
@@ -6185,6 +6249,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.nonlinear_offset_adjustment = dlg.nonlinear_offset_adjustment();
             updated.modulation_mode = dlg.modulation_mode();
             updated.recolor_small_perimeter_loops = dlg.recolor_small_perimeter_loops();
+            updated.recolor_top_visible_perimeter_sections = dlg.recolor_top_visible_perimeter_sections();
+            updated.top_visible_perimeter_recolor_aggressiveness = dlg.top_visible_perimeter_recolor_aggressiveness();
             updated.compact_offset_mode = dlg.compact_offset_mode();
             updated.use_legacy_fixed_color_mode = dlg.use_legacy_fixed_color_mode();
             updated.high_speed_image_texture_sampling = dlg.high_speed_image_texture_sampling();

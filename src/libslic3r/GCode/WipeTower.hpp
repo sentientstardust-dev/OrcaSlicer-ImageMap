@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <initializer_list>
 #include <limits>
 #include <vector>
@@ -763,6 +764,7 @@ class WipeTower
 {
 public:
     friend class WipeTowerWriter;
+    using ProgressCallback = std::function<void(size_t, size_t)>;
     static const std::string never_skip_tag() { return "_GCODE_WIPE_TOWER_NEVER_SKIP_TAG"; }
 
 	// WipeTower height to minimum depth map
@@ -934,7 +936,7 @@ public:
                          int          texture_mapping_wall_tool = -1);
 
 	// Iterates through prepared m_plan, generates ToolChangeResults and appends them to "result"
-	void generate(std::vector<std::vector<ToolChangeResult>> &result);
+	void generate(std::vector<std::vector<ToolChangeResult>> &result, ProgressCallback progress_callback = {});
     void set_prime_tower_texture(const PrimeTowerTextureRenderSettings &settings) { m_prime_tower_texture = settings; }
 
 	WipeTower::ToolChangeResult only_generate_out_wall(bool is_new_mode = false);
@@ -1132,7 +1134,7 @@ public:
 	void reset_block_status();
     int get_wall_filament_for_all_layer();
 	// for generate new wipe tower
-    void generate_new(std::vector<std::vector<WipeTower::ToolChangeResult>> &result);
+    void generate_new(std::vector<std::vector<WipeTower::ToolChangeResult>> &result, ProgressCallback progress_callback = {});
 
 	void plan_tower_new();
 	void generate_wipe_tower_blocks();

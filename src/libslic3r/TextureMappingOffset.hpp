@@ -7,6 +7,7 @@
 #include "Point.hpp"
 #include "TextureMapping.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -29,6 +30,9 @@ struct TextureMappingOffsetWeightField {
     std::vector<float> sample_x_mm;
     std::vector<float> sample_y_mm;
     std::vector<float> sample_weight;
+    std::vector<float> sample_r;
+    std::vector<float> sample_g;
+    std::vector<float> sample_b;
     std::vector<float> sample_component_weights;
     std::vector<std::vector<uint32_t>> buckets;
     std::vector<float> fallback_weights;
@@ -96,6 +100,11 @@ std::vector<float> sample_weight_field_components(const TextureMappingOffsetWeig
                                                   float                                  x_mm,
                                                   float                                  y_mm,
                                                   bool                                   high_resolution_texture_sampling);
+
+std::optional<std::array<float, 3>> sample_weight_field_rgb(const TextureMappingOffsetWeightField &weight_field,
+                                                            float                                  x_mm,
+                                                            float                                  y_mm,
+                                                            bool                                   high_resolution_texture_sampling);
 
 float texture_mapping_offset_surface_inset_mm(const TextureMappingOffsetContext &context,
                                               const Point                       &point,

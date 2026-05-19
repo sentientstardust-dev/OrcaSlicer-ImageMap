@@ -1341,6 +1341,8 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 	for (LayerRegion *layerm : m_regions)
 	    for (const ExtrusionEntity *thin_fill : layerm->thin_fills.entities) {
 	        ExtrusionEntityCollection &collection = *(new ExtrusionEntityCollection());
+            if (const auto *thin_fill_collection = dynamic_cast<const ExtrusionEntityCollection *>(thin_fill))
+                collection.texture_mapping_extruder_override = thin_fill_collection->texture_mapping_extruder_override;
 	        layerm->fills.entities.push_back(&collection);
 	        collection.entities.push_back(thin_fill->clone());
 	    }

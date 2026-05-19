@@ -51,6 +51,12 @@ struct TextureMappingZone
         ModulationPerimeterPath = 1
     };
 
+    enum TopVisiblePerimeterRecolorAggressiveness : uint8_t {
+        TopVisibleRecolorConservative = 0,
+        TopVisibleRecolorBalanced = 1,
+        TopVisibleRecolorAggressive = 2
+    };
+
     enum FilamentColorMode : uint8_t {
         FilamentColorAny = 0,
         FilamentColorRGB = 1,
@@ -109,6 +115,8 @@ struct TextureMappingZone
     static constexpr bool  DefaultNonlinearOffsetAdjustment = false;
     static constexpr int   DefaultModulationMode = int(ModulationLineWidth);
     static constexpr bool  DefaultRecolorSmallPerimeterLoops = true;
+    static constexpr bool  DefaultRecolorTopVisiblePerimeterSections = true;
+    static constexpr int   DefaultTopVisiblePerimeterRecolorAggressiveness = int(TopVisibleRecolorConservative);
     static constexpr bool  DefaultCompactOffsetMode = true;
     static constexpr bool  DefaultUseLegacyFixedColorMode = false;
     static constexpr bool  DefaultHighSpeedImageTextureSampling = true;
@@ -163,6 +171,8 @@ struct TextureMappingZone
     bool        nonlinear_offset_adjustment = DefaultNonlinearOffsetAdjustment;
     int         modulation_mode = DefaultModulationMode;
     bool        recolor_small_perimeter_loops = DefaultRecolorSmallPerimeterLoops;
+    bool        recolor_top_visible_perimeter_sections = DefaultRecolorTopVisiblePerimeterSections;
+    int         top_visible_perimeter_recolor_aggressiveness = DefaultTopVisiblePerimeterRecolorAggressiveness;
     bool        compact_offset_mode = DefaultCompactOffsetMode;
     bool        use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
     bool        high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;
@@ -215,6 +225,8 @@ struct TextureMappingZone
         nonlinear_offset_adjustment = DefaultNonlinearOffsetAdjustment;
         modulation_mode = DefaultModulationMode;
         recolor_small_perimeter_loops = DefaultRecolorSmallPerimeterLoops;
+        recolor_top_visible_perimeter_sections = DefaultRecolorTopVisiblePerimeterSections;
+        top_visible_perimeter_recolor_aggressiveness = DefaultTopVisiblePerimeterRecolorAggressiveness;
         compact_offset_mode = DefaultCompactOffsetMode;
         use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
         high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;

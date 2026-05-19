@@ -2694,7 +2694,7 @@ static WipeTower::ToolChangeResult merge_tcr(WipeTower::ToolChangeResult& first,
 
 // Processes vector m_plan and calls respective functions to generate G-code for the wipe tower
 // Resulting ToolChangeResults are appended into vector "result"
-void WipeTower2::generate(std::vector<std::vector<WipeTower::ToolChangeResult>> &result)
+void WipeTower2::generate(std::vector<std::vector<WipeTower::ToolChangeResult>> &result, WipeTower::ProgressCallback progress_callback)
 {
 	if (m_plan.empty())
         return;
@@ -2730,8 +2730,12 @@ void WipeTower2::generate(std::vector<std::vector<WipeTower::ToolChangeResult>> 
 
     m_old_temperature = -1; // reset last temperature written in the gcode
 
+    const size_t progress_total = m_plan.size();
+    size_t progress_current = 0;
 	for (const WipeTower2::WipeTowerInfo& layer : m_plan)
 	{
+        if (progress_callback)
+            progress_callback(++progress_current, progress_total);
         std::vector<WipeTower::ToolChangeResult> layer_result;
         set_layer(layer.z, layer.height, 0, false/*layer.z == m_plan.front().z*/, layer.z == m_plan.back().z);
         m_internal_rotation += 180.f;

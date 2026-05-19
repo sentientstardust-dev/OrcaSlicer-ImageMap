@@ -1,6 +1,9 @@
 #ifndef slic3r_MultiMaterialSegmentation_hpp_
 #define slic3r_MultiMaterialSegmentation_hpp_
 
+#include "Line.hpp"
+
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -51,6 +54,9 @@ std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(con
 
 // Returns fuzzy skin segmentation based on painting in fuzzy skin segmentation gizmo
 std::vector<std::vector<ExPolygons>> fuzzy_skin_segmentation_by_painting(const PrintObject &print_object, const std::function<void()> &throw_on_cancel_callback);
+
+std::vector<ExPolygons> segmentation_by_colored_contours(const std::vector<ColoredLines> &colorized_contours,
+                                                         size_t                           num_facets_states);
 
 } // namespace Slic3r
 

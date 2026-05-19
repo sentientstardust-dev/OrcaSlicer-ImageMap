@@ -2,12 +2,14 @@
 #include "ClipperUtils.hpp"
 #include "EdgeGrid.hpp"
 #include "Layer.hpp"
+#include "Polygon.hpp"
 #include "Print.hpp"
 #include "Geometry/VoronoiVisualUtils.hpp"
 #include "Geometry/VoronoiUtils.hpp"
 #include "MutablePolygon.hpp"
 #include "format.hpp"
 
+#include <cmath>
 #include <utility>
 #include <unordered_set>
 
@@ -1971,6 +1973,65 @@ static bool has_layer_only_one_color(const std::vector<ColoredLines> &colored_po
                 return false;
 
     return true;
+}
+
+static bool is_valid_colored_contour(const ColoredLines &lines)
+{
+    if (lines.size() < 3)
+        return false;
+
+    Polygon polygon;
+    polygon.points.reserve(lines.size());
+    for (size_t idx = 0; idx < lines.size(); ++idx) {
+        const ColoredLine &line = lines[idx];
+        const ColoredLine &next = lines[(idx + 1) % lines.size()];
+        if (line.line.a == line.line.b || line.line.b != next.line.a)
+            return false;
+        polygon.points.emplace_back(line.line.a);
+    }
+
+    remove_same_neighbor(polygon);
+    return polygon.points.size() >= 3 && std::isfinite(polygon.area()) && polygon.is_valid();
+}
+
+std::vector<ExPolygons> segmentation_by_colored_contours(const std::vector<ColoredLines> &colorized_contours,
+                                                         size_t                           num_facets_states)
+{
+    std::vector<ExPolygons> out(num_facets_states);
+    std::vector<ColoredLines> contours;
+    contours.reserve(colorized_contours.size());
+    for (const ColoredLines &lines : colorized_contours)
+        if (is_valid_colored_contour(lines))
+            contours.emplace_back(lines);
+    if (contours.empty())
+        return out;
+
+    size_t poly_idx = 0;
+    for (ColoredLines &lines : contours) {
+        size_t line_idx = 0;
+        for (ColoredLine &line : lines) {
+            line.poly_idx = int(poly_idx);
+            line.local_line_idx = int(line_idx);
+            ++line_idx;
+        }
+        ++poly_idx;
+    }
+
+    if (has_layer_only_one_color(contours)) {
+        const int color = contours.front().front().color;
+        if (color >= 0 && size_t(color) < out.size())
+            out[size_t(color)] = union_ex(colored_points_to_polygon(contours));
+        return out;
+    }
+
+    MMU_Graph graph = build_graph(0, contours);
+    remove_multiple_edges_in_vertices(graph, contours);
+    graph.remove_nodes_with_one_arc();
+    out = extract_colored_segments(graph, num_facets_states);
+    for (ExPolygons &expolygons : out)
+        if (!expolygons.empty())
+            expolygons = union_ex(expolygons);
+    return out;
 }
 
 std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject                                               &print_object,

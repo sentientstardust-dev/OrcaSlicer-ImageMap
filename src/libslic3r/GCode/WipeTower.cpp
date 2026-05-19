@@ -4265,7 +4265,7 @@ int WipeTower::get_wall_filament_for_all_layer()
     return filament_id;
 }
 
-void WipeTower::generate_new(std::vector<std::vector<WipeTower::ToolChangeResult>> &result)
+void WipeTower::generate_new(std::vector<std::vector<WipeTower::ToolChangeResult>> &result, WipeTower::ProgressCallback progress_callback)
 {
     if (m_plan.empty())
         return;
@@ -4290,7 +4290,11 @@ void WipeTower::generate_new(std::vector<std::vector<WipeTower::ToolChangeResult
     std::vector<WipeTower::ToolChangeResult> layer_result;
     int index = 0;
     std::unordered_set<int> solid_blocks_id;// The contact surface of different bonded materials is solid.
+    const size_t progress_total = m_plan.size();
+    size_t progress_current = 0;
     for (auto layer : m_plan) {
+        if (progress_callback)
+            progress_callback(++progress_current, progress_total);
         reset_block_status();
         m_cur_layer_id = index++;
         m_prev_layer_had_interface = m_current_layer_has_interface;
@@ -4508,7 +4512,7 @@ void WipeTower::generate_new(std::vector<std::vector<WipeTower::ToolChangeResult
 
 // Processes vector m_plan and calls respective functions to generate G-code for the wipe tower
 // Resulting ToolChangeResults are appended into vector "result"
-void WipeTower::generate(std::vector<std::vector<WipeTower::ToolChangeResult>> &result)
+void WipeTower::generate(std::vector<std::vector<WipeTower::ToolChangeResult>> &result, WipeTower::ProgressCallback progress_callback)
 {
 	if (m_plan.empty())
         return;
@@ -4541,8 +4545,12 @@ void WipeTower::generate(std::vector<std::vector<WipeTower::ToolChangeResult>> &
 
     std::vector<WipeTower::ToolChangeResult> layer_result;
     int index = 0;
+    const size_t progress_total = m_plan.size();
+    size_t progress_current = 0;
 	for (auto layer : m_plan)
 	{
+        if (progress_callback)
+            progress_callback(++progress_current, progress_total);
         m_cur_layer_id = index++;
         set_layer(layer.z, layer.height, 0, false/*layer.z == m_plan.front().z*/, layer.z == m_plan.back().z);
         // BBS

@@ -541,6 +541,26 @@ static int modulation_mode_from_name(const std::string &name)
         int(TextureMappingZone::ModulationLineWidth);
 }
 
+static std::string top_visible_recolor_aggressiveness_name(int mode)
+{
+    switch (clamp_int(mode,
+                      int(TextureMappingZone::TopVisibleRecolorConservative),
+                      int(TextureMappingZone::TopVisibleRecolorAggressive))) {
+    case int(TextureMappingZone::TopVisibleRecolorAggressive): return "aggressive";
+    case int(TextureMappingZone::TopVisibleRecolorBalanced):   return "balanced";
+    default:                                                   return "conservative";
+    }
+}
+
+static int top_visible_recolor_aggressiveness_from_name(const std::string &name)
+{
+    if (name == "aggressive")
+        return int(TextureMappingZone::TopVisibleRecolorAggressive);
+    if (name == "balanced")
+        return int(TextureMappingZone::TopVisibleRecolorBalanced);
+    return int(TextureMappingZone::TopVisibleRecolorConservative);
+}
+
 static std::string color_model_name(int mode)
 {
     switch (clamp_int(mode, int(TextureMappingZone::FilamentColorAny), int(TextureMappingZone::FilamentColorRGBKW))) {
@@ -840,6 +860,8 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            nonlinear_offset_adjustment == rhs.nonlinear_offset_adjustment &&
            modulation_mode == rhs.modulation_mode &&
            recolor_small_perimeter_loops == rhs.recolor_small_perimeter_loops &&
+           recolor_top_visible_perimeter_sections == rhs.recolor_top_visible_perimeter_sections &&
+           top_visible_perimeter_recolor_aggressiveness == rhs.top_visible_perimeter_recolor_aggressiveness &&
            compact_offset_mode == rhs.compact_offset_mode &&
            use_legacy_fixed_color_mode == rhs.use_legacy_fixed_color_mode &&
            high_speed_image_texture_sampling == rhs.high_speed_image_texture_sampling &&
@@ -1095,6 +1117,9 @@ std::string TextureMappingManager::serialize_entries()
         texture["nonlinear_offset_adjustment"] = zone.nonlinear_offset_adjustment;
         texture["modulation_mode"] = modulation_mode_name(zone.modulation_mode);
         texture["recolor_small_perimeter_loops"] = zone.recolor_small_perimeter_loops;
+        texture["recolor_top_visible_perimeter_sections"] = zone.recolor_top_visible_perimeter_sections;
+        texture["top_visible_perimeter_recolor_aggressiveness"] =
+            top_visible_recolor_aggressiveness_name(zone.top_visible_perimeter_recolor_aggressiveness);
         texture["compact_offset_mode"] = zone.compact_offset_mode;
         texture["use_legacy_fixed_color_mode"] = zone.use_legacy_fixed_color_mode;
         texture["high_speed_image_texture_sampling"] = zone.high_speed_image_texture_sampling;
@@ -1241,6 +1266,12 @@ void TextureMappingManager::load_entries(const std::string &serialized,
                                                     modulation_mode_name(TextureMappingZone::DefaultModulationMode)));
         zone.recolor_small_perimeter_loops =
             texture.value("recolor_small_perimeter_loops", TextureMappingZone::DefaultRecolorSmallPerimeterLoops);
+        zone.recolor_top_visible_perimeter_sections =
+            texture.value("recolor_top_visible_perimeter_sections", TextureMappingZone::DefaultRecolorTopVisiblePerimeterSections);
+        zone.top_visible_perimeter_recolor_aggressiveness =
+            top_visible_recolor_aggressiveness_from_name(
+                texture.value("top_visible_perimeter_recolor_aggressiveness",
+                              top_visible_recolor_aggressiveness_name(TextureMappingZone::DefaultTopVisiblePerimeterRecolorAggressiveness)));
         zone.compact_offset_mode = texture.value("compact_offset_mode", TextureMappingZone::DefaultCompactOffsetMode);
         zone.use_legacy_fixed_color_mode =
             texture.value("use_legacy_fixed_color_mode", TextureMappingZone::DefaultUseLegacyFixedColorMode);

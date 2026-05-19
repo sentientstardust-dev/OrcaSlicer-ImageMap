@@ -706,6 +706,21 @@ std::array<float, 3> apply_texture_contrast_to_rgb(const std::array<float, 3> &r
     };
 }
 
+std::array<float, 3> texture_sample_target_rgb(const WeightedTextureSample &sample, float tone_gamma, float contrast_factor)
+{
+    std::array<float, 3> target = {
+        clamp01f(sample.rgba[0]),
+        clamp01f(sample.rgba[1]),
+        clamp01f(sample.rgba[2])
+    };
+    if (std::abs(tone_gamma - 1.f) > 1e-5f) {
+        target[0] = apply_texture_tone_gamma(target[0], tone_gamma);
+        target[1] = apply_texture_tone_gamma(target[1], tone_gamma);
+        target[2] = apply_texture_tone_gamma(target[2], tone_gamma);
+    }
+    return apply_texture_contrast_to_rgb(target, contrast_factor);
+}
+
 std::array<float, 3> generic_solver_v2_axis_weights(const std::array<float, 3> &target_oklab)
 {
     const float chroma = std::hypot(target_oklab[1], target_oklab[2]);
@@ -1563,18 +1578,7 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
             };
 
             auto sample_target_oklab = [tone_gamma, contrast_factor](const WeightedTextureSample &sample) {
-                std::array<float, 3> target = {
-                    clamp01f(sample.rgba[0]),
-                    clamp01f(sample.rgba[1]),
-                    clamp01f(sample.rgba[2])
-                };
-                if (std::abs(tone_gamma - 1.f) > 1e-5f) {
-                    target[0] = apply_texture_tone_gamma(target[0], tone_gamma);
-                    target[1] = apply_texture_tone_gamma(target[1], tone_gamma);
-                    target[2] = apply_texture_tone_gamma(target[2], tone_gamma);
-                }
-                target = apply_texture_contrast_to_rgb(target, contrast_factor);
-                return color_solver_oklab_from_srgb(target);
+                return color_solver_oklab_from_srgb(texture_sample_target_rgb(sample, tone_gamma, contrast_factor));
             };
 
             std::vector<BinaryDitherCell> cells;
@@ -1692,6 +1696,9 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
     weight_field.sample_x_mm.resize(sample_count);
     weight_field.sample_y_mm.resize(sample_count);
     weight_field.sample_weight.resize(sample_count);
+    weight_field.sample_r.resize(sample_count);
+    weight_field.sample_g.resize(sample_count);
+    weight_field.sample_b.resize(sample_count);
     weight_field.sample_component_weights.assign(sample_count * component_count, 0.f);
     weight_field.raw_component_weights_from_texture = false;
     weight_field.binary_dithered = !binary_dither_masks.empty();
@@ -1707,6 +1714,10 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
         weight_field.sample_x_mm[sample_idx] = sample.x_mm;
         weight_field.sample_y_mm[sample_idx] = sample.y_mm;
         weight_field.sample_weight[sample_idx] = sample.weight;
+        const std::array<float, 3> target_rgb = texture_sample_target_rgb(sample, tone_gamma, contrast_factor);
+        weight_field.sample_r[sample_idx] = target_rgb[0];
+        weight_field.sample_g[sample_idx] = target_rgb[1];
+        weight_field.sample_b[sample_idx] = target_rgb[2];
 
         std::vector<float> desired(component_count, 0.f);
         const bool has_binary_dither = sample_idx < binary_dither_masks.size() && binary_dither_masks[sample_idx] != 0;
@@ -2377,6 +2388,90 @@ std::vector<float> sample_weight_field_components(const TextureMappingOffsetWeig
                                                   bool high_resolution_texture_sampling)
 {
     return sample_weight_field_components_impl(weight_field, x_mm, y_mm, high_resolution_texture_sampling);
+}
+
+std::optional<std::array<float, 3>> sample_weight_field_rgb(const TextureMappingOffsetWeightField &weight_field,
+                                                            float x_mm,
+                                                            float y_mm,
+                                                            bool high_resolution_texture_sampling)
+{
+    if (weight_field.empty() ||
+        weight_field.sample_r.size() != weight_field.sample_x_mm.size() ||
+        weight_field.sample_g.size() != weight_field.sample_x_mm.size() ||
+        weight_field.sample_b.size() != weight_field.sample_x_mm.size() ||
+        !std::isfinite(x_mm) ||
+        !std::isfinite(y_mm))
+        return std::nullopt;
+
+    const float gx = (x_mm - weight_field.min_x_mm) / std::max(weight_field.bucket_width_mm, 1e-6f);
+    const float gy = (y_mm - weight_field.min_y_mm) / std::max(weight_field.bucket_height_mm, 1e-6f);
+    const int cx = std::clamp(int(std::floor(gx)), 0, weight_field.bucket_width - 1);
+    const int cy = std::clamp(int(std::floor(gy)), 0, weight_field.bucket_height - 1);
+    const float max_radius_mm =
+        high_resolution_texture_sampling ?
+            std::max(0.18f, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * 2.5f) :
+            std::max(0.32f, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * 3.0f);
+    const int max_ring = std::clamp(int(std::ceil(max_radius_mm / std::max(std::min(weight_field.bucket_width_mm,
+                                                                                       weight_field.bucket_height_mm),
+                                                                               1e-3f))),
+                                    1,
+                                    std::max(weight_field.bucket_width, weight_field.bucket_height));
+    double weighted_r = 0.0;
+    double weighted_g = 0.0;
+    double weighted_b = 0.0;
+    double total_weight = 0.0;
+    size_t nearest_sample_idx = size_t(-1);
+    float nearest_d2 = std::numeric_limits<float>::max();
+
+    for (int ring = 0; ring <= max_ring; ++ring) {
+        const int min_x = std::max(0, cx - ring);
+        const int max_x = std::min(weight_field.bucket_width - 1, cx + ring);
+        const int min_y = std::max(0, cy - ring);
+        const int max_y = std::min(weight_field.bucket_height - 1, cy + ring);
+        for (int by = min_y; by <= max_y; ++by) {
+            for (int bx = min_x; bx <= max_x; ++bx) {
+                const size_t bucket_idx = size_t(by) * size_t(weight_field.bucket_width) + size_t(bx);
+                if (bucket_idx >= weight_field.buckets.size())
+                    continue;
+                for (const uint32_t sample_idx_u32 : weight_field.buckets[bucket_idx]) {
+                    const size_t sample_idx = size_t(sample_idx_u32);
+                    if (sample_idx >= weight_field.sample_x_mm.size())
+                        continue;
+                    const float dx = x_mm - weight_field.sample_x_mm[sample_idx];
+                    const float dy = y_mm - weight_field.sample_y_mm[sample_idx];
+                    const float d2 = dx * dx + dy * dy;
+                    if (d2 < nearest_d2) {
+                        nearest_d2 = d2;
+                        nearest_sample_idx = sample_idx;
+                    }
+                    if (d2 > max_radius_mm * max_radius_mm)
+                        continue;
+                    const float kernel = std::exp(-0.5f * d2 / std::max(max_radius_mm * max_radius_mm * 0.16f, 1e-6f));
+                    const float sample_w = weight_field.sample_weight[sample_idx] * kernel;
+                    if (!std::isfinite(sample_w) || sample_w <= EPSILON)
+                        continue;
+                    weighted_r += double(weight_field.sample_r[sample_idx]) * double(sample_w);
+                    weighted_g += double(weight_field.sample_g[sample_idx]) * double(sample_w);
+                    weighted_b += double(weight_field.sample_b[sample_idx]) * double(sample_w);
+                    total_weight += double(sample_w);
+                }
+            }
+        }
+        if (total_weight > EPSILON)
+            break;
+    }
+
+    if (total_weight > EPSILON)
+        return std::array<float, 3>{ clamp01f(float(weighted_r / total_weight)),
+                                     clamp01f(float(weighted_g / total_weight)),
+                                     clamp01f(float(weighted_b / total_weight)) };
+
+    if (nearest_sample_idx != size_t(-1))
+        return std::array<float, 3>{ clamp01f(weight_field.sample_r[nearest_sample_idx]),
+                                     clamp01f(weight_field.sample_g[nearest_sample_idx]),
+                                     clamp01f(weight_field.sample_b[nearest_sample_idx]) };
+
+    return std::nullopt;
 }
 
 std::vector<unsigned int> decode_texture_mapping_offset_component_ids(const TextureMappingZone &zone, size_t num_physical)

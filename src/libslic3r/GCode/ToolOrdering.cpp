@@ -833,10 +833,19 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
 
             bool has_infill       = false;
             bool has_solid_infill = false;
+            bool has_texture_override_fill = false;
             bool something_nonoverriddable = false;
             for (const ExtrusionEntity *ee : layerm->fills.entities) {
                 // fill represents infill extrusions of a single island.
                 const auto *fill = dynamic_cast<const ExtrusionEntityCollection*>(ee);
+                if (fill->texture_mapping_extruder_override >= 0 &&
+                    (layer_tools.num_physical_filaments == 0 || unsigned(fill->texture_mapping_extruder_override) < layer_tools.num_physical_filaments)) {
+                    append_layer_filament(unsigned(fill->texture_mapping_extruder_override) + 1);
+                    if (layerCount == 0)
+                        firstLayerExtruders.emplace_back(fill->texture_mapping_extruder_override + 1);
+                    has_texture_override_fill = true;
+                    continue;
+                }
                 ExtrusionRole role = fill->entities.empty() ? erNone : fill->entities.front()->role();
                 if (is_solid_infill(role))
                     has_solid_infill = true;
@@ -858,7 +867,7 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
                 } else if (has_solid_infill || has_infill)
                     append_layer_filament(extruder_override);
             }
-            if (has_solid_infill || has_infill)
+            if (has_solid_infill || has_infill || has_texture_override_fill)
                 layer_tools.has_object = true;
         }
         layerCount++;
