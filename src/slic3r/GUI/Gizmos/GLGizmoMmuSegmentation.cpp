@@ -13498,19 +13498,6 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
         ensure_text_projection_image();
     update_default_projection_mode();
 
-    if (m_show_overlay && ensure_overlay_texture()) {
-        const OverlayRect rect = overlay_rect();
-        if (rect.width > 0.f && rect.height > 0.f) {
-            ImGui::GetBackgroundDrawList()->AddImage((void *)(intptr_t)m_overlay_texture.get_id(),
-                                                     ImVec2(rect.left, rect.top),
-                                                     ImVec2(rect.left + rect.width, rect.top + rect.height),
-                                                     ImVec2(0.f, 0.f),
-                                                     ImVec2(1.f, 1.f),
-                                                     ImGui::GetColorU32(
-                                                         ImVec4(1.f, 1.f, 1.f, 0.72f * std::clamp(m_projection_opacity, 0.f, 1.f))));
-        }
-    }
-
     const float approx_height = m_imgui->scaled(12.0f);
     y = std::min(y, bottom_limit - approx_height);
     GizmoImguiSetNextWIndowPos(x, y, ImGuiCond_Always);
@@ -13649,6 +13636,19 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
 
     GizmoImguiEnd();
     ImGuiWrapper::pop_toolbar_style();
+
+    if (m_show_overlay && ensure_overlay_texture()) {
+        const OverlayRect rect = overlay_rect();
+        if (rect.width > 0.f && rect.height > 0.f) {
+            ImGui::GetBackgroundDrawList()->AddImage((void *)(intptr_t)m_overlay_texture.get_id(),
+                                                     ImVec2(rect.left, rect.top),
+                                                     ImVec2(rect.left + rect.width, rect.top + rect.height),
+                                                     ImVec2(0.f, 0.f),
+                                                     ImVec2(1.f, 1.f),
+                                                     ImGui::GetColorU32(
+                                                         ImVec4(1.f, 1.f, 1.f, 0.72f * std::clamp(m_projection_opacity, 0.f, 1.f))));
+        }
+    }
 }
 
 bool GLGizmoImageProjection::project_image_to_selected_object()

@@ -1950,6 +1950,7 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
 
         void _generate_current_object_list(std::vector<Component> &sub_objects, Id object_id, IdToCurrentObjectMap& current_objects);
         bool _generate_volumes_new(ModelObject& object, const std::vector<Component> &sub_objects, const ObjectMetadata::VolumeMetadataList& volumes, ConfigSubstitutionContext& config_substitutions);
+        bool _try_extract_imported_obj_texture_from_archive(mz_zip_archive &archive, const std::string &image_file, std::vector<uint8_t> &image_payload);
         void _restore_imported_obj_textures_from_archive(mz_zip_archive &archive);
         void _restore_prime_tower_texture_from_archive(mz_zip_archive &archive, const DynamicPrintConfig &config, Model &model);
         //bool _generate_volumes(ModelObject& object, const Geometry& geometry, const ObjectMetadata::VolumeMetadataList& volumes, ConfigSubstitutionContext& config_substitutions);
@@ -5931,6 +5932,53 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
         return true;
     }
 
+    bool _BBS_3MF_Importer::_try_extract_imported_obj_texture_from_archive(mz_zip_archive &archive, const std::string &image_file, std::vector<uint8_t> &image_payload)
+    {
+        image_payload.clear();
+        if (try_extract_file_from_archive(archive, image_file, image_payload))
+            return true;
+
+        if (!m_load_restore)
+            return false;
+
+        for (const std::string &sub_model_path : m_sub_model_paths) {
+            std::string path = sub_model_path;
+            std::replace(path.begin(), path.end(), '\\', '/');
+            while (!path.empty() && path.front() == '/')
+                path.erase(path.begin());
+            if (path.empty())
+                continue;
+
+            const boost::filesystem::path object_archive_path = boost::filesystem::path(m_backup_path) / path;
+            if (!boost::filesystem::exists(object_archive_path))
+                continue;
+
+            mz_zip_archive object_archive;
+            mz_zip_zero_struct(&object_archive);
+            if (!open_zip_reader(&object_archive, object_archive_path.string()))
+                continue;
+
+            const bool found = try_extract_file_from_archive(object_archive, image_file, image_payload);
+            close_zip_reader(&object_archive);
+            if (found)
+                return true;
+        }
+
+        if (!m_origin_file.empty() && boost::filesystem::exists(m_origin_file)) {
+            mz_zip_archive origin_archive;
+            mz_zip_zero_struct(&origin_archive);
+            if (open_zip_reader(&origin_archive, m_origin_file)) {
+                const bool found = try_extract_file_from_archive(origin_archive, image_file, image_payload);
+                close_zip_reader(&origin_archive);
+                if (found)
+                    return true;
+            }
+        }
+
+        image_payload.clear();
+        return false;
+    }
+
     void _BBS_3MF_Importer::_restore_imported_obj_textures_from_archive(mz_zip_archive &archive)
     {
         if (m_model == nullptr)
@@ -5946,7 +5994,7 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
                 continue;
 
             std::vector<uint8_t> image_payload;
-            if (!try_extract_file_from_archive(archive, source.image_file, image_payload)) {
+            if (!_try_extract_imported_obj_texture_from_archive(archive, source.image_file, image_payload)) {
                 BOOST_LOG_TRIVIAL(warning) << "3MF texture2d payload missing for image='" << source.image_file << "'";
                 continue;
             }

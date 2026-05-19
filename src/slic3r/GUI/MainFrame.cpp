@@ -300,6 +300,7 @@ DPIFrame(NULL, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, BORDERLESS_FRAME_
 {
 #ifdef __WXOSX__
     set_miniaturizable(GetHandle());
+    mac_install_text_paste_shortcut();
 #endif
 
 #ifdef __WXGTK__
@@ -2899,6 +2900,9 @@ void MainFrame::init_menubar_as_editor()
         // BBS Paste
         append_menu_item(editMenu, wxID_ANY, _L("Paste") + sep + ctrl_t + "V",
             _L("Paste clipboard"), [this, handle_key_event](wxCommandEvent&) {
+                if (mac_paste_to_text_control()) {
+                    return;
+                }
                 wxKeyEvent e;
                 e.SetEventType(wxEVT_KEY_DOWN);
                 e.SetControlDown(true);
@@ -2907,7 +2911,7 @@ void MainFrame::init_menubar_as_editor()
                     return;
                 }
                 m_plater->paste_from_clipboard(); },
-            "", nullptr, [this](){return m_plater->can_paste_from_clipboard(); }, this);
+            "", nullptr, [this](){return mac_can_paste_to_text_control() || m_plater->can_paste_from_clipboard(); }, this);
 #if 0
         // BBS Delete selected
         append_menu_item(editMenu, wxID_ANY, _L("Delete selected") + "\t" + _L("Backspace"),
@@ -4346,4 +4350,3 @@ void SettingsDialog::on_dpi_changed(const wxRect& suggested_rect)
 
 } // GUI
 } // Slic3r
-

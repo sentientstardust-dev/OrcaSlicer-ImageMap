@@ -719,6 +719,21 @@ static wxSize from_dip_for_parent(wxWindow *parent, const wxSize &size)
     return wxWindow::FromDIP(size, parent);
 }
 
+class TextureMappingScrolledWindow : public wxScrolledWindow
+{
+public:
+    TextureMappingScrolledWindow(wxWindow *parent,
+                                 wxWindowID id = wxID_ANY,
+                                 const wxPoint &pos = wxDefaultPosition,
+                                 const wxSize &size = wxDefaultSize,
+                                 long style = wxVSCROLL)
+        : wxScrolledWindow(parent, id, pos, size, style)
+    {
+    }
+
+    bool ShouldScrollToChildOnFocus(wxWindow *child) override { return false; }
+};
+
 class TextureMappingPatternPreview : public wxPanel
 {
 public:
@@ -1353,7 +1368,7 @@ public:
         m_recolor_top_visible_perimeter_sections_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) { update_modulation_mode_options_visibility(false); });
         auto *top_visible_recolor_row = new wxBoxSizer(wxHORIZONTAL);
         m_top_visible_perimeter_recolor_aggressiveness_label =
-            new wxStaticText(print_settings_page, wxID_ANY, _L("Top-visible recolor sensitivity:"));
+            new wxStaticText(print_settings_page, wxID_ANY, _L("Top layer line recolor sensitivity:"));
         top_visible_recolor_row->Add(m_top_visible_perimeter_recolor_aggressiveness_label, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         wxArrayString top_visible_recolor_choices;
         top_visible_recolor_choices.Add(_L("Conservative"));
@@ -4090,7 +4105,7 @@ Sidebar::Sidebar(Plater *parent)
     spliter_texture_2->SetLineColour("#CECECE");
     scrolled_sizer->Add(spliter_texture_2, 0, wxEXPAND);
 
-    p->m_panel_texture_mapping_content = new wxScrolledWindow(p->scrolled, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxTAB_TRAVERSAL);
+    p->m_panel_texture_mapping_content = new TextureMappingScrolledWindow(p->scrolled, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxTAB_TRAVERSAL);
     p->m_panel_texture_mapping_content->SetScrollRate(0, 5);
     p->m_panel_texture_mapping_content->ShowScrollbars(wxSHOW_SB_NEVER, wxSHOW_SB_DEFAULT);
     p->m_panel_texture_mapping_content->SetBackgroundColour(wxGetApp().dark_mode() ? wxColour(45, 45, 49) : wxColour(255, 255, 255));
@@ -5659,6 +5674,19 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
     wxWindowUpdateLocker no_updates_sidebar(this);
     wxWindowUpdateLocker no_updates_panel(p->m_panel_texture_mapping_content);
 
+    int texture_mapping_scroll_x = 0;
+    int texture_mapping_scroll_y = 0;
+    p->m_panel_texture_mapping_content->GetViewStart(&texture_mapping_scroll_x, &texture_mapping_scroll_y);
+
+    auto scroll_texture_mapping_content_to = [this](int scroll_x, int scroll_y) {
+        if (p->m_panel_texture_mapping_content != nullptr)
+            p->m_panel_texture_mapping_content->Scroll(scroll_x, scroll_y);
+    };
+
+    auto restore_texture_mapping_scroll = [scroll_texture_mapping_content_to, texture_mapping_scroll_x, texture_mapping_scroll_y]() {
+        scroll_texture_mapping_content_to(texture_mapping_scroll_x, texture_mapping_scroll_y);
+    };
+
     PresetBundle *bundle = wxGetApp().preset_bundle;
     if (bundle == nullptr)
         return;
@@ -5735,9 +5763,12 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         return;
     content_sizer->Clear(true);
     content_sizer->AddSpacer(FromDIP(SidebarProps::ContentMargin()));
-    auto update_texture_mapping_area_height = [this]() {
+    auto update_texture_mapping_area_height = [this, scroll_texture_mapping_content_to]() {
         if (p->m_panel_texture_mapping_content == nullptr || p->m_panel_texture_mapping_content->GetSizer() == nullptr)
             return;
+        int scroll_x = 0;
+        int scroll_y = 0;
+        p->m_panel_texture_mapping_content->GetViewStart(&scroll_x, &scroll_y);
         const int max_height = FromDIP(260);
         p->m_panel_texture_mapping_content->SetMaxSize(wxSize(-1, max_height));
         p->m_panel_texture_mapping_content->Layout();
@@ -5746,6 +5777,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         if (min_size.y > max_height)
             min_size.y = max_height;
         p->m_panel_texture_mapping_content->SetMinSize(wxSize(-1, std::max(FromDIP(1), min_size.y)));
+        scroll_texture_mapping_content_to(scroll_x, scroll_y);
     };
 
     if (p->m_btn_add_texture_map != nullptr)
@@ -5839,6 +5871,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         update_texture_mapping_area_height();
         m_scrolled_sizer->Layout();
         Layout();
+        restore_texture_mapping_scroll();
         return;
     }
 
@@ -6395,6 +6428,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
     update_texture_mapping_area_height();
     m_scrolled_sizer->Layout();
     Layout();
+    restore_texture_mapping_scroll();
 }
 
 std::vector<unsigned int> Sidebar::get_ui_ordered_filament_ids() const

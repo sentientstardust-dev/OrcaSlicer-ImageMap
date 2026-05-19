@@ -41,6 +41,77 @@ double mac_max_scaling_factor()
 	}
     return scaling;
 }
+
+static id mac_text_paste_target()
+{
+    id target = [NSApp targetForAction:@selector(paste:) to:nil from:nil];
+    if (target != nil && [target isKindOfClass:[NSText class]])
+        return target;
+    return nil;
+}
+
+static NSString *mac_color_panel_hex_string()
+{
+    NSWindow *window = [NSApp keyWindow];
+    if (![window isKindOfClass:[NSColorPanel class]])
+        return nil;
+
+    NSString *string = [[NSPasteboard generalPasteboard] stringForType:NSPasteboardTypeString];
+    string = [string stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (![string hasPrefix:@"#"])
+        return nil;
+
+    NSString *value = [string substringFromIndex:1];
+    if ([value length] != 6)
+        return nil;
+
+    NSCharacterSet *non_hex = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdefABCDEF"] invertedSet];
+    if ([value rangeOfCharacterFromSet:non_hex].location != NSNotFound)
+        return nil;
+
+    return value;
+}
+
+bool mac_can_paste_to_text_control()
+{
+    NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
+    if ([pasteboard stringForType:NSPasteboardTypeString] == nil)
+        return false;
+    return mac_text_paste_target() != nil;
+}
+
+bool mac_paste_to_text_control()
+{
+    id target = mac_text_paste_target();
+    if (target == nil)
+        return false;
+
+    NSString *color_panel_hex = mac_color_panel_hex_string();
+    if (color_panel_hex != nil && [target respondsToSelector:@selector(insertText:)]) {
+        [target insertText:color_panel_hex];
+        return true;
+    }
+
+    return [NSApp sendAction:@selector(paste:) to:nil from:nil] == YES;
+}
+
+void mac_install_text_paste_shortcut()
+{
+    static id monitor = nil;
+    if (monitor != nil)
+        return;
+
+    monitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent *(NSEvent *event) {
+        NSEventModifierFlags flags = [event modifierFlags];
+        if ((flags & NSEventModifierFlagCommand) != 0 &&
+            (flags & (NSEventModifierFlagShift | NSEventModifierFlagControl | NSEventModifierFlagOption)) == 0) {
+            NSString *characters = [event charactersIgnoringModifiers];
+            if ([characters length] == 1 && [[characters lowercaseString] isEqualToString:@"v"] && mac_paste_to_text_control())
+                return nil;
+        }
+        return event;
+    }];
+}
     
 void set_miniaturizable(void * window)
 {
