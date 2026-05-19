@@ -2888,6 +2888,9 @@ void MainFrame::init_menubar_as_editor()
         // BBS Copy
         append_menu_item(editMenu, wxID_ANY, _L("Copy") + sep + ctrl_t + "C",
             _L("Copy selection to clipboard"), [this, handle_key_event](wxCommandEvent&) {
+                if (mac_copy_to_text_control()) {
+                    return;
+                }
                 wxKeyEvent e;
                 e.SetEventType(wxEVT_KEY_DOWN);
                 e.SetControlDown(true);
@@ -2896,7 +2899,7 @@ void MainFrame::init_menubar_as_editor()
                     return;
                 }
                 m_plater->copy_selection_to_clipboard(); },
-            "", nullptr, [this](){return m_plater->can_copy_to_clipboard(); }, this);
+            "", nullptr, [this](){return mac_can_copy_to_text_control() || m_plater->can_copy_to_clipboard(); }, this);
         // BBS Paste
         append_menu_item(editMenu, wxID_ANY, _L("Paste") + sep + ctrl_t + "V",
             _L("Paste clipboard"), [this, handle_key_event](wxCommandEvent&) {

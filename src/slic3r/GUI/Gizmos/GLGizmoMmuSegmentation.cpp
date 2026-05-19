@@ -14,6 +14,7 @@
 #include "slic3r/GUI/MainFrame.hpp"
 #include "slic3r/GUI/Tab.hpp"
 #include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/TextureMapping.hpp"
 #include "libslic3r/ColorSolver.hpp"
@@ -70,6 +71,47 @@ constexpr float SlopeAutoPaintMaxAngleDeg = 180.f;
 constexpr float ProjectionTextRasterBaseFontSize = 200.f;
 constexpr int ProjectionTextRasterMaxDimension = 2048;
 constexpr int ProjectionTextRasterMinFontSize = 18;
+
+static bool queue_color_data_crash_backup(ModelObject *object)
+{
+    if (object == nullptr ||
+        object->get_model() == nullptr ||
+        !object->get_model()->is_need_backup() ||
+        object->volumes.empty() ||
+        object->instances.empty())
+        return false;
+
+    Slic3r::save_object_mesh(*object);
+    return true;
+}
+
+static ModelObject *find_model_object_by_id(const ObjectID &object_id)
+{
+    for (ModelObject *object : wxGetApp().model().objects)
+        if (object != nullptr && object->id() == object_id)
+            return object;
+    return nullptr;
+}
+
+static void remember_color_data_crash_backup_object(std::vector<ObjectID> &object_ids, const ModelObject *object)
+{
+    if (object == nullptr)
+        return;
+
+    const ObjectID object_id = object->id();
+    if (std::find(object_ids.begin(), object_ids.end(), object_id) == object_ids.end())
+        object_ids.emplace_back(object_id);
+}
+
+static void queue_color_data_crash_backups(std::vector<ObjectID> &object_ids)
+{
+    bool queued = false;
+    for (const ObjectID &object_id : object_ids)
+        queued |= queue_color_data_crash_backup(find_model_object_by_id(object_id));
+    object_ids.clear();
+    if (queued)
+        Slic3r::backup_soon();
+}
 }
 
 struct ManagedRegionColorSource
@@ -8226,6 +8268,8 @@ public:
         m_background_clear->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { clear_background_color(); });
     }
 
+    bool changed() const { return m_changed; }
+
 private:
     struct Row
     {
@@ -8578,6 +8622,7 @@ private:
 
     void refresh_object_after_change()
     {
+        m_changed = true;
         refresh_managed_color_data_object(m_canvas, m_object);
         notify_object_changed();
         m_canvas.set_as_dirty();
@@ -8620,6 +8665,7 @@ private:
     std::function<void()> m_on_object_changed;
     wxPanel          *m_background_picker = nullptr;
     wxButton          *m_background_clear = nullptr;
+    bool               m_changed = false;
     std::vector<Row>   m_rows;
     std::vector<wxWindow *> m_raw_image_texture_info_windows;
     wxStaticText       *m_raw_image_texture_status = nullptr;
@@ -8634,6 +8680,8 @@ void open_color_data_management_dialog(wxWindow *parent, GLCanvas3D &canvas, Mod
 
     ColorDataManagementDialog dialog(parent, canvas, object, std::move(on_object_changed));
     dialog.ShowModal();
+    if (dialog.changed() && queue_color_data_crash_backup(object))
+        Slic3r::backup_soon();
 }
 
 void GLGizmoMmuSegmentation::init_extruders_data(const std::vector<ColorRGBA> &extruder_colors)
@@ -10807,6 +10855,8 @@ void GLGizmoMmuSegmentation::convert_selected_object_vertex_colors_to_texture_ma
         wxGetApp().plater()->get_partplate_list().notify_instance_update(object_idx, 0);
     }
     m_parent.post_event(SimpleEvent(EVT_GLCANVAS_SCHEDULE_BACKGROUND_PROCESS));
+    if (queue_color_data_crash_backup(object))
+        Slic3r::backup_soon();
 }
 
 void GLGizmoMmuSegmentation::convert_selected_object_image_texture_to_texture_mapping_colors()
@@ -10878,6 +10928,8 @@ void GLGizmoMmuSegmentation::convert_selected_object_image_texture_to_texture_ma
         wxGetApp().plater()->get_partplate_list().notify_instance_update(object_idx, 0);
     }
     m_parent.post_event(SimpleEvent(EVT_GLCANVAS_SCHEDULE_BACKGROUND_PROCESS));
+    if (queue_color_data_crash_backup(object))
+        Slic3r::backup_soon();
 }
 
 void GLGizmoMmuSegmentation::convert_selected_regions_to_vertex_colors()
@@ -10958,6 +11010,8 @@ void GLGizmoMmuSegmentation::finish_selected_regions_color_data_conversion(Model
         wxGetApp().plater()->get_partplate_list().notify_instance_update(object_idx, 0);
     }
     m_parent.post_event(SimpleEvent(EVT_GLCANVAS_SCHEDULE_BACKGROUND_PROCESS));
+    if (queue_color_data_crash_backup(&object))
+        Slic3r::backup_soon();
     m_parent.render();
 }
 
@@ -11117,6 +11171,14 @@ void GLGizmoTrueColorPainting::on_shutdown()
     m_background_color_edit_config_snapshot.reset();
     m_parent.use_slope(false);
     m_parent.toggle_model_objects_visibility(true);
+}
+
+void GLGizmoTrueColorPainting::on_set_state()
+{
+    GLGizmoPainterBase::on_set_state();
+
+    if (get_state() == Off)
+        backup_changed_rgb_data_objects();
 }
 
 PainterGizmoType GLGizmoTrueColorPainting::get_painter_type() const
@@ -11845,6 +11907,7 @@ void GLGizmoTrueColorPainting::convert_selected_object_image_texture_to_rgb_data
 
 void GLGizmoTrueColorPainting::refresh_selected_object_after_rgb_change(ModelObject *object)
 {
+    remember_changed_rgb_data_object(object);
     update_selected_object_color_state();
     init_model_triangle_selectors();
     m_parent.update_volumes_colors_by_extruder();
@@ -11857,6 +11920,16 @@ void GLGizmoTrueColorPainting::refresh_selected_object_after_rgb_change(ModelObj
         wxGetApp().plater()->get_partplate_list().notify_instance_update(object_idx, 0);
     }
     m_parent.post_event(SimpleEvent(EVT_GLCANVAS_SCHEDULE_BACKGROUND_PROCESS));
+}
+
+void GLGizmoTrueColorPainting::remember_changed_rgb_data_object(ModelObject *object)
+{
+    remember_color_data_crash_backup_object(m_changed_rgb_data_object_ids, object);
+}
+
+void GLGizmoTrueColorPainting::backup_changed_rgb_data_objects()
+{
+    queue_color_data_crash_backups(m_changed_rgb_data_object_ids);
 }
 
 bool GLGizmoTrueColorPainting::pick_color_from_model(const Vec2d &mouse_position)
@@ -12639,6 +12712,7 @@ void GLGizmoTrueColorPainting::refresh_selected_object_after_background_color_ch
     if (object == nullptr)
         return;
 
+    remember_changed_rgb_data_object(object);
     cancel_rgb_data_preview_conversion();
     m_preview_rgb_data_volume_ids.clear();
     m_preview_rgb_data_by_volume.clear();
@@ -12952,6 +13026,7 @@ void GLGizmoImageProjection::on_set_state()
     } else if (get_state() == Off) {
         m_parent.enable_picking(true);
         m_parent.toggle_model_objects_visibility(true);
+        backup_projected_objects();
     }
 }
 
@@ -13762,6 +13837,7 @@ bool GLGizmoImageProjection::project_image_to_selected_object()
     }
 
     refresh_projected_object(object);
+    remember_projected_object(object);
     m_projection_mode_initialized = true;
     m_projection_mode_object_id = object->id();
     if (converting_raw_to_rgba_image && !selected_object_has_raw_atlas_texture_data())
@@ -14440,6 +14516,16 @@ void GLGizmoImageProjection::refresh_projected_object(ModelObject *object)
         wxGetApp().plater()->get_partplate_list().notify_instance_update(object_idx, 0);
     }
     m_parent.post_event(SimpleEvent(EVT_GLCANVAS_SCHEDULE_BACKGROUND_PROCESS));
+}
+
+void GLGizmoImageProjection::remember_projected_object(ModelObject *object)
+{
+    remember_color_data_crash_backup_object(m_projected_object_ids, object);
+}
+
+void GLGizmoImageProjection::backup_projected_objects()
+{
+    queue_color_data_crash_backups(m_projected_object_ids);
 }
 
 void GLMmSegmentationGizmo3DScene::release_geometry() {

@@ -42,34 +42,93 @@ double mac_max_scaling_factor()
     return scaling;
 }
 
-static id mac_text_paste_target()
+static id mac_text_target_for_action(SEL action)
 {
-    id target = [NSApp targetForAction:@selector(paste:) to:nil from:nil];
+    id target = [NSApp targetForAction:action to:nil from:nil];
     if (target != nil && [target isKindOfClass:[NSText class]])
         return target;
-    return nil;
+
+    id responder = [[NSApp keyWindow] firstResponder];
+    return [responder isKindOfClass:[NSText class]] ? responder : nil;
+}
+
+static id mac_text_paste_target()
+{
+    return mac_text_target_for_action(@selector(paste:));
+}
+
+static id mac_text_copy_target()
+{
+    return mac_text_target_for_action(@selector(copy:));
+}
+
+static bool mac_text_target_has_selection(id target)
+{
+    return [target respondsToSelector:@selector(selectedRange)] && [target selectedRange].length > 0;
+}
+
+static bool mac_string_is_six_hex(NSString *string)
+{
+    if ([string length] != 6)
+        return false;
+
+    NSCharacterSet *non_hex = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdefABCDEF"] invertedSet];
+    return [string rangeOfCharacterFromSet:non_hex].location == NSNotFound;
+}
+
+static bool mac_string_is_hex_field_value(NSString *string)
+{
+    NSUInteger length = [string length];
+    if (length < 6)
+        return false;
+
+    NSCharacterSet *non_hex = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdefABCDEF"] invertedSet];
+    return [string rangeOfCharacterFromSet:non_hex].location == NSNotFound;
+}
+
+static bool mac_key_window_is_color_panel()
+{
+    return [[NSApp keyWindow] isKindOfClass:[NSColorPanel class]];
 }
 
 static NSString *mac_color_panel_hex_string()
 {
-    NSWindow *window = [NSApp keyWindow];
-    if (![window isKindOfClass:[NSColorPanel class]])
+    if (!mac_key_window_is_color_panel())
         return nil;
 
     NSString *string = [[NSPasteboard generalPasteboard] stringForType:NSPasteboardTypeString];
     string = [string stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (![string hasPrefix:@"#"])
-        return nil;
 
-    NSString *value = [string substringFromIndex:1];
-    if ([value length] != 6)
-        return nil;
-
-    NSCharacterSet *non_hex = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdefABCDEF"] invertedSet];
-    if ([value rangeOfCharacterFromSet:non_hex].location != NSNotFound)
+    NSString *value = [string hasPrefix:@"#"] ? [string substringFromIndex:1] : string;
+    if (!mac_string_is_six_hex(value))
         return nil;
 
     return value;
+}
+
+static NSString *mac_color_panel_hex_target_value(id target)
+{
+    if (!mac_key_window_is_color_panel() || ![target respondsToSelector:@selector(string)])
+        return nil;
+
+    NSString *string = [target string];
+    return mac_string_is_hex_field_value(string) ? string : nil;
+}
+
+static void mac_select_hex_text_target(id target)
+{
+    if (![target respondsToSelector:@selector(string)] || ![target respondsToSelector:@selector(setSelectedRange:)])
+        return;
+
+    NSString *string = mac_color_panel_hex_target_value(target);
+    if (string != nil)
+        [target setSelectedRange:NSMakeRange(0, [string length])];
+}
+
+bool mac_can_copy_to_text_control()
+{
+    id target = mac_text_copy_target();
+    return target != nil && (mac_text_target_has_selection(target) || mac_color_panel_hex_target_value(target) != nil);
 }
 
 bool mac_can_paste_to_text_control()
@@ -80,6 +139,25 @@ bool mac_can_paste_to_text_control()
     return mac_text_paste_target() != nil;
 }
 
+bool mac_copy_to_text_control()
+{
+    id target = mac_text_copy_target();
+    if (target == nil)
+        return false;
+
+    if (!mac_text_target_has_selection(target)) {
+        NSString *color_panel_hex = mac_color_panel_hex_target_value(target);
+        if (color_panel_hex == nil)
+            return false;
+
+        NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
+        [pasteboard clearContents];
+        return [pasteboard setString:color_panel_hex forType:NSPasteboardTypeString] == YES;
+    }
+
+    return [NSApp sendAction:@selector(copy:) to:nil from:nil] == YES;
+}
+
 bool mac_paste_to_text_control()
 {
     id target = mac_text_paste_target();
@@ -88,6 +166,7 @@ bool mac_paste_to_text_control()
 
     NSString *color_panel_hex = mac_color_panel_hex_string();
     if (color_panel_hex != nil && [target respondsToSelector:@selector(insertText:)]) {
+        mac_select_hex_text_target(target);
         [target insertText:color_panel_hex];
         return true;
     }
@@ -106,8 +185,13 @@ void mac_install_text_paste_shortcut()
         if ((flags & NSEventModifierFlagCommand) != 0 &&
             (flags & (NSEventModifierFlagShift | NSEventModifierFlagControl | NSEventModifierFlagOption)) == 0) {
             NSString *characters = [event charactersIgnoringModifiers];
-            if ([characters length] == 1 && [[characters lowercaseString] isEqualToString:@"v"] && mac_paste_to_text_control())
-                return nil;
+            if ([characters length] == 1) {
+                NSString *key = [characters lowercaseString];
+                if ([key isEqualToString:@"c"] && mac_copy_to_text_control())
+                    return nil;
+                if ([key isEqualToString:@"v"] && mac_paste_to_text_control())
+                    return nil;
+            }
         }
         return event;
     }];

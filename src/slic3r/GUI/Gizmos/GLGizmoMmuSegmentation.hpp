@@ -309,6 +309,7 @@ private:
     void update_from_model_object(bool first_update = false) override;
     void on_opening() override;
     void on_shutdown() override;
+    void on_set_state() override;
     PainterGizmoType get_painter_type() const override;
 
     void init_model_triangle_selectors();
@@ -322,6 +323,8 @@ private:
     void convert_selected_object_vertex_colors_to_rgb_data();
     void convert_selected_object_image_texture_to_rgb_data();
     void refresh_selected_object_after_rgb_change(ModelObject *object);
+    void remember_changed_rgb_data_object(ModelObject *object);
+    void backup_changed_rgb_data_objects();
     void update_triangle_selectors_color();
     void update_rgb_data_preview_conversion();
     void start_rgb_data_preview_conversion(ModelObject &object);
@@ -391,6 +394,7 @@ private:
     bool                 m_color_picker_active = false;
     bool                 m_brush_stroke_active = false;
     ObjectID             m_selected_color_state_object_id;
+    std::vector<ObjectID> m_changed_rgb_data_object_ids;
     std::vector<std::vector<Vec3f>> m_brush_stroke_points_by_volume;
     std::vector<ObjectID> m_preview_rgb_data_volume_ids;
     std::vector<std::unique_ptr<ColorFacetsAnnotation>> m_preview_rgb_data_by_volume;
@@ -477,6 +481,8 @@ private:
     bool project_to_image_texture(ModelObject *object);
     bool project_to_rgb_data(ModelObject *object);
     void refresh_projected_object(ModelObject *object);
+    void remember_projected_object(ModelObject *object);
+    void backup_projected_objects();
 
     ProjectionMode       m_projection_mode = ProjectionMode::RGBData;
     bool                 m_projection_mode_initialized = false;
@@ -512,6 +518,7 @@ private:
     bool                 m_apply_transparency_as_background = false;
     bool                 m_pass_through_model = false;
     bool                 m_convert_existing_colors_to_raw_offsets = true;
+    std::vector<ObjectID> m_projected_object_ids;
 };
 
 } // namespace Slic3r

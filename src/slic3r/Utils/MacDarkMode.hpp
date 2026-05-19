@@ -9,7 +9,9 @@ namespace GUI {
 #if __APPLE__
 extern bool mac_dark_mode();
 extern double mac_max_scaling_factor();
+extern bool mac_can_copy_to_text_control();
 extern bool mac_can_paste_to_text_control();
+extern bool mac_copy_to_text_control();
 extern bool mac_paste_to_text_control();
 extern void mac_install_text_paste_shortcut();
 extern void set_miniaturizable(void * window);
