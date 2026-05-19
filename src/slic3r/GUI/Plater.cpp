@@ -1160,6 +1160,29 @@ public:
         tone_gamma_row->Add(new wxStaticText(image_page, wxID_ANY, _L("x")), 0, wxALIGN_CENTER_VERTICAL);
         image_root->Add(tone_gamma_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
 
+        auto *dithering_row = new wxBoxSizer(wxHORIZONTAL);
+        m_dithering_enabled_checkbox = new wxCheckBox(image_page, wxID_ANY, _L("Enable dithering"));
+        m_dithering_enabled_checkbox->SetValue(dithering_enabled);
+        dithering_row->Add(m_dithering_enabled_checkbox, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        wxArrayString dithering_choices;
+        dithering_choices.Add(_L("Closest combination (no dithering)"));
+        dithering_choices.Add(_L("Floyd-Steinberg - not recommended"));
+        dithering_choices.Add(_L("Ordered Bayer - not recommended"));
+        dithering_choices.Add(_L("Halftone"));
+        dithering_choices.Add(_L("Halftone (increased detail) - not recommended"));
+        m_dithering_method_choice = new wxChoice(image_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, dithering_choices);
+        m_dithering_method_choice->SetSelection(std::clamp(dithering_method,
+                                                           int(TextureMappingZone::DitheringClosest),
+                                                           int(TextureMappingZone::DitheringHalftoneIncreasedDetail)));
+        dithering_row->Add(m_dithering_method_choice, 1, wxALIGN_CENTER_VERTICAL);
+        m_dithering_enabled_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+            update_dithering_options_visibility(true);
+        });
+        m_dithering_method_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) {
+            update_dithering_options_visibility(true);
+        });
+        image_root->Add(dithering_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
         const std::vector<wxString> channel_labels = texture_mapping_channel_labels(filament_color_mode);
         auto component_label = [&component_ids, &channel_labels](size_t i) {
             wxString text = wxString::Format("F%d", int(component_ids[i]));
@@ -1365,28 +1388,6 @@ public:
         m_compact_offset_mode_checkbox->SetToolTip(
             _L("Normalizes sampled filament offsets so the strongest active color uses the full maximum line width."));
         experimental_box->Add(m_compact_offset_mode_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
-        auto *dithering_row = new wxBoxSizer(wxHORIZONTAL);
-        m_dithering_enabled_checkbox = new wxCheckBox(experimental_page, wxID_ANY, _L("Enable dithering (not recommended)"));
-        m_dithering_enabled_checkbox->SetValue(dithering_enabled);
-        dithering_row->Add(m_dithering_enabled_checkbox, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-        wxArrayString dithering_choices;
-        dithering_choices.Add(_L("Closest combination (no dithering)"));
-        dithering_choices.Add(_L("Floyd-Steinberg"));
-        dithering_choices.Add(_L("Ordered Bayer"));
-        dithering_choices.Add(_L("Halftone"));
-        dithering_choices.Add(_L("Halftone (increased detail)"));
-        m_dithering_method_choice = new wxChoice(experimental_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, dithering_choices);
-        m_dithering_method_choice->SetSelection(std::clamp(dithering_method,
-                                                           int(TextureMappingZone::DitheringClosest),
-                                                           int(TextureMappingZone::DitheringHalftoneIncreasedDetail)));
-        dithering_row->Add(m_dithering_method_choice, 1, wxALIGN_CENTER_VERTICAL);
-        m_dithering_enabled_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
-            update_dithering_options_visibility(true);
-        });
-        m_dithering_method_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) {
-            update_dithering_options_visibility(true);
-        });
-        experimental_box->Add(dithering_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
         m_dithering_resolution_panel = new wxPanel(experimental_page, wxID_ANY);
         auto *dithering_resolution_row = new wxBoxSizer(wxHORIZONTAL);
         m_dithering_resolution_panel->SetSizer(dithering_resolution_row);
@@ -1537,7 +1538,7 @@ public:
         global_root->Add(prime_image_box, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
 
         auto *angle_row = new wxBoxSizer(wxHORIZONTAL);
-        angle_row->Add(new wxStaticText(global_page, wxID_ANY, _L("Angle offset")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        angle_row->Add(new wxStaticText(global_page, wxID_ANY, _L("Rotate image (Z):")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         m_prime_tower_angle_spin = new wxSpinCtrlDouble(global_page,
                                                         wxID_ANY,
                                                         wxEmptyString,
@@ -6060,7 +6061,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             if (offset_btn != nullptr)
                 offset_btn->Show(!image_texture);
             if (advanced_btn != nullptr)
-                advanced_btn->Show(image_texture);
+                advanced_btn->Show();
             editor->Layout();
             row->Layout();
             update_texture_mapping_area_height();
