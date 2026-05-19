@@ -9,6 +9,7 @@
 #include <memory>
 #include <sstream>
 #include <iomanip>
+#include <utility>
 
 #include "ClipperUtils.hpp"
 #include "GCodeProcessor.hpp"
@@ -2701,10 +2702,12 @@ void WipeTower2::generate(std::vector<std::vector<WipeTower::ToolChangeResult>> 
 
 	plan_tower();
 #if 1
+    const bool suppress_prime_tower_texture = std::exchange(m_suppress_prime_tower_texture, true);
     for (int i=0;i<5;++i) {
         save_on_last_wipe();
         plan_tower();
     }
+    m_suppress_prime_tower_texture = suppress_prime_tower_texture;
 #endif
 
     m_rib_length = std::max({m_rib_length, sqrt(m_wipe_tower_depth * m_wipe_tower_depth + m_wipe_tower_width * m_wipe_tower_width)});
@@ -2880,7 +2883,7 @@ Polygon WipeTower2::generate_support_rib_wall(WipeTowerWriter2&                 
         insert_skip_polygon = wall_polygon;
     }
     bool textured_path_written = false;
-    if (m_prime_tower_texture.valid() && result_wall.size() == 1 && !result_wall.front().points.empty()) {
+    if (!m_suppress_prime_tower_texture && m_prime_tower_texture.valid() && result_wall.size() == 1 && !result_wall.front().points.empty()) {
         std::vector<size_t> texture_normalization_tools;
         const size_t texture_tool_count = m_prime_tower_texture.filament_colours.size();
         if (m_layer_info != m_plan.end() && !m_layer_info->texture_mapping_layer_tools.empty()) {
@@ -3025,7 +3028,7 @@ Polygon WipeTower2::generate_support_cone_wall(
             }
         }
     }
-    if (m_prime_tower_texture.valid() && polylines.empty()) {
+    if (!m_suppress_prime_tower_texture && m_prime_tower_texture.valid() && polylines.empty()) {
         std::vector<size_t> texture_normalization_tools;
         const size_t texture_tool_count = m_prime_tower_texture.filament_colours.size();
         if (m_layer_info != m_plan.end() && !m_layer_info->texture_mapping_layer_tools.empty()) {

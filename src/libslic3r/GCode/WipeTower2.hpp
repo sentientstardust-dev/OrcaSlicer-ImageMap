@@ -337,6 +337,7 @@ private:
     std::vector<float> m_used_filament_length;
 	std::vector<std::pair<float, std::vector<float>>> m_used_filament_length_until_layer;
     PrimeTowerTextureRenderSettings m_prime_tower_texture;
+    bool m_suppress_prime_tower_texture = false;
 
     // Return index of first toolchange that switches to non-soluble extruder
     // ot -1 if there is no such toolchange.
