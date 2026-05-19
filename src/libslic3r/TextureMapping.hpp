@@ -115,8 +115,8 @@ struct TextureMappingZone
     static constexpr bool  DefaultNonlinearOffsetAdjustment = false;
     static constexpr int   DefaultModulationMode = int(ModulationLineWidth);
     static constexpr bool  DefaultRecolorSmallPerimeterLoops = true;
-    static constexpr bool  DefaultRecolorTopVisiblePerimeterSections = true;
-    static constexpr int   DefaultTopVisiblePerimeterRecolorAggressiveness = int(TopVisibleRecolorConservative);
+    static constexpr bool  DefaultRecolorTopVisiblePerimeterSections = false;
+    static constexpr int   DefaultTopVisiblePerimeterRecolorAggressiveness = int(TopVisibleRecolorAggressive);
     static constexpr bool  DefaultCompactOffsetMode = true;
     static constexpr bool  DefaultUseLegacyFixedColorMode = false;
     static constexpr bool  DefaultHighSpeedImageTextureSampling = true;

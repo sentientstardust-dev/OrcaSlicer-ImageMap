@@ -3570,7 +3570,7 @@ void Print::_make_wipe_tower()
     WipeTower::ProgressCallback wipe_tower_progress;
     if (prime_tower_texture.valid()) {
         wipe_tower_progress = [this](size_t current, size_t total) {
-            this->set_status(74, Slic3r::format(L("Generating wipe tower (%1%/%2% layers)"), current, total));
+            this->set_status(74, Slic3r::format(L("Generating wipe tower (%1%/%2%)"), current, total));
         };
     }
     const std::vector<size_t> prime_tower_texture_component_tools = prime_tower_texture.component_tools_for_layer_sequence();

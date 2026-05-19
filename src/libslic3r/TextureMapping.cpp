@@ -1112,17 +1112,17 @@ std::string TextureMappingManager::serialize_entries()
                                                        int(TextureMappingZone::TextureMappingRawValues)));
         texture["color_model"] = color_model_name(zone.filament_color_mode);
         texture["ordered_roles"] = zone.force_sequential_filaments;
-        texture["reduce_outer_surface_texture"] = zone.reduce_outer_surface_texture;
+        texture["reduce_outer_surface_texture"] = false;
         texture["hide_seams"] = zone.seam_hiding;
         texture["nonlinear_offset_adjustment"] = zone.nonlinear_offset_adjustment;
         texture["modulation_mode"] = modulation_mode_name(zone.modulation_mode);
-        texture["recolor_small_perimeter_loops"] = zone.recolor_small_perimeter_loops;
+        texture["recolor_small_perimeter_loops"] = zone.recolor_small_perimeter_loops || zone.recolor_top_visible_perimeter_sections;
         texture["recolor_top_visible_perimeter_sections"] = zone.recolor_top_visible_perimeter_sections;
         texture["top_visible_perimeter_recolor_aggressiveness"] =
             top_visible_recolor_aggressiveness_name(zone.top_visible_perimeter_recolor_aggressiveness);
         texture["compact_offset_mode"] = zone.compact_offset_mode;
         texture["use_legacy_fixed_color_mode"] = zone.use_legacy_fixed_color_mode;
-        texture["high_speed_image_texture_sampling"] = zone.high_speed_image_texture_sampling;
+        texture["high_speed_image_texture_sampling"] = true;
         texture["minimum_visibility_offset_enabled"] = zone.minimum_visibility_offset_enabled;
         texture["minimum_visibility_offset_pct"] =
             std::clamp(finite_or(zone.minimum_visibility_offset_pct, TextureMappingZone::DefaultMinimumVisibilityOffsetPct), 0.f, 100.f);
@@ -1140,7 +1140,7 @@ std::string TextureMappingManager::serialize_entries()
                        TextureMappingZone::MinHalftoneDotSizeMm,
                        TextureMappingZone::MaxHalftoneDotSizeMm);
         texture["contrast_pct"] = std::clamp(finite_or(zone.contrast_pct, 100.f), 25.f, 300.f);
-        texture["high_resolution_sampling"] = zone.high_resolution_sampling;
+        texture["high_resolution_sampling"] = true;
         texture["tone_gamma"] = normalize_tone_gamma(zone.tone_gamma);
         texture["transmission_distance_calibration"] =
             transmission_distance_calibration_mode_name(zone.transmission_distance_calibration_mode);
@@ -1258,7 +1258,7 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.texture_mapping_mode = mapping_mode_from_name(texture.value("mode", std::string("target_color")));
         zone.filament_color_mode = color_model_from_name(texture.value("color_model", std::string("cmyk")));
         zone.force_sequential_filaments = texture.value("ordered_roles", false);
-        zone.reduce_outer_surface_texture = texture.value("reduce_outer_surface_texture", false);
+        zone.reduce_outer_surface_texture = false;
         zone.seam_hiding = texture.value("hide_seams", false);
         zone.nonlinear_offset_adjustment = texture.value("nonlinear_offset_adjustment", false);
         zone.modulation_mode =
@@ -1268,6 +1268,8 @@ void TextureMappingManager::load_entries(const std::string &serialized,
             texture.value("recolor_small_perimeter_loops", TextureMappingZone::DefaultRecolorSmallPerimeterLoops);
         zone.recolor_top_visible_perimeter_sections =
             texture.value("recolor_top_visible_perimeter_sections", TextureMappingZone::DefaultRecolorTopVisiblePerimeterSections);
+        if (zone.recolor_top_visible_perimeter_sections)
+            zone.recolor_small_perimeter_loops = true;
         zone.top_visible_perimeter_recolor_aggressiveness =
             top_visible_recolor_aggressiveness_from_name(
                 texture.value("top_visible_perimeter_recolor_aggressiveness",
@@ -1275,8 +1277,7 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.compact_offset_mode = texture.value("compact_offset_mode", TextureMappingZone::DefaultCompactOffsetMode);
         zone.use_legacy_fixed_color_mode =
             texture.value("use_legacy_fixed_color_mode", TextureMappingZone::DefaultUseLegacyFixedColorMode);
-        zone.high_speed_image_texture_sampling =
-            texture.value("high_speed_image_texture_sampling", TextureMappingZone::DefaultHighSpeedImageTextureSampling);
+        zone.high_speed_image_texture_sampling = true;
         zone.minimum_visibility_offset_enabled =
             texture.value("minimum_visibility_offset_enabled", TextureMappingZone::DefaultMinimumVisibilityOffsetEnabled);
         zone.minimum_visibility_offset_pct =
@@ -1309,7 +1310,7 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         if (zone.dithering_enabled)
             zone.compact_offset_mode = true;
         zone.contrast_pct = std::clamp(texture.value("contrast_pct", 100.f), 25.f, 300.f);
-        zone.high_resolution_sampling = texture.value("high_resolution_sampling", true);
+        zone.high_resolution_sampling = true;
         zone.tone_gamma = normalize_tone_gamma(texture.value("tone_gamma", 1.f));
         zone.transmission_distance_calibration_mode = transmission_distance_calibration_mode_from_json(texture);
         zone.preview_opacity_pct =
