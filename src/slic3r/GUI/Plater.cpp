@@ -555,6 +555,52 @@ static bool assign_imported_texture_mapping_zone(Model &model)
     return true;
 }
 
+static bool texture_mapping_config_uses_zone_id(const ConfigOptionResolver &config, unsigned int zone_id)
+{
+    static constexpr std::array<const char *, 6> filament_keys = {
+        "extruder",
+        "wall_filament",
+        "sparse_infill_filament",
+        "solid_infill_filament",
+        "support_filament",
+        "support_interface_filament"
+    };
+    const int target = int(zone_id);
+    for (const char *key : filament_keys) {
+        const ConfigOptionInt *opt = dynamic_cast<const ConfigOptionInt *>(config.option(key));
+        if (opt != nullptr && opt->getInt() == target)
+            return true;
+    }
+    return false;
+}
+
+static bool model_uses_texture_mapping_zone_id(const Model &model, const ConfigOptionResolver *print_config, unsigned int zone_id)
+{
+    if (zone_id == 0)
+        return false;
+    if (print_config != nullptr && texture_mapping_config_uses_zone_id(*print_config, zone_id))
+        return true;
+    for (const ModelObject *object : model.objects) {
+        if (object == nullptr)
+            continue;
+        if (texture_mapping_config_uses_zone_id(object->config.get(), zone_id))
+            return true;
+        for (const auto &layer_range : object->layer_config_ranges)
+            if (texture_mapping_config_uses_zone_id(layer_range.second.get(), zone_id))
+                return true;
+        for (const ModelVolume *volume : object->volumes) {
+            if (volume == nullptr)
+                continue;
+            if (texture_mapping_config_uses_zone_id(volume->config.get(), zone_id))
+                return true;
+            const std::vector<bool> &used_states = volume->mmu_segmentation_facets.get_data().used_states;
+            if (size_t(zone_id) < used_states.size() && used_states[zone_id])
+                return true;
+        }
+    }
+    return false;
+}
+
 static wxColour parse_texture_mapping_color(const std::string &hex)
 {
     unsigned char rgba[4] = {38, 166, 154, 255};
@@ -4052,12 +4098,12 @@ Sidebar::Sidebar(Plater *parent)
             bundle->project_config.set_key_value("texture_mapping_definitions", new ConfigOptionString(serialized));
         if (auto *print_tab = wxGetApp().get_tab(Preset::TYPE_PRINT))
             print_tab->update_dirty();
-        if (wxGetApp().mainframe != nullptr)
-            wxGetApp().mainframe->on_config_changed(print_cfg);
         if (wxGetApp().plater() != nullptr)
             wxGetApp().plater()->update_project_dirty_from_presets();
-        update_texture_mapping_panel(false);
+        CallAfter([this]() { update_texture_mapping_panel(false); });
         update_dynamic_filament_list();
+        if (obj_list() != nullptr)
+            obj_list()->update_filament_colors();
     };
     auto add_texture_map_action = [this, persist_texture_mapping]() {
         PresetBundle *bundle = wxGetApp().preset_bundle;
@@ -5730,14 +5776,14 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             bundle->project_config.set_key_value(key, new ConfigOptionString(value));
     };
 
-    auto notify_change = [this, print_cfg]() {
+    auto notify_change = [this, print_cfg](bool affects_scene) {
         if (auto *print_tab = wxGetApp().get_tab(Preset::TYPE_PRINT))
             print_tab->update_dirty();
-        if (wxGetApp().mainframe != nullptr && print_cfg != nullptr)
+        if (affects_scene && wxGetApp().mainframe != nullptr && print_cfg != nullptr)
             wxGetApp().mainframe->on_config_changed(print_cfg);
         if (wxGetApp().plater() != nullptr) {
             wxGetApp().plater()->update_project_dirty_from_presets();
-            if (wxGetApp().plater()->get_view3D_canvas3D() != nullptr)
+            if (affects_scene && wxGetApp().plater()->get_view3D_canvas3D() != nullptr)
                 wxGetApp().plater()->get_view3D_canvas3D()->reload_scene(false);
         }
         update_dynamic_filament_list();
@@ -5763,12 +5809,9 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         return;
     content_sizer->Clear(true);
     content_sizer->AddSpacer(FromDIP(SidebarProps::ContentMargin()));
-    auto update_texture_mapping_area_height = [this, scroll_texture_mapping_content_to]() {
+    auto update_texture_mapping_area_height = [this]() {
         if (p->m_panel_texture_mapping_content == nullptr || p->m_panel_texture_mapping_content->GetSizer() == nullptr)
             return;
-        int scroll_x = 0;
-        int scroll_y = 0;
-        p->m_panel_texture_mapping_content->GetViewStart(&scroll_x, &scroll_y);
         const int max_height = FromDIP(260);
         p->m_panel_texture_mapping_content->SetMaxSize(wxSize(-1, max_height));
         p->m_panel_texture_mapping_content->Layout();
@@ -5777,7 +5820,6 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         if (min_size.y > max_height)
             min_size.y = max_height;
         p->m_panel_texture_mapping_content->SetMinSize(wxSize(-1, std::max(FromDIP(1), min_size.y)));
-        scroll_texture_mapping_content_to(scroll_x, scroll_y);
     };
 
     if (p->m_btn_add_texture_map != nullptr)
@@ -5896,9 +5938,13 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             canvas->reload_scene(true, true);
     };
 
-    auto persist_rows = [mgr_ptr, set_config_string, notify_change]() {
+    auto texture_mapping_zone_affects_scene = [print_cfg](unsigned int zone_id) {
+        return model_uses_texture_mapping_zone_id(wxGetApp().model(), print_cfg, zone_id);
+    };
+
+    auto persist_rows = [mgr_ptr, set_config_string, notify_change](bool affects_scene) {
         set_config_string("texture_mapping_definitions", mgr_ptr->serialize_entries());
-        notify_change();
+        notify_change(affects_scene);
     };
 
     for (const size_t zone_index : visible_zone_indices) {
@@ -5972,19 +6018,30 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         };
 
         auto apply_zone = [zone_index, mgr_ptr, num_physical, set_config_string, notify_change, refresh_texture_mapping_preview,
-                           is_preview_only_texture_row_change, refresh_summary_preview](TextureMappingZone updated) {
+                           is_preview_only_texture_row_change, refresh_summary_preview, texture_mapping_zone_affects_scene](TextureMappingZone updated) {
             auto &rows = mgr_ptr->zones();
             if (zone_index >= rows.size())
-                return;
-            const bool preview_only_change = is_preview_only_texture_row_change(rows[zone_index], updated);
+                return false;
+            const TextureMappingZone before = rows[zone_index];
+            if (before == updated)
+                return false;
+            const unsigned int before_zone_id = before.zone_id;
+            const bool preview_only_change = is_preview_only_texture_row_change(before, updated);
             rows[zone_index] = std::move(updated);
             mgr_ptr->normalize_zone_ids(num_physical);
+            const unsigned int after_zone_id = rows[zone_index].zone_id;
+            const bool affects_scene = texture_mapping_zone_affects_scene(before_zone_id) ||
+                                       texture_mapping_zone_affects_scene(after_zone_id);
             refresh_summary_preview(rows[zone_index]);
             set_config_string("texture_mapping_definitions", mgr_ptr->serialize_entries());
-            if (preview_only_change)
-                refresh_texture_mapping_preview();
+            if (preview_only_change) {
+                notify_change(false);
+                if (affects_scene)
+                    refresh_texture_mapping_preview();
+            }
             else
-                notify_change();
+                notify_change(affects_scene);
+            return affects_scene;
         };
 
         auto *surface_row = new wxBoxSizer(wxHORIZONTAL);
@@ -6202,7 +6259,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 return;
             updated.surface_pattern = int(TextureMappingZone::Gradient2D);
             apply_zone(std::move(updated));
-            update_texture_mapping_panel(false);
+            CallAfter([this]() { update_texture_mapping_panel(false); });
         });
         advanced_btn->Bind(wxEVT_BUTTON, [this,
                                           zone_index,
@@ -6344,14 +6401,14 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             while (!updated.filament_transmission_distances_mm.empty() &&
                    std::abs(updated.filament_transmission_distances_mm.back()) <= 1e-6f)
                 updated.filament_transmission_distances_mm.pop_back();
-            apply_zone(std::move(updated));
-            if (p->plater != nullptr && !p->plater->is_preview_shown()) {
+            const bool affects_scene = apply_zone(std::move(updated));
+            if (affects_scene && p->plater != nullptr && !p->plater->is_preview_shown()) {
                 if (GLCanvas3D *canvas = p->plater->get_view3D_canvas3D())
                     canvas->reload_scene(true, true);
                 if (GLCanvas3D *canvas = p->plater->get_assmeble_canvas3D())
                     canvas->reload_scene(true, true);
             }
-            update_texture_mapping_panel(false);
+            CallAfter([this]() { update_texture_mapping_panel(false); });
         });
 
         auto toggle_editor = [this, zone_index, editor, row, update_texture_mapping_area_height]() {
@@ -6385,7 +6442,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             evt.StopPropagation();
             evt.Skip();
         });
-        menu_btn->Bind(wxEVT_BUTTON, [this, zone_index, num_physical, physical_colors, mgr_ptr, persist_rows, menu_btn, bundle, set_config_string](wxCommandEvent &) {
+        menu_btn->Bind(wxEVT_BUTTON, [this, zone_index, num_physical, physical_colors, mgr_ptr, persist_rows, menu_btn, bundle, set_config_string, texture_mapping_zone_affects_scene](wxCommandEvent &) {
             if (menu_btn == nullptr)
                 return;
             wxMenu menu;
@@ -6393,18 +6450,19 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             const int delete_id = wxWindow::NewControlId();
             menu.Append(duplicate_id, _L("Duplicate"));
             menu.Append(delete_id, _L("Delete"));
-            menu.Bind(wxEVT_COMMAND_MENU_SELECTED, [this, zone_index, num_physical, physical_colors, mgr_ptr, persist_rows, duplicate_id, delete_id, bundle, set_config_string](wxCommandEvent &evt) {
+            menu.Bind(wxEVT_COMMAND_MENU_SELECTED, [this, zone_index, num_physical, physical_colors, mgr_ptr, persist_rows, duplicate_id, delete_id, bundle, set_config_string, texture_mapping_zone_affects_scene](wxCommandEvent &evt) {
                 auto &rows = mgr_ptr->zones();
                 if (zone_index >= rows.size())
                     return;
                 if (evt.GetId() == duplicate_id) {
                     mgr_ptr->duplicate_zone(zone_index, num_physical, physical_colors);
-                    persist_rows();
-                    update_texture_mapping_panel(false);
+                    persist_rows(false);
+                    CallAfter([this]() { update_texture_mapping_panel(false); });
                     return;
                 }
                 if (evt.GetId() == delete_id) {
                     const uint64_t deleted_stable_id = rows[zone_index].stable_id;
+                    const bool affects_scene = texture_mapping_zone_affects_scene(rows[zone_index].zone_id);
                     rows.erase(rows.begin() + ptrdiff_t(zone_index));
                     if (deleted_stable_id != 0 &&
                         bundle->texture_mapping_global_settings.prime_tower_settings_zone_uid == deleted_stable_id) {
@@ -6414,8 +6472,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                         set_config_string("texture_mapping_global_settings", bundle->texture_mapping_global_settings.serialize());
                     }
                     p->m_expanded_texture_mapping_rows.clear();
-                    persist_rows();
-                    update_texture_mapping_panel(false);
+                    persist_rows(affects_scene);
+                    CallAfter([this]() { update_texture_mapping_panel(false); });
                 }
             });
             menu_btn->PopupMenu(&menu, wxPoint(0, menu_btn->GetSize().GetHeight()));

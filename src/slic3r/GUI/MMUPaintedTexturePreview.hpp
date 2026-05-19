@@ -80,6 +80,17 @@ bool texture_preview_simulation_enabled_for_all_filaments(const std::vector<unsi
 size_t texture_preview_simulation_generation_signature();
 
 size_t texture_preview_settings_signature(size_t num_physical, const TextureMappingManager *texture_mgr);
+size_t texture_preview_settings_signature(size_t num_physical,
+                                          const TextureMappingManager *texture_mgr,
+                                          unsigned int base_filament_id,
+                                          const std::vector<bool> *used_states);
+size_t texture_preview_model_settings_signature(size_t num_physical,
+                                                const TextureMappingManager *texture_mgr,
+                                                unsigned int base_filament_id,
+                                                const std::vector<bool> *used_states,
+                                                bool has_texture_preview_data,
+                                                bool has_vertex_color_preview_data,
+                                                bool has_texture_mapping_color_preview_data);
 
 void render_model_texture_preview_models(
     std::vector<GUI::GLModel>       &models,

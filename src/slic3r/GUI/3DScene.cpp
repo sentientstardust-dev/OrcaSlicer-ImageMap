@@ -675,9 +675,12 @@ void GLVolume::simple_render(GLShaderProgram* shader,
              texture_preview_used_states_have_surface_gradient(model_volume->mmu_segmentation_facets.get_data().used_states,
                                                                num_physical,
                                                                texture_mgr));
+        const bool has_texture_mapping_color_data =
+            model_volume_has_texture_mapping_color_preview_data(*model_volume);
         const bool has_texture_mapping_color_preview_data =
-            base_uses_texture_preview && model_volume_has_texture_mapping_color_preview_data(*model_volume);
+            base_uses_texture_preview && has_texture_mapping_color_data;
         const bool has_texture_preview_data = model_volume_has_texture_preview_data(*model_volume);
+        const bool has_vertex_color_preview_data = model_volume_has_vertex_color_preview_data(*model_volume);
         const Transform3d preview_world_matrix = this->world_matrix();
         use_original_mesh_texture_preview =
             !has_mmu_segmentation &&
@@ -703,12 +706,22 @@ void GLVolume::simple_render(GLShaderProgram* shader,
         }
 
         color_volume = has_mmu_segmentation;
-        size_t preview_visual_signature = texture_preview_settings_signature(num_physical, texture_mgr);
+        const std::vector<bool> *texture_preview_used_states = has_mmu_segmentation ?
+            &model_volume->mmu_segmentation_facets.get_data().used_states : nullptr;
+        size_t preview_visual_signature = texture_preview_model_settings_signature(num_physical,
+                                                                                   texture_mgr,
+                                                                                   base_filament_id,
+                                                                                   texture_preview_used_states,
+                                                                                   has_texture_preview_data,
+                                                                                   has_vertex_color_preview_data,
+                                                                                   has_texture_mapping_color_data);
         preview_visual_signature ^= size_t(base_filament_id) + 0x9e3779b97f4a7c15ull +
                                     (preview_visual_signature << 6) + (preview_visual_signature >> 2);
         preview_visual_signature ^= texture_preview_simulation_generation_signature() + 0x9e3779b97f4a7c15ull +
                                     (preview_visual_signature << 6) + (preview_visual_signature >> 2);
         preview_visual_signature ^= model_volume_texture_preview_signature(*model_volume) + 0x9e3779b97f4a7c15ull +
+                                    (preview_visual_signature << 6) + (preview_visual_signature >> 2);
+        preview_visual_signature ^= model_volume->imported_vertex_colors_rgba.id().id + 0x9e3779b97f4a7c15ull +
                                     (preview_visual_signature << 6) + (preview_visual_signature >> 2);
         preview_visual_signature ^= model_volume->imported_vertex_colors_rgba.size() + 0x9e3779b97f4a7c15ull +
                                     (preview_visual_signature << 6) + (preview_visual_signature >> 2);
@@ -923,9 +936,13 @@ void GLVolume::render_mmu_texture_preview(const Transform3d &view_matrix,
 
     const Transform3d model_matrix = this->world_matrix();
     const std::vector<ColorRGBA> extruder_colors = GUI::wxGetApp().plater()->get_extruders_colors();
-    auto adjusted_preview_colors = [this](const std::vector<ColorRGBA> &colors) {
+    auto adjusted_preview_colors = [this, &extruder_colors](const std::vector<unsigned int> &filament_ids, const std::vector<ColorRGBA> &colors) {
         std::vector<ColorRGBA> preview_colors = colors;
-        for (ColorRGBA &preview_color : preview_colors) {
+        for (size_t idx = 0; idx < preview_colors.size(); ++idx) {
+            ColorRGBA &preview_color = preview_colors[idx];
+            const unsigned int filament_id = idx < filament_ids.size() ? filament_ids[idx] : 0u;
+            if (filament_id > 0 && size_t(filament_id - 1) < extruder_colors.size())
+                preview_color = extruder_colors[size_t(filament_id - 1)];
             preview_color = adjust_color_for_rendering(preview_color);
             if (force_native_color && render_color.is_transparent())
                 preview_color.a(render_color.a());
@@ -963,7 +980,7 @@ void GLVolume::render_mmu_texture_preview(const Transform3d &view_matrix,
                                                opaque);
         } else {
             render_model_texture_preview_models(mmuseg_texture_preview_models,
-                                                adjusted_preview_colors(mmuseg_texture_preview_colors),
+                                                adjusted_preview_colors(mmuseg_texture_preview_filament_ids, mmuseg_texture_preview_colors),
                                                 mmuseg_texture_preview_filament_ids,
                                                 num_physical,
                                                 texture_mgr,
@@ -983,7 +1000,7 @@ void GLVolume::render_mmu_texture_preview(const Transform3d &view_matrix,
 
     if (!mmuseg_vertex_color_preview_models.empty()) {
         render_model_vertex_color_preview_models(mmuseg_vertex_color_preview_models,
-                                                 adjusted_preview_colors(mmuseg_vertex_color_preview_colors),
+                                                 adjusted_preview_colors(mmuseg_vertex_color_preview_filament_ids, mmuseg_vertex_color_preview_colors),
                                                  mmuseg_vertex_color_preview_filament_ids,
                                                  num_physical,
                                                  texture_mgr,

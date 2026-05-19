@@ -311,6 +311,9 @@ private:
     void on_shutdown() override;
     void on_set_state() override;
     PainterGizmoType get_painter_type() const override;
+    void on_brush_projected_mouse_positions(SLAGizmoEventType action,
+                                            int mesh_idx,
+                                            const std::vector<ProjectedMousePosition> &projected_mouse_positions) override;
 
     void init_model_triangle_selectors();
     ModelObject *selected_model_object() const;
@@ -331,8 +334,10 @@ private:
     void cancel_rgb_data_preview_conversion();
     bool rgb_data_preview_conversion_pending_for_selected_object() const;
     ColorFacetsAnnotation *preview_rgb_data_for_volume(const ModelVolume &volume) const;
-    bool record_brush_stroke_point(const Vec2d &mouse_position);
+    bool append_brush_stroke_point(int mesh_idx, const Vec3f &hit, const Transform3d &world_matrix);
     void clear_brush_stroke_points();
+    void clear_rgb_preview_cache();
+    void render_cached_rgb_data_preview(const ModelObject &object, const Selection &selection);
     bool pick_color_from_model(const Vec2d &mouse_position);
     bool sample_color_from_model(const Vec2d &mouse_position, ColorRGBA &color) const;
     void set_active_color_from_sample(const ColorRGBA &color);
@@ -393,9 +398,20 @@ private:
     bool                 m_selected_has_raw_atlas_texture_data = false;
     bool                 m_color_picker_active = false;
     bool                 m_brush_stroke_active = false;
+    bool                 m_live_selector_preview_active = false;
     ObjectID             m_selected_color_state_object_id;
     std::vector<ObjectID> m_changed_rgb_data_object_ids;
     std::vector<std::vector<Vec3f>> m_brush_stroke_points_by_volume;
+    struct RgbPreviewVolumeCache
+    {
+        ObjectID volume_id;
+        bool valid = false;
+        size_t signature = 0;
+        std::vector<GLModel> models;
+        std::vector<ColorRGBA> colors;
+        std::vector<unsigned int> filament_ids;
+    };
+    std::vector<RgbPreviewVolumeCache> m_rgb_preview_cache;
     std::vector<ObjectID> m_preview_rgb_data_volume_ids;
     std::vector<std::unique_ptr<ColorFacetsAnnotation>> m_preview_rgb_data_by_volume;
     std::unique_ptr<TextureMappingBackgroundConfigSnapshot> m_background_color_edit_config_snapshot;

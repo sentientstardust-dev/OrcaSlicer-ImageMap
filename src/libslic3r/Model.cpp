@@ -4952,7 +4952,7 @@ bool model_mmu_segmentation_data_changed(const ModelObject& mo, const ModelObjec
 template<class T>
 static bool model_volume_imported_vector_matches(const ModelVolumeImportedVector<T> &lhs, const ModelVolumeImportedVector<T> &rhs)
 {
-    return lhs.size() == rhs.size() && std::equal(lhs.begin(), lhs.end(), rhs.begin());
+    return lhs.id() == rhs.id() && lhs.size() == rhs.size();
 }
 
 static std::string model_volume_texture_mapping_background_config_value(const ModelVolume &volume)

@@ -3783,6 +3783,21 @@ size_t texture_preview_state_triangles_signature(const std::vector<TriangleSelec
     return signature;
 }
 
+void mix_color_facets_signature(size_t &signature, const ColorFacetsAnnotation &color_source)
+{
+    auto mix = [&signature](size_t value) {
+        signature ^= value + 0x9e3779b97f4a7c15ull + (signature << 6) + (signature >> 2);
+    };
+
+    const TriangleColorSplittingData &data = color_source.get_data();
+    mix(color_source.id().id);
+    mix(static_cast<size_t>(color_source.timestamp()));
+    mix(data.triangles_to_split.size());
+    mix(data.bitstream.size());
+    mix(data.colors_rgba.size());
+    mix(std::hash<std::string>{}(data.metadata_json));
+}
+
 size_t texture_preview_vertex_color_source_signature(const ModelVolume                                      &model_volume,
                                                      const std::vector<TriangleSelector::FacetStateTriangle> &state_triangles)
 {
@@ -3792,11 +3807,15 @@ size_t texture_preview_vertex_color_source_signature(const ModelVolume          
     };
 
     mix(reinterpret_cast<size_t>(model_volume.mesh_ptr().get()));
+    mix(model_volume.id().id);
     mix(model_volume.mesh().its.vertices.size());
     mix(model_volume.mesh().its.indices.size());
+    mix(model_volume.mmu_segmentation_facets.id().id);
+    mix(static_cast<size_t>(model_volume.mmu_segmentation_facets.timestamp()));
+    mix(model_volume.imported_vertex_colors_rgba.id().id);
     mix(model_volume.imported_vertex_colors_rgba.size());
     mix(reinterpret_cast<size_t>(model_volume.imported_vertex_colors_rgba.data()));
-    mix(texture_preview_state_triangles_signature(state_triangles));
+    mix(state_triangles.size());
     const ColorRGBA background = texture_mapping_background_color_for_preview(model_volume);
     auto background_signature_component = [](float value) {
         return size_t(std::clamp(value, 0.f, 1.f) * 255.f + 0.5f);
@@ -3817,24 +3836,13 @@ size_t texture_preview_color_facets_source_signature(const ModelVolume          
     };
 
     mix(reinterpret_cast<size_t>(model_volume.mesh_ptr().get()));
+    mix(model_volume.id().id);
     mix(model_volume.mesh().its.vertices.size());
     mix(model_volume.mesh().its.indices.size());
-    const TriangleColorSplittingData &data = color_source.get_data();
-    mix(data.triangles_to_split.size());
-    mix(data.bitstream.size());
-    mix(data.colors_rgba.size());
-    for (const ColorTriangleBitStreamMapping &mapping : data.triangles_to_split) {
-        mix(size_t(mapping.triangle_idx));
-        mix(size_t(mapping.bitstream_start_idx));
-        mix(size_t(mapping.color_start_idx));
-    }
-    for (const bool bit : data.bitstream)
-        mix(bit ? 1u : 0u);
-    for (const uint32_t color : data.colors_rgba)
-        mix(size_t(color));
-    for (const char ch : data.metadata_json)
-        mix(size_t(static_cast<unsigned char>(ch)));
-    mix(texture_preview_state_triangles_signature(state_triangles));
+    mix(model_volume.mmu_segmentation_facets.id().id);
+    mix(static_cast<size_t>(model_volume.mmu_segmentation_facets.timestamp()));
+    mix_color_facets_signature(signature, color_source);
+    mix(state_triangles.size());
     const ColorRGBA background = texture_mapping_background_color_for_preview(model_volume, &color_source);
     auto background_signature_component = [](float value) {
         return size_t(std::clamp(value, 0.f, 1.f) * 255.f + 0.5f);
@@ -3853,10 +3861,13 @@ size_t texture_preview_image_halftone_source_signature(const ModelVolume        
     auto mix = [&signature](size_t value) {
         signature ^= value + 0x9e3779b97f4a7c15ull + (signature << 6) + (signature >> 2);
     };
+    mix(model_volume.id().id);
     mix(reinterpret_cast<size_t>(model_volume.mesh_ptr().get()));
     mix(model_volume.mesh().its.vertices.size());
     mix(model_volume.mesh().its.indices.size());
-    mix(texture_preview_state_triangles_signature(state_triangles));
+    mix(model_volume.mmu_segmentation_facets.id().id);
+    mix(static_cast<size_t>(model_volume.mmu_segmentation_facets.timestamp()));
+    mix(state_triangles.size());
     for (int row = 0; row < 4; ++row)
         for (int col = 0; col < 4; ++col)
             mix(std::hash<int>{}(int(std::lround(world_matrix(row, col) * 1000000.0))));
@@ -4826,16 +4837,24 @@ size_t model_volume_texture_preview_signature(const ModelVolume &model_volume)
     auto mix = [&signature](size_t value) {
         signature ^= value + 0x9e3779b97f4a7c15ull + (signature << 6) + (signature >> 2);
     };
+    mix(model_volume.id().id);
+    mix(reinterpret_cast<size_t>(model_volume.mesh_ptr().get()));
+    mix(model_volume.mesh().its.vertices.size());
+    mix(model_volume.mesh().its.indices.size());
     mix(size_t(model_volume.imported_texture_width));
     mix(size_t(model_volume.imported_texture_height));
+    mix(model_volume.imported_texture_rgba.id().id);
     mix(model_volume.imported_texture_rgba.size());
     mix(reinterpret_cast<size_t>(model_volume.imported_texture_rgba.data()));
     mix(size_t(model_volume.imported_texture_raw_channels));
     mix(std::hash<std::string>{}(model_volume.imported_texture_raw_metadata_json));
+    mix(model_volume.imported_texture_raw_filament_offsets.id().id);
     mix(model_volume.imported_texture_raw_filament_offsets.size());
     mix(reinterpret_cast<size_t>(model_volume.imported_texture_raw_filament_offsets.data()));
+    mix(model_volume.imported_texture_uvs_per_face.id().id);
     mix(model_volume.imported_texture_uvs_per_face.size());
     mix(reinterpret_cast<size_t>(model_volume.imported_texture_uvs_per_face.data()));
+    mix(model_volume.imported_texture_uv_valid.id().id);
     mix(model_volume.imported_texture_uv_valid.size());
     mix(reinterpret_cast<size_t>(model_volume.imported_texture_uv_valid.data()));
     const ColorRGBA background = texture_mapping_background_color_for_preview(model_volume);
@@ -4855,21 +4874,9 @@ size_t model_volume_texture_mapping_color_preview_signature(const ModelVolume &m
         signature ^= value + 0x9e3779b97f4a7c15ull + (signature << 6) + (signature >> 2);
     };
 
-    const TriangleColorSplittingData &data = model_volume.texture_mapping_color_facets.get_data();
-    mix(data.triangles_to_split.size());
-    mix(data.bitstream.size());
-    mix(data.colors_rgba.size());
-    for (const ColorTriangleBitStreamMapping &mapping : data.triangles_to_split) {
-        mix(size_t(mapping.triangle_idx));
-        mix(size_t(mapping.bitstream_start_idx));
-        mix(size_t(mapping.color_start_idx));
-    }
-    for (const bool bit : data.bitstream)
-        mix(bit ? 1u : 0u);
-    for (const uint32_t color : data.colors_rgba)
-        mix(size_t(color));
-    for (const char ch : data.metadata_json)
-        mix(size_t(static_cast<unsigned char>(ch)));
+    mix(model_volume.id().id);
+    mix(reinterpret_cast<size_t>(model_volume.mesh_ptr().get()));
+    mix_color_facets_signature(signature, model_volume.texture_mapping_color_facets);
     const ColorRGBA background = texture_mapping_background_color_for_preview(model_volume);
     auto background_signature_component = [](float value) {
         return size_t(std::clamp(value, 0.f, 1.f) * 255.f + 0.5f);
@@ -4904,7 +4911,9 @@ bool ensure_model_volume_texture_preview(const ModelVolume &model_volume,
     return true;
 }
 
-size_t texture_preview_settings_signature(size_t num_physical, const TextureMappingManager *texture_mgr)
+static size_t texture_preview_settings_signature_impl(size_t num_physical,
+                                                      const TextureMappingManager *texture_mgr,
+                                                      const std::vector<unsigned int> *active_zone_ids)
 {
     size_t signature = 1469598103934665603ull;
     auto signature_mix = [&signature](size_t value) {
@@ -4927,7 +4936,14 @@ size_t texture_preview_settings_signature(size_t num_physical, const TextureMapp
     if (texture_mgr == nullptr)
         return signature;
 
+    auto zone_is_active = [active_zone_ids](unsigned int zone_id) {
+        return active_zone_ids == nullptr ||
+               std::find(active_zone_ids->begin(), active_zone_ids->end(), zone_id) != active_zone_ids->end();
+    };
+
     for (const TextureMappingZone &zone : texture_mgr->zones()) {
+        if (!zone_is_active(zone.zone_id))
+            continue;
         signature_mix(std::hash<uint64_t>{}(zone.stable_id));
         signature_mix(std::hash<unsigned int>{}(zone.zone_id));
         signature_mix(std::hash<int>{}(zone.enabled ? 1 : 0));
@@ -4974,6 +4990,174 @@ size_t texture_preview_settings_signature(size_t num_physical, const TextureMapp
             signature_mix_float(strength_pct, 100.f);
         for (const float minimum_offset_pct : zone.filament_minimum_offsets_pct)
             signature_mix_float(minimum_offset_pct, 100.f);
+    }
+    return signature;
+}
+
+static std::vector<unsigned int> active_texture_preview_zone_ids(const TextureMappingManager *texture_mgr,
+                                                                 unsigned int base_filament_id,
+                                                                 const std::vector<bool> *used_states)
+{
+    std::vector<unsigned int> active_zone_ids;
+    if (texture_mgr == nullptr)
+        return active_zone_ids;
+
+    auto append_active_zone_id = [texture_mgr, &active_zone_ids](unsigned int zone_id) {
+        if (zone_id != 0 && texture_mgr->zone_from_id(zone_id) != nullptr)
+            active_zone_ids.emplace_back(zone_id);
+    };
+    append_active_zone_id(base_filament_id);
+    if (used_states != nullptr) {
+        for (size_t idx = 1; idx < used_states->size(); ++idx)
+            if ((*used_states)[idx])
+                append_active_zone_id(unsigned(idx));
+    }
+    std::sort(active_zone_ids.begin(), active_zone_ids.end());
+    active_zone_ids.erase(std::unique(active_zone_ids.begin(), active_zone_ids.end()), active_zone_ids.end());
+    return active_zone_ids;
+}
+
+static bool active_texture_preview_zone_ids_contains(const std::vector<unsigned int> &active_zone_ids, unsigned int zone_id)
+{
+    return std::binary_search(active_zone_ids.begin(), active_zone_ids.end(), zone_id);
+}
+
+static bool texture_preview_zone_uses_halftone_model(const TextureMappingZone &zone)
+{
+    if (!zone.enabled || zone.deleted || !zone.is_image_texture() || !zone.preview_simulate_colors)
+        return false;
+    const int mapping_mode = std::clamp(zone.texture_mapping_mode,
+                                        int(TextureMappingZone::TextureMappingFilamentBlending),
+                                        int(TextureMappingZone::TextureMappingRawValues));
+    const int method = std::clamp(zone.dithering_method,
+                                  int(TextureMappingZone::DitheringClosest),
+                                  int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+    return mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
+           zone.dithering_enabled &&
+           (method == int(TextureMappingZone::DitheringHalftone) ||
+            method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+}
+
+static void texture_preview_mix_zone_baked_model_settings(size_t &signature,
+                                                          const TextureMappingZone &zone,
+                                                          size_t num_physical)
+{
+    auto signature_mix = [&signature](size_t value) {
+        signature ^= value + 0x9e3779b97f4a7c15ull + (signature << 6) + (signature >> 2);
+    };
+    auto signature_mix_float = [&signature_mix](float value, float scale = 1000.f) {
+        const float safe_value = std::isfinite(value) ? value : 0.f;
+        signature_mix(std::hash<int>{}(int(std::lround(safe_value * scale))));
+    };
+
+    signature_mix(std::hash<unsigned int>{}(zone.component_a));
+    signature_mix(std::hash<unsigned int>{}(zone.component_b));
+    signature_mix(std::hash<std::string>{}(zone.component_ids));
+    signature_mix(std::hash<std::string>{}(zone.component_weights));
+    signature_mix(std::hash<std::string>{}(zone.offset_distances));
+    signature_mix(std::hash<std::string>{}(zone.offset_angles));
+    signature_mix(std::hash<int>{}(zone.offset_mode));
+    signature_mix(std::hash<int>{}(zone.offset_rotation_enabled ? 1 : 0));
+    signature_mix_float(zone.offset_rotations);
+    signature_mix_float(zone.offset_repeats);
+    signature_mix(std::hash<int>{}(zone.offset_reverse_repeats ? 1 : 0));
+    signature_mix(std::hash<int>{}(zone.offset_clockwise ? 1 : 0));
+    signature_mix(std::hash<int>{}(zone.offset_fade_mode));
+    signature_mix(std::hash<int>{}(zone.offset_angle_mode));
+    signature_mix(std::hash<int>{}(zone.texture_mapping_mode));
+    signature_mix(std::hash<int>{}(zone.filament_color_mode));
+    signature_mix(std::hash<int>{}(zone.force_sequential_filaments ? 1 : 0));
+    signature_mix(std::hash<int>{}(zone.nonlinear_offset_adjustment ? 1 : 0));
+    signature_mix(std::hash<int>{}(zone.compact_offset_mode ? 1 : 0));
+    signature_mix(std::hash<int>{}(zone.use_legacy_fixed_color_mode ? 1 : 0));
+    signature_mix(std::hash<int>{}(zone.dithering_enabled ? 1 : 0));
+    signature_mix(std::hash<int>{}(zone.dithering_method));
+    if (zone.dithering_method == int(TextureMappingZone::DitheringHalftone) ||
+        zone.dithering_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail))
+        signature_mix_float(zone.halftone_dot_size_mm, 1000.f);
+    else
+        signature_mix_float(zone.dithering_resolution_mm, 1000.f);
+    signature_mix(std::hash<int>{}(zone.minimum_visibility_offset_enabled ? 1 : 0));
+    signature_mix_float(zone.minimum_visibility_offset_pct, 100.f);
+    signature_mix(std::hash<int>{}(zone.generic_solver_lookup_mode));
+    signature_mix(std::hash<int>{}(zone.generic_solver_mode));
+    signature_mix(std::hash<int>{}(TextureMappingZone::DefaultGenericSolverMixModel));
+    signature_mix(std::hash<int>{}(zone.preview_simulate_colors ? 1 : 0));
+    signature_mix(std::hash<int>{}(zone.preview_limit_resolution ? 1 : 0));
+    signature_mix_float(zone.contrast_pct, 100.f);
+    signature_mix_float(zone.tone_gamma);
+    for (const float strength_pct : zone.filament_strengths_pct)
+        signature_mix_float(strength_pct, 100.f);
+    for (const float minimum_offset_pct : zone.filament_minimum_offsets_pct)
+        signature_mix_float(minimum_offset_pct, 100.f);
+
+    if (zone.is_2d_gradient()) {
+        signature_mix_float(texture_preview_config_float("texture_mapping_outer_wall_gradient_global_strength", 100.f), 100.f);
+        signature_mix_float(texture_preview_config_float("texture_mapping_outer_wall_gradient_max_line_width", 0.95f), 1000.f);
+        signature_mix_float(texture_preview_config_float("texture_mapping_outer_wall_gradient_min_line_width", 0.32f), 1000.f);
+    }
+
+    const std::vector<std::string> physical_colors = physical_filament_colors_for_texture_preview(num_physical);
+    for (const std::string &color : physical_colors)
+        signature_mix(std::hash<std::string>{}(color));
+}
+
+size_t texture_preview_settings_signature(size_t num_physical, const TextureMappingManager *texture_mgr)
+{
+    return texture_preview_settings_signature_impl(num_physical, texture_mgr, nullptr);
+}
+
+size_t texture_preview_settings_signature(size_t num_physical,
+                                          const TextureMappingManager *texture_mgr,
+                                          unsigned int base_filament_id,
+                                          const std::vector<bool> *used_states)
+{
+    if (texture_mgr == nullptr)
+        return texture_preview_settings_signature_impl(num_physical, texture_mgr, nullptr);
+
+    std::vector<unsigned int> active_zone_ids = active_texture_preview_zone_ids(texture_mgr, base_filament_id, used_states);
+    return texture_preview_settings_signature_impl(num_physical, texture_mgr, &active_zone_ids);
+}
+
+size_t texture_preview_model_settings_signature(size_t num_physical,
+                                                const TextureMappingManager *texture_mgr,
+                                                unsigned int base_filament_id,
+                                                const std::vector<bool> *used_states,
+                                                bool has_texture_preview_data,
+                                                bool has_vertex_color_preview_data,
+                                                bool has_texture_mapping_color_preview_data)
+{
+    size_t signature = 1469598103934665603ull;
+    auto signature_mix = [&signature](size_t value) {
+        signature ^= value + 0x9e3779b97f4a7c15ull + (signature << 6) + (signature >> 2);
+    };
+
+    signature_mix(std::hash<size_t>{}(num_physical));
+    if (texture_mgr == nullptr)
+        return signature;
+
+    const std::vector<unsigned int> active_zone_ids = active_texture_preview_zone_ids(texture_mgr, base_filament_id, used_states);
+    for (const TextureMappingZone &zone : texture_mgr->zones()) {
+        if (!active_texture_preview_zone_ids_contains(active_zone_ids, zone.zone_id))
+            continue;
+
+        signature_mix(std::hash<unsigned int>{}(zone.zone_id));
+        signature_mix(std::hash<int>{}(zone.enabled ? 1 : 0));
+        signature_mix(std::hash<int>{}(zone.deleted ? 1 : 0));
+        signature_mix(std::hash<int>{}(zone.surface_pattern));
+
+        const bool image_zone = zone.enabled && !zone.deleted && zone.is_image_texture();
+        const bool gradient_zone = zone.enabled && !zone.deleted && zone.is_2d_gradient();
+        const bool halftone_model = texture_preview_zone_uses_halftone_model(zone);
+        const bool simulated_vertex_color_model =
+            image_zone &&
+            zone.preview_simulate_colors &&
+            (has_texture_mapping_color_preview_data || (!has_texture_preview_data && has_vertex_color_preview_data));
+        signature_mix(std::hash<int>{}(halftone_model ? 1 : 0));
+        signature_mix(std::hash<int>{}(simulated_vertex_color_model ? 1 : 0));
+
+        if (gradient_zone || halftone_model || simulated_vertex_color_model)
+            texture_preview_mix_zone_baked_model_settings(signature, zone, num_physical);
     }
     return signature;
 }

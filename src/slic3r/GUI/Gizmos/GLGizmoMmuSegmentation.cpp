@@ -13,6 +13,8 @@
 #include "slic3r/GUI/ObjColorDialog.hpp"
 #include "slic3r/GUI/MainFrame.hpp"
 #include "slic3r/GUI/Tab.hpp"
+#include "slic3r/GUI/3DScene.hpp"
+#include "slic3r/GUI/MMUPaintedTexturePreview.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/Model.hpp"
@@ -1433,6 +1435,7 @@ static void refresh_imported_texture_storage(ModelVolume &volume)
 {
     std::vector<uint8_t> refreshed(volume.imported_texture_rgba.begin(), volume.imported_texture_rgba.end());
     volume.imported_texture_rgba.swap(refreshed);
+    volume.imported_texture_rgba.set_new_unique_id();
 }
 
 static void refresh_imported_texture_raw_storage(ModelVolume &volume)
@@ -1440,13 +1443,28 @@ static void refresh_imported_texture_raw_storage(ModelVolume &volume)
     std::vector<uint8_t> refreshed(volume.imported_texture_raw_filament_offsets.begin(),
                                    volume.imported_texture_raw_filament_offsets.end());
     volume.imported_texture_raw_filament_offsets.swap(refreshed);
+    volume.imported_texture_raw_filament_offsets.set_new_unique_id();
+}
+
+static void touch_imported_texture_data(ModelVolume &volume)
+{
+    volume.imported_texture_uvs_per_face.set_new_unique_id();
+    volume.imported_texture_uv_valid.set_new_unique_id();
+    volume.imported_texture_rgba.set_new_unique_id();
+    volume.imported_texture_raw_filament_offsets.set_new_unique_id();
 }
 
 static void clear_imported_texture_raw_atlas(ModelVolume &volume)
 {
+    const bool changed =
+        !volume.imported_texture_raw_filament_offsets.empty() ||
+        volume.imported_texture_raw_channels != 0 ||
+        !volume.imported_texture_raw_metadata_json.empty();
     volume.imported_texture_raw_filament_offsets.clear();
     volume.imported_texture_raw_channels = 0;
     volume.imported_texture_raw_metadata_json.clear();
+    if (changed)
+        volume.imported_texture_raw_filament_offsets.set_new_unique_id();
 }
 
 static ColorRGBA raw_filament_color_for_projection_preview(const ImageMapRawFilament &filament)
@@ -1874,6 +1892,8 @@ static bool merge_imported_texture_raw_atlas(ModelVolume &volume, const RawAtlas
     volume.imported_texture_raw_channels = merged_channels;
     volume.imported_texture_raw_metadata_json = metadata;
     volume.imported_texture_raw_filament_offsets = std::move(merged);
+    if (changed)
+        volume.imported_texture_raw_filament_offsets.set_new_unique_id();
     return changed;
 }
 
@@ -2391,6 +2411,70 @@ static std::vector<int> rgb_existing_source_triangle_depths(const TriangleColorS
     return depths;
 }
 
+static void true_color_rgb_preview_signature_mix(size_t &signature, size_t value)
+{
+    signature ^= value + 0x9e3779b97f4a7c15ull + (signature << 6) + (signature >> 2);
+}
+
+static size_t true_color_rgb_preview_color_facets_signature(const ColorFacetsAnnotation &annotation)
+{
+    size_t signature = 1469598103934665603ull;
+    const TriangleColorSplittingData &data = annotation.get_data();
+    true_color_rgb_preview_signature_mix(signature, annotation.id().id);
+    true_color_rgb_preview_signature_mix(signature, static_cast<size_t>(annotation.timestamp()));
+    true_color_rgb_preview_signature_mix(signature, data.triangles_to_split.size());
+    true_color_rgb_preview_signature_mix(signature, data.bitstream.size());
+    true_color_rgb_preview_signature_mix(signature, data.colors_rgba.size());
+    true_color_rgb_preview_signature_mix(signature, std::hash<std::string>{}(data.metadata_json));
+    return signature;
+}
+
+static size_t true_color_rgb_preview_cache_signature(const ModelVolume           &volume,
+                                                    const ColorFacetsAnnotation &annotation,
+                                                    size_t                       num_physical,
+                                                    const TextureMappingManager *texture_mgr)
+{
+    size_t signature = model_volume_texture_mapping_color_preview_signature(volume);
+    true_color_rgb_preview_signature_mix(signature, size_t(volume.extruder_id()));
+    true_color_rgb_preview_signature_mix(signature, true_color_rgb_preview_color_facets_signature(annotation));
+    true_color_rgb_preview_signature_mix(signature,
+                                         texture_preview_model_settings_signature(num_physical,
+                                                                                  texture_mgr,
+                                                                                  volume.extruder_id() > 0 ? unsigned(volume.extruder_id()) : 0u,
+                                                                                  nullptr,
+                                                                                  model_volume_has_texture_preview_data(volume),
+                                                                                  model_volume_has_vertex_color_preview_data(volume),
+                                                                                  !annotation.empty()));
+    true_color_rgb_preview_signature_mix(signature, texture_preview_simulation_generation_signature());
+    return signature;
+}
+
+static std::vector<std::vector<TriangleSelector::FacetStateTriangle>> true_color_rgb_preview_triangles(const ModelVolume &volume)
+{
+    std::vector<std::vector<TriangleSelector::FacetStateTriangle>> triangles_per_type(1);
+    const indexed_triangle_set &its = volume.mesh().its;
+    triangles_per_type.front().reserve(its.indices.size());
+    for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+        const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
+        if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
+            continue;
+        if (size_t(tri[0]) >= its.vertices.size() ||
+            size_t(tri[1]) >= its.vertices.size() ||
+            size_t(tri[2]) >= its.vertices.size())
+            continue;
+
+        TriangleSelector::FacetStateTriangle facet;
+        facet.source_triangle = int(tri_idx);
+        facet.vertices = {
+            its.vertices[size_t(tri[0])].cast<float>(),
+            its.vertices[size_t(tri[1])].cast<float>(),
+            its.vertices[size_t(tri[2])].cast<float>()
+        };
+        triangles_per_type.front().emplace_back(std::move(facet));
+    }
+    return triangles_per_type;
+}
+
 static bool apply_rgb_stroke_to_volume(ModelVolume                                           &volume,
                                        const std::vector<TriangleSelector::FacetStateTriangle> &stroke_facets,
                                        const ColorRGBA                                      &brush_color,
@@ -2451,20 +2535,32 @@ static bool apply_rgb_stroke_to_volume(ModelVolume                              
         if (use_brush_path && (tri_idx >= brush_candidate_triangles.size() || !brush_candidate_triangles[tri_idx]))
             return pack_vertex_color_rgba(source_color);
 
-        const float alpha = use_brush_path ?
-            sample_rgb_brush_path_alpha(brush_stroke_points_world,
-                                        transform_point(world_matrix, point),
-                                        hardness,
-                                        opacity,
-                                        brush_radius) :
-            sample_rgb_stroke_alpha(stroke_facets,
-                                    stroke_by_source_triangle,
-                                    stroke_boundary_edges,
-                                    int(tri_idx),
-                                    point,
-                                    hardness,
-                                    opacity,
-                                    brush_radius);
+        float alpha = 0.f;
+        if (use_brush_path) {
+            alpha = sample_rgb_brush_path_alpha(brush_stroke_points_world,
+                                                transform_point(world_matrix, point),
+                                                hardness,
+                                                opacity,
+                                                brush_radius);
+            alpha = std::max(alpha,
+                             sample_rgb_stroke_alpha(stroke_facets,
+                                                     stroke_by_source_triangle,
+                                                     stroke_boundary_edges,
+                                                     int(tri_idx),
+                                                     point,
+                                                     hardness,
+                                                     opacity,
+                                                     brush_radius));
+        } else {
+            alpha = sample_rgb_stroke_alpha(stroke_facets,
+                                            stroke_by_source_triangle,
+                                            stroke_boundary_edges,
+                                            int(tri_idx),
+                                            point,
+                                            hardness,
+                                            opacity,
+                                            brush_radius);
+        }
         if (alpha <= 0.f)
             return pack_vertex_color_rgba(source_color);
         if (alpha >= 1.f)
@@ -4398,6 +4494,8 @@ static bool initialize_generated_image_texture(ModelVolume                &volum
         }
     }
 
+    touch_imported_texture_data(volume);
+
     if (atlas_out != nullptr)
         *atlas_out = std::move(atlas);
     return true;
@@ -5867,6 +5965,7 @@ static bool clear_object_managed_color_data(ModelObject &object, ManagedColorDat
         case ManagedColorDataType::VertexColors:
             if (!volume->imported_vertex_colors_rgba.empty()) {
                 volume->imported_vertex_colors_rgba.clear();
+                volume->imported_vertex_colors_rgba.set_new_unique_id();
                 changed = true;
             }
             break;
@@ -5883,6 +5982,7 @@ static bool clear_object_managed_color_data(ModelObject &object, ManagedColorDat
                 volume->imported_texture_width = 0;
                 volume->imported_texture_height = 0;
                 volume->uv_map_generator_version = 0;
+                touch_imported_texture_data(*volume);
                 changed = true;
             }
             break;
@@ -6590,6 +6690,7 @@ static bool managed_color_data_replace_rgba(ColorFacetsAnnotation &annotation, u
         return false;
 
     rewritten->set_metadata_json(annotation.metadata_json());
+    rewritten->touch();
     annotation.assign(*rewritten);
     return true;
 }
@@ -6878,6 +6979,7 @@ static bool unsplit_volume_rgba_data_once(ModelVolume &volume)
     if (volume.texture_mapping_color_facets.equals(*unsplit))
         return false;
 
+    unsplit->touch();
     volume.texture_mapping_color_facets.assign(*unsplit);
     return true;
 }
@@ -6937,6 +7039,7 @@ static bool simplify_volume_rgba_data_to_one_color_per_triangle(ModelVolume &vol
     if (volume.texture_mapping_color_facets.equals(*simplified))
         return false;
 
+    simplified->touch();
     volume.texture_mapping_color_facets.assign(*simplified);
     return true;
 }
@@ -7274,6 +7377,7 @@ static bool convert_object_to_vertex_colors(ModelObject &object, const ManagedCo
         }
 
         volume->imported_vertex_colors_rgba = std::move(vertex_colors);
+        volume->imported_vertex_colors_rgba.set_new_unique_id();
         changed = true;
     }
     return changed;
@@ -10753,6 +10857,7 @@ void GLGizmoMmuSegmentation::bake_selected_object_image_texture_to_vertex_colors
             continue;
 
         volume->imported_vertex_colors_rgba = std::move(vertex_colors);
+        volume->imported_vertex_colors_rgba.set_new_unique_id();
         volume->imported_texture_uvs_per_face.clear();
         volume->imported_texture_uv_valid.clear();
         volume->imported_texture_rgba.clear();
@@ -10760,6 +10865,7 @@ void GLGizmoMmuSegmentation::bake_selected_object_image_texture_to_vertex_colors
         volume->imported_texture_width = 0;
         volume->imported_texture_height = 0;
         volume->uv_map_generator_version = 0;
+        touch_imported_texture_data(*volume);
         baked = true;
     }
 
@@ -11034,6 +11140,7 @@ void GLGizmoMmuSegmentation::clear_selected_object_image_texture_data()
         volume->imported_texture_width = 0;
         volume->imported_texture_height = 0;
         volume->uv_map_generator_version = 0;
+        touch_imported_texture_data(*volume);
         cleared = true;
     }
 
@@ -11165,6 +11272,8 @@ void GLGizmoTrueColorPainting::on_shutdown()
     cancel_rgb_data_preview_conversion();
     m_color_picker_active = false;
     clear_brush_stroke_points();
+    m_live_selector_preview_active = false;
+    clear_rgb_preview_cache();
     m_preview_rgb_data_volume_ids.clear();
     m_preview_rgb_data_by_volume.clear();
     m_color_picker_source_cache.clear();
@@ -11238,7 +11347,20 @@ void GLGizmoTrueColorPainting::render_painter_gizmo()
     glsafe(::glEnable(GL_BLEND));
     glsafe(::glEnable(GL_DEPTH_TEST));
 
-    render_triangles(selection);
+    render_cached_rgb_data_preview(*object, selection);
+    if (m_brush_stroke_active || m_live_selector_preview_active) {
+        GLboolean depth_mask = GL_TRUE;
+        GLint depth_func = GL_LESS;
+        glsafe(::glGetBooleanv(GL_DEPTH_WRITEMASK, &depth_mask));
+        glsafe(::glGetIntegerv(GL_DEPTH_FUNC, &depth_func));
+        glsafe(::glDepthMask(GL_FALSE));
+        glsafe(::glDepthFunc(GL_ALWAYS));
+        render_triangles(selection);
+        glsafe(::glDepthFunc(depth_func));
+        glsafe(::glDepthMask(depth_mask));
+    } else {
+        render_triangles(selection);
+    }
     m_c->object_clipper()->render_cut();
     m_c->instances_hider()->render_cut();
     render_cursor();
@@ -11297,17 +11419,29 @@ bool GLGizmoTrueColorPainting::gizmo_event(SLAGizmoEventType action,
 
     if (action == SLAGizmoEventType::LeftDown) {
         clear_brush_stroke_points();
-        m_brush_stroke_active = !shift_down && !control_down && record_brush_stroke_point(mouse_position);
-    } else if (action == SLAGizmoEventType::Dragging && m_brush_stroke_active && !shift_down && !control_down) {
-        record_brush_stroke_point(mouse_position);
+        int mesh_id = -1;
+        Vec3f hit = Vec3f::Zero();
+        size_t facet = 0;
+        m_live_selector_preview_active = !shift_down && !control_down && !alt_down;
+        m_brush_stroke_active = !shift_down &&
+                                !control_down &&
+                                raycast_to_selected_mesh(mouse_position, mesh_id, hit, facet) &&
+                                mesh_id >= 0;
+    } else if (action == SLAGizmoEventType::Dragging &&
+               (m_brush_stroke_active || m_live_selector_preview_active) &&
+               !shift_down &&
+               !control_down) {
+        m_parent.set_as_dirty();
     } else if (action == SLAGizmoEventType::RightDown || (action == SLAGizmoEventType::Dragging && shift_down)) {
         clear_brush_stroke_points();
+        m_live_selector_preview_active = false;
     }
 
     const bool handled = GLGizmoPainterBase::gizmo_event(action, mouse_position, shift_down, alt_down, control_down);
     if (action == SLAGizmoEventType::LeftUp || action == SLAGizmoEventType::RightUp) {
         clear_brush_stroke_points();
         m_brush_stroke_active = false;
+        m_live_selector_preview_active = false;
     }
     return handled;
 }
@@ -11342,8 +11476,9 @@ void GLGizmoTrueColorPainting::init_model_triangle_selectors()
         if (TriangleSelectorPatch *patch = dynamic_cast<TriangleSelectorPatch *>(m_triangle_selectors.back().get())) {
             patch->set_none_state_rendered(render_normal_surface);
             patch->set_texture_mapping_color_preview(preview_rgb_data);
-            patch->set_texture_preview_needed(preview_rgb_data != nullptr);
+            patch->set_texture_preview_needed(false);
             patch->set_texture_preview_opaque(true);
+            patch->set_surface_offset(preview_rgb_data != nullptr ? 0.002f : 0.f);
         }
         m_triangle_selectors.back()->set_wireframe_needed(true);
         m_triangle_selectors.back()->request_update_render_data(true);
@@ -11441,6 +11576,7 @@ void GLGizmoTrueColorPainting::update_rgb_data_preview_conversion()
     }
 
     if (applied) {
+        clear_rgb_preview_cache();
         init_model_triangle_selectors();
         m_parent.set_as_dirty();
         m_parent.request_extra_frame();
@@ -11544,16 +11680,16 @@ void GLGizmoTrueColorPainting::start_rgb_data_preview_conversion(ModelObject &ob
     m_parent.request_extra_frame();
 }
 
-bool GLGizmoTrueColorPainting::record_brush_stroke_point(const Vec2d &mouse_position)
+void GLGizmoTrueColorPainting::on_brush_projected_mouse_positions(
+    SLAGizmoEventType action,
+    int mesh_idx,
+    const std::vector<ProjectedMousePosition> &projected_mouse_positions)
 {
-    int mesh_id = -1;
-    Vec3f hit = Vec3f::Zero();
-    size_t facet = 0;
-    if (!raycast_to_selected_mesh(mouse_position, mesh_id, hit, facet) || mesh_id < 0)
-        return false;
-
-    if (m_brush_stroke_points_by_volume.size() <= size_t(mesh_id))
-        m_brush_stroke_points_by_volume.resize(size_t(mesh_id) + 1);
+    if (!m_brush_stroke_active ||
+        mesh_idx < 0 ||
+        projected_mouse_positions.empty() ||
+        (action != SLAGizmoEventType::LeftDown && action != SLAGizmoEventType::Dragging))
+        return;
 
     const ModelObject *object = selected_model_object();
     const ModelVolume *hit_volume = nullptr;
@@ -11563,7 +11699,7 @@ bool GLGizmoTrueColorPainting::record_brush_stroke_point(const Vec2d &mouse_posi
             if (volume == nullptr || !volume->is_model_part())
                 continue;
             ++model_part_idx;
-            if (model_part_idx == mesh_id) {
+            if (model_part_idx == mesh_idx) {
                 hit_volume = volume;
                 break;
             }
@@ -11576,7 +11712,22 @@ bool GLGizmoTrueColorPainting::record_brush_stroke_point(const Vec2d &mouse_posi
         world_matrix = projection_world_matrix_for_volume(m_parent, object, hit_volume, selection.get_instance_idx());
     }
 
-    std::vector<Vec3f> &points = m_brush_stroke_points_by_volume[size_t(mesh_id)];
+    for (auto point_it = projected_mouse_positions.rbegin(); point_it != projected_mouse_positions.rend(); ++point_it) {
+        if (point_it->mesh_idx != mesh_idx)
+            continue;
+        append_brush_stroke_point(mesh_idx, point_it->mesh_hit, world_matrix);
+    }
+}
+
+bool GLGizmoTrueColorPainting::append_brush_stroke_point(int mesh_idx, const Vec3f &hit, const Transform3d &world_matrix)
+{
+    if (mesh_idx < 0)
+        return false;
+
+    if (m_brush_stroke_points_by_volume.size() <= size_t(mesh_idx))
+        m_brush_stroke_points_by_volume.resize(size_t(mesh_idx) + 1);
+
+    std::vector<Vec3f> &points = m_brush_stroke_points_by_volume[size_t(mesh_idx)];
     const float min_spacing = true_color_brush_subdivision_target(m_cursor_radius);
     if (points.empty() ||
         (transform_point(world_matrix, points.back()) - transform_point(world_matrix, hit)).norm() >= min_spacing)
@@ -11588,6 +11739,107 @@ void GLGizmoTrueColorPainting::clear_brush_stroke_points()
 {
     m_brush_stroke_points_by_volume.clear();
     m_brush_stroke_active = false;
+}
+
+void GLGizmoTrueColorPainting::clear_rgb_preview_cache()
+{
+    m_rgb_preview_cache.clear();
+}
+
+void GLGizmoTrueColorPainting::render_cached_rgb_data_preview(const ModelObject &object, const Selection &selection)
+{
+    const size_t num_physical = std::max(0, wxGetApp().filaments_cnt());
+    const TextureMappingManager *texture_mgr = wxGetApp().preset_bundle != nullptr ?
+        &wxGetApp().preset_bundle->texture_mapping_zones : nullptr;
+
+    const Camera &camera = wxGetApp().plater()->get_camera();
+    const Transform3d &view_matrix = camera.get_view_matrix();
+    const Transform3d &projection_matrix = camera.get_projection_matrix();
+    const ClippingPlaneDataWrapper clp_data = get_clipping_plane_data();
+    const ModelInstance *instance = selection.get_instance_idx() >= 0 &&
+                                    size_t(selection.get_instance_idx()) < object.instances.size() ?
+        object.instances[size_t(selection.get_instance_idx())] :
+        nullptr;
+    if (instance == nullptr)
+        return;
+
+    for (const ModelVolume *volume : object.volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+
+        const ColorFacetsAnnotation *preview_rgb_data = !volume->texture_mapping_color_facets.empty() ?
+            &volume->texture_mapping_color_facets :
+            preview_rgb_data_for_volume(*volume);
+        if (preview_rgb_data == nullptr || preview_rgb_data->empty())
+            continue;
+
+        const size_t signature = true_color_rgb_preview_cache_signature(*volume, *preview_rgb_data, num_physical, texture_mgr);
+        auto cache_it = std::find_if(m_rgb_preview_cache.begin(),
+                                     m_rgb_preview_cache.end(),
+                                     [volume_id = volume->id()](const RgbPreviewVolumeCache &cache) {
+                                         return cache.volume_id == volume_id;
+                                     });
+        if (cache_it == m_rgb_preview_cache.end()) {
+            m_rgb_preview_cache.emplace_back();
+            cache_it = m_rgb_preview_cache.end() - 1;
+            cache_it->volume_id = volume->id();
+        }
+
+        if (!cache_it->valid || cache_it->signature != signature) {
+            cache_it->models.clear();
+            cache_it->colors.clear();
+            cache_it->filament_ids.clear();
+            const std::vector<ColorRGBA> colors = { ColorRGBA(1.f, 1.f, 1.f, 0.f) };
+            std::vector<std::vector<TriangleSelector::FacetStateTriangle>> triangles_per_type =
+                true_color_rgb_preview_triangles(*volume);
+            build_mmu_vertex_color_preview_models(*volume,
+                                                  triangles_per_type,
+                                                  colors,
+                                                  volume->extruder_id() > 0 ? unsigned(volume->extruder_id()) : 0u,
+                                                  num_physical,
+                                                  texture_mgr,
+                                                  cache_it->models,
+                                                  cache_it->colors,
+                                                  cache_it->filament_ids,
+                                                  preview_rgb_data,
+                                                  reinterpret_cast<size_t>(this));
+            cache_it->signature = signature;
+            cache_it->valid = true;
+        }
+
+        if (cache_it->models.empty())
+            continue;
+
+        Transform3d matrix;
+        if (m_parent.get_canvas_type() == GLCanvas3D::CanvasAssembleView) {
+            matrix = instance->get_assemble_transformation().get_matrix() * volume->get_matrix();
+            matrix.translate(volume->get_transformation().get_offset() * (GLVolume::explosion_ratio - 1.0) +
+                             instance->get_offset_to_assembly() * (GLVolume::explosion_ratio - 1.0));
+        } else {
+            matrix = instance->get_transformation().get_matrix() * volume->get_matrix();
+        }
+
+        std::vector<ColorRGBA> preview_colors = cache_it->colors;
+        for (ColorRGBA &preview_color : preview_colors) {
+            preview_color = adjust_color_for_rendering(preview_color);
+            preview_color.a(1.f);
+        }
+
+        render_model_vertex_color_preview_models(cache_it->models,
+                                                 preview_colors,
+                                                 cache_it->filament_ids,
+                                                 num_physical,
+                                                 texture_mgr,
+                                                 matrix,
+                                                 view_matrix,
+                                                 projection_matrix,
+                                                 clp_data.z_range,
+                                                 clp_data.clp_dataf,
+                                                 -1,
+                                                 std::array<float, 4>{ 0.f, 0.f, 0.f, 0.f },
+                                                 std::array<float, 2>{ 0.f, 0.f },
+                                                 true);
+    }
 }
 
 void GLGizmoTrueColorPainting::update_triangle_selectors_color()
@@ -11707,6 +11959,7 @@ void GLGizmoTrueColorPainting::open_color_data_management_dialog()
     cancel_rgb_data_preview_conversion();
     m_preview_rgb_data_volume_ids.clear();
     m_preview_rgb_data_by_volume.clear();
+    clear_rgb_preview_cache();
     Slic3r::GUI::open_color_data_management_dialog(wxGetApp().mainframe, m_parent, object, [this]() {
         update_selected_object_color_state();
         init_model_triangle_selectors();
@@ -11734,6 +11987,7 @@ void GLGizmoTrueColorPainting::update_selected_object_color_state()
         cancel_rgb_data_preview_conversion();
         m_preview_rgb_data_volume_ids.clear();
         m_preview_rgb_data_by_volume.clear();
+        clear_rgb_preview_cache();
         m_color_picker_source_cache.clear();
         m_background_color_edit_config_snapshot.reset();
     }
@@ -11909,6 +12163,7 @@ void GLGizmoTrueColorPainting::refresh_selected_object_after_rgb_change(ModelObj
 {
     remember_changed_rgb_data_object(object);
     update_selected_object_color_state();
+    clear_rgb_preview_cache();
     init_model_triangle_selectors();
     m_parent.update_volumes_colors_by_extruder();
     m_parent.set_as_dirty();
@@ -12716,6 +12971,7 @@ void GLGizmoTrueColorPainting::refresh_selected_object_after_background_color_ch
     cancel_rgb_data_preview_conversion();
     m_preview_rgb_data_volume_ids.clear();
     m_preview_rgb_data_by_volume.clear();
+    clear_rgb_preview_cache();
     m_color_picker_source_cache.clear();
     update_selected_object_color_state();
     init_model_triangle_selectors();
@@ -13992,6 +14248,7 @@ bool GLGizmoImageProjection::project_to_vertex_colors(ModelObject *object)
             }
             volume->imported_vertex_colors_rgba[idx] = pack_vertex_color_rgba(color);
         }
+        volume->imported_vertex_colors_rgba.set_new_unique_id();
         changed = true;
     }
     return changed;

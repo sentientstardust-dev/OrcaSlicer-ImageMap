@@ -133,6 +133,13 @@ public:
     void set_texture_preview_needed(bool needed) { m_texture_preview_needed = needed; }
     void set_texture_preview_opaque(bool opaque) { m_texture_preview_opaque = opaque; }
     void set_texture_mapping_color_preview(const ColorFacetsAnnotation *preview) { m_texture_mapping_color_preview = preview; }
+    void set_surface_offset(float surface_offset)
+    {
+        if (m_surface_offset != surface_offset) {
+            m_surface_offset = surface_offset;
+            request_update_render_data(true);
+        }
+    }
 
     constexpr static float GapAreaMin = 0.f;
     constexpr static float GapAreaMax = 5.f;
@@ -191,6 +198,7 @@ protected:
     mutable std::vector<GLModel> m_texture_preview_models;
     std::vector<ColorRGBA>  m_texture_preview_colors;
     std::vector<unsigned int> m_texture_preview_filament_ids;
+    std::vector<bool>       m_texture_preview_used_states;
     mutable GLTexture       m_texture_preview;
     mutable size_t          m_texture_preview_signature { 0 };
     size_t                  m_texture_preview_visual_signature { 0 };
@@ -203,6 +211,7 @@ protected:
     bool                        m_render_none_state = true;
     bool                        m_texture_preview_needed = true;
     bool                        m_texture_preview_opaque = false;
+    float                       m_surface_offset = 0.f;
 
 private:
     void update_render_data();
@@ -306,6 +315,10 @@ protected:
         int    mesh_idx;
         size_t facet_idx;
     };
+
+    virtual void on_brush_projected_mouse_positions(SLAGizmoEventType,
+                                                    int,
+                                                    const std::vector<ProjectedMousePosition> &) {}
 
     // BBS: projected result of mouse height range for a mesh
     struct ProjectedHeightRange
