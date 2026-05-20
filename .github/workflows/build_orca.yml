@@ -364,7 +364,7 @@ jobs:
         # env:
         #   WindowsSdkDir: 'C:\Program Files (x86)\Windows Kits\10\'
         #   WindowsSDKVersion: '10.0.26100.0\'
-        run: .\build_release_vs.bat slicer ${{ !vars.SELF_HOSTED && '-x' || '' }}
+        run: .\build_release_vs.bat slicer ${{ !vars.SELF_HOSTED && '-x -p' || '' }}
 
       - name: Show sccache stats Windows
         if: ${{ always() && runner.os == 'Windows' && !vars.SELF_HOSTED }}
