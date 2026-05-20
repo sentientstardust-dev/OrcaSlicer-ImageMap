@@ -19,6 +19,7 @@
 #include "../Utils.hpp"
 #include "../format.hpp"
 
+#include <numeric>
 #include <string_view>
 
 #include <boost/log/trivial.hpp>

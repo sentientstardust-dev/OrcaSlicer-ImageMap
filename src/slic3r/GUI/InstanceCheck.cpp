@@ -1,6 +1,9 @@
 #include "GUI_App.hpp"
 #include "InstanceCheck.hpp"
 #include "Plater.hpp"
+#ifdef _WIN32
+#include <Windows.h>
+#endif
 #include <boost/regex.hpp>
 
 #ifdef _WIN32

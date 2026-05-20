@@ -4,6 +4,7 @@
 #include <queue>
 #include <random>
 #include <cassert>
+#include <numeric>
 #include <sstream>
 
 namespace Slic3r
@@ -895,5 +896,4 @@ namespace Slic3r
     }
 
 }
-
 

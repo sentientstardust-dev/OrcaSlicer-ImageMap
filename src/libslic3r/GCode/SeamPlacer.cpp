@@ -8,6 +8,7 @@
 #include <boost/log/trivial.hpp>
 #include <random>
 #include <algorithm>
+#include <numeric>
 #include <queue>
 
 #include "libslic3r/AABBTreeLines.hpp"

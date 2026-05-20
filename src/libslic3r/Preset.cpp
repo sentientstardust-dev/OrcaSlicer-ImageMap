@@ -6,12 +6,6 @@
 #include "PresetBundle.hpp"
 #include "AppConfig.hpp"
 
-#ifdef _MSC_VER
-    #define WIN32_LEAN_AND_MEAN
-    #define NOMINMAX
-    #include <Windows.h>
-#endif /* _MSC_VER */
-
 // instead of #include "slic3r/GUI/I18N.hpp" :
 #ifndef L
 // !!! If you needed to translate some string,

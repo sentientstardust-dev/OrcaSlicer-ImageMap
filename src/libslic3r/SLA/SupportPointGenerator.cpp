@@ -16,6 +16,7 @@
 #include "libslic3r.h"
 
 #include <iostream>
+#include <numeric>
 #include <random>
 
 namespace Slic3r {

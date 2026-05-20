@@ -21,6 +21,10 @@ on:
           required: false
           type: string
           default: ''
+        build_without_pch_windows:
+          required: false
+          type: boolean
+          default: false
 
 jobs:
   build_orca:
@@ -57,8 +61,9 @@ jobs:
           useCloudCache: true
 
       - name: Restore sccache cache
+        id: restore-sccache
         if: ${{ !vars.SELF_HOSTED && (runner.os == 'Windows' || runner.os == 'Linux' || (runner.os == 'macOS' && !inputs.macos-combine-only)) }}
-        uses: actions/cache@v5
+        uses: actions/cache/restore@v5
         with:
           path: ${{ env.SCCACHE_DIR }}
           key: sccache-orcaslicer-${{ runner.os }}-${{ inputs.arch || 'default' }}-${{ github.sha }}
@@ -364,7 +369,7 @@ jobs:
         # env:
         #   WindowsSdkDir: 'C:\Program Files (x86)\Windows Kits\10\'
         #   WindowsSDKVersion: '10.0.26100.0\'
-        run: .\build_release_vs.bat slicer ${{ !vars.SELF_HOSTED && '-x -p' || '' }}
+        run: .\build_release_vs.bat slicer ${{ !vars.SELF_HOSTED && '-x' || '' }} ${{ !vars.SELF_HOSTED && inputs.build_without_pch_windows && '-p' || '' }}
 
       - name: Show sccache stats Windows
         if: ${{ always() && runner.os == 'Windows' && !vars.SELF_HOSTED }}
@@ -472,6 +477,19 @@ jobs:
           if command -v sccache >/dev/null 2>&1; then
             sccache --show-stats
           fi
+
+      - name: Stop sccache server
+        if: ${{ always() && !vars.SELF_HOSTED && (runner.os == 'Windows' || runner.os == 'Linux' || (runner.os == 'macOS' && !inputs.macos-combine-only)) }}
+        continue-on-error: true
+        run: sccache --stop-server
+
+      - name: Save sccache cache
+        if: ${{ always() && !vars.SELF_HOSTED && (runner.os == 'Windows' || runner.os == 'Linux' || (runner.os == 'macOS' && !inputs.macos-combine-only)) && steps.restore-sccache.outputs.cache-hit != 'true' && steps.restore-sccache.outputs.cache-primary-key != '' }}
+        continue-on-error: true
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: ${{ steps.restore-sccache.outputs.cache-primary-key }}
 
         # Use tar because upload-artifacts won't always preserve directory structure
         # and doesn't preserve file permissions

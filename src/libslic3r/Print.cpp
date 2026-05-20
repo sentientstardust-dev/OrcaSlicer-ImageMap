@@ -25,6 +25,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <numeric>
 #include <unordered_set>
 #include <boost/filesystem/path.hpp>
 #include <boost/format.hpp>

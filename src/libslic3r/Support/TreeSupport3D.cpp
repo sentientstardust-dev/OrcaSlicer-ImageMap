@@ -27,6 +27,7 @@
 #include <cassert>
 #include <chrono>
 #include <fstream>
+#include <numeric>
 #include <optional>
 #include <stdio.h>
 #include <string>

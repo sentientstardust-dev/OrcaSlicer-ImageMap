@@ -21,6 +21,7 @@
 #include <cassert>
 #include <limits>
 #include <algorithm>
+#include <numeric>
 #include <unordered_map>
 
 #include <libslic3r.h>

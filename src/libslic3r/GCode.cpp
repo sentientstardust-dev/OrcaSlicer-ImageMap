@@ -37,6 +37,7 @@
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <sstream>

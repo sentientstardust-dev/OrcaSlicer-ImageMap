@@ -12,7 +12,7 @@ on:
       build_linux:
         description: 'Build Linux AppImage artifacts'
         type: boolean
-        default: false
+        default: true
       build_flatpak:
         description: 'Build Linux Flatpak artifacts'
         type: boolean
@@ -21,6 +21,10 @@ on:
         description: 'Build Windows artifacts'
         type: boolean
         default: true
+      build_without_pch_windows:
+        description: 'Build without PCH (windows)'
+        type: boolean
+        default: false
       build_macos:
         description: 'Build macOS artifacts'
         type: boolean
@@ -52,7 +56,7 @@ jobs:
   build_linux:
     strategy:
       fail-fast: false
-    if: ${{ !cancelled() && (github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/'))) && ((inputs.build_linux || false) || vars.BUILD_LINUX == 'true') }}
+    if: ${{ !cancelled() && (github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/'))) && (inputs.build_linux || github.event_name != 'workflow_dispatch' || vars.BUILD_LINUX == 'true') }}
     uses: ./.github/workflows/build_check_cache.yml
     with:
       os: ${{ vars.SELF_HOSTED && 'orca-lnx-server' || 'ubuntu-24.04' }}
@@ -67,6 +71,7 @@ jobs:
       build-deps-only: ${{ inputs.build-deps-only || false }}
       force-build: false
       release-version: ${{ inputs.release_version || '' }}
+      build_without_pch_windows: ${{ inputs.build_without_pch_windows || false }}
     secrets: inherit
   build_macos_arch:
     strategy:
@@ -159,7 +164,7 @@ jobs:
     name: Unit Tests
     runs-on: ${{ vars.SELF_HOSTED && 'orca-lnx-server' || 'ubuntu-24.04' }}
     needs: build_linux
-    if: ${{ !cancelled() && (github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/'))) && ((inputs.build_linux || false) || vars.BUILD_LINUX == 'true') && needs.build_linux.result == 'success' }}
+    if: ${{ !cancelled() && (github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/'))) && (inputs.build_linux || github.event_name != 'workflow_dispatch' || vars.BUILD_LINUX == 'true') && needs.build_linux.result == 'success' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6

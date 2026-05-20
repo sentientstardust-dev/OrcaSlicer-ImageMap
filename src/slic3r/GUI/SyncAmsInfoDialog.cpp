@@ -1,5 +1,6 @@
 #include "SyncAmsInfoDialog.hpp"
 
+#include <numeric>
 #include <thread>
 #include <wx/event.h>
 #include <wx/sizer.h>

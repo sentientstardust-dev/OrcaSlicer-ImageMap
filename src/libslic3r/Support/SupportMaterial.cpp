@@ -11,6 +11,7 @@
 
 #include <cmath>
 #include <memory>
+#include <numeric>
 #include <boost/log/trivial.hpp>
 #include <boost/container/static_vector.hpp>
 

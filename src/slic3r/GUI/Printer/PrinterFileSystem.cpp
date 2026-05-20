@@ -11,6 +11,9 @@
 #include <boost/endian/conversion.hpp>
 #include <boost/log/trivial.hpp>
 #include <boost/uuid/detail/md5.hpp>
+#ifdef _WIN32
+#include <Windows.h>
+#endif
 #include <boost/regex.hpp>
 
 #include <wx/mstream.h>

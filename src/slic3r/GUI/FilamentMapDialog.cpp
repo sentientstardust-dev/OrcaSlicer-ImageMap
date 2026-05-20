@@ -8,6 +8,8 @@
 #include "CapsuleButton.hpp"
 #include "MsgDialog.hpp"
 
+#include <numeric>
+
 namespace Slic3r { namespace GUI {
 
 static bool get_pop_up_remind_flag()
