@@ -120,7 +120,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultCompactOffsetMode = true;
     static constexpr bool  DefaultUseLegacyFixedColorMode = false;
     static constexpr bool  DefaultHighSpeedImageTextureSampling = true;
-    static constexpr bool  DefaultMinimumVisibilityOffsetEnabled = false;
+    static constexpr bool  DefaultMinimumVisibilityOffsetEnabled = true;
     static constexpr float DefaultMinimumVisibilityOffsetPct = 30.f;
     static constexpr int   DefaultGenericSolverLookupMode = int(GenericSolverClosestMix);
     static constexpr int   DefaultGenericSolverMode = int(GenericSolverV2);

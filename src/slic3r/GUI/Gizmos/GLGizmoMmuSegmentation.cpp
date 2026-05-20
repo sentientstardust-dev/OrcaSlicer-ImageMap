@@ -10,6 +10,7 @@
 #include "slic3r/GUI/GUI_ObjectList.hpp"
 #include "slic3r/GUI/NotificationManager.hpp"
 #include "slic3r/GUI/GUI.hpp"
+#include "slic3r/GUI/MsgDialog.hpp"
 #include "slic3r/GUI/ObjColorDialog.hpp"
 #include "slic3r/GUI/MainFrame.hpp"
 #include "slic3r/GUI/Tab.hpp"
@@ -33,8 +34,10 @@
 #include <array>
 #include <cctype>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -201,6 +204,50 @@ struct GLGizmoTrueColorPainting::RgbDataConversionState
     mutable std::mutex                mutex;
     bool                              finished = false;
     TrueColorRgbDataConversionResult result;
+};
+
+struct GLGizmoTrueColorPainting::ImageTexturePaintTask
+{
+    ObjectID object_id;
+    ObjectID volume_id;
+    int mesh_id = -1;
+    uint64_t sequence = 0;
+    indexed_triangle_set its;
+    std::vector<float> imported_texture_uvs_per_face;
+    std::vector<uint8_t> imported_texture_uv_valid;
+    uint32_t imported_texture_width = 0;
+    uint32_t imported_texture_height = 0;
+    bool generated_uvs = false;
+    bool has_uv_core_coverage = false;
+    std::vector<uint8_t> uv_core_coverage;
+    std::vector<TriangleSelector::FacetStateTriangle> stroke_facets;
+    ColorRGBA brush_color = ColorRGBA::BLACK();
+    float hardness = 1.f;
+    float opacity = 1.f;
+    float brush_radius = 0.f;
+    std::vector<Vec3f> brush_stroke_points;
+    Transform3d world_matrix = Transform3d::Identity();
+    std::shared_ptr<std::atomic_bool> cancel;
+};
+
+struct GLGizmoTrueColorPainting::ImageTexturePaintResult
+{
+    ObjectID object_id;
+    ObjectID volume_id;
+    uint64_t sequence = 0;
+    uint32_t imported_texture_width = 0;
+    uint32_t imported_texture_height = 0;
+    ColorRGBA brush_color = ColorRGBA::BLACK();
+    std::vector<std::pair<size_t, float>> pixel_alphas;
+};
+
+struct GLGizmoTrueColorPainting::PendingImageTexturePaintPreview
+{
+    ObjectID object_id;
+    ObjectID volume_id;
+    int mesh_id = -1;
+    uint64_t sequence = 0;
+    GLModel model;
 };
 
 class TrueColorRgbDataConversionCanceledException : public std::exception
@@ -504,6 +551,11 @@ static wxString raw_offset_data_image_texture_projection_warning_text()
 {
     return _L("Projecting a normal image in Image Texture mode will convert the raw offset atlas into a regular RGBA image before "
               "projecting, destroying the raw offset data.");
+}
+
+static wxString raw_offset_data_image_texture_painting_warning_text()
+{
+    return _L("Painting in Image Texture mode will convert the raw offset atlas into a regular RGBA image, destroying the raw offset data.");
 }
 
 static void show_raw_offset_data_converted_to_rgba_message()
@@ -2001,6 +2053,22 @@ struct RGBStrokeBoundaryEdges
     std::vector<RGBStrokeBoundaryEdge> all;
 };
 
+struct RGBBrushPathSegment
+{
+    Vec3f local_a = Vec3f::Zero();
+    Vec3f local_b = Vec3f::Zero();
+    Vec3f world_a = Vec3f::Zero();
+    Vec3f world_b = Vec3f::Zero();
+    Vec3f world_min = Vec3f::Zero();
+    Vec3f world_max = Vec3f::Zero();
+};
+
+struct RGBBrushCandidateSourceTriangles
+{
+    std::vector<bool> candidates;
+    std::vector<std::vector<size_t>> path_segments_by_source_triangle;
+};
+
 static RGBStrokeBoundaryEdges build_rgb_stroke_boundary_edges(
     const std::vector<TriangleSelector::FacetStateTriangle> &stroke_facets)
 {
@@ -2035,14 +2103,19 @@ static RGBStrokeBoundaryEdges build_rgb_stroke_boundary_edges(
     return boundary_edges;
 }
 
-static float distance_to_segment(const Vec3f &point, const Vec3f &a, const Vec3f &b)
+static float distance_to_segment_squared(const Vec3f &point, const Vec3f &a, const Vec3f &b)
 {
     const Vec3f ab = b - a;
     const float len2 = ab.squaredNorm();
     if (len2 <= EPSILON)
-        return (point - a).norm();
+        return (point - a).squaredNorm();
     const float t = std::clamp((point - a).dot(ab) / len2, 0.f, 1.f);
-    return (point - (a + ab * t)).norm();
+    return (point - (a + ab * t)).squaredNorm();
+}
+
+static float distance_to_segment(const Vec3f &point, const Vec3f &a, const Vec3f &b)
+{
+    return std::sqrt(distance_to_segment_squared(point, a, b));
 }
 
 static float distance_between_segments(const Vec3f &p1, const Vec3f &q1, const Vec3f &p2, const Vec3f &q2)
@@ -2237,6 +2310,78 @@ static float sample_rgb_brush_path_alpha(const std::vector<Vec3f> &stroke_points
     return opacity * soft_alpha;
 }
 
+static std::vector<RGBBrushPathSegment> build_rgb_brush_path_segments(const std::vector<Vec3f> &stroke_points,
+                                                                      const Transform3d        &world_matrix,
+                                                                      float                     brush_radius)
+{
+    std::vector<RGBBrushPathSegment> segments;
+    if (stroke_points.empty() || brush_radius <= EPSILON)
+        return segments;
+
+    const size_t segment_count = stroke_points.size() == 1 ? 1 : stroke_points.size() - 1;
+    segments.reserve(segment_count);
+    for (size_t idx = 0; idx < segment_count; ++idx) {
+        const Vec3f local_a = stroke_points[idx];
+        const Vec3f local_b = stroke_points.size() == 1 ? stroke_points[idx] : stroke_points[idx + 1];
+        const Vec3f world_a = transform_point(world_matrix, local_a);
+        const Vec3f world_b = transform_point(world_matrix, local_b);
+        RGBBrushPathSegment segment;
+        segment.local_a = local_a;
+        segment.local_b = local_b;
+        segment.world_a = world_a;
+        segment.world_b = world_b;
+        segment.world_min = world_a.cwiseMin(world_b) - Vec3f::Constant(brush_radius);
+        segment.world_max = world_a.cwiseMax(world_b) + Vec3f::Constant(brush_radius);
+        segments.emplace_back(segment);
+    }
+    return segments;
+}
+
+static float sample_rgb_brush_path_alpha(const std::vector<RGBBrushPathSegment> &segments,
+                                         const std::vector<size_t>              &segment_indices,
+                                         const Vec3f                            &point,
+                                         float                                   hardness,
+                                         float                                   opacity,
+                                         float                                   brush_radius)
+{
+    opacity = std::clamp(opacity, 0.f, 1.f);
+    if (opacity <= 0.f || brush_radius <= EPSILON || segments.empty() || segment_indices.empty())
+        return 0.f;
+
+    const float radius_sq = brush_radius * brush_radius;
+    float distance_sq = std::numeric_limits<float>::max();
+    for (const size_t segment_idx : segment_indices) {
+        if (segment_idx >= segments.size())
+            continue;
+        const RGBBrushPathSegment &segment = segments[segment_idx];
+        if (point.x() < segment.world_min.x() ||
+            point.y() < segment.world_min.y() ||
+            point.z() < segment.world_min.z() ||
+            point.x() > segment.world_max.x() ||
+            point.y() > segment.world_max.y() ||
+            point.z() > segment.world_max.z())
+            continue;
+        distance_sq = std::min(distance_sq, distance_to_segment_squared(point, segment.world_a, segment.world_b));
+    }
+
+    if (!std::isfinite(distance_sq) || distance_sq > radius_sq)
+        return 0.f;
+
+    const float distance = std::sqrt(distance_sq);
+    hardness = std::clamp(hardness, 0.f, 1.f);
+    const float solid_radius = brush_radius * hardness;
+    if (distance <= solid_radius)
+        return opacity;
+
+    const float fade_width = brush_radius - solid_radius;
+    if (fade_width <= EPSILON)
+        return opacity;
+
+    const float t = std::clamp((brush_radius - distance) / fade_width, 0.f, 1.f);
+    const float soft_alpha = t * t * (3.f - 2.f * t);
+    return opacity * soft_alpha;
+}
+
 static float sample_rgb_stroke_alpha(const std::vector<TriangleSelector::FacetStateTriangle>      &stroke_facets,
                                      const std::unordered_map<int, std::vector<size_t>>           &stroke_by_source_triangle,
                                      const RGBStrokeBoundaryEdges                                 &stroke_boundary_edges,
@@ -2244,7 +2389,8 @@ static float sample_rgb_stroke_alpha(const std::vector<TriangleSelector::FacetSt
                                      const Vec3f                                                  &point,
                                      float                                                         hardness,
                                      float                                                         opacity,
-                                     float                                                         brush_radius)
+                                     float                                                         brush_radius,
+                                     bool                                                          use_global_boundary_fallback = true)
 {
     if (opacity <= 0.f)
         return 0.f;
@@ -2287,7 +2433,7 @@ static float sample_rgb_stroke_alpha(const std::vector<TriangleSelector::FacetSt
         for (const RGBStrokeBoundaryEdge &edge : boundary_found->second)
             boundary_distance = std::min(boundary_distance, distance_to_segment(point, edge.a, edge.b));
 
-    if (!std::isfinite(boundary_distance) || boundary_distance > fade_width) {
+    if (use_global_boundary_fallback && (!std::isfinite(boundary_distance) || boundary_distance > fade_width)) {
         for (const RGBStrokeBoundaryEdge &edge : stroke_boundary_edges.all)
             boundary_distance = std::min(boundary_distance, distance_to_segment(point, edge.a, edge.b));
     }
@@ -2301,13 +2447,12 @@ static float sample_rgb_stroke_alpha(const std::vector<TriangleSelector::FacetSt
 }
 
 static std::vector<bool> rgb_brush_candidate_source_triangles(
-    const ModelVolume                                     &volume,
+    const indexed_triangle_set                            &its,
     const std::vector<Vec3f>                              &stroke_points,
     float                                                  brush_radius,
     const std::unordered_map<int, std::vector<size_t>>    &stroke_by_source_triangle,
     const Transform3d                                     &world_matrix)
 {
-    const indexed_triangle_set &its = volume.mesh().its;
     std::vector<bool> candidates(its.indices.size(), false);
     for (const auto &entry : stroke_by_source_triangle)
         if (entry.first >= 0 && size_t(entry.first) < candidates.size())
@@ -2369,6 +2514,80 @@ static std::vector<bool> rgb_brush_candidate_source_triangles(
     }
 
     return candidates;
+}
+
+static RGBBrushCandidateSourceTriangles rgb_brush_candidate_source_triangles(
+    const indexed_triangle_set                         &its,
+    const std::vector<RGBBrushPathSegment>             &path_segments,
+    float                                               brush_radius,
+    const std::unordered_map<int, std::vector<size_t>> &stroke_by_source_triangle,
+    const Transform3d                                  &world_matrix)
+{
+    RGBBrushCandidateSourceTriangles data;
+    data.candidates.assign(its.indices.size(), false);
+    data.path_segments_by_source_triangle.resize(its.indices.size());
+    for (const auto &entry : stroke_by_source_triangle)
+        if (entry.first >= 0 && size_t(entry.first) < data.candidates.size())
+            data.candidates[size_t(entry.first)] = true;
+
+    if (path_segments.empty() || brush_radius <= EPSILON)
+        return data;
+
+    Vec3f path_min = path_segments.front().world_min;
+    Vec3f path_max = path_segments.front().world_max;
+    for (const RGBBrushPathSegment &segment : path_segments) {
+        path_min = path_min.cwiseMin(segment.world_min);
+        path_max = path_max.cwiseMax(segment.world_max);
+    }
+
+    for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+        const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
+        if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
+            continue;
+        if (size_t(tri[0]) >= its.vertices.size() ||
+            size_t(tri[1]) >= its.vertices.size() ||
+            size_t(tri[2]) >= its.vertices.size())
+            continue;
+
+        const std::array<Vec3f, 3> vertices = {
+            its.vertices[size_t(tri[0])].cast<float>(),
+            its.vertices[size_t(tri[1])].cast<float>(),
+            its.vertices[size_t(tri[2])].cast<float>()
+        };
+        const std::array<Vec3f, 3> world_vertices = transform_triangle(world_matrix, vertices);
+        Vec3f tri_min = world_vertices[0].cwiseMin(world_vertices[1]).cwiseMin(world_vertices[2]);
+        Vec3f tri_max = world_vertices[0].cwiseMax(world_vertices[1]).cwiseMax(world_vertices[2]);
+        if (!aabb_overlap(tri_min, tri_max, path_min, path_max))
+            continue;
+
+        std::vector<size_t> &segments = data.path_segments_by_source_triangle[tri_idx];
+        for (size_t segment_idx = 0; segment_idx < path_segments.size(); ++segment_idx) {
+            const RGBBrushPathSegment &segment = path_segments[segment_idx];
+            if (!aabb_overlap(tri_min, tri_max, segment.world_min, segment.world_max))
+                continue;
+            if (triangle_intersects_brush_segment(world_vertices, segment.world_a, segment.world_b, brush_radius))
+                segments.emplace_back(segment_idx);
+        }
+
+        if (!segments.empty())
+            data.candidates[tri_idx] = true;
+    }
+
+    return data;
+}
+
+static std::vector<bool> rgb_brush_candidate_source_triangles(
+    const ModelVolume                                     &volume,
+    const std::vector<Vec3f>                              &stroke_points,
+    float                                                  brush_radius,
+    const std::unordered_map<int, std::vector<size_t>>    &stroke_by_source_triangle,
+    const Transform3d                                     &world_matrix)
+{
+    return rgb_brush_candidate_source_triangles(volume.mesh().its,
+                                                stroke_points,
+                                                brush_radius,
+                                                stroke_by_source_triangle,
+                                                world_matrix);
 }
 
 static int rgb_color_tree_max_depth(const TriangleColorSplittingData &data, int bitstream_end, int &bit_idx, int depth)
@@ -7878,6 +8097,861 @@ static bool convert_object_to_rgba_data(ModelObject &object, const ManagedColorD
     return changed;
 }
 
+static bool rasterize_generated_image_texture_colors(
+    ModelVolume &volume,
+    const GeneratedImageTextureAtlas &atlas,
+    const std::function<ColorRGBA(size_t, const Vec3f &, const Vec3f &)> &sampler)
+{
+    const indexed_triangle_set &its = volume.mesh().its;
+    if (its.vertices.empty() ||
+        its.indices.empty() ||
+        volume.imported_texture_width == 0 ||
+        volume.imported_texture_height == 0)
+        return false;
+
+    bool changed = false;
+    const float texture_width = float(volume.imported_texture_width);
+    const float texture_height = float(volume.imported_texture_height);
+    for (const GeneratedImageTextureIsland &island : atlas.islands) {
+        const size_t tri_idx = island.tri_idx;
+        if (tri_idx >= its.indices.size() ||
+            tri_idx >= volume.imported_texture_uv_valid.size() ||
+            volume.imported_texture_uv_valid[tri_idx] == 0)
+            continue;
+
+        const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
+        if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
+            continue;
+        if (size_t(tri[0]) >= its.vertices.size() ||
+            size_t(tri[1]) >= its.vertices.size() ||
+            size_t(tri[2]) >= its.vertices.size())
+            continue;
+
+        const size_t uv_offset = tri_idx * 6;
+        if (uv_offset + 5 >= volume.imported_texture_uvs_per_face.size())
+            continue;
+
+        const std::array<Vec2f, 3> pixel_uvs = {
+            Vec2f(volume.imported_texture_uvs_per_face[uv_offset + 0] * texture_width,
+                  volume.imported_texture_uvs_per_face[uv_offset + 1] * texture_height),
+            Vec2f(volume.imported_texture_uvs_per_face[uv_offset + 2] * texture_width,
+                  volume.imported_texture_uvs_per_face[uv_offset + 3] * texture_height),
+            Vec2f(volume.imported_texture_uvs_per_face[uv_offset + 4] * texture_width,
+                  volume.imported_texture_uvs_per_face[uv_offset + 5] * texture_height)
+        };
+        const std::array<Vec3f, 3> vertices = {
+            its.vertices[size_t(tri[0])].cast<float>(),
+            its.vertices[size_t(tri[1])].cast<float>(),
+            its.vertices[size_t(tri[2])].cast<float>()
+        };
+
+        const int min_x = std::clamp(island.x, 0, int(volume.imported_texture_width) - 1);
+        const int max_x = std::clamp(island.x + island.rect_width - 1, 0, int(volume.imported_texture_width) - 1);
+        const int min_y = std::clamp(island.y, 0, int(volume.imported_texture_height) - 1);
+        const int max_y = std::clamp(island.y + island.rect_height - 1, 0, int(volume.imported_texture_height) - 1);
+        for (int y_px = min_y; y_px <= max_y; ++y_px) {
+            for (int x_px = min_x; x_px <= max_x; ++x_px) {
+                Vec3f barycentric = Vec3f::Zero();
+                const Vec2f pixel(float(x_px) + 0.5f, float(y_px) + 0.5f);
+                if (!barycentric_weights_2d(pixel, pixel_uvs[0], pixel_uvs[1], pixel_uvs[2], barycentric))
+                    continue;
+                if (barycentric.x() < -1e-4f || barycentric.y() < -1e-4f || barycentric.z() < -1e-4f)
+                    barycentric = normalized_nonnegative_barycentric(barycentric);
+                const Vec3f point = vertices[0] * barycentric.x() +
+                                    vertices[1] * barycentric.y() +
+                                    vertices[2] * barycentric.z();
+                changed |= write_rgba_pixel(volume.imported_texture_rgba,
+                                            volume.imported_texture_width,
+                                            uint32_t(x_px),
+                                            uint32_t(y_px),
+                                            sampler(tri_idx, point, barycentric));
+            }
+        }
+    }
+    return changed;
+}
+
+static bool seed_generated_image_texture_from_current_surface_color(ModelVolume &volume,
+                                                                    const GeneratedImageTextureAtlas &atlas,
+                                                                    const ColorRGBA &fallback_color)
+{
+    const indexed_triangle_set &its = volume.mesh().its;
+    const bool use_vertex_colors = volume.imported_vertex_colors_rgba.size() == its.vertices.size();
+    const bool use_color_regions = !use_vertex_colors && !volume.mmu_segmentation_facets.empty();
+    if (!use_vertex_colors && !use_color_regions)
+        return false;
+
+    const VolumeColorSource rgba_source;
+    const ManagedRegionColorSource region_source = use_color_regions ?
+        build_managed_region_color_source(volume) :
+        ManagedRegionColorSource();
+    return rasterize_generated_image_texture_colors(
+        volume,
+        atlas,
+        [&volume,
+         &rgba_source,
+         &region_source,
+         use_vertex_colors,
+         use_color_regions,
+         fallback_color](size_t tri_idx, const Vec3f &point, const Vec3f &barycentric) {
+            return sample_managed_volume_color_source(volume,
+                                                      rgba_source,
+                                                      region_source,
+                                                      tri_idx,
+                                                      point,
+                                                      barycentric,
+                                                      false,
+                                                      false,
+                                                      use_vertex_colors,
+                                                      use_color_regions,
+                                                      fallback_color);
+        });
+}
+
+static bool convert_volume_rgba_data_to_image_texture_for_painting(ModelObject &object, ModelVolume &volume)
+{
+    if (volume.texture_mapping_color_facets.empty())
+        return false;
+
+    const ColorRGBA background = rgb_metadata_background_color(volume.texture_mapping_color_facets);
+    const VolumeColorSource rgba_source = build_volume_color_source(volume);
+    GeneratedImageTextureAtlas generated_atlas;
+    Transform3d metric_matrix = volume.get_matrix();
+    if (!object.instances.empty() && object.instances.front() != nullptr)
+        metric_matrix = object.instances.front()->get_transformation().get_matrix() * metric_matrix;
+    if (!initialize_generated_image_texture(volume, background, &generated_atlas, &metric_matrix))
+        return false;
+
+    bool changed = rasterize_generated_image_texture_colors(
+        volume,
+        generated_atlas,
+        [&volume, &rgba_source, background](size_t tri_idx, const Vec3f &point, const Vec3f &barycentric) {
+            return sample_volume_color_source(volume, rgba_source, tri_idx, point, barycentric, false, &background);
+        });
+    changed |= set_texture_mapping_background_config(volume.config, background);
+    refresh_imported_texture_storage(volume);
+    return changed || model_volume_has_bakeable_image_texture_data(&volume);
+}
+
+static bool build_texture_uv_core_coverage(const ModelVolume &volume, std::vector<uint8_t> &coverage)
+{
+    coverage.clear();
+    const indexed_triangle_set &its = volume.mesh().its;
+    if (volume.imported_texture_width == 0 ||
+        volume.imported_texture_height == 0 ||
+        its.indices.empty() ||
+        volume.imported_texture_uv_valid.size() != its.indices.size() ||
+        volume.imported_texture_uvs_per_face.size() < its.indices.size() * 6)
+        return false;
+
+    const uint64_t pixel_count64 = uint64_t(volume.imported_texture_width) * uint64_t(volume.imported_texture_height);
+    if (pixel_count64 == 0 || pixel_count64 > 64ull * 1024ull * 1024ull)
+        return false;
+
+    coverage.assign(size_t(pixel_count64), 0);
+    const bool generated_uvs = volume.uv_map_generator_version > 0;
+    const float texture_width = float(volume.imported_texture_width);
+    const float texture_height = float(volume.imported_texture_height);
+    for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+        if (volume.imported_texture_uv_valid[tri_idx] == 0)
+            continue;
+
+        const size_t uv_offset = tri_idx * 6;
+        if (uv_offset + 5 >= volume.imported_texture_uvs_per_face.size())
+            continue;
+
+        const std::array<Vec2f, 3> uvs = unwrap_projection_uvs(std::array<Vec2f, 3>{
+            Vec2f(volume.imported_texture_uvs_per_face[uv_offset + 0], volume.imported_texture_uvs_per_face[uv_offset + 1]),
+            Vec2f(volume.imported_texture_uvs_per_face[uv_offset + 2], volume.imported_texture_uvs_per_face[uv_offset + 3]),
+            Vec2f(volume.imported_texture_uvs_per_face[uv_offset + 4], volume.imported_texture_uvs_per_face[uv_offset + 5])
+        });
+        const std::array<Vec2f, 3> pixel_uvs = {
+            Vec2f(uvs[0].x() * texture_width, uvs[0].y() * texture_height),
+            Vec2f(uvs[1].x() * texture_width, uvs[1].y() * texture_height),
+            Vec2f(uvs[2].x() * texture_width, uvs[2].y() * texture_height)
+        };
+        const int min_x = int(std::floor(std::min({ uvs[0].x(), uvs[1].x(), uvs[2].x() }) * texture_width));
+        const int max_x = int(std::ceil(std::max({ uvs[0].x(), uvs[1].x(), uvs[2].x() }) * texture_width));
+        const int min_y = int(std::floor(std::min({ uvs[0].y(), uvs[1].y(), uvs[2].y() }) * texture_height));
+        const int max_y = int(std::ceil(std::max({ uvs[0].y(), uvs[1].y(), uvs[2].y() }) * texture_height));
+        if (max_x - min_x > int(volume.imported_texture_width) * 2 ||
+            max_y - min_y > int(volume.imported_texture_height) * 2)
+            continue;
+
+        for (int y_px = min_y; y_px <= max_y; ++y_px) {
+            for (int x_px = min_x; x_px <= max_x; ++x_px) {
+                if (generated_uvs &&
+                    (x_px < 0 ||
+                     y_px < 0 ||
+                     x_px >= int(volume.imported_texture_width) ||
+                     y_px >= int(volume.imported_texture_height)))
+                    continue;
+                Vec3f barycentric = Vec3f::Zero();
+                const Vec2f pixel(float(x_px) + 0.5f, float(y_px) + 0.5f);
+                if (!barycentric_weights_2d(pixel, pixel_uvs[0], pixel_uvs[1], pixel_uvs[2], barycentric))
+                    continue;
+                if (barycentric.x() < -1e-4f || barycentric.y() < -1e-4f || barycentric.z() < -1e-4f)
+                    continue;
+                const uint32_t wrapped_x = generated_uvs ?
+                    uint32_t(x_px) :
+                    wrapped_texture_pixel(x_px, volume.imported_texture_width);
+                const uint32_t wrapped_y = generated_uvs ?
+                    uint32_t(y_px) :
+                    wrapped_texture_pixel(y_px, volume.imported_texture_height);
+                coverage[size_t(wrapped_y) * size_t(volume.imported_texture_width) + size_t(wrapped_x)] = 1;
+            }
+        }
+    }
+
+    return true;
+}
+
+struct TextureUvCoreCoverageCacheEntry
+{
+    ObjectID volume_id;
+    size_t   width = 0;
+    size_t   height = 0;
+    size_t   uv_id = 0;
+    size_t   uv_valid_id = 0;
+    int      uv_map_generator_version = 0;
+    bool     available = false;
+    std::vector<uint8_t> coverage;
+};
+
+static const std::vector<uint8_t> *cached_texture_uv_core_coverage(const ModelVolume &volume)
+{
+    static std::vector<TextureUvCoreCoverageCacheEntry> cache;
+    const ObjectID volume_id = volume.id();
+    const size_t width = size_t(volume.imported_texture_width);
+    const size_t height = size_t(volume.imported_texture_height);
+    const size_t uv_id = volume.imported_texture_uvs_per_face.id().id;
+    const size_t uv_valid_id = volume.imported_texture_uv_valid.id().id;
+    const int uv_map_generator_version = volume.uv_map_generator_version;
+
+    auto matches = [&](const TextureUvCoreCoverageCacheEntry &entry) {
+        return entry.volume_id == volume_id &&
+               entry.width == width &&
+               entry.height == height &&
+               entry.uv_id == uv_id &&
+               entry.uv_valid_id == uv_valid_id &&
+               entry.uv_map_generator_version == uv_map_generator_version;
+    };
+
+    auto it = std::find_if(cache.begin(), cache.end(), matches);
+    if (it == cache.end()) {
+        if (cache.size() >= 4)
+            cache.erase(cache.begin());
+        cache.emplace_back();
+        it = cache.end() - 1;
+        it->volume_id = volume_id;
+        it->width = width;
+        it->height = height;
+        it->uv_id = uv_id;
+        it->uv_valid_id = uv_valid_id;
+        it->uv_map_generator_version = uv_map_generator_version;
+        it->available = build_texture_uv_core_coverage(volume, it->coverage);
+    }
+
+    return it->available ? &it->coverage : nullptr;
+}
+
+struct RGBStrokePixelBounds
+{
+    float min_x = std::numeric_limits<float>::max();
+    float min_y = std::numeric_limits<float>::max();
+    float max_x = -std::numeric_limits<float>::max();
+    float max_y = -std::numeric_limits<float>::max();
+    bool valid = false;
+};
+
+static bool rgb_pixel_uv_for_local_point(const Vec3f                  &point,
+                                         const std::array<Vec3f, 3>   &vertices,
+                                         const std::array<Vec2f, 3>   &pixel_uvs,
+                                         Vec2f                        &out)
+{
+    Vec3f barycentric = Vec3f::Zero();
+    if (!barycentric_weights_for_region_vertex_colors(point, vertices[0], vertices[1], vertices[2], barycentric))
+        return false;
+    out = pixel_uvs[0] * barycentric.x() + pixel_uvs[1] * barycentric.y() + pixel_uvs[2] * barycentric.z();
+    return std::isfinite(out.x()) && std::isfinite(out.y());
+}
+
+static void rgb_expand_pixel_bounds(RGBStrokePixelBounds &bounds, const Vec2f &point, float radius)
+{
+    bounds.min_x = std::min(bounds.min_x, point.x() - radius);
+    bounds.min_y = std::min(bounds.min_y, point.y() - radius);
+    bounds.max_x = std::max(bounds.max_x, point.x() + radius);
+    bounds.max_y = std::max(bounds.max_y, point.y() + radius);
+    bounds.valid = true;
+}
+
+static float rgb_triangle_uv_pixels_per_world_unit(const std::array<Vec2f, 3> &pixel_uvs,
+                                                   const std::array<Vec3f, 3> &world_vertices)
+{
+    float scale = 0.f;
+    for (size_t idx = 0; idx < 3; ++idx) {
+        const size_t next = (idx + 1) % 3;
+        const float world_len = (world_vertices[next] - world_vertices[idx]).norm();
+        if (world_len <= EPSILON)
+            continue;
+        const float uv_len = (pixel_uvs[next] - pixel_uvs[idx]).norm();
+        if (std::isfinite(uv_len))
+            scale = std::max(scale, uv_len / world_len);
+    }
+    return scale;
+}
+
+std::shared_ptr<GLGizmoTrueColorPainting::ImageTexturePaintResult>
+GLGizmoTrueColorPainting::compute_image_texture_paint_task(const ImageTexturePaintTask &task)
+{
+    std::shared_ptr<ImageTexturePaintResult> result = std::make_shared<ImageTexturePaintResult>();
+    result->object_id = task.object_id;
+    result->volume_id = task.volume_id;
+    result->sequence = task.sequence;
+    result->imported_texture_width = task.imported_texture_width;
+    result->imported_texture_height = task.imported_texture_height;
+    result->brush_color = task.brush_color;
+
+    if (task.stroke_facets.empty() ||
+        task.imported_texture_width == 0 ||
+        task.imported_texture_height == 0 ||
+        task.its.indices.empty() ||
+        task.its.vertices.empty())
+        return result;
+
+    auto canceled = [&task]() {
+        return task.cancel && task.cancel->load(std::memory_order_relaxed);
+    };
+    if (canceled())
+        return result;
+
+    std::unordered_map<int, std::vector<size_t>> stroke_by_source_triangle;
+    stroke_by_source_triangle.reserve(task.stroke_facets.size());
+    for (size_t idx = 0; idx < task.stroke_facets.size(); ++idx)
+        stroke_by_source_triangle[task.stroke_facets[idx].source_triangle].emplace_back(idx);
+    const RGBStrokeBoundaryEdges stroke_boundary_edges = build_rgb_stroke_boundary_edges(task.stroke_facets);
+    const std::vector<RGBBrushPathSegment> brush_path_segments =
+        build_rgb_brush_path_segments(task.brush_stroke_points, task.world_matrix, task.brush_radius);
+    const RGBBrushCandidateSourceTriangles brush_candidates =
+        rgb_brush_candidate_source_triangles(task.its,
+                                             brush_path_segments,
+                                             task.brush_radius,
+                                             stroke_by_source_triangle,
+                                             task.world_matrix);
+    const bool use_brush_path = !brush_path_segments.empty();
+
+    const std::vector<uint8_t> *uv_core_coverage =
+        task.has_uv_core_coverage ? &task.uv_core_coverage : nullptr;
+    const int padding_px = task.generated_uvs || uv_core_coverage != nullptr ? 1 : 0;
+    const size_t texture_pixel_count = size_t(task.imported_texture_width) * size_t(task.imported_texture_height);
+    const bool use_dense_alphas = texture_pixel_count <= 32ull * 1024ull * 1024ull;
+    std::vector<float> dense_alphas;
+    std::vector<size_t> touched_pixels;
+    if (use_dense_alphas) {
+        dense_alphas.assign(texture_pixel_count, 0.f);
+        touched_pixels.reserve(std::max<size_t>(task.stroke_facets.size() * 32, 128));
+    }
+    std::unordered_map<size_t, float> pixel_alphas;
+    if (!use_dense_alphas)
+        pixel_alphas.reserve(std::max<size_t>(task.stroke_facets.size() * 32, 128));
+
+    const float texture_width = float(task.imported_texture_width);
+    const float texture_height = float(task.imported_texture_height);
+    for (size_t tri_idx = 0; tri_idx < task.its.indices.size(); ++tri_idx) {
+        if ((tri_idx & 0x3f) == 0 && canceled())
+            return result;
+        if (tri_idx >= brush_candidates.candidates.size() || !brush_candidates.candidates[tri_idx])
+            continue;
+        if (tri_idx >= task.imported_texture_uv_valid.size() ||
+            task.imported_texture_uv_valid[tri_idx] == 0)
+            continue;
+
+        const stl_triangle_vertex_indices &tri = task.its.indices[tri_idx];
+        if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
+            continue;
+        if (size_t(tri[0]) >= task.its.vertices.size() ||
+            size_t(tri[1]) >= task.its.vertices.size() ||
+            size_t(tri[2]) >= task.its.vertices.size())
+            continue;
+
+        const size_t uv_offset = tri_idx * 6;
+        if (uv_offset + 5 >= task.imported_texture_uvs_per_face.size())
+            continue;
+
+        const std::array<Vec2f, 3> uvs = unwrap_projection_uvs(std::array<Vec2f, 3>{
+            Vec2f(task.imported_texture_uvs_per_face[uv_offset + 0], task.imported_texture_uvs_per_face[uv_offset + 1]),
+            Vec2f(task.imported_texture_uvs_per_face[uv_offset + 2], task.imported_texture_uvs_per_face[uv_offset + 3]),
+            Vec2f(task.imported_texture_uvs_per_face[uv_offset + 4], task.imported_texture_uvs_per_face[uv_offset + 5])
+        });
+        const std::array<Vec2f, 3> pixel_uvs = {
+            Vec2f(uvs[0].x() * texture_width, uvs[0].y() * texture_height),
+            Vec2f(uvs[1].x() * texture_width, uvs[1].y() * texture_height),
+            Vec2f(uvs[2].x() * texture_width, uvs[2].y() * texture_height)
+        };
+        const std::array<Vec3f, 3> vertices = {
+            task.its.vertices[size_t(tri[0])].cast<float>(),
+            task.its.vertices[size_t(tri[1])].cast<float>(),
+            task.its.vertices[size_t(tri[2])].cast<float>()
+        };
+        const std::array<Vec3f, 3> world_vertices = transform_triangle(task.world_matrix, vertices);
+        const std::vector<size_t> empty_path_segments;
+        const std::vector<size_t> &path_segment_indices =
+            tri_idx < brush_candidates.path_segments_by_source_triangle.size() ?
+                brush_candidates.path_segments_by_source_triangle[tri_idx] :
+                empty_path_segments;
+
+        const int full_min_x = int(std::floor(std::min({ uvs[0].x(), uvs[1].x(), uvs[2].x() }) * texture_width)) - padding_px;
+        const int full_max_x = int(std::ceil(std::max({ uvs[0].x(), uvs[1].x(), uvs[2].x() }) * texture_width)) + padding_px;
+        const int full_min_y = int(std::floor(std::min({ uvs[0].y(), uvs[1].y(), uvs[2].y() }) * texture_height)) - padding_px;
+        const int full_max_y = int(std::ceil(std::max({ uvs[0].y(), uvs[1].y(), uvs[2].y() }) * texture_height)) + padding_px;
+        int min_x = full_min_x;
+        int max_x = full_max_x;
+        int min_y = full_min_y;
+        int max_y = full_max_y;
+        RGBStrokePixelBounds restricted_bounds;
+        auto stroke_found = stroke_by_source_triangle.find(int(tri_idx));
+        if (path_segment_indices.empty() && stroke_found != stroke_by_source_triangle.end()) {
+            for (const size_t facet_idx : stroke_found->second) {
+                if (facet_idx >= task.stroke_facets.size())
+                    continue;
+                for (const Vec3f &vertex : task.stroke_facets[facet_idx].vertices) {
+                    Vec2f pixel_uv = Vec2f::Zero();
+                    if (rgb_pixel_uv_for_local_point(vertex, vertices, pixel_uvs, pixel_uv))
+                        rgb_expand_pixel_bounds(restricted_bounds, pixel_uv, float(padding_px + 1));
+                }
+            }
+        }
+        if (!path_segment_indices.empty()) {
+            const float uv_radius = task.brush_radius * rgb_triangle_uv_pixels_per_world_unit(pixel_uvs, world_vertices) * 2.f + float(padding_px + 1);
+            if (uv_radius > 0.f && std::isfinite(uv_radius)) {
+                for (const size_t segment_idx : path_segment_indices) {
+                    if (segment_idx >= brush_path_segments.size())
+                        continue;
+                    Vec2f pixel_uv = Vec2f::Zero();
+                    if (rgb_pixel_uv_for_local_point(brush_path_segments[segment_idx].local_a, vertices, pixel_uvs, pixel_uv))
+                        rgb_expand_pixel_bounds(restricted_bounds, pixel_uv, uv_radius);
+                    if (rgb_pixel_uv_for_local_point(brush_path_segments[segment_idx].local_b, vertices, pixel_uvs, pixel_uv))
+                        rgb_expand_pixel_bounds(restricted_bounds, pixel_uv, uv_radius);
+                }
+            }
+        }
+        if (!restricted_bounds.valid && stroke_found != stroke_by_source_triangle.end()) {
+            for (const size_t facet_idx : stroke_found->second) {
+                if (facet_idx >= task.stroke_facets.size())
+                    continue;
+                for (const Vec3f &vertex : task.stroke_facets[facet_idx].vertices) {
+                    Vec2f pixel_uv = Vec2f::Zero();
+                    if (rgb_pixel_uv_for_local_point(vertex, vertices, pixel_uvs, pixel_uv))
+                        rgb_expand_pixel_bounds(restricted_bounds, pixel_uv, float(padding_px + 1));
+                }
+            }
+        }
+        if (restricted_bounds.valid) {
+            min_x = std::max(full_min_x, int(std::floor(restricted_bounds.min_x)));
+            max_x = std::min(full_max_x, int(std::ceil(restricted_bounds.max_x)));
+            min_y = std::max(full_min_y, int(std::floor(restricted_bounds.min_y)));
+            max_y = std::min(full_max_y, int(std::ceil(restricted_bounds.max_y)));
+        }
+        if (max_x < min_x || max_y < min_y)
+            continue;
+        if (max_x - min_x > int(task.imported_texture_width) * 2 ||
+            max_y - min_y > int(task.imported_texture_height) * 2)
+            continue;
+
+        for (int y_px = min_y; y_px <= max_y; ++y_px) {
+            if (((y_px - min_y) & 0x1f) == 0 && canceled())
+                return result;
+            for (int x_px = min_x; x_px <= max_x; ++x_px) {
+                if (task.generated_uvs &&
+                    (x_px < 0 ||
+                     y_px < 0 ||
+                     x_px >= int(task.imported_texture_width) ||
+                     y_px >= int(task.imported_texture_height)))
+                    continue;
+                const Vec2f pixel(float(x_px) + 0.5f, float(y_px) + 0.5f);
+                Vec3f barycentric = Vec3f::Zero();
+                const bool has_core_barycentric =
+                    barycentric_weights_2d(pixel, pixel_uvs[0], pixel_uvs[1], pixel_uvs[2], barycentric);
+                const bool core_inside =
+                    has_core_barycentric &&
+                    barycentric.x() >= -1e-4f &&
+                    barycentric.y() >= -1e-4f &&
+                    barycentric.z() >= -1e-4f;
+                if (!core_inside) {
+                    if (padding_px <= 0)
+                        continue;
+                    if (!conservative_barycentric_weights_2d(pixel,
+                                                              pixel_uvs[0],
+                                                              pixel_uvs[1],
+                                                              pixel_uvs[2],
+                                                              float(padding_px) + 0.7072f,
+                                                              barycentric))
+                        continue;
+                }
+
+                const uint32_t wrapped_x = task.generated_uvs ?
+                    uint32_t(x_px) :
+                    wrapped_texture_pixel(x_px, task.imported_texture_width);
+                const uint32_t wrapped_y = task.generated_uvs ?
+                    uint32_t(y_px) :
+                    wrapped_texture_pixel(y_px, task.imported_texture_height);
+                const size_t pixel_idx = size_t(wrapped_y) * size_t(task.imported_texture_width) + size_t(wrapped_x);
+                if (!core_inside &&
+                    uv_core_coverage != nullptr &&
+                    pixel_idx < uv_core_coverage->size() &&
+                    (*uv_core_coverage)[pixel_idx] != 0)
+                    continue;
+
+                float alpha = 0.f;
+                if (use_brush_path) {
+                    const Vec3f point_world = world_vertices[0] * barycentric.x() +
+                                              world_vertices[1] * barycentric.y() +
+                                              world_vertices[2] * barycentric.z();
+                    alpha = sample_rgb_brush_path_alpha(brush_path_segments,
+                                                        path_segment_indices,
+                                                        point_world,
+                                                        task.hardness,
+                                                        task.opacity,
+                                                        task.brush_radius);
+                    if (alpha <= 0.f) {
+                        const Vec3f point = vertices[0] * barycentric.x() +
+                                            vertices[1] * barycentric.y() +
+                                            vertices[2] * barycentric.z();
+                        alpha = sample_rgb_stroke_alpha(task.stroke_facets,
+                                                        stroke_by_source_triangle,
+                                                        stroke_boundary_edges,
+                                                        int(tri_idx),
+                                                        point,
+                                                        task.hardness,
+                                                        task.opacity,
+                                                        task.brush_radius,
+                                                        false);
+                    }
+                } else {
+                    const Vec3f point = vertices[0] * barycentric.x() +
+                                        vertices[1] * barycentric.y() +
+                                        vertices[2] * barycentric.z();
+                    alpha = sample_rgb_stroke_alpha(task.stroke_facets,
+                                                    stroke_by_source_triangle,
+                                                    stroke_boundary_edges,
+                                                    int(tri_idx),
+                                                    point,
+                                                    task.hardness,
+                                                    task.opacity,
+                                                    task.brush_radius,
+                                                    false);
+                }
+                if (alpha <= 0.f)
+                    continue;
+                if (use_dense_alphas) {
+                    float &stored_alpha = dense_alphas[pixel_idx];
+                    if (stored_alpha <= 0.f)
+                        touched_pixels.emplace_back(pixel_idx);
+                    stored_alpha = std::max(stored_alpha, std::clamp(alpha, 0.f, 1.f));
+                } else {
+                    float &stored_alpha = pixel_alphas[pixel_idx];
+                    stored_alpha = std::max(stored_alpha, std::clamp(alpha, 0.f, 1.f));
+                }
+            }
+        }
+    }
+
+    result->pixel_alphas.reserve(use_dense_alphas ? touched_pixels.size() : pixel_alphas.size());
+    if (use_dense_alphas) {
+        for (const size_t pixel_idx : touched_pixels)
+            result->pixel_alphas.emplace_back(pixel_idx, dense_alphas[pixel_idx]);
+    } else {
+        for (const auto &entry : pixel_alphas)
+            result->pixel_alphas.emplace_back(entry.first, entry.second);
+    }
+    std::sort(result->pixel_alphas.begin(),
+              result->pixel_alphas.end(),
+              [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
+    return result;
+}
+
+std::unique_ptr<GLGizmoTrueColorPainting::PendingImageTexturePaintPreview>
+GLGizmoTrueColorPainting::build_pending_image_texture_paint_preview(const ImageTexturePaintTask &task)
+{
+    if (task.stroke_facets.empty())
+        return {};
+
+    GLModel::Geometry geometry;
+    geometry.format = { GLModel::Geometry::EPrimitiveType::Triangles, GLModel::Geometry::EVertexLayout::P3N3 };
+    geometry.color = ColorRGBA(task.brush_color.r(), task.brush_color.g(), task.brush_color.b(), 0.85f);
+    geometry.reserve_vertices(task.stroke_facets.size() * 3);
+    geometry.reserve_indices(task.stroke_facets.size() * 3);
+    unsigned int vertex_idx = 0;
+    for (const TriangleSelector::FacetStateTriangle &facet : task.stroke_facets) {
+        Vec3f normal = (facet.vertices[1] - facet.vertices[0]).cross(facet.vertices[2] - facet.vertices[0]);
+        if (normal.squaredNorm() <= EPSILON)
+            normal = Vec3f(0.f, 0.f, 1.f);
+        else
+            normal.normalize();
+        const Vec3f offset = normal * 0.003f;
+        geometry.add_vertex(facet.vertices[0] + offset, normal);
+        geometry.add_vertex(facet.vertices[1] + offset, normal);
+        geometry.add_vertex(facet.vertices[2] + offset, normal);
+        geometry.add_triangle(vertex_idx, vertex_idx + 1, vertex_idx + 2);
+        vertex_idx += 3;
+    }
+
+    if (geometry.is_empty())
+        return {};
+
+    auto preview = std::make_unique<PendingImageTexturePaintPreview>();
+    preview->object_id = task.object_id;
+    preview->volume_id = task.volume_id;
+    preview->mesh_id = task.mesh_id;
+    preview->sequence = task.sequence;
+    preview->model.init_from(std::move(geometry));
+    return preview;
+}
+
+bool GLGizmoTrueColorPainting::apply_image_texture_paint_result_to_volume(ModelVolume &volume,
+                                                                          const ImageTexturePaintResult &result)
+{
+    if (result.pixel_alphas.empty() ||
+        result.imported_texture_width == 0 ||
+        result.imported_texture_height == 0 ||
+        volume.imported_texture_width != result.imported_texture_width ||
+        volume.imported_texture_height != result.imported_texture_height ||
+        volume.imported_texture_rgba.empty())
+        return false;
+
+    bool volume_changed = false;
+    for (const auto &entry : result.pixel_alphas) {
+        const size_t pixel_idx = entry.first;
+        const uint32_t x = uint32_t(pixel_idx % size_t(volume.imported_texture_width));
+        const uint32_t y = uint32_t(pixel_idx / size_t(volume.imported_texture_width));
+        if (y >= volume.imported_texture_height)
+            continue;
+        const float alpha = std::clamp(entry.second, 0.f, 1.f);
+        const ColorRGBA source_color = read_rgba_pixel(volume.imported_texture_rgba, volume.imported_texture_width, x, y);
+        const ColorRGBA color(source_color.r() * (1.f - alpha) + result.brush_color.r() * alpha,
+                              source_color.g() * (1.f - alpha) + result.brush_color.g() * alpha,
+                              source_color.b() * (1.f - alpha) + result.brush_color.b() * alpha,
+                              source_color.a() * (1.f - alpha) + alpha);
+        volume_changed |= write_rgba_pixel(volume.imported_texture_rgba,
+                                           volume.imported_texture_width,
+                                           x,
+                                           y,
+                                           color);
+    }
+
+    if (volume_changed)
+        volume.imported_texture_rgba.set_new_unique_id();
+    return volume_changed;
+}
+
+[[maybe_unused]] static bool apply_rgb_stroke_to_image_texture(ModelObject                                           &object,
+                                              ModelVolume                                           &volume,
+                                              const std::vector<TriangleSelector::FacetStateTriangle> &stroke_facets,
+                                              const ColorRGBA                                      &brush_color,
+                                              float                                                hardness,
+                                              float                                                opacity,
+                                              float                                                brush_radius,
+                                              const std::vector<Vec3f>                            &brush_stroke_points,
+                                              const Transform3d                                   &world_matrix)
+{
+    if (stroke_facets.empty())
+        return false;
+
+    bool volume_changed = false;
+    if (!model_volume_has_bakeable_image_texture_data(&volume)) {
+        GeneratedImageTextureAtlas generated_atlas;
+        const ColorRGBA fallback_color = projection_base_color_for_volume(volume);
+        Transform3d metric_matrix = volume.get_matrix();
+        if (!object.instances.empty() && object.instances.front() != nullptr)
+            metric_matrix = object.instances.front()->get_transformation().get_matrix() * metric_matrix;
+        if (!initialize_generated_image_texture(volume, fallback_color, &generated_atlas, &metric_matrix))
+            return false;
+        seed_generated_image_texture_from_current_surface_color(volume, generated_atlas, fallback_color);
+        volume_changed = true;
+    }
+
+    if (model_volume_has_raw_atlas_texture_data(&volume)) {
+        clear_imported_texture_raw_atlas(volume);
+        volume_changed = true;
+    }
+
+    if (!model_volume_has_bakeable_image_texture_data(&volume))
+        return volume_changed;
+
+    std::unordered_map<int, std::vector<size_t>> stroke_by_source_triangle;
+    stroke_by_source_triangle.reserve(stroke_facets.size());
+    for (size_t idx = 0; idx < stroke_facets.size(); ++idx)
+        stroke_by_source_triangle[stroke_facets[idx].source_triangle].emplace_back(idx);
+    const RGBStrokeBoundaryEdges stroke_boundary_edges = build_rgb_stroke_boundary_edges(stroke_facets);
+    const std::vector<bool> brush_candidate_triangles =
+        rgb_brush_candidate_source_triangles(volume, brush_stroke_points, brush_radius, stroke_by_source_triangle, world_matrix);
+    const bool use_brush_path = !brush_stroke_points.empty();
+    std::vector<Vec3f> brush_stroke_points_world;
+    if (use_brush_path) {
+        brush_stroke_points_world.reserve(brush_stroke_points.size());
+        for (const Vec3f &point : brush_stroke_points)
+            brush_stroke_points_world.emplace_back(transform_point(world_matrix, point));
+    }
+
+    const bool generated_uvs = volume.uv_map_generator_version > 0;
+    const std::vector<uint8_t> *uv_core_coverage = generated_uvs ? nullptr : cached_texture_uv_core_coverage(volume);
+    const int padding_px = generated_uvs || uv_core_coverage != nullptr ? 1 : 0;
+    std::unordered_map<size_t, float> pixel_alphas;
+    pixel_alphas.reserve(std::max<size_t>(stroke_facets.size() * 32, 128));
+
+    const indexed_triangle_set &its = volume.mesh().its;
+    const float texture_width = float(volume.imported_texture_width);
+    const float texture_height = float(volume.imported_texture_height);
+    for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+        if (tri_idx >= brush_candidate_triangles.size() || !brush_candidate_triangles[tri_idx])
+            continue;
+        if (tri_idx >= volume.imported_texture_uv_valid.size() ||
+            volume.imported_texture_uv_valid[tri_idx] == 0)
+            continue;
+
+        const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
+        if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
+            continue;
+        if (size_t(tri[0]) >= its.vertices.size() ||
+            size_t(tri[1]) >= its.vertices.size() ||
+            size_t(tri[2]) >= its.vertices.size())
+            continue;
+
+        const size_t uv_offset = tri_idx * 6;
+        if (uv_offset + 5 >= volume.imported_texture_uvs_per_face.size())
+            continue;
+
+        const std::array<Vec2f, 3> uvs = unwrap_projection_uvs(std::array<Vec2f, 3>{
+            Vec2f(volume.imported_texture_uvs_per_face[uv_offset + 0], volume.imported_texture_uvs_per_face[uv_offset + 1]),
+            Vec2f(volume.imported_texture_uvs_per_face[uv_offset + 2], volume.imported_texture_uvs_per_face[uv_offset + 3]),
+            Vec2f(volume.imported_texture_uvs_per_face[uv_offset + 4], volume.imported_texture_uvs_per_face[uv_offset + 5])
+        });
+        const std::array<Vec2f, 3> pixel_uvs = {
+            Vec2f(uvs[0].x() * texture_width, uvs[0].y() * texture_height),
+            Vec2f(uvs[1].x() * texture_width, uvs[1].y() * texture_height),
+            Vec2f(uvs[2].x() * texture_width, uvs[2].y() * texture_height)
+        };
+        const std::array<Vec3f, 3> vertices = {
+            its.vertices[size_t(tri[0])].cast<float>(),
+            its.vertices[size_t(tri[1])].cast<float>(),
+            its.vertices[size_t(tri[2])].cast<float>()
+        };
+
+        const int min_x = int(std::floor(std::min({ uvs[0].x(), uvs[1].x(), uvs[2].x() }) * texture_width)) - padding_px;
+        const int max_x = int(std::ceil(std::max({ uvs[0].x(), uvs[1].x(), uvs[2].x() }) * texture_width)) + padding_px;
+        const int min_y = int(std::floor(std::min({ uvs[0].y(), uvs[1].y(), uvs[2].y() }) * texture_height)) - padding_px;
+        const int max_y = int(std::ceil(std::max({ uvs[0].y(), uvs[1].y(), uvs[2].y() }) * texture_height)) + padding_px;
+        if (max_x - min_x > int(volume.imported_texture_width) * 2 ||
+            max_y - min_y > int(volume.imported_texture_height) * 2)
+            continue;
+
+        for (int y_px = min_y; y_px <= max_y; ++y_px) {
+            for (int x_px = min_x; x_px <= max_x; ++x_px) {
+                if (generated_uvs &&
+                    (x_px < 0 ||
+                     y_px < 0 ||
+                     x_px >= int(volume.imported_texture_width) ||
+                     y_px >= int(volume.imported_texture_height)))
+                    continue;
+                const Vec2f pixel(float(x_px) + 0.5f, float(y_px) + 0.5f);
+                Vec3f barycentric = Vec3f::Zero();
+                const bool has_core_barycentric =
+                    barycentric_weights_2d(pixel, pixel_uvs[0], pixel_uvs[1], pixel_uvs[2], barycentric);
+                const bool core_inside =
+                    has_core_barycentric &&
+                    barycentric.x() >= -1e-4f &&
+                    barycentric.y() >= -1e-4f &&
+                    barycentric.z() >= -1e-4f;
+                if (!core_inside) {
+                    if (padding_px <= 0)
+                        continue;
+                    if (!conservative_barycentric_weights_2d(pixel,
+                                                              pixel_uvs[0],
+                                                              pixel_uvs[1],
+                                                              pixel_uvs[2],
+                                                              float(padding_px) + 0.7072f,
+                                                              barycentric))
+                        continue;
+                }
+
+                const uint32_t wrapped_x = generated_uvs ?
+                    uint32_t(x_px) :
+                    wrapped_texture_pixel(x_px, volume.imported_texture_width);
+                const uint32_t wrapped_y = generated_uvs ?
+                    uint32_t(y_px) :
+                    wrapped_texture_pixel(y_px, volume.imported_texture_height);
+                const size_t pixel_idx = size_t(wrapped_y) * size_t(volume.imported_texture_width) + size_t(wrapped_x);
+                if (!core_inside &&
+                    uv_core_coverage != nullptr &&
+                    pixel_idx < uv_core_coverage->size() &&
+                    (*uv_core_coverage)[pixel_idx] != 0)
+                    continue;
+
+                const Vec3f point = vertices[0] * barycentric.x() +
+                                    vertices[1] * barycentric.y() +
+                                    vertices[2] * barycentric.z();
+                float alpha = 0.f;
+                if (use_brush_path) {
+                    alpha = sample_rgb_brush_path_alpha(brush_stroke_points_world,
+                                                        transform_point(world_matrix, point),
+                                                        hardness,
+                                                        opacity,
+                                                        brush_radius);
+                    alpha = std::max(alpha,
+                                     sample_rgb_stroke_alpha(stroke_facets,
+                                                             stroke_by_source_triangle,
+                                                             stroke_boundary_edges,
+                                                             int(tri_idx),
+                                                             point,
+                                                             hardness,
+                                                             opacity,
+                                                             brush_radius));
+                } else {
+                    alpha = sample_rgb_stroke_alpha(stroke_facets,
+                                                    stroke_by_source_triangle,
+                                                    stroke_boundary_edges,
+                                                    int(tri_idx),
+                                                    point,
+                                                    hardness,
+                                                    opacity,
+                                                    brush_radius);
+                }
+                if (alpha <= 0.f)
+                    continue;
+                float &stored_alpha = pixel_alphas[pixel_idx];
+                stored_alpha = std::max(stored_alpha, std::clamp(alpha, 0.f, 1.f));
+            }
+        }
+    }
+
+    if (pixel_alphas.empty()) {
+        if (volume_changed)
+            volume.imported_texture_rgba.set_new_unique_id();
+        return volume_changed;
+    }
+
+    for (const auto &entry : pixel_alphas) {
+        const size_t pixel_idx = entry.first;
+        const uint32_t x = uint32_t(pixel_idx % size_t(volume.imported_texture_width));
+        const uint32_t y = uint32_t(pixel_idx / size_t(volume.imported_texture_width));
+        const float alpha = std::clamp(entry.second, 0.f, 1.f);
+        const ColorRGBA source_color = read_rgba_pixel(volume.imported_texture_rgba, volume.imported_texture_width, x, y);
+        const ColorRGBA color(source_color.r() * (1.f - alpha) + brush_color.r() * alpha,
+                              source_color.g() * (1.f - alpha) + brush_color.g() * alpha,
+                              source_color.b() * (1.f - alpha) + brush_color.b() * alpha,
+                              source_color.a() * (1.f - alpha) + alpha);
+        volume_changed |= write_rgba_pixel(volume.imported_texture_rgba,
+                                           volume.imported_texture_width,
+                                           x,
+                                           y,
+                                           color);
+    }
+
+    if (volume_changed)
+        volume.imported_texture_rgba.set_new_unique_id();
+    return volume_changed;
+}
+
 static bool append_dialog_vertex_colors_for_volume(const ModelVolume                    &volume,
                                                    std::vector<RGBA>                   &input_colors,
                                                    const ManagedColorDataCreateSource  &source)
@@ -11247,6 +12321,7 @@ GLGizmoTrueColorPainting::GLGizmoTrueColorPainting(GLCanvas3D& parent, const std
 
 GLGizmoTrueColorPainting::~GLGizmoTrueColorPainting()
 {
+    cancel_image_texture_paint_worker();
     cancel_rgb_data_preview_conversion();
 }
 
@@ -11256,19 +12331,39 @@ bool GLGizmoTrueColorPainting::on_init()
     m_tool_type = ToolType::BRUSH;
     m_triangle_splitting_enabled = true;
     m_cursor_radius = 1.f;
+    m_painting_storage_mode = PaintingStorageMode::ImageTexture;
     sync_active_color_mode_from_rgb(true);
     return true;
 }
 
 void GLGizmoTrueColorPainting::on_opening()
 {
+    m_painting_storage_mode = PaintingStorageMode::ImageTexture;
     update_selected_object_color_state();
     if (m_color_input_mode == ColorInputMode::FilamentColors)
         sync_active_color_mode_from_rgb(true);
 }
 
+bool GLGizmoTrueColorPainting::on_before_shutdown()
+{
+    process_completed_image_texture_paint_strokes();
+    if (!has_pending_image_texture_paint_strokes())
+        return true;
+
+    MessageDialog dlg(wxGetApp().mainframe,
+                      _L("Brushstrokes you have made are still applying. Closing the panel now will lose recent changes"),
+                      _L("RGB Color Painting"),
+                      wxICON_WARNING | wxYES | wxNO);
+    dlg.SetButtonLabel(wxID_YES, _L("Close panel"));
+    dlg.SetButtonLabel(wxID_NO, _L("Wait"), true);
+    dlg.SetButtonStyle(wxID_YES, ButtonStyle::Alert);
+    dlg.SetButtonStyle(wxID_NO, ButtonStyle::Confirm);
+    return dlg.ShowModal() == wxID_YES;
+}
+
 void GLGizmoTrueColorPainting::on_shutdown()
 {
+    cancel_image_texture_paint_worker();
     cancel_rgb_data_preview_conversion();
     m_color_picker_active = false;
     clear_brush_stroke_points();
@@ -11336,7 +12431,8 @@ ColorRGBA GLGizmoTrueColorPainting::get_cursor_sphere_left_button_color() const
 
 void GLGizmoTrueColorPainting::render_painter_gizmo()
 {
-    update_rgb_data_preview_conversion();
+    if (active_painting_storage_mode() == PaintingStorageMode::RgbaData)
+        update_rgb_data_preview_conversion();
     const ModelObject *object = selected_model_object();
     if (object == nullptr)
         return;
@@ -11347,7 +12443,8 @@ void GLGizmoTrueColorPainting::render_painter_gizmo()
     glsafe(::glEnable(GL_BLEND));
     glsafe(::glEnable(GL_DEPTH_TEST));
 
-    render_cached_rgb_data_preview(*object, selection);
+    if (active_painting_storage_mode() == PaintingStorageMode::RgbaData)
+        render_cached_rgb_data_preview(*object, selection);
     if (m_brush_stroke_active || m_live_selector_preview_active) {
         GLboolean depth_mask = GL_TRUE;
         GLint depth_func = GL_LESS;
@@ -11368,6 +12465,52 @@ void GLGizmoTrueColorPainting::render_painter_gizmo()
     glsafe(::glDisable(GL_BLEND));
 }
 
+bool GLGizmoTrueColorPainting::render_triangle_texture_preview_before_selector() const
+{
+    return active_painting_storage_mode() == PaintingStorageMode::ImageTexture;
+}
+
+void GLGizmoTrueColorPainting::render_extra_triangle_overlays(int mesh_id,
+                                                              const Transform3d &matrix,
+                                                              const Transform3d &view_matrix,
+                                                              const Transform3d &projection_matrix,
+                                                              const std::array<float, 2> &z_range,
+                                                              const std::array<float, 4> &clipping_plane) const
+{
+    (void)matrix;
+    (void)view_matrix;
+    (void)projection_matrix;
+    (void)z_range;
+    (void)clipping_plane;
+    if (active_painting_storage_mode() != PaintingStorageMode::ImageTexture ||
+        m_pending_image_texture_paint_previews.empty() ||
+        mesh_id < 0)
+        return;
+
+    GLShaderProgram *shader = wxGetApp().get_current_shader();
+    if (shader == nullptr)
+        return;
+
+    GLint depth_func = GL_LESS;
+    GLfloat polygon_offset_factor = 0.f;
+    GLfloat polygon_offset_units = 0.f;
+    GLboolean polygon_offset_fill_enabled = glIsEnabled(GL_POLYGON_OFFSET_FILL);
+    glsafe(::glGetIntegerv(GL_DEPTH_FUNC, &depth_func));
+    glsafe(::glGetFloatv(GL_POLYGON_OFFSET_FACTOR, &polygon_offset_factor));
+    glsafe(::glGetFloatv(GL_POLYGON_OFFSET_UNITS, &polygon_offset_units));
+
+    glsafe(::glDepthFunc(GL_LEQUAL));
+    glsafe(::glEnable(GL_POLYGON_OFFSET_FILL));
+    glsafe(::glPolygonOffset(-1.f, -1.f));
+    for (const std::unique_ptr<PendingImageTexturePaintPreview> &preview : m_pending_image_texture_paint_previews)
+        if (preview && preview->mesh_id == mesh_id)
+            preview->model.render(shader);
+    glsafe(::glPolygonOffset(polygon_offset_factor, polygon_offset_units));
+    if (!polygon_offset_fill_enabled)
+        glsafe(::glDisable(GL_POLYGON_OFFSET_FILL));
+    glsafe(::glDepthFunc(depth_func));
+}
+
 bool GLGizmoTrueColorPainting::gizmo_event(SLAGizmoEventType action,
                                            const Vec2d& mouse_position,
                                            bool shift_down,
@@ -11384,7 +12527,15 @@ bool GLGizmoTrueColorPainting::gizmo_event(SLAGizmoEventType action,
     const ModelObject *object = selected_model_object();
     if (object == nullptr || object->id() != m_selected_color_state_object_id)
         update_selected_object_color_state();
-    update_rgb_data_preview_conversion();
+    const PaintingStorageMode storage_mode = active_painting_storage_mode();
+    if (storage_mode == PaintingStorageMode::RgbaData)
+        update_rgb_data_preview_conversion();
+
+    if (storage_mode == PaintingStorageMode::ImageTexture && selected_object_has_rgb_data()) {
+        if (painting_event)
+            return true;
+        return false;
+    }
 
     if (m_color_picker_active) {
         if (action == SLAGizmoEventType::LeftDown) {
@@ -11400,7 +12551,8 @@ bool GLGizmoTrueColorPainting::gizmo_event(SLAGizmoEventType action,
             return true;
     }
 
-    if (rgb_data_preview_conversion_pending_for_selected_object() &&
+    if (storage_mode == PaintingStorageMode::RgbaData &&
+        rgb_data_preview_conversion_pending_for_selected_object() &&
         action == SLAGizmoEventType::LeftDown) {
         int mesh_id = -1;
         Vec3f hit = Vec3f::Zero();
@@ -11452,6 +12604,32 @@ void GLGizmoTrueColorPainting::init_model_triangle_selectors()
     m_triangle_selectors.clear();
     if (object == nullptr)
         return;
+
+    if (active_painting_storage_mode() == PaintingStorageMode::ImageTexture) {
+        for (const ModelVolume *volume : object->volumes) {
+            if (volume == nullptr || !volume->is_model_part())
+                continue;
+
+            const bool has_rgba_data = !volume->texture_mapping_color_facets.empty();
+            const bool has_image_texture = !has_rgba_data && model_volume_has_bakeable_image_texture_data(volume);
+            const std::vector<ColorRGBA> colors = {
+                has_image_texture ? ColorRGBA(1.f, 1.f, 1.f, 0.f) : projection_base_color_for_volume(*volume),
+                ColorRGBA(m_rgb_color[0], m_rgb_color[1], m_rgb_color[2], 1.f)
+            };
+            m_triangle_selectors.emplace_back(std::make_unique<TriangleSelectorPatch>(volume->mesh(), volume, colors, 0.2f));
+            if (TriangleSelectorPatch *patch = dynamic_cast<TriangleSelectorPatch *>(m_triangle_selectors.back().get())) {
+                patch->set_none_state_rendered(!has_image_texture);
+                patch->set_texture_mapping_color_preview(nullptr);
+                patch->set_full_texture_preview_forced(has_image_texture);
+                patch->set_texture_preview_needed(has_image_texture);
+                patch->set_texture_preview_opaque(true);
+                patch->set_surface_offset(has_image_texture ? 0.002f : 0.f);
+            }
+            m_triangle_selectors.back()->set_wireframe_needed(true);
+            m_triangle_selectors.back()->request_update_render_data(true);
+        }
+        return;
+    }
 
     bool needs_async_rgb_preview = false;
     for (const ModelVolume *volume : object->volumes) {
@@ -11515,6 +12693,164 @@ void GLGizmoTrueColorPainting::cancel_rgb_data_preview_conversion()
         m_rgb_data_conversion_thread.join();
     m_rgb_data_conversion_state.reset();
     m_rgb_data_conversion_object_id = ObjectID();
+}
+
+void GLGizmoTrueColorPainting::start_image_texture_paint_worker()
+{
+    if (m_image_texture_paint_thread.joinable())
+        return;
+
+    {
+        std::lock_guard<std::mutex> lock(m_image_texture_paint_mutex);
+        if (!m_image_texture_paint_cancel)
+            m_image_texture_paint_cancel = std::make_shared<std::atomic_bool>(false);
+        m_image_texture_paint_cancel->store(false, std::memory_order_relaxed);
+        m_image_texture_paint_stop = false;
+        m_image_texture_paint_worker_running = true;
+    }
+
+    m_image_texture_paint_thread = std::thread([this]() {
+        for (;;) {
+            std::shared_ptr<ImageTexturePaintTask> task;
+            {
+                std::unique_lock<std::mutex> lock(m_image_texture_paint_mutex);
+                m_image_texture_paint_cv.wait(lock, [this]() {
+                    return m_image_texture_paint_stop || !m_image_texture_paint_tasks.empty();
+                });
+                if (m_image_texture_paint_stop && m_image_texture_paint_tasks.empty())
+                    break;
+                task = std::move(m_image_texture_paint_tasks.front());
+                m_image_texture_paint_tasks.pop_front();
+                m_image_texture_paint_task_active = true;
+            }
+
+            std::shared_ptr<ImageTexturePaintResult> result;
+            if (task) {
+                try {
+                    result = compute_image_texture_paint_task(*task);
+                } catch (...) {
+                    result = std::make_shared<ImageTexturePaintResult>();
+                    result->object_id = task->object_id;
+                    result->volume_id = task->volume_id;
+                    result->sequence = task->sequence;
+                    result->imported_texture_width = task->imported_texture_width;
+                    result->imported_texture_height = task->imported_texture_height;
+                    result->brush_color = task->brush_color;
+                }
+            }
+
+            if (result) {
+                bool canceled = false;
+                {
+                    std::lock_guard<std::mutex> lock(m_image_texture_paint_mutex);
+                    canceled = m_image_texture_paint_stop;
+                    if (!canceled)
+                        m_image_texture_paint_results.emplace_back(std::move(result));
+                    m_image_texture_paint_task_active = false;
+                }
+                if (!canceled) {
+                    call_after_if_true_color_painting_active([this]() {
+                        process_completed_image_texture_paint_strokes();
+                    });
+                }
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(m_image_texture_paint_mutex);
+        m_image_texture_paint_worker_running = false;
+        m_image_texture_paint_task_active = false;
+    });
+}
+
+void GLGizmoTrueColorPainting::cancel_image_texture_paint_worker()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_image_texture_paint_mutex);
+        if (m_image_texture_paint_cancel)
+            m_image_texture_paint_cancel->store(true, std::memory_order_relaxed);
+        m_image_texture_paint_stop = true;
+        m_image_texture_paint_tasks.clear();
+        m_image_texture_paint_results.clear();
+    }
+    m_image_texture_paint_cv.notify_all();
+    if (m_image_texture_paint_thread.joinable())
+        m_image_texture_paint_thread.join();
+    {
+        std::lock_guard<std::mutex> lock(m_image_texture_paint_mutex);
+        m_image_texture_paint_stop = false;
+        m_image_texture_paint_worker_running = false;
+        m_image_texture_paint_task_active = false;
+        m_image_texture_paint_tasks.clear();
+        m_image_texture_paint_results.clear();
+        m_image_texture_paint_cancel.reset();
+    }
+    clear_pending_image_texture_paint_previews();
+    m_next_image_texture_paint_sequence = 1;
+    m_next_image_texture_paint_apply_sequence = 1;
+}
+
+void GLGizmoTrueColorPainting::clear_pending_image_texture_paint_previews()
+{
+    m_pending_image_texture_paint_previews.clear();
+}
+
+bool GLGizmoTrueColorPainting::has_pending_image_texture_paint_strokes()
+{
+    std::lock_guard<std::mutex> lock(m_image_texture_paint_mutex);
+    return m_image_texture_paint_task_active ||
+           !m_image_texture_paint_tasks.empty() ||
+           !m_image_texture_paint_results.empty() ||
+           !m_pending_image_texture_paint_previews.empty();
+}
+
+void GLGizmoTrueColorPainting::process_completed_image_texture_paint_strokes()
+{
+    std::vector<std::shared_ptr<ImageTexturePaintResult>> results;
+    {
+        std::lock_guard<std::mutex> lock(m_image_texture_paint_mutex);
+        while (!m_image_texture_paint_results.empty() &&
+               m_image_texture_paint_results.front() &&
+               m_image_texture_paint_results.front()->sequence == m_next_image_texture_paint_apply_sequence) {
+            results.emplace_back(std::move(m_image_texture_paint_results.front()));
+            m_image_texture_paint_results.pop_front();
+            ++m_next_image_texture_paint_apply_sequence;
+        }
+    }
+
+    if (results.empty())
+        return;
+
+    std::vector<ModelObject *> changed_objects;
+    for (const std::shared_ptr<ImageTexturePaintResult> &result : results) {
+        if (!result)
+            continue;
+
+        ModelObject *object = find_model_object_by_id(result->object_id);
+        if (object != nullptr) {
+            for (ModelVolume *volume : object->volumes) {
+                if (volume == nullptr || volume->id() != result->volume_id)
+                    continue;
+                if (apply_image_texture_paint_result_to_volume(*volume, *result) &&
+                    std::find(changed_objects.begin(), changed_objects.end(), object) == changed_objects.end())
+                    changed_objects.emplace_back(object);
+                break;
+            }
+        }
+
+        m_pending_image_texture_paint_previews.erase(
+            std::remove_if(m_pending_image_texture_paint_previews.begin(),
+                           m_pending_image_texture_paint_previews.end(),
+                           [sequence = result->sequence](const std::unique_ptr<PendingImageTexturePaintPreview> &preview) {
+                               return !preview || preview->sequence == sequence;
+                           }),
+            m_pending_image_texture_paint_previews.end());
+    }
+
+    for (ModelObject *object : changed_objects)
+        refresh_selected_object_after_image_texture_change(object, false);
+
+    m_parent.set_as_dirty();
+    m_parent.request_extra_frame();
 }
 
 void GLGizmoTrueColorPainting::update_rgb_data_preview_conversion()
@@ -11844,14 +13180,32 @@ void GLGizmoTrueColorPainting::render_cached_rgb_data_preview(const ModelObject 
 
 void GLGizmoTrueColorPainting::update_triangle_selectors_color()
 {
-    const std::vector<ColorRGBA> colors = {
-        ColorRGBA(1.f, 1.f, 1.f, 0.f),
-        ColorRGBA(m_rgb_color[0], m_rgb_color[1], m_rgb_color[2], 1.f)
-    };
+    ModelObject *object = selected_model_object();
+    int selector_idx = -1;
     for (std::unique_ptr<TriangleSelectorGUI> &selector : m_triangle_selectors) {
+        ++selector_idx;
         TriangleSelectorPatch *patch = dynamic_cast<TriangleSelectorPatch *>(selector.get());
         if (patch == nullptr)
             continue;
+        ColorRGBA base_color(1.f, 1.f, 1.f, 0.f);
+        if (active_painting_storage_mode() == PaintingStorageMode::ImageTexture && object != nullptr) {
+            int volume_idx = -1;
+            for (const ModelVolume *volume : object->volumes) {
+                if (volume == nullptr || !volume->is_model_part())
+                    continue;
+                ++volume_idx;
+                if (volume_idx == selector_idx) {
+                    if (!model_volume_has_bakeable_image_texture_data(volume) ||
+                        !volume->texture_mapping_color_facets.empty())
+                        base_color = projection_base_color_for_volume(*volume);
+                    break;
+                }
+            }
+        }
+        const std::vector<ColorRGBA> colors = {
+            base_color,
+            ColorRGBA(m_rgb_color[0], m_rgb_color[1], m_rgb_color[2], 1.f)
+        };
         patch->set_ebt_colors(colors);
     }
     m_parent.set_as_dirty();
@@ -11860,7 +13214,8 @@ void GLGizmoTrueColorPainting::update_triangle_selectors_color()
 void GLGizmoTrueColorPainting::update_from_model_object(bool first_update)
 {
     (void)first_update;
-    update_rgb_data_preview_conversion();
+    if (active_painting_storage_mode() == PaintingStorageMode::RgbaData)
+        update_rgb_data_preview_conversion();
     update_selected_object_color_state();
     init_model_triangle_selectors();
 }
@@ -11870,6 +13225,142 @@ void GLGizmoTrueColorPainting::update_model_object()
     ModelObject *object = selected_model_object();
     if (object == nullptr)
         return;
+
+    if (active_painting_storage_mode() == PaintingStorageMode::ImageTexture) {
+        if (selected_object_has_rgb_data()) {
+            clear_brush_stroke_points();
+            return;
+        }
+
+        const bool converting_raw_to_rgba_image = selected_object_has_raw_atlas_texture_data();
+        bool rebuild_selectors_after_update = false;
+        for (const ModelVolume *volume : object->volumes) {
+            if (volume == nullptr || !volume->is_model_part())
+                continue;
+            if (!model_volume_has_bakeable_image_texture_data(volume)) {
+                rebuild_selectors_after_update = true;
+                break;
+            }
+        }
+        bool updated = false;
+        bool queued = false;
+        std::vector<std::shared_ptr<ImageTexturePaintTask>> tasks_to_queue;
+        std::vector<std::unique_ptr<PendingImageTexturePaintPreview>> previews_to_add;
+        if (!m_image_texture_paint_cancel)
+            m_image_texture_paint_cancel = std::make_shared<std::atomic_bool>(false);
+        m_image_texture_paint_cancel->store(false, std::memory_order_relaxed);
+        int selector_idx = -1;
+        for (ModelVolume *volume : object->volumes) {
+            if (volume == nullptr || !volume->is_model_part())
+                continue;
+            ++selector_idx;
+            if (selector_idx < 0 ||
+                size_t(selector_idx) >= m_triangle_selectors.size() ||
+                m_triangle_selectors[size_t(selector_idx)] == nullptr)
+                continue;
+
+            std::vector<std::vector<TriangleSelector::FacetStateTriangle>> triangles_per_type;
+            m_triangle_selectors[size_t(selector_idx)]->get_facet_triangles(triangles_per_type);
+            const size_t paint_state = size_t(EnforcerBlockerType::ENFORCER);
+            if (triangles_per_type.size() <= paint_state || triangles_per_type[paint_state].empty())
+                continue;
+
+            const ColorRGBA brush_color(m_rgb_color[0], m_rgb_color[1], m_rgb_color[2], 1.f);
+            const std::vector<Vec3f> empty_brush_stroke_points;
+            const std::vector<Vec3f> &brush_stroke_points =
+                selector_idx < int(m_brush_stroke_points_by_volume.size()) ?
+                    m_brush_stroke_points_by_volume[size_t(selector_idx)] :
+                    empty_brush_stroke_points;
+            const Selection &selection = m_parent.get_selection();
+            const Transform3d world_matrix =
+                projection_world_matrix_for_volume(m_parent, object, volume, selection.get_instance_idx());
+
+            bool prepared_texture = false;
+            if (!model_volume_has_bakeable_image_texture_data(volume)) {
+                GeneratedImageTextureAtlas generated_atlas;
+                const ColorRGBA fallback_color = projection_base_color_for_volume(*volume);
+                Transform3d metric_matrix = volume->get_matrix();
+                if (!object->instances.empty() && object->instances.front() != nullptr)
+                    metric_matrix = object->instances.front()->get_transformation().get_matrix() * metric_matrix;
+                if (initialize_generated_image_texture(*volume, fallback_color, &generated_atlas, &metric_matrix)) {
+                    seed_generated_image_texture_from_current_surface_color(*volume, generated_atlas, fallback_color);
+                    prepared_texture = true;
+                }
+            }
+
+            if (model_volume_has_raw_atlas_texture_data(volume)) {
+                clear_imported_texture_raw_atlas(*volume);
+                prepared_texture = true;
+            }
+
+            if (prepared_texture) {
+                volume->imported_texture_rgba.set_new_unique_id();
+                updated = true;
+            }
+
+            if (model_volume_has_bakeable_image_texture_data(volume)) {
+                auto task = std::make_shared<ImageTexturePaintTask>();
+                task->object_id = object->id();
+                task->volume_id = volume->id();
+                task->mesh_id = selector_idx;
+                task->sequence = m_next_image_texture_paint_sequence++;
+                task->its = volume->mesh().its;
+                task->imported_texture_uvs_per_face.assign(volume->imported_texture_uvs_per_face.begin(),
+                                                           volume->imported_texture_uvs_per_face.end());
+                task->imported_texture_uv_valid.assign(volume->imported_texture_uv_valid.begin(),
+                                                       volume->imported_texture_uv_valid.end());
+                task->imported_texture_width = volume->imported_texture_width;
+                task->imported_texture_height = volume->imported_texture_height;
+                task->generated_uvs = volume->uv_map_generator_version > 0;
+                if (!task->generated_uvs) {
+                    if (const std::vector<uint8_t> *coverage = cached_texture_uv_core_coverage(*volume);
+                        coverage != nullptr) {
+                        task->has_uv_core_coverage = true;
+                        task->uv_core_coverage = *coverage;
+                    }
+                }
+                task->stroke_facets = triangles_per_type[paint_state];
+                task->brush_color = brush_color;
+                task->hardness = m_brush_hardness;
+                task->opacity = m_opacity;
+                task->brush_radius = m_cursor_radius;
+                task->brush_stroke_points = brush_stroke_points;
+                task->world_matrix = world_matrix;
+                task->cancel = m_image_texture_paint_cancel;
+
+                if (std::unique_ptr<PendingImageTexturePaintPreview> preview = build_pending_image_texture_paint_preview(*task))
+                    previews_to_add.emplace_back(std::move(preview));
+                tasks_to_queue.emplace_back(std::move(task));
+                queued = true;
+            }
+
+            m_triangle_selectors[size_t(selector_idx)]->reset();
+            m_triangle_selectors[size_t(selector_idx)]->request_update_render_data(true);
+        }
+
+        if (!updated && !queued)
+            return;
+
+        if (queued) {
+            start_image_texture_paint_worker();
+            {
+                std::lock_guard<std::mutex> lock(m_image_texture_paint_mutex);
+                for (std::shared_ptr<ImageTexturePaintTask> &task : tasks_to_queue)
+                    m_image_texture_paint_tasks.emplace_back(std::move(task));
+            }
+            m_image_texture_paint_cv.notify_all();
+            for (std::unique_ptr<PendingImageTexturePaintPreview> &preview : previews_to_add)
+                m_pending_image_texture_paint_previews.emplace_back(std::move(preview));
+        }
+
+        const unsigned int texture_mapping_filament_id = ensure_texture_mapping_zone();
+        assign_texture_mapping_zone_preserving_painted_regions(*object, texture_mapping_filament_id);
+
+        refresh_selected_object_after_image_texture_change(object, rebuild_selectors_after_update);
+        if (converting_raw_to_rgba_image && !selected_object_has_raw_atlas_texture_data())
+            show_raw_offset_data_converted_to_rgba_image_message();
+        return;
+    }
 
     const bool converting_raw_to_rgba = selected_object_has_raw_atlas_texture_data() && !selected_object_has_rgb_data();
     bool updated = false;
@@ -11956,6 +13447,7 @@ void GLGizmoTrueColorPainting::open_color_data_management_dialog()
     if (object == nullptr)
         return;
 
+    cancel_image_texture_paint_worker();
     cancel_rgb_data_preview_conversion();
     m_preview_rgb_data_volume_ids.clear();
     m_preview_rgb_data_by_volume.clear();
@@ -11976,6 +13468,7 @@ void GLGizmoTrueColorPainting::update_selected_object_color_state()
 {
     m_selected_has_rgb_data = false;
     m_selected_has_imported_color_data = false;
+    m_selected_has_image_texture_data = false;
     m_selected_can_convert_vertex = false;
     m_selected_can_convert_image = false;
     m_selected_has_raw_atlas_texture_data = false;
@@ -11984,6 +13477,7 @@ void GLGizmoTrueColorPainting::update_selected_object_color_state()
     const ObjectID previous_object_id = m_selected_color_state_object_id;
     m_selected_color_state_object_id = object != nullptr ? object->id() : ObjectID();
     if (m_selected_color_state_object_id != previous_object_id) {
+        cancel_image_texture_paint_worker();
         cancel_rgb_data_preview_conversion();
         m_preview_rgb_data_volume_ids.clear();
         m_preview_rgb_data_by_volume.clear();
@@ -11999,15 +13493,31 @@ void GLGizmoTrueColorPainting::update_selected_object_color_state()
             continue;
         m_selected_has_rgb_data |= !volume->texture_mapping_color_facets.empty();
         m_selected_can_convert_vertex |= !volume->imported_vertex_colors_rgba.empty();
+        m_selected_has_image_texture_data |= model_volume_has_imported_image_texture_data(volume);
         m_selected_can_convert_image |= model_volume_has_bakeable_image_texture_data(volume);
         m_selected_has_raw_atlas_texture_data |= model_volume_has_raw_atlas_texture_data(volume);
     }
     m_selected_has_imported_color_data = m_selected_can_convert_vertex || m_selected_can_convert_image;
 }
 
+GLGizmoTrueColorPainting::PaintingStorageMode GLGizmoTrueColorPainting::active_painting_storage_mode() const
+{
+#if 0
+    return m_painting_storage_mode;
+#else
+    (void)m_painting_storage_mode;
+    return PaintingStorageMode::ImageTexture;
+#endif
+}
+
 bool GLGizmoTrueColorPainting::selected_object_has_rgb_data() const
 {
     return m_selected_has_rgb_data;
+}
+
+bool GLGizmoTrueColorPainting::selected_object_has_image_texture_data() const
+{
+    return m_selected_has_image_texture_data;
 }
 
 bool GLGizmoTrueColorPainting::selected_object_has_imported_color_data() const
@@ -12159,6 +13669,74 @@ void GLGizmoTrueColorPainting::convert_selected_object_image_texture_to_rgb_data
     refresh_selected_object_after_rgb_change(object);
 }
 
+void GLGizmoTrueColorPainting::convert_selected_object_rgba_data_to_image_texture()
+{
+    ModelObject *object = selected_model_object();
+    if (object == nullptr || !selected_object_has_rgb_data())
+        return;
+
+    bool converted = false;
+    bool cleared = false;
+    std::optional<ColorRGBA> object_background;
+    Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Convert RGBA data to image texture", UndoRedo::SnapshotType::GizmoAction);
+    for (ModelVolume *volume : object->volumes) {
+        if (volume == nullptr || !volume->is_model_part() || volume->texture_mapping_color_facets.empty())
+            continue;
+
+        const ColorRGBA background = rgb_metadata_background_color(volume->texture_mapping_color_facets);
+        if (!object_background)
+            object_background = background;
+        if (!convert_volume_rgba_data_to_image_texture_for_painting(*object, *volume))
+            continue;
+
+        volume->texture_mapping_color_facets.reset();
+        converted = true;
+        cleared = true;
+    }
+
+    if (!converted)
+        return;
+
+    if (object_background)
+        set_texture_mapping_background_config(object->config, *object_background);
+
+    const unsigned int texture_mapping_filament_id = ensure_texture_mapping_zone();
+    assign_texture_mapping_zone_preserving_painted_regions(*object, texture_mapping_filament_id);
+
+    refresh_selected_object_after_image_texture_change(object);
+    remember_changed_rgb_data_object(object);
+    backup_changed_rgb_data_objects();
+    if (cleared)
+        m_color_picker_source_cache.clear();
+}
+
+void GLGizmoTrueColorPainting::erase_selected_object_rgba_data_for_image_texture_painting()
+{
+    ModelObject *object = selected_model_object();
+    if (object == nullptr || !selected_object_has_rgb_data() || !selected_object_has_image_texture_data())
+        return;
+
+    bool cleared = false;
+    Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Erase RGBA data", UndoRedo::SnapshotType::GizmoAction);
+    for (ModelVolume *volume : object->volumes) {
+        if (volume == nullptr || !volume->is_model_part() || volume->texture_mapping_color_facets.empty())
+            continue;
+        volume->texture_mapping_color_facets.reset();
+        cleared = true;
+    }
+
+    if (!cleared)
+        return;
+
+    const unsigned int texture_mapping_filament_id = ensure_texture_mapping_zone();
+    assign_texture_mapping_zone_preserving_painted_regions(*object, texture_mapping_filament_id);
+
+    refresh_selected_object_after_image_texture_change(object);
+    remember_changed_rgb_data_object(object);
+    backup_changed_rgb_data_objects();
+    m_color_picker_source_cache.clear();
+}
+
 void GLGizmoTrueColorPainting::refresh_selected_object_after_rgb_change(ModelObject *object)
 {
     remember_changed_rgb_data_object(object);
@@ -12171,6 +13749,29 @@ void GLGizmoTrueColorPainting::refresh_selected_object_after_rgb_change(ModelObj
     const ModelObjectPtrs &objects = wxGetApp().model().objects;
     const size_t object_idx = size_t(std::find(objects.begin(), objects.end(), object) - objects.begin());
     if (object_idx < objects.size()) {
+        wxGetApp().obj_list()->update_info_items(object_idx);
+        wxGetApp().plater()->get_partplate_list().notify_instance_update(object_idx, 0);
+    }
+    m_parent.post_event(SimpleEvent(EVT_GLCANVAS_SCHEDULE_BACKGROUND_PROCESS));
+}
+
+void GLGizmoTrueColorPainting::refresh_selected_object_after_image_texture_change(ModelObject *object, bool rebuild_selectors)
+{
+    remember_changed_rgb_data_object(object);
+    update_selected_object_color_state();
+    clear_rgb_preview_cache();
+    if (rebuild_selectors)
+        init_model_triangle_selectors();
+    else
+        update_triangle_selectors_color();
+    m_parent.update_volumes_colors_by_extruder();
+    m_parent.set_as_dirty();
+    m_parent.request_extra_frame();
+
+    const ModelObjectPtrs &objects = wxGetApp().model().objects;
+    const size_t object_idx = size_t(std::find(objects.begin(), objects.end(), object) - objects.begin());
+    if (object_idx < objects.size()) {
+        m_parent.invalidate_texture_mapping_preview_for_object(object_idx);
         wxGetApp().obj_list()->update_info_items(object_idx);
         wxGetApp().plater()->get_partplate_list().notify_instance_update(object_idx, 0);
     }
@@ -12201,6 +13802,8 @@ bool GLGizmoTrueColorPainting::sample_color_from_model(const Vec2d &mouse_positi
 {
     ModelObject *object = selected_model_object();
     if (object == nullptr)
+        return false;
+    if (active_painting_storage_mode() == PaintingStorageMode::ImageTexture && selected_object_has_rgb_data())
         return false;
 
     int mesh_idx = -1;
@@ -12986,7 +14589,9 @@ void GLGizmoTrueColorPainting::on_render_input_window(float x, float y, float bo
         return;
     if (object->id() != m_selected_color_state_object_id)
         update_selected_object_color_state();
-    update_rgb_data_preview_conversion();
+    const PaintingStorageMode storage_mode = active_painting_storage_mode();
+    if (storage_mode == PaintingStorageMode::RgbaData)
+        update_rgb_data_preview_conversion();
 
     const float approx_height = m_imgui->scaled(22.0f);
     y = std::min(y, bottom_limit - approx_height);
@@ -12998,14 +14603,42 @@ void GLGizmoTrueColorPainting::on_render_input_window(float x, float y, float bo
 
     const float slider_width = m_imgui->scaled(8.f);
     const float max_tooltip_width = ImGui::GetFontSize() * 20.f;
-    if (rgb_data_preview_conversion_pending_for_selected_object())
+#if 0
+    bool use_image_texture_data = m_painting_storage_mode == PaintingStorageMode::ImageTexture;
+    if (ImGui::Checkbox("Paint image texture data", &use_image_texture_data)) {
+        m_painting_storage_mode = use_image_texture_data ? PaintingStorageMode::ImageTexture : PaintingStorageMode::RgbaData;
+        update_selected_object_color_state();
+        clear_rgb_preview_cache();
+        init_model_triangle_selectors();
+        m_parent.set_as_dirty();
+        m_parent.request_extra_frame();
+    }
+#endif
+    if (storage_mode == PaintingStorageMode::RgbaData && rgb_data_preview_conversion_pending_for_selected_object())
         m_imgui->warning_text(_L("Generating RGBA color conversion... Please wait"), m_imgui->scaled(RawOffsetDataWarningWrapEm));
 
     if (m_imgui->button(_L("Manage Color Data for this object")))
         open_color_data_management_dialog();
 
-    if (selected_object_has_raw_atlas_texture_data() && !selected_object_has_rgb_data())
-        m_imgui->warning_text(raw_offset_data_rgba_conversion_warning_text(), m_imgui->scaled(RawOffsetDataWarningWrapEm));
+    if (storage_mode == PaintingStorageMode::ImageTexture && selected_object_has_rgb_data()) {
+        m_imgui->warning_text(_L("Painting cannot be used on objects with RGBA data."), m_imgui->scaled(RawOffsetDataWarningWrapEm));
+        if (m_imgui->button(_L("Convert RGBA data to image data")))
+            convert_selected_object_rgba_data_to_image_texture();
+        if (selected_object_has_image_texture_data() &&
+            m_imgui->button(_L("Erase RGBA data and use existing image data (may not look as it does now)")))
+            erase_selected_object_rgba_data_for_image_texture_painting();
+
+        GizmoImguiEnd();
+        ImGuiWrapper::pop_toolbar_style();
+        return;
+    }
+
+    if (selected_object_has_raw_atlas_texture_data() && !selected_object_has_rgb_data()) {
+        if (storage_mode == PaintingStorageMode::ImageTexture)
+            m_imgui->warning_text(raw_offset_data_image_texture_painting_warning_text(), m_imgui->scaled(RawOffsetDataWarningWrapEm));
+        else
+            m_imgui->warning_text(raw_offset_data_rgba_conversion_warning_text(), m_imgui->scaled(RawOffsetDataWarningWrapEm));
+    }
 
     bool color_changed = false;
     switch (m_color_input_mode) {

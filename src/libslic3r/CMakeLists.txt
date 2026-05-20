@@ -612,6 +612,7 @@ target_link_libraries(libslic3r
         clipper
         Clipper2
         draco::draco
+        earcut
         eigen
         glu-libtess
         JPEG::JPEG

@@ -776,7 +776,8 @@ Model Model::read_from_file(const std::string&                                  
                             BBLProject *                                        project,
                             int                                                 plate_id,
                             ObjImportColorFn                                    objFn,
-                            ObjImportModeFn                                     objModeFn)
+                            ObjImportModeFn                                     objModeFn,
+                            ObjTriangulationFn                                  objTriangulationFn)
 {
     Model model;
 
@@ -806,7 +807,7 @@ Model Model::read_from_file(const std::string&                                  
         result = load_stl(input_file.c_str(), &model, nullptr, stlFn,256);
     else if (boost::algorithm::iends_with(input_file, ".obj")) {
         ObjInfo                 obj_info;
-        result = load_obj(input_file.c_str(), &model, obj_info, message);
+        result = load_obj(input_file.c_str(), &model, obj_info, message, nullptr);
         if (result){
             for (ModelObject *obj : model.objects)
                 if (obj != nullptr)
@@ -834,8 +835,13 @@ Model Model::read_from_file(const std::string&                                  
                 if (import_mode == ObjImportMode::UseDefault)
                     import_mode = has_usable_uv_texture_data ? ObjImportMode::ImportTextures : ObjImportMode::ImportPaintedRegions;
             }
+            if (obj_info.triangulation_info.complex_polygon_face_count > 0 &&
+                objTriangulationFn &&
+                !objTriangulationFn(obj_info.triangulation_info)) {
+                is_cb_cancel = true;
+            }
 
-            if (model.objects.size() == 1) {
+            if (!is_cb_cancel && model.objects.size() == 1) {
                 ModelObject *obj = model.objects.front();
                 if (obj != nullptr && obj->volumes.size() == 1 && obj->volumes.front() != nullptr) {
                     ModelVolume *volume = obj->volumes.front();
@@ -914,7 +920,7 @@ Model Model::read_from_file(const std::string&                                  
                 (import_mode == ObjImportMode::ImportPaintedRegions) :
                 true;
 
-            if (import_painted_regions && objFn) {
+            if (!is_cb_cancel && import_painted_regions && objFn) {
                 ObjDialogInOut in_out;
                 in_out.model = &model;
                 in_out.lost_material_name = obj_info.lost_material_name;

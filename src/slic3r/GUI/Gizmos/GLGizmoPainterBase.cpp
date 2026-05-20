@@ -45,6 +45,28 @@ std::vector<bool> texture_preview_used_states_for_painting(
     return used_states;
 }
 
+size_t texture_preview_geometry_signature_for_painting(const ModelVolume &model_volume)
+{
+    size_t signature = 1469598103934665603ull;
+    auto mix = [&signature](size_t value) {
+        signature ^= value + 0x9e3779b97f4a7c15ull + (signature << 6) + (signature >> 2);
+    };
+    mix(model_volume.id().id);
+    mix(reinterpret_cast<size_t>(model_volume.mesh_ptr().get()));
+    mix(model_volume.mesh().its.vertices.size());
+    mix(model_volume.mesh().its.indices.size());
+    mix(size_t(model_volume.imported_texture_width));
+    mix(size_t(model_volume.imported_texture_height));
+    mix(model_volume.imported_texture_uvs_per_face.id().id);
+    mix(model_volume.imported_texture_uvs_per_face.size());
+    mix(reinterpret_cast<size_t>(model_volume.imported_texture_uvs_per_face.data()));
+    mix(model_volume.imported_texture_uv_valid.id().id);
+    mix(model_volume.imported_texture_uv_valid.size());
+    mix(reinterpret_cast<size_t>(model_volume.imported_texture_uv_valid.data()));
+    mix(size_t(model_volume.uv_map_generator_version));
+    return signature;
+}
+
 size_t texture_preview_visual_signature_for_painting(const ModelVolume             &model_volume,
                                                      const std::vector<bool>      *used_states,
                                                      size_t                        num_physical,
@@ -64,7 +86,7 @@ size_t texture_preview_visual_signature_for_painting(const ModelVolume          
                                                                 has_texture_mapping_color_preview_data);
     signature ^= texture_preview_simulation_generation_signature() + 0x9e3779b97f4a7c15ull +
                  (signature << 6) + (signature >> 2);
-    signature ^= model_volume_texture_preview_signature(model_volume) + 0x9e3779b97f4a7c15ull +
+    signature ^= texture_preview_geometry_signature_for_painting(model_volume) + 0x9e3779b97f4a7c15ull +
                  (signature << 6) + (signature >> 2);
     signature ^= model_volume.imported_vertex_colors_rgba.id().id + 0x9e3779b97f4a7c15ull +
                  (signature << 6) + (signature >> 2);
@@ -216,8 +238,16 @@ void GLGizmoPainterBase::render_triangles(const Selection& selection) const
         shader->set_uniform("volume_world_matrix", trafo_matrix);
         shader->set_uniform("volume_mirrored", is_left_handed);
         set_render_triangle_slope_uniforms(shader, mv, normal_matrix);
+        if (should_render_triangle_texture_preview() && render_triangle_texture_preview_before_selector()) {
+            m_triangle_selectors[mesh_id]->render_texture_preview(trafo_matrix,
+                                                                  view_matrix,
+                                                                  projection_matrix,
+                                                                  clp_data.z_range,
+                                                                  clp_data.clp_dataf);
+            shader->start_using();
+        }
         m_triangle_selectors[mesh_id]->render(m_imgui, trafo_matrix);
-        if (should_render_triangle_texture_preview())
+        if (should_render_triangle_texture_preview() && !render_triangle_texture_preview_before_selector())
             m_triangle_selectors[mesh_id]->render_texture_preview(trafo_matrix,
                                                                   view_matrix,
                                                                   projection_matrix,
@@ -1308,6 +1338,10 @@ void GLGizmoPainterBase::on_set_state()
         //camera.look_at(position, rotate_target, Vec3d::UnitZ());
     }
     if (m_state == Off && m_old_state != Off) { // the gizmo was just turned Off
+        if (!on_before_shutdown()) {
+            m_state = m_old_state;
+            return;
+        }
         m_parent.enable_picking(true);
         // we are actually shutting down
         on_shutdown();
@@ -1768,7 +1802,18 @@ void TriangleSelectorPatch::update_render_data()
                                                               num_physical,
                                                               texture_mgr,
                                                               m_texture_mapping_color_preview);
-            if (m_texture_mapping_color_preview != nullptr && !m_texture_mapping_color_preview->empty()) {
+            if (m_force_full_texture_preview && model_volume_has_texture_preview_data_for_painting(*m_model_volume)) {
+                std::vector<TriangleSelector::FacetStateTriangle> full_texture_triangles;
+                for (const std::vector<TriangleSelector::FacetStateTriangle> &state_triangles : triangles_per_type)
+                    full_texture_triangles.insert(full_texture_triangles.end(), state_triangles.begin(), state_triangles.end());
+
+                GUI::GLModel model;
+                if (build_texture_preview_model_for_state(*m_model_volume, full_texture_triangles, model)) {
+                    m_texture_preview_models.emplace_back(std::move(model));
+                    m_texture_preview_colors.emplace_back(ColorRGBA(1.f, 1.f, 1.f, 1.f));
+                    m_texture_preview_filament_ids.emplace_back(0u);
+                }
+            } else if (m_texture_mapping_color_preview != nullptr && !m_texture_mapping_color_preview->empty()) {
                 build_mmu_vertex_color_preview_models(*m_model_volume,
                                                       triangles_per_type,
                                                       m_ebt_colors,

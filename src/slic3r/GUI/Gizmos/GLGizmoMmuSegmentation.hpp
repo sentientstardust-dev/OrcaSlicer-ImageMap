@@ -6,9 +6,13 @@
 #include "libslic3r/ImageMapRawFilamentOffsetAtlas.hpp"
 
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -277,6 +281,13 @@ protected:
     ColorRGBA get_cursor_sphere_left_button_color() const override;
     EnforcerBlockerType get_left_button_state_type() const override { return EnforcerBlockerType::ENFORCER; }
     EnforcerBlockerType get_right_button_state_type() const override { return EnforcerBlockerType(-1); }
+    bool render_triangle_texture_preview_before_selector() const override;
+    void render_extra_triangle_overlays(int mesh_id,
+                                        const Transform3d &matrix,
+                                        const Transform3d &view_matrix,
+                                        const Transform3d &projection_matrix,
+                                        const std::array<float, 2> &z_range,
+                                        const std::array<float, 4> &clipping_plane) const override;
 
     void on_render_input_window(float x, float y, float bottom_limit) override;
     std::string on_get_name() const override;
@@ -304,10 +315,17 @@ private:
         RGBKW
     };
 
+    enum class PaintingStorageMode : int
+    {
+        ImageTexture,
+        RgbaData
+    };
+
     bool on_init() override;
     void update_model_object() override;
     void update_from_model_object(bool first_update = false) override;
     void on_opening() override;
+    bool on_before_shutdown() override;
     void on_shutdown() override;
     void on_set_state() override;
     PainterGizmoType get_painter_type() const override;
@@ -319,19 +337,29 @@ private:
     ModelObject *selected_model_object() const;
     void update_selected_object_color_state();
     void open_color_data_management_dialog();
+    PaintingStorageMode active_painting_storage_mode() const;
     bool selected_object_has_rgb_data() const;
+    bool selected_object_has_image_texture_data() const;
     bool selected_object_has_imported_color_data() const;
     bool selected_object_has_raw_atlas_texture_data() const;
     void initialize_selected_object_rgb_data();
     void convert_selected_object_vertex_colors_to_rgb_data();
     void convert_selected_object_image_texture_to_rgb_data();
+    void convert_selected_object_rgba_data_to_image_texture();
+    void erase_selected_object_rgba_data_for_image_texture_painting();
     void refresh_selected_object_after_rgb_change(ModelObject *object);
+    void refresh_selected_object_after_image_texture_change(ModelObject *object, bool rebuild_selectors = true);
     void remember_changed_rgb_data_object(ModelObject *object);
     void backup_changed_rgb_data_objects();
     void update_triangle_selectors_color();
     void update_rgb_data_preview_conversion();
     void start_rgb_data_preview_conversion(ModelObject &object);
     void cancel_rgb_data_preview_conversion();
+    void start_image_texture_paint_worker();
+    void cancel_image_texture_paint_worker();
+    void process_completed_image_texture_paint_strokes();
+    void clear_pending_image_texture_paint_previews();
+    bool has_pending_image_texture_paint_strokes();
     bool rgb_data_preview_conversion_pending_for_selected_object() const;
     ColorFacetsAnnotation *preview_rgb_data_for_volume(const ModelVolume &volume) const;
     bool append_brush_stroke_point(int mesh_idx, const Vec3f &hit, const Transform3d &world_matrix);
@@ -393,9 +421,11 @@ private:
     ColorInputMode       m_color_input_mode = ColorInputMode::FilamentColors;
     bool                 m_selected_has_rgb_data = false;
     bool                 m_selected_has_imported_color_data = false;
+    bool                 m_selected_has_image_texture_data = false;
     bool                 m_selected_can_convert_vertex = false;
     bool                 m_selected_can_convert_image = false;
     bool                 m_selected_has_raw_atlas_texture_data = false;
+    PaintingStorageMode  m_painting_storage_mode = PaintingStorageMode::ImageTexture;
     bool                 m_color_picker_active = false;
     bool                 m_brush_stroke_active = false;
     bool                 m_live_selector_preview_active = false;
@@ -420,6 +450,24 @@ private:
     std::thread          m_rgb_data_conversion_thread;
     uint64_t             m_rgb_data_conversion_generation = 0;
     ObjectID             m_rgb_data_conversion_object_id;
+    struct ImageTexturePaintTask;
+    struct ImageTexturePaintResult;
+    struct PendingImageTexturePaintPreview;
+    static std::shared_ptr<ImageTexturePaintResult> compute_image_texture_paint_task(const ImageTexturePaintTask &task);
+    static std::unique_ptr<PendingImageTexturePaintPreview> build_pending_image_texture_paint_preview(const ImageTexturePaintTask &task);
+    static bool apply_image_texture_paint_result_to_volume(ModelVolume &volume, const ImageTexturePaintResult &result);
+    std::mutex m_image_texture_paint_mutex;
+    std::condition_variable m_image_texture_paint_cv;
+    std::deque<std::shared_ptr<ImageTexturePaintTask>> m_image_texture_paint_tasks;
+    std::deque<std::shared_ptr<ImageTexturePaintResult>> m_image_texture_paint_results;
+    std::shared_ptr<std::atomic_bool> m_image_texture_paint_cancel;
+    std::thread m_image_texture_paint_thread;
+    bool m_image_texture_paint_stop = false;
+    bool m_image_texture_paint_worker_running = false;
+    bool m_image_texture_paint_task_active = false;
+    uint64_t m_next_image_texture_paint_sequence = 1;
+    uint64_t m_next_image_texture_paint_apply_sequence = 1;
+    std::vector<std::unique_ptr<PendingImageTexturePaintPreview>> m_pending_image_texture_paint_previews;
     struct ColorPickerVolumeSourceCache
     {
         ObjectID volume_id;

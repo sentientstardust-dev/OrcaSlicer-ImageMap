@@ -27,6 +27,10 @@ bool build_mmu_texture_preview_models(
     std::vector<ColorRGBA>                                               &out_colors,
     std::vector<unsigned int>                                            &out_filament_ids);
 
+bool build_texture_preview_model_for_state(const ModelVolume                                      &model_volume,
+                                           const std::vector<TriangleSelector::FacetStateTriangle> &state_triangles,
+                                           GUI::GLModel                                            &out_model);
+
 bool build_mmu_vertex_color_preview_models(
     const ModelVolume                                                    &model_volume,
     const std::vector<std::vector<TriangleSelector::FacetStateTriangle>> &triangles_per_type,
