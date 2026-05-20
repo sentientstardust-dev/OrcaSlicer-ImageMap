@@ -16,7 +16,7 @@ Test print with white, beige, light and dark blue PLA:
 ![The Great Wave off Kanagawa - Katsushika Hokusai](https://gradients.garden/gitlab_images/the_great_wave2.jpeg)
 (image: The Great Wave off Kanagawa - Katsushika Hokusai)
 
-This color sheet was printed with CMYK PLA:
+This color sheet was printed with CMYW PLA:
 ![CMYW Test Sheet](https://gradients.garden/gitlab_images/cmyw_test_sheet.jpeg)
 (test sheet image Designed by Freepik)
 
@@ -28,7 +28,6 @@ Grayscale:
 
 CMYK:
 ![Van Gogh Art Cube](https://gradients.garden/gitlab_images/artcube2.jpeg)
-
 
 </details>
 
