@@ -151,7 +151,7 @@ public:
 
 protected:
     // Release the geometry data, release OpenGL VBOs.
-    void release_geometry();
+    void release_geometry(bool release_preview_texture = true);
     // Finalize the initialization of the geometry, upload the geometry to OpenGL VBO objects
     // and possibly releasing it if it has been loaded into the VBOs.
     void finalize_vertices();

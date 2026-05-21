@@ -17,8 +17,8 @@
 namespace Slic3r {
 namespace {
 
-constexpr uint32_t GeneratedImageTextureSize = 2048;
-constexpr uint32_t MaxSourceImageTextureSize = 2048;
+constexpr uint32_t GeneratedImageTextureSize = 4096;
+constexpr uint32_t MaxSourceImageTextureSize = 4096;
 constexpr int GeneratedImageTextureUvMapVersion = 1;
 constexpr float RemapEpsilon = 1e-6f;
 

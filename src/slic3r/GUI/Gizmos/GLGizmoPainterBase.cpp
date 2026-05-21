@@ -1766,7 +1766,12 @@ void TriangleSelectorPatch::update_render_data()
 {
     //BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", m_paint_changed=%1%, m_triangle_patches.size %2%")%m_paint_changed%m_triangle_patches.size();
     if (m_paint_changed || (m_triangle_patches.size() == 0)) {
-        this->release_geometry();
+        const bool can_keep_full_texture_preview =
+            m_force_full_texture_preview &&
+            m_texture_preview_needed &&
+            m_model_volume != nullptr &&
+            model_volume_has_texture_preview_data_for_painting(*m_model_volume);
+        this->release_geometry(!can_keep_full_texture_preview);
 
         /*m_patch_vertices.reserve(m_vertices.size() * 3);
         for (const Vertex& vr : m_vertices) {
@@ -1792,17 +1797,17 @@ void TriangleSelectorPatch::update_render_data()
         if (m_texture_preview_needed && m_model_volume != nullptr) {
             std::vector<std::vector<TriangleSelector::FacetStateTriangle>> triangles_per_type;
             get_facet_triangles(triangles_per_type);
-            m_texture_preview_used_states = texture_preview_used_states_for_painting(triangles_per_type);
             const size_t num_physical = std::max(0, wxGetApp().filaments_cnt());
             const TextureMappingManager *texture_mgr = wxGetApp().preset_bundle != nullptr ?
                 &wxGetApp().preset_bundle->texture_mapping_zones : nullptr;
-            m_texture_preview_visual_signature =
-                texture_preview_visual_signature_for_painting(*m_model_volume,
-                                                              &m_texture_preview_used_states,
-                                                              num_physical,
-                                                              texture_mgr,
-                                                              m_texture_mapping_color_preview);
             if (m_force_full_texture_preview && model_volume_has_texture_preview_data_for_painting(*m_model_volume)) {
+                m_texture_preview_used_states = texture_preview_used_states_for_painting(triangles_per_type);
+                const size_t visual_signature =
+                    texture_preview_visual_signature_for_painting(*m_model_volume,
+                                                                  &m_texture_preview_used_states,
+                                                                  num_physical,
+                                                                  texture_mgr,
+                                                                  m_texture_mapping_color_preview);
                 std::vector<TriangleSelector::FacetStateTriangle> full_texture_triangles;
                 for (const std::vector<TriangleSelector::FacetStateTriangle> &state_triangles : triangles_per_type)
                     full_texture_triangles.insert(full_texture_triangles.end(), state_triangles.begin(), state_triangles.end());
@@ -1813,7 +1818,15 @@ void TriangleSelectorPatch::update_render_data()
                     m_texture_preview_colors.emplace_back(ColorRGBA(1.f, 1.f, 1.f, 1.f));
                     m_texture_preview_filament_ids.emplace_back(0u);
                 }
+                m_texture_preview_visual_signature = visual_signature;
             } else if (m_texture_mapping_color_preview != nullptr && !m_texture_mapping_color_preview->empty()) {
+                m_texture_preview_used_states = texture_preview_used_states_for_painting(triangles_per_type);
+                const size_t visual_signature =
+                    texture_preview_visual_signature_for_painting(*m_model_volume,
+                                                                  &m_texture_preview_used_states,
+                                                                  num_physical,
+                                                                  texture_mgr,
+                                                                  m_texture_mapping_color_preview);
                 build_mmu_vertex_color_preview_models(*m_model_volume,
                                                       triangles_per_type,
                                                       m_ebt_colors,
@@ -1825,7 +1838,15 @@ void TriangleSelectorPatch::update_render_data()
                                                       m_vertex_color_preview_filament_ids,
                                                       m_texture_mapping_color_preview,
                                                       reinterpret_cast<size_t>(this));
+                m_texture_preview_visual_signature = visual_signature;
             } else {
+                m_texture_preview_used_states = texture_preview_used_states_for_painting(triangles_per_type);
+                const size_t visual_signature =
+                    texture_preview_visual_signature_for_painting(*m_model_volume,
+                                                                  &m_texture_preview_used_states,
+                                                                  num_physical,
+                                                                  texture_mgr,
+                                                                  m_texture_mapping_color_preview);
                 if (model_volume_has_texture_preview_data_for_painting(*m_model_volume)) {
                     build_mmu_texture_preview_models(*m_model_volume,
                                                      triangles_per_type,
@@ -1848,6 +1869,7 @@ void TriangleSelectorPatch::update_render_data()
                                                       m_vertex_color_preview_filament_ids,
                                                       nullptr,
                                                       reinterpret_cast<size_t>(this));
+                m_texture_preview_visual_signature = visual_signature;
             }
         }
 
@@ -1935,7 +1957,7 @@ void TriangleSelectorPatch::render(int triangle_indices_idx, bool show_wireframe
     glsafe(::glBindBuffer(GL_ARRAY_BUFFER, 0));
 }
 
-void TriangleSelectorPatch::release_geometry()
+void TriangleSelectorPatch::release_geometry(bool release_preview_texture)
 {
     /*if (m_vertices_VBO_id) {
         glsafe(::glDeleteBuffers(1, &m_vertices_VBO_id));
@@ -1964,12 +1986,14 @@ void TriangleSelectorPatch::release_geometry()
     m_texture_preview_colors.clear();
     m_texture_preview_filament_ids.clear();
     m_texture_preview_used_states.clear();
-    m_texture_preview.reset();
-    m_texture_preview_signature = 0;
     m_texture_preview_visual_signature = 0;
     m_vertex_color_preview_models.clear();
     m_vertex_color_preview_colors.clear();
     m_vertex_color_preview_filament_ids.clear();
+    if (release_preview_texture) {
+        m_texture_preview.reset();
+        m_texture_preview_signature = 0;
+    }
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", Line %1%: released geometry")%__LINE__;
 }
