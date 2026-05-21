@@ -411,11 +411,18 @@ wxString sanitize_window_layout_for_wayland(const wxString& layout, bool* remove
 }
 #endif
 
+static bool is_color_import_choice_file(const std::string &path)
+{
+    return boost::iends_with(path, ".obj") ||
+           boost::iends_with(path, ".gltf") ||
+           boost::iends_with(path, ".glb");
+}
+
 static ObjImportMode show_obj_import_choice_dialog(wxWindow *parent, const ObjImportCapabilities &capabilities)
 {
     wxDialog dialog(parent ? parent : static_cast<wxWindow *>(wxGetApp().mainframe),
                     wxID_ANY,
-                    _L("OBJ import"),
+                    _L("Color import"),
                     wxDefaultPosition,
                     wxDefaultSize,
                     wxDEFAULT_DIALOG_STYLE);
@@ -426,7 +433,7 @@ static ObjImportMode show_obj_import_choice_dialog(wxWindow *parent, const ObjIm
     line_top->SetBackgroundColour(wxColour(166, 169, 170));
     main_sizer->Add(line_top, 0, wxEXPAND, 0);
 
-    auto *message = new wxStaticText(&dialog, wxID_ANY, _L("Choose how to import this OBJ file."));
+    auto *message = new wxStaticText(&dialog, wxID_ANY, _L("Choose how to import this model's color data."));
     message->Wrap(dialog.FromDIP(420));
     main_sizer->Add(message, 0, wxALL | wxEXPAND, dialog.FromDIP(16));
 
@@ -9271,7 +9278,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                 bool obj_imported_for_texture_mapping = false;
                 auto obj_color_fun = [this, &path](ObjDialogInOut &in_out) {
 
-                    if (!boost::iends_with(path.string(), ".obj")) { return; }
+                    if (!is_color_import_choice_file(path.string())) { return; }
                     const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config(nullptr, false);
                     ObjColorDialog                 color_dlg(nullptr, in_out, extruder_colours);
                     if (color_dlg.ShowModal() != wxID_OK) {
@@ -9279,7 +9286,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                     }
                 };
                 auto obj_import_mode_fun = [this, &path, &obj_imported_for_texture_mapping](const ObjImportCapabilities &capabilities) -> ObjImportMode {
-                    if (!boost::iends_with(path.string(), ".obj"))
+                    if (!is_color_import_choice_file(path.string()))
                         return ObjImportMode::UseDefault;
                     const ObjImportMode mode        = show_obj_import_choice_dialog(q, capabilities);
                     obj_imported_for_texture_mapping = mode == ObjImportMode::ImportTextures;
@@ -11492,7 +11499,7 @@ void Plater::priv::reload_from_disk()
         const auto& path = input_paths[i].string();
         bool        obj_imported_for_texture_mapping = false;
         auto        obj_color_fun = [this, &path](ObjDialogInOut &in_out) {
-            if (!boost::iends_with(path, ".obj")) { return; }
+            if (!is_color_import_choice_file(path)) { return; }
             const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config(nullptr, false);
             ObjColorDialog                 color_dlg(nullptr, in_out, extruder_colours);
             if (color_dlg.ShowModal() != wxID_OK) {
@@ -11500,7 +11507,7 @@ void Plater::priv::reload_from_disk()
             }
         };
         auto obj_import_mode_fun = [this, &path, &obj_imported_for_texture_mapping](const ObjImportCapabilities &capabilities) -> ObjImportMode {
-            if (!boost::iends_with(path, ".obj"))
+            if (!is_color_import_choice_file(path))
                 return ObjImportMode::UseDefault;
             const ObjImportMode mode        = show_obj_import_choice_dialog(q, capabilities);
             obj_imported_for_texture_mapping = mode == ObjImportMode::ImportTextures;

@@ -5691,8 +5691,8 @@ msgstr "プロジェクトを名前を付けて保存"
 msgid "Save current project as"
 msgstr "プロジェクトを名前を付けて保存"
 
-msgid "Import 3MF/STL/STEP/SVG/OBJ/AMF"
-msgstr "3MF/STL/STEP/SVG/OBJ/AMFをインポート"
+msgid "Import 3MF/STL/STEP/SVG/OBJ/GLTF/GLB/AMF"
+msgstr "3MF/STL/STEP/SVG/OBJ/GLTF/GLB/AMFをインポート"
 
 msgid "Load a model"
 msgstr "モデルを読み込む"

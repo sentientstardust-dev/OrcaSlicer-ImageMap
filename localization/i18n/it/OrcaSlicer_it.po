@@ -5865,8 +5865,8 @@ msgstr "Salva Progetto come"
 msgid "Save current project as"
 msgstr "Salva Progetto corrente come"
 
-msgid "Import 3MF/STL/STEP/SVG/OBJ/AMF"
-msgstr "Importa 3MF/STL/STEP/SVG/OBJ/AMF"
+msgid "Import 3MF/STL/STEP/SVG/OBJ/GLTF/GLB/AMF"
+msgstr "Importa 3MF/STL/STEP/SVG/OBJ/GLTF/GLB/AMF"
 
 msgid "Load a model"
 msgstr "Carica modello"

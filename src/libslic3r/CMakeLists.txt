@@ -200,6 +200,10 @@ set(lisbslic3r_sources
     Format/DRC.hpp
     Format/bbs_3mf.cpp
     Format/bbs_3mf.hpp
+    Format/GLTF.cpp
+    Format/GLTF.hpp
+    Format/ImportedTexture.cpp
+    Format/ImportedTexture.hpp
     format.hpp
     Format/OBJ.cpp
     Format/OBJ.hpp
@@ -623,6 +627,7 @@ target_link_libraries(libslic3r
         qhull
         qoi
         semver
+        tinygltf_v3
         TBB::tbb
         TBB::tbbmalloc
         ZLIB::ZLIB

@@ -11,12 +11,12 @@
 #include "TriangleMeshSlicer.hpp"
 #include "TriangleSelector.hpp"
 #include "MaterialType.hpp"
-#include "PNGReadWrite.hpp"
 
 #include "Format/AMF.hpp"
 #include "Format/svg.hpp"
 #include "Format/bbs_3mf.hpp"
 #include "Format/DRC.hpp"
+#include "Format/GLTF.hpp"
 // BBS
 #include "FaceDetector.hpp"
 
@@ -25,7 +25,6 @@
 #include <float.h>
 #include <cctype>
 #include <cmath>
-#include <csetjmp>
 #include <iterator>
 #include <limits>
 #include <unordered_map>
@@ -34,10 +33,7 @@
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/log/trivial.hpp>
-#include <boost/nowide/fstream.hpp>
 #include <boost/nowide/iostream.hpp>
-
-#include <jpeglib.h>
 
 #include "SVG.hpp"
 #include <Eigen/Dense>
@@ -147,198 +143,6 @@ static std::vector<std::string> resolve_obj_texture_path_candidates(const std::s
     return candidates;
 }
 
-static bool decode_png_texture_rgba(const std::string &texture_path,
-                                    std::vector<uint8_t> &out_rgba,
-                                    uint32_t &out_width,
-                                    uint32_t &out_height)
-{
-    out_rgba.clear();
-    out_width  = 0;
-    out_height = 0;
-
-    boost::nowide::ifstream ifs(texture_path, std::ios::binary);
-    if (!ifs.is_open())
-        return false;
-
-    std::string encoded_data((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-    if (encoded_data.empty())
-        return false;
-
-    png::ReadBuf      rb{encoded_data.data(), encoded_data.size()};
-    png::ImageColorscale img;
-    if (!png::decode_colored_png(rb, img))
-        return false;
-
-    if (img.cols == 0 || img.rows == 0 || (img.bytes_per_pixel != 3 && img.bytes_per_pixel != 4))
-        return false;
-
-    size_t rgba_size = 0;
-    if (!checked_rgba_buffer_size(img.cols, img.rows, rgba_size))
-        return false;
-
-    const size_t row_stride = img.cols * size_t(img.bytes_per_pixel);
-    if (img.buf.size() < img.rows * row_stride)
-        return false;
-
-    out_rgba.assign(rgba_size, 255);
-    for (size_t y = 0; y < img.rows; ++y) {
-        const size_t src_row_off = y * row_stride;
-        const size_t dst_row_off = y * img.cols * 4;
-        for (size_t x = 0; x < img.cols; ++x) {
-            const size_t src = src_row_off + x * size_t(img.bytes_per_pixel);
-            const size_t dst = dst_row_off + x * 4;
-            out_rgba[dst + 0] = img.buf[src + 0];
-            out_rgba[dst + 1] = img.buf[src + 1];
-            out_rgba[dst + 2] = img.buf[src + 2];
-            out_rgba[dst + 3] = (img.bytes_per_pixel == 4) ? img.buf[src + 3] : uint8_t(255);
-        }
-    }
-
-    out_width  = uint32_t(img.cols);
-    out_height = uint32_t(img.rows);
-    return true;
-}
-
-struct JpegDecodeErrorManager
-{
-    jpeg_error_mgr pub;
-    jmp_buf        setjmp_buffer;
-};
-
-static void jpeg_decode_error_exit(j_common_ptr cinfo)
-{
-    auto *err = reinterpret_cast<JpegDecodeErrorManager *>(cinfo->err);
-    longjmp(err->setjmp_buffer, 1);
-}
-
-static bool decode_jpeg_texture_rgba(const std::string &texture_path,
-                                     std::vector<uint8_t> &out_rgba,
-                                     uint32_t &out_width,
-                                     uint32_t &out_height)
-{
-    out_rgba.clear();
-    out_width  = 0;
-    out_height = 0;
-
-    boost::nowide::ifstream ifs(texture_path, std::ios::binary);
-    if (!ifs.is_open())
-        return false;
-
-    std::string encoded_data((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-    if (encoded_data.empty())
-        return false;
-
-    jpeg_decompress_struct cinfo{};
-    JpegDecodeErrorManager jerr{};
-    cinfo.err = jpeg_std_error(&jerr.pub);
-    jerr.pub.error_exit = jpeg_decode_error_exit;
-    bool jpeg_created = false;
-    auto destroy_jpeg = [&cinfo, &jpeg_created]() {
-        if (jpeg_created) {
-            jpeg_destroy_decompress(&cinfo);
-            jpeg_created = false;
-        }
-    };
-
-    if (setjmp(jerr.setjmp_buffer)) {
-        destroy_jpeg();
-        return false;
-    }
-
-    jpeg_create_decompress(&cinfo);
-    jpeg_created = true;
-    jpeg_mem_src(&cinfo,
-                 reinterpret_cast<const unsigned char *>(encoded_data.data()),
-                 static_cast<unsigned long>(encoded_data.size()));
-
-    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
-        destroy_jpeg();
-        return false;
-    }
-
-    if (!jpeg_start_decompress(&cinfo)) {
-        destroy_jpeg();
-        return false;
-    }
-
-    const uint32_t width = cinfo.output_width;
-    const uint32_t height = cinfo.output_height;
-    const int components = cinfo.output_components;
-    size_t rgba_size = 0;
-    const size_t scanline_stride = size_t(width) * size_t(std::max(components, 0));
-    if (!checked_rgba_buffer_size(width, height, rgba_size) ||
-        components <= 0 ||
-        scanline_stride > std::numeric_limits<JDIMENSION>::max()) {
-        jpeg_finish_decompress(&cinfo);
-        destroy_jpeg();
-        return false;
-    }
-
-    out_rgba.assign(rgba_size, uint8_t(255));
-    JSAMPARRAY scanline = (*cinfo.mem->alloc_sarray)((j_common_ptr) &cinfo,
-                                                     JPOOL_IMAGE,
-                                                     JDIMENSION(scanline_stride),
-                                                     1);
-
-    uint32_t y = 0;
-    while (cinfo.output_scanline < cinfo.output_height) {
-        jpeg_read_scanlines(&cinfo, scanline, 1);
-        const unsigned char *src = scanline[0];
-        const uint32_t dst_y = height - 1 - y;
-        for (uint32_t x = 0; x < width; ++x) {
-            const size_t dst = (size_t(dst_y) * size_t(width) + size_t(x)) * 4;
-            if (components >= 3) {
-                const size_t s = size_t(x) * size_t(components);
-                out_rgba[dst + 0] = src[s + 0];
-                out_rgba[dst + 1] = src[s + 1];
-                out_rgba[dst + 2] = src[s + 2];
-            } else {
-                const unsigned char g = src[x];
-                out_rgba[dst + 0] = g;
-                out_rgba[dst + 1] = g;
-                out_rgba[dst + 2] = g;
-            }
-            out_rgba[dst + 3] = 255;
-        }
-        ++y;
-    }
-
-    if (!jpeg_finish_decompress(&cinfo)) {
-        destroy_jpeg();
-        return false;
-    }
-    destroy_jpeg();
-
-    out_width  = width;
-    out_height = height;
-    return true;
-}
-
-static bool decode_image_texture_rgba(const std::string &texture_path,
-                                      std::vector<uint8_t> &out_rgba,
-                                      uint32_t &out_width,
-                                      uint32_t &out_height)
-{
-    out_rgba.clear();
-    out_width  = 0;
-    out_height = 0;
-
-    if (boost::algorithm::iends_with(texture_path, ".png"))
-        return decode_png_texture_rgba(texture_path, out_rgba, out_width, out_height);
-
-    if (boost::algorithm::iends_with(texture_path, ".jpg") || boost::algorithm::iends_with(texture_path, ".jpeg"))
-        return decode_jpeg_texture_rgba(texture_path, out_rgba, out_width, out_height);
-
-    return false;
-}
-
-static bool is_supported_obj_texture_path(const std::string &texture_path)
-{
-    return boost::algorithm::iends_with(texture_path, ".png") ||
-           boost::algorithm::iends_with(texture_path, ".jpg") ||
-           boost::algorithm::iends_with(texture_path, ".jpeg");
-}
-
 struct ObjTextureImage
 {
     std::string          resolved_path;
@@ -381,7 +185,7 @@ static size_t count_resolved_obj_albedo_texture_references(const std::string &ob
         const std::string texture_ref = extract_obj_texture_reference(map_kd_raw);
         const auto        candidates  = resolve_obj_texture_path_candidates(obj_path, texture_ref);
         for (const std::string &candidate : candidates) {
-            if (!is_supported_obj_texture_path(candidate) || !boost::filesystem::exists(candidate))
+            if (!is_supported_image_texture_path(candidate) || !boost::filesystem::exists(candidate))
                 continue;
 
             const std::string normalized = boost::filesystem::path(candidate).lexically_normal().string();
@@ -422,7 +226,7 @@ static ObjTextureImportData load_obj_albedo_textures(const std::string &obj_path
 
             ObjTextureImage image;
             image.resolved_path = candidate;
-            if (!decode_image_texture_rgba(candidate, image.rgba, image.width, image.height)) {
+            if (!decode_image_texture_rgba_from_file(candidate, image.rgba, image.width, image.height)) {
                 had_decode_failure = true;
                 last_failed_path = candidate;
                 continue;
@@ -932,6 +736,133 @@ Model Model::read_from_file(const std::string&                                  
                 } else if (obj_info.face_colors.size() > 0) {
                     in_out.input_colors      = obj_info.face_colors;
                     in_out.is_single_color   = obj_info.is_single_mtl;
+                    in_out.deal_vertex_color = false;
+                    objFn(in_out);
+                }
+            }
+        }
+    }
+    else if (boost::algorithm::iends_with(input_file, ".gltf") || boost::algorithm::iends_with(input_file, ".glb")) {
+        GltfImportInfo gltf_info;
+        result = load_gltf(input_file.c_str(), &model, gltf_info, message);
+        if (result) {
+            for (ModelObject *obj : model.objects)
+                if (obj != nullptr)
+                    obj->rotate(Geometry::deg2rad(90.0), Axis::X);
+
+            if (!message.empty())
+                BOOST_LOG_TRIVIAL(error) << message;
+
+            const bool has_valid_texture_uvs = std::any_of(gltf_info.triangle_uvs_valid.begin(), gltf_info.triangle_uvs_valid.end(), [](uint8_t uv_valid) {
+                return uv_valid != 0;
+            });
+            const ObjImportCapabilities capabilities{
+                gltf_info.has_vertex_colors,
+                gltf_info.has_material_colors,
+                gltf_info.is_single_material_color,
+                gltf_info.textures.size(),
+                has_valid_texture_uvs
+            };
+            const bool has_mode_selection = bool(objModeFn);
+            ObjImportMode import_mode = ObjImportMode::UseDefault;
+            const bool has_usable_uv_texture_data = capabilities.texture_count > 0 && capabilities.has_valid_texture_uvs;
+            if (has_mode_selection) {
+                import_mode = objModeFn(capabilities);
+                if (import_mode == ObjImportMode::UseDefault)
+                    import_mode = has_usable_uv_texture_data ? ObjImportMode::ImportTextures : ObjImportMode::ImportPaintedRegions;
+            }
+
+            if (!is_cb_cancel && model.objects.size() == 1) {
+                ModelObject *obj = model.objects.front();
+                if (obj != nullptr && obj->volumes.size() == 1 && obj->volumes.front() != nullptr) {
+                    ModelVolume *volume = obj->volumes.front();
+
+                    volume->imported_vertex_colors_rgba.clear();
+                    volume->imported_texture_uvs_per_face.clear();
+                    volume->imported_texture_uv_valid.clear();
+                    volume->imported_texture_rgba.clear();
+                    volume->imported_texture_raw_filament_offsets.clear();
+                    volume->imported_texture_width = 0;
+                    volume->imported_texture_height = 0;
+                    volume->imported_texture_raw_channels = 0;
+                    volume->imported_texture_raw_metadata_json.clear();
+                    volume->uv_map_generator_version = 0;
+                    bool has_imported_usable_uv_texture_data = false;
+
+                    const size_t triangle_count = volume->mesh().its.indices.size();
+                    if (triangle_count == gltf_info.triangle_uvs.size() &&
+                        triangle_count == gltf_info.triangle_uvs_valid.size() &&
+                        triangle_count == gltf_info.triangle_texture_indices.size()) {
+                        std::vector<std::array<Vec2f, 3>> triangle_uvs = gltf_info.triangle_uvs;
+                        std::vector<uint8_t> triangle_uv_valid = gltf_info.triangle_uvs_valid;
+
+                        const bool import_textures = has_mode_selection ?
+                            (import_mode == ObjImportMode::ImportTextures) :
+                            true;
+
+                        if (import_textures) {
+                            std::vector<uint8_t> atlas_rgba;
+                            uint32_t atlas_width = 0;
+                            uint32_t atlas_height = 0;
+                            if (build_imported_texture_atlas(gltf_info.textures,
+                                                             gltf_info.triangle_texture_indices,
+                                                             triangle_uvs,
+                                                             triangle_uv_valid,
+                                                             atlas_rgba,
+                                                             atlas_width,
+                                                             atlas_height)) {
+                                volume->imported_texture_uvs_per_face.reserve(triangle_count * 6);
+                                volume->imported_texture_uv_valid.reserve(triangle_count);
+                                bool has_any_valid_uv_face = false;
+                                for (size_t face_idx = 0; face_idx < triangle_count; ++face_idx) {
+                                    const std::array<Vec2f, 3> &uv = triangle_uvs[face_idx];
+                                    volume->imported_texture_uvs_per_face.emplace_back(uv[0].x());
+                                    volume->imported_texture_uvs_per_face.emplace_back(uv[0].y());
+                                    volume->imported_texture_uvs_per_face.emplace_back(uv[1].x());
+                                    volume->imported_texture_uvs_per_face.emplace_back(uv[1].y());
+                                    volume->imported_texture_uvs_per_face.emplace_back(uv[2].x());
+                                    volume->imported_texture_uvs_per_face.emplace_back(uv[2].y());
+                                    volume->imported_texture_uv_valid.emplace_back(triangle_uv_valid[face_idx]);
+                                    has_any_valid_uv_face = has_any_valid_uv_face || (triangle_uv_valid[face_idx] != 0);
+                                }
+                                volume->imported_texture_width = atlas_width;
+                                volume->imported_texture_height = atlas_height;
+                                volume->imported_texture_rgba = std::move(atlas_rgba);
+                                volume->imported_texture_raw_filament_offsets.clear();
+                                volume->imported_texture_raw_channels = 0;
+                                volume->imported_texture_raw_metadata_json.clear();
+                                volume->uv_map_generator_version = 0;
+                                has_imported_usable_uv_texture_data = has_any_valid_uv_face;
+                            }
+                        }
+                    }
+
+                    const bool import_vertex_colors = has_mode_selection ?
+                        (import_mode == ObjImportMode::ImportPaintedRegions ||
+                         (import_mode == ObjImportMode::ImportTextures && !has_imported_usable_uv_texture_data)) :
+                        true;
+                    if (import_vertex_colors &&
+                        gltf_info.has_vertex_colors &&
+                        volume->mesh().its.vertices.size() == gltf_info.vertex_colors_rgba.size())
+                        volume->imported_vertex_colors_rgba = gltf_info.vertex_colors_rgba;
+                }
+            }
+
+            const bool import_painted_regions = has_mode_selection ?
+                (import_mode == ObjImportMode::ImportPaintedRegions) :
+                true;
+
+            if (!is_cb_cancel && import_painted_regions && objFn) {
+                ObjDialogInOut in_out;
+                in_out.model = &model;
+                if (gltf_info.has_vertex_colors && !gltf_info.vertex_colors.empty()) {
+                    in_out.input_colors      = gltf_info.vertex_colors;
+                    in_out.is_single_color   = false;
+                    in_out.deal_vertex_color = true;
+                    objFn(in_out);
+                } else if (gltf_info.has_material_colors && !gltf_info.material_colors.empty()) {
+                    in_out.input_colors      = gltf_info.material_colors;
+                    in_out.is_single_color   = gltf_info.is_single_material_color;
                     in_out.deal_vertex_color = false;
                     objFn(in_out);
                 }
