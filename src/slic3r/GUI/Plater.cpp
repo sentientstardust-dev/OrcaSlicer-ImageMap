@@ -411,11 +411,18 @@ wxString sanitize_window_layout_for_wayland(const wxString& layout, bool* remove
 }
 #endif
 
+static bool is_color_import_choice_file(const std::string &path)
+{
+    return boost::iends_with(path, ".obj") ||
+           boost::iends_with(path, ".gltf") ||
+           boost::iends_with(path, ".glb");
+}
+
 static ObjImportMode show_obj_import_choice_dialog(wxWindow *parent, const ObjImportCapabilities &capabilities)
 {
     wxDialog dialog(parent ? parent : static_cast<wxWindow *>(wxGetApp().mainframe),
                     wxID_ANY,
-                    _L("OBJ import"),
+                    _L("Color import"),
                     wxDefaultPosition,
                     wxDefaultSize,
                     wxDEFAULT_DIALOG_STYLE);
@@ -426,7 +433,7 @@ static ObjImportMode show_obj_import_choice_dialog(wxWindow *parent, const ObjIm
     line_top->SetBackgroundColour(wxColour(166, 169, 170));
     main_sizer->Add(line_top, 0, wxEXPAND, 0);
 
-    auto *message = new wxStaticText(&dialog, wxID_ANY, _L("Choose how to import this OBJ file."));
+    auto *message = new wxStaticText(&dialog, wxID_ANY, _L("Choose how to import this model's color data."));
     message->Wrap(dialog.FromDIP(420));
     main_sizer->Add(message, 0, wxALL | wxEXPAND, dialog.FromDIP(16));
 
@@ -488,6 +495,22 @@ static ObjImportMode show_obj_import_choice_dialog(wxWindow *parent, const ObjIm
     dialog.CenterOnParent();
     dialog.ShowModal();
     return selected;
+}
+
+static bool show_obj_triangulation_dialog(wxWindow *parent, const ObjTriangulationInfo &)
+{
+    MessageDialog dialog(parent ? parent : static_cast<wxWindow *>(wxGetApp().mainframe),
+                         _L("This OBJ file contains faces with more than four vertices and must be triangulated before it can be "
+                            "imported.\n\n"
+                            "OrcaSlicer can auto-triangulate it now, but the result may not be perfect. You may get better results by "
+                            "manually triangulating the model in 3D modelling software such as Blender, then importing the triangulated "
+                            "OBJ.\n\n"
+                            "Auto-triangulate this OBJ and continue?"),
+                         _L("Auto-triangulate OBJ"),
+                         wxYES_NO | wxNO_DEFAULT | wxICON_WARNING);
+    dialog.SetButtonLabel(wxID_YES, _L("Auto-triangulate"));
+    dialog.SetButtonLabel(wxID_NO, _L("Cancel import"));
+    return dialog.ShowModal() == wxID_YES;
 }
 
 static bool model_volume_has_imported_texture_mapping_data(const ModelVolume *volume)
@@ -1384,7 +1407,27 @@ public:
         preview_box->Add(m_auto_adjust_filament_selection_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
         m_preview_limit_resolution_checkbox = new wxCheckBox(preview_page, wxID_ANY, _L("Limit color simulation texture resolution"));
         m_preview_limit_resolution_checkbox->SetValue(preview_limit_resolution);
-        preview_box->Add(m_preview_limit_resolution_checkbox, 0, wxEXPAND | wxALL, gap);
+        preview_box->Add(m_preview_limit_resolution_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+        auto *minimum_visibility_offset_row = new wxBoxSizer(wxHORIZONTAL);
+        m_minimum_visibility_offset_checkbox = new wxCheckBox(preview_page, wxID_ANY, _L("Minimum visibility offset"));
+        m_minimum_visibility_offset_checkbox->SetValue(minimum_visibility_offset_enabled);
+        minimum_visibility_offset_row->Add(m_minimum_visibility_offset_checkbox, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        m_minimum_visibility_offset_spin = new wxSpinCtrl(preview_page,
+                                                          wxID_ANY,
+                                                          wxEmptyString,
+                                                          wxDefaultPosition,
+                                                          wxSize(FromDIP(70), -1),
+                                                          wxSP_ARROW_KEYS | wxALIGN_RIGHT,
+                                                          0,
+                                                          100,
+                                                          std::clamp(int(std::lround(minimum_visibility_offset_pct)), 0, 100));
+        minimum_visibility_offset_row->Add(m_minimum_visibility_offset_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+        m_minimum_visibility_offset_units = new wxStaticText(preview_page, wxID_ANY, _L("%"));
+        minimum_visibility_offset_row->Add(m_minimum_visibility_offset_units, 0, wxALIGN_CENTER_VERTICAL);
+        m_minimum_visibility_offset_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+            update_minimum_visibility_offset_visibility(true);
+        });
+        preview_box->Add(minimum_visibility_offset_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, gap);
         preview_root->Add(preview_box, 0, wxEXPAND | wxALL, gap);
 
         auto *modulation_mode_row = new wxBoxSizer(wxHORIZONTAL);
@@ -1537,26 +1580,6 @@ public:
         m_generic_solver_lookup_choice->SetToolTip(_L("Controls how the fallback Generic Solver picks from precomputed filament color mixes."));
         generic_solver_row->Add(m_generic_solver_lookup_choice, 1, wxALIGN_CENTER_VERTICAL);
         experimental_box->Add(generic_solver_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
-        auto *minimum_visibility_offset_row = new wxBoxSizer(wxHORIZONTAL);
-        m_minimum_visibility_offset_checkbox = new wxCheckBox(experimental_page, wxID_ANY, _L("Minimum visibility offset"));
-        m_minimum_visibility_offset_checkbox->SetValue(minimum_visibility_offset_enabled);
-        minimum_visibility_offset_row->Add(m_minimum_visibility_offset_checkbox, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-        m_minimum_visibility_offset_spin = new wxSpinCtrl(experimental_page,
-                                                          wxID_ANY,
-                                                          wxEmptyString,
-                                                          wxDefaultPosition,
-                                                          wxSize(FromDIP(70), -1),
-                                                          wxSP_ARROW_KEYS | wxALIGN_RIGHT,
-                                                          0,
-                                                          100,
-                                                          std::clamp(int(std::lround(minimum_visibility_offset_pct)), 0, 100));
-        minimum_visibility_offset_row->Add(m_minimum_visibility_offset_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
-        m_minimum_visibility_offset_units = new wxStaticText(experimental_page, wxID_ANY, _L("%"));
-        minimum_visibility_offset_row->Add(m_minimum_visibility_offset_units, 0, wxALIGN_CENTER_VERTICAL);
-        m_minimum_visibility_offset_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
-            update_minimum_visibility_offset_visibility(true);
-        });
-        experimental_box->Add(minimum_visibility_offset_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
         update_dithering_options_visibility(false);
         update_minimum_visibility_offset_visibility(false);
         update_modulation_mode_options_visibility(false);
@@ -2083,6 +2106,7 @@ private:
             m_minimum_visibility_offset_spin->Show(enabled);
         if (m_minimum_visibility_offset_units != nullptr)
             m_minimum_visibility_offset_units->Show(enabled);
+        layout_current_options_page();
         if (!fit_dialog)
             return;
         update_options_book_min_size();
@@ -9254,7 +9278,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                 bool obj_imported_for_texture_mapping = false;
                 auto obj_color_fun = [this, &path](ObjDialogInOut &in_out) {
 
-                    if (!boost::iends_with(path.string(), ".obj")) { return; }
+                    if (!is_color_import_choice_file(path.string())) { return; }
                     const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config(nullptr, false);
                     ObjColorDialog                 color_dlg(nullptr, in_out, extruder_colours);
                     if (color_dlg.ShowModal() != wxID_OK) {
@@ -9262,11 +9286,16 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                     }
                 };
                 auto obj_import_mode_fun = [this, &path, &obj_imported_for_texture_mapping](const ObjImportCapabilities &capabilities) -> ObjImportMode {
-                    if (!boost::iends_with(path.string(), ".obj"))
+                    if (!is_color_import_choice_file(path.string()))
                         return ObjImportMode::UseDefault;
                     const ObjImportMode mode        = show_obj_import_choice_dialog(q, capabilities);
                     obj_imported_for_texture_mapping = mode == ObjImportMode::ImportTextures;
                     return mode;
+                };
+                auto obj_triangulation_fun = [this, &path](const ObjTriangulationInfo &info) {
+                    if (!boost::iends_with(path.string(), ".obj"))
+                        return true;
+                    return show_obj_triangulation_dialog(q, info);
                 };
                 if (boost::iends_with(path.string(), ".stp") ||
                     boost::iends_with(path.string(), ".step")) {
@@ -9334,7 +9363,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                             cont          = dlg.Update(progress_percent, msg);
                             cancel        = !cont;
                     },
-                    nullptr, 0, obj_color_fun, obj_import_mode_fun);
+                    nullptr, 0, obj_color_fun, obj_import_mode_fun, obj_triangulation_fun);
                 }
 
                 if (designer_model_id.empty() && boost::algorithm::iends_with(path.string(), ".stl")) {
@@ -11025,8 +11054,17 @@ bool Plater::priv::replace_volume_with_stl(int object_idx, int volume_idx, const
             new_model = Model::read_from_step(path, LoadStrategy::AddDefaultInstances | LoadStrategy::LoadModel, nullptr, nullptr, callback, linear, angle, split_compound);
             if (is_user_cancel) return false;
         } else {
-            new_model = Model::read_from_file(path, nullptr, nullptr, LoadStrategy::AddDefaultInstances | LoadStrategy::LoadModel);
+            auto obj_triangulation_fun = [this, &path](const ObjTriangulationInfo &info) {
+                if (!boost::iends_with(path, ".obj"))
+                    return true;
+                return show_obj_triangulation_dialog(q, info);
+            };
+            new_model = Model::read_from_file(path, nullptr, nullptr, LoadStrategy::AddDefaultInstances | LoadStrategy::LoadModel,
+                                              nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, nullptr, nullptr,
+                                              obj_triangulation_fun);
         }
+        if (new_model.objects.empty())
+            return false;
         for (ModelObject* model_object : new_model.objects) {
             model_object->center_around_origin();
             model_object->ensure_on_bed();
@@ -11461,7 +11499,7 @@ void Plater::priv::reload_from_disk()
         const auto& path = input_paths[i].string();
         bool        obj_imported_for_texture_mapping = false;
         auto        obj_color_fun = [this, &path](ObjDialogInOut &in_out) {
-            if (!boost::iends_with(path, ".obj")) { return; }
+            if (!is_color_import_choice_file(path)) { return; }
             const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config(nullptr, false);
             ObjColorDialog                 color_dlg(nullptr, in_out, extruder_colours);
             if (color_dlg.ShowModal() != wxID_OK) {
@@ -11469,11 +11507,16 @@ void Plater::priv::reload_from_disk()
             }
         };
         auto obj_import_mode_fun = [this, &path, &obj_imported_for_texture_mapping](const ObjImportCapabilities &capabilities) -> ObjImportMode {
-            if (!boost::iends_with(path, ".obj"))
+            if (!is_color_import_choice_file(path))
                 return ObjImportMode::UseDefault;
             const ObjImportMode mode        = show_obj_import_choice_dialog(q, capabilities);
             obj_imported_for_texture_mapping = mode == ObjImportMode::ImportTextures;
             return mode;
+        };
+        auto obj_triangulation_fun = [this, &path](const ObjTriangulationInfo &info) {
+            if (!boost::iends_with(path, ".obj"))
+                return true;
+            return show_obj_triangulation_dialog(q, info);
         };
         wxBusyCursor wait;
         wxBusyInfo info(_L("Reload from:") + " " + from_u8(path), q->get_current_canvas3D()->get_wxglcanvas());
@@ -11494,7 +11537,9 @@ void Plater::priv::reload_from_disk()
                 bool   is_split = wxGetApp().app_config->get_bool("is_split_compound");
                 new_model       = Model::read_from_step(path, LoadStrategy::AddDefaultInstances | LoadStrategy::LoadModel, nullptr, nullptr, nullptr, linear, angle, is_split);
             }else {
-                new_model = Model::read_from_file(path, nullptr, nullptr, LoadStrategy::AddDefaultInstances | LoadStrategy::LoadModel, &plate_data, &project_presets, nullptr, nullptr, nullptr, nullptr, nullptr, 0, obj_color_fun, obj_import_mode_fun);
+                new_model = Model::read_from_file(path, nullptr, nullptr, LoadStrategy::AddDefaultInstances | LoadStrategy::LoadModel,
+                                                  &plate_data, &project_presets, nullptr, nullptr, nullptr, nullptr, nullptr, 0,
+                                                  obj_color_fun, obj_import_mode_fun, obj_triangulation_fun);
             }
 
             if (obj_imported_for_texture_mapping && assign_imported_texture_mapping_zone(new_model)) {

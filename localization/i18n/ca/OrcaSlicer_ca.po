@@ -5833,8 +5833,8 @@ msgstr "Desa el projecte com a"
 msgid "Save current project as"
 msgstr "Desar el projecte actual com"
 
-msgid "Import 3MF/STL/STEP/SVG/OBJ/AMF"
-msgstr "Importar 3MF STL/STEP/SVG/OBJ/AMF"
+msgid "Import 3MF/STL/STEP/SVG/OBJ/GLTF/GLB/AMF"
+msgstr "Importar 3MF STL/STEP/SVG/OBJ/GLTF/GLB/AMF"
 
 msgid "Load a model"
 msgstr "Carregar un model"

@@ -5647,8 +5647,8 @@ msgstr "프로젝트 다른 이름으로 저장"
 msgid "Save current project as"
 msgstr "현재 프로젝트 다른 이름으로 저장"
 
-msgid "Import 3MF/STL/STEP/SVG/OBJ/AMF"
-msgstr "3MF/STL/STEP/SVG/OBJ/AMF 가져오기"
+msgid "Import 3MF/STL/STEP/SVG/OBJ/GLTF/GLB/AMF"
+msgstr "3MF/STL/STEP/SVG/OBJ/GLTF/GLB/AMF 가져오기"
 
 msgid "Load a model"
 msgstr "모델 불러오기"

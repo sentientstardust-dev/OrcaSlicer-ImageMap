@@ -5638,8 +5638,8 @@ msgstr "Зберегти проєкт як"
 msgid "Save current project as"
 msgstr "Зберегти поточний проєкт як"
 
-msgid "Import 3MF/STL/STEP/SVG/OBJ/AMF"
-msgstr "Імпорт 3MF/STL/STEP/SVG/OBJ/AMF"
+msgid "Import 3MF/STL/STEP/SVG/OBJ/GLTF/GLB/AMF"
+msgstr "Імпорт 3MF/STL/STEP/SVG/OBJ/GLTF/GLB/AMF"
 
 msgid "Load a model"
 msgstr "Завантажте модель"

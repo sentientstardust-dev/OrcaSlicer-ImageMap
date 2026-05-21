@@ -5813,8 +5813,8 @@ msgstr "Projekt mentése másként"
 msgid "Save current project as"
 msgstr "Jelenlegi projekt mentése másként"
 
-msgid "Import 3MF/STL/STEP/SVG/OBJ/AMF"
-msgstr "Importálás 3MF/STL/STEP/SVG/OBJ/AMF"
+msgid "Import 3MF/STL/STEP/SVG/OBJ/GLTF/GLB/AMF"
+msgstr "Importálás 3MF/STL/STEP/SVG/OBJ/GLTF/GLB/AMF"
 
 msgid "Load a model"
 msgstr "Modell betöltése"

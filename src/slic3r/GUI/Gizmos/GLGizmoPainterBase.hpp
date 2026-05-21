@@ -133,6 +133,7 @@ public:
     void set_texture_preview_needed(bool needed) { m_texture_preview_needed = needed; }
     void set_texture_preview_opaque(bool opaque) { m_texture_preview_opaque = opaque; }
     void set_texture_mapping_color_preview(const ColorFacetsAnnotation *preview) { m_texture_mapping_color_preview = preview; }
+    void set_full_texture_preview_forced(bool forced) { m_force_full_texture_preview = forced; }
     void set_surface_offset(float surface_offset)
     {
         if (m_surface_offset != surface_offset) {
@@ -211,6 +212,7 @@ protected:
     bool                        m_render_none_state = true;
     bool                        m_texture_preview_needed = true;
     bool                        m_texture_preview_opaque = false;
+    bool                        m_force_full_texture_preview = false;
     float                       m_surface_offset = 0.f;
 
 private:
@@ -263,6 +265,7 @@ protected:
     virtual void render_triangles(const Selection& selection) const;
     virtual void set_render_triangle_slope_uniforms(GLShaderProgram *shader, const ModelVolume *model_volume, const Matrix3f &normal_matrix) const;
     virtual bool should_render_triangle_texture_preview() const { return true; }
+    virtual bool render_triangle_texture_preview_before_selector() const { return false; }
     virtual void render_extra_triangle_overlays(int mesh_id,
                                                 const Transform3d &matrix,
                                                 const Transform3d &view_matrix,
@@ -421,6 +424,7 @@ private:
 protected:
     void on_set_state() override;
     virtual void on_opening() = 0;
+    virtual bool on_before_shutdown() { return true; }
     virtual void on_shutdown() = 0;
     virtual PainterGizmoType get_painter_type() const = 0;
 

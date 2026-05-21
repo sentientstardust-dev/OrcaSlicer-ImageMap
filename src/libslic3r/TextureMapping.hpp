@@ -120,7 +120,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultCompactOffsetMode = true;
     static constexpr bool  DefaultUseLegacyFixedColorMode = false;
     static constexpr bool  DefaultHighSpeedImageTextureSampling = true;
-    static constexpr bool  DefaultMinimumVisibilityOffsetEnabled = false;
+    static constexpr bool  DefaultMinimumVisibilityOffsetEnabled = true;
     static constexpr float DefaultMinimumVisibilityOffsetPct = 30.f;
     static constexpr int   DefaultGenericSolverLookupMode = int(GenericSolverClosestMix);
     static constexpr int   DefaultGenericSolverMode = int(GenericSolverV2);
@@ -137,7 +137,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultHighResolutionSampling = true;
     static constexpr float DefaultToneGamma = 1.f;
     static constexpr int   DefaultTransmissionDistanceCalibrationMode = int(TDCalibrationAbsolute);
-    static constexpr bool  DefaultPreviewSimulateColors = true;
+    static constexpr bool  DefaultPreviewSimulateColors = false;
     static constexpr bool  DefaultPreviewLimitResolution = true;
     static constexpr bool  DefaultAutoAdjustFilamentSelection = true;
 

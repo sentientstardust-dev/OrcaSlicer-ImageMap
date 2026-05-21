@@ -32,6 +32,16 @@ struct ObjImportCapabilities {
 
 typedef std::function<ObjImportMode(const ObjImportCapabilities &capabilities)> ObjImportModeFn;
 
+struct ObjTriangulationInfo {
+    size_t face_count{0};
+    size_t non_triangular_face_count{0};
+    size_t complex_polygon_face_count{0};
+    size_t max_face_vertices{0};
+    size_t generated_triangle_count{0};
+};
+
+typedef std::function<bool(const ObjTriangulationInfo &info)> ObjTriangulationFn;
+
 // Load an OBJ file into a provided model.
 struct ObjInfo {
     std::vector<RGBA> vertex_colors;
@@ -46,6 +56,7 @@ struct ObjInfo {
     std::unordered_map<int, std::string> uv_map_pngs;
     bool              has_uv_png{false};
     std::string       single_texture_image;
+    ObjTriangulationInfo triangulation_info;
 
 };
 struct ObjDialogInOut
@@ -60,8 +71,10 @@ struct ObjDialogInOut
     std::string lost_material_name{""};
 };
 typedef std::function<void(ObjDialogInOut &in_out)> ObjImportColorFn;
-extern bool load_obj(const char *path, TriangleMesh *mesh, ObjInfo &vertex_colors, std::string &message);
-extern bool load_obj(const char *path, Model *model, ObjInfo &vertex_colors, std::string &message, const char *object_name = nullptr);
+extern bool load_obj(const char *path, TriangleMesh *mesh, ObjInfo &vertex_colors, std::string &message,
+                     ObjTriangulationFn objTriangulationFn = nullptr);
+extern bool load_obj(const char *path, Model *model, ObjInfo &vertex_colors, std::string &message,
+                     const char *object_name = nullptr, ObjTriangulationFn objTriangulationFn = nullptr);
 
 extern bool store_obj(const char *path, TriangleMesh *mesh);
 extern bool store_obj(const char *path, ModelObject *model);

@@ -3060,6 +3060,8 @@ const GUI::GLTexture *simulated_texture_preview_texture_for_filament(const Model
     return &fallback_texture;
 }
 
+} // namespace
+
 bool build_texture_preview_model_for_state(const ModelVolume                                      &model_volume,
                                            const std::vector<TriangleSelector::FacetStateTriangle> &state_triangles,
                                            GUI::GLModel                                            &out_model)
@@ -3136,6 +3138,8 @@ bool build_texture_preview_model_for_state(const ModelVolume                    
     out_model.init_from(std::move(geometry));
     return true;
 }
+
+namespace {
 
 bool build_vertex_color_preview_geometry_for_state(const indexed_triangle_set                              &its,
                                                    const std::vector<uint32_t>                            &vertex_colors_rgba,

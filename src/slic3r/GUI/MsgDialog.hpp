@@ -67,6 +67,7 @@ struct MsgDialog : DPIDialog
 	bool get_checkbox_state();
 	virtual void on_dpi_changed(const wxRect& suggested_rect);
 	void SetButtonLabel(wxWindowID btn_id, const wxString& label, bool set_focus = false);
+	void SetButtonStyle(wxWindowID btn_id, ButtonStyle style, ButtonType type = ButtonType::Choice);
 
 protected:
 	enum {

@@ -5783,8 +5783,8 @@ msgstr "Bewaar project als"
 msgid "Save current project as"
 msgstr "Bewaar huidig project als"
 
-msgid "Import 3MF/STL/STEP/SVG/OBJ/AMF"
-msgstr "3MF/STL/STEP/SVG/OBJ/AMF importeren"
+msgid "Import 3MF/STL/STEP/SVG/OBJ/GLTF/GLB/AMF"
+msgstr "3MF/STL/STEP/SVG/OBJ/GLTF/GLB/AMF importeren"
 
 msgid "Load a model"
 msgstr "Laad een model"

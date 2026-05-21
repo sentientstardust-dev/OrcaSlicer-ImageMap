@@ -5713,8 +5713,8 @@ msgstr "Lưu dự án thành"
 msgid "Save current project as"
 msgstr "Lưu dự án hiện tại thành"
 
-msgid "Import 3MF/STL/STEP/SVG/OBJ/AMF"
-msgstr "Nhập 3MF/STL/STEP/SVG/OBJ/AMF"
+msgid "Import 3MF/STL/STEP/SVG/OBJ/GLTF/GLB/AMF"
+msgstr "Nhập 3MF/STL/STEP/SVG/OBJ/GLTF/GLB/AMF"
 
 msgid "Load a model"
 msgstr "Tải model"
