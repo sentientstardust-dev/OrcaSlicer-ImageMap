@@ -3,7 +3,11 @@
 
 #include "GLGizmoBase.hpp"
 #include "GLGizmosCommon.hpp"
+#include "libslic3r/MeshBoolean.hpp"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/ModelTextureDataRemap.hpp"
+
+#include <vector>
 
 namespace Slic3r {
 
@@ -87,7 +91,11 @@ private:
     VolumeInfo m_src;
     VolumeInfo m_tool;
 
-    void generate_new_volume(bool delete_input, const TriangleMesh& mesh_result);
+    void run_boolean_operation(const std::string &boolean_opts, bool delete_input);
+    void generate_new_volume(bool delete_input,
+                             const TriangleMesh& mesh_result,
+                             const std::vector<MultiSourceTextureDataSource>* sources = nullptr,
+                             const std::vector<MeshBoolean::mcut::MeshFaceProvenance>* provenance = nullptr);
 };
 
 } // namespace GUI

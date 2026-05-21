@@ -6,6 +6,7 @@
 #include "Model.hpp"
 #include "TriangleMesh.hpp"
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -72,6 +73,20 @@ struct SimplifyTextureDataRemapOptions
     bool remap_region_painting { true };
 };
 
+struct MultiSourceTextureDataSource
+{
+    SimplifyTextureDataSnapshot snapshot;
+    ColorRGBA fallback_color { 1.f, 1.f, 1.f, 1.f };
+};
+
+struct MultiSourceTextureTriangleProvenance
+{
+    bool valid { false };
+    size_t source_index { 0 };
+    size_t source_triangle { 0 };
+    std::array<Vec3f, 3> source_barycentric;
+};
+
 using SimplifyTextureCancelFn = std::function<void()>;
 using SimplifyTextureProgressFn = std::function<void(int)>;
 
@@ -86,6 +101,13 @@ SimplifyTextureDataResult remap_simplify_texture_data(const SimplifyTextureDataS
                                                        const SimplifyTextureCancelFn    &throw_on_cancel = {},
                                                        const SimplifyTextureProgressFn  &status_fn = {},
                                                        const SimplifyTextureDataRemapOptions &options = SimplifyTextureDataRemapOptions());
+
+SimplifyTextureDataResult remap_multi_source_texture_data(const std::vector<MultiSourceTextureDataSource> &sources,
+                                                          const indexed_triangle_set                      &target_mesh,
+                                                          const std::vector<MultiSourceTextureTriangleProvenance> &provenance,
+                                                          const SimplifyTextureCancelFn                   &throw_on_cancel = {},
+                                                          const SimplifyTextureProgressFn                 &status_fn = {},
+                                                          const SimplifyTextureDataRemapOptions           &options = SimplifyTextureDataRemapOptions());
 
 void apply_simplify_texture_data_result(ModelVolume &volume, SimplifyTextureDataResult &&result);
 

@@ -1,8 +1,10 @@
 #ifndef libslic3r_MeshBoolean_hpp_
 #define libslic3r_MeshBoolean_hpp_
 
+#include <array>
 #include <memory>
 #include <exception>
+#include <vector>
 
 #include <libslic3r/TriangleMesh.hpp>
 #include <Eigen/Geometry>
@@ -84,8 +86,23 @@ struct McutMeshDeleter
 using McutMeshPtr = std::unique_ptr<McutMesh, McutMeshDeleter>;
 bool empty(const McutMesh &mesh);
 
+struct MeshFaceProvenance
+{
+    bool valid { false };
+    size_t source_index { 0 };
+    size_t source_triangle { 0 };
+    std::array<Vec3f, 3> source_barycentric;
+};
+
+struct ProvenancedMesh
+{
+    TriangleMesh mesh;
+    std::vector<MeshFaceProvenance> provenance;
+};
+
 McutMeshPtr  triangle_mesh_to_mcut(const indexed_triangle_set &M);
 TriangleMesh mcut_to_triangle_mesh(const McutMesh &mcutmesh);
+std::vector<MeshFaceProvenance> identity_provenance(const indexed_triangle_set &its, size_t source_index);
 
 // do boolean and save result to srcMesh
 // return true if sucessful
@@ -93,10 +110,21 @@ bool do_boolean_single(McutMesh& srcMesh, const McutMesh& cutMesh, const std::st
 // do boolean of mesh with multiple volumes and save result to srcMesh
 // Both srcMesh and cutMesh may have multiple volumes.
 void do_boolean(McutMesh &srcMesh, const McutMesh &cutMesh, const std::string &boolean_opts);
+bool do_boolean_with_provenance(McutMesh                         &srcMesh,
+                                std::vector<MeshFaceProvenance>  &src_provenance,
+                                const McutMesh                   &cutMesh,
+                                const std::vector<MeshFaceProvenance> &cut_provenance,
+                                const std::string                &boolean_opts);
 
 
 // do boolean and convert result to TriangleMesh
 void make_boolean(const TriangleMesh &src_mesh, const TriangleMesh &cut_mesh, std::vector<TriangleMesh> &dst_mesh, const std::string &boolean_opts);
+bool make_boolean_with_provenance(const TriangleMesh          &src_mesh,
+                                  size_t                       src_source_index,
+                                  const TriangleMesh          &cut_mesh,
+                                  size_t                       cut_source_index,
+                                  std::vector<ProvenancedMesh> &dst_mesh,
+                                  const std::string           &boolean_opts);
 } // namespace mcut
 
 } // namespace MeshBoolean

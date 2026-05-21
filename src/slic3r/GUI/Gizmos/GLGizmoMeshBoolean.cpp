@@ -2,10 +2,13 @@
 #include "slic3r/GUI/GLCanvas3D.hpp"
 #include "slic3r/GUI/ImGuiWrapper.hpp"
 #include "slic3r/GUI/GUI.hpp"
+#include "slic3r/GUI/GUI_Utils.hpp"
 #include "libslic3r/MeshBoolean.hpp"
+#include "libslic3r/ModelTextureDataRemap.hpp"
 #include "slic3r/GUI/GUI_ObjectList.hpp"
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/Camera.hpp"
+#include "slic3r/GUI/MsgDialog.hpp"
 #include "slic3r/GUI/NotificationManager.hpp"
 #ifndef IMGUI_DEFINE_MATH_OPERATORS
 #define IMGUI_DEFINE_MATH_OPERATORS
@@ -15,6 +18,111 @@ namespace Slic3r {
 namespace GUI {
 
 static const std::string warning_text = _u8L("Unable to perform boolean operation on selected parts");
+
+static wxString mesh_boolean_color_transfer_warning_text()
+{
+    return _L("Color data could not be transferred because boolean face provenance was unavailable. The mesh boolean result was created without color data.");
+}
+
+static wxString mesh_boolean_color_remap_warning_text()
+{
+    return _L("Color data could not be transferred. The mesh boolean result was created without color data.");
+}
+
+static void show_mesh_boolean_color_transfer_warning_dialog()
+{
+    MessageDialog(wxGetApp().plater(), mesh_boolean_color_transfer_warning_text(), _L("Warning"), wxOK | wxICON_WARNING).ShowModal();
+}
+
+static void show_mesh_boolean_color_remap_warning_dialog()
+{
+    MessageDialog(wxGetApp().plater(), mesh_boolean_color_remap_warning_text(), _L("Warning"), wxOK | wxICON_WARNING).ShowModal();
+}
+
+static ColorRGBA mesh_boolean_volume_base_color(const ModelVolume &volume)
+{
+    std::vector<std::string> colors;
+    if (wxGetApp().plater() != nullptr)
+        colors = wxGetApp().plater()->get_extruder_colors_from_plater_config(nullptr, true);
+    const int extruder_id = std::max(volume.extruder_id(), 1);
+    if (size_t(extruder_id - 1) < colors.size())
+        return decode_color_to_float_array(colors[size_t(extruder_id - 1)]);
+    return ColorRGBA(0.15f, 0.65f, 0.6f, 1.f);
+}
+
+static bool mesh_boolean_snapshot_has_transfer_data(const SimplifyTextureDataSnapshot &snapshot)
+{
+    return snapshot.source != SimplifyColorSource::None || snapshot.region_painting_present;
+}
+
+static bool mesh_boolean_texture_result_has_output(const SimplifyTextureDataResult &result)
+{
+    switch (result.source) {
+    case SimplifyColorSource::RgbaData:
+        return !result.remap_failed || (result.rgba_data != nullptr && !result.rgba_data->empty());
+    case SimplifyColorSource::ImageTexture:
+        return result.texture_width > 0 &&
+               result.texture_height > 0 &&
+               !result.texture_uv_valid.empty() &&
+               (!result.texture_rgba.empty() || !result.texture_raw_filament_offsets.empty());
+    case SimplifyColorSource::VertexColors:
+        return !result.vertex_colors_rgba.empty();
+    case SimplifyColorSource::None:
+        break;
+    }
+    return result.region_painting_valid;
+}
+
+static void mesh_boolean_transform_snapshot(SimplifyTextureDataSnapshot &snapshot, const Transform3d &transform, bool fix_left_handed)
+{
+    transform_simplify_texture_data_snapshot(snapshot, transform);
+    if (!fix_left_handed)
+        return;
+    if (transform.matrix().block(0, 0, 3, 3).determinant() >= 0.)
+        return;
+    if (!snapshot.source_mesh.indices.empty())
+        its_flip_triangles(snapshot.source_mesh);
+    for (size_t tri_idx = 0; tri_idx < snapshot.texture_uv_valid.size(); ++tri_idx) {
+        const size_t uv_offset = tri_idx * 6;
+        if (uv_offset + 5 >= snapshot.texture_uvs_per_face.size())
+            break;
+        std::swap(snapshot.texture_uvs_per_face[uv_offset + 2], snapshot.texture_uvs_per_face[uv_offset + 4]);
+        std::swap(snapshot.texture_uvs_per_face[uv_offset + 3], snapshot.texture_uvs_per_face[uv_offset + 5]);
+    }
+}
+
+static MultiSourceTextureDataSource mesh_boolean_gizmo_source(const ModelVolume &volume,
+                                                              const Transform3d &transform,
+                                                              const ColorRGBA &fallback_color,
+                                                              bool &had_transfer_data)
+{
+    MultiSourceTextureDataSource source;
+    source.snapshot = snapshot_simplify_texture_data(volume);
+    mesh_boolean_transform_snapshot(source.snapshot, transform, true);
+    source.fallback_color = fallback_color;
+    had_transfer_data = true;
+    had_transfer_data |= mesh_boolean_snapshot_has_transfer_data(source.snapshot);
+    return source;
+}
+
+static MultiSourceTextureTriangleProvenance mesh_boolean_remap_provenance_entry(const MeshBoolean::mcut::MeshFaceProvenance &entry)
+{
+    MultiSourceTextureTriangleProvenance out;
+    out.valid = entry.valid;
+    out.source_index = entry.source_index;
+    out.source_triangle = entry.source_triangle;
+    out.source_barycentric = entry.source_barycentric;
+    return out;
+}
+
+static std::vector<MultiSourceTextureTriangleProvenance> mesh_boolean_remap_provenance(const std::vector<MeshBoolean::mcut::MeshFaceProvenance> &provenance)
+{
+    std::vector<MultiSourceTextureTriangleProvenance> out;
+    out.reserve(provenance.size());
+    for (const MeshBoolean::mcut::MeshFaceProvenance &entry : provenance)
+        out.emplace_back(mesh_boolean_remap_provenance_entry(entry));
+    return out;
+}
 
 GLGizmoMeshBoolean::GLGizmoMeshBoolean(GLCanvas3D& parent, const std::string& icon_filename, unsigned int sprite_id)
     : GLGizmoBase(parent, icon_filename, sprite_id)
@@ -338,57 +446,18 @@ void GLGizmoMeshBoolean::on_render_input_window(float x, float y, float bottom_l
     bool enable_button = m_src.mv && m_tool.mv;
     if (m_operation_mode == MeshBooleanOperation::Union)
     {
-        if (operate_button(_L("Union") + "##btn", enable_button)) {
-            TriangleMesh temp_src_mesh = m_src.mv->mesh();
-            temp_src_mesh.transform(m_src.trafo);
-            TriangleMesh temp_tool_mesh = m_tool.mv->mesh();
-            temp_tool_mesh.transform(m_tool.trafo);
-            std::vector<TriangleMesh> temp_mesh_resuls;
-            Slic3r::MeshBoolean::mcut::make_boolean(temp_src_mesh, temp_tool_mesh, temp_mesh_resuls, "UNION");
-            if (temp_mesh_resuls.size() != 0) {
-                generate_new_volume(true, *temp_mesh_resuls.begin());
-                wxGetApp().notification_manager()->close_plater_warning_notification(warning_text);
-            }
-            else {
-                wxGetApp().notification_manager()->push_plater_warning_notification(warning_text);
-            }
-        }
+        if (operate_button(_L("Union") + "##btn", enable_button))
+            run_boolean_operation("UNION", true);
     }
     else if (m_operation_mode == MeshBooleanOperation::Difference) {
         m_imgui->bbl_checkbox(_L("Delete input"), m_diff_delete_input);
-        if (operate_button(_L("Difference") + "##btn", enable_button)) {
-            TriangleMesh temp_src_mesh = m_src.mv->mesh();
-            temp_src_mesh.transform(m_src.trafo);
-            TriangleMesh temp_tool_mesh = m_tool.mv->mesh();
-            temp_tool_mesh.transform(m_tool.trafo);
-            std::vector<TriangleMesh> temp_mesh_resuls;
-            Slic3r::MeshBoolean::mcut::make_boolean(temp_src_mesh, temp_tool_mesh, temp_mesh_resuls, "A_NOT_B");
-            if (temp_mesh_resuls.size() != 0) {
-                generate_new_volume(m_diff_delete_input, *temp_mesh_resuls.begin());
-                wxGetApp().notification_manager()->close_plater_warning_notification(warning_text);
-            }
-            else {
-                wxGetApp().notification_manager()->push_plater_warning_notification(warning_text);
-            }
-        }
+        if (operate_button(_L("Difference") + "##btn", enable_button))
+            run_boolean_operation("A_NOT_B", m_diff_delete_input);
     }
     else if (m_operation_mode == MeshBooleanOperation::Intersection){
         m_imgui->bbl_checkbox(_L("Delete input"), m_inter_delete_input);
-        if (operate_button(_L("Intersection") + "##btn", enable_button)) {
-            TriangleMesh temp_src_mesh = m_src.mv->mesh();
-            temp_src_mesh.transform(m_src.trafo);
-            TriangleMesh temp_tool_mesh = m_tool.mv->mesh();
-            temp_tool_mesh.transform(m_tool.trafo);
-            std::vector<TriangleMesh> temp_mesh_resuls;
-            Slic3r::MeshBoolean::mcut::make_boolean(temp_src_mesh, temp_tool_mesh, temp_mesh_resuls, "INTERSECTION");
-            if (temp_mesh_resuls.size() != 0) {
-                generate_new_volume(m_inter_delete_input, *temp_mesh_resuls.begin());
-                wxGetApp().notification_manager()->close_plater_warning_notification(warning_text);
-            }
-            else {
-                wxGetApp().notification_manager()->push_plater_warning_notification(warning_text);
-            }
-        }
+        if (operate_button(_L("Intersection") + "##btn", enable_button))
+            run_boolean_operation("INTERSECTION", m_inter_delete_input);
     }
 
     float win_w = ImGui::GetWindowWidth();
@@ -420,7 +489,54 @@ void GLGizmoMeshBoolean::on_save(cereal::BinaryOutputArchive &ar) const
     ar(m_enable, m_operation_mode, m_selecting_state, m_diff_delete_input, m_inter_delete_input, m_src, m_tool);
 }
 
-void GLGizmoMeshBoolean::generate_new_volume(bool delete_input, const TriangleMesh& mesh_result) {
+void GLGizmoMeshBoolean::run_boolean_operation(const std::string &boolean_opts, bool delete_input)
+{
+    TriangleMesh temp_src_mesh = m_src.mv->mesh();
+    temp_src_mesh.transform(m_src.trafo, true);
+    TriangleMesh temp_tool_mesh = m_tool.mv->mesh();
+    temp_tool_mesh.transform(m_tool.trafo, true);
+
+    const ColorRGBA source_base_color = mesh_boolean_volume_base_color(*m_src.mv);
+    const ColorRGBA tool_base_color = mesh_boolean_volume_base_color(*m_tool.mv);
+    bool had_transfer_data = false;
+    std::vector<MultiSourceTextureDataSource> sources;
+    sources.reserve(2);
+    sources.emplace_back(mesh_boolean_gizmo_source(*m_src.mv, m_src.trafo, source_base_color, had_transfer_data));
+    MultiSourceTextureDataSource tool_source = mesh_boolean_gizmo_source(*m_tool.mv,
+                                                                         m_tool.trafo,
+                                                                         tool_base_color,
+                                                                         had_transfer_data);
+    if (boolean_opts == "A_NOT_B" && tool_source.snapshot.source == SimplifyColorSource::None)
+        tool_source.fallback_color = source_base_color;
+    sources.emplace_back(std::move(tool_source));
+
+    if (had_transfer_data) {
+        std::vector<MeshBoolean::mcut::ProvenancedMesh> provenanced_results;
+        const bool provenance_ok = MeshBoolean::mcut::make_boolean_with_provenance(temp_src_mesh, 0, temp_tool_mesh, 1, provenanced_results, boolean_opts);
+        if (provenance_ok && !provenanced_results.empty()) {
+            generate_new_volume(delete_input, provenanced_results.front().mesh, &sources, &provenanced_results.front().provenance);
+            wxGetApp().notification_manager()->close_plater_warning_notification(warning_text);
+            return;
+        }
+    }
+
+    std::vector<TriangleMesh> temp_mesh_resuls;
+    Slic3r::MeshBoolean::mcut::make_boolean(temp_src_mesh, temp_tool_mesh, temp_mesh_resuls, boolean_opts);
+    if (temp_mesh_resuls.size() != 0) {
+        if (had_transfer_data)
+            show_mesh_boolean_color_transfer_warning_dialog();
+        generate_new_volume(delete_input, *temp_mesh_resuls.begin());
+        wxGetApp().notification_manager()->close_plater_warning_notification(warning_text);
+    }
+    else {
+        wxGetApp().notification_manager()->push_plater_warning_notification(warning_text);
+    }
+}
+
+void GLGizmoMeshBoolean::generate_new_volume(bool delete_input,
+                                             const TriangleMesh& mesh_result,
+                                             const std::vector<MultiSourceTextureDataSource>* sources,
+                                             const std::vector<MeshBoolean::mcut::MeshFaceProvenance>* provenance) {
 
     wxGetApp().plater()->take_snapshot("Mesh Boolean");
 
@@ -449,7 +565,15 @@ void GLGizmoMeshBoolean::generate_new_volume(bool delete_input, const TriangleMe
     new_volume->config.apply(old_volume->config);
     new_volume->set_type(old_volume->type());
     new_volume->set_material_id(old_volume->material_id());
-    new_volume->set_offset(old_volume->get_transformation().get_offset());
+    if (sources != nullptr && provenance != nullptr && new_volume->mesh().its.indices.size() == provenance->size()) {
+        std::vector<MultiSourceTextureTriangleProvenance> remap_provenance = mesh_boolean_remap_provenance(*provenance);
+        SimplifyTextureDataResult result = remap_multi_source_texture_data(*sources, new_volume->mesh().its, remap_provenance);
+        if (mesh_boolean_texture_result_has_output(result) || result.region_painting_touched)
+            apply_simplify_texture_data_result(*new_volume, std::move(result));
+        else
+            show_mesh_boolean_color_remap_warning_dialog();
+    } else if (sources != nullptr && !sources->empty())
+        show_mesh_boolean_color_transfer_warning_dialog();
     //Vec3d translate_z = { 0,0, (new_volume->source.mesh_offset - old_volume->source.mesh_offset).z() };
     //new_volume->translate(new_volume->get_transformation().get_matrix_no_offset() * translate_z);
     //new_volume->supported_facets.assign(old_volume->supported_facets);

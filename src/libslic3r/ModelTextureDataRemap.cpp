@@ -1445,6 +1445,436 @@ static SimplifyTextureDataResult remap_vertex_colors_from_snapshot(const Simplif
     return result;
 }
 
+struct PreparedMultiSourceTextureDataSource
+{
+    MultiSourceTextureDataSource source;
+    RgbaFacetLookup rgba_lookup;
+    RegionFacetLookup region_lookup;
+};
+
+static bool snapshot_has_color_data(const SimplifyTextureDataSnapshot &snapshot)
+{
+    return snapshot.source != SimplifyColorSource::None;
+}
+
+static ColorRGBA first_multi_source_fallback_color(const std::vector<PreparedMultiSourceTextureDataSource> &sources)
+{
+    return sources.empty() ? ColorRGBA(1.f, 1.f, 1.f, 1.f) : sources.front().source.fallback_color;
+}
+
+static bool multi_source_provenance_source(const std::vector<PreparedMultiSourceTextureDataSource> &sources,
+                                           const std::vector<MultiSourceTextureTriangleProvenance> &provenance,
+                                           size_t                                                   target_triangle,
+                                           size_t                                                  &source_index,
+                                           const MultiSourceTextureTriangleProvenance              *&entry)
+{
+    if (target_triangle >= provenance.size())
+        return false;
+    entry = &provenance[target_triangle];
+    if (!entry->valid || entry->source_index >= sources.size())
+        return false;
+    source_index = entry->source_index;
+    return true;
+}
+
+static Vec3f multi_source_source_barycentric(const MultiSourceTextureTriangleProvenance &entry, const Vec3f &target_barycentric)
+{
+    return normalized_nonnegative_barycentric(entry.source_barycentric[0] * target_barycentric.x() +
+                                              entry.source_barycentric[1] * target_barycentric.y() +
+                                              entry.source_barycentric[2] * target_barycentric.z());
+}
+
+static bool multi_source_source_point(const SimplifyTextureDataSnapshot &snapshot,
+                                      size_t                             source_triangle,
+                                      const Vec3f                       &source_barycentric,
+                                      Vec3f                             &source_point)
+{
+    std::array<Vec3f, 3> source_vertices;
+    if (!valid_triangle_vertices(snapshot.source_mesh, source_triangle, source_vertices))
+        return false;
+    source_point = source_vertices[0] * source_barycentric.x() +
+                   source_vertices[1] * source_barycentric.y() +
+                   source_vertices[2] * source_barycentric.z();
+    return true;
+}
+
+static bool ensure_snapshot_rgba_preview_from_raw(SimplifyTextureDataSnapshot &snapshot)
+{
+    if (snapshot_has_valid_rgba_texture(snapshot))
+        return true;
+    if (!snapshot_has_valid_raw_atlas(snapshot))
+        return false;
+
+    ImageMapRawFilamentOffsetAtlas atlas;
+    atlas.width = snapshot.texture_width;
+    atlas.height = snapshot.texture_height;
+    atlas.channels = snapshot.texture_raw_channels;
+    atlas.offsets = snapshot.texture_raw_filament_offsets;
+    atlas.metadata_json = snapshot.texture_raw_metadata_json;
+    atlas.filaments = image_map_raw_filaments_from_metadata_json(atlas.metadata_json, atlas.channels);
+    snapshot.texture_rgba = image_map_raw_filament_offset_preview_rgba(atlas);
+    return snapshot_has_valid_rgba_texture(snapshot);
+}
+
+static std::vector<PreparedMultiSourceTextureDataSource> prepare_multi_source_texture_data_sources(const std::vector<MultiSourceTextureDataSource> &sources)
+{
+    std::vector<PreparedMultiSourceTextureDataSource> prepared;
+    prepared.reserve(sources.size());
+    for (const MultiSourceTextureDataSource &source : sources) {
+        PreparedMultiSourceTextureDataSource item;
+        item.source = source;
+        if (item.source.snapshot.source == SimplifyColorSource::ImageTexture)
+            limit_snapshot_texture_resolution(item.source.snapshot);
+        if (item.source.snapshot.source == SimplifyColorSource::RgbaData)
+            item.rgba_lookup = make_rgba_facet_lookup(item.source.snapshot);
+        if (item.source.snapshot.region_painting_transfer_needed)
+            item.region_lookup = make_region_facet_lookup(item.source.snapshot);
+        prepared.emplace_back(std::move(item));
+    }
+    return prepared;
+}
+
+static ColorRGBA sample_multi_source_color_at_target(const std::vector<PreparedMultiSourceTextureDataSource> &sources,
+                                                     const std::vector<MultiSourceTextureTriangleProvenance> &provenance,
+                                                     size_t                                                   target_triangle,
+                                                     const Vec3f                                             &target_barycentric)
+{
+    size_t source_index = 0;
+    const MultiSourceTextureTriangleProvenance *entry = nullptr;
+    if (!multi_source_provenance_source(sources, provenance, target_triangle, source_index, entry))
+        return first_multi_source_fallback_color(sources);
+
+    const PreparedMultiSourceTextureDataSource &source = sources[source_index];
+    const SimplifyTextureDataSnapshot &snapshot = source.source.snapshot;
+    if (snapshot.source == SimplifyColorSource::None)
+        return source.source.fallback_color;
+
+    const Vec3f source_barycentric = multi_source_source_barycentric(*entry, target_barycentric);
+    switch (snapshot.source) {
+    case SimplifyColorSource::RgbaData: {
+        Vec3f source_point = Vec3f::Zero();
+        if (!multi_source_source_point(snapshot, entry->source_triangle, source_barycentric, source_point))
+            return source.source.fallback_color;
+        return sample_rgba_facets_at_source(snapshot, source.rgba_lookup, entry->source_triangle, source_point);
+    }
+    case SimplifyColorSource::ImageTexture:
+        return snapshot_has_valid_rgba_texture(snapshot) ?
+            sample_image_rgba_at_source(snapshot, entry->source_triangle, source_barycentric) :
+            source.source.fallback_color;
+    case SimplifyColorSource::VertexColors:
+        return sample_vertex_color_at_source(snapshot, entry->source_triangle, source_barycentric);
+    case SimplifyColorSource::None:
+        break;
+    }
+    return source.source.fallback_color;
+}
+
+static std::vector<uint8_t> sample_multi_source_raw_at_target(const std::vector<PreparedMultiSourceTextureDataSource> &sources,
+                                                              const std::vector<MultiSourceTextureTriangleProvenance> &provenance,
+                                                              size_t                                                   target_triangle,
+                                                              const Vec3f                                             &target_barycentric,
+                                                              uint32_t                                                 channels)
+{
+    size_t source_index = 0;
+    const MultiSourceTextureTriangleProvenance *entry = nullptr;
+    if (!multi_source_provenance_source(sources, provenance, target_triangle, source_index, entry))
+        return std::vector<uint8_t>(size_t(channels), 0);
+
+    const SimplifyTextureDataSnapshot &snapshot = sources[source_index].source.snapshot;
+    if (snapshot.source != SimplifyColorSource::ImageTexture || !snapshot_has_valid_raw_atlas(snapshot))
+        return std::vector<uint8_t>(size_t(channels), 0);
+    return sample_image_raw_at_source(snapshot, entry->source_triangle, multi_source_source_barycentric(*entry, target_barycentric));
+}
+
+static unsigned int sample_multi_source_region_at_target(const std::vector<PreparedMultiSourceTextureDataSource> &sources,
+                                                         const std::vector<MultiSourceTextureTriangleProvenance> &provenance,
+                                                         size_t                                                   target_triangle,
+                                                         const Vec3f                                             &target_barycentric)
+{
+    size_t source_index = 0;
+    const MultiSourceTextureTriangleProvenance *entry = nullptr;
+    if (!multi_source_provenance_source(sources, provenance, target_triangle, source_index, entry))
+        return 0;
+
+    const PreparedMultiSourceTextureDataSource &source = sources[source_index];
+    const SimplifyTextureDataSnapshot &snapshot = source.source.snapshot;
+    if (!snapshot.region_painting_transfer_needed)
+        return 0;
+
+    const Vec3f source_barycentric = multi_source_source_barycentric(*entry, target_barycentric);
+    Vec3f source_point = Vec3f::Zero();
+    if (!multi_source_source_point(snapshot, entry->source_triangle, source_barycentric, source_point))
+        return 0;
+    return sample_region_state_at_source(snapshot, source.region_lookup, entry->source_triangle, source_point);
+}
+
+static bool multi_source_raw_compatible(const std::vector<PreparedMultiSourceTextureDataSource> &sources,
+                                        const std::vector<uint8_t>                              &participating,
+                                        uint32_t                                                &channels,
+                                        std::string                                             &metadata_json)
+{
+    channels = 0;
+    metadata_json.clear();
+    bool found = false;
+    for (size_t source_idx = 0; source_idx < sources.size(); ++source_idx) {
+        if (source_idx >= participating.size() || participating[source_idx] == 0)
+            continue;
+        const SimplifyTextureDataSnapshot &snapshot = sources[source_idx].source.snapshot;
+        if (!snapshot_has_color_data(snapshot))
+            continue;
+        if (snapshot.source != SimplifyColorSource::ImageTexture || !snapshot_has_valid_raw_atlas(snapshot))
+            return false;
+        if (!found) {
+            channels = snapshot.texture_raw_channels;
+            metadata_json = snapshot.texture_raw_metadata_json;
+            found = true;
+        } else if (channels != snapshot.texture_raw_channels || metadata_json != snapshot.texture_raw_metadata_json)
+            return false;
+    }
+    return found;
+}
+
+static SimplifyTextureDataResult remap_multi_source_rgba_from_provenance(const std::vector<PreparedMultiSourceTextureDataSource> &sources,
+                                                                         const indexed_triangle_set                             &target_mesh,
+                                                                         const std::vector<MultiSourceTextureTriangleProvenance> &provenance,
+                                                                         bool                                                    any_image_source,
+                                                                         const SimplifyTextureCancelFn                          &throw_on_cancel,
+                                                                         const SimplifyTextureProgressFn                        &status_fn)
+{
+    SimplifyTextureDataResult result;
+    result.source = SimplifyColorSource::RgbaData;
+    if (target_mesh.indices.empty() || provenance.size() != target_mesh.indices.size())
+        return result;
+
+    set_progress(status_fn, 0);
+    auto annotation = ColorFacetsAnnotation::make_temporary();
+    annotation->set_metadata_json(rgb_metadata_json(ColorRGBA(1.f, 1.f, 1.f, 1.f)));
+
+    const int max_depth = any_image_source ? 5 : 4;
+    const float target_span = std::max(mesh_max_axis_span(target_mesh) / 120.f, 0.3f);
+    TextureMappingColorSubdivisionDepths subdivision_depths =
+        [target_span, max_depth](size_t, const std::array<Vec3f, 3> &vertices) {
+            const int depth = texture_mapping_depth_from_span(triangle_max_edge_length(vertices), target_span, max_depth);
+            return std::make_pair(depth, max_depth);
+        };
+
+    size_t sample_counter = 0;
+    TextureMappingColorSampler sampler = [&](size_t target_triangle, const Vec3f &, const Vec3f &target_barycentric) {
+        if ((++sample_counter & 1023u) == 0)
+            check_cancel(throw_on_cancel);
+        return pack_rgba(sample_multi_source_color_at_target(sources, provenance, target_triangle, target_barycentric));
+    };
+
+    const float split_threshold = any_image_source ? 0.025f : 0.04f;
+    TextureMappingColorProgressFn progress_fn = [&status_fn](size_t completed, size_t total) {
+        const int percent = total == 0 ? 100 : int((uint64_t(completed) * 100u) / uint64_t(total));
+        set_progress(status_fn, percent);
+    };
+    annotation->set_from_triangle_sampler(target_mesh, sampler, max_depth, split_threshold, subdivision_depths, nullptr, {}, progress_fn);
+    check_cancel(throw_on_cancel);
+    set_progress(status_fn, 100);
+    if (!annotation->empty())
+        result.rgba_data = std::move(annotation);
+    return result;
+}
+
+static SimplifyTextureDataResult remap_multi_source_image_from_provenance(const std::vector<PreparedMultiSourceTextureDataSource> &sources,
+                                                                          const indexed_triangle_set                             &target_mesh,
+                                                                          const std::vector<MultiSourceTextureTriangleProvenance> &provenance,
+                                                                          bool                                                    remap_raw,
+                                                                          uint32_t                                                raw_channels,
+                                                                          const std::string                                      &raw_metadata_json,
+                                                                          const SimplifyTextureCancelFn                          &throw_on_cancel,
+                                                                          const SimplifyTextureProgressFn                        &status_fn)
+{
+    SimplifyTextureDataResult result;
+    if (target_mesh.indices.empty() || provenance.size() != target_mesh.indices.size())
+        return result;
+
+    set_progress(status_fn, 0);
+    GeneratedImageTextureAtlas atlas;
+    if (!initialize_generated_image_texture(target_mesh, result, atlas, first_multi_source_fallback_color(sources)))
+        return result;
+    set_progress(status_fn, 8);
+    check_cancel(throw_on_cancel);
+
+    if (remap_raw) {
+        result.texture_raw_channels = raw_channels;
+        result.texture_raw_metadata_json = raw_metadata_json;
+        result.texture_raw_filament_offsets.assign(size_t(result.texture_width) * size_t(result.texture_height) * size_t(result.texture_raw_channels), 0);
+    }
+
+    auto island_pixel_count = [&result](const GeneratedImageTextureIsland &island) -> uint64_t {
+        const int x_begin = std::max(0, island.x);
+        const int y_begin = std::max(0, island.y);
+        const int x_end = std::min<int>(island.x + island.rect_width, int(result.texture_width));
+        const int y_end = std::min<int>(island.y + island.rect_height, int(result.texture_height));
+        if (x_end <= x_begin || y_end <= y_begin)
+            return 0;
+        return uint64_t(x_end - x_begin) * uint64_t(y_end - y_begin);
+    };
+
+    uint64_t total_pixels = 0;
+    for (const GeneratedImageTextureIsland &island : atlas.islands)
+        total_pixels += island_pixel_count(island);
+
+    uint64_t processed_pixels = 0;
+    int last_raster_progress = -1;
+    auto report_raster_progress = [&status_fn, total_pixels, &processed_pixels, &last_raster_progress]() {
+        const int progress = total_pixels == 0 ? 96 : 8 + int((processed_pixels * 88u) / total_pixels);
+        if (progress != last_raster_progress) {
+            last_raster_progress = progress;
+            set_progress(status_fn, progress);
+        }
+    };
+    report_raster_progress();
+
+    size_t pixel_counter = 0;
+    for (size_t island_idx = 0; island_idx < atlas.islands.size(); ++island_idx) {
+        if ((island_idx & 31u) == 0)
+            check_cancel(throw_on_cancel);
+
+        const GeneratedImageTextureIsland &island = atlas.islands[island_idx];
+        const uint64_t island_pixels = island_pixel_count(island);
+        const size_t uv_offset = island.tri_idx * 6;
+        if (uv_offset + 5 >= result.texture_uvs_per_face.size()) {
+            processed_pixels += island_pixels;
+            report_raster_progress();
+            continue;
+        }
+
+        const float texture_size = float(result.texture_width);
+        const std::array<Vec2f, 3> target_uv_pixels = {
+            Vec2f(result.texture_uvs_per_face[uv_offset + 0] * texture_size, result.texture_uvs_per_face[uv_offset + 1] * texture_size),
+            Vec2f(result.texture_uvs_per_face[uv_offset + 2] * texture_size, result.texture_uvs_per_face[uv_offset + 3] * texture_size),
+            Vec2f(result.texture_uvs_per_face[uv_offset + 4] * texture_size, result.texture_uvs_per_face[uv_offset + 5] * texture_size)
+        };
+
+        const int x_end = std::min<int>(island.x + island.rect_width, int(result.texture_width));
+        const int y_end = std::min<int>(island.y + island.rect_height, int(result.texture_height));
+        for (int y = std::max(0, island.y); y < y_end; ++y) {
+            for (int x = std::max(0, island.x); x < x_end; ++x) {
+                ++processed_pixels;
+                report_raster_progress();
+                if ((++pixel_counter & 65535u) == 0)
+                    check_cancel(throw_on_cancel);
+
+                const Vec2f pixel(float(x) + 0.5f, float(y) + 0.5f);
+                const Vec3f raw_target_bary = barycentric_weights_2d(pixel, target_uv_pixels);
+                const Vec3f target_bary = normalized_nonnegative_barycentric(raw_target_bary);
+                if (std::min({ raw_target_bary.x(), raw_target_bary.y(), raw_target_bary.z() }) < -1e-4f) {
+                    const Vec2f closest = target_uv_pixels[0] * target_bary.x() +
+                                          target_uv_pixels[1] * target_bary.y() +
+                                          target_uv_pixels[2] * target_bary.z();
+                    const float bleed_px = float(atlas.padding_px) + 1.5f;
+                    if ((closest - pixel).squaredNorm() > bleed_px * bleed_px)
+                        continue;
+                }
+
+                if (remap_raw) {
+                    write_raw_offset_pixel(result.texture_raw_filament_offsets,
+                                           result.texture_width,
+                                           result.texture_raw_channels,
+                                           uint32_t(x),
+                                           uint32_t(y),
+                                           sample_multi_source_raw_at_target(sources, provenance, island.tri_idx, target_bary, raw_channels));
+                } else {
+                    write_rgba_pixel(result.texture_rgba,
+                                     result.texture_width,
+                                     uint32_t(x),
+                                     uint32_t(y),
+                                     sample_multi_source_color_at_target(sources, provenance, island.tri_idx, target_bary));
+                }
+            }
+        }
+    }
+
+    if (remap_raw && !refresh_result_preview_from_raw(result))
+        return SimplifyTextureDataResult();
+
+    set_progress(status_fn, 100);
+    result.source = SimplifyColorSource::ImageTexture;
+    return result;
+}
+
+static void remap_multi_source_region_painting_from_provenance(const std::vector<PreparedMultiSourceTextureDataSource> &sources,
+                                                               const indexed_triangle_set                             &target_mesh,
+                                                               const std::vector<MultiSourceTextureTriangleProvenance> &provenance,
+                                                               bool                                                    region_painting_present,
+                                                               bool                                                    region_painting_transfer_needed,
+                                                               const SimplifyTextureCancelFn                          &throw_on_cancel,
+                                                               const SimplifyTextureProgressFn                        &status_fn,
+                                                               SimplifyTextureDataResult                              &result)
+{
+    result.region_painting_touched = region_painting_present;
+    if (!region_painting_present) {
+        set_progress(status_fn, 100);
+        return;
+    }
+
+    if (!region_painting_transfer_needed) {
+        set_progress(status_fn, 100);
+        return;
+    }
+
+    if (target_mesh.indices.empty() || provenance.size() != target_mesh.indices.size()) {
+        result.region_painting_remap_failed = true;
+        set_progress(status_fn, 100);
+        return;
+    }
+
+    set_progress(status_fn, 0);
+    const int max_depth = 4;
+    const float target_span = std::max(mesh_max_axis_span(target_mesh) / 120.f, 0.3f);
+    const std::array<Vec3f, 3> root_barycentrics = {
+        Vec3f(1.f, 0.f, 0.f),
+        Vec3f(0.f, 1.f, 0.f),
+        Vec3f(0.f, 0.f, 1.f)
+    };
+
+    RegionPaintingSampler sampler = [&](size_t target_triangle, const Vec3f &, const Vec3f &target_barycentric) {
+        return sample_multi_source_region_at_target(sources, provenance, target_triangle, target_barycentric);
+    };
+
+    TriangleSelector::TriangleSplittingData data;
+    data.triangles_to_split.reserve(target_mesh.indices.size());
+    size_t sample_counter = 0;
+    for (size_t tri_idx = 0; tri_idx < target_mesh.indices.size(); ++tri_idx) {
+        if ((++sample_counter & 255u) == 0) {
+            check_cancel(throw_on_cancel);
+            set_progress(status_fn, int((uint64_t(tri_idx) * 100u) / std::max<size_t>(target_mesh.indices.size(), 1)));
+        }
+
+        std::array<Vec3f, 3> vertices;
+        if (!valid_triangle_vertices(target_mesh, tri_idx, vertices))
+            continue;
+
+        const size_t bitstream_start = data.bitstream.size();
+        const int min_depth = texture_mapping_depth_from_span(triangle_max_edge_length(vertices), target_span, max_depth);
+        const bool has_non_base = region_append_sampled_triangle(data,
+                                                                 sampler,
+                                                                 tri_idx,
+                                                                 vertices,
+                                                                 root_barycentrics,
+                                                                 0,
+                                                                 min_depth,
+                                                                 max_depth);
+        if (has_non_base)
+            data.triangles_to_split.emplace_back(int(tri_idx), int(bitstream_start));
+        else
+            data.bitstream.resize(bitstream_start);
+    }
+
+    check_cancel(throw_on_cancel);
+    set_progress(status_fn, 100);
+    data.triangles_to_split.shrink_to_fit();
+    data.bitstream.shrink_to_fit();
+    if (!data.triangles_to_split.empty()) {
+        result.region_painting_data = std::move(data);
+        result.region_painting_valid = true;
+    }
+}
+
 static void clear_image_texture(ModelVolume &volume)
 {
     volume.imported_texture_uvs_per_face.clear();
@@ -1640,6 +2070,117 @@ SimplifyTextureDataResult remap_simplify_texture_data(const SimplifyTextureDataS
             region_progress = scaled_progress(80, 20);
         if (options.remap_region_painting)
             remap_region_painting_from_snapshot(snapshot, simplified_mesh, throw_on_cancel, region_progress, result);
+        else {
+            result.region_painting_touched = true;
+            set_progress(region_progress, 100);
+        }
+    }
+
+    set_progress(status_fn, 100);
+    return result;
+}
+
+SimplifyTextureDataResult remap_multi_source_texture_data(const std::vector<MultiSourceTextureDataSource> &sources,
+                                                          const indexed_triangle_set                      &target_mesh,
+                                                          const std::vector<MultiSourceTextureTriangleProvenance> &provenance,
+                                                          const SimplifyTextureCancelFn                   &throw_on_cancel,
+                                                          const SimplifyTextureProgressFn                 &status_fn,
+                                                          const SimplifyTextureDataRemapOptions           &options)
+{
+    std::vector<PreparedMultiSourceTextureDataSource> prepared = prepare_multi_source_texture_data_sources(sources);
+    std::vector<uint8_t> participating(prepared.size(), 0);
+    for (const MultiSourceTextureTriangleProvenance &entry : provenance)
+        if (entry.valid && entry.source_index < participating.size())
+            participating[entry.source_index] = 1;
+
+    bool has_color_data = false;
+    bool any_image_source = false;
+    bool region_painting_present = false;
+    bool region_painting_transfer_needed = false;
+    for (size_t source_idx = 0; source_idx < prepared.size(); ++source_idx) {
+        if (source_idx >= participating.size() || participating[source_idx] == 0)
+            continue;
+        const SimplifyTextureDataSnapshot &snapshot = prepared[source_idx].source.snapshot;
+        has_color_data = true;
+        any_image_source |= snapshot.source == SimplifyColorSource::ImageTexture;
+        region_painting_present |= snapshot.region_painting_present;
+        region_painting_transfer_needed |= snapshot.region_painting_transfer_needed;
+    }
+
+    const bool remap_color = has_color_data && options.remap_color_data && !target_mesh.indices.empty();
+    const bool remap_region = region_painting_present &&
+                              options.remap_region_painting &&
+                              region_painting_transfer_needed &&
+                              !target_mesh.indices.empty();
+    if (!remap_color && !remap_region) {
+        set_progress(status_fn, 100);
+        SimplifyTextureDataResult result;
+        result.source = SimplifyColorSource::None;
+        result.region_painting_touched = region_painting_present;
+        return result;
+    }
+
+    if (provenance.size() != target_mesh.indices.size()) {
+        SimplifyTextureDataResult result;
+        result.source = SimplifyColorSource::None;
+        result.remap_failed = remap_color;
+        result.region_painting_touched = region_painting_present;
+        result.region_painting_remap_failed = remap_region;
+        set_progress(status_fn, 100);
+        return result;
+    }
+
+    uint32_t raw_channels = 0;
+    std::string raw_metadata_json;
+    const bool remap_raw = any_image_source && multi_source_raw_compatible(prepared, participating, raw_channels, raw_metadata_json);
+    if (any_image_source && !remap_raw) {
+        for (PreparedMultiSourceTextureDataSource &source : prepared)
+            if (source.source.snapshot.source == SimplifyColorSource::ImageTexture)
+                ensure_snapshot_rgba_preview_from_raw(source.source.snapshot);
+    }
+
+    auto scaled_progress = [&status_fn](int offset, int span) {
+        return [status_fn, offset, span](int percent) {
+            set_progress(status_fn, offset + int(std::round(float(std::clamp(percent, 0, 100)) * float(span) / 100.f)));
+        };
+    };
+
+    const bool split_progress = remap_color && region_painting_present;
+    SimplifyTextureDataResult result;
+    if (remap_color) {
+        const SimplifyTextureProgressFn color_progress = split_progress ? scaled_progress(0, 80) : status_fn;
+        if (any_image_source) {
+            result = remap_multi_source_image_from_provenance(prepared,
+                                                              target_mesh,
+                                                              provenance,
+                                                              remap_raw,
+                                                              raw_channels,
+                                                              raw_metadata_json,
+                                                              throw_on_cancel,
+                                                              color_progress);
+            if (result.source != SimplifyColorSource::ImageTexture) {
+                result = remap_multi_source_rgba_from_provenance(prepared, target_mesh, provenance, true, throw_on_cancel, color_progress);
+                result.remap_failed = true;
+                result.used_fallback_rgba = result.source == SimplifyColorSource::RgbaData && result.rgba_data != nullptr;
+            }
+        } else
+            result = remap_multi_source_rgba_from_provenance(prepared, target_mesh, provenance, false, throw_on_cancel, color_progress);
+    } else
+        result.source = SimplifyColorSource::None;
+
+    if (region_painting_present) {
+        SimplifyTextureProgressFn region_progress = status_fn;
+        if (split_progress)
+            region_progress = scaled_progress(80, 20);
+        if (options.remap_region_painting)
+            remap_multi_source_region_painting_from_provenance(prepared,
+                                                               target_mesh,
+                                                               provenance,
+                                                               region_painting_present,
+                                                               region_painting_transfer_needed,
+                                                               throw_on_cancel,
+                                                               region_progress,
+                                                               result);
         else {
             result.region_painting_touched = true;
             set_progress(region_progress, 100);

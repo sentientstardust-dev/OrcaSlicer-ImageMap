@@ -1,5 +1,6 @@
 #include "Exception.hpp"
 #include "MeshBoolean.hpp"
+#include "libslic3r/MeshSplitImpl.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/TryCatchSignal.hpp"
 #include "libslic3r/format.hpp"
@@ -28,6 +29,11 @@
 #include <CGAL/boost/graph/Face_filtered_graph.h>
 // BBS: for boolean using mcut
 #include "mcut/include/mcut/mcut.h"
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <map>
 
 namespace Slic3r {
 namespace MeshBoolean {
@@ -583,6 +589,248 @@ struct McutMesh
 void McutMeshDeleter::operator()(McutMesh *ptr) { delete ptr; }
 
 bool empty(const McutMesh &mesh) { return mesh.vertexCoordsArray.empty() || mesh.faceIndicesArray.empty(); }
+
+static Vec3f mcut_vertex(const McutMesh &mesh, uint32_t vertex_idx)
+{
+    const size_t offset = size_t(vertex_idx) * 3;
+    if (offset + 2 >= mesh.vertexCoordsArray.size())
+        return Vec3f::Zero();
+    return Vec3f(float(mesh.vertexCoordsArray[offset + 0]), float(mesh.vertexCoordsArray[offset + 1]), float(mesh.vertexCoordsArray[offset + 2]));
+}
+
+static size_t mcut_face_offset(const McutMesh &mesh, size_t face_idx)
+{
+    size_t offset = 0;
+    for (size_t idx = 0; idx < face_idx && idx < mesh.faceSizesArray.size(); ++idx)
+        offset += size_t(mesh.faceSizesArray[idx]);
+    return offset;
+}
+
+static bool mcut_face_vertices(const McutMesh &mesh, size_t face_idx, std::array<Vec3f, 3> &vertices)
+{
+    if (face_idx >= mesh.faceSizesArray.size() || mesh.faceSizesArray[face_idx] != 3)
+        return false;
+    const size_t offset = mcut_face_offset(mesh, face_idx);
+    if (offset + 2 >= mesh.faceIndicesArray.size())
+        return false;
+    vertices = {
+        mcut_vertex(mesh, mesh.faceIndicesArray[offset + 0]),
+        mcut_vertex(mesh, mesh.faceIndicesArray[offset + 1]),
+        mcut_vertex(mesh, mesh.faceIndicesArray[offset + 2])
+    };
+    return true;
+}
+
+static Vec3f normalized_nonnegative_barycentric_mcut(Vec3f weights)
+{
+    weights.x() = std::max(weights.x(), 0.f);
+    weights.y() = std::max(weights.y(), 0.f);
+    weights.z() = std::max(weights.z(), 0.f);
+    const float sum = weights.x() + weights.y() + weights.z();
+    if (sum <= 1e-6f)
+        return Vec3f(1.f / 3.f, 1.f / 3.f, 1.f / 3.f);
+    weights /= sum;
+    return weights;
+}
+
+static Vec3f barycentric_weights_3d_mcut(const Vec3f &point, const std::array<Vec3f, 3> &vertices)
+{
+    const Vec3f v0 = vertices[1] - vertices[0];
+    const Vec3f v1 = vertices[2] - vertices[0];
+    const Vec3f v2 = point - vertices[0];
+    const float d00 = v0.dot(v0);
+    const float d01 = v0.dot(v1);
+    const float d11 = v1.dot(v1);
+    const float d20 = v2.dot(v0);
+    const float d21 = v2.dot(v1);
+    const float denom = d00 * d11 - d01 * d01;
+    if (!std::isfinite(denom) || std::abs(denom) <= 1e-6f)
+        return Vec3f(1.f / 3.f, 1.f / 3.f, 1.f / 3.f);
+    const float v = (d11 * d20 - d01 * d21) / denom;
+    const float w = (d00 * d21 - d01 * d20) / denom;
+    return Vec3f(1.f - v - w, v, w);
+}
+
+static Vec3f interpolate_source_barycentric(const MeshFaceProvenance &provenance, const Vec3f &weights)
+{
+    return normalized_nonnegative_barycentric_mcut(provenance.source_barycentric[0] * weights.x() +
+                                                   provenance.source_barycentric[1] * weights.y() +
+                                                   provenance.source_barycentric[2] * weights.z());
+}
+
+std::vector<MeshFaceProvenance> identity_provenance(const indexed_triangle_set &its, size_t source_index)
+{
+    std::vector<MeshFaceProvenance> provenance(its.indices.size());
+    for (size_t tri_idx = 0; tri_idx < provenance.size(); ++tri_idx) {
+        MeshFaceProvenance &entry = provenance[tri_idx];
+        entry.valid = true;
+        entry.source_index = source_index;
+        entry.source_triangle = tri_idx;
+        entry.source_barycentric = {
+            Vec3f(1.f, 0.f, 0.f),
+            Vec3f(0.f, 1.f, 0.f),
+            Vec3f(0.f, 0.f, 1.f)
+        };
+    }
+    return provenance;
+}
+
+struct ProvenancedIts
+{
+    indexed_triangle_set its;
+    std::vector<MeshFaceProvenance> provenance;
+};
+
+enum class McutBooleanStatus
+{
+    Success,
+    NoOutput,
+    Failure
+};
+
+static bool its_bounds_overlap_mcut(const indexed_triangle_set &a, const indexed_triangle_set &b)
+{
+    if (a.vertices.empty() || b.vertices.empty())
+        return false;
+
+    Vec3f a_min = Vec3f::Constant(std::numeric_limits<float>::max());
+    Vec3f a_max = Vec3f::Constant(std::numeric_limits<float>::lowest());
+    for (const Vec3f &v : a.vertices) {
+        a_min = a_min.cwiseMin(v);
+        a_max = a_max.cwiseMax(v);
+    }
+
+    Vec3f b_min = Vec3f::Constant(std::numeric_limits<float>::max());
+    Vec3f b_max = Vec3f::Constant(std::numeric_limits<float>::lowest());
+    for (const Vec3f &v : b.vertices) {
+        b_min = b_min.cwiseMin(v);
+        b_max = b_max.cwiseMax(v);
+    }
+
+    constexpr float eps = 1e-5f;
+    return a_min.x() <= b_max.x() + eps && a_max.x() + eps >= b_min.x() &&
+           a_min.y() <= b_max.y() + eps && a_max.y() + eps >= b_min.y() &&
+           a_min.z() <= b_max.z() + eps && a_max.z() + eps >= b_min.z();
+}
+
+static std::vector<ProvenancedIts> split_with_provenance(const indexed_triangle_set &its, const std::vector<MeshFaceProvenance> &provenance)
+{
+    std::vector<ProvenancedIts> ret;
+    if (provenance.size() != its.indices.size())
+        return ret;
+
+    struct VertexConv {
+        size_t part_id = std::numeric_limits<size_t>::max();
+        size_t vertex_image = 0;
+    };
+    std::vector<VertexConv> vidx_conv(its.vertices.size());
+    meshsplit_detail::NeighborVisitor visitor(its, meshsplit_detail::ItsWithNeighborsIndex_<indexed_triangle_set>::get_index(its));
+
+    std::vector<size_t> facets;
+    for (size_t part_id = 0;; ++part_id) {
+        facets.clear();
+        visitor.visit([&facets](size_t idx) { facets.emplace_back(idx); return true; });
+        if (facets.empty())
+            break;
+
+        ProvenancedIts part;
+        part.its.indices.reserve(facets.size());
+        part.its.vertices.reserve(std::min(facets.size() * 3, its.vertices.size()));
+        part.provenance.reserve(facets.size());
+
+        for (size_t face_id : facets) {
+            const auto &face = its.indices[face_id];
+            Vec3i32 new_face;
+            for (size_t v = 0; v < 3; ++v) {
+                auto vi = face(v);
+                if (vidx_conv[vi].part_id != part_id) {
+                    vidx_conv[vi] = { part_id, part.its.vertices.size() };
+                    part.its.vertices.emplace_back(its.vertices[size_t(vi)]);
+                }
+                new_face(v) = int(vidx_conv[vi].vertex_image);
+            }
+            part.its.indices.emplace_back(new_face);
+            part.provenance.emplace_back(provenance[face_id]);
+        }
+
+        ret.emplace_back(std::move(part));
+    }
+
+    return ret;
+}
+
+static void append_with_provenance(indexed_triangle_set &dst,
+                                   std::vector<MeshFaceProvenance> &dst_provenance,
+                                   const indexed_triangle_set &src,
+                                   const std::vector<MeshFaceProvenance> &src_provenance)
+{
+    if (src.indices.size() != src_provenance.size())
+        return;
+    const int vertex_offset = int(dst.vertices.size());
+    dst.vertices.insert(dst.vertices.end(), src.vertices.begin(), src.vertices.end());
+    for (const Vec3i32 &face : src.indices)
+        dst.indices.emplace_back(Vec3i32(face.x() + vertex_offset, face.y() + vertex_offset, face.z() + vertex_offset));
+    dst_provenance.insert(dst_provenance.end(), src_provenance.begin(), src_provenance.end());
+}
+
+static void merge_mcut_meshes_with_provenance(McutMesh &srcMesh,
+                                              std::vector<MeshFaceProvenance> &src_provenance,
+                                              const McutMesh &cutMesh,
+                                              const std::vector<MeshFaceProvenance> &cut_provenance)
+{
+    TriangleMesh tri_src = mcut_to_triangle_mesh(srcMesh);
+    TriangleMesh tri_cut = mcut_to_triangle_mesh(cutMesh);
+    indexed_triangle_set all_its;
+    std::vector<MeshFaceProvenance> all_provenance;
+    append_with_provenance(all_its, all_provenance, tri_src.its, src_provenance);
+    append_with_provenance(all_its, all_provenance, tri_cut.its, cut_provenance);
+    srcMesh = *triangle_mesh_to_mcut(all_its);
+    src_provenance = std::move(all_provenance);
+}
+
+static bool mapped_output_face_provenance(const McutMesh &srcMesh,
+                                          const std::vector<MeshFaceProvenance> &src_provenance,
+                                          const McutMesh &cutMesh,
+                                          const std::vector<MeshFaceProvenance> &cut_provenance,
+                                          uint32_t face_map,
+                                          const std::vector<double> &ccVertices,
+                                          const std::vector<uint32_t> &ccFaceIndices,
+                                          uint32_t face_offset,
+                                          int vertex_index_offset,
+                                          MeshFaceProvenance &out)
+{
+    const uint32_t src_face_count = uint32_t(srcMesh.faceSizesArray.size());
+    const bool from_cut = face_map >= src_face_count;
+    const McutMesh &input_mesh = from_cut ? cutMesh : srcMesh;
+    const std::vector<MeshFaceProvenance> &input_provenance = from_cut ? cut_provenance : src_provenance;
+    const size_t input_face = size_t(from_cut ? face_map - src_face_count : face_map);
+    if (input_face >= input_provenance.size() || !input_provenance[input_face].valid)
+        return false;
+
+    std::array<Vec3f, 3> input_vertices;
+    if (!mcut_face_vertices(input_mesh, input_face, input_vertices))
+        return false;
+
+    const MeshFaceProvenance &input = input_provenance[input_face];
+    out.valid = true;
+    out.source_index = input.source_index;
+    out.source_triangle = input.source_triangle;
+    for (size_t corner = 0; corner < 3; ++corner) {
+        const uint32_t global_vertex_idx = ccFaceIndices[size_t(face_offset) + corner];
+        if (int(global_vertex_idx) < vertex_index_offset)
+            return false;
+        const size_t local_vertex_idx = size_t(int(global_vertex_idx) - vertex_index_offset);
+        const size_t vertex_offset = local_vertex_idx * 3;
+        if (vertex_offset + 2 >= ccVertices.size())
+            return false;
+        const Vec3f point = Vec3f(float(ccVertices[vertex_offset + 0]),
+                                  float(ccVertices[vertex_offset + 1]),
+                                  float(ccVertices[vertex_offset + 2]));
+        out.source_barycentric[corner] = interpolate_source_barycentric(input, barycentric_weights_3d_mcut(point, input_vertices));
+    }
+    return true;
+}
+
 void triangle_mesh_to_mcut(const TriangleMesh &src_mesh, McutMesh &srcMesh, const Transform3d &src_nm = Transform3d::Identity())
 {
     // vertices precision convention and copy
@@ -845,6 +1093,327 @@ bool do_boolean_single(McutMesh &srcMesh, const McutMesh &cutMesh, const std::st
     return true;
 }
 
+static bool do_boolean_single_with_cgal_fallback(McutMesh &srcMesh, const McutMesh &cutMesh, const std::string &boolean_opts)
+{
+    McutMesh original = srcMesh;
+    if (boolean_opts != "INTERSECTION" && do_boolean_single(srcMesh, cutMesh, boolean_opts))
+        return true;
+
+    TriangleMesh tri_src = mcut_to_triangle_mesh(original);
+    TriangleMesh tri_cut = mcut_to_triangle_mesh(cutMesh);
+    try {
+        if (boolean_opts == "UNION")
+            MeshBoolean::cgal::plus(tri_src, tri_cut);
+        else if (boolean_opts == "A_NOT_B")
+            MeshBoolean::cgal::minus(tri_src, tri_cut);
+        else if (boolean_opts == "INTERSECTION")
+            MeshBoolean::cgal::intersect(tri_src, tri_cut);
+        else {
+            srcMesh = std::move(original);
+            return false;
+        }
+    } catch (...) {
+        srcMesh = std::move(original);
+        return false;
+    }
+
+    srcMesh = *triangle_mesh_to_mcut(tri_src.its);
+    return true;
+}
+
+static McutBooleanStatus do_boolean_single_with_igl_provenance(McutMesh &srcMesh,
+                                                               std::vector<MeshFaceProvenance> &src_provenance,
+                                                               const McutMesh &cutMesh,
+                                                               const std::vector<MeshFaceProvenance> &cut_provenance,
+                                                               const std::string &boolean_opts)
+{
+    TriangleMesh tri_src = mcut_to_triangle_mesh(srcMesh);
+    TriangleMesh tri_cut = mcut_to_triangle_mesh(cutMesh);
+    if (tri_src.its.indices.size() != src_provenance.size() || tri_cut.its.indices.size() != cut_provenance.size())
+        return McutBooleanStatus::Failure;
+    if (tri_src.empty()) {
+        if (boolean_opts == "UNION") {
+            srcMesh = cutMesh;
+            src_provenance = cut_provenance;
+        } else
+            src_provenance.clear();
+        return McutBooleanStatus::Success;
+    }
+    if (tri_cut.empty()) {
+        if (boolean_opts == "INTERSECTION") {
+            srcMesh = *triangle_mesh_to_mcut(indexed_triangle_set{});
+            src_provenance.clear();
+        }
+        return McutBooleanStatus::Success;
+    }
+
+    igl::MeshBooleanType boolean_type;
+    if (boolean_opts == "UNION")
+        boolean_type = igl::MESH_BOOLEAN_TYPE_UNION;
+    else if (boolean_opts == "A_NOT_B")
+        boolean_type = igl::MESH_BOOLEAN_TYPE_MINUS;
+    else if (boolean_opts == "INTERSECTION")
+        boolean_type = igl::MESH_BOOLEAN_TYPE_INTERSECT;
+    else
+        return McutBooleanStatus::Failure;
+
+    EigenMesh src_eigen = triangle_mesh_to_eigen(tri_src);
+    EigenMesh cut_eigen = triangle_mesh_to_eigen(tri_cut);
+    Eigen::MatrixXd vertices;
+    Eigen::MatrixXi faces;
+    Eigen::VectorXi face_birth;
+    try {
+        igl::copyleft::cgal::mesh_boolean(src_eigen.first,
+                                           src_eigen.second,
+                                           cut_eigen.first,
+                                           cut_eigen.second,
+                                           boolean_type,
+                                           vertices,
+                                           faces,
+                                           face_birth);
+    } catch (...) {
+        return McutBooleanStatus::Failure;
+    }
+
+    if (faces.rows() != face_birth.rows())
+        return McutBooleanStatus::Failure;
+
+    TriangleMesh out_mesh = eigen_to_triangle_mesh({ std::move(vertices), std::move(faces) });
+    std::vector<MeshFaceProvenance> out_provenance;
+    out_provenance.reserve(out_mesh.its.indices.size());
+    const int src_face_count = int(tri_src.its.indices.size());
+    for (size_t face_idx = 0; face_idx < out_mesh.its.indices.size(); ++face_idx) {
+        const int birth = face_birth[int(face_idx)];
+        if (birth < 0)
+            return McutBooleanStatus::Failure;
+        const bool from_cut = birth >= src_face_count;
+        const indexed_triangle_set &input_its = from_cut ? tri_cut.its : tri_src.its;
+        const std::vector<MeshFaceProvenance> &input_provenance = from_cut ? cut_provenance : src_provenance;
+        const size_t input_face = size_t(from_cut ? birth - src_face_count : birth);
+        if (input_face >= input_its.indices.size() || input_face >= input_provenance.size() || !input_provenance[input_face].valid)
+            return McutBooleanStatus::Failure;
+
+        const Vec3i32 &input_face_indices = input_its.indices[input_face];
+        std::array<Vec3f, 3> input_vertices = {
+            input_its.vertices[size_t(input_face_indices.x())],
+            input_its.vertices[size_t(input_face_indices.y())],
+            input_its.vertices[size_t(input_face_indices.z())]
+        };
+        const MeshFaceProvenance &input = input_provenance[input_face];
+        MeshFaceProvenance output;
+        output.valid = true;
+        output.source_index = input.source_index;
+        output.source_triangle = input.source_triangle;
+        const Vec3i32 &output_face_indices = out_mesh.its.indices[face_idx];
+        for (size_t corner = 0; corner < 3; ++corner) {
+            const Vec3f &point = out_mesh.its.vertices[size_t(output_face_indices[int(corner)])];
+            output.source_barycentric[corner] = interpolate_source_barycentric(input, barycentric_weights_3d_mcut(point, input_vertices));
+        }
+        out_provenance.emplace_back(output);
+    }
+
+    srcMesh = *triangle_mesh_to_mcut(out_mesh.its);
+    src_provenance = std::move(out_provenance);
+    return McutBooleanStatus::Success;
+}
+
+static McutBooleanStatus do_boolean_single_with_provenance(McutMesh &srcMesh,
+                                                           std::vector<MeshFaceProvenance> &src_provenance,
+                                                           const McutMesh &cutMesh,
+                                                           const std::vector<MeshFaceProvenance> &cut_provenance,
+                                                           const std::string &boolean_opts)
+{
+    if (src_provenance.size() != srcMesh.faceSizesArray.size() || cut_provenance.size() != cutMesh.faceSizesArray.size())
+        return McutBooleanStatus::Failure;
+    if (boolean_opts == "INTERSECTION")
+        return do_boolean_single_with_igl_provenance(srcMesh, src_provenance, cutMesh, cut_provenance, boolean_opts);
+
+    McContext context = MC_NULL_HANDLE;
+    McResult err = mcCreateContext(&context, 0);
+    if (err != MC_NO_ERROR)
+        return McutBooleanStatus::Failure;
+    mcDebugMessageCallback(context, mcDebugOutput, nullptr);
+    mcDebugMessageControl(context, MC_DEBUG_SOURCE_ALL, MC_DEBUG_TYPE_ERROR, MC_DEBUG_SEVERITY_MEDIUM, true);
+
+    const std::map<std::string, McFlags> booleanOpts = {
+        {"A_NOT_B", MC_DISPATCH_FILTER_FRAGMENT_SEALING_INSIDE | MC_DISPATCH_FILTER_FRAGMENT_LOCATION_ABOVE},
+        {"B_NOT_A", MC_DISPATCH_FILTER_FRAGMENT_SEALING_OUTSIDE | MC_DISPATCH_FILTER_FRAGMENT_LOCATION_BELOW},
+        {"UNION", MC_DISPATCH_FILTER_FRAGMENT_SEALING_OUTSIDE | MC_DISPATCH_FILTER_FRAGMENT_LOCATION_ABOVE},
+        {"INTERSECTION", MC_DISPATCH_FILTER_FRAGMENT_SEALING_INSIDE | MC_DISPATCH_FILTER_FRAGMENT_LOCATION_BELOW},
+    };
+
+    auto it = booleanOpts.find(boolean_opts);
+    if (it == booleanOpts.end()) {
+        mcReleaseContext(context);
+        return McutBooleanStatus::Failure;
+    }
+
+    if (srcMesh.vertexCoordsArray.empty() && (boolean_opts == "UNION" || boolean_opts == "B_NOT_A")) {
+        srcMesh = cutMesh;
+        src_provenance = cut_provenance;
+        mcReleaseContext(context);
+        return McutBooleanStatus::Success;
+    }
+
+    err = mcDispatch(context,
+                     MC_DISPATCH_VERTEX_ARRAY_DOUBLE |
+                         MC_DISPATCH_ENFORCE_GENERAL_POSITION |
+                         MC_DISPATCH_INCLUDE_FACE_MAP |
+                         it->second,
+                     reinterpret_cast<const void *>(srcMesh.vertexCoordsArray.data()),
+                     reinterpret_cast<const uint32_t *>(srcMesh.faceIndicesArray.data()),
+                     srcMesh.faceSizesArray.data(),
+                     static_cast<uint32_t>(srcMesh.vertexCoordsArray.size() / 3),
+                     static_cast<uint32_t>(srcMesh.faceSizesArray.size()),
+                     reinterpret_cast<const void *>(cutMesh.vertexCoordsArray.data()),
+                     cutMesh.faceIndicesArray.data(),
+                     cutMesh.faceSizesArray.data(),
+                     static_cast<uint32_t>(cutMesh.vertexCoordsArray.size() / 3),
+                     static_cast<uint32_t>(cutMesh.faceSizesArray.size()));
+    if (err != MC_NO_ERROR) {
+        BOOST_LOG_TRIVIAL(debug) << "MCUT mcDispatch provenance fails! err=" << err;
+        mcReleaseContext(context);
+        if (boolean_opts == "UNION") {
+            merge_mcut_meshes_with_provenance(srcMesh, src_provenance, cutMesh, cut_provenance);
+            return McutBooleanStatus::Success;
+        }
+        return do_boolean_single_with_igl_provenance(srcMesh, src_provenance, cutMesh, cut_provenance, boolean_opts);
+    }
+
+    uint32_t numConnComps = 0;
+    err = mcGetConnectedComponents(context, MC_CONNECTED_COMPONENT_TYPE_FRAGMENT, 0, NULL, &numConnComps);
+    if (err != MC_NO_ERROR || numConnComps == 0) {
+        BOOST_LOG_TRIVIAL(debug) << "MCUT mcGetConnectedComponents provenance fails! err=" << err << ", numConnComps" << numConnComps;
+        mcReleaseContext(context);
+        if (numConnComps == 0 && boolean_opts == "UNION") {
+            merge_mcut_meshes_with_provenance(srcMesh, src_provenance, cutMesh, cut_provenance);
+            return McutBooleanStatus::Success;
+        }
+        return do_boolean_single_with_igl_provenance(srcMesh, src_provenance, cutMesh, cut_provenance, boolean_opts);
+    }
+
+    std::vector<McConnectedComponent> connectedComponents(numConnComps, MC_NULL_HANDLE);
+    err = mcGetConnectedComponents(context, MC_CONNECTED_COMPONENT_TYPE_FRAGMENT, uint32_t(connectedComponents.size()), connectedComponents.data(), NULL);
+    if (err != MC_NO_ERROR) {
+        mcReleaseContext(context);
+        return do_boolean_single_with_igl_provenance(srcMesh, src_provenance, cutMesh, cut_provenance, boolean_opts);
+    }
+
+    McutMesh outMesh;
+    std::vector<MeshFaceProvenance> out_provenance;
+    int vertex_index_offset = 0;
+    bool ok = true;
+    for (int n = 0; n < int(numConnComps) && ok; ++n) {
+        McConnectedComponent connComp = connectedComponents[n];
+
+        McSize numBytes = 0;
+        err = mcGetConnectedComponentData(context, connComp, MC_CONNECTED_COMPONENT_DATA_VERTEX_DOUBLE, 0, NULL, &numBytes);
+        if (err != MC_NO_ERROR) {
+            ok = false;
+            break;
+        }
+        uint32_t ccVertexCount = uint32_t(numBytes / (sizeof(double) * 3));
+        std::vector<double> ccVertices(size_t(ccVertexCount) * 3u, 0);
+        err = mcGetConnectedComponentData(context, connComp, MC_CONNECTED_COMPONENT_DATA_VERTEX_DOUBLE, numBytes, ccVertices.data(), NULL);
+        if (err != MC_NO_ERROR) {
+            ok = false;
+            break;
+        }
+
+        numBytes = 0;
+        err = mcGetConnectedComponentData(context, connComp, MC_CONNECTED_COMPONENT_DATA_FACE_TRIANGULATION, 0, NULL, &numBytes);
+        if (err != MC_NO_ERROR) {
+            ok = false;
+            break;
+        }
+        std::vector<uint32_t> ccFaceIndices(numBytes / sizeof(uint32_t), 0);
+        err = mcGetConnectedComponentData(context, connComp, MC_CONNECTED_COMPONENT_DATA_FACE_TRIANGULATION, numBytes, ccFaceIndices.data(), NULL);
+        if (err != MC_NO_ERROR) {
+            ok = false;
+            break;
+        }
+        std::vector<uint32_t> faceSizes(ccFaceIndices.size() / 3, 3);
+        const uint32_t ccFaceCount = uint32_t(faceSizes.size());
+
+        numBytes = 0;
+        err = mcGetConnectedComponentData(context, connComp, MC_CONNECTED_COMPONENT_DATA_FACE_TRIANGULATION_MAP, 0, NULL, &numBytes);
+        if (err != MC_NO_ERROR) {
+            ok = false;
+            break;
+        }
+        std::vector<uint32_t> ccFaceMap(numBytes / sizeof(uint32_t), 0);
+        err = mcGetConnectedComponentData(context, connComp, MC_CONNECTED_COMPONENT_DATA_FACE_TRIANGULATION_MAP, numBytes, ccFaceMap.data(), NULL);
+        if (err != MC_NO_ERROR || ccFaceMap.size() != ccFaceCount) {
+            ok = false;
+            break;
+        }
+
+        McPatchLocation patchLocation = (McPatchLocation) 0;
+        err = mcGetConnectedComponentData(context, connComp, MC_CONNECTED_COMPONENT_DATA_PATCH_LOCATION, sizeof(McPatchLocation), &patchLocation, NULL);
+        if (err != MC_NO_ERROR) {
+            ok = false;
+            break;
+        }
+        McFragmentLocation fragmentLocation = (McFragmentLocation) 0;
+        err = mcGetConnectedComponentData(context, connComp, MC_CONNECTED_COMPONENT_DATA_FRAGMENT_LOCATION, sizeof(McFragmentLocation), &fragmentLocation, NULL);
+        if (err != MC_NO_ERROR) {
+            ok = false;
+            break;
+        }
+
+        outMesh.vertexCoordsArray.insert(outMesh.vertexCoordsArray.end(), ccVertices.begin(), ccVertices.end());
+        for (size_t i = 0; i < ccFaceIndices.size(); ++i)
+            ccFaceIndices[i] += uint32_t(vertex_index_offset);
+
+        int faceVertexOffsetBase = 0;
+        for (uint32_t f = 0; f < ccFaceCount; ++f) {
+            const bool reverseWindingOrder = (fragmentLocation == MC_FRAGMENT_LOCATION_BELOW) && (patchLocation == MC_PATCH_LOCATION_OUTSIDE);
+            const int faceSize = int(faceSizes[f]);
+            if (faceSize != 3) {
+                ok = false;
+                break;
+            }
+            if (reverseWindingOrder) {
+                std::vector<uint32_t> faceIndex(static_cast<size_t>(faceSize));
+                for (int v = faceSize - 1; v >= 0; --v)
+                    faceIndex[size_t(v)] = ccFaceIndices[size_t(faceVertexOffsetBase) + size_t(v)];
+                std::copy(faceIndex.begin(), faceIndex.end(), ccFaceIndices.begin() + faceVertexOffsetBase);
+            }
+            MeshFaceProvenance face_provenance;
+            if (!mapped_output_face_provenance(srcMesh,
+                                               src_provenance,
+                                               cutMesh,
+                                               cut_provenance,
+                                               ccFaceMap[f],
+                                               ccVertices,
+                                               ccFaceIndices,
+                                               uint32_t(faceVertexOffsetBase),
+                                               vertex_index_offset,
+                                               face_provenance)) {
+                ok = false;
+                break;
+            }
+            out_provenance.emplace_back(face_provenance);
+            faceVertexOffsetBase += faceSize;
+        }
+        if (!ok)
+            break;
+
+        outMesh.faceIndicesArray.insert(outMesh.faceIndicesArray.end(), ccFaceIndices.begin(), ccFaceIndices.end());
+        outMesh.faceSizesArray.insert(outMesh.faceSizesArray.end(), faceSizes.begin(), faceSizes.end());
+        vertex_index_offset += int(ccVertexCount);
+    }
+
+    mcReleaseConnectedComponents(context, 0, NULL);
+    mcReleaseContext(context);
+    if (!ok || out_provenance.size() != outMesh.faceSizesArray.size())
+        return do_boolean_single_with_igl_provenance(srcMesh, src_provenance, cutMesh, cut_provenance, boolean_opts);
+
+    srcMesh = std::move(outMesh);
+    src_provenance = std::move(out_provenance);
+    return McutBooleanStatus::Success;
+}
+
 void do_boolean(McutMesh& srcMesh, const McutMesh& cutMesh, const std::string& boolean_opts)
 {
     TriangleMesh tri_src = mcut_to_triangle_mesh(srcMesh);
@@ -863,31 +1432,122 @@ void do_boolean(McutMesh& srcMesh, const McutMesh& cutMesh, const std::string& b
     // But we can force it to work by spliting the src mesh into disconnected components,
     // and do booleans seperately, then merge all the results.
     indexed_triangle_set all_its;
+    bool ok = true;
     if (boolean_opts == "UNION" || boolean_opts == "A_NOT_B") {
-        for (size_t i = 0; i < src_parts.size(); i++) {
+        for (size_t i = 0; i < src_parts.size() && ok; i++) {
             auto src_part = triangle_mesh_to_mcut(src_parts[i]);
             for (size_t j = 0; j < cut_parts.size(); j++) {
+                if (boolean_opts == "A_NOT_B") {
+                    TriangleMesh current_src_part = mcut_to_triangle_mesh(*src_part);
+                    if (!its_bounds_overlap_mcut(current_src_part.its, cut_parts[j]))
+                        continue;
+                }
                 auto cut_part = triangle_mesh_to_mcut(cut_parts[j]);
-                do_boolean_single(*src_part, *cut_part, boolean_opts);
+                if (!do_boolean_single_with_cgal_fallback(*src_part, *cut_part, boolean_opts)) {
+                    ok = false;
+                    break;
+                }
             }
+            if (!ok)
+                break;
             TriangleMesh tri_part = mcut_to_triangle_mesh(*src_part);
             its_merge(all_its, tri_part.its);
         }
     }
     else if (boolean_opts == "INTERSECTION") {
-        for (size_t i = 0; i < src_parts.size(); i++) {
+        for (size_t i = 0; i < src_parts.size() && ok; i++) {
             for (size_t j = 0; j < cut_parts.size(); j++) {
+                if (!its_bounds_overlap_mcut(src_parts[i], cut_parts[j]))
+                    continue;
                 auto src_part = triangle_mesh_to_mcut(src_parts[i]);
                 auto cut_part = triangle_mesh_to_mcut(cut_parts[j]);
-                bool success = do_boolean_single(*src_part, *cut_part, boolean_opts);
-                if (success) {
-                    TriangleMesh tri_part = mcut_to_triangle_mesh(*src_part);
-                    its_merge(all_its, tri_part.its);
+                if (!do_boolean_single_with_cgal_fallback(*src_part, *cut_part, boolean_opts)) {
+                    ok = false;
+                    break;
                 }
+                TriangleMesh tri_part = mcut_to_triangle_mesh(*src_part);
+                its_merge(all_its, tri_part.its);
             }
         }
     }
+    if (!ok) {
+        srcMesh = *triangle_mesh_to_mcut(indexed_triangle_set{});
+        return;
+    }
     srcMesh = *triangle_mesh_to_mcut(all_its);
+}
+
+bool do_boolean_with_provenance(McutMesh &srcMesh,
+                                std::vector<MeshFaceProvenance> &src_provenance,
+                                const McutMesh &cutMesh,
+                                const std::vector<MeshFaceProvenance> &cut_provenance,
+                                const std::string &boolean_opts)
+{
+    TriangleMesh tri_src = mcut_to_triangle_mesh(srcMesh);
+    TriangleMesh tri_cut = mcut_to_triangle_mesh(cutMesh);
+    if (src_provenance.size() != tri_src.its.indices.size() || cut_provenance.size() != tri_cut.its.indices.size())
+        return false;
+
+    std::vector<ProvenancedIts> src_parts = split_with_provenance(tri_src.its, src_provenance);
+    std::vector<ProvenancedIts> cut_parts = split_with_provenance(tri_cut.its, cut_provenance);
+
+    if (src_parts.empty() && boolean_opts == "UNION") {
+        srcMesh = cutMesh;
+        src_provenance = cut_provenance;
+        return true;
+    }
+    if (cut_parts.empty())
+        return true;
+
+    indexed_triangle_set all_its;
+    std::vector<MeshFaceProvenance> all_provenance;
+    if (boolean_opts == "UNION" || boolean_opts == "A_NOT_B") {
+        for (size_t i = 0; i < src_parts.size(); ++i) {
+            auto src_part = triangle_mesh_to_mcut(src_parts[i].its);
+            std::vector<MeshFaceProvenance> src_part_provenance = src_parts[i].provenance;
+            for (size_t j = 0; j < cut_parts.size(); ++j) {
+                if (boolean_opts == "A_NOT_B") {
+                    TriangleMesh current_src_part = mcut_to_triangle_mesh(*src_part);
+                    if (!its_bounds_overlap_mcut(current_src_part.its, cut_parts[j].its))
+                        continue;
+                }
+                auto cut_part = triangle_mesh_to_mcut(cut_parts[j].its);
+                const McutBooleanStatus status = do_boolean_single_with_provenance(*src_part, src_part_provenance, *cut_part, cut_parts[j].provenance, boolean_opts);
+                if (status == McutBooleanStatus::Failure)
+                    return false;
+                if (status == McutBooleanStatus::NoOutput && boolean_opts != "A_NOT_B")
+                    return false;
+            }
+            TriangleMesh tri_part = mcut_to_triangle_mesh(*src_part);
+            if (tri_part.its.indices.size() != src_part_provenance.size())
+                return false;
+            append_with_provenance(all_its, all_provenance, tri_part.its, src_part_provenance);
+        }
+    } else if (boolean_opts == "INTERSECTION") {
+        for (size_t i = 0; i < src_parts.size(); ++i) {
+            for (size_t j = 0; j < cut_parts.size(); ++j) {
+                if (!its_bounds_overlap_mcut(src_parts[i].its, cut_parts[j].its))
+                    continue;
+                auto src_part = triangle_mesh_to_mcut(src_parts[i].its);
+                auto cut_part = triangle_mesh_to_mcut(cut_parts[j].its);
+                std::vector<MeshFaceProvenance> src_part_provenance = src_parts[i].provenance;
+                const McutBooleanStatus status = do_boolean_single_with_provenance(*src_part, src_part_provenance, *cut_part, cut_parts[j].provenance, boolean_opts);
+                if (status == McutBooleanStatus::Failure)
+                    return false;
+                if (status == McutBooleanStatus::NoOutput)
+                    continue;
+                TriangleMesh tri_part = mcut_to_triangle_mesh(*src_part);
+                if (tri_part.its.indices.size() != src_part_provenance.size())
+                    return false;
+                append_with_provenance(all_its, all_provenance, tri_part.its, src_part_provenance);
+            }
+        }
+    } else
+        return false;
+
+    srcMesh = *triangle_mesh_to_mcut(all_its);
+    src_provenance = std::move(all_provenance);
+    return true;
 }
 
 void make_boolean(const TriangleMesh &src_mesh, const TriangleMesh &cut_mesh, std::vector<TriangleMesh> &dst_mesh, const std::string &boolean_opts)
@@ -900,6 +1560,31 @@ void make_boolean(const TriangleMesh &src_mesh, const TriangleMesh &cut_mesh, st
     TriangleMesh tri_src = mcut_to_triangle_mesh(srcMesh);
     if (!tri_src.empty())
         dst_mesh.push_back(std::move(tri_src));
+}
+
+bool make_boolean_with_provenance(const TriangleMesh &src_mesh,
+                                  size_t src_source_index,
+                                  const TriangleMesh &cut_mesh,
+                                  size_t cut_source_index,
+                                  std::vector<ProvenancedMesh> &dst_mesh,
+                                  const std::string &boolean_opts)
+{
+    McutMesh srcMesh, cutMesh;
+    triangle_mesh_to_mcut(src_mesh, srcMesh);
+    triangle_mesh_to_mcut(cut_mesh, cutMesh);
+    std::vector<MeshFaceProvenance> src_provenance = identity_provenance(src_mesh.its, src_source_index);
+    std::vector<MeshFaceProvenance> cut_provenance = identity_provenance(cut_mesh.its, cut_source_index);
+
+    if (!do_boolean_with_provenance(srcMesh, src_provenance, cutMesh, cut_provenance, boolean_opts))
+        return false;
+
+    TriangleMesh tri_src = mcut_to_triangle_mesh(srcMesh);
+    if (!tri_src.empty()) {
+        if (tri_src.its.indices.size() != src_provenance.size())
+            return false;
+        dst_mesh.push_back({ std::move(tri_src), std::move(src_provenance) });
+    }
+    return true;
 }
 
 } // namespace mcut

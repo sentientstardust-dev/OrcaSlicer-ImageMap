@@ -4,6 +4,7 @@
 #include "GUI_Factories.hpp"
 //#include "GUI_ObjectLayers.hpp"
 #include "GUI_App.hpp"
+#include "GUI_Utils.hpp"
 #include "I18N.hpp"
 #include "Plater.hpp"
 #include "BitmapComboBox.hpp"
@@ -14,6 +15,8 @@
 #include "Tab.hpp"
 #include "wxExtensions.hpp"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/MeshBoolean.hpp"
+#include "libslic3r/ModelTextureDataRemap.hpp"
 #include "GLCanvas3D.hpp"
 #include "Selection.hpp"
 #include "PartPlate.hpp"
@@ -25,6 +28,7 @@
 #include "StepMeshDialog.hpp"
 
 
+#include <algorithm>
 #include <vector>
 #include <unordered_map>
 #include <functional>
@@ -141,6 +145,257 @@ static void take_snapshot(const std::string& snapshot_name)
     Plater* plater = wxGetApp().plater();
     if (plater)
         plater->take_snapshot(snapshot_name);
+}
+
+static wxString mesh_boolean_color_transfer_warning_text()
+{
+    return _L("Color data could not be transferred because boolean face provenance was unavailable. The mesh boolean result was created without color data.");
+}
+
+static wxString mesh_boolean_color_remap_warning_text()
+{
+    return _L("Color data could not be transferred. The mesh boolean result was created without color data.");
+}
+
+static void show_mesh_boolean_color_transfer_warning_dialog()
+{
+    MessageDialog(wxGetApp().plater(), mesh_boolean_color_transfer_warning_text(), _L("Warning"), wxOK | wxICON_WARNING).ShowModal();
+}
+
+static void show_mesh_boolean_color_remap_warning_dialog()
+{
+    MessageDialog(wxGetApp().plater(), mesh_boolean_color_remap_warning_text(), _L("Warning"), wxOK | wxICON_WARNING).ShowModal();
+}
+
+static ColorRGBA mesh_boolean_volume_base_color(const ModelVolume &volume)
+{
+    std::vector<std::string> colors;
+    if (wxGetApp().plater() != nullptr)
+        colors = wxGetApp().plater()->get_extruder_colors_from_plater_config(nullptr, true);
+    const int extruder_id = std::max(volume.extruder_id(), 1);
+    if (size_t(extruder_id - 1) < colors.size())
+        return decode_color_to_float_array(colors[size_t(extruder_id - 1)]);
+    return ColorRGBA(0.15f, 0.65f, 0.6f, 1.f);
+}
+
+static bool mesh_boolean_snapshot_has_transfer_data(const SimplifyTextureDataSnapshot &snapshot)
+{
+    return snapshot.source != SimplifyColorSource::None || snapshot.region_painting_present;
+}
+
+static const ModelVolume *mesh_boolean_primary_positive_volume(const ModelObject &object)
+{
+    for (const ModelVolume *volume : object.volumes)
+        if (volume != nullptr && volume->is_model_part())
+            return volume;
+    return nullptr;
+}
+
+static bool mesh_boolean_texture_result_has_output(const SimplifyTextureDataResult &result)
+{
+    switch (result.source) {
+    case SimplifyColorSource::RgbaData:
+        return !result.remap_failed || (result.rgba_data != nullptr && !result.rgba_data->empty());
+    case SimplifyColorSource::ImageTexture:
+        return result.texture_width > 0 &&
+               result.texture_height > 0 &&
+               !result.texture_uv_valid.empty() &&
+               (!result.texture_rgba.empty() || !result.texture_raw_filament_offsets.empty());
+    case SimplifyColorSource::VertexColors:
+        return !result.vertex_colors_rgba.empty();
+    case SimplifyColorSource::None:
+        break;
+    }
+    return result.region_painting_valid;
+}
+
+static void mesh_boolean_transform_snapshot(SimplifyTextureDataSnapshot &snapshot, const Transform3d &transform, bool fix_left_handed)
+{
+    transform_simplify_texture_data_snapshot(snapshot, transform);
+    if (!fix_left_handed)
+        return;
+    if (transform.matrix().block(0, 0, 3, 3).determinant() >= 0.)
+        return;
+    if (!snapshot.source_mesh.indices.empty())
+        its_flip_triangles(snapshot.source_mesh);
+    for (size_t tri_idx = 0; tri_idx < snapshot.texture_uv_valid.size(); ++tri_idx) {
+        const size_t uv_offset = tri_idx * 6;
+        if (uv_offset + 5 >= snapshot.texture_uvs_per_face.size())
+            break;
+        std::swap(snapshot.texture_uvs_per_face[uv_offset + 2], snapshot.texture_uvs_per_face[uv_offset + 4]);
+        std::swap(snapshot.texture_uvs_per_face[uv_offset + 3], snapshot.texture_uvs_per_face[uv_offset + 5]);
+    }
+}
+
+static MultiSourceTextureTriangleProvenance mesh_boolean_remap_provenance_entry(const MeshBoolean::mcut::MeshFaceProvenance &entry)
+{
+    MultiSourceTextureTriangleProvenance out;
+    out.valid = entry.valid;
+    out.source_index = entry.source_index;
+    out.source_triangle = entry.source_triangle;
+    out.source_barycentric = entry.source_barycentric;
+    return out;
+}
+
+static std::vector<MultiSourceTextureTriangleProvenance> mesh_boolean_remap_provenance(const std::vector<MeshBoolean::mcut::MeshFaceProvenance> &provenance)
+{
+    std::vector<MultiSourceTextureTriangleProvenance> out;
+    out.reserve(provenance.size());
+    for (const MeshBoolean::mcut::MeshFaceProvenance &entry : provenance)
+        out.emplace_back(mesh_boolean_remap_provenance_entry(entry));
+    return out;
+}
+
+static void mesh_boolean_append_transformed_mesh(indexed_triangle_set &dst,
+                                                 std::vector<MeshBoolean::mcut::MeshFaceProvenance> &dst_provenance,
+                                                 const TriangleMesh &src,
+                                                 const std::vector<MeshBoolean::mcut::MeshFaceProvenance> &src_provenance,
+                                                 const Transform3d &transform)
+{
+    if (src.its.indices.size() != src_provenance.size())
+        return;
+
+    TriangleMesh transformed = src;
+    transformed.transform(transform, true);
+    const bool flipped = transform.matrix().block(0, 0, 3, 3).determinant() < 0.;
+    const int vertex_offset = int(dst.vertices.size());
+    dst.vertices.insert(dst.vertices.end(), transformed.its.vertices.begin(), transformed.its.vertices.end());
+    for (const Vec3i32 &face : transformed.its.indices)
+        dst.indices.emplace_back(Vec3i32(face.x() + vertex_offset, face.y() + vertex_offset, face.z() + vertex_offset));
+    for (MeshBoolean::mcut::MeshFaceProvenance entry : src_provenance) {
+        if (flipped)
+            std::swap(entry.source_barycentric[1], entry.source_barycentric[2]);
+        dst_provenance.emplace_back(entry);
+    }
+}
+
+static void mesh_boolean_append_transformed_mesh(indexed_triangle_set &dst, const TriangleMesh &src, const Transform3d &transform)
+{
+    TriangleMesh transformed = src;
+    transformed.transform(transform, true);
+    its_merge(dst, transformed.its);
+}
+
+static bool mesh_boolean_object_with_provenance(const ModelObject &object,
+                                                TriangleMesh &mesh,
+                                                std::vector<MeshBoolean::mcut::MeshFaceProvenance> &provenance,
+                                                std::vector<MultiSourceTextureDataSource> &sources,
+                                                bool &had_transfer_data)
+{
+    const ModelVolume *primary_positive_volume = mesh_boolean_primary_positive_volume(object);
+    ColorRGBA positive_base_color = primary_positive_volume != nullptr ?
+        mesh_boolean_volume_base_color(*primary_positive_volume) :
+        ColorRGBA(0.15f, 0.65f, 0.6f, 1.f);
+
+    MeshBoolean::mcut::McutMeshPtr current_mesh;
+    std::vector<MeshBoolean::mcut::MeshFaceProvenance> current_provenance;
+    bool has_current_mesh = false;
+
+    for (const ModelVolume *volume : object.volumes) {
+        if (volume == nullptr || volume->mesh_ptr() == nullptr || (!volume->is_model_part() && !volume->is_negative_volume()))
+            continue;
+
+        TriangleMesh volume_mesh = volume->mesh();
+        volume_mesh.transform(volume->get_matrix(), true);
+        if (volume_mesh.empty())
+            continue;
+
+        SimplifyTextureDataSnapshot snapshot = snapshot_simplify_texture_data(*volume);
+        mesh_boolean_transform_snapshot(snapshot, volume->get_matrix(), true);
+        had_transfer_data = true;
+        had_transfer_data |= mesh_boolean_snapshot_has_transfer_data(snapshot);
+
+        const bool use_positive_fallback = volume->is_negative_volume() && snapshot.source == SimplifyColorSource::None;
+        MultiSourceTextureDataSource source;
+        source.snapshot = std::move(snapshot);
+        source.fallback_color = use_positive_fallback ? positive_base_color : mesh_boolean_volume_base_color(*volume);
+        const size_t source_index = sources.size();
+        sources.emplace_back(std::move(source));
+
+        auto volume_mcut = MeshBoolean::mcut::triangle_mesh_to_mcut(volume_mesh.its);
+        std::vector<MeshBoolean::mcut::MeshFaceProvenance> volume_provenance = MeshBoolean::mcut::identity_provenance(volume_mesh.its, source_index);
+        if (volume->is_model_part()) {
+            if (!has_current_mesh) {
+                current_mesh = std::move(volume_mcut);
+                current_provenance = std::move(volume_provenance);
+                has_current_mesh = true;
+            } else if (!MeshBoolean::mcut::do_boolean_with_provenance(*current_mesh, current_provenance, *volume_mcut, volume_provenance, "UNION"))
+                return false;
+        } else if (has_current_mesh && !MeshBoolean::mcut::do_boolean_with_provenance(*current_mesh, current_provenance, *volume_mcut, volume_provenance, "A_NOT_B"))
+            return false;
+    }
+
+    if (!has_current_mesh)
+        return false;
+
+    TriangleMesh object_mesh = MeshBoolean::mcut::mcut_to_triangle_mesh(*current_mesh);
+    if (object_mesh.empty() || object_mesh.its.indices.size() != current_provenance.size())
+        return false;
+
+    indexed_triangle_set all_instances;
+    std::vector<MeshBoolean::mcut::MeshFaceProvenance> all_provenance;
+    if (object.instances.empty())
+        mesh_boolean_append_transformed_mesh(all_instances, all_provenance, object_mesh, current_provenance, Transform3d::Identity());
+    else {
+        for (const ModelInstance *instance : object.instances)
+            if (instance != nullptr)
+                mesh_boolean_append_transformed_mesh(all_instances, all_provenance, object_mesh, current_provenance, instance->get_matrix());
+    }
+
+    if (all_instances.indices.size() != all_provenance.size())
+        return false;
+
+    mesh = TriangleMesh(std::move(all_instances));
+    provenance = std::move(all_provenance);
+    return true;
+}
+
+static bool mesh_boolean_object_without_provenance(const ModelObject &object, TriangleMesh &mesh)
+{
+    MeshBoolean::mcut::McutMeshPtr current_mesh;
+    bool has_current_mesh = false;
+
+    for (const ModelVolume *volume : object.volumes) {
+        if (volume == nullptr || volume->mesh_ptr() == nullptr || (!volume->is_model_part() && !volume->is_negative_volume()))
+            continue;
+
+        TriangleMesh volume_mesh = volume->mesh();
+        volume_mesh.transform(volume->get_matrix(), true);
+        if (volume_mesh.empty())
+            continue;
+
+        auto volume_mcut = MeshBoolean::mcut::triangle_mesh_to_mcut(volume_mesh.its);
+        if (volume->is_model_part()) {
+            if (!has_current_mesh) {
+                current_mesh = std::move(volume_mcut);
+                has_current_mesh = true;
+            } else
+                MeshBoolean::mcut::do_boolean(*current_mesh, *volume_mcut, "UNION");
+        } else if (has_current_mesh)
+            MeshBoolean::mcut::do_boolean(*current_mesh, *volume_mcut, "A_NOT_B");
+    }
+
+    if (!has_current_mesh)
+        return false;
+
+    TriangleMesh object_mesh = MeshBoolean::mcut::mcut_to_triangle_mesh(*current_mesh);
+    if (object_mesh.empty())
+        return false;
+
+    indexed_triangle_set all_instances;
+    if (object.instances.empty())
+        mesh_boolean_append_transformed_mesh(all_instances, object_mesh, Transform3d::Identity());
+    else {
+        for (const ModelInstance *instance : object.instances)
+            if (instance != nullptr)
+                mesh_boolean_append_transformed_mesh(all_instances, object_mesh, instance->get_matrix());
+    }
+
+    if (all_instances.indices.empty())
+        return false;
+
+    mesh = TriangleMesh(std::move(all_instances));
+    return true;
 }
 
 class wxRenderer : public wxDelegateRendererNative
@@ -3118,11 +3373,9 @@ void ObjectList::merge(bool to_multipart_object)
                 if (object->volumes.size() > 1){
                     new_volume->config.assign_config(volume->config);
                 }
-                auto option = new_volume->config.option("extruder");
-                if (!option) {
-                    auto opt = object->config.option("extruder");
-                    if (opt) { new_volume->config.set_key_value("extruder", new ConfigOptionInt(opt->getInt())); }
-                }
+                const int source_extruder_id = volume->extruder_id();
+                if (source_extruder_id > 0)
+                    new_volume->config.set_key_value("extruder", new ConfigOptionInt(source_extruder_id));
                 new_volume->mmu_segmentation_facets.assign(std::move(volume->mmu_segmentation_facets));
             }
             new_object->sort_volumes(true);
@@ -3143,14 +3396,6 @@ void ObjectList::merge(bool to_multipart_object)
                     config.set_key_value(opt_key, option->clone());
                 }
             }
-            // save extruder value if it was set
-            if (object->volumes.size() == 1 && find(opt_keys.begin(), opt_keys.end(), "extruder") != opt_keys.end()) {
-                ModelVolume* volume = new_object->volumes.back();
-                const ConfigOption* option = from_config.option("extruder");
-                if (option)
-                    volume->config.set_key_value("extruder", option->clone());
-            }
-
             // merge printable and auto_drop values
             // non-default have priority -> if one object has printable == false, 
             // then merged object will also have printable == false
@@ -3308,7 +3553,15 @@ void ObjectList::boolean()
     Plater::TakeSnapshot snapshot(wxGetApp().plater(), "boolean");
 
     ModelObject* object = (*m_objects)[obj_idxs.front()];
-    TriangleMesh mesh = Plater::combine_mesh_fff(*object, -1, [this](const std::string& msg) {return wxGetApp().notification_manager()->push_plater_error_notification(msg); });
+    TriangleMesh mesh;
+    std::vector<MeshBoolean::mcut::MeshFaceProvenance> provenance;
+    std::vector<MultiSourceTextureDataSource> sources;
+    bool had_transfer_data = false;
+    bool provenance_available = mesh_boolean_object_with_provenance(*object, mesh, provenance, sources, had_transfer_data);
+    if (!provenance_available && !mesh_boolean_object_without_provenance(*object, mesh)) {
+        wxGetApp().notification_manager()->push_plater_error_notification(_u8L("Unable to perform boolean operation on model meshes."));
+        return;
+    }
 
     // add mesh to model as a new object, keep the original object's name and config
     Model* model = object->get_model();
@@ -3318,6 +3571,26 @@ void ObjectList::boolean()
     if (new_object->instances.empty())
         new_object->add_instance();
     ModelVolume* new_volume = new_object->add_volume(mesh);
+    if (const ModelVolume *primary_positive_volume = mesh_boolean_primary_positive_volume(*object); primary_positive_volume != nullptr)
+        new_volume->config.apply(primary_positive_volume->config);
+    if (provenance_available && had_transfer_data && new_volume->mesh().its.indices.size() == provenance.size()) {
+        std::vector<MultiSourceTextureTriangleProvenance> remap_provenance = mesh_boolean_remap_provenance(provenance);
+        ProgressDialog progress_dlg(_L("Transferring color data"), "", 100, find_toplevel_parent(wxGetApp().plater()), wxPD_AUTO_HIDE | wxPD_APP_MODAL);
+        progress_dlg.Update(0, _L("Transferring color data"));
+        SimplifyTextureDataResult result = remap_multi_source_texture_data(sources,
+                                                                           new_volume->mesh().its,
+                                                                           remap_provenance,
+                                                                           {},
+                                                                           [&progress_dlg](int percent) {
+                                                                               progress_dlg.Update(std::clamp(percent, 0, 100), _L("Transferring color data"));
+                                                                           });
+        progress_dlg.Update(100, _L("Transferring color data"));
+        if (mesh_boolean_texture_result_has_output(result) || result.region_painting_touched)
+            apply_simplify_texture_data_result(*new_volume, std::move(result));
+        else
+            show_mesh_boolean_color_remap_warning_dialog();
+    } else if (had_transfer_data)
+        show_mesh_boolean_color_transfer_warning_dialog();
 
     // BBS: ensure on bed but no need to ensure locate in the center around origin
     new_object->ensure_on_bed();
