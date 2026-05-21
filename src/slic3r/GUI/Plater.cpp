@@ -641,9 +641,9 @@ static bool assign_imported_texture_mapping_zone(Model &model)
     return true;
 }
 
-static bool texture_mapping_config_uses_zone_id(const ConfigOptionResolver &config, unsigned int zone_id)
+static const std::array<const char *, 6> &texture_mapping_filament_config_keys()
 {
-    static constexpr std::array<const char *, 6> filament_keys = {
+    static const std::array<const char *, 6> filament_keys = {
         "extruder",
         "wall_filament",
         "sparse_infill_filament",
@@ -651,8 +651,13 @@ static bool texture_mapping_config_uses_zone_id(const ConfigOptionResolver &conf
         "support_filament",
         "support_interface_filament"
     };
+    return filament_keys;
+}
+
+static bool texture_mapping_config_uses_zone_id(const ConfigOptionResolver &config, unsigned int zone_id)
+{
     const int target = int(zone_id);
-    for (const char *key : filament_keys) {
+    for (const char *key : texture_mapping_filament_config_keys()) {
         const ConfigOptionInt *opt = dynamic_cast<const ConfigOptionInt *>(config.option(key));
         if (opt != nullptr && opt->getInt() == target)
             return true;
@@ -685,6 +690,121 @@ static bool model_uses_texture_mapping_zone_id(const Model &model, const ConfigO
         }
     }
     return false;
+}
+
+static std::set<unsigned int> texture_mapping_zone_ids_from_import_config(const DynamicPrintConfig &config)
+{
+    const ConfigOptionString *defs = config.option<ConfigOptionString>("texture_mapping_definitions");
+    if (defs == nullptr || defs->value.empty())
+        return {};
+
+    std::set<unsigned int> ids;
+    try {
+        const json root = json::parse(defs->value);
+        if (!root.is_array())
+            return {};
+        for (const json &entry : root) {
+            if (!entry.is_object() || !entry.value("enabled", true))
+                continue;
+            const unsigned int zone_id = entry.value("zone_id", entry.value("filament_id", 0u));
+            if (zone_id != 0)
+                ids.insert(zone_id);
+        }
+    } catch (...) {
+        ids.clear();
+    }
+    return ids;
+}
+
+static bool store_texture_mapping_definitions(PresetBundle &bundle)
+{
+    const std::string serialized = bundle.texture_mapping_zones.serialize_entries();
+    DynamicPrintConfig &project_config = bundle.project_config;
+    if (ConfigOptionString *opt = project_config.option<ConfigOptionString>("texture_mapping_definitions"))
+        opt->value = serialized;
+    else
+        project_config.set_key_value("texture_mapping_definitions", new ConfigOptionString(serialized));
+
+    DynamicPrintConfig &print_config = bundle.prints.get_edited_preset().config;
+    if (ConfigOptionString *opt = print_config.option<ConfigOptionString>("texture_mapping_definitions"))
+        opt->value = serialized;
+    else
+        print_config.set_key_value("texture_mapping_definitions", new ConfigOptionString(serialized));
+    return true;
+}
+
+static unsigned int ensure_texture_mapping_import_target_zone(PresetBundle &bundle, bool &changed)
+{
+    DynamicPrintConfig &project_config = bundle.project_config;
+    const ConfigOptionStrings *color_opt = project_config.option<ConfigOptionStrings>("filament_colour", false);
+    if (color_opt == nullptr || color_opt->values.size() < 2)
+        return 0;
+
+    project_config.option<ConfigOptionString>("texture_mapping_definitions", true);
+    bundle.texture_mapping_zones.load_entries(project_config.opt_string("texture_mapping_definitions"), color_opt->values);
+    for (const unsigned int zone_id : bundle.texture_mapping_zones.zone_ids_by_index())
+        if (zone_id != 0)
+            return zone_id;
+
+    const unsigned int zone_id = bundle.texture_mapping_zones.ensure_image_texture_zone(color_opt->values.size(), color_opt->values);
+    if (zone_id != 0)
+        changed |= store_texture_mapping_definitions(bundle);
+    return zone_id;
+}
+
+static bool remap_texture_mapping_model_config(ModelConfig &config, const std::set<unsigned int> &source_zone_ids, unsigned int target_zone_id)
+{
+    bool changed = false;
+    for (const char *key : texture_mapping_filament_config_keys()) {
+        const ConfigOptionInt *opt = dynamic_cast<const ConfigOptionInt *>(config.option(key));
+        if (opt == nullptr || source_zone_ids.find(unsigned(opt->getInt())) == source_zone_ids.end())
+            continue;
+        if (opt->getInt() != int(target_zone_id)) {
+            config.set(key, int(target_zone_id));
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+static bool assign_imported_3mf_texture_mapping_zones(Model &model, const std::set<unsigned int> &source_zone_ids)
+{
+    if (source_zone_ids.empty())
+        return false;
+
+    std::set<unsigned int> used_zone_ids;
+    for (const unsigned int zone_id : source_zone_ids)
+        if (model_uses_texture_mapping_zone_id(model, nullptr, zone_id))
+            used_zone_ids.insert(zone_id);
+    if (used_zone_ids.empty())
+        return false;
+
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    if (bundle == nullptr)
+        return false;
+
+    bool changed = false;
+    const unsigned int target_zone_id = ensure_texture_mapping_import_target_zone(*bundle, changed);
+    if (target_zone_id == 0)
+        return changed;
+
+    for (ModelObject *object : model.objects) {
+        if (object == nullptr)
+            continue;
+        changed |= remap_texture_mapping_model_config(object->config, used_zone_ids, target_zone_id);
+        for (auto &layer_range : object->layer_config_ranges)
+            changed |= remap_texture_mapping_model_config(layer_range.second, used_zone_ids, target_zone_id);
+        for (ModelVolume *volume : object->volumes)
+            if (volume != nullptr)
+                changed |= remap_texture_mapping_model_config(volume->config, used_zone_ids, target_zone_id);
+    }
+
+    std::map<unsigned int, unsigned int> state_map;
+    for (const unsigned int zone_id : used_zone_ids)
+        if (zone_id != target_zone_id)
+            state_map[zone_id] = target_zone_id;
+    changed |= remap_mmu_segmentation_filaments(model, state_map);
+    return changed;
 }
 
 static wxColour parse_texture_mapping_color(const std::string &hex)
@@ -8781,6 +8901,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
         // const bool type_prusa   = std::regex_match(path.string(), pattern_prusa);
 
         Slic3r::Model model;
+        std::set<unsigned int> imported_texture_mapping_zone_ids;
         // BBS: add auxiliary files related logic
         bool load_aux = strategy & LoadStrategy::LoadAuxiliary, load_old_project = false;
         if (load_model && load_config && type_3mf) {
@@ -8818,9 +8939,14 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                                                  if (cancel)
                                                                      is_user_cancel = cancel;
                                                              });
-                          BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ":" << __LINE__
+                    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ":" << __LINE__
                                       << boost::format(", plate_data.size %1%, project_preset.size %2%, is_bbs_or_orca_3mf %3%, file_version %4% \n") % plate_data.size() %
                                           project_presets.size() % (en_3mf_file_type == En3mfType::From_BBS || en_3mf_file_type == En3mfType::From_Orca) % file_version.to_string();
+                    imported_texture_mapping_zone_ids = texture_mapping_zone_ids_from_import_config(config_loaded);
+                    if (load_model && !load_config && assign_imported_3mf_texture_mapping_zones(model, imported_texture_mapping_zone_ids)) {
+                        sidebar->update_texture_mapping_panel(false);
+                        sidebar->update_dynamic_filament_list();
+                    }
 
                     // 1. add extruder for prusa model if the number of existing extruders is not enough
                     // 2. add extruder for BBS or Other model if only import geometry
@@ -9551,7 +9677,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                 // convert_model_if(model, answer_convert_from_imperial_units == wxID_YES);
             }
 
-             if (!is_project_file && model.looks_like_multipart_object()) {
+            if (!is_project_file && model.looks_like_multipart_object()) {
                MessageDialog msg_dlg(q, _L(
                     "This file contains several objects positioned at multiple heights.\n"
                     "Instead of considering them as multiple objects, should \n"
@@ -9560,6 +9686,10 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                 if (msg_dlg.ShowModal() == wxID_YES) {
                     model.convert_multipart_object(filaments_cnt);
                 }
+            }
+            if (type_3mf && load_model && !load_config && assign_imported_3mf_texture_mapping_zones(model, imported_texture_mapping_zone_ids)) {
+                sidebar->update_texture_mapping_panel(false);
+                sidebar->update_dynamic_filament_list();
             }
         }
         // else if ((wxGetApp().get_mode() == comSimple) && (type_3mf || type_any_amf) && model_has_advanced_features(model)) {

@@ -1821,6 +1821,7 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
         void _extract_print_config_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat, DynamicPrintConfig& config, ConfigSubstitutionContext& subs_context, const std::string& archive_filename);
         //BBS: add project config file logic
         void _extract_project_config_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat, DynamicPrintConfig& config, ConfigSubstitutionContext& subs_context, Model& model);
+        void _extract_texture_mapping_config_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat, DynamicPrintConfig& config);
         //BBS: extract project embedded presets
         void _extract_project_embedded_presets_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat, std::vector<Preset*>&project_presets, Model& model, Preset::Type type, bool use_json = true);
 
@@ -2591,9 +2592,12 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
                     // extract slic3r print config file
                 //    _extract_print_config_from_archive(archive, stat, config, config_substitutions, filename);
                 //} else
-                if (!dont_load_config && boost::algorithm::iequals(name, BBS_PROJECT_CONFIG_FILE)) {
+                if (boost::algorithm::iequals(name, BBS_PROJECT_CONFIG_FILE)) {
                     // extract slic3r print config file
-                    _extract_project_config_from_archive(archive, stat, config, config_substitutions, model);
+                    if (!dont_load_config)
+                        _extract_project_config_from_archive(archive, stat, config, config_substitutions, model);
+                    else
+                        _extract_texture_mapping_config_from_archive(archive, stat, config);
                 }
                 else if (boost::algorithm::iequals(name, CUT_INFORMATION_FILE)) {
                     // extract object cut info
@@ -3328,6 +3332,37 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
                 return;
             }
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", load project config file successfully from %1%\n") %dest_file;
+        }
+    }
+
+    void _BBS_3MF_Importer::_extract_texture_mapping_config_from_archive(mz_zip_archive& archive, const mz_zip_archive_file_stat& stat, DynamicPrintConfig& config)
+    {
+        if (stat.m_uncomp_size == 0)
+            return;
+
+        std::string buffer(size_t(stat.m_uncomp_size), 0);
+        mz_bool res = mz_zip_reader_extract_to_mem(&archive, stat.m_file_index, (void *)buffer.data(), size_t(stat.m_uncomp_size), 0);
+        if (res == 0)
+            return;
+
+        try {
+            const nlohmann::json root = nlohmann::json::parse(buffer);
+            const auto texture_defs_it = root.find("texture_mapping_definitions");
+            if (texture_defs_it != root.end() && texture_defs_it->is_string())
+                config.set_key_value("texture_mapping_definitions", new ConfigOptionString(texture_defs_it->get<std::string>()));
+
+            const auto filament_colour_it = root.find("filament_colour");
+            if (filament_colour_it != root.end() && filament_colour_it->is_array()) {
+                std::vector<std::string> colors;
+                colors.reserve(filament_colour_it->size());
+                for (const nlohmann::json &entry : *filament_colour_it)
+                    if (entry.is_string())
+                        colors.emplace_back(entry.get<std::string>());
+                if (!colors.empty())
+                    config.set_key_value("filament_colour", new ConfigOptionStrings(std::move(colors)));
+            }
+        } catch (const std::exception &e) {
+            BOOST_LOG_TRIVIAL(warning) << "_extract_texture_mapping_config_from_archive JSON parse failed: " << e.what();
         }
     }
 
