@@ -502,20 +502,6 @@ static unsigned int ensure_texture_mapping_zone(bool allow_raw_values = false, b
     return mgr.find_image_texture_zone_id(num_physical, allow_raw_values, prefer_raw_values);
 }
 
-static void enable_texture_mapping_zone_simulated_preview(unsigned int texture_mapping_filament_id)
-{
-    if (texture_mapping_filament_id == 0 || wxGetApp().preset_bundle == nullptr)
-        return;
-
-    TextureMappingManager &mgr = wxGetApp().preset_bundle->texture_mapping_zones;
-    TextureMappingZone *zone = mgr.zone_from_id(texture_mapping_filament_id);
-    if (zone == nullptr || zone->preview_simulate_colors)
-        return;
-
-    zone->preview_simulate_colors = true;
-    persist_texture_mapping_zone_definitions(mgr);
-}
-
 static constexpr size_t MaxImageProjectionRawOffsetChannels = 4;
 static constexpr float  RawOffsetDataWarningWrapEm          = 24.f;
 
@@ -15688,9 +15674,6 @@ bool GLGizmoImageProjection::project_image_to_selected_object()
         (!whole_image_texture_mapped_without_regions || active_raw_atlas_valid()) ?
             texture_mapping_zone_id_for_image_projection(*object) :
             0;
-    if (active_raw_atlas_valid() && texture_mapping_filament_id != 0)
-        enable_texture_mapping_zone_simulated_preview(texture_mapping_filament_id);
-
     if (!whole_image_texture_mapped_without_regions) {
         if (texture_mapping_filament_id != 0) {
             const Selection &selection = m_parent.get_selection();

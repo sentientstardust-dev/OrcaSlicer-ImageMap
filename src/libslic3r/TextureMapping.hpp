@@ -137,7 +137,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultHighResolutionSampling = true;
     static constexpr float DefaultToneGamma = 1.f;
     static constexpr int   DefaultTransmissionDistanceCalibrationMode = int(TDCalibrationAbsolute);
-    static constexpr bool  DefaultPreviewSimulateColors = true;
+    static constexpr bool  DefaultPreviewSimulateColors = false;
     static constexpr bool  DefaultPreviewLimitResolution = true;
     static constexpr bool  DefaultAutoAdjustFilamentSelection = true;
 
