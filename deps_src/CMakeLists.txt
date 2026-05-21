@@ -33,6 +33,7 @@ add_subdirectory(pigment-painter)
 add_subdirectory(qhull)
 add_subdirectory(qoi)
 add_subdirectory(semver)      # Semver static library
+add_subdirectory(tinygltf)
 
 # Eigen header-only library
 add_subdirectory(eigen)
