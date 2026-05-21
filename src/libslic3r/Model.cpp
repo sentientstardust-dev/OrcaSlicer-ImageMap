@@ -25,8 +25,10 @@
 #include <float.h>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <iterator>
 #include <limits>
+#include <set>
 #include <unordered_map>
 
 #include <boost/algorithm/string/predicate.hpp>
@@ -77,6 +79,166 @@ static bool checked_rgba_buffer_size(size_t width, size_t height, size_t &buffer
         return false;
     buffer_size = pixel_count * 4;
     return true;
+}
+
+static constexpr unsigned int MmuSegmentationTextureZoneIdBase = 99;
+static constexpr size_t MmuSegmentationMaxPhysicalFilamentId =
+    MAXIMUM_EXTRUDER_NUMBER < MmuSegmentationTextureZoneIdBase ? MAXIMUM_EXTRUDER_NUMBER : MmuSegmentationTextureZoneIdBase - 1;
+
+static size_t config_physical_filament_count(const DynamicPrintConfig &config)
+{
+    if (const ConfigOptionStrings *colors = config.option<ConfigOptionStrings>("filament_colour");
+        colors != nullptr && !colors->values.empty())
+        return colors->values.size();
+    if (const ConfigOptionFloats *diameters = config.option<ConfigOptionFloats>("filament_diameter");
+        diameters != nullptr && !diameters->values.empty())
+        return diameters->values.size();
+    if (const ConfigOptionStrings *settings = config.option<ConfigOptionStrings>("filament_settings_id");
+        settings != nullptr && !settings->values.empty())
+        return settings->values.size();
+    return 0;
+}
+
+static std::vector<std::string> config_filament_colours_or_default(const DynamicPrintConfig &config, size_t count)
+{
+    std::vector<std::string> colors;
+    if (const ConfigOptionStrings *opt = config.option<ConfigOptionStrings>("filament_colour");
+        opt != nullptr && !opt->values.empty())
+        colors = opt->values;
+    if (colors.empty())
+        colors.assign(count, "#FFFFFF");
+    else
+        colors.resize(count, colors.front());
+    return colors;
+}
+
+static TextureMappingManager texture_mapping_manager_for_mmu_repair(const DynamicPrintConfig &config, size_t physical_count)
+{
+    TextureMappingManager manager;
+    const ConfigOptionString *defs = config.option<ConfigOptionString>("texture_mapping_definitions");
+    if (defs == nullptr || defs->value.empty())
+        return manager;
+    manager.load_entries(defs->value, config_filament_colours_or_default(config, std::max<size_t>(physical_count, 2)));
+    return manager;
+}
+
+static std::map<uint64_t, unsigned int> active_texture_zone_ids_by_stable_id(const TextureMappingManager &manager)
+{
+    std::map<uint64_t, unsigned int> ids;
+    for (const TextureMappingZone &zone : manager.zones())
+        if (zone.enabled && !zone.deleted && zone.stable_id != 0 && zone.zone_id != 0)
+            ids[zone.stable_id] = zone.zone_id;
+    return ids;
+}
+
+static std::string generated_missing_mmu_filament_color(unsigned int state_id, size_t index)
+{
+    uint64_t x = uint64_t(state_id) * 0x9E3779B97F4A7C15ull + uint64_t(index + 1) * 0xBF58476D1CE4E5B9ull;
+    auto next_channel = [&x]() {
+        x ^= x >> 30;
+        x *= 0xBF58476D1CE4E5B9ull;
+        x ^= x >> 27;
+        x *= 0x94D049BB133111EBull;
+        x ^= x >> 31;
+        return 64 + int(x % 160);
+    };
+    char buffer[8];
+    const int r = next_channel();
+    const int g = next_channel();
+    const int b = next_channel();
+    std::snprintf(buffer, sizeof(buffer), "#%02X%02X%02X", r, g, b);
+    return std::string(buffer);
+}
+
+static void append_string_filament_values(DynamicPrintConfig &config,
+                                          const char *key,
+                                          size_t physical_count,
+                                          const std::vector<std::string> &values,
+                                          const std::string &fallback)
+{
+    ConfigOptionStrings *opt = config.option<ConfigOptionStrings>(key, true);
+    const std::string fill = opt->values.empty() ? fallback : opt->values.back();
+    opt->values.resize(physical_count, fill);
+    opt->values.insert(opt->values.end(), values.begin(), values.end());
+}
+
+static void append_repeated_string_filament_values(DynamicPrintConfig &config,
+                                                   const char *key,
+                                                   size_t physical_count,
+                                                   size_t added_count,
+                                                   const std::string &value)
+{
+    ConfigOptionStrings *opt = config.option<ConfigOptionStrings>(key, true);
+    const std::string fill = opt->values.empty() ? value : opt->values.back();
+    opt->values.resize(physical_count, fill);
+    opt->values.resize(physical_count + added_count, value);
+}
+
+static void append_float_filament_values(DynamicPrintConfig &config,
+                                         const char *key,
+                                         size_t physical_count,
+                                         size_t added_count,
+                                         double fallback)
+{
+    ConfigOptionFloats *opt = config.option<ConfigOptionFloats>(key, true);
+    const double fill = opt->values.empty() ? fallback : opt->values.back();
+    opt->values.resize(physical_count, fill);
+    opt->values.resize(physical_count + added_count, fill);
+}
+
+static void append_missing_mmu_filaments_to_config(DynamicPrintConfig &config,
+                                                   size_t physical_count,
+                                                   const std::vector<std::string> &new_colors)
+{
+    append_string_filament_values(config, "filament_colour", physical_count, new_colors, "#FFFFFF");
+    append_string_filament_values(config, "filament_multi_colour", physical_count, new_colors, "#FFFFFF");
+    append_repeated_string_filament_values(config, "filament_colour_type", physical_count, new_colors.size(), "1");
+    append_repeated_string_filament_values(config, "filament_settings_id", physical_count, new_colors.size(), std::string());
+    append_float_filament_values(config, "filament_diameter", physical_count, new_colors.size(), 1.75);
+
+    ConfigOptionInts *self_index = config.option<ConfigOptionInts>("filament_self_index", true);
+    const size_t target_count = physical_count + new_colors.size();
+    self_index->values.resize(target_count);
+    for (size_t i = 0; i < target_count; ++i)
+        if (self_index->values[i] <= 0)
+            self_index->values[i] = int(i + 1);
+
+    if (ConfigOptionStrings *different = config.option<ConfigOptionStrings>("different_settings_to_system", true))
+        different->values.resize(target_count + 2);
+
+    if (ConfigOptionStrings *filament_ids = config.option<ConfigOptionStrings>("filament_ids", true))
+        filament_ids->values.resize(target_count);
+}
+
+static void append_texture_zone_id_remaps_after_filament_add(DynamicPrintConfig &config,
+                                                             size_t target_physical_count,
+                                                             const TextureMappingManager &old_manager,
+                                                             std::map<unsigned int, unsigned int> &filament_id_map)
+{
+    const ConfigOptionString *defs = config.option<ConfigOptionString>("texture_mapping_definitions");
+    if (defs == nullptr || defs->value.empty())
+        return;
+
+    const std::map<uint64_t, unsigned int> old_ids = active_texture_zone_ids_by_stable_id(old_manager);
+    if (old_ids.empty())
+        return;
+
+    TextureMappingManager new_manager;
+    new_manager.load_entries(defs->value, config_filament_colours_or_default(config, std::max<size_t>(target_physical_count, 2)));
+
+    bool changed = false;
+    for (const TextureMappingZone &zone : new_manager.zones()) {
+        if (!zone.enabled || zone.deleted || zone.stable_id == 0 || zone.zone_id == 0)
+            continue;
+        auto old_it = old_ids.find(zone.stable_id);
+        if (old_it != old_ids.end() && old_it->second != zone.zone_id) {
+            filament_id_map[old_it->second] = zone.zone_id;
+            changed = true;
+        }
+    }
+
+    if (changed)
+        config.set_key_value("texture_mapping_definitions", new ConfigOptionString(new_manager.serialize_entries()));
 }
 
 static std::vector<std::string> split_obj_mtl_tokens(const std::string &line)
@@ -914,6 +1076,9 @@ Model Model::read_from_file(const std::string&                                  
     if (model.objects.empty())
         throw Slic3r::RuntimeError(_L("The supplied file couldn't be read because it's empty"));
 
+    if ((options & LoadStrategy::LoadConfig) && boost::algorithm::iends_with(input_file, ".3mf"))
+        auto_add_missing_mmu_segmentation_filaments(model, *config);
+
     for (ModelObject *o : model.objects)
         o->input_file = input_file;
 
@@ -970,6 +1135,9 @@ Model Model::read_from_archive(const std::string& input_file, DynamicPrintConfig
 
     if (!result)
         throw Slic3r::RuntimeError(_L("Loading of a model file failed."));
+
+    if ((options & LoadStrategy::LoadConfig) && out_file_type != En3mfType::From_Prusa)
+        auto_add_missing_mmu_segmentation_filaments(model, *config);
 
     for (ModelObject *o : model.objects) {
 //        if (boost::algorithm::iends_with(input_file, ".zip.amf"))
@@ -4884,6 +5052,100 @@ bool model_mmu_segmentation_data_changed(const ModelObject& mo, const ModelObjec
         [](const ModelVolume &mv_old, const ModelVolume &mv_new) {
             return mv_old.mmu_segmentation_facets.timestamp_matches(mv_new.mmu_segmentation_facets);
         });
+}
+
+std::vector<unsigned int> collect_missing_mmu_segmentation_filaments(const Model &model,
+                                                                     size_t physical_filament_count,
+                                                                     const TextureMappingManager &texture_mapping_manager)
+{
+    std::set<unsigned int> missing;
+    for (const ModelObject *object : model.objects) {
+        if (object == nullptr)
+            continue;
+        for (const ModelVolume *volume : object->volumes) {
+            if (volume == nullptr || volume->mmu_segmentation_facets.empty())
+                continue;
+            const std::vector<bool> &used_states = volume->mmu_segmentation_facets.get_data().used_states;
+            const size_t max_state = std::min<size_t>(used_states.size(), size_t(EnforcerBlockerType::ExtruderMax) + 1);
+            for (size_t state_id = 1; state_id < max_state; ++state_id) {
+                if (!used_states[state_id] || state_id <= physical_filament_count)
+                    continue;
+                if (state_id >= MmuSegmentationTextureZoneIdBase ||
+                    texture_mapping_manager.is_texture_mapping_zone_id(unsigned(state_id)))
+                    continue;
+                missing.insert(unsigned(state_id));
+            }
+        }
+    }
+    return {missing.begin(), missing.end()};
+}
+
+bool remap_mmu_segmentation_filaments(Model &model, const std::map<unsigned int, unsigned int> &filament_id_map)
+{
+    if (filament_id_map.empty())
+        return false;
+
+    EnforcerBlockerStateMap state_map;
+    for (size_t i = 0; i < state_map.size(); ++i)
+        state_map[i] = EnforcerBlockerType(i);
+    for (const auto &[from, to] : filament_id_map)
+        if (from < state_map.size() && to < state_map.size())
+            state_map[from] = EnforcerBlockerType(to);
+
+    bool changed = false;
+    for (ModelObject *object : model.objects) {
+        if (object == nullptr)
+            continue;
+        for (ModelVolume *volume : object->volumes) {
+            if (volume == nullptr || volume->mmu_segmentation_facets.empty())
+                continue;
+            TriangleSelector selector(volume->mesh());
+            selector.deserialize(volume->mmu_segmentation_facets.get_data(),
+                                 false,
+                                 EnforcerBlockerType::ExtruderMax,
+                                 EnforcerBlockerType::NONE,
+                                 EnforcerBlockerType::NONE,
+                                 &state_map);
+            changed |= volume->mmu_segmentation_facets.set(selector);
+        }
+    }
+    return changed;
+}
+
+size_t auto_add_missing_mmu_segmentation_filaments(Model &model, DynamicPrintConfig &config)
+{
+    const size_t physical_count = config_physical_filament_count(config);
+    if (physical_count == 0 || physical_count >= MmuSegmentationMaxPhysicalFilamentId)
+        return 0;
+
+    TextureMappingManager old_texture_manager = texture_mapping_manager_for_mmu_repair(config, physical_count);
+    std::vector<unsigned int> missing_states =
+        collect_missing_mmu_segmentation_filaments(model, physical_count, old_texture_manager);
+    if (missing_states.empty())
+        return 0;
+
+    std::vector<std::string> new_colors;
+    std::map<unsigned int, unsigned int> filament_id_map;
+    unsigned int next_filament_id = unsigned(physical_count + 1);
+    for (const unsigned int state_id : missing_states) {
+        if (next_filament_id > unsigned(MmuSegmentationMaxPhysicalFilamentId))
+            break;
+        if (state_id != next_filament_id)
+            filament_id_map[state_id] = next_filament_id;
+        new_colors.emplace_back(generated_missing_mmu_filament_color(state_id, new_colors.size()));
+        ++next_filament_id;
+    }
+
+    if (new_colors.empty())
+        return 0;
+
+    append_missing_mmu_filaments_to_config(config, physical_count, new_colors);
+    append_texture_zone_id_remaps_after_filament_add(config,
+                                                     physical_count + new_colors.size(),
+                                                     old_texture_manager,
+                                                     filament_id_map);
+    remap_mmu_segmentation_filaments(model, filament_id_map);
+    return new_colors.size();
 }
 
 template<class T>

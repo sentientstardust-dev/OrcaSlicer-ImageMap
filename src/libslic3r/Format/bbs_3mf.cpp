@@ -163,6 +163,7 @@ static bool is_texture_mapping_virtual_filament_id(const Slic3r::DynamicPrintCon
         physical_colors = colors_opt->values;
     else
         physical_colors.assign(physical_count, "#FFFFFF");
+    physical_colors.resize(std::max<size_t>(physical_colors.size(), 2), physical_colors.empty() ? "#FFFFFF" : physical_colors.front());
 
     Slic3r::TextureMappingManager texture_mgr;
     texture_mgr.load_entries(texture_defs_opt->value, physical_colors);

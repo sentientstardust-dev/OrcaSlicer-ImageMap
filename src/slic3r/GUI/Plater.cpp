@@ -3,11 +3,14 @@
 #include "libslic3r_version.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <algorithm>
 #include <array>
 #include <iomanip>
 #include <numeric>
 #include <limits>
+#include <map>
+#include <set>
 #include <sstream>
 #include <unordered_set>
 #include <vector>
@@ -363,6 +366,66 @@ void SlicedInfo::SetTextAndShow(SlicedInfoIdx idx, const wxString& text, const w
 static wxString temp_dir;
 
 namespace {
+
+static std::map<uint64_t, unsigned int> active_texture_zone_ids_by_stable_id_for_import(const TextureMappingManager &manager)
+{
+    std::map<uint64_t, unsigned int> ids;
+    for (const TextureMappingZone &zone : manager.zones())
+        if (zone.enabled && !zone.deleted && zone.stable_id != 0 && zone.zone_id != 0)
+            ids[zone.stable_id] = zone.zone_id;
+    return ids;
+}
+
+static bool auto_add_missing_mmu_segmentation_filaments_to_current_project(Model &model)
+{
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    if (bundle == nullptr)
+        return false;
+
+    constexpr size_t max_physical_filament_id = MAXIMUM_EXTRUDER_NUMBER < 99 ? MAXIMUM_EXTRUDER_NUMBER : 98;
+    const size_t physical_count = bundle->filament_presets.size();
+    if (physical_count == 0 || physical_count >= max_physical_filament_id)
+        return false;
+
+    const std::map<uint64_t, unsigned int> old_zone_ids =
+        active_texture_zone_ids_by_stable_id_for_import(bundle->texture_mapping_zones);
+    std::vector<unsigned int> missing_states =
+        collect_missing_mmu_segmentation_filaments(model, physical_count, bundle->texture_mapping_zones);
+    if (missing_states.empty())
+        return false;
+
+    std::vector<std::string> new_colors;
+    std::map<unsigned int, unsigned int> filament_id_map;
+    unsigned int next_filament_id = unsigned(physical_count + 1);
+    for (const unsigned int state_id : missing_states) {
+        if (next_filament_id > unsigned(max_physical_filament_id))
+            break;
+        if (state_id != next_filament_id)
+            filament_id_map[state_id] = next_filament_id;
+        wxColour new_col = GUI::Plater::get_next_color_for_filament();
+        new_colors.emplace_back(new_col.GetAsString(wxC2S_HTML_SYNTAX).ToStdString());
+        ++next_filament_id;
+    }
+
+    if (new_colors.empty())
+        return false;
+
+    const size_t target_count = physical_count + new_colors.size();
+    bundle->set_num_filaments(unsigned(target_count), new_colors);
+
+    const std::map<uint64_t, unsigned int> new_zone_ids =
+        active_texture_zone_ids_by_stable_id_for_import(bundle->texture_mapping_zones);
+    for (const auto &[stable_id, old_zone_id] : old_zone_ids) {
+        auto new_it = new_zone_ids.find(stable_id);
+        if (new_it != new_zone_ids.end() && new_it->second != old_zone_id)
+            filament_id_map[old_zone_id] = new_it->second;
+    }
+
+    remap_mmu_segmentation_filaments(model, filament_id_map);
+    if (Plater *plater = wxGetApp().plater())
+        plater->on_filament_count_change(target_count);
+    return true;
+}
 
 #ifdef __WXGTK__
 wxString sanitize_window_layout_for_wayland(const wxString& layout, bool* removed_floating_state = nullptr)
@@ -8762,12 +8825,25 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                     // 1. add extruder for prusa model if the number of existing extruders is not enough
                     // 2. add extruder for BBS or Other model if only import geometry
                     if (en_3mf_file_type == En3mfType::From_Prusa || (load_model && !load_config)) {
+                        auto_add_missing_mmu_segmentation_filaments_to_current_project(model);
+                        PresetBundle *preset_bundle = wxGetApp().preset_bundle;
+                        auto count_as_physical_extruder = [preset_bundle](int extruder_id) {
+                            if (extruder_id <= 0 || extruder_id >= 99)
+                                return false;
+                            return preset_bundle == nullptr ||
+                                   !preset_bundle->texture_mapping_zones.is_texture_mapping_zone_id(unsigned(extruder_id));
+                        };
                         std::set<int> extruderIds;
                         for (ModelObject *o : model.objects) {
-                            if (o->config.option("extruder")) extruderIds.insert(o->config.extruder());
+                            if (o->config.option("extruder") && count_as_physical_extruder(o->config.extruder()))
+                                extruderIds.insert(o->config.extruder());
                             for (auto volume : o->volumes) {
-                                if (volume->config.option("extruder")) extruderIds.insert(volume->config.extruder());
-                                for (int extruder : volume->get_extruders()) { extruderIds.insert(extruder); }
+                                if (volume->config.option("extruder") && count_as_physical_extruder(volume->config.extruder()))
+                                    extruderIds.insert(volume->config.extruder());
+                                for (int extruder : volume->get_extruders()) {
+                                    if (count_as_physical_extruder(extruder))
+                                        extruderIds.insert(extruder);
+                                }
                             }
                         }
                         int size = extruderIds.size() == 0 ? 0 : *(extruderIds.rbegin());

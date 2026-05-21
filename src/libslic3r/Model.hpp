@@ -2055,6 +2055,12 @@ extern bool model_mmu_segmentation_data_changed(const ModelObject& mo, const Mod
 
 extern bool model_texture_mapping_color_data_changed(const ModelObject& mo, const ModelObject& mo_new);
 
+std::vector<unsigned int> collect_missing_mmu_segmentation_filaments(const Model &model,
+                                                                     size_t physical_filament_count,
+                                                                     const TextureMappingManager &texture_mapping_manager);
+bool remap_mmu_segmentation_filaments(Model &model, const std::map<unsigned int, unsigned int> &filament_id_map);
+size_t auto_add_missing_mmu_segmentation_filaments(Model &model, DynamicPrintConfig &config);
+
 // Test whether the now ModelObject has newer fuzzy skin data than the old one.
 // The function assumes that volumes list is synchronized.
 extern bool model_fuzzy_skin_data_changed(const ModelObject &mo, const ModelObject &mo_new);
