@@ -411,21 +411,33 @@ static std::optional<PerimeterTextureRecolorSampler> perimeter_texture_make_reco
     float                    base_outer_width_mm)
 {
     const Layer *layer = layer_region.layer();
-    if (layer == nullptr || layer->object() == nullptr || layer->object()->print() == nullptr)
+    if (layer == nullptr)
+        return std::nullopt;
+
+    const PrintObject *print_object = layer->object();
+    if (print_object == nullptr)
+        return std::nullopt;
+
+    const Print *print = print_object->print();
+    if (print == nullptr || print->canceled())
+        return std::nullopt;
+
+    const PrintConfig &print_config = print->config();
+    const size_t num_physical = print_config.filament_colour.values.size();
+    if (num_physical == 0)
         return std::nullopt;
 
     std::optional<TextureMappingOffsetContext> context =
-        build_texture_mapping_offset_context_for_layer(*layer->object(), *layer, zone, texture_zone_id, 0, base_outer_width_mm);
-    if (!context)
+        build_texture_mapping_offset_context_for_layer(*print_object, *layer, zone, texture_zone_id, 0, base_outer_width_mm);
+    if (!context || print->canceled() || context->component_ids.empty())
         return std::nullopt;
 
     PerimeterTextureRecolorSampler sampler;
     sampler.image_texture = zone.is_image_texture();
-    sampler.num_physical = layer->object()->print()->config().filament_colour.values.size();
+    sampler.num_physical = num_physical;
     if (sampler.image_texture) {
         sampler.image_context = std::move(*context);
         sampler.image_component_colors.reserve(sampler.image_context->component_ids.size());
-        const PrintConfig &print_config = layer->object()->print()->config();
         for (const unsigned int id : sampler.image_context->component_ids) {
             ColorRGB decoded;
             if (id >= 1 && id <= print_config.filament_colour.values.size() &&
@@ -441,15 +453,19 @@ static std::optional<PerimeterTextureRecolorSampler> perimeter_texture_make_reco
     sampler.component_ids.reserve(context->component_ids.size());
     sampler.gradient_contexts.reserve(context->component_ids.size());
     for (const unsigned int component_id : context->component_ids) {
+        if (print->canceled())
+            return std::nullopt;
         if (component_id < 1 || component_id > sampler.num_physical)
             continue;
         std::optional<TextureMappingOffsetContext> component_context =
-            build_texture_mapping_offset_context_for_layer(*layer->object(), *layer, zone, texture_zone_id, component_id, base_outer_width_mm);
+            build_texture_mapping_offset_context_for_layer(*print_object, *layer, zone, texture_zone_id, component_id, base_outer_width_mm);
         if (!component_context)
             continue;
         sampler.component_ids.emplace_back(component_id);
         sampler.gradient_contexts.emplace_back(std::move(*component_context));
     }
+    if (sampler.component_ids.empty() || sampler.component_ids.size() != sampler.gradient_contexts.size())
+        return std::nullopt;
     return sampler;
 }
 
@@ -971,6 +987,52 @@ static ExPolygons perimeter_texture_recolor_masks_union(const std::vector<ExPoly
     return out.empty() ? ExPolygons() : union_ex(out);
 }
 
+static void perimeter_texture_top_visible_recolor_data(const LayerRegion       &layer_region,
+                                                       const SurfaceCollection &slices,
+                                                       const TextureMappingZone &zone,
+                                                       unsigned int             texture_zone_id,
+                                                       float                    texture_external_width_mm,
+                                                       std::vector<ExPolygons> &top_visible_recolor_masks,
+                                                       ExPolygons              &top_visible_recolor_protection_mask,
+                                                       PerimeterTextureTopVisibleRecolorThresholds &top_visible_recolor_thresholds)
+{
+    top_visible_recolor_masks.clear();
+    top_visible_recolor_protection_mask.clear();
+    top_visible_recolor_thresholds =
+        perimeter_texture_top_visible_recolor_thresholds(zone.top_visible_perimeter_recolor_aggressiveness);
+    const PrintRegionConfig &region_config = layer_region.region().config();
+    const int wall_loops = std::max(1, region_config.wall_loops.value);
+    const Flow perimeter_flow = layer_region.flow(frPerimeter);
+    const float wall_depth_mm =
+        0.5f * texture_external_width_mm +
+        float(std::max(0, wall_loops - 1)) * float(perimeter_flow.spacing()) +
+        0.5f * float(perimeter_flow.width()) + 0.05f;
+    ExPolygons top_visible_recolor_wall_band;
+    ExPolygons top_visible_recolor_mask =
+        perimeter_texture_top_visible_wall_band_mask(layer_region, slices, wall_depth_mm, &top_visible_recolor_wall_band);
+    if (top_visible_recolor_mask.empty())
+        return;
+
+    top_visible_recolor_masks =
+        perimeter_texture_top_visible_region_recolor_masks(layer_region,
+                                                           slices,
+                                                           top_visible_recolor_wall_band,
+                                                           top_visible_recolor_mask,
+                                                           zone,
+                                                           texture_zone_id,
+                                                           texture_external_width_mm,
+                                                           top_visible_recolor_thresholds);
+    if (!perimeter_texture_recolor_masks_have_color(top_visible_recolor_masks)) {
+        top_visible_recolor_masks.clear();
+        return;
+    }
+
+    ExPolygons recolor_union = perimeter_texture_recolor_masks_union(top_visible_recolor_masks);
+    top_visible_recolor_protection_mask = intersection_ex(recolor_union, top_visible_recolor_mask);
+    if (top_visible_recolor_protection_mask.empty())
+        top_visible_recolor_masks.clear();
+}
+
 static bool perimeter_texture_split_surfaces_by_recolor_masks(const SurfaceCollection        &input,
                                                               const SurfaceCollection        &colored_input,
                                                               const std::vector<ExPolygons> &masks,
@@ -1365,6 +1427,106 @@ static const TextureMappingZone *perimeter_path_modulation_zone_for_region(const
     return zone;
 }
 
+static const TextureMappingZone *perimeter_path_modulation_v2_zone_for_region(const Print              &print,
+                                                                              const PrintRegionConfig &region_config,
+                                                                              unsigned int            &texture_zone_id)
+{
+    const TextureMappingZone *zone = perimeter_path_modulation_zone_for_region(print, region_config, texture_zone_id);
+    return zone != nullptr && zone->uses_perimeter_path_modulation_v2() ? zone : nullptr;
+}
+
+void Layer::apply_perimeter_path_modulation_v2()
+{
+    PrintObject *print_object = this->object();
+    if (print_object == nullptr || print_object->print() == nullptr)
+        return;
+
+    bool needs_geometry_update = false;
+    for (LayerRegion *layerm : m_regions) {
+        if (layerm == nullptr)
+            continue;
+        unsigned int texture_zone_id = 0;
+        if (layerm->perimeter_path_modulation_v2_applied ||
+            perimeter_path_modulation_v2_zone_for_region(*print_object->print(),
+                                                         layerm->region().config(),
+                                                         texture_zone_id) != nullptr) {
+            needs_geometry_update = true;
+            break;
+        }
+    }
+    if (!needs_geometry_update)
+        return;
+
+    for (LayerRegion *layerm : m_regions) {
+        if (layerm == nullptr)
+            continue;
+        if (layerm->unmodulated_raw_slices.empty() && !layerm->raw_slices.empty())
+            layerm->unmodulated_raw_slices = layerm->raw_slices;
+        if (layerm->unmodulated_raw_slices.empty() && !layerm->slices.empty())
+            layerm->unmodulated_raw_slices = to_expolygons(layerm->slices.surfaces);
+        if (!layerm->unmodulated_raw_slices.empty() || !layerm->slices.empty()) {
+            layerm->slices.set(layerm->unmodulated_raw_slices, stInternal);
+            layerm->raw_slices = layerm->unmodulated_raw_slices;
+        } else {
+            layerm->raw_slices.clear();
+        }
+        layerm->perimeter_path_modulation_v2_applied = false;
+        layerm->perimeter_path_modulation_v2_fallback_slices.clear();
+        layerm->perimeter_path_modulation_v2_has_fallback_slices = false;
+        layerm->perimeter_path_modulation_v2_fallback_is_modulated = false;
+    }
+
+    for (LayerRegion *layerm : m_regions) {
+        if (layerm == nullptr || layerm->slices.empty())
+            continue;
+        unsigned int texture_zone_id = 0;
+        const TextureMappingZone *zone =
+            perimeter_path_modulation_v2_zone_for_region(*print_object->print(),
+                                                         layerm->region().config(),
+                                                         texture_zone_id);
+        if (zone == nullptr)
+            continue;
+        ExPolygons top_visible_recolor_protection_mask;
+        std::vector<ExPolygons> top_visible_recolor_masks;
+        PerimeterTextureTopVisibleRecolorThresholds top_visible_recolor_thresholds;
+        const ExPolygons *top_visible_recolor_mask_ptr = nullptr;
+        const PerimeterTextureTopVisibleRecolorThresholds *top_visible_recolor_thresholds_ptr = nullptr;
+        if (zone->recolor_top_visible_perimeter_sections) {
+            const float texture_external_width_mm =
+                std::max(0.05f, float(print_object->print()->config().texture_mapping_outer_wall_gradient_max_line_width.value));
+            perimeter_texture_top_visible_recolor_data(*layerm,
+                                                       layerm->slices,
+                                                       *zone,
+                                                       texture_zone_id,
+                                                       texture_external_width_mm,
+                                                       top_visible_recolor_masks,
+                                                       top_visible_recolor_protection_mask,
+                                                       top_visible_recolor_thresholds);
+            if (!top_visible_recolor_protection_mask.empty()) {
+                top_visible_recolor_mask_ptr = &top_visible_recolor_protection_mask;
+                top_visible_recolor_thresholds_ptr = &top_visible_recolor_thresholds;
+            }
+        }
+        SurfaceCollection modulated_slices =
+            perimeter_path_modulated_surfaces(*layerm,
+                                              layerm->slices,
+                                              *zone,
+                                              texture_zone_id,
+                                              std::nullopt,
+                                              top_visible_recolor_mask_ptr,
+                                              top_visible_recolor_thresholds_ptr);
+        layerm->slices = std::move(modulated_slices);
+        layerm->raw_slices = to_expolygons(layerm->slices.surfaces);
+        layerm->perimeter_path_modulation_v2_applied = true;
+    }
+
+    this->make_slices();
+    this->lslices_bboxes.clear();
+    this->lslices_bboxes.reserve(this->lslices.size());
+    for (const ExPolygon &expoly : this->lslices)
+        this->lslices_bboxes.emplace_back(get_extents(expoly));
+}
+
 Flow LayerRegion::flow(FlowRole role) const
 {
     return this->flow(role, m_layer->height);
@@ -1435,8 +1597,6 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
 
     SurfaceCollection modulated_slices;
     const SurfaceCollection *perimeter_slices = &slices;
-    ExPolygons top_visible_recolor_mask;
-    ExPolygons top_visible_recolor_wall_band;
     ExPolygons top_visible_recolor_protection_mask;
     std::vector<ExPolygons> top_visible_recolor_masks;
     const ExPolygons *top_visible_recolor_mask_ptr = nullptr;
@@ -1444,54 +1604,56 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
     const PerimeterTextureTopVisibleRecolorThresholds *top_visible_recolor_thresholds_ptr = nullptr;
     unsigned int perimeter_texture_zone_id = 0;
     bool use_perimeter_path_modulation = false;
+    bool use_legacy_perimeter_path_modulation = false;
+    bool use_perimeter_path_modulation_v2 = false;
     const TextureMappingZone *perimeter_path_zone =
         perimeter_path_modulation_zone_for_region(*this->layer()->object()->print(), region_config, perimeter_texture_zone_id);
     if (perimeter_path_zone != nullptr) {
         if (perimeter_path_zone->recolor_top_visible_perimeter_sections) {
-            top_visible_recolor_thresholds =
-                perimeter_texture_top_visible_recolor_thresholds(perimeter_path_zone->top_visible_perimeter_recolor_aggressiveness);
-            const int wall_loops = std::max(1, region_config.wall_loops.value);
-            const Flow perimeter_flow = this->flow(frPerimeter);
-            const float wall_depth_mm =
-                0.5f * texture_external_width_mm +
-                float(std::max(0, wall_loops - 1)) * float(perimeter_flow.spacing()) +
-                0.5f * float(perimeter_flow.width()) + 0.05f;
-            top_visible_recolor_mask =
-                perimeter_texture_top_visible_wall_band_mask(*this, slices, wall_depth_mm, &top_visible_recolor_wall_band);
-            if (!top_visible_recolor_mask.empty()) {
-                top_visible_recolor_masks =
-                    perimeter_texture_top_visible_region_recolor_masks(*this,
-                                                                       slices,
-                                                                       top_visible_recolor_wall_band,
-                                                                       top_visible_recolor_mask,
-                                                                       *perimeter_path_zone,
-                                                                       perimeter_texture_zone_id,
-                                                                       texture_external_width_mm,
-                                                                       top_visible_recolor_thresholds);
-                if (perimeter_texture_recolor_masks_have_color(top_visible_recolor_masks)) {
-                    ExPolygons recolor_union = perimeter_texture_recolor_masks_union(top_visible_recolor_masks);
-                    top_visible_recolor_protection_mask = intersection_ex(recolor_union, top_visible_recolor_mask);
-                    if (!top_visible_recolor_protection_mask.empty()) {
-                        top_visible_recolor_mask_ptr = &top_visible_recolor_protection_mask;
-                        top_visible_recolor_thresholds_ptr = &top_visible_recolor_thresholds;
-                    } else {
-                        top_visible_recolor_masks.clear();
-                    }
-                } else {
-                    top_visible_recolor_masks.clear();
-                }
+            perimeter_texture_top_visible_recolor_data(*this,
+                                                       slices,
+                                                       *perimeter_path_zone,
+                                                       perimeter_texture_zone_id,
+                                                       texture_external_width_mm,
+                                                       top_visible_recolor_masks,
+                                                       top_visible_recolor_protection_mask,
+                                                       top_visible_recolor_thresholds);
+            if (!top_visible_recolor_protection_mask.empty()) {
+                top_visible_recolor_mask_ptr = &top_visible_recolor_protection_mask;
+                top_visible_recolor_thresholds_ptr = &top_visible_recolor_thresholds;
             }
         }
-        modulated_slices = perimeter_path_modulated_surfaces(*this,
-                                                             slices,
-                                                             *perimeter_path_zone,
-                                                             perimeter_texture_zone_id,
-                                                             std::nullopt,
-                                                             top_visible_recolor_mask_ptr,
-                                                             top_visible_recolor_thresholds_ptr);
-        perimeter_slices = &modulated_slices;
+        if (perimeter_path_zone->uses_legacy_perimeter_path_modulation()) {
+            modulated_slices = perimeter_path_modulated_surfaces(*this,
+                                                                 slices,
+                                                                 *perimeter_path_zone,
+                                                                 perimeter_texture_zone_id,
+                                                                 std::nullopt,
+                                                                 top_visible_recolor_mask_ptr,
+                                                                 top_visible_recolor_thresholds_ptr);
+            perimeter_slices = &modulated_slices;
+            use_legacy_perimeter_path_modulation = true;
+        } else if (perimeter_path_zone->uses_perimeter_path_modulation_v2()) {
+            use_perimeter_path_modulation_v2 = true;
+        }
         use_perimeter_path_modulation = true;
     }
+
+    SurfaceCollection v2_original_slices;
+    const SurfaceCollection *fallback_original_slices = &slices;
+    if (use_perimeter_path_modulation_v2 && !this->unmodulated_raw_slices.empty()) {
+        v2_original_slices.set(this->unmodulated_raw_slices, stInternal);
+        fallback_original_slices = &v2_original_slices;
+    }
+
+    auto set_perimeter_path_modulation_v2_fallback_slices =
+        [this, use_perimeter_path_modulation_v2](const SurfaceCollection &fallback_slices, bool is_modulated) {
+            if (!use_perimeter_path_modulation_v2)
+                return;
+            this->perimeter_path_modulation_v2_fallback_slices = fallback_slices;
+            this->perimeter_path_modulation_v2_has_fallback_slices = true;
+            this->perimeter_path_modulation_v2_fallback_is_modulated = is_modulated;
+        };
 
     const bool force_classic_wall_generator = region_uses_overhang_texture_mapping(*this->layer()->object()->print(), region_config);
     auto texture_external_flow = [&](float external_width_mm) {
@@ -1592,7 +1754,7 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
 
     SurfaceCollection fill_surfaces_before;
     ExPolygons fill_no_overlap_before;
-    if (use_perimeter_path_modulation) {
+    if (use_legacy_perimeter_path_modulation || use_perimeter_path_modulation_v2) {
         fill_surfaces_before = *fill_surfaces;
         fill_no_overlap_before = *fill_no_overlap;
     }
@@ -1601,14 +1763,16 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         use_perimeter_path_modulation ? std::optional<float>(texture_external_width_mm) : std::optional<float>();
     process_slices_with_top_visible_recolor(perimeter_slices, &slices, initial_texture_external_width_mm);
 
-    if (use_perimeter_path_modulation && this->perimeters.entities.empty() && this->thin_fills.entities.empty()) {
+    if ((use_legacy_perimeter_path_modulation || use_perimeter_path_modulation_v2) &&
+        this->perimeters.entities.empty() &&
+        this->thin_fills.entities.empty()) {
         this->perimeters.clear();
         this->thin_fills.clear();
         *fill_surfaces = fill_surfaces_before;
         *fill_no_overlap = fill_no_overlap_before;
         fill_surfaces_before = *fill_surfaces;
         fill_no_overlap_before = *fill_no_overlap;
-        process_slices(&slices, std::optional<float>(texture_external_width_mm));
+        process_slices(fallback_original_slices, std::optional<float>(texture_external_width_mm));
         const bool original_texture_has_extrusions =
             !this->perimeters.entities.empty() || !this->thin_fills.entities.empty();
         const std::optional<float> reduced_external_width_mm = perimeter_texture_min_external_width(this->perimeters);
@@ -1619,8 +1783,10 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
             if (perimeter_texture_apply_recolor_small_perimeter_loops(*this,
                                                                       *perimeter_path_zone,
                                                                       perimeter_texture_zone_id,
-                                                                      texture_external_width_mm))
+                                                                      texture_external_width_mm)) {
+                set_perimeter_path_modulation_v2_fallback_slices(*fallback_original_slices, false);
                 return;
+            }
         }
         if (has_reduced_external_width) {
             this->perimeters.clear();
@@ -1629,14 +1795,18 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
             *fill_no_overlap = fill_no_overlap_before;
             SurfaceCollection reduced_modulated_slices =
                 perimeter_path_modulated_surfaces(*this,
-                                                  slices,
+                                                  *fallback_original_slices,
                                                   *perimeter_path_zone,
                                                   perimeter_texture_zone_id,
                                                   reduced_external_width_mm,
                                                   top_visible_recolor_mask_ptr,
                                                   top_visible_recolor_thresholds_ptr);
-            process_slices_with_top_visible_recolor(&reduced_modulated_slices, &slices, reduced_external_width_mm);
+            process_slices_with_top_visible_recolor(&reduced_modulated_slices, fallback_original_slices, reduced_external_width_mm);
+            if (!this->perimeters.entities.empty() || !this->thin_fills.entities.empty())
+                set_perimeter_path_modulation_v2_fallback_slices(reduced_modulated_slices, true);
         }
+        if (!has_reduced_external_width && (!this->perimeters.entities.empty() || !this->thin_fills.entities.empty()))
+            set_perimeter_path_modulation_v2_fallback_slices(*fallback_original_slices, false);
         if (this->perimeters.entities.empty() && this->thin_fills.entities.empty()) {
             this->perimeters.clear();
             this->thin_fills.clear();
@@ -1644,7 +1814,8 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
             *fill_no_overlap = fill_no_overlap_before;
             const std::optional<float> fallback_texture_external_width_mm =
                 original_texture_has_extrusions ? std::optional<float>(texture_external_width_mm) : std::optional<float>();
-            process_slices(&slices, fallback_texture_external_width_mm);
+            process_slices(fallback_original_slices, fallback_texture_external_width_mm);
+            set_perimeter_path_modulation_v2_fallback_slices(*fallback_original_slices, false);
         }
     }
 }

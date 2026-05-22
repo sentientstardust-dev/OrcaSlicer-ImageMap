@@ -526,19 +526,25 @@ static int mapping_mode_from_name(const std::string &name)
 
 static std::string modulation_mode_name(int mode)
 {
-    return clamp_int(mode,
-                     int(TextureMappingZone::ModulationLineWidth),
-                     int(TextureMappingZone::ModulationPerimeterPath)) ==
-               int(TextureMappingZone::ModulationPerimeterPath) ?
-        std::string("perimeter_path") :
-        std::string("line_width");
+    switch (clamp_int(mode,
+                      int(TextureMappingZone::ModulationLineWidth),
+                      int(TextureMappingZone::ModulationPerimeterPathV2))) {
+    case int(TextureMappingZone::ModulationPerimeterPath):
+        return std::string("perimeter_path");
+    case int(TextureMappingZone::ModulationPerimeterPathV2):
+        return std::string("perimeter_path_v2");
+    default:
+        return std::string("line_width");
+    }
 }
 
 static int modulation_mode_from_name(const std::string &name)
 {
-    return name == "perimeter_path" ?
-        int(TextureMappingZone::ModulationPerimeterPath) :
-        int(TextureMappingZone::ModulationLineWidth);
+    if (name == "perimeter_path")
+        return int(TextureMappingZone::ModulationPerimeterPath);
+    if (name == "perimeter_path_v2")
+        return int(TextureMappingZone::ModulationPerimeterPathV2);
+    return int(TextureMappingZone::ModulationLineWidth);
 }
 
 static std::string top_visible_recolor_aggressiveness_name(int mode)
@@ -859,6 +865,7 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            seam_hiding == rhs.seam_hiding &&
            nonlinear_offset_adjustment == rhs.nonlinear_offset_adjustment &&
            modulation_mode == rhs.modulation_mode &&
+           use_modulated_overhang_geometry_for_support == rhs.use_modulated_overhang_geometry_for_support &&
            recolor_small_perimeter_loops == rhs.recolor_small_perimeter_loops &&
            recolor_top_visible_perimeter_sections == rhs.recolor_top_visible_perimeter_sections &&
            top_visible_perimeter_recolor_aggressiveness == rhs.top_visible_perimeter_recolor_aggressiveness &&
@@ -1116,6 +1123,7 @@ std::string TextureMappingManager::serialize_entries()
         texture["hide_seams"] = zone.seam_hiding;
         texture["nonlinear_offset_adjustment"] = zone.nonlinear_offset_adjustment;
         texture["modulation_mode"] = modulation_mode_name(zone.modulation_mode);
+        texture["use_modulated_overhang_geometry_for_support"] = zone.use_modulated_overhang_geometry_for_support;
         texture["recolor_small_perimeter_loops"] = zone.recolor_small_perimeter_loops || zone.recolor_top_visible_perimeter_sections;
         texture["recolor_top_visible_perimeter_sections"] = zone.recolor_top_visible_perimeter_sections;
         texture["top_visible_perimeter_recolor_aggressiveness"] =
@@ -1264,6 +1272,9 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.modulation_mode =
             modulation_mode_from_name(texture.value("modulation_mode",
                                                     modulation_mode_name(TextureMappingZone::DefaultModulationMode)));
+        zone.use_modulated_overhang_geometry_for_support =
+            texture.value("use_modulated_overhang_geometry_for_support",
+                          TextureMappingZone::DefaultUseModulatedOverhangGeometryForSupport);
         zone.recolor_small_perimeter_loops =
             texture.value("recolor_small_perimeter_loops", TextureMappingZone::DefaultRecolorSmallPerimeterLoops);
         zone.recolor_top_visible_perimeter_sections =

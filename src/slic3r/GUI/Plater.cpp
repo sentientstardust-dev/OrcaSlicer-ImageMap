@@ -1426,6 +1426,7 @@ public:
                                         bool seam_hiding,
                                         bool nonlinear_offset_adjustment,
                                         int modulation_mode,
+                                        bool use_modulated_overhang_geometry_for_support,
                                         bool recolor_small_perimeter_loops,
                                         bool recolor_top_visible_perimeter_sections,
                                         int top_visible_perimeter_recolor_aggressiveness,
@@ -1699,11 +1700,12 @@ public:
         modulation_mode_row->Add(new wxStaticText(print_settings_page, wxID_ANY, _L("Modulation mode:")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         wxArrayString modulation_mode_choices;
         modulation_mode_choices.Add(_L("Line width modulation"));
-        modulation_mode_choices.Add(_L("Perimeter path modulation"));
+        modulation_mode_choices.Add(_L("Perimeter path modulation (legacy v1)"));
+        modulation_mode_choices.Add(_L("Perimeter path modulation (v2)"));
         m_modulation_mode_choice = new wxChoice(print_settings_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, modulation_mode_choices);
         m_modulation_mode_choice->SetSelection(std::clamp(modulation_mode,
                                                           int(TextureMappingZone::ModulationLineWidth),
-                                                          int(TextureMappingZone::ModulationPerimeterPath)));
+                                                          int(TextureMappingZone::ModulationPerimeterPathV2)));
         modulation_mode_row->Add(m_modulation_mode_choice, 1, wxALIGN_CENTER_VERTICAL);
         print_settings_root->Add(modulation_mode_row, 0, wxEXPAND | wxALL, gap);
         m_modulation_mode_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) { update_modulation_mode_options_visibility(false); });
@@ -1757,6 +1759,10 @@ public:
         m_compact_offset_mode_checkbox->SetToolTip(
             _L("Normalizes sampled filament offsets so the strongest active color uses the full maximum line width."));
         experimental_box->Add(m_compact_offset_mode_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        m_use_modulated_overhang_geometry_for_support_checkbox =
+            new wxCheckBox(experimental_page, wxID_ANY, _L("Use modulated overhang geometry in support generation"));
+        m_use_modulated_overhang_geometry_for_support_checkbox->SetValue(use_modulated_overhang_geometry_for_support);
+        experimental_box->Add(m_use_modulated_overhang_geometry_for_support_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
         m_dithering_resolution_panel = new wxPanel(experimental_page, wxID_ANY);
         auto *dithering_resolution_row = new wxBoxSizer(wxHORIZONTAL);
         m_dithering_resolution_panel->SetSizer(dithering_resolution_row);
@@ -2028,12 +2034,17 @@ public:
     bool reduce_outer_surface_texture() const { return false; }
     bool seam_hiding() const { return m_seam_hiding_checkbox && m_seam_hiding_checkbox->GetValue(); }
     bool nonlinear_offset_adjustment() const { return m_nonlinear_offset_adjustment_checkbox && m_nonlinear_offset_adjustment_checkbox->GetValue(); }
+    bool use_modulated_overhang_geometry_for_support() const
+    {
+        return m_use_modulated_overhang_geometry_for_support_checkbox != nullptr &&
+               m_use_modulated_overhang_geometry_for_support_checkbox->GetValue();
+    }
     int modulation_mode() const
     {
         return m_modulation_mode_choice ?
             std::clamp(m_modulation_mode_choice->GetSelection(),
                        int(TextureMappingZone::ModulationLineWidth),
-                       int(TextureMappingZone::ModulationPerimeterPath)) :
+                       int(TextureMappingZone::ModulationPerimeterPathV2)) :
             TextureMappingZone::DefaultModulationMode;
     }
     bool compact_offset_mode() const { return dithering_enabled() || (m_compact_offset_mode_checkbox && m_compact_offset_mode_checkbox->GetValue()); }
@@ -2383,7 +2394,9 @@ private:
 
     void update_modulation_mode_options_visibility(bool fit_dialog)
     {
-        const bool perimeter_path_mode = modulation_mode() == int(TextureMappingZone::ModulationPerimeterPath);
+        const bool perimeter_path_mode = modulation_mode() == int(TextureMappingZone::ModulationPerimeterPath) ||
+                                         modulation_mode() == int(TextureMappingZone::ModulationPerimeterPathV2);
+        const bool perimeter_path_v2_mode = modulation_mode() == int(TextureMappingZone::ModulationPerimeterPathV2);
         const bool top_visible_checked =
             m_recolor_top_visible_perimeter_sections_checkbox != nullptr &&
             m_recolor_top_visible_perimeter_sections_checkbox->GetValue();
@@ -2393,6 +2406,8 @@ private:
             m_recolor_small_perimeter_loops_checkbox->Enable(perimeter_path_mode && !top_visible_checked);
         if (m_recolor_top_visible_perimeter_sections_checkbox != nullptr)
             m_recolor_top_visible_perimeter_sections_checkbox->Enable(perimeter_path_mode);
+        if (m_use_modulated_overhang_geometry_for_support_checkbox != nullptr)
+            m_use_modulated_overhang_geometry_for_support_checkbox->Enable(perimeter_path_v2_mode);
         const bool top_visible_enabled =
             perimeter_path_mode &&
             top_visible_checked;
@@ -2457,6 +2472,7 @@ private:
     wxCheckBox *m_reduce_outer_surface_texture_checkbox {nullptr};
     wxCheckBox *m_seam_hiding_checkbox {nullptr};
     wxCheckBox *m_nonlinear_offset_adjustment_checkbox {nullptr};
+    wxCheckBox *m_use_modulated_overhang_geometry_for_support_checkbox {nullptr};
     wxChoice *m_modulation_mode_choice {nullptr};
     wxCheckBox *m_recolor_small_perimeter_loops_checkbox {nullptr};
     wxCheckBox *m_recolor_top_visible_perimeter_sections_checkbox {nullptr};
@@ -6642,6 +6658,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.seam_hiding,
                                                     updated.nonlinear_offset_adjustment,
                                                     updated.modulation_mode,
+                                                    updated.use_modulated_overhang_geometry_for_support,
                                                     updated.recolor_small_perimeter_loops,
                                                     updated.recolor_top_visible_perimeter_sections,
                                                     updated.top_visible_perimeter_recolor_aggressiveness,
@@ -6683,6 +6700,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.seam_hiding = dlg.seam_hiding();
             updated.nonlinear_offset_adjustment = dlg.nonlinear_offset_adjustment();
             updated.modulation_mode = dlg.modulation_mode();
+            updated.use_modulated_overhang_geometry_for_support = dlg.use_modulated_overhang_geometry_for_support();
             updated.recolor_small_perimeter_loops = dlg.recolor_small_perimeter_loops();
             updated.recolor_top_visible_perimeter_sections = dlg.recolor_top_visible_perimeter_sections();
             updated.top_visible_perimeter_recolor_aggressiveness = dlg.top_visible_perimeter_recolor_aggressiveness();

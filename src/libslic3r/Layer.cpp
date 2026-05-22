@@ -75,12 +75,45 @@ static inline bool layer_needs_raw_backup(const Layer *layer)
 void Layer::backup_untyped_slices()
 {
     if (layer_needs_raw_backup(this)) {
-        for (LayerRegion *layerm : m_regions)
+        for (LayerRegion *layerm : m_regions) {
             layerm->raw_slices = to_expolygons(layerm->slices.surfaces);
+            layerm->unmodulated_raw_slices = layerm->raw_slices;
+            layerm->perimeter_path_modulation_v2_applied = false;
+            layerm->perimeter_path_modulation_v2_fallback_slices.clear();
+            layerm->perimeter_path_modulation_v2_has_fallback_slices = false;
+            layerm->perimeter_path_modulation_v2_fallback_is_modulated = false;
+        }
     } else {
         assert(m_regions.size() == 1);
         m_regions.front()->raw_slices.clear();
+        m_regions.front()->unmodulated_raw_slices.clear();
+        m_regions.front()->perimeter_path_modulation_v2_applied = false;
+        m_regions.front()->perimeter_path_modulation_v2_fallback_slices.clear();
+        m_regions.front()->perimeter_path_modulation_v2_has_fallback_slices = false;
+        m_regions.front()->perimeter_path_modulation_v2_fallback_is_modulated = false;
     }
+}
+
+void Layer::commit_perimeter_path_modulation_v2_fallbacks()
+{
+    bool changed = false;
+    for (LayerRegion *layerm : m_regions) {
+        if (layerm == nullptr || !layerm->perimeter_path_modulation_v2_has_fallback_slices)
+            continue;
+        layerm->slices = std::move(layerm->perimeter_path_modulation_v2_fallback_slices);
+        layerm->raw_slices = to_expolygons(layerm->slices.surfaces);
+        layerm->perimeter_path_modulation_v2_applied = layerm->perimeter_path_modulation_v2_fallback_is_modulated;
+        layerm->perimeter_path_modulation_v2_has_fallback_slices = false;
+        layerm->perimeter_path_modulation_v2_fallback_is_modulated = false;
+        changed = true;
+    }
+    if (!changed)
+        return;
+    this->make_slices();
+    this->lslices_bboxes.clear();
+    this->lslices_bboxes.reserve(this->lslices.size());
+    for (const ExPolygon &expoly : this->lslices)
+        this->lslices_bboxes.emplace_back(get_extents(expoly));
 }
 
 void Layer::restore_untyped_slices()
@@ -182,8 +215,14 @@ void Layer::make_perimeters()
     // keep track of regions whose perimeters we have already generated
     std::vector<unsigned char> done(m_regions.size(), false);
 
+    auto has_perimeter_input = [](const LayerRegion *layerm) {
+        return layerm != nullptr &&
+               (!layerm->slices.empty() ||
+                (layerm->perimeter_path_modulation_v2_applied && !layerm->unmodulated_raw_slices.empty()));
+    };
+
     for (LayerRegionPtrs::iterator layerm = m_regions.begin(); layerm != m_regions.end(); ++ layerm)
-    	if ((*layerm)->slices.empty()) {
+        if (!has_perimeter_input(*layerm)) {
  			(*layerm)->perimeters.clear();
  			(*layerm)->fills.clear();
  			(*layerm)->thin_fills.clear();
@@ -199,7 +238,7 @@ void Layer::make_perimeters()
 	        LayerRegionPtrs layerms;
 	        layerms.push_back(*layerm);
 	        for (LayerRegionPtrs::const_iterator it = layerm + 1; it != m_regions.end(); ++it)
-	            if (! (*it)->slices.empty()) {
+	            if (has_perimeter_input(*it)) {
 		            LayerRegion* other_layerm = *it;
 		            const PrintRegion &other_region = other_layerm->region();
                     if (is_perimeter_compatible(this_region, other_region))

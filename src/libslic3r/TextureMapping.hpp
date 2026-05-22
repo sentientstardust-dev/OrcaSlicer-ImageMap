@@ -48,7 +48,8 @@ struct TextureMappingZone
 
     enum ModulationMode : uint8_t {
         ModulationLineWidth = 0,
-        ModulationPerimeterPath = 1
+        ModulationPerimeterPath = 1,
+        ModulationPerimeterPathV2 = 2
     };
 
     enum TopVisiblePerimeterRecolorAggressiveness : uint8_t {
@@ -114,6 +115,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultSeamHiding = false;
     static constexpr bool  DefaultNonlinearOffsetAdjustment = false;
     static constexpr int   DefaultModulationMode = int(ModulationLineWidth);
+    static constexpr bool  DefaultUseModulatedOverhangGeometryForSupport = false;
     static constexpr bool  DefaultRecolorSmallPerimeterLoops = false;
     static constexpr bool  DefaultRecolorTopVisiblePerimeterSections = false;
     static constexpr int   DefaultTopVisiblePerimeterRecolorAggressiveness = int(TopVisibleRecolorAggressive);
@@ -170,6 +172,7 @@ struct TextureMappingZone
     bool        seam_hiding = DefaultSeamHiding;
     bool        nonlinear_offset_adjustment = DefaultNonlinearOffsetAdjustment;
     int         modulation_mode = DefaultModulationMode;
+    bool        use_modulated_overhang_geometry_for_support = DefaultUseModulatedOverhangGeometryForSupport;
     bool        recolor_small_perimeter_loops = DefaultRecolorSmallPerimeterLoops;
     bool        recolor_top_visible_perimeter_sections = DefaultRecolorTopVisiblePerimeterSections;
     int         top_visible_perimeter_recolor_aggressiveness = DefaultTopVisiblePerimeterRecolorAggressiveness;
@@ -199,7 +202,13 @@ struct TextureMappingZone
 
     bool is_image_texture() const { return surface_pattern == int(ImageTexture); }
     bool is_2d_gradient() const { return surface_pattern == int(Gradient2D); }
-    bool uses_perimeter_path_modulation() const { return modulation_mode == int(ModulationPerimeterPath); }
+    bool uses_perimeter_path_modulation() const
+    {
+        return modulation_mode == int(ModulationPerimeterPath) ||
+               modulation_mode == int(ModulationPerimeterPathV2);
+    }
+    bool uses_legacy_perimeter_path_modulation() const { return modulation_mode == int(ModulationPerimeterPath); }
+    bool uses_perimeter_path_modulation_v2() const { return modulation_mode == int(ModulationPerimeterPathV2); }
 
     void reset_offset_settings()
     {
@@ -224,6 +233,7 @@ struct TextureMappingZone
         seam_hiding = DefaultSeamHiding;
         nonlinear_offset_adjustment = DefaultNonlinearOffsetAdjustment;
         modulation_mode = DefaultModulationMode;
+        use_modulated_overhang_geometry_for_support = DefaultUseModulatedOverhangGeometryForSupport;
         recolor_small_perimeter_loops = DefaultRecolorSmallPerimeterLoops;
         recolor_top_visible_perimeter_sections = DefaultRecolorTopVisiblePerimeterSections;
         top_visible_perimeter_recolor_aggressiveness = DefaultTopVisiblePerimeterRecolorAggressiveness;

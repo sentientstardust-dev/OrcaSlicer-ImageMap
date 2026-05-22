@@ -509,6 +509,11 @@ void PrintObject::make_perimeters()
         m_typed_slices = false;
     }
 
+    for (auto layer_it = m_layers.rbegin(); layer_it != m_layers.rend(); ++layer_it) {
+        m_print->throw_if_canceled();
+        (*layer_it)->apply_perimeter_path_modulation_v2();
+    }
+
     // compare each layer to the one below, and mark those slices needing
     // one additional inner perimeter, like the top of domed objects-
 
@@ -592,6 +597,11 @@ void PrintObject::make_perimeters()
     );
     m_print->throw_if_canceled();
     BOOST_LOG_TRIVIAL(debug) << "Generating perimeters in parallel - end";
+
+    for (Layer *layer : m_layers) {
+        m_print->throw_if_canceled();
+        layer->commit_perimeter_path_modulation_v2_fallbacks();
+    }
 
     this->set_done(posPerimeters);
 }
@@ -832,45 +842,169 @@ void PrintObject::generate_support_material()
     if (this->set_started(posSupportMaterial)) {
         this->clear_support_layers();
 
-        if(!has_support() && !m_print->get_no_check_flag()) {
-            // BBS: pop a warning if objects have significant amount of overhangs but support material is not enabled
-            // Note: we also need to pop warning if support is disabled and only raft is enabled
-            m_print->set_status(50, L("Checking support necessity"));
-            typedef std::chrono::high_resolution_clock clock_;
-            typedef std::chrono::duration<double, std::ratio<1> > second_;
-            std::chrono::time_point<clock_> t0{ clock_::now() };
+        struct LayerSupportGeometryBackup {
+            Layer *layer { nullptr };
+            ExPolygons lslices;
+            std::vector<BoundingBox> lslices_bboxes;
+        };
+        struct LayerRegionSupportGeometryBackup {
+            LayerRegion *layerm { nullptr };
+            SurfaceCollection slices;
+            ExPolygons raw_slices;
+            SurfaceCollection fill_surfaces;
+            ExPolygons fill_expolygons;
+            ExPolygons fill_no_overlap_expolygons;
+            bool perimeter_path_modulation_v2_applied { false };
+        };
 
-            SupportNecessaryType sntype = this->is_support_necessary();
+        std::vector<LayerSupportGeometryBackup> layer_backups;
+        std::vector<LayerRegionSupportGeometryBackup> region_backups;
+        const bool typed_slices_backup = m_typed_slices;
+        bool support_geometry_swapped = false;
 
-            double duration{ std::chrono::duration_cast<second_>(clock_::now() - t0).count() };
-            BOOST_LOG_TRIVIAL(info) << std::fixed << std::setprecision(0) << "is_support_necessary takes " << duration << " secs.";
+        auto rebuild_layer_geometry = [](Layer *layer) {
+            layer->make_slices();
+            layer->lslices_bboxes.clear();
+            layer->lslices_bboxes.reserve(layer->lslices.size());
+            for (const ExPolygon &expoly : layer->lslices)
+                layer->lslices_bboxes.emplace_back(get_extents(expoly));
+        };
 
-            if (sntype != NoNeedSupp) {
-                std::map<SupportNecessaryType, std::string> reasons = {
-                    {SharpTail,L("floating regions")},
-                    {Cantilever,L("floating cantilever")},
-                    {LargeOverhang,L("large overhangs")} };
-                std::string warning_message = Slic3r::format(L("It seems object %s has %s. Please re-orient the object or enable support generation."),
-                    this->model_object()->name, reasons[sntype]);
-                this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, warning_message, PrintStateBase::SlicingNeedSupportOn);
+        auto region_uses_unmodulated_support_geometry = [this](const LayerRegion *layerm) {
+            if (layerm == nullptr)
+                return false;
+            const int filament_id = layerm->region().config().wall_filament.value;
+            if (filament_id <= 0)
+                return false;
+            const TextureMappingZone *zone = this->print()->texture_mapping_manager().zone_from_id(unsigned(filament_id));
+            return zone != nullptr &&
+                   zone->enabled &&
+                   !zone->deleted &&
+                   zone->uses_perimeter_path_modulation_v2() &&
+                   !zone->use_modulated_overhang_geometry_for_support &&
+                   (zone->is_2d_gradient() || zone->is_image_texture());
+        };
+
+        auto restore_support_geometry = [&]() {
+            if (!support_geometry_swapped)
+                return;
+            for (LayerRegionSupportGeometryBackup &backup : region_backups) {
+                backup.layerm->slices = std::move(backup.slices);
+                backup.layerm->raw_slices = std::move(backup.raw_slices);
+                backup.layerm->fill_surfaces = std::move(backup.fill_surfaces);
+                backup.layerm->fill_expolygons = std::move(backup.fill_expolygons);
+                backup.layerm->fill_no_overlap_expolygons = std::move(backup.fill_no_overlap_expolygons);
+                backup.layerm->perimeter_path_modulation_v2_applied = backup.perimeter_path_modulation_v2_applied;
             }
+            for (LayerSupportGeometryBackup &backup : layer_backups) {
+                backup.layer->lslices = std::move(backup.lslices);
+                backup.layer->lslices_bboxes = std::move(backup.lslices_bboxes);
+            }
+            m_typed_slices = typed_slices_backup;
+            support_geometry_swapped = false;
+        };
+
+        auto use_unmodulated_support_geometry = [&]() {
+            bool needed = false;
+            for (Layer *layer : m_layers) {
+                for (LayerRegion *layerm : layer->m_regions) {
+                    if (region_uses_unmodulated_support_geometry(layerm)) {
+                        needed = true;
+                        break;
+                    }
+                }
+                if (needed)
+                    break;
+            }
+            if (!needed)
+                return;
+
+            layer_backups.reserve(m_layers.size());
+            for (Layer *layer : m_layers) {
+                layer_backups.push_back({ layer, layer->lslices, layer->lslices_bboxes });
+                for (LayerRegion *layerm : layer->m_regions) {
+                    region_backups.push_back({
+                        layerm,
+                        layerm->slices,
+                        layerm->raw_slices,
+                        layerm->fill_surfaces,
+                        layerm->fill_expolygons,
+                        layerm->fill_no_overlap_expolygons,
+                        layerm->perimeter_path_modulation_v2_applied
+                    });
+                }
+            }
+            support_geometry_swapped = true;
+
+            for (Layer *layer : m_layers) {
+                bool layer_changed = false;
+                for (LayerRegion *layerm : layer->m_regions) {
+                    if (!region_uses_unmodulated_support_geometry(layerm))
+                        continue;
+                    ExPolygons support_slices =
+                        !layerm->unmodulated_raw_slices.empty() ?
+                            layerm->unmodulated_raw_slices :
+                            (!layerm->raw_slices.empty() ?
+                                layerm->raw_slices :
+                                to_expolygons(layerm->slices.surfaces));
+                    layerm->slices.set(support_slices, stInternal);
+                    layerm->raw_slices = std::move(support_slices);
+                    layerm->perimeter_path_modulation_v2_applied = false;
+                    layer_changed = true;
+                }
+                if (layer_changed)
+                    rebuild_layer_geometry(layer);
+            }
+            this->detect_surfaces_type();
+        };
+
+        try {
+            use_unmodulated_support_geometry();
+
+            if(!has_support() && !m_print->get_no_check_flag()) {
+                // BBS: pop a warning if objects have significant amount of overhangs but support material is not enabled
+                // Note: we also need to pop warning if support is disabled and only raft is enabled
+                m_print->set_status(50, L("Checking support necessity"));
+                typedef std::chrono::high_resolution_clock clock_;
+                typedef std::chrono::duration<double, std::ratio<1> > second_;
+                std::chrono::time_point<clock_> t0{ clock_::now() };
+
+                SupportNecessaryType sntype = this->is_support_necessary();
+
+                double duration{ std::chrono::duration_cast<second_>(clock_::now() - t0).count() };
+                BOOST_LOG_TRIVIAL(info) << std::fixed << std::setprecision(0) << "is_support_necessary takes " << duration << " secs.";
+
+                if (sntype != NoNeedSupp) {
+                    std::map<SupportNecessaryType, std::string> reasons = {
+                        {SharpTail,L("floating regions")},
+                        {Cantilever,L("floating cantilever")},
+                        {LargeOverhang,L("large overhangs")} };
+                    std::string warning_message = Slic3r::format(L("It seems object %s has %s. Please re-orient the object or enable support generation."),
+                        this->model_object()->name, reasons[sntype]);
+                    this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, warning_message, PrintStateBase::SlicingNeedSupportOn);
+                }
 
 #if 0
-            // Printing without supports. Empty layer means some objects or object parts are levitating,
-            // therefore they cannot be printed without supports.
-            for (const Layer *layer : m_layers)
-                if (layer->empty())
-                    throw Slic3r::SlicingError("Levitating objects cannot be printed without supports.");
+                // Printing without supports. Empty layer means some objects or object parts are levitating,
+                // therefore they cannot be printed without supports.
+                for (const Layer *layer : m_layers)
+                    if (layer->empty())
+                        throw Slic3r::SlicingError("Levitating objects cannot be printed without supports.");
 #endif
-        }
+            }
 
-        if ((this->has_support() && m_layers.size() > 1) || (this->has_raft() && !m_layers.empty())) {
-            m_print->set_status(50, L("Generating support"));
+            if ((this->has_support() && m_layers.size() > 1) || (this->has_raft() && !m_layers.empty())) {
+                m_print->set_status(50, L("Generating support"));
 
-            this->_generate_support_material();
-            m_print->throw_if_canceled();
+                this->_generate_support_material();
+                m_print->throw_if_canceled();
+            }
+            restore_support_geometry();
+            this->set_done(posSupportMaterial);
+        } catch (...) {
+            restore_support_geometry();
+            throw;
         }
-        this->set_done(posSupportMaterial);
     }
 }
 

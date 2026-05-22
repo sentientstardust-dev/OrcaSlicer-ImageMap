@@ -514,6 +514,7 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
             || opt_key == "texture_mapping_definitions"
             || opt_key == "texture_mapping_global_settings") {
             osteps.emplace_back(posPerimeters);
+            osteps.emplace_back(posSupportMaterial);
             steps.emplace_back(psWipeTower);
             steps.emplace_back(psSkirtBrim);
         } else if (
@@ -4116,6 +4117,8 @@ const std::string PrintStatistics::TotalFilamentUsedWipeTowerValueMask = "; tota
 #define JSON_LAYER_REGION_CONFIG_HASH             "config_hash"
 #define JSON_LAYER_REGION_SLICES                  "slices"
 #define JSON_LAYER_REGION_RAW_SLICES              "raw_slices"
+#define JSON_LAYER_REGION_UNMODULATED_RAW_SLICES  "unmodulated_raw_slices"
+#define JSON_LAYER_REGION_PERIMETER_PATH_MODULATION_V2_APPLIED "perimeter_path_modulation_v2_applied"
 //#define JSON_LAYER_REGION_ENTITIES                "entities"
 #define JSON_LAYER_REGION_THIN_FILLS                  "thin_fills"
 #define JSON_LAYER_REGION_FILL_EXPOLYGONS             "fill_expolygons"
@@ -4326,7 +4329,7 @@ static bool convert_extrusion_to_json(json& entity_json, json& entity_paths_json
 }
 
 static void to_json(json& j, const LayerRegion& layer_region) {
-    json unsupported_bridge_edges_json = json::array(), slices_surfaces_json = json::array(), raw_slices_json = json::array(), thin_fills_json, thin_fill_entities_json = json::array();
+    json unsupported_bridge_edges_json = json::array(), slices_surfaces_json = json::array(), raw_slices_json = json::array(), unmodulated_raw_slices_json = json::array(), thin_fills_json, thin_fill_entities_json = json::array();
     json fill_expolygons_json = json::array(), fill_no_overlap_expolygons_json = json::array(), fill_surfaces_json = json::array(), perimeters_json, perimeter_entities_json = json::array(), fills_json, fill_entities_json = json::array();
 
     j[JSON_LAYER_REGION_CONFIG_HASH] = layer_region.region().config_hash();
@@ -4344,6 +4347,13 @@ static void to_json(json& j, const LayerRegion& layer_region) {
         raw_slices_json.push_back(std::move(raw_polygon_json));
     }
     j.push_back({JSON_LAYER_REGION_RAW_SLICES, std::move(raw_slices_json)});
+    for (const ExPolygon& raw_slice_explogyon : layer_region.unmodulated_raw_slices) {
+        json raw_polygon_json = raw_slice_explogyon;
+
+        unmodulated_raw_slices_json.push_back(std::move(raw_polygon_json));
+    }
+    j.push_back({JSON_LAYER_REGION_UNMODULATED_RAW_SLICES, std::move(unmodulated_raw_slices_json)});
+    j.push_back({JSON_LAYER_REGION_PERIMETER_PATH_MODULATION_V2_APPLIED, layer_region.perimeter_path_modulation_v2_applied});
 
     //thin fills
     thin_fills_json[JSON_EXTRUSION_NO_SORT] = layer_region.thin_fills.no_sort;
@@ -4631,6 +4641,20 @@ static void convert_layer_region_from_json(const json& j, LayerRegion& layer_reg
         polygon = j[JSON_LAYER_REGION_RAW_SLICES][raw_slices_index];
         layer_region.raw_slices.push_back(std::move(polygon));
     }
+    if (j.contains(JSON_LAYER_REGION_UNMODULATED_RAW_SLICES)) {
+        int unmodulated_raw_slices_count = j[JSON_LAYER_REGION_UNMODULATED_RAW_SLICES].size();
+        for (int raw_slices_index = 0; raw_slices_index < unmodulated_raw_slices_count; raw_slices_index++)
+        {
+            ExPolygon polygon;
+
+            polygon = j[JSON_LAYER_REGION_UNMODULATED_RAW_SLICES][raw_slices_index];
+            layer_region.unmodulated_raw_slices.push_back(std::move(polygon));
+        }
+    } else {
+        layer_region.unmodulated_raw_slices = layer_region.raw_slices;
+    }
+    layer_region.perimeter_path_modulation_v2_applied =
+        j.value(JSON_LAYER_REGION_PERIMETER_PATH_MODULATION_V2_APPLIED, false);
 
     //thin fills
     layer_region.thin_fills.no_sort = j[JSON_LAYER_REGION_THIN_FILLS][JSON_EXTRUSION_NO_SORT];
