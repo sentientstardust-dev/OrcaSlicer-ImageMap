@@ -24,6 +24,8 @@
 #include "AABBTreeLines.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <float.h>
 #include <oneapi/tbb/blocked_range.h>
 #include <oneapi/tbb/concurrent_vector.h>
@@ -500,6 +502,49 @@ void PrintObject::make_perimeters()
     m_print->set_status(15, L("Generating walls"));
     BOOST_LOG_TRIVIAL(info) << "Generating walls..." << log_memory_info();
 
+    const size_t total_wall_layers = m_layers.size();
+    const size_t wall_progress_step = std::max<size_t>(1, total_wall_layers / 100);
+    tbb::spin_mutex wall_status_mutex;
+    auto wall_progress_percent = [](int min_percent, int max_percent, size_t current, size_t total) {
+        if (total == 0)
+            return min_percent;
+        const double progress = std::min(1.0, double(current) / double(total));
+        return min_percent + int(std::floor(double(max_percent - min_percent) * progress));
+    };
+    auto set_wall_status = [&](int percent, const std::string &message) {
+        tbb::spin_mutex::scoped_lock lock(wall_status_mutex);
+        m_print->set_status(percent, message);
+    };
+    auto should_report_wall_layer = [wall_progress_step, total_wall_layers](size_t current) {
+        return current == 1 || current == total_wall_layers || current % wall_progress_step == 0;
+    };
+    auto layer_region_needs_v2_wall_geometry_update = [this](const LayerRegion *layerm) {
+        if (layerm == nullptr)
+            return false;
+        if (layerm->perimeter_path_modulation_v2_applied)
+            return true;
+        const int filament_id = layerm->region().config().wall_filament.value;
+        if (filament_id <= 0)
+            return false;
+        const TextureMappingZone *zone = this->print()->texture_mapping_manager().zone_from_id(unsigned(filament_id));
+        return zone != nullptr &&
+               zone->enabled &&
+               !zone->deleted &&
+               zone->uses_perimeter_path_modulation_v2() &&
+               (zone->is_2d_gradient() || zone->is_image_texture());
+    };
+    bool report_v2_wall_geometry_progress = false;
+    for (const Layer *layer : m_layers) {
+        for (const LayerRegion *layerm : layer->regions()) {
+            if (layer_region_needs_v2_wall_geometry_update(layerm)) {
+                report_v2_wall_geometry_progress = true;
+                break;
+            }
+        }
+        if (report_v2_wall_geometry_progress)
+            break;
+    }
+
     // Revert the typed slices into untyped slices.
     if (m_typed_slices) {
         for (Layer *layer : m_layers) {
@@ -509,9 +554,21 @@ void PrintObject::make_perimeters()
         m_typed_slices = false;
     }
 
+    size_t prepared_wall_layers = 0;
     for (auto layer_it = m_layers.rbegin(); layer_it != m_layers.rend(); ++layer_it) {
         m_print->throw_if_canceled();
+        if (report_v2_wall_geometry_progress && should_report_wall_layer(prepared_wall_layers + 1))
+            set_wall_status(wall_progress_percent(15, 18, prepared_wall_layers, total_wall_layers),
+                            Slic3r::format(L("Generating walls: preparing layer %1%/%2%"),
+                                           prepared_wall_layers + 1,
+                                           total_wall_layers));
         (*layer_it)->apply_perimeter_path_modulation_v2();
+        ++prepared_wall_layers;
+        if (report_v2_wall_geometry_progress && prepared_wall_layers == total_wall_layers)
+            set_wall_status(18,
+                            Slic3r::format(L("Generating walls: preparing layer %1%/%2%"),
+                                           prepared_wall_layers,
+                                           total_wall_layers));
     }
 
     // compare each layer to the one below, and mark those slices needing
@@ -586,12 +643,36 @@ void PrintObject::make_perimeters()
     }
 
     BOOST_LOG_TRIVIAL(debug) << "Generating perimeters in parallel - start";
+    if (total_wall_layers > 0)
+        set_wall_status(19, Slic3r::format(L("Generating walls: layer %1%/%2%"), 0, total_wall_layers));
+    std::atomic<size_t> completed_wall_layers { 0 };
+    std::atomic<size_t> next_wall_progress_report { wall_progress_step };
     tbb::parallel_for(
         tbb::blocked_range<size_t>(0, m_layers.size()),
-        [this](const tbb::blocked_range<size_t>& range) {
+        [this,
+         total_wall_layers,
+         wall_progress_step,
+         &completed_wall_layers,
+         &next_wall_progress_report,
+         &wall_progress_percent,
+         &set_wall_status](const tbb::blocked_range<size_t>& range) {
             for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
                 m_print->throw_if_canceled();
                 m_layers[layer_idx]->make_perimeters();
+                const size_t completed = ++completed_wall_layers;
+                if (completed == total_wall_layers) {
+                    set_wall_status(24, Slic3r::format(L("Generating walls: layer %1%/%2%"), completed, total_wall_layers));
+                } else {
+                    size_t next_report = next_wall_progress_report.load();
+                    while (completed >= next_report) {
+                        const size_t next_target = std::min(total_wall_layers, completed + wall_progress_step);
+                        if (next_wall_progress_report.compare_exchange_weak(next_report, next_target)) {
+                            set_wall_status(wall_progress_percent(19, 24, completed, total_wall_layers),
+                                            Slic3r::format(L("Generating walls: layer %1%/%2%"), completed, total_wall_layers));
+                            break;
+                        }
+                    }
+                }
             }
         }
     );
