@@ -76,6 +76,7 @@ constexpr float SlopeAutoPaintMaxAngleDeg = 180.f;
 constexpr float ProjectionTextRasterBaseFontSize = 200.f;
 constexpr int ProjectionTextRasterMaxDimension = 2048;
 constexpr int ProjectionTextRasterMinFontSize = 18;
+constexpr double ProjectionSliderDoubleClickMaxSeconds = 0.24;
 
 static bool queue_color_data_crash_backup(ModelObject *object)
 {
@@ -2954,9 +2955,136 @@ struct ProjectionContext
     uint32_t                     image_width = 0;
     uint32_t                     image_height = 0;
     float                        image_opacity = 1.f;
+    float                        overlay_rotation_deg = 0.f;
     bool                         apply_transparency_as_background = false;
     ClippingPlane                section_clipping_plane;
 };
+
+struct ProjectionScreenBounds
+{
+    float left = 0.f;
+    float top = 0.f;
+    float right = 0.f;
+    float bottom = 0.f;
+};
+
+static float normalize_projection_rotation_deg(float rotation_deg)
+{
+    if (!std::isfinite(rotation_deg))
+        return 0.f;
+    rotation_deg = std::fmod(rotation_deg, 360.f);
+    if (rotation_deg > 180.f)
+        rotation_deg -= 360.f;
+    if (rotation_deg < -180.f)
+        rotation_deg += 360.f;
+    return rotation_deg;
+}
+
+static Vec2f rotate_projection_screen_offset(const Vec2f &offset, float rotation_deg)
+{
+    const float angle = Geometry::deg2rad(rotation_deg);
+    const float c = std::cos(angle);
+    const float s = std::sin(angle);
+    return Vec2f(offset.x() * c - offset.y() * s,
+                 offset.x() * s + offset.y() * c);
+}
+
+static Vec2f projection_overlay_center(const ProjectionContext &context)
+{
+    return Vec2f(context.overlay_left + context.overlay_width * 0.5f,
+                 context.overlay_top + context.overlay_height * 0.5f);
+}
+
+static std::array<Vec2f, 4> projection_overlay_screen_corners(const ProjectionContext &context)
+{
+    const Vec2f center = projection_overlay_center(context);
+    const float half_w = context.overlay_width * 0.5f;
+    const float half_h = context.overlay_height * 0.5f;
+    const std::array<Vec2f, 4> offsets = {
+        Vec2f(-half_w, -half_h),
+        Vec2f( half_w, -half_h),
+        Vec2f( half_w,  half_h),
+        Vec2f(-half_w,  half_h)
+    };
+
+    std::array<Vec2f, 4> corners;
+    const float rotation_deg = normalize_projection_rotation_deg(context.overlay_rotation_deg);
+    for (size_t idx = 0; idx < offsets.size(); ++idx)
+        corners[idx] = center + rotate_projection_screen_offset(offsets[idx], rotation_deg);
+    return corners;
+}
+
+static ProjectionScreenBounds projection_overlay_screen_bounds(const ProjectionContext &context)
+{
+    ProjectionScreenBounds bounds;
+    const std::array<Vec2f, 4> corners = projection_overlay_screen_corners(context);
+    bounds.left = std::min({ corners[0].x(), corners[1].x(), corners[2].x(), corners[3].x() });
+    bounds.top = std::min({ corners[0].y(), corners[1].y(), corners[2].y(), corners[3].y() });
+    bounds.right = std::max({ corners[0].x(), corners[1].x(), corners[2].x(), corners[3].x() });
+    bounds.bottom = std::max({ corners[0].y(), corners[1].y(), corners[2].y(), corners[3].y() });
+    return bounds;
+}
+
+static bool projection_screen_to_image_uv(const ProjectionContext &context,
+                                          const Vec2f             &screen,
+                                          Vec2f                   &uv,
+                                          bool                     reject_outside)
+{
+    if (context.overlay_width <= EPSILON ||
+        context.overlay_height <= EPSILON ||
+        context.image_width == 0 ||
+        context.image_height == 0)
+        return false;
+
+    const Vec2f center = projection_overlay_center(context);
+    const Vec2f unrotated = rotate_projection_screen_offset(screen - center, -normalize_projection_rotation_deg(context.overlay_rotation_deg));
+    uv.x() = (unrotated.x() + context.overlay_width * 0.5f) / context.overlay_width;
+    uv.y() = (unrotated.y() + context.overlay_height * 0.5f) / context.overlay_height;
+    if (!std::isfinite(uv.x()) || !std::isfinite(uv.y()))
+        return false;
+    if (reject_outside) {
+        constexpr float edge_epsilon = 1e-6f;
+        if (uv.x() < -edge_epsilon ||
+            uv.y() < -edge_epsilon ||
+            uv.x() > 1.f + edge_epsilon ||
+            uv.y() > 1.f + edge_epsilon)
+            return false;
+        uv.x() = std::clamp(uv.x(), 0.f, 1.f);
+        uv.y() = std::clamp(uv.y(), 0.f, 1.f);
+    }
+    return true;
+}
+
+static bool projection_screen_to_image_pixel(const ProjectionContext &context,
+                                             const Vec2f             &screen,
+                                             Vec2f                   &image_pixel,
+                                             bool                     reject_outside)
+{
+    Vec2f uv = Vec2f::Zero();
+    if (!projection_screen_to_image_uv(context, screen, uv, reject_outside))
+        return false;
+    image_pixel.x() = uv.x() * float(context.image_width);
+    image_pixel.y() = uv.y() * float(context.image_height);
+    return std::isfinite(image_pixel.x()) && std::isfinite(image_pixel.y());
+}
+
+static bool projection_slider_short_double_clicked(double &last_click_time, bool click_changed_value)
+{
+    if (!ImGui::IsItemHovered() || !ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+        return false;
+
+    if (click_changed_value) {
+        last_click_time = -1.0;
+        return false;
+    }
+
+    const double now = ImGui::GetTime();
+    const bool double_clicked =
+        last_click_time >= 0.0 &&
+        now - last_click_time <= ProjectionSliderDoubleClickMaxSeconds;
+    last_click_time = double_clicked ? -1.0 : now;
+    return double_clicked;
+}
 
 static bool projection_section_view_active(const ProjectionContext &context)
 {
@@ -3695,15 +3823,11 @@ static std::optional<ColorRGBA> projected_image_color_at_point(const ProjectionC
     Vec2f screen = Vec2f::Zero();
     if (!project_point_to_screen(context, world_point, screen))
         return std::nullopt;
-    if (screen.x() < context.overlay_left ||
-        screen.y() < context.overlay_top ||
-        screen.x() > context.overlay_left + context.overlay_width ||
-        screen.y() > context.overlay_top + context.overlay_height)
-        return std::nullopt;
 
-    const float u = (screen.x() - context.overlay_left) / context.overlay_width;
-    const float v = (screen.y() - context.overlay_top) / context.overlay_height;
-    return sample_rgba_bilinear_clamped(*context.image_rgba, context.image_width, context.image_height, u, v);
+    Vec2f uv = Vec2f::Zero();
+    if (!projection_screen_to_image_uv(context, screen, uv, true))
+        return std::nullopt;
+    return sample_rgba_bilinear_clamped(*context.image_rgba, context.image_width, context.image_height, uv.x(), uv.y());
 }
 
 static std::vector<uint8_t> projected_raw_offsets_at_point(const ProjectionContext &context,
@@ -3721,15 +3845,11 @@ static std::vector<uint8_t> projected_raw_offsets_at_point(const ProjectionConte
     Vec2f screen = Vec2f::Zero();
     if (!project_point_to_screen(context, world_point, screen))
         return {};
-    if (screen.x() < context.overlay_left ||
-        screen.y() < context.overlay_top ||
-        screen.x() > context.overlay_left + context.overlay_width ||
-        screen.y() > context.overlay_top + context.overlay_height)
-        return {};
 
-    const float u = (screen.x() - context.overlay_left) / context.overlay_width;
-    const float v = (screen.y() - context.overlay_top) / context.overlay_height;
-    return sample_raw_offsets_bilinear_clamped(atlas, u, v);
+    Vec2f uv = Vec2f::Zero();
+    if (!projection_screen_to_image_uv(context, screen, uv, true))
+        return {};
+    return sample_raw_offsets_bilinear_clamped(atlas, uv.x(), uv.y());
 }
 
 static bool projection_triangle_intersects_overlay(const ProjectionContext      &context,
@@ -3750,19 +3870,22 @@ static bool projection_triangle_intersects_overlay(const ProjectionContext      
         Vec2f screen = Vec2f::Zero();
         if (!project_point_to_depth_clipped_screen(context, vertex, screen))
             continue;
-        min_x = std::min(min_x, screen.x());
-        min_y = std::min(min_y, screen.y());
-        max_x = std::max(max_x, screen.x());
-        max_y = std::max(max_y, screen.y());
+        Vec2f image_pixel = Vec2f::Zero();
+        if (!projection_screen_to_image_pixel(context, screen, image_pixel, false))
+            continue;
+        min_x = std::min(min_x, image_pixel.x());
+        min_y = std::min(min_y, image_pixel.y());
+        max_x = std::max(max_x, image_pixel.x());
+        max_y = std::max(max_y, image_pixel.y());
         any_projected = true;
     }
 
     if (!any_projected)
         return false;
-    return max_x >= context.overlay_left &&
-           min_x <= context.overlay_left + context.overlay_width &&
-           max_y >= context.overlay_top &&
-           min_y <= context.overlay_top + context.overlay_height;
+    return max_x >= 0.f &&
+           min_x <= float(context.image_width) &&
+           max_y >= 0.f &&
+           min_y <= float(context.image_height);
 }
 
 static bool project_point_to_image_pixel(const ProjectionContext &context,
@@ -3779,9 +3902,7 @@ static bool project_point_to_image_pixel(const ProjectionContext &context,
     if (!project_point_to_screen(context, world_point, screen))
         return false;
 
-    image_pixel.x() = ((screen.x() - context.overlay_left) / context.overlay_width) * float(context.image_width);
-    image_pixel.y() = ((screen.y() - context.overlay_top) / context.overlay_height) * float(context.image_height);
-    return std::isfinite(image_pixel.x()) && std::isfinite(image_pixel.y());
+    return projection_screen_to_image_pixel(context, screen, image_pixel, false);
 }
 
 static bool project_depth_clipped_point_to_image_pixel(const ProjectionContext &context,
@@ -3798,9 +3919,7 @@ static bool project_depth_clipped_point_to_image_pixel(const ProjectionContext &
     if (!project_point_to_depth_clipped_screen(context, world_point, screen))
         return false;
 
-    image_pixel.x() = ((screen.x() - context.overlay_left) / context.overlay_width) * float(context.image_width);
-    image_pixel.y() = ((screen.y() - context.overlay_top) / context.overlay_height) * float(context.image_height);
-    return std::isfinite(image_pixel.x()) && std::isfinite(image_pixel.y());
+    return projection_screen_to_image_pixel(context, screen, image_pixel, false);
 }
 
 static float projection_triangle_image_pixel_span(const ProjectionContext     &context,
@@ -3885,28 +4004,27 @@ static float projection_triangle_overlay_image_pixel_span(const ProjectionContex
     polygon.reserve(world_polygon.size());
     for (const Vec3d &vertex : world_polygon) {
         Vec2f screen = Vec2f::Zero();
-        if (project_point_to_depth_clipped_screen(context, vertex, screen))
-            polygon.emplace_back(screen);
+        if (!project_point_to_depth_clipped_screen(context, vertex, screen))
+            continue;
+        Vec2f image_pixel = Vec2f::Zero();
+        if (projection_screen_to_image_pixel(context, screen, image_pixel, false))
+            polygon.emplace_back(image_pixel);
     }
 
     if (polygon.size() < 2)
         return projection_triangle_image_pixel_span(context, world_matrix, vertices);
 
-    projection_clip_screen_polygon(polygon, 0, context.overlay_left, true);
-    projection_clip_screen_polygon(polygon, 0, context.overlay_left + context.overlay_width, false);
-    projection_clip_screen_polygon(polygon, 1, context.overlay_top, true);
-    projection_clip_screen_polygon(polygon, 1, context.overlay_top + context.overlay_height, false);
+    projection_clip_screen_polygon(polygon, 0, 0.f, true);
+    projection_clip_screen_polygon(polygon, 0, float(context.image_width), false);
+    projection_clip_screen_polygon(polygon, 1, 0.f, true);
+    projection_clip_screen_polygon(polygon, 1, float(context.image_height), false);
     if (polygon.size() < 2)
         return projection_triangle_image_pixel_span(context, world_matrix, vertices);
 
     float span = 0.f;
     for (size_t i = 0; i + 1 < polygon.size(); ++i) {
-        const Vec2f pixel_i(((polygon[i].x() - context.overlay_left) / context.overlay_width) * float(context.image_width),
-                            ((polygon[i].y() - context.overlay_top) / context.overlay_height) * float(context.image_height));
         for (size_t j = i + 1; j < polygon.size(); ++j) {
-            const Vec2f pixel_j(((polygon[j].x() - context.overlay_left) / context.overlay_width) * float(context.image_width),
-                                ((polygon[j].y() - context.overlay_top) / context.overlay_height) * float(context.image_height));
-            span = std::max(span, (pixel_i - pixel_j).norm());
+            span = std::max(span, (polygon[i] - polygon[j]).norm());
         }
     }
     return span;
@@ -5016,12 +5134,18 @@ static ProjectionVisibility build_projection_visibility(const ProjectionContext 
     if (object == nullptr || context.overlay_width <= 0.f || context.overlay_height <= 0.f)
         return visibility;
 
-    const float max_dim = std::max(context.overlay_width, context.overlay_height);
+    const ProjectionScreenBounds bounds = projection_overlay_screen_bounds(context);
+    const float bounds_width = bounds.right - bounds.left;
+    const float bounds_height = bounds.bottom - bounds.top;
+    if (bounds_width <= 0.f || bounds_height <= 0.f)
+        return visibility;
+
+    const float max_dim = std::max(bounds_width, bounds_height);
     visibility.scale = max_dim > 2048.f ? 2048.f / max_dim : 1.f;
-    visibility.width = std::max(1, int(std::ceil(context.overlay_width * visibility.scale)));
-    visibility.height = std::max(1, int(std::ceil(context.overlay_height * visibility.scale)));
-    visibility.left = context.overlay_left;
-    visibility.top = context.overlay_top;
+    visibility.width = std::max(1, int(std::ceil(bounds_width * visibility.scale)));
+    visibility.height = std::max(1, int(std::ceil(bounds_height * visibility.scale)));
+    visibility.left = bounds.left;
+    visibility.top = bounds.top;
     visibility.depth.assign(size_t(visibility.width) * size_t(visibility.height), std::numeric_limits<float>::max());
     visibility.triangle_keys.assign(visibility.depth.size(), PROJECTION_VISIBILITY_INVALID_TRIANGLE_KEY);
 
@@ -14802,8 +14926,17 @@ void GLGizmoImageProjection::on_load(cereal::BinaryInputArchive& ar)
         m_text_capitalize = true;
     }
 
+    try {
+        ar(m_projection_rotation_deg,
+           m_projection_panel_expanded);
+    } catch (...) {
+        m_projection_rotation_deg = 0.f;
+        m_projection_panel_expanded = true;
+    }
+
     m_projection_mode = ProjectionMode(std::clamp(mode, 0, 2));
     m_projection_mode_initialized = false;
+    m_projection_rotation_deg = normalize_projection_rotation_deg(m_projection_rotation_deg);
     m_text_font_size = ProjectionTextRasterBaseFontSize;
     for (float &channel : m_text_color)
         channel = std::clamp(channel, 0.f, 1.f);
@@ -14883,6 +15016,9 @@ void GLGizmoImageProjection::on_save(cereal::BinaryOutputArchive& ar) const
        m_text_background_color[2],
        m_text_background_transparent,
        m_text_capitalize);
+
+    ar(m_projection_rotation_deg,
+       m_projection_panel_expanded);
 }
 
 void GLGizmoImageProjection::on_render()
@@ -15053,6 +15189,7 @@ void GLGizmoImageProjection::mark_text_projection_dirty()
     m_text_raw_atlas = {};
     if (m_text_mode)
         m_overlay_texture_dirty = true;
+    show_projection_overlay();
     m_parent.set_as_dirty();
     m_parent.request_extra_frame();
 }
@@ -15277,6 +15414,46 @@ bool GLGizmoImageProjection::ensure_overlay_texture()
     return true;
 }
 
+void GLGizmoImageProjection::render_projection_overlay()
+{
+    if (!m_show_overlay || !ensure_overlay_texture())
+        return;
+
+    const OverlayRect rect = overlay_rect();
+    if (rect.width <= 0.f || rect.height <= 0.f)
+        return;
+
+    ProjectionContext overlay_context;
+    overlay_context.overlay_left = rect.left;
+    overlay_context.overlay_top = rect.top;
+    overlay_context.overlay_width = rect.width;
+    overlay_context.overlay_height = rect.height;
+    overlay_context.image_width = active_projection_width();
+    overlay_context.image_height = active_projection_height();
+    overlay_context.overlay_rotation_deg = m_projection_rotation_deg;
+    const std::array<Vec2f, 4> corners = projection_overlay_screen_corners(overlay_context);
+    ImGui::GetBackgroundDrawList()->AddImageQuad((void *)(intptr_t)m_overlay_texture.get_id(),
+                                                  ImVec2(corners[0].x(), corners[0].y()),
+                                                  ImVec2(corners[1].x(), corners[1].y()),
+                                                  ImVec2(corners[2].x(), corners[2].y()),
+                                                  ImVec2(corners[3].x(), corners[3].y()),
+                                                  ImVec2(0.f, 0.f),
+                                                  ImVec2(1.f, 0.f),
+                                                  ImVec2(1.f, 1.f),
+                                                  ImVec2(0.f, 1.f),
+                                                  ImGui::GetColorU32(
+                                                      ImVec4(1.f, 1.f, 1.f, 0.72f * std::clamp(m_projection_opacity, 0.f, 1.f))));
+}
+
+void GLGizmoImageProjection::show_projection_overlay()
+{
+    if (m_show_overlay)
+        return;
+    m_show_overlay = true;
+    m_parent.set_as_dirty();
+    m_parent.request_extra_frame();
+}
+
 GLGizmoImageProjection::OverlayRect GLGizmoImageProjection::overlay_rect() const
 {
     OverlayRect rect;
@@ -15454,6 +15631,30 @@ bool GLGizmoImageProjection::selected_object_has_raw_atlas_texture_data() const
     return false;
 }
 
+bool GLGizmoImageProjection::render_projection_action_controls()
+{
+    if (active_projection_empty()) {
+        bool overlay = false;
+        m_imgui->disabled_begin(true);
+        ImGui::Checkbox(m_text_mode ? "Show text overlay" : "Show image overlay", &overlay);
+        m_imgui->disabled_end();
+    } else if (ImGui::Checkbox(m_text_mode ? "Show text overlay" : "Show image overlay", &m_show_overlay)) {
+        m_parent.set_as_dirty();
+        m_parent.request_extra_frame();
+    }
+
+    m_imgui->disabled_begin(active_projection_empty() || !projection_mode_allowed(m_projection_mode));
+    const wxString project_label = m_text_mode ? _L("Project text onto model") : _L("Project image onto model");
+    const bool projected = m_imgui->button(project_label) && project_image_to_selected_object();
+    if (projected) {
+        m_show_overlay = false;
+        m_parent.set_as_dirty();
+        m_parent.request_extra_frame();
+    }
+    m_imgui->disabled_end();
+    return projected;
+}
+
 void GLGizmoImageProjection::on_render_input_window(float x, float y, float bottom_limit)
 {
     if (m_text_mode)
@@ -15468,6 +15669,20 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
     GizmoImguiBegin(get_name(), ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize |
                                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar);
     const float max_tooltip_width = ImGui::GetFontSize() * 20.f;
+
+    if (m_imgui->button(m_projection_panel_expanded ? _L("Collapse") : _L("Expand"))) {
+        m_projection_panel_expanded = !m_projection_panel_expanded;
+        m_parent.set_as_dirty();
+        m_parent.request_extra_frame();
+    }
+
+    if (!m_projection_panel_expanded) {
+        render_projection_action_controls();
+        GizmoImguiEnd();
+        ImGuiWrapper::pop_toolbar_style();
+        render_projection_overlay();
+        return;
+    }
 
     if (m_imgui->button(_L("Manage Color Data for this object")))
         open_color_data_management_dialog();
@@ -15498,6 +15713,7 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
         if (m_text_mode)
             ensure_text_projection_image();
         update_default_projection_mode();
+        show_projection_overlay();
         m_parent.set_as_dirty();
         m_parent.request_extra_frame();
     }
@@ -15518,11 +15734,6 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
             m_imgui->warning_text(raw_offset_data_rgba_conversion_warning_text(), m_imgui->scaled(RawOffsetDataWarningWrapEm));
     }
 
-    if (!active_projection_empty() && ImGui::Checkbox(m_text_mode ? "Show text overlay" : "Show image overlay", &m_show_overlay)) {
-        m_parent.set_as_dirty();
-        m_parent.request_extra_frame();
-    }
-
     // if (has_rgba_data)
     //     m_imgui->warning_text(_L("Note: Image Texture mode is disabled as this object has RGBA data (must use RGBA data mode)"));
 
@@ -15539,6 +15750,7 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
             if (ImGui::Selectable(mode_labels[idx], selected, flags) && allowed) {
                 mode = idx;
                 m_projection_mode = candidate;
+                show_projection_overlay();
             }
             if (selected)
                 ImGui::SetItemDefaultFocus();
@@ -15549,10 +15761,39 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
     float opacity_pct = m_projection_opacity * 100.f;
     m_imgui->text(_L("Opacity"));
     ImGui::PushItemWidth(m_imgui->scaled(8.f));
-    if (m_imgui->bbl_slider_float_style("##image_projection_opacity", &opacity_pct, 0.f, 100.f, "%.0f%%", 1.f, true)) {
-        m_projection_opacity = std::clamp(opacity_pct / 100.f, 0.f, 1.f);
+    const bool opacity_changed =
+        m_imgui->bbl_slider_float_style("##image_projection_opacity", &opacity_pct, 0.f, 100.f, "%.0f%%", 1.f, true);
+    const bool opacity_reset = projection_slider_short_double_clicked(m_projection_opacity_last_click_time, opacity_changed);
+    if (opacity_reset)
+        m_projection_opacity_reset_active = true;
+    const bool suppress_opacity_slider = opacity_reset || m_projection_opacity_reset_active;
+    if (suppress_opacity_slider || opacity_changed) {
+        m_projection_opacity = suppress_opacity_slider ? 1.f : std::clamp(opacity_pct / 100.f, 0.f, 1.f);
+        show_projection_overlay();
         m_parent.set_as_dirty();
+        m_parent.request_extra_frame();
     }
+    if (m_projection_opacity_reset_active && !ImGui::IsMouseDown(ImGuiMouseButton_Left))
+        m_projection_opacity_reset_active = false;
+    ImGui::PopItemWidth();
+
+    float rotation_deg = m_projection_rotation_deg;
+    m_imgui->text(_L("Rotation"));
+    ImGui::PushItemWidth(m_imgui->scaled(8.f));
+    const bool rotation_changed =
+        m_imgui->bbl_slider_float_style("##image_projection_rotation", &rotation_deg, -180.f, 180.f, "%.0f deg", 1.f, true);
+    const bool rotation_reset = projection_slider_short_double_clicked(m_projection_rotation_last_click_time, rotation_changed);
+    if (rotation_reset)
+        m_projection_rotation_reset_active = true;
+    const bool suppress_rotation_slider = rotation_reset || m_projection_rotation_reset_active;
+    if (suppress_rotation_slider || rotation_changed) {
+        m_projection_rotation_deg = suppress_rotation_slider ? 0.f : normalize_projection_rotation_deg(rotation_deg);
+        show_projection_overlay();
+        m_parent.set_as_dirty();
+        m_parent.request_extra_frame();
+    }
+    if (m_projection_rotation_reset_active && !ImGui::IsMouseDown(ImGuiMouseButton_Left))
+        m_projection_rotation_reset_active = false;
     ImGui::PopItemWidth();
 
     if (m_c != nullptr && m_c->object_clipper() != nullptr) {
@@ -15564,21 +15805,36 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
                 if (m_c != nullptr && m_c->object_clipper() != nullptr)
                     m_c->object_clipper()->set_position_by_ratio(-1., false);
             });
+            show_projection_overlay();
         }
 
         float clp_dist = float(m_c->object_clipper()->get_position());
         ImGui::PushItemWidth(m_imgui->scaled(8.f));
-        if (m_imgui->bbl_slider_float_style("##image_projection_clp_dist", &clp_dist, 0.f, 1.f, "%.2f", 1.f, true))
+        const bool section_changed =
+            m_imgui->bbl_slider_float_style("##image_projection_clp_dist", &clp_dist, 0.f, 1.f, "%.2f", 1.f, true);
+        const bool section_reset = projection_slider_short_double_clicked(m_projection_section_last_click_time, section_changed);
+        if (section_reset)
+            m_projection_section_reset_active = true;
+        const bool suppress_section_slider = section_reset || m_projection_section_reset_active;
+        if (suppress_section_slider) {
+            m_c->object_clipper()->set_position_by_ratio(0., true);
+            show_projection_overlay();
+        } else if (section_changed) {
             m_c->object_clipper()->set_position_by_ratio(clp_dist, true);
+            show_projection_overlay();
+        }
+        if (m_projection_section_reset_active && !ImGui::IsMouseDown(ImGuiMouseButton_Left))
+            m_projection_section_reset_active = false;
         ImGui::PopItemWidth();
 
         if (ImGui::IsItemHovered())
             m_imgui->tooltip(_L("Section view"), max_tooltip_width);
     }
 
-    if (!m_text_mode)
-        ImGui::Checkbox("Apply transparent regions as background color", &m_apply_transparency_as_background);
-    ImGui::Checkbox("Pass through model", &m_pass_through_model);
+    if (!m_text_mode && ImGui::Checkbox("Apply transparent regions as background color", &m_apply_transparency_as_background))
+        show_projection_overlay();
+    if (ImGui::Checkbox("Pass through model", &m_pass_through_model))
+        show_projection_overlay();
 
     const bool show_raw_conversion_option =
         active_raw_atlas_valid() &&
@@ -15587,30 +15843,12 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
     if (show_raw_conversion_option)
         ImGui::Checkbox("Convert existing colors to raw offset data (slow)", &m_convert_existing_colors_to_raw_offsets);
 
-    m_imgui->disabled_begin(active_projection_empty() || !projection_mode_allowed(m_projection_mode));
-    const wxString project_label = m_text_mode ? _L("Project text onto model") : _L("Project image onto model");
-    if (m_imgui->button(project_label) && project_image_to_selected_object()) {
-        m_show_overlay = false;
-        m_parent.set_as_dirty();
-        m_parent.request_extra_frame();
-    }
-    m_imgui->disabled_end();
+    render_projection_action_controls();
 
     GizmoImguiEnd();
     ImGuiWrapper::pop_toolbar_style();
 
-    if (m_show_overlay && ensure_overlay_texture()) {
-        const OverlayRect rect = overlay_rect();
-        if (rect.width > 0.f && rect.height > 0.f) {
-            ImGui::GetBackgroundDrawList()->AddImage((void *)(intptr_t)m_overlay_texture.get_id(),
-                                                     ImVec2(rect.left, rect.top),
-                                                     ImVec2(rect.left + rect.width, rect.top + rect.height),
-                                                     ImVec2(0.f, 0.f),
-                                                     ImVec2(1.f, 1.f),
-                                                     ImGui::GetColorU32(
-                                                         ImVec4(1.f, 1.f, 1.f, 0.72f * std::clamp(m_projection_opacity, 0.f, 1.f))));
-        }
-    }
+    render_projection_overlay();
 }
 
 bool GLGizmoImageProjection::project_image_to_selected_object()
@@ -15708,6 +15946,7 @@ bool GLGizmoImageProjection::project_image_to_selected_object()
             context.image_width = active_projection_width();
             context.image_height = active_projection_height();
             context.image_opacity = m_projection_opacity;
+            context.overlay_rotation_deg = m_projection_rotation_deg;
             context.apply_transparency_as_background = effective_apply_transparency_as_background();
             apply_projection_section_view(context, m_c != nullptr ? m_c->object_clipper() : nullptr);
 
@@ -15753,6 +15992,7 @@ bool GLGizmoImageProjection::project_to_vertex_colors(ModelObject *object)
     context.image_width = active_projection_width();
     context.image_height = active_projection_height();
     context.image_opacity = m_projection_opacity;
+    context.overlay_rotation_deg = m_projection_rotation_deg;
     context.apply_transparency_as_background = effective_apply_transparency_as_background();
     apply_projection_section_view(context, m_c != nullptr ? m_c->object_clipper() : nullptr);
 
@@ -15904,6 +16144,7 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
     context.image_width = active_projection_width();
     context.image_height = active_projection_height();
     context.image_opacity = m_projection_opacity;
+    context.overlay_rotation_deg = m_projection_rotation_deg;
     context.apply_transparency_as_background = effective_apply_transparency_as_background();
     apply_projection_section_view(context, m_c != nullptr ? m_c->object_clipper() : nullptr);
 
@@ -16223,6 +16464,7 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
     context.image_width = active_projection_width();
     context.image_height = active_projection_height();
     context.image_opacity = m_projection_opacity;
+    context.overlay_rotation_deg = m_projection_rotation_deg;
     context.apply_transparency_as_background = effective_apply_transparency_as_background();
     apply_projection_section_view(context, m_c != nullptr ? m_c->object_clipper() : nullptr);
 

@@ -522,6 +522,9 @@ private:
     bool ensure_text_projection_image();
     bool update_text_raw_atlas(const std::vector<uint8_t> &glyph_mask);
     void render_text_projection_controls(float max_tooltip_width);
+    bool render_projection_action_controls();
+    void render_projection_overlay();
+    void show_projection_overlay();
     bool ensure_overlay_texture();
     OverlayRect overlay_rect() const;
     const std::vector<uint8_t> &active_projection_rgba() const;
@@ -579,6 +582,14 @@ private:
     bool                 m_overlay_texture_dirty = false;
     bool                 m_show_overlay = true;
     float                m_projection_opacity = 1.f;
+    bool                 m_projection_opacity_reset_active = false;
+    double               m_projection_opacity_last_click_time = -1.0;
+    float                m_projection_rotation_deg = 0.f;
+    bool                 m_projection_rotation_reset_active = false;
+    double               m_projection_rotation_last_click_time = -1.0;
+    bool                 m_projection_section_reset_active = false;
+    double               m_projection_section_last_click_time = -1.0;
+    bool                 m_projection_panel_expanded = true;
     bool                 m_apply_transparency_as_background = false;
     bool                 m_pass_through_model = false;
     bool                 m_convert_existing_colors_to_raw_offsets = true;
