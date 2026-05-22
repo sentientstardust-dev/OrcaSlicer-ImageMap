@@ -68,6 +68,7 @@ struct TextureMappingOffsetContext {
     std::vector<float>              rotated_angles;
     TextureMappingOffsetWeightField weight_field;
     float                           inset_strength_reference_mm { 0.f };
+    float                           signed_fade_factor { 1.f };
     float                           fade_factor { 1.f };
     float                           max_width_delta_mm { 0.f };
     float                           dither_pitch_mm { TextureMappingZone::DefaultDitheringResolutionMm };

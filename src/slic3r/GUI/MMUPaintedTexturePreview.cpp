@@ -99,6 +99,7 @@ struct SurfaceGradientPreviewSettings
 {
     std::vector<unsigned int> component_ids;
     std::vector<std::array<float, 3>> component_colors;
+    std::array<float, 3> base_color { 0.f, 0.f, 0.f };
     std::vector<float> distances_mm;
     std::vector<float> angles_deg;
     std::vector<float> strength_factors;
@@ -4145,17 +4146,16 @@ std::optional<SurfaceGradientPreviewSettings> surface_gradient_preview_settings_
         settings.strength_factors.emplace_back(std::clamp((std::isfinite(strength_pct) ? strength_pct : 100.f) / 100.f, 0.f, 1.f));
         settings.minimum_offset_factors.emplace_back(std::clamp((std::isfinite(minimum_offset_pct) ? minimum_offset_pct : 0.f) / 100.f, 0.f, 1.f));
     }
+    const std::vector<float> base_weights(settings.component_colors.size(), 1.f);
+    const ColorRGBA base_color = blend_component_colors(settings.component_colors, base_weights);
+    settings.base_color = { base_color.r(), base_color.g(), base_color.b() };
 
     const float max_distance_mm = TextureMappingManager::max_component_surface_offset_mm();
     settings.max_component_distance_mm = max_distance_mm;
     settings.distances_mm = TextureMappingManager::effective_offset_distances(zone, settings.component_ids.size());
-    bool has_nonzero_distance = false;
     for (float &distance_mm : settings.distances_mm) {
         distance_mm = std::clamp(distance_mm, 0.f, max_distance_mm);
-        has_nonzero_distance = has_nonzero_distance || distance_mm > k_epsilon;
     }
-    if (!has_nonzero_distance)
-        return std::nullopt;
 
     settings.angles_deg = TextureMappingManager::effective_offset_angles(zone, settings.component_ids.size());
     settings.angle_mode = std::clamp(zone.offset_angle_mode,
@@ -4177,8 +4177,9 @@ std::optional<SurfaceGradientPreviewSettings> surface_gradient_preview_settings_
     const float global_strength_factor =
         std::clamp(surface_gradient_preview_config_float("texture_mapping_outer_wall_gradient_global_strength", 100.f) / 100.f, 0.f, 1.f);
     settings.max_width_delta_limit_mm = std::min((base_outer_width_mm - min_outer_width_mm) * global_strength_factor, 2.f * max_distance_mm);
-    if (!std::isfinite(settings.max_width_delta_limit_mm) || settings.max_width_delta_limit_mm <= k_epsilon)
+    if (!std::isfinite(settings.max_width_delta_limit_mm))
         return std::nullopt;
+    settings.max_width_delta_limit_mm = std::max(0.f, settings.max_width_delta_limit_mm);
 
     const indexed_triangle_set &its = model_volume.mesh().its;
     if (its.vertices.empty())
@@ -4325,6 +4326,7 @@ void set_surface_gradient_preview_uniforms(GLShaderProgram &shader, const Surfac
     const size_t count = settings == nullptr ? size_t(0) :
         std::min(settings->component_colors.size(), k_surface_gradient_preview_max_components);
     shader.set_uniform("gradient_component_count", int(count));
+    shader.set_uniform("gradient_base_color", settings != nullptr ? settings->base_color : std::array<float, 3>{ 0.f, 0.f, 0.f });
     shader.set_uniform("gradient_max_component_distance_mm", settings != nullptr ? settings->max_component_distance_mm : 0.f);
     shader.set_uniform("gradient_max_width_delta_limit_mm", settings != nullptr ? settings->max_width_delta_limit_mm : 0.f);
     shader.set_uniform("gradient_angle_mode", settings != nullptr ? settings->angle_mode : int(TextureMappingZone::OffsetAngleObjectCenter));
@@ -4840,6 +4842,17 @@ static bool texture_preview_zone_uses_halftone_model(const TextureMappingZone &z
             method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
 }
 
+static bool texture_preview_gradient_zone_uses_model(const TextureMappingZone &zone, size_t num_physical)
+{
+    if (!zone.enabled || zone.deleted || !zone.is_2d_gradient())
+        return false;
+    if (TextureMappingManager::selected_component_ids(zone, num_physical).size() < 2)
+        return true;
+
+    const std::vector<unsigned int> component_ids = decode_surface_gradient_component_ids(zone, num_physical);
+    return component_ids.size() >= 2;
+}
+
 static void texture_preview_mix_zone_baked_model_settings(size_t &signature,
                                                           const TextureMappingZone &zone,
                                                           size_t num_physical)
@@ -4958,7 +4971,9 @@ size_t texture_preview_model_settings_signature(size_t num_physical,
         signature_mix(std::hash<int>{}(halftone_model ? 1 : 0));
         signature_mix(std::hash<int>{}(simulated_vertex_color_model ? 1 : 0));
 
-        if (gradient_zone || halftone_model || simulated_vertex_color_model)
+        if (gradient_zone)
+            signature_mix(std::hash<int>{}(texture_preview_gradient_zone_uses_model(zone, num_physical) ? 1 : 0));
+        else if (halftone_model || simulated_vertex_color_model)
             texture_preview_mix_zone_baked_model_settings(signature, zone, num_physical);
     }
     return signature;

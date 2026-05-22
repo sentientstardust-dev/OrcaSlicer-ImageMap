@@ -2512,7 +2512,7 @@ float texture_mapping_offset_fade_factor(int fade_mode, float progress01)
     case int(TextureMappingZone::OffsetFadeOutUp):         return 1.f - p;
     case int(TextureMappingZone::OffsetFadeInOut):         return 1.f - std::abs(2.f * p - 1.f);
     case int(TextureMappingZone::OffsetFadeOutIn):         return std::abs(2.f * p - 1.f);
-    case int(TextureMappingZone::OffsetFadeOutInReversed): return 2.f * p - 1.f;
+    case int(TextureMappingZone::OffsetFadeOutInReversed): return 1.f - 2.f * p;
     default:                                               return 1.f;
     }
 }
@@ -2789,7 +2789,8 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     for (float &a : rotated_angles)
         a = normalize_texture_mapping_offset_angle_deg(a + rotation_deg);
 
-    const float fade_factor = std::abs(texture_mapping_offset_fade_factor(zone.offset_fade_mode, z_progress));
+    const float signed_fade_factor = texture_mapping_offset_fade_factor(zone.offset_fade_mode, z_progress);
+    const float fade_factor = std::abs(signed_fade_factor);
     if (fade_factor <= EPSILON)
         return std::nullopt;
 
@@ -2812,6 +2813,7 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     context.rotated_angles = std::move(rotated_angles);
     context.weight_field = std::move(weight_field);
     context.inset_strength_reference_mm = max_allowed_distance_mm;
+    context.signed_fade_factor = signed_fade_factor;
     context.fade_factor = fade_factor;
     context.max_width_delta_mm = max_width_delta_limit_mm;
     context.dither_pitch_mm = dither_pitch_mm;
@@ -2882,6 +2884,9 @@ float texture_mapping_offset_surface_inset_mm(const TextureMappingOffsetContext 
 
         const float theta_deg =
             normalize_texture_mapping_offset_angle_deg(float(Geometry::rad2deg(std::atan2(theta_direction_y, theta_direction_x))));
+        const float sample_theta_deg = context.signed_fade_factor < 0.f ?
+            normalize_texture_mapping_offset_angle_deg(theta_deg + 180.f) :
+            theta_deg;
         float raw_inset_mm = 0.f;
         const size_t component_count = std::min(context.component_ids.size(), context.component_distances_mm.size());
         for (size_t i = 0; i < component_count; ++i) {
@@ -2889,7 +2894,7 @@ float texture_mapping_offset_surface_inset_mm(const TextureMappingOffsetContext 
                 continue;
             const float influence =
                 component_angular_influence(context.component_ids[i],
-                                            theta_deg,
+                                            sample_theta_deg,
                                             context.component_ids,
                                             context.rotated_angles);
             raw_inset_mm += context.component_distances_mm[i] * influence;

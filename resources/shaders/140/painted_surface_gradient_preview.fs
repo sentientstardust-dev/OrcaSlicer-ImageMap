@@ -18,6 +18,7 @@ uniform bool invalid_texture_mapping;
 uniform PrintVolumeDetection print_volume;
 
 uniform int gradient_component_count;
+uniform vec3 gradient_base_color;
 uniform vec3 gradient_component_colors[MAX_GRADIENT_COMPONENTS];
 uniform float gradient_distances_mm[MAX_GRADIENT_COMPONENTS];
 uniform float gradient_angles_deg[MAX_GRADIENT_COMPONENTS];
@@ -98,7 +99,7 @@ float offset_fade_factor(int fade_mode, float progress01)
     if (fade_mode == 4)
         return abs(2.0 * p - 1.0);
     if (fade_mode == 5)
-        return 2.0 * p - 1.0;
+        return 1.0 - 2.0 * p;
     return 1.0;
 }
 
@@ -198,17 +199,19 @@ vec3 surface_gradient_color()
         direction_vec = vec2(1.0, 0.0);
 
     float theta_deg = normalize_angle(degrees(atan(direction_vec.y, direction_vec.x)) - rotation_deg);
-    float fade_factor = abs(offset_fade_factor(gradient_fade_mode, z_progress));
+    float signed_fade_factor = offset_fade_factor(gradient_fade_mode, z_progress);
+    float fade_factor = abs(signed_fade_factor);
+    float sample_theta_deg = signed_fade_factor < 0.0 ? normalize_angle(theta_deg + 180.0) : theta_deg;
     float influences[MAX_GRADIENT_COMPONENTS];
-    float edge_reaches[MAX_GRADIENT_COMPONENTS];
-    float min_reach = 1000000.0;
-    float max_reach = -1000000.0;
+    float visibility_weights[MAX_GRADIENT_COMPONENTS];
+    float min_visibility = 1.0;
+    float max_visibility = 0.0;
 
     for (int i = 0; i < MAX_GRADIENT_COMPONENTS; ++i) {
         influences[i] = 0.0;
-        edge_reaches[i] = 0.0;
+        visibility_weights[i] = 0.0;
         if (i < count)
-            influences[i] = component_angular_influence(i, theta_deg);
+            influences[i] = component_angular_influence(i, sample_theta_deg);
     }
 
     for (int i = 0; i < MAX_GRADIENT_COMPONENTS; ++i) {
@@ -225,24 +228,25 @@ vec3 surface_gradient_color()
                                                     gradient_max_width_delta_limit_mm,
                                                     gradient_minimum_offset_factors[i],
                                                     gradient_strength_factors[i]);
-        edge_reaches[i] = clamp(gradient_max_width_delta_limit_mm - width_delta_mm, 0.0, gradient_max_width_delta_limit_mm);
-        min_reach = min(min_reach, edge_reaches[i]);
-        max_reach = max(max_reach, edge_reaches[i]);
+        visibility_weights[i] = 1.0 - clamp(width_delta_mm / max(gradient_max_width_delta_limit_mm, EPSILON), 0.0, 1.0);
+        min_visibility = min(min_visibility, visibility_weights[i]);
+        max_visibility = max(max_visibility, visibility_weights[i]);
     }
 
-    vec3 mixed_color = vec3(0.0);
-    float total_weight = 0.0;
-    float reach_span = max_reach - min_reach;
+    vec3 target_color = vec3(0.0);
+    float total_excess_weight = 0.0;
     for (int i = 0; i < MAX_GRADIENT_COMPONENTS; ++i) {
         if (i >= count)
             continue;
-        float weight = reach_span > EPSILON ? clamp((edge_reaches[i] - min_reach) / reach_span, 0.0, 1.0) : 1.0;
-        mixed_color += gradient_component_colors[i] * weight;
-        total_weight += weight;
+        float weight = max(0.0, visibility_weights[i] - min_visibility);
+        target_color += gradient_component_colors[i] * weight;
+        total_excess_weight += weight;
     }
-    if (total_weight <= EPSILON)
-        return gradient_component_colors[0];
-    return clamp(mixed_color / total_weight, 0.0, 1.0);
+    if (total_excess_weight <= EPSILON)
+        return clamp(gradient_base_color, 0.0, 1.0);
+    float contrast = clamp(max_visibility - min_visibility, 0.0, 1.0);
+    target_color = clamp(target_color / total_excess_weight, 0.0, 1.0);
+    return mix(clamp(gradient_base_color, 0.0, 1.0), target_color, contrast);
 }
 
 float invalid_texture_mapping_checker()

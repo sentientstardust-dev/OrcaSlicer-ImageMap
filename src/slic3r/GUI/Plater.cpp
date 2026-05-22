@@ -16,6 +16,7 @@
 #include <vector>
 #include <string>
 #include <regex>
+#include <functional>
 #include <future>
 #include <boost/algorithm/string.hpp>
 #include <boost/iterator/counting_iterator.hpp>
@@ -50,6 +51,7 @@
 #include <wx/simplebook.h>
 #include <wx/slider.h>
 #include <wx/spinctrl.h>
+#include <wx/timer.h>
 #ifdef _WIN32
 #include <wx/richtooltip.h>
 #include <wx/custombgwin.h>
@@ -1092,9 +1094,12 @@ public:
                                        const TextureMappingZone &zone,
                                        size_t num_physical,
                                        const std::vector<double> &nozzle_diameters,
-                                       const std::vector<wxColour> &palette)
+                                       const std::vector<wxColour> &palette,
+                                       std::function<void(const TextureMappingZone &)> live_preview = {})
         : wxDialog(parent, wxID_ANY, _L("Offset Gradient"), wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
         , m_zone(zone)
+        , m_live_preview(std::move(live_preview))
+        , m_live_preview_timer(this)
     {
         const int gap = FromDIP(8);
         const int compact_gap = std::max(FromDIP(3), gap / 2);
@@ -1133,7 +1138,7 @@ public:
         mode_row->Add(m_basic_angle_label, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, compact_gap);
         m_basic_angle_spin = new wxSpinCtrlDouble(this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(84), -1),
                                                   wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER, 0.0, 360.0,
-                                                  initial_angles.empty() ? 0.0 : std::clamp(double(initial_angles.front()), 0.0, 360.0), 1.0);
+                                                  initial_angles.empty() ? 0.0 : std::clamp(double(initial_angles.front()), 0.0, 360.0), 10.0);
         m_basic_angle_spin->SetDigits(1);
         mode_row->Add(m_basic_angle_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, compact_gap);
         m_basic_angle_units = new wxStaticText(this, wxID_ANY, _L("deg"));
@@ -1211,7 +1216,7 @@ public:
             row->Add(new wxStaticText(this, wxID_ANY, _L("%")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
             wxSpinCtrlDouble *angle_spin = new wxSpinCtrlDouble(this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(84), -1),
                                                                 wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER, 0.0, 360.0,
-                                                                i < initial_angles.size() ? std::clamp(double(initial_angles[i]), 0.0, 360.0) : 0.0, 1.0);
+                                                                i < initial_angles.size() ? std::clamp(double(initial_angles[i]), 0.0, 360.0) : 0.0, 10.0);
             angle_spin->SetDigits(1);
             row->Add(angle_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, compact_gap);
             row->Add(new wxStaticText(this, wxID_ANY, _L("deg")), 0, wxALIGN_CENTER_VERTICAL);
@@ -1234,10 +1239,18 @@ public:
             EndModal(wxID_OK);
         });
 
-        m_mode_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) { update_advanced_visibility(); });
+        m_mode_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) {
+            update_advanced_visibility();
+            emit_live_preview();
+        });
+        bind_live_preview_events();
         SetSizerAndFit(root);
         SetMinSize(wxSize(FromDIP(560), std::max(GetSize().GetHeight(), FromDIP(420))));
         update_advanced_visibility();
+        if (m_live_preview) {
+            Bind(wxEVT_TIMER, [this](wxTimerEvent &) { emit_live_preview(); });
+            m_live_preview_timer.Start(100);
+        }
     }
 
     bool apply_to(TextureMappingZone &out)
@@ -1303,7 +1316,67 @@ private:
         Fit();
     }
 
+    void bind_live_preview_events()
+    {
+        auto bind_spin = [this](wxSpinCtrlDouble *spin, double step, double min_value, double max_value) {
+            if (spin == nullptr)
+                return;
+            spin->Bind(wxEVT_SPINCTRLDOUBLE, [this](wxSpinDoubleEvent &) { emit_live_preview(); });
+            spin->Bind(wxEVT_TEXT, [this](wxCommandEvent &) { emit_live_preview(); });
+            spin->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent &) { emit_live_preview(); });
+            spin->Bind(wxEVT_CHAR_HOOK, [this, spin, step, min_value, max_value](wxKeyEvent &evt) {
+                const int key = evt.GetKeyCode();
+                if (key != WXK_UP && key != WXK_NUMPAD_UP && key != WXK_DOWN && key != WXK_NUMPAD_DOWN) {
+                    evt.Skip();
+                    return;
+                }
+                const double direction = (key == WXK_UP || key == WXK_NUMPAD_UP) ? 1.0 : -1.0;
+                spin->SetValue(std::clamp(spin->GetValue() + direction * step, min_value, max_value));
+                emit_live_preview();
+            });
+            spin->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent &evt) {
+                emit_live_preview();
+                evt.Skip();
+            });
+        };
+        auto bind_check = [this](wxCheckBox *check) {
+            if (check != nullptr)
+                check->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) { emit_live_preview(); });
+        };
+        auto bind_choice = [this](wxChoice *choice) {
+            if (choice != nullptr)
+                choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) { emit_live_preview(); });
+        };
+
+        bind_spin(m_basic_distance_spin, 1.0, 0.0, 100.0);
+        bind_spin(m_basic_angle_spin, 10.0, 0.0, 360.0);
+        bind_spin(m_rotations_spin, 0.1, -64.0, 64.0);
+        bind_spin(m_repeats_spin, 0.1, 1.0, 64.0);
+        for (wxSpinCtrlDouble *spin : m_distance_spins)
+            bind_spin(spin, 1.0, 0.0, 100.0);
+        for (wxSpinCtrlDouble *spin : m_angle_spins)
+            bind_spin(spin, 10.0, 0.0, 360.0);
+        bind_check(m_rotation_enabled);
+        bind_check(m_reverse_repeats);
+        bind_check(m_clockwise);
+        bind_choice(m_fade_choice);
+        bind_choice(m_angle_mode_choice);
+    }
+
+    void emit_live_preview()
+    {
+        if (!m_live_preview)
+            return;
+        TextureMappingZone preview;
+        if (!apply_to(preview))
+            return;
+        preview.surface_pattern = int(TextureMappingZone::Gradient2D);
+        m_live_preview(preview);
+    }
+
     TextureMappingZone m_zone;
+    std::function<void(const TextureMappingZone &)> m_live_preview;
+    wxTimer m_live_preview_timer;
     std::vector<unsigned int> m_component_ids;
     wxChoice *m_mode_choice {nullptr};
     wxSpinCtrlDouble *m_basic_distance_spin {nullptr};
@@ -6316,7 +6389,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                           gap);
 
         auto *button_row = new wxBoxSizer(wxHORIZONTAL);
-        auto *offset_btn = new wxButton(editor, wxID_ANY, _L("Offset Gradient Settings"));
+        auto *offset_btn = new wxButton(editor, wxID_ANY, _L("2D Gradient Settings"));
         auto *advanced_btn = new wxButton(editor, wxID_ANY, _L("Advanced Options"));
         button_row->Add(offset_btn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         button_row->Add(advanced_btn, 0, wxALIGN_CENTER_VERTICAL);
@@ -6466,13 +6539,56 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             apply_controls();
             evt.Skip();
         });
-        offset_btn->Bind(wxEVT_BUTTON, [this, zone_index, mgr_ptr, palette, nozzle_diameters, apply_zone](wxCommandEvent &) {
+        offset_btn->Bind(wxEVT_BUTTON, [this,
+                                        zone_index,
+                                        mgr_ptr,
+                                        palette,
+                                        nozzle_diameters,
+                                        apply_zone,
+                                        set_config_string](wxCommandEvent &) {
             if (zone_index >= mgr_ptr->zones().size())
                 return;
-            TextureMappingZone updated = mgr_ptr->zones()[zone_index];
-            TextureMappingOffsetGradientDialog dlg(this, updated, palette.size(), nozzle_diameters, palette);
-            if (dlg.ShowModal() != wxID_OK || !dlg.apply_to(updated))
+            const TextureMappingZone original = mgr_ptr->zones()[zone_index];
+            const std::string original_serialized = mgr_ptr->serialize_entries();
+            TextureMappingZone updated = original;
+            bool live_preview_applied = false;
+            auto redraw_live_preview = [this]() {
+                if (p->plater == nullptr)
+                    return;
+                auto mark_canvas_dirty = [](GLCanvas3D *canvas) {
+                    if (canvas == nullptr)
+                        return;
+                    canvas->set_as_dirty();
+                    canvas->request_extra_frame();
+                    if (wxGLCanvas *wx_canvas = canvas->get_wxglcanvas(); wx_canvas != nullptr && wx_canvas->IsShownOnScreen())
+                        canvas->render();
+                };
+                mark_canvas_dirty(p->plater->get_view3D_canvas3D());
+                mark_canvas_dirty(p->plater->get_assmeble_canvas3D());
+            };
+            auto live_preview = [zone_index, mgr_ptr, &live_preview_applied, redraw_live_preview, set_config_string](const TextureMappingZone &preview) {
+                if (zone_index >= mgr_ptr->zones().size())
+                    return;
+                if (mgr_ptr->zones()[zone_index] == preview)
+                    return;
+                mgr_ptr->zones()[zone_index] = preview;
+                set_config_string("texture_mapping_definitions", mgr_ptr->serialize_entries());
+                live_preview_applied = true;
+                redraw_live_preview();
+            };
+            TextureMappingOffsetGradientDialog dlg(this, updated, palette.size(), nozzle_diameters, palette, live_preview);
+            const int dialog_result = dlg.ShowModal();
+            if (zone_index >= mgr_ptr->zones().size())
                 return;
+            if (live_preview_applied)
+                mgr_ptr->zones()[zone_index] = original;
+            if (live_preview_applied)
+                set_config_string("texture_mapping_definitions", original_serialized);
+            if (dialog_result != wxID_OK || !dlg.apply_to(updated)) {
+                if (live_preview_applied)
+                    redraw_live_preview();
+                return;
+            }
             updated.surface_pattern = int(TextureMappingZone::Gradient2D);
             apply_zone(std::move(updated));
             CallAfter([this]() { update_texture_mapping_panel(false); });

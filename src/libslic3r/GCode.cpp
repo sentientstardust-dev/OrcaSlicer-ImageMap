@@ -9800,12 +9800,15 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
 
             const float theta_deg =
                 normalize_angle_deg_for_gcode(float(Geometry::rad2deg(std::atan2(theta_direction_y, theta_direction_x))));
+            const float sample_theta_deg = state.signed_fade_factor < 0.f ?
+                normalize_angle_deg_for_gcode(theta_deg + 180.f) :
+                theta_deg;
             float raw_inset_mm = 0.f;
             for (size_t i = 0; i < component_ids.size(); ++i) {
                 if (i == state.active_component_idx)
                     continue;
                 const float influence = component_angular_influence_for_gcode(component_ids[i],
-                                                                               theta_deg,
+                                                                               sample_theta_deg,
                                                                                component_ids,
                                                                                rotated_angles);
                 raw_inset_mm += distances_mm[i] * influence;
@@ -9839,7 +9842,7 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
             return std::nullopt;
 
         const float centerline_shift_mm = base_centerline_shift_mm + 0.5f * width_delta_mm;
-        const float centerline_outward_shift_mm = state.signed_fade_factor >= 0.f ? -centerline_shift_mm : centerline_shift_mm;
+        const float centerline_outward_shift_mm = -centerline_shift_mm;
         const float outer_offset_mm = centerline_outward_shift_mm + 0.5f * target_width_mm;
         if (!std::isfinite(outer_offset_mm))
             return std::nullopt;
@@ -10765,7 +10768,6 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         bool                      object_center_mode { false };
         Point                     object_center;
         float                     inset_strength_reference_mm { 0.f };
-        float                     signed_fade_factor { 1.f };
         float                     max_width_delta_mm { 0.f };
         float                     base_outer_width_mm { 0.4f };
         float                     dither_pitch_mm { 0.08f };
@@ -11002,7 +11004,6 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                 outer_wall_gradient_dynamic_ctx.object_center_mode = object_center_mode;
                                 outer_wall_gradient_dynamic_ctx.object_center = object_center;
                                 outer_wall_gradient_dynamic_ctx.inset_strength_reference_mm = max_allowed_distance_mm;
-                                outer_wall_gradient_dynamic_ctx.signed_fade_factor = signed_fade_factor;
                                 outer_wall_gradient_dynamic_ctx.max_width_delta_mm = effective_max_width_delta_mm;
                                 outer_wall_gradient_dynamic_ctx.base_outer_width_mm = base_outer_width_mm;
                                 outer_wall_gradient_dynamic_ctx.dither_pitch_mm = offset_context->dither_pitch_mm;
@@ -11027,7 +11028,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                     if (std::abs(centerline_shift_mm) <= EPSILON)
                                         return true;
 
-                                    const bool reverse_shift = (signed_fade_factor < 0.f) != (centerline_shift_mm < 0.f);
+                                    const bool reverse_shift = centerline_shift_mm < 0.f;
                                     const double shift_x = reverse_shift ? -mod.shift_unit_x : mod.shift_unit_x;
                                     const double shift_y = reverse_shift ? -mod.shift_unit_y : mod.shift_unit_y;
                                     const double shift_scaled = scale_(double(std::abs(centerline_shift_mm)));
@@ -11805,8 +11806,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         if (std::abs(centerline_shift_mm) > EPSILON) {
             const double inward_x = -outward_x;
             const double inward_y = -outward_y;
-            const bool reverse_shift =
-                (outer_wall_gradient_dynamic_ctx.signed_fade_factor < 0.f) != (centerline_shift_mm < 0.f);
+            const bool reverse_shift = centerline_shift_mm < 0.f;
             const double shift_x = reverse_shift ? -inward_x : inward_x;
             const double shift_y = reverse_shift ? -inward_y : inward_y;
             const double shift_scaled = scale_(double(std::abs(centerline_shift_mm)));
