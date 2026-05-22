@@ -776,17 +776,6 @@ void GLVolume::simple_render(GLShaderProgram* shader,
 
             const bool has_active_texture_mapping_color_preview_data =
                 has_texture_preview_state && model_volume_has_texture_mapping_color_preview_data(*model_volume);
-            if (has_texture_preview_state && !use_original_mesh_texture_preview && !has_active_texture_mapping_color_preview_data && has_texture_preview_data) {
-                build_mmu_texture_preview_models(*model_volume,
-                                                 triangles_per_type,
-                                                 state_colors,
-                                                 base_filament_id,
-                                                 num_physical,
-                                                 texture_mgr,
-                                                 mmuseg_texture_preview_models,
-                                                 mmuseg_texture_preview_colors,
-                                                 mmuseg_texture_preview_filament_ids);
-            }
             if (has_texture_preview_state) {
                 build_mmu_vertex_color_preview_models(*model_volume,
                                                       triangles_per_type,
@@ -798,6 +787,18 @@ void GLVolume::simple_render(GLShaderProgram* shader,
                                                       mmuseg_vertex_color_preview_models,
                                                       mmuseg_vertex_color_preview_colors,
                                                       mmuseg_vertex_color_preview_filament_ids);
+            }
+            if (has_texture_preview_state && !use_original_mesh_texture_preview && !has_active_texture_mapping_color_preview_data && has_texture_preview_data) {
+                build_mmu_texture_preview_models(*model_volume,
+                                                 triangles_per_type,
+                                                 state_colors,
+                                                 base_filament_id,
+                                                 num_physical,
+                                                 texture_mgr,
+                                                 mmuseg_texture_preview_models,
+                                                 mmuseg_texture_preview_colors,
+                                                 mmuseg_texture_preview_filament_ids,
+                                                 &mmuseg_vertex_color_preview_filament_ids);
             }
             mmuseg_ts = model_volume->mmu_segmentation_facets.timestamp();
             mmuseg_texture_preview_visual_signature = preview_visual_signature;
@@ -1012,7 +1013,8 @@ void GLVolume::render_mmu_texture_preview(const Transform3d &view_matrix,
                                                  print_volume_type,
                                                  print_volume_xy,
                                                  print_volume_z,
-                                                 opaque);
+                                                 opaque,
+                                                 model_volume);
     }
 
     if (this->is_left_handed())

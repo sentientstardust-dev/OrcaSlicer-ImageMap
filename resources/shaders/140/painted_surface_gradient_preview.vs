@@ -21,13 +21,11 @@ uniform vec4 clipping_plane;
 
 in vec3 v_position;
 in vec3 v_normal;
-in vec2 v_tex_coord;
 
 out vec2 intensity;
 out vec3 clipping_planes_dots;
 out vec4 world_pos;
 out vec3 world_normal;
-out vec2 tex_coord;
 
 void main()
 {
@@ -43,7 +41,6 @@ void main()
 
     world_pos = volume_world_matrix * vec4(v_position, 1.0);
     world_normal = normalize(vec3(volume_world_matrix * vec4(v_normal, 0.0)));
-    tex_coord = v_tex_coord;
     gl_Position = projection_matrix * position;
     clipping_planes_dots = vec3(dot(world_pos, clipping_plane), world_pos.z - z_range.x, z_range.y - world_pos.z);
 }

@@ -1,4 +1,4 @@
-#version 140
+#version 110
 
 #define INTENSITY_CORRECTION 0.6
 
@@ -19,15 +19,13 @@ uniform mat4 volume_world_matrix;
 uniform vec2 z_range;
 uniform vec4 clipping_plane;
 
-in vec3 v_position;
-in vec3 v_normal;
-in vec2 v_tex_coord;
+attribute vec3 v_position;
+attribute vec3 v_normal;
 
-out vec2 intensity;
-out vec3 clipping_planes_dots;
-out vec4 world_pos;
-out vec3 world_normal;
-out vec2 tex_coord;
+varying vec2 intensity;
+varying vec3 clipping_planes_dots;
+varying vec4 world_pos;
+varying vec3 world_normal;
 
 void main()
 {
@@ -43,7 +41,6 @@ void main()
 
     world_pos = volume_world_matrix * vec4(v_position, 1.0);
     world_normal = normalize(vec3(volume_world_matrix * vec4(v_normal, 0.0)));
-    tex_coord = v_tex_coord;
     gl_Position = projection_matrix * position;
     clipping_planes_dots = vec3(dot(world_pos, clipping_plane), world_pos.z - z_range.x, z_range.y - world_pos.z);
 }

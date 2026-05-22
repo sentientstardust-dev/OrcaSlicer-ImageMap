@@ -25,7 +25,8 @@ bool build_mmu_texture_preview_models(
     const TextureMappingManager                                          *texture_mgr,
     std::vector<GUI::GLModel>                                            &out_models,
     std::vector<ColorRGBA>                                               &out_colors,
-    std::vector<unsigned int>                                            &out_filament_ids);
+    std::vector<unsigned int>                                            &out_filament_ids,
+    const std::vector<unsigned int>                                      *ready_simulated_filament_ids = nullptr);
 
 bool build_texture_preview_model_for_state(const ModelVolume                                      &model_volume,
                                            const std::vector<TriangleSelector::FacetStateTriangle> &state_triangles,
@@ -147,7 +148,8 @@ void render_model_vertex_color_preview_models(
     int                              print_volume_type = -1,
     const std::array<float, 4>      &print_volume_xy = std::array<float, 4>{ 0.f, 0.f, 0.f, 0.f },
     const std::array<float, 2>      &print_volume_z = std::array<float, 2>{ 0.f, 0.f },
-    bool                             opaque = false);
+    bool                             opaque = false,
+    const ModelVolume               *model_volume = nullptr);
 
 } // namespace Slic3r
 

@@ -9427,7 +9427,18 @@ public:
         SetMinSize(GetSize());
         CenterOnParent();
 
+        SetEscapeId(wxID_CLOSE);
         Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { EndModal(wxID_CLOSE); }, wxID_CLOSE);
+        Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent &event) {
+            if (event.GetKeyCode() == WXK_ESCAPE) {
+                if (IsModal())
+                    EndModal(wxID_CLOSE);
+                else
+                    Close();
+                return;
+            }
+            event.Skip();
+        });
         m_background_picker->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent &) { pick_background_color(); });
         m_background_clear->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { clear_background_color(); });
     }
@@ -13160,7 +13171,8 @@ void GLGizmoTrueColorPainting::render_cached_rgb_data_preview(const ModelObject 
                                                  -1,
                                                  std::array<float, 4>{ 0.f, 0.f, 0.f, 0.f },
                                                  std::array<float, 2>{ 0.f, 0.f },
-                                                 true);
+                                                 true,
+                                                 volume);
     }
 }
 

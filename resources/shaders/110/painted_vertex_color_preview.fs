@@ -1,6 +1,7 @@
 #version 110
 
 const vec3 ZERO = vec3(0.0, 0.0, 0.0);
+const float INVALID_TEXTURE_CHECKER_SCALE = 0.2;
 
 struct PrintVolumeDetection
 {
@@ -17,7 +18,19 @@ uniform PrintVolumeDetection print_volume;
 varying vec2 intensity;
 varying vec3 clipping_planes_dots;
 varying vec4 world_pos;
+varying vec3 world_normal;
 varying vec4 vertex_color;
+
+float invalid_texture_mapping_checker()
+{
+    vec3 normal_axes = abs(world_normal);
+    vec2 checker_pos = world_pos.xy;
+    if (normal_axes.x > normal_axes.y && normal_axes.x > normal_axes.z)
+        checker_pos = world_pos.yz;
+    else if (normal_axes.y > normal_axes.z)
+        checker_pos = world_pos.xz;
+    return mod(floor(checker_pos.x * INVALID_TEXTURE_CHECKER_SCALE) + floor(checker_pos.y * INVALID_TEXTURE_CHECKER_SCALE), 2.0);
+}
 
 void main()
 {
@@ -28,7 +41,7 @@ void main()
     float mix_factor = clamp(texture_preview_mix, 0.0, 1.0);
     color.rgb = mix(color.rgb, vertex_color.rgb, mix_factor);
     if (invalid_texture_mapping) {
-        float checker = mod(floor(world_pos.x * 4.0) + floor(world_pos.y * 4.0) + floor(world_pos.z * 4.0), 2.0);
+        float checker = invalid_texture_mapping_checker();
         vec3 checker_color = mix(vec3(0.0), vec3(1.0), checker);
         color.rgb = mix(color.rgb, checker_color, 0.62);
     }

@@ -1324,6 +1324,15 @@ private:
     bool m_remove_requested {false};
 };
 
+static bool texture_mapping_prime_tower_images_equal(const TextureMappingPrimeTowerImage &lhs,
+                                                     const TextureMappingPrimeTowerImage &rhs)
+{
+    return lhs.width == rhs.width &&
+           lhs.height == rhs.height &&
+           lhs.image_name == rhs.image_name &&
+           lhs.rgba == rhs.rgba;
+}
+
 class TextureMappingAdvancedOptionsDialog : public wxDialog
 {
 public:
@@ -6475,7 +6484,9 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                           physical_colors,
                                           apply_zone,
                                           bundle,
-                                          set_config_string](wxCommandEvent &) {
+                                          set_config_string,
+                                          notify_change,
+                                          refresh_texture_mapping_preview](wxCommandEvent &) {
             if (zone_index >= mgr_ptr->zones().size())
                 return;
             TextureMappingZone updated = mgr_ptr->zones()[zone_index];
@@ -6579,8 +6590,14 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 dlg_global_settings.serialize() != bundle->texture_mapping_global_settings.serialize();
             if (global_settings_changed)
                 bundle->texture_mapping_global_settings = dlg_global_settings;
-            wxGetApp().model().texture_mapping_prime_tower_image = dlg.prime_tower_image();
-            wxGetApp().model().texture_mapping_prime_tower_image_back = dlg.prime_tower_image_back();
+            Model &model = wxGetApp().model();
+            const bool prime_tower_images_changed =
+                !texture_mapping_prime_tower_images_equal(model.texture_mapping_prime_tower_image, dlg.prime_tower_image()) ||
+                !texture_mapping_prime_tower_images_equal(model.texture_mapping_prime_tower_image_back, dlg.prime_tower_image_back());
+            if (prime_tower_images_changed) {
+                model.texture_mapping_prime_tower_image = dlg.prime_tower_image();
+                model.texture_mapping_prime_tower_image_back = dlg.prime_tower_image_back();
+            }
             if (global_settings_changed)
                 set_config_string("texture_mapping_global_settings", bundle->texture_mapping_global_settings.serialize());
             if (updated.filament_strengths_pct.size() < palette.size())
@@ -6609,12 +6626,11 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                    std::abs(updated.filament_transmission_distances_mm.back()) <= 1e-6f)
                 updated.filament_transmission_distances_mm.pop_back();
             const bool affects_scene = apply_zone(std::move(updated));
-            if (affects_scene && p->plater != nullptr && !p->plater->is_preview_shown()) {
-                if (GLCanvas3D *canvas = p->plater->get_view3D_canvas3D())
-                    canvas->reload_scene(true, true);
-                if (GLCanvas3D *canvas = p->plater->get_assmeble_canvas3D())
-                    canvas->reload_scene(true, true);
-            }
+            const bool prime_tower_preview_changed = global_settings_changed || prime_tower_images_changed;
+            if (prime_tower_preview_changed)
+                notify_change(true);
+            if (affects_scene || prime_tower_preview_changed)
+                refresh_texture_mapping_preview();
             CallAfter([this]() { update_texture_mapping_panel(false); });
         });
 

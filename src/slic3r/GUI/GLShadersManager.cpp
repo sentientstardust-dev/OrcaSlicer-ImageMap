@@ -83,6 +83,7 @@ std::pair<bool, std::string> GLShadersManager::init()
 #if !SLIC3R_OPENGL_ES
     valid &= append_shader("painted_texture_preview", { prefix + "painted_texture_preview.vs", prefix + "painted_texture_preview.fs" });
     valid &= append_shader("painted_vertex_color_preview", { prefix + "painted_vertex_color_preview.vs", prefix + "painted_vertex_color_preview.fs" });
+    valid &= append_shader("painted_surface_gradient_preview", { prefix + "painted_surface_gradient_preview.vs", prefix + "painted_surface_gradient_preview.fs" });
 #endif // !SLIC3R_OPENGL_ES
     // Used to render painted triangles inside the multi-material gizmo. Triangle normals are computed inside fragment shader.
     // For Apple's on Arm CPU computed triangle normals inside fragment shader using dFdx and dFdy has the opposite direction.

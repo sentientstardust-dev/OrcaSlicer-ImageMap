@@ -26,6 +26,7 @@ attribute vec4 v_color;
 varying vec2 intensity;
 varying vec3 clipping_planes_dots;
 varying vec4 world_pos;
+varying vec3 world_normal;
 varying vec4 vertex_color;
 
 void main()
@@ -41,6 +42,7 @@ void main()
     intensity.x += NdotL * LIGHT_FRONT_DIFFUSE;
 
     world_pos = volume_world_matrix * vec4(v_position, 1.0);
+    world_normal = normalize(vec3(volume_world_matrix * vec4(v_normal, 0.0)));
     vertex_color = v_color;
     gl_Position = projection_matrix * position;
     clipping_planes_dots = vec3(dot(world_pos, clipping_plane), world_pos.z - z_range.x, z_range.y - world_pos.z);

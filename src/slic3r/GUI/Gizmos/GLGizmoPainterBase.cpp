@@ -1847,17 +1847,6 @@ void TriangleSelectorPatch::update_render_data()
                                                                   num_physical,
                                                                   texture_mgr,
                                                                   m_texture_mapping_color_preview);
-                if (model_volume_has_texture_preview_data_for_painting(*m_model_volume)) {
-                    build_mmu_texture_preview_models(*m_model_volume,
-                                                     triangles_per_type,
-                                                     m_ebt_colors,
-                                                     m_model_volume->extruder_id() > 0 ? unsigned(m_model_volume->extruder_id()) : 0u,
-                                                     num_physical,
-                                                     texture_mgr,
-                                                     m_texture_preview_models,
-                                                     m_texture_preview_colors,
-                                                     m_texture_preview_filament_ids);
-                }
                 build_mmu_vertex_color_preview_models(*m_model_volume,
                                                       triangles_per_type,
                                                       m_ebt_colors,
@@ -1869,6 +1858,18 @@ void TriangleSelectorPatch::update_render_data()
                                                       m_vertex_color_preview_filament_ids,
                                                       nullptr,
                                                       reinterpret_cast<size_t>(this));
+                if (model_volume_has_texture_preview_data_for_painting(*m_model_volume)) {
+                    build_mmu_texture_preview_models(*m_model_volume,
+                                                     triangles_per_type,
+                                                     m_ebt_colors,
+                                                     m_model_volume->extruder_id() > 0 ? unsigned(m_model_volume->extruder_id()) : 0u,
+                                                     num_physical,
+                                                     texture_mgr,
+                                                     m_texture_preview_models,
+                                                     m_texture_preview_colors,
+                                                     m_texture_preview_filament_ids,
+                                                     &m_vertex_color_preview_filament_ids);
+                }
                 m_texture_preview_visual_signature = visual_signature;
             }
         }
@@ -2076,7 +2077,8 @@ void TriangleSelectorPatch::render_texture_preview(const Transform3d&          m
                                                  -1,
                                                  std::array<float, 4>{ 0.f, 0.f, 0.f, 0.f },
                                                  std::array<float, 2>{ 0.f, 0.f },
-                                                 m_texture_preview_opaque);
+                                                 m_texture_preview_opaque,
+                                                 m_model_volume);
     }
 }
 
