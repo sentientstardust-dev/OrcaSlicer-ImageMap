@@ -1342,7 +1342,7 @@ static bool region_uses_overhang_texture_mapping(const Print &print, const Print
         return false;
 
     const TextureMappingZone *zone = print.texture_mapping_manager().zone_from_id(unsigned(filament_id));
-    return zone != nullptr && zone->enabled && !zone->deleted && (zone->is_2d_gradient() || zone->is_image_texture());
+    return zone != nullptr && zone->enabled && !zone->deleted && (zone->is_surface_gradient() || zone->is_image_texture());
 }
 
 static const TextureMappingZone *perimeter_path_modulation_zone_for_region(const Print              &print,
@@ -1359,7 +1359,7 @@ static const TextureMappingZone *perimeter_path_modulation_zone_for_region(const
         !zone->enabled ||
         zone->deleted ||
         !zone->uses_perimeter_path_modulation() ||
-        (!zone->is_2d_gradient() && !zone->is_image_texture()))
+        (!zone->is_surface_gradient() && !zone->is_image_texture()))
         return nullptr;
 
     return zone;

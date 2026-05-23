@@ -6331,7 +6331,7 @@ static float local_surface_stair_step_distance_for_gcode(const Layer *layer,
 
 static bool is_horizontal_overhang_gradient_row_for_gcode(const TextureMappingZone &zone)
 {
-    return zone.enabled && !zone.deleted && !zone.uses_perimeter_path_modulation() && (zone.is_2d_gradient() || zone.is_image_texture());
+    return zone.enabled && !zone.deleted && !zone.uses_perimeter_path_modulation() && (zone.is_surface_gradient() || zone.is_image_texture());
 }
 
 static bool is_vertex_color_match_overhang_row_for_gcode(const TextureMappingZone &zone)
@@ -6342,6 +6342,11 @@ static bool is_vertex_color_match_overhang_row_for_gcode(const TextureMappingZon
 static bool is_2d_offset_gradient_row_for_gcode(const TextureMappingZone &zone)
 {
     return zone.enabled && !zone.deleted && !zone.uses_perimeter_path_modulation() && zone.is_2d_gradient();
+}
+
+static bool is_surface_offset_gradient_row_for_gcode(const TextureMappingZone &zone)
+{
+    return zone.enabled && !zone.deleted && !zone.uses_perimeter_path_modulation() && zone.is_surface_gradient();
 }
 
 static std::array<float, 4> unpack_rgba_u32(uint32_t packed_rgba)
@@ -10868,7 +10873,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             if (zone != nullptr &&
                 is_horizontal_overhang_gradient_row_for_gcode(*zone) &&
                 (vertex_color_match_mode ||
-                 is_2d_offset_gradient_row_for_gcode(*zone) ||
+                 is_surface_offset_gradient_row_for_gcode(*zone) ||
                  has_explicit_offset_gradient_profile_for_gcode(*zone))) {
                 std::vector<unsigned int> component_ids = decode_texture_mapping_offset_component_ids(*zone, num_physical);
                 if (vertex_color_match_mode) {
@@ -10978,7 +10983,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                                                                                 texture_zone_id,
                                                                                                 active_component_id,
                                                                                                 base_outer_width_mm,
-                                                                                                layer_height_mm);
+                                                                                                layer_height_mm,
+                                                                                                m_origin);
                             }
                             const bool high_resolution_texture_sampling =
                                 offset_context ? offset_context->high_resolution_texture_sampling : zone->high_resolution_sampling;

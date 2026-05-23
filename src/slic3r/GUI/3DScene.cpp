@@ -10,6 +10,8 @@
 #include "Camera.hpp"
 
 #include "libslic3r/BuildVolume.hpp"
+#include "libslic3r/Color.hpp"
+#include "libslic3r/ColorSolver.hpp"
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/ExtrusionEntityCollection.hpp"
 #include "libslic3r/Geometry.hpp"
@@ -29,7 +31,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <algorithm>
+#include <cmath>
 #include <limits>
+#include <map>
+#include <optional>
+#include <utility>
+#include <vector>
 
 #include <boost/log/trivial.hpp>
 
@@ -120,7 +128,7 @@ const TextureMappingZone *texture_preview_zone_for_filament(unsigned int filamen
 {
     const TextureMappingZone *zone = texture_mgr != nullptr && filament_id > num_physical ?
         texture_mgr->zone_from_id(filament_id) : nullptr;
-    return zone != nullptr && zone->enabled && !zone->deleted && (zone->is_image_texture() || zone->is_2d_gradient()) ?
+    return zone != nullptr && zone->enabled && !zone->deleted && (zone->is_image_texture() || zone->is_surface_gradient()) ?
         zone : nullptr;
 }
 
@@ -136,7 +144,7 @@ bool filament_state_uses_surface_gradient_preview(unsigned int filament_id,
                                                   const TextureMappingManager *texture_mgr)
 {
     const TextureMappingZone *zone = texture_preview_zone_for_filament(filament_id, num_physical, texture_mgr);
-    return zone != nullptr && zone->is_2d_gradient();
+    return zone != nullptr && zone->is_surface_gradient();
 }
 
 bool texture_preview_used_states_have_surface_gradient(const std::vector<bool> &used_states,
@@ -149,6 +157,311 @@ bool texture_preview_used_states_have_surface_gradient(const std::vector<bool> &
     }
 
     return false;
+}
+
+bool simple_gradient_vec3_is_finite(const Vec3f &point)
+{
+    return std::isfinite(point.x()) && std::isfinite(point.y()) && std::isfinite(point.z());
+}
+
+Vec3f simple_gradient_anchor_array_point(const std::array<float, 3> &point)
+{
+    return Vec3f(point[0], point[1], point[2]);
+}
+
+std::optional<Vec3f> simple_gradient_anchor_global_point(const TextureMappingZone::SimpleGradientAnchor &anchor)
+{
+    if (!anchor.valid)
+        return std::nullopt;
+
+    const Vec3f local = simple_gradient_anchor_array_point(anchor.local_point);
+    if (anchor.object_id != 0 && anchor.instance_id != 0) {
+        for (const ModelObject *object : GUI::wxGetApp().model().objects) {
+            if (object == nullptr || object->id().id != anchor.object_id)
+                continue;
+            for (const ModelInstance *instance : object->instances) {
+                if (instance != nullptr && instance->id().id == anchor.instance_id) {
+                    const Vec3f global = (instance->get_matrix() * local.cast<double>()).cast<float>();
+                    if (simple_gradient_vec3_is_finite(global))
+                        return global;
+                }
+            }
+        }
+    }
+
+    const Vec3f fallback = simple_gradient_anchor_array_point(anchor.global_point);
+    return simple_gradient_vec3_is_finite(fallback) ? std::optional<Vec3f>(fallback) : std::nullopt;
+}
+
+bool model_volume_uses_texture_mapping_zone(const ModelVolume &model_volume, unsigned int zone_id)
+{
+    if (zone_id == 0)
+        return false;
+    if (model_volume.extruder_id() > 0 && unsigned(model_volume.extruder_id()) == zone_id)
+        return true;
+    if (model_volume.mmu_segmentation_facets.empty())
+        return false;
+    const std::vector<bool> &used_states = model_volume.mmu_segmentation_facets.get_data().used_states;
+    return zone_id < used_states.size() && used_states[zone_id];
+}
+
+std::vector<unsigned int> simple_gradient_component_ids_for_arrow(const TextureMappingZone &zone, size_t num_physical)
+{
+    std::vector<unsigned int> ids = TextureMappingManager::selected_component_ids(zone, num_physical);
+    ids.erase(std::remove_if(ids.begin(), ids.end(), [num_physical](unsigned int id) {
+        return id == 0 || id > num_physical;
+    }), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    if (ids.size() > 2)
+        ids.resize(2);
+    if (ids.size() < 2 && num_physical >= 2)
+        ids = {1, 2};
+    return ids;
+}
+
+std::array<float, 3> simple_gradient_filament_color(unsigned int filament_id, const std::vector<std::string> &filament_colors)
+{
+    ColorRGB decoded;
+    if (filament_id >= 1 &&
+        size_t(filament_id - 1) < filament_colors.size() &&
+        decode_color(filament_colors[size_t(filament_id - 1)], decoded))
+        return { decoded.r(), decoded.g(), decoded.b() };
+    return { 0.5f, 0.5f, 0.5f };
+}
+
+ColorRGBA simple_gradient_arrow_color(const std::array<float, 3> &start_color,
+                                      const std::array<float, 3> &end_color,
+                                      float t)
+{
+    std::vector<std::array<float, 3>> colors { start_color, end_color };
+    std::vector<float> weights { std::clamp(1.f - t, 0.f, 1.f), std::clamp(t, 0.f, 1.f) };
+    const std::array<float, 3> mixed = mix_color_solver_components(colors, weights, ColorSolverMixModel::PigmentPainter);
+    return { std::clamp(mixed[0], 0.f, 1.f), std::clamp(mixed[1], 0.f, 1.f), std::clamp(mixed[2], 0.f, 1.f), 1.f };
+}
+
+struct SimpleGradientArrowUsage {
+    bool any { false };
+    Vec3f default_start { Vec3f::Zero() };
+    Vec3f default_end { Vec3f::UnitZ() };
+};
+
+SimpleGradientArrowUsage simple_gradient_arrow_usage(const GLVolumePtrs &volumes, unsigned int zone_id)
+{
+    SimpleGradientArrowUsage usage;
+    const Model &model = GUI::wxGetApp().model();
+    std::map<std::pair<int, int>, BoundingBoxf3> object_boxes;
+    for (const GLVolume *volume : volumes) {
+        if (volume == nullptr ||
+            !volume->is_active ||
+            volume->disabled ||
+            volume->is_wipe_tower ||
+            volume->is_modifier ||
+            volume->is_extrusion_path ||
+            volume->object_idx() < 0 ||
+            volume->volume_idx() < 0 ||
+            volume->instance_idx() < 0)
+            continue;
+        if (size_t(volume->object_idx()) >= model.objects.size())
+            continue;
+        const ModelObject *object = model.objects[size_t(volume->object_idx())];
+        if (object == nullptr || size_t(volume->volume_idx()) >= object->volumes.size())
+            continue;
+        const ModelVolume *model_volume = object->volumes[size_t(volume->volume_idx())];
+        if (model_volume == nullptr || !model_volume_uses_texture_mapping_zone(*model_volume, zone_id))
+            continue;
+
+        const BoundingBoxf3 bbox = volume->transformed_convex_hull_bounding_box();
+        if (!bbox.defined)
+            continue;
+        const std::pair<int, int> key { volume->object_idx(), volume->instance_idx() };
+        auto it = object_boxes.find(key);
+        if (it == object_boxes.end())
+            object_boxes.emplace(key, bbox);
+        else
+            it->second.merge(bbox);
+    }
+
+    if (object_boxes.empty())
+        return usage;
+
+    Vec3f center_sum = Vec3f::Zero();
+    float max_z = 0.f;
+    size_t count = 0;
+    for (const auto &item : object_boxes) {
+        if (!item.second.defined)
+            continue;
+        center_sum += item.second.center().cast<float>();
+        max_z = std::max(max_z, float(item.second.max.z()));
+        ++count;
+    }
+    if (count == 0)
+        return usage;
+
+    const Vec3f avg = center_sum / float(count);
+    usage.any = true;
+    usage.default_start = Vec3f(avg.x(), avg.y(), 0.f);
+    usage.default_end = Vec3f(avg.x(), avg.y(), std::max(0.01f, max_z));
+    return usage;
+}
+
+unsigned int simple_gradient_add_vertex(GUI::GLModel::Geometry &geometry,
+                                        const Vec3f &position,
+                                        const Vec3f &normal,
+                                        const ColorRGBA &color)
+{
+    const unsigned int id = unsigned(geometry.vertices_count());
+    geometry.add_vertex(position, normal, color);
+    return id;
+}
+
+void simple_gradient_arrow_basis(const Vec3f &direction, Vec3f &u, Vec3f &v)
+{
+    const Vec3f reference = std::abs(direction.z()) < 0.9f ? Vec3f::UnitZ() : Vec3f::UnitX();
+    u = direction.cross(reference).normalized();
+    if (!simple_gradient_vec3_is_finite(u) || u.squaredNorm() <= 1e-8f)
+        u = Vec3f::UnitX();
+    v = direction.cross(u).normalized();
+    if (!simple_gradient_vec3_is_finite(v) || v.squaredNorm() <= 1e-8f)
+        v = Vec3f::UnitY();
+}
+
+void append_simple_gradient_cylinder(GUI::GLModel::Geometry &geometry,
+                                     const Vec3f &start,
+                                     const Vec3f &end,
+                                     const Vec3f &arrow_start,
+                                     float arrow_length,
+                                     const Vec3f &axis,
+                                     const Vec3f &u,
+                                     const Vec3f &v,
+                                     float radius,
+                                     const std::array<float, 3> &start_color,
+                                     const std::array<float, 3> &end_color,
+                                     bool black)
+{
+    constexpr int sectors = 32;
+    const ColorRGBA black_color = ColorRGBA::BLACK();
+    const float safe_arrow_length = std::max(0.0001f, arrow_length);
+    const float center_t = std::clamp((start - arrow_start).dot(axis) / safe_arrow_length, 0.f, 1.f);
+    const unsigned int start_center =
+        simple_gradient_add_vertex(geometry,
+                                   start,
+                                   -axis,
+                                   black ? black_color : simple_gradient_arrow_color(start_color, end_color, center_t));
+    for (int i = 0; i < sectors; ++i) {
+        const float a0 = 2.f * float(PI) * float(i) / float(sectors);
+        const float a1 = 2.f * float(PI) * float(i + 1) / float(sectors);
+        const Vec3f r0 = std::cos(a0) * u + std::sin(a0) * v;
+        const Vec3f r1 = std::cos(a1) * u + std::sin(a1) * v;
+        const Vec3f p0 = start + radius * r0;
+        const Vec3f p1 = start + radius * r1;
+        const Vec3f p2 = end + radius * r0;
+        const Vec3f p3 = end + radius * r1;
+        const float t0 = std::clamp((p0 - arrow_start).dot(axis) / safe_arrow_length, 0.f, 1.f);
+        const float t1 = std::clamp((p2 - arrow_start).dot(axis) / safe_arrow_length, 0.f, 1.f);
+        const ColorRGBA c0 = black ? black_color : simple_gradient_arrow_color(start_color, end_color, t0);
+        const ColorRGBA c1 = black ? black_color : simple_gradient_arrow_color(start_color, end_color, t1);
+        const unsigned int i0 = simple_gradient_add_vertex(geometry, p0, r0, c0);
+        const unsigned int i1 = simple_gradient_add_vertex(geometry, p1, r1, c0);
+        const unsigned int i2 = simple_gradient_add_vertex(geometry, p2, r0, c1);
+        const unsigned int i3 = simple_gradient_add_vertex(geometry, p3, r1, c1);
+        geometry.add_triangle(i0, i2, i1);
+        geometry.add_triangle(i1, i2, i3);
+        geometry.add_triangle(start_center, i1, i0);
+    }
+}
+
+void append_simple_gradient_cone(GUI::GLModel::Geometry &geometry,
+                                 const Vec3f &base,
+                                 const Vec3f &tip,
+                                 const Vec3f &arrow_start,
+                                 float arrow_length,
+                                 const Vec3f &axis,
+                                 const Vec3f &u,
+                                 const Vec3f &v,
+                                 float radius,
+                                 const std::array<float, 3> &start_color,
+                                 const std::array<float, 3> &end_color,
+                                 bool black)
+{
+    constexpr int sectors = 32;
+    const ColorRGBA black_color = ColorRGBA::BLACK();
+    const float safe_arrow_length = std::max(0.0001f, arrow_length);
+    const float tip_t = std::clamp((tip - arrow_start).dot(axis) / safe_arrow_length, 0.f, 1.f);
+    const ColorRGBA tip_color = black ? black_color : simple_gradient_arrow_color(start_color, end_color, tip_t);
+    for (int i = 0; i < sectors; ++i) {
+        const float a0 = 2.f * float(PI) * float(i) / float(sectors);
+        const float a1 = 2.f * float(PI) * float(i + 1) / float(sectors);
+        const Vec3f r0 = std::cos(a0) * u + std::sin(a0) * v;
+        const Vec3f r1 = std::cos(a1) * u + std::sin(a1) * v;
+        const Vec3f p0 = base + radius * r0;
+        const Vec3f p1 = base + radius * r1;
+        const float base_t = std::clamp((base - arrow_start).dot(axis) / safe_arrow_length, 0.f, 1.f);
+        const ColorRGBA base_color = black ? black_color : simple_gradient_arrow_color(start_color, end_color, base_t);
+        const Vec3f n0 = (r0 + axis * 0.35f).normalized();
+        const Vec3f n1 = (r1 + axis * 0.35f).normalized();
+        const unsigned int i0 = simple_gradient_add_vertex(geometry, p0, n0, base_color);
+        const unsigned int i1 = simple_gradient_add_vertex(geometry, p1, n1, base_color);
+        const unsigned int i2 = simple_gradient_add_vertex(geometry, tip, axis, tip_color);
+        geometry.add_triangle(i0, i2, i1);
+    }
+}
+
+void append_simple_gradient_sphere(GUI::GLModel::Geometry &geometry,
+                                   const Vec3f &center,
+                                   float radius,
+                                   const ColorRGBA &color)
+{
+    constexpr int sectors = 32;
+    constexpr int stacks = 16;
+    std::vector<std::vector<unsigned int>> ids(size_t(stacks + 1), std::vector<unsigned int>(size_t(sectors + 1), 0));
+    for (int stack = 0; stack <= stacks; ++stack) {
+        const float phi = 0.5f * float(PI) - float(PI) * float(stack) / float(stacks);
+        const float z = std::sin(phi);
+        const float xy = std::cos(phi);
+        for (int sector = 0; sector <= sectors; ++sector) {
+            const float theta = 2.f * float(PI) * float(sector) / float(sectors);
+            const Vec3f normal(xy * std::cos(theta), xy * std::sin(theta), z);
+            ids[size_t(stack)][size_t(sector)] =
+                simple_gradient_add_vertex(geometry, center + radius * normal, normal, color);
+        }
+    }
+    for (int stack = 0; stack < stacks; ++stack) {
+        for (int sector = 0; sector < sectors; ++sector) {
+            const unsigned int a = ids[size_t(stack)][size_t(sector)];
+            const unsigned int b = ids[size_t(stack + 1)][size_t(sector)];
+            const unsigned int c = ids[size_t(stack)][size_t(sector + 1)];
+            const unsigned int d = ids[size_t(stack + 1)][size_t(sector + 1)];
+            if (stack != 0)
+                geometry.add_triangle(a, b, c);
+            if (stack + 1 != stacks)
+                geometry.add_triangle(c, b, d);
+        }
+    }
+}
+
+void append_simple_gradient_arrow(GUI::GLModel::Geometry &geometry,
+                                  const Vec3f &start,
+                                  const Vec3f &end,
+                                  float radius,
+                                  float head_radius,
+                                  float head_length,
+                                  const std::array<float, 3> &start_color,
+                                  const std::array<float, 3> &end_color,
+                                  bool black)
+{
+    const Vec3f delta = end - start;
+    const float length = delta.norm();
+    if (length <= 1e-6f)
+        return;
+    const Vec3f axis = delta / length;
+    Vec3f u;
+    Vec3f v;
+    simple_gradient_arrow_basis(axis, u, v);
+    float clamped_head_length = std::min(head_length, length * 0.75f);
+    clamped_head_length = std::max(clamped_head_length, std::min(radius * 2.f, length * 0.5f));
+    const Vec3f shaft_end = start + axis * std::max(radius, length - clamped_head_length);
+    append_simple_gradient_cylinder(geometry, start, shaft_end, start, length, axis, u, v, radius, start_color, end_color, black);
+    append_simple_gradient_cone(geometry, shaft_end, end, start, length, axis, u, v, head_radius, start_color, end_color, black);
 }
 
 } // namespace
@@ -2602,6 +2915,157 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType       type,
         glsafe(::glEnable(GL_CULL_FACE));
 
     if (type == ERenderType::Transparent)
+        glsafe(::glDisable(GL_BLEND));
+}
+
+void GLVolumeCollection::render_simple_gradient_direction_arrows(const Transform3d &view_matrix,
+                                                                 const Transform3d &projection_matrix) const
+{
+    const PresetBundle *bundle = GUI::wxGetApp().preset_bundle;
+    if (bundle == nullptr)
+        return;
+    const ConfigOptionStrings *colors_opt = bundle->project_config.option<ConfigOptionStrings>("filament_colour");
+    if (colors_opt == nullptr || colors_opt->values.empty())
+        return;
+
+    const std::vector<std::string> &filament_colors = colors_opt->values;
+    const size_t num_physical = filament_colors.size();
+    const TextureMappingManager &texture_mgr = bundle->texture_mapping_zones;
+
+    GUI::GLModel::Geometry black_geometry;
+    black_geometry.format = { GUI::GLModel::Geometry::EPrimitiveType::Triangles, GUI::GLModel::Geometry::EVertexLayout::P3N3C4 };
+    GUI::GLModel::Geometry color_geometry;
+    color_geometry.format = { GUI::GLModel::Geometry::EPrimitiveType::Triangles, GUI::GLModel::Geometry::EVertexLayout::P3N3C4 };
+
+    for (const TextureMappingZone &zone : texture_mgr.zones()) {
+        if (!zone.enabled || zone.deleted || !zone.is_simple_gradient() || !zone.show_simple_gradient_direction_arrow)
+            continue;
+
+        const std::vector<unsigned int> component_ids = simple_gradient_component_ids_for_arrow(zone, num_physical);
+        if (component_ids.size() < 2)
+            continue;
+
+        const SimpleGradientArrowUsage usage = simple_gradient_arrow_usage(volumes, zone.zone_id);
+        const std::optional<Vec3f> start_anchor = simple_gradient_anchor_global_point(zone.simple_gradient_start);
+        const std::optional<Vec3f> end_anchor = simple_gradient_anchor_global_point(zone.simple_gradient_end);
+        if (!usage.any && !start_anchor && !end_anchor)
+            continue;
+
+        Vec3f start = start_anchor ? *start_anchor : usage.default_start;
+        Vec3f end = end_anchor ? *end_anchor : usage.default_end;
+        if (!start_anchor && !usage.any)
+            start = end - Vec3f::UnitZ();
+        if (!end_anchor && !usage.any)
+            end = start + Vec3f::UnitZ();
+        if (!simple_gradient_vec3_is_finite(start) || !simple_gradient_vec3_is_finite(end))
+            continue;
+
+        Vec3f delta = end - start;
+        float length = delta.norm();
+        if (length <= 1e-5f) {
+            if (usage.any) {
+                start = usage.default_start;
+                end = usage.default_end;
+                delta = end - start;
+                length = delta.norm();
+            }
+            if (length <= 1e-5f)
+                continue;
+        }
+
+        const std::array<float, 3> start_color = simple_gradient_filament_color(component_ids[0], filament_colors);
+        const std::array<float, 3> end_color = simple_gradient_filament_color(component_ids[1], filament_colors);
+        const float shaft_radius = std::clamp(length * 0.018f, 0.35f, 2.2f);
+        const float head_length = std::min(length * 0.24f, std::max(shaft_radius * 4.f, length * 0.12f));
+        const float head_radius = shaft_radius * 3.1f;
+        append_simple_gradient_arrow(black_geometry,
+                                     start,
+                                     end,
+                                     shaft_radius * 1.55f,
+                                     head_radius * 1.28f,
+                                     head_length,
+                                     start_color,
+                                     end_color,
+                                     true);
+        append_simple_gradient_arrow(color_geometry,
+                                     start,
+                                     end,
+                                     shaft_radius,
+                                     head_radius,
+                                     head_length,
+                                     start_color,
+                                     end_color,
+                                     false);
+
+        const float sphere_radius = shaft_radius * 2.45f;
+        if (start_anchor)
+            append_simple_gradient_sphere(black_geometry, *start_anchor, sphere_radius, ColorRGBA::BLACK());
+        if (end_anchor)
+            append_simple_gradient_sphere(black_geometry, *end_anchor, sphere_radius, ColorRGBA::BLACK());
+    }
+
+    if (black_geometry.is_empty() && color_geometry.is_empty())
+        return;
+
+    GLShaderProgram *shader = GUI::wxGetApp().get_shader("flat_vertex_color");
+    if (shader == nullptr)
+        return;
+
+    GLboolean depth_test_enabled = glIsEnabled(GL_DEPTH_TEST);
+    GLboolean blend_enabled = glIsEnabled(GL_BLEND);
+    GLboolean cull_face_enabled = glIsEnabled(GL_CULL_FACE);
+    GLboolean depth_mask = GL_TRUE;
+    GLint depth_func = GL_LESS;
+    GLint cull_face_mode = GL_BACK;
+    GLenum blend_src_rgb = GL_ONE;
+    GLenum blend_dst_rgb = GL_ZERO;
+    GLenum blend_src_alpha = GL_ONE;
+    GLenum blend_dst_alpha = GL_ZERO;
+    glsafe(::glGetBooleanv(GL_DEPTH_WRITEMASK, &depth_mask));
+    glsafe(::glGetIntegerv(GL_DEPTH_FUNC, &depth_func));
+    glsafe(::glGetIntegerv(GL_CULL_FACE_MODE, &cull_face_mode));
+    glsafe(::glGetIntegerv(GL_BLEND_SRC_RGB, reinterpret_cast<GLint *>(&blend_src_rgb)));
+    glsafe(::glGetIntegerv(GL_BLEND_DST_RGB, reinterpret_cast<GLint *>(&blend_dst_rgb)));
+    glsafe(::glGetIntegerv(GL_BLEND_SRC_ALPHA, reinterpret_cast<GLint *>(&blend_src_alpha)));
+    glsafe(::glGetIntegerv(GL_BLEND_DST_ALPHA, reinterpret_cast<GLint *>(&blend_dst_alpha)));
+
+    glsafe(::glDisable(GL_DEPTH_TEST));
+    glsafe(::glDepthMask(GL_FALSE));
+    glsafe(::glDisable(GL_CULL_FACE));
+    glsafe(::glEnable(GL_BLEND));
+    glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
+
+    shader->start_using();
+    shader->set_uniform("view_model_matrix", view_matrix);
+    shader->set_uniform("projection_matrix", projection_matrix);
+
+    if (!black_geometry.is_empty()) {
+        GUI::GLModel black_model;
+        black_model.init_from(std::move(black_geometry));
+        black_model.render(shader);
+    }
+    if (!color_geometry.is_empty()) {
+        GUI::GLModel color_model;
+        color_model.init_from(std::move(color_geometry));
+        color_model.render(shader);
+    }
+
+    shader->stop_using();
+    glsafe(::glBlendFuncSeparate(blend_src_rgb, blend_dst_rgb, blend_src_alpha, blend_dst_alpha));
+    glsafe(::glCullFace(cull_face_mode));
+    if (cull_face_enabled)
+        glsafe(::glEnable(GL_CULL_FACE));
+    else
+        glsafe(::glDisable(GL_CULL_FACE));
+    glsafe(::glDepthFunc(depth_func));
+    glsafe(::glDepthMask(depth_mask));
+    if (depth_test_enabled)
+        glsafe(::glEnable(GL_DEPTH_TEST));
+    else
+        glsafe(::glDisable(GL_DEPTH_TEST));
+    if (blend_enabled)
+        glsafe(::glEnable(GL_BLEND));
+    else
         glsafe(::glDisable(GL_BLEND));
 }
 

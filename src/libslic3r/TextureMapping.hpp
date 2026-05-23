@@ -4,7 +4,9 @@
 #define slic3r_TextureMapping_hpp_
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -18,7 +20,8 @@ struct TextureMappingZone
 
     enum SurfacePattern : uint8_t {
         ImageTexture = 0,
-        Gradient2D   = 1
+        Gradient2D   = 1,
+        SimpleGradient = 2
     };
 
     enum OffsetControlMode : uint8_t {
@@ -141,6 +144,14 @@ struct TextureMappingZone
     static constexpr bool  DefaultPreviewLimitResolution = true;
     static constexpr bool  DefaultAutoAdjustFilamentSelection = true;
 
+    struct SimpleGradientAnchor {
+        bool valid = false;
+        size_t object_id = 0;
+        size_t instance_id = 0;
+        std::array<float, 3> local_point { { 0.f, 0.f, 0.f } };
+        std::array<float, 3> global_point { { 0.f, 0.f, 0.f } };
+    };
+
     uint64_t     stable_id = 0;
     unsigned int zone_id = 0;
     bool         enabled = true;
@@ -196,9 +207,14 @@ struct TextureMappingZone
     std::vector<float> filament_strengths_pct;
     std::vector<float> filament_minimum_offsets_pct;
     std::vector<float> filament_transmission_distances_mm;
+    SimpleGradientAnchor simple_gradient_start;
+    SimpleGradientAnchor simple_gradient_end;
+    bool show_simple_gradient_direction_arrow = true;
 
     bool is_image_texture() const { return surface_pattern == int(ImageTexture); }
     bool is_2d_gradient() const { return surface_pattern == int(Gradient2D); }
+    bool is_simple_gradient() const { return surface_pattern == int(SimpleGradient); }
+    bool is_surface_gradient() const { return is_2d_gradient() || is_simple_gradient(); }
     bool uses_perimeter_path_modulation() const { return modulation_mode == int(ModulationPerimeterPath); }
 
     void reset_offset_settings()
@@ -250,6 +266,12 @@ struct TextureMappingZone
         filament_strengths_pct.clear();
         filament_minimum_offsets_pct.clear();
         filament_transmission_distances_mm.clear();
+    }
+
+    void clear_simple_gradient_points()
+    {
+        simple_gradient_start = {};
+        simple_gradient_end = {};
     }
 
     bool has_custom_offset_settings() const

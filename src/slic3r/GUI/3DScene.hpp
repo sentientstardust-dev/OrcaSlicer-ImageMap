@@ -584,6 +584,8 @@ public:
                 std::function<bool(const GLVolume &)> filter_func   = std::function<bool(const GLVolume &)>(),
                 bool                                  partly_inside_enable =true
            ) const;
+    void render_simple_gradient_direction_arrows(const Transform3d &view_matrix,
+                                                 const Transform3d &projection_matrix) const;
 
     // Clear the geometry
     void clear() { clear_texture_preview_simulation_cache(); for (auto *v : volumes) delete v; volumes.clear(); }
