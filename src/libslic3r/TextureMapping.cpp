@@ -498,25 +498,37 @@ static std::array<float, 3> point3_from_json(const nlohmann::json &value)
     return out;
 }
 
-static nlohmann::json simple_gradient_anchor_to_json(const TextureMappingZone::SimpleGradientAnchor &anchor)
+static nlohmann::json linear_gradient_anchor_to_json(const TextureMappingZone::LinearGradientAnchor &anchor)
 {
     nlohmann::json out;
     out["valid"] = anchor.valid;
     out["object_id"] = anchor.object_id;
     out["instance_id"] = anchor.instance_id;
+    out["object_backup_id"] = anchor.object_backup_id;
+    out["object_index_valid"] = anchor.object_index_valid;
+    out["object_index"] = anchor.object_index;
+    out["instance_index_valid"] = anchor.instance_index_valid;
+    out["instance_index"] = anchor.instance_index;
+    out["instance_loaded_id"] = anchor.instance_loaded_id;
     out["local_point"] = point3_to_json(anchor.local_point);
     out["global_point"] = point3_to_json(anchor.global_point);
     return out;
 }
 
-static TextureMappingZone::SimpleGradientAnchor simple_gradient_anchor_from_json(const nlohmann::json &value)
+static TextureMappingZone::LinearGradientAnchor linear_gradient_anchor_from_json(const nlohmann::json &value)
 {
-    TextureMappingZone::SimpleGradientAnchor out;
+    TextureMappingZone::LinearGradientAnchor out;
     if (!value.is_object())
         return out;
     out.valid = value.value("valid", false);
     out.object_id = value.value("object_id", size_t(0));
     out.instance_id = value.value("instance_id", size_t(0));
+    out.object_backup_id = value.value("object_backup_id", -1);
+    out.object_index_valid = value.value("object_index_valid", false);
+    out.object_index = value.value("object_index", size_t(0));
+    out.instance_index_valid = value.value("instance_index_valid", false);
+    out.instance_index = value.value("instance_index", size_t(0));
+    out.instance_loaded_id = value.value("instance_loaded_id", size_t(0));
     out.local_point = point3_from_json(value.value("local_point", nlohmann::json::array()));
     out.global_point = point3_from_json(value.value("global_point", nlohmann::json::array()));
     return out;
@@ -526,8 +538,8 @@ static std::string surface_pattern_name(int surface_pattern)
 {
     if (surface_pattern == int(TextureMappingZone::Gradient2D))
         return "2d_gradient";
-    if (surface_pattern == int(TextureMappingZone::SimpleGradient))
-        return "simple_gradient";
+    if (surface_pattern == int(TextureMappingZone::LinearGradient))
+        return "linear_gradient";
     return "image_texture";
 }
 
@@ -535,8 +547,8 @@ static int surface_pattern_from_name(const std::string &name)
 {
     if (name == "2d_gradient" || name == "surface_gradient")
         return int(TextureMappingZone::Gradient2D);
-    if (name == "simple_gradient" || name == "linear_gradient")
-        return int(TextureMappingZone::SimpleGradient);
+    if (name == "linear_gradient")
+        return int(TextureMappingZone::LinearGradient);
     return int(TextureMappingZone::ImageTexture);
 }
 
@@ -889,11 +901,17 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
                 return false;
         return true;
     };
-    auto anchors_equal = [eps](const TextureMappingZone::SimpleGradientAnchor &lhs,
-                               const TextureMappingZone::SimpleGradientAnchor &rhs_values) {
+    auto anchors_equal = [eps](const TextureMappingZone::LinearGradientAnchor &lhs,
+                               const TextureMappingZone::LinearGradientAnchor &rhs_values) {
         if (lhs.valid != rhs_values.valid ||
             lhs.object_id != rhs_values.object_id ||
-            lhs.instance_id != rhs_values.instance_id)
+            lhs.instance_id != rhs_values.instance_id ||
+            lhs.object_backup_id != rhs_values.object_backup_id ||
+            lhs.object_index_valid != rhs_values.object_index_valid ||
+            lhs.object_index != rhs_values.object_index ||
+            lhs.instance_index_valid != rhs_values.instance_index_valid ||
+            lhs.instance_index != rhs_values.instance_index ||
+            lhs.instance_loaded_id != rhs_values.instance_loaded_id)
             return false;
         for (size_t i = 0; i < 3; ++i) {
             if (std::abs(lhs.local_point[i] - rhs_values.local_point[i]) > eps ||
@@ -956,9 +974,9 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            floats_equal(filament_strengths_pct, rhs.filament_strengths_pct) &&
            floats_equal(filament_minimum_offsets_pct, rhs.filament_minimum_offsets_pct) &&
            floats_equal(filament_transmission_distances_mm, rhs.filament_transmission_distances_mm) &&
-           anchors_equal(simple_gradient_start, rhs.simple_gradient_start) &&
-           anchors_equal(simple_gradient_end, rhs.simple_gradient_end) &&
-           show_simple_gradient_direction_arrow == rhs.show_simple_gradient_direction_arrow;
+           anchors_equal(linear_gradient_start, rhs.linear_gradient_start) &&
+           anchors_equal(linear_gradient_end, rhs.linear_gradient_end) &&
+           show_linear_gradient_direction_arrow == rhs.show_linear_gradient_direction_arrow;
 }
 
 uint64_t TextureMappingManager::allocate_stable_id()
@@ -1031,9 +1049,9 @@ void TextureMappingManager::remove_physical_filament(unsigned int deleted_filame
             zone.component_a = ids[0];
             zone.component_b = ids[1];
         }
-        if (zone.is_simple_gradient() && ids.size() > 2)
+        if (zone.is_linear_gradient() && ids.size() > 2)
             ids.resize(2);
-        if (zone.is_simple_gradient() && ids.size() >= 2) {
+        if (zone.is_linear_gradient() && ids.size() >= 2) {
             zone.component_a = ids[0];
             zone.component_b = ids[1];
         }
@@ -1065,7 +1083,7 @@ TextureMappingZone *TextureMappingManager::add_zone(size_t num_physical,
     if (zone.zone_id == 0)
         return nullptr;
     zone.surface_pattern =
-        surface_pattern == int(TextureMappingZone::Gradient2D) || surface_pattern == int(TextureMappingZone::SimpleGradient) ?
+        surface_pattern == int(TextureMappingZone::Gradient2D) || surface_pattern == int(TextureMappingZone::LinearGradient) ?
             surface_pattern :
             int(TextureMappingZone::ImageTexture);
 
@@ -1166,11 +1184,11 @@ std::string TextureMappingManager::serialize_entries()
                 return id == 0 || id > 9;
             }), component_ids.end());
         }
-        if (zone.is_simple_gradient() && component_ids.size() > 2)
+        if (zone.is_linear_gradient() && component_ids.size() > 2)
             component_ids.resize(2);
         unsigned int anchor_a = zone.component_a;
         unsigned int anchor_b = zone.component_b;
-        if (zone.is_simple_gradient() && component_ids.size() >= 2) {
+        if (zone.is_linear_gradient() && component_ids.size() >= 2) {
             anchor_a = component_ids[0];
             anchor_b = component_ids[1];
         }
@@ -1194,12 +1212,12 @@ std::string TextureMappingManager::serialize_entries()
         entry["component_filaments"] = ids_to_json(component_ids);
         entry["component_weights_pct"] = weights_to_json(normalized_weights, component_ids.size());
         entry["display_color"] = zone.display_color;
-        if (zone.is_simple_gradient()) {
-            nlohmann::json simple_gradient;
-            simple_gradient["start"] = simple_gradient_anchor_to_json(zone.simple_gradient_start);
-            simple_gradient["end"] = simple_gradient_anchor_to_json(zone.simple_gradient_end);
-            simple_gradient["show_direction_arrow"] = zone.show_simple_gradient_direction_arrow;
-            entry["simple_gradient"] = std::move(simple_gradient);
+        if (zone.is_linear_gradient()) {
+            nlohmann::json linear_gradient;
+            linear_gradient["start"] = linear_gradient_anchor_to_json(zone.linear_gradient_start);
+            linear_gradient["end"] = linear_gradient_anchor_to_json(zone.linear_gradient_end);
+            linear_gradient["show_direction_arrow"] = zone.show_linear_gradient_direction_arrow;
+            entry["linear_gradient"] = std::move(linear_gradient);
         }
 
         nlohmann::json texture;
@@ -1339,9 +1357,9 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.enabled = entry.value("enabled", true);
         zone.deleted = false;
         zone.surface_pattern = surface_pattern_from_name(entry.value("surface_pattern", std::string("image_texture")));
-        if (zone.is_simple_gradient() && component_ids.size() > 2)
+        if (zone.is_linear_gradient() && component_ids.size() > 2)
             component_ids.resize(2);
-        if (zone.is_simple_gradient() && component_ids.size() >= 2) {
+        if (zone.is_linear_gradient() && component_ids.size() >= 2) {
             zone.component_a = component_ids[0];
             zone.component_b = component_ids[1];
         }
@@ -1351,11 +1369,11 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.display_color = entry.value("display_color", std::string());
         if (zone.display_color.empty() || zone.display_color[0] != '#')
             zone.display_color = random_display_color(zone.stable_id);
-        if (zone.is_simple_gradient()) {
-            const nlohmann::json simple_gradient = entry.value("simple_gradient", nlohmann::json::object());
-            zone.simple_gradient_start = simple_gradient_anchor_from_json(simple_gradient.value("start", nlohmann::json::object()));
-            zone.simple_gradient_end = simple_gradient_anchor_from_json(simple_gradient.value("end", nlohmann::json::object()));
-            zone.show_simple_gradient_direction_arrow = simple_gradient.value("show_direction_arrow", true);
+        if (zone.is_linear_gradient()) {
+            const nlohmann::json linear_gradient = entry.value("linear_gradient", nlohmann::json::object());
+            zone.linear_gradient_start = linear_gradient_anchor_from_json(linear_gradient.value("start", nlohmann::json::object()));
+            zone.linear_gradient_end = linear_gradient_anchor_from_json(linear_gradient.value("end", nlohmann::json::object()));
+            zone.show_linear_gradient_direction_arrow = linear_gradient.value("show_direction_arrow", true);
         }
 
         const nlohmann::json texture = entry.value("texture_options", nlohmann::json::object());
@@ -1638,7 +1656,7 @@ std::vector<unsigned int> TextureMappingManager::selected_component_ids(const Te
 {
     std::vector<unsigned int> ids = decode_component_ids(zone.component_ids, num_physical);
     if (!ids.empty()) {
-        if (zone.is_simple_gradient() && ids.size() > 2)
+        if (zone.is_linear_gradient() && ids.size() > 2)
             ids.resize(2);
         return ids;
     }
@@ -1647,7 +1665,7 @@ std::vector<unsigned int> TextureMappingManager::selected_component_ids(const Te
         ids.emplace_back(zone.component_a);
     if (zone.component_b >= 1 && zone.component_b <= num_physical && zone.component_b != zone.component_a)
         ids.emplace_back(zone.component_b);
-    if (zone.is_simple_gradient() && ids.size() > 2)
+    if (zone.is_linear_gradient() && ids.size() > 2)
         ids.resize(2);
     return ids;
 }

@@ -3,7 +3,7 @@
 const vec3 ZERO = vec3(0.0, 0.0, 0.0);
 const float INVALID_TEXTURE_CHECKER_SCALE = 0.2;
 const int MAX_GRADIENT_COMPONENTS = 10;
-const int MAX_SIMPLE_GRADIENT_LUT_COLORS = 33;
+const int MAX_LINEAR_GRADIENT_LUT_COLORS = 33;
 const float EPSILON = 0.000001;
 
 struct PrintVolumeDetection
@@ -37,11 +37,11 @@ uniform int gradient_fade_mode;
 uniform vec3 gradient_center;
 uniform float gradient_z_min;
 uniform float gradient_z_max;
-uniform bool gradient_simple_mode;
-uniform vec3 gradient_simple_start;
-uniform vec3 gradient_simple_end;
-uniform int gradient_simple_lut_count;
-uniform vec3 gradient_simple_lut_colors[MAX_SIMPLE_GRADIENT_LUT_COLORS];
+uniform bool gradient_linear_mode;
+uniform vec3 gradient_linear_start;
+uniform vec3 gradient_linear_end;
+uniform int gradient_linear_lut_count;
+uniform vec3 gradient_linear_lut_colors[MAX_LINEAR_GRADIENT_LUT_COLORS];
 
 in vec2 intensity;
 in vec3 clipping_planes_dots;
@@ -178,29 +178,29 @@ float variable_width_delta(float inset_strength, float max_width_delta_limit_mm,
     return clamp(max_width_delta_limit_mm * (1.0 - adjusted_width_factor), 0.0, max_width_delta_limit_mm);
 }
 
-vec3 simple_gradient_lut_color(float t)
+vec3 linear_gradient_lut_color(float t)
 {
-    int count = min(gradient_simple_lut_count, MAX_SIMPLE_GRADIENT_LUT_COLORS);
+    int count = min(gradient_linear_lut_count, MAX_LINEAR_GRADIENT_LUT_COLORS);
     if (count <= 0)
         return clamp(gradient_base_color, 0.0, 1.0);
     if (count == 1)
-        return clamp(gradient_simple_lut_colors[0], 0.0, 1.0);
+        return clamp(gradient_linear_lut_colors[0], 0.0, 1.0);
 
     float scaled = clamp(t, 0.0, 1.0) * float(count - 1);
     int lower = int(floor(scaled));
     int upper = min(lower + 1, count - 1);
     float f = scaled - float(lower);
-    return clamp(mix(gradient_simple_lut_colors[lower], gradient_simple_lut_colors[upper], f), 0.0, 1.0);
+    return clamp(mix(gradient_linear_lut_colors[lower], gradient_linear_lut_colors[upper], f), 0.0, 1.0);
 }
 
-vec3 simple_gradient_color(int count)
+vec3 linear_gradient_color(int count)
 {
-    vec3 direction_vec = gradient_simple_end - gradient_simple_start;
+    vec3 direction_vec = gradient_linear_end - gradient_linear_start;
     float denom = dot(direction_vec, direction_vec);
-    float t = denom > EPSILON ? clamp(dot(world_pos.xyz - gradient_simple_start, direction_vec) / denom, 0.0, 1.0) : 0.0;
+    float t = denom > EPSILON ? clamp(dot(world_pos.xyz - gradient_linear_start, direction_vec) / denom, 0.0, 1.0) : 0.0;
     if (count <= 0)
         return clamp(gradient_base_color, 0.0, 1.0);
-    return simple_gradient_lut_color(t);
+    return linear_gradient_lut_color(t);
 }
 
 vec3 surface_gradient_color()
@@ -208,8 +208,8 @@ vec3 surface_gradient_color()
     int count = min(gradient_component_count, MAX_GRADIENT_COMPONENTS);
     if (count <= 0)
         return uniform_color.rgb;
-    if (gradient_simple_mode)
-        return simple_gradient_color(count);
+    if (gradient_linear_mode)
+        return linear_gradient_color(count);
 
     float z_span = gradient_z_max - gradient_z_min;
     float z_progress = z_span > EPSILON ? clamp((world_pos.z - gradient_z_min) / z_span, 0.0, 1.0) : 0.0;

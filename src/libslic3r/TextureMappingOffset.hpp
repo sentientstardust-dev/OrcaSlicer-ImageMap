@@ -53,7 +53,7 @@ struct TextureMappingOffsetWeightField {
 
 struct TextureMappingOffsetContext {
     bool                            vertex_color_match_mode { false };
-    bool                            simple_gradient_mode { false };
+    bool                            linear_gradient_mode { false };
     bool                            object_center_mode { false };
     bool                            high_resolution_texture_sampling { false };
     bool                            compact_offset_mode { false };
@@ -62,8 +62,8 @@ struct TextureMappingOffsetContext {
     bool                            halftone_increased_detail_enabled { false };
     bool                            nonlinear_offset_adjustment { false };
     Point                           object_center;
-    Vec3f                           simple_gradient_start_mm { Vec3f::Zero() };
-    Vec3f                           simple_gradient_end_mm { Vec3f::Zero() };
+    Vec3f                           linear_gradient_start_mm { Vec3f::Zero() };
+    Vec3f                           linear_gradient_end_mm { Vec3f::Zero() };
     unsigned int                    active_component_id { 0 };
     size_t                          active_component_idx { size_t(-1) };
     std::vector<unsigned int>       component_ids;

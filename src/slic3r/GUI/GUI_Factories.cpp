@@ -55,8 +55,8 @@ static int filaments_count()
 
 static wxString texture_mapping_menu_label(const TextureMappingZone &zone)
 {
-    if (zone.is_simple_gradient())
-        return _L("Texture Mapping Simple Gradient");
+    if (zone.is_linear_gradient())
+        return _L("Texture Mapping Linear Gradient");
     if (zone.is_2d_gradient())
         return _L("Texture Mapping 2D Gradient");
     const std::string color_model = TextureMappingManager::filament_color_mode_name(zone.filament_color_mode);

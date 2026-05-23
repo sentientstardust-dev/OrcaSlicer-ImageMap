@@ -592,6 +592,8 @@ Model& Model::assign_copy(const Model &rhs)
     this->md_value = rhs.md_value;
     this->texture_mapping_prime_tower_image = rhs.texture_mapping_prime_tower_image;
     this->texture_mapping_prime_tower_image_back = rhs.texture_mapping_prime_tower_image_back;
+    this->texture_mapping_definitions = rhs.texture_mapping_definitions;
+    this->texture_mapping_definitions_valid = rhs.texture_mapping_definitions_valid;
 
     return *this;
 }
@@ -629,6 +631,8 @@ Model& Model::assign_copy(Model &&rhs)
     this->md_value = rhs.md_value;
     this->texture_mapping_prime_tower_image = std::move(rhs.texture_mapping_prime_tower_image);
     this->texture_mapping_prime_tower_image_back = std::move(rhs.texture_mapping_prime_tower_image_back);
+    this->texture_mapping_definitions = std::move(rhs.texture_mapping_definitions);
+    this->texture_mapping_definitions_valid = rhs.texture_mapping_definitions_valid;
     this->backup_path = std::move(rhs.backup_path);
     this->object_backup_id_map = std::move(rhs.object_backup_id_map);
     this->next_object_backup_id = rhs.next_object_backup_id;
@@ -1345,6 +1349,12 @@ int Model::get_object_backup_id(ModelObject const& object) const
     return object_backup_id_map.find(object.id().id)->second;
 }
 
+int Model::find_object_backup_id(ModelObject const& object) const
+{
+    auto it = object_backup_id_map.find(object.id().id);
+    return it == object_backup_id_map.end() ? -1 : it->second;
+}
+
 void Model::delete_material(t_model_material_id material_id)
 {
     ModelMaterialMap::iterator i = this->materials.find(material_id);
@@ -1786,6 +1796,8 @@ void Model::load_from(Model& model)
     md_value = model.md_value;
     texture_mapping_prime_tower_image = std::move(model.texture_mapping_prime_tower_image);
     texture_mapping_prime_tower_image_back = std::move(model.texture_mapping_prime_tower_image_back);
+    texture_mapping_definitions = std::move(model.texture_mapping_definitions);
+    texture_mapping_definitions_valid = model.texture_mapping_definitions_valid;
     model.design_info.reset();
     model.model_info.reset();
     model.profile_info.reset();

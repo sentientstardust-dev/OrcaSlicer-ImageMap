@@ -738,6 +738,45 @@ static bool store_texture_mapping_definitions(PresetBundle &bundle)
     return true;
 }
 
+static void set_texture_mapping_definitions(PresetBundle &bundle, const std::string &serialized)
+{
+    DynamicPrintConfig &project_config = bundle.project_config;
+    if (ConfigOptionString *opt = project_config.option<ConfigOptionString>("texture_mapping_definitions"))
+        opt->value = serialized;
+    else
+        project_config.set_key_value("texture_mapping_definitions", new ConfigOptionString(serialized));
+
+    DynamicPrintConfig &print_config = bundle.prints.get_edited_preset().config;
+    if (ConfigOptionString *opt = print_config.option<ConfigOptionString>("texture_mapping_definitions"))
+        opt->value = serialized;
+    else
+        print_config.set_key_value("texture_mapping_definitions", new ConfigOptionString(serialized));
+}
+
+static void load_texture_mapping_definitions(PresetBundle &bundle, const std::string &serialized)
+{
+    set_texture_mapping_definitions(bundle, serialized);
+    const ConfigOptionStrings *color_opt = bundle.project_config.option<ConfigOptionStrings>("filament_colour", false);
+    bundle.texture_mapping_zones.load_entries(serialized, color_opt != nullptr ? color_opt->values : std::vector<std::string>());
+}
+
+static void sync_model_texture_mapping_definitions(Model &model, const std::string &serialized)
+{
+    model.texture_mapping_definitions = serialized;
+    model.texture_mapping_definitions_valid = true;
+}
+
+static void sync_current_model_texture_mapping_definitions(const std::string &serialized)
+{
+    if (Plater *plater = wxGetApp().plater(); plater != nullptr)
+        sync_model_texture_mapping_definitions(plater->model(), serialized);
+}
+
+static std::string serialize_texture_mapping_manager(TextureMappingManager *manager)
+{
+    return manager != nullptr ? manager->serialize_entries() : std::string();
+}
+
 static unsigned int ensure_texture_mapping_import_target_zone(PresetBundle &bundle, bool &changed)
 {
     DynamicPrintConfig &project_config = bundle.project_config;
@@ -844,9 +883,9 @@ static std::vector<unsigned int> texture_mapping_selected_ids(const TextureMappi
         for (size_t i = 1; i <= std::min<size_t>(num_physical, 9); ++i)
             ids.emplace_back(unsigned(i));
     }
-    if (ids.size() < 2)
+    if (ids.size() < 2 && num_physical >= 2)
         ids = {1, 2};
-    if (zone.is_simple_gradient() && ids.size() > 2)
+    if (zone.is_linear_gradient() && ids.size() > 2)
         ids.resize(2);
     return ids;
 }
@@ -942,7 +981,7 @@ static std::vector<wxString> texture_mapping_channel_labels(int filament_color_m
 static wxString texture_mapping_summary(const TextureMappingZone &zone, size_t num_physical)
 {
     const bool raw_offset = zone.is_image_texture() && zone.texture_mapping_mode == int(TextureMappingZone::TextureMappingRawValues);
-    wxString summary = zone.is_simple_gradient() ? _L("Simple Gradient") :
+    wxString summary = zone.is_linear_gradient() ? _L("Linear Gradient") :
         zone.is_2d_gradient() ? _L("2D Gradient") :
         from_u8(TextureMappingManager::filament_color_mode_name(zone.filament_color_mode));
     if (!zone.is_surface_gradient() && summary == "any")
@@ -965,8 +1004,8 @@ static wxString texture_mapping_summary(const TextureMappingZone &zone, size_t n
 
 static wxString texture_mapping_menu_label(const TextureMappingZone &zone)
 {
-    if (zone.is_simple_gradient())
-        return _L("Texture Mapping Simple Gradient");
+    if (zone.is_linear_gradient())
+        return _L("Texture Mapping Linear Gradient");
     if (zone.is_2d_gradient())
         return _L("Texture Mapping 2D Gradient");
     const std::string color_model = TextureMappingManager::filament_color_mode_name(zone.filament_color_mode);
@@ -1011,12 +1050,12 @@ public:
     void set_data(const std::vector<wxColour> &palette,
                   const std::vector<unsigned int> &component_ids,
                   const wxColour &fallback,
-                  bool simple_gradient = false)
+                  bool linear_gradient = false)
     {
         m_palette = palette;
         m_component_ids = component_ids;
         m_fallback = fallback.IsOk() ? fallback : wxColour("#26A69A");
-        m_simple_gradient = simple_gradient;
+        m_linear_gradient = linear_gradient;
         Refresh();
     }
 
@@ -1039,7 +1078,7 @@ private:
         dc.SetPen(*wxTRANSPARENT_PEN);
         dc.SetBrush(wxBrush(m_fallback));
         dc.DrawRectangle(rect);
-        if (m_simple_gradient && m_component_ids.size() >= 2) {
+        if (m_linear_gradient && m_component_ids.size() >= 2) {
             const wxColour start = color_for(m_component_ids[0]);
             const wxColour end = color_for(m_component_ids[1]);
             const int h = std::max(1, rect.GetHeight());
@@ -1068,7 +1107,7 @@ private:
     std::vector<wxColour>     m_palette;
     std::vector<unsigned int> m_component_ids;
     wxColour                  m_fallback {wxColour("#26A69A")};
-    bool                      m_simple_gradient { false };
+    bool                      m_linear_gradient { false };
 };
 
 class TextureMappingNumberSwatch : public wxPanel
@@ -6120,6 +6159,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
     mgr.normalize_zone_ids(num_physical);
     set_config_string("texture_mapping_definitions", mgr.serialize_entries());
     set_config_string("texture_mapping_global_settings", bundle->texture_mapping_global_settings.serialize());
+    sync_current_model_texture_mapping_definitions(mgr.serialize_entries());
 
     wxSizer *content_sizer = p->m_panel_texture_mapping_content->GetSizer();
     if (content_sizer == nullptr)
@@ -6190,6 +6230,55 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         return unsigned(combo->GetSelection() + 1);
     };
 
+    auto set_filament_combo_id = [](::ComboBox *combo, unsigned int id) {
+        if (combo == nullptr || combo->GetCount() <= 0 || id == 0)
+            return;
+        combo->SetSelection(std::clamp(int(id) - 1, 0, int(combo->GetCount() - 1)));
+    };
+
+    auto linear_gradient_filament_ids = [num_physical, filament_combo_id, set_filament_combo_id](::ComboBox *start_combo,
+                                                                                                 ::ComboBox *end_combo,
+                                                                                                 const TextureMappingZone &zone,
+                                                                                                 int changed_side) {
+        const unsigned int count = unsigned(std::min<size_t>(num_physical, 9));
+        std::vector<unsigned int> ids;
+        if (count == 0)
+            return ids;
+        auto normalize_id = [count](unsigned int id) {
+            return id >= 1 && id <= count ? id : 1u;
+        };
+        unsigned int start_id = normalize_id(filament_combo_id(start_combo, zone.component_a));
+        unsigned int end_id = normalize_id(filament_combo_id(end_combo, zone.component_b));
+        auto different_id = [count](unsigned int id) {
+            for (unsigned int candidate = 1; candidate <= count; ++candidate)
+                if (candidate != id)
+                    return candidate;
+            return id;
+        };
+        if (count == 1) {
+            start_id = 1;
+            end_id = 1;
+        } else if (start_id == end_id) {
+            if (changed_side == 1) {
+                end_id = normalize_id(zone.component_a);
+                if (end_id == start_id)
+                    end_id = different_id(start_id);
+            } else if (changed_side == 2) {
+                start_id = normalize_id(zone.component_b);
+                if (start_id == end_id)
+                    start_id = different_id(end_id);
+            } else {
+                end_id = normalize_id(zone.component_b);
+                if (end_id == start_id)
+                    end_id = different_id(start_id);
+            }
+        }
+        set_filament_combo_id(start_combo, start_id);
+        set_filament_combo_id(end_combo, end_id);
+        ids = {start_id, end_id};
+        return ids;
+    };
+
     auto repaint_sidebar_checkbox = [](::CheckBox *checkbox) {
         if (checkbox == nullptr)
             return;
@@ -6243,7 +6332,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             visible_zone_indices.emplace_back(idx);
 
     auto surface_pattern_selection = [](const TextureMappingZone &zone) {
-        if (zone.is_simple_gradient())
+        if (zone.is_linear_gradient())
             return 1;
         if (zone.is_2d_gradient())
             return 2;
@@ -6252,7 +6341,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
 
     auto surface_pattern_from_selection = [](int selection) {
         if (selection == 1)
-            return int(TextureMappingZone::SimpleGradient);
+            return int(TextureMappingZone::LinearGradient);
         if (selection == 2)
             return int(TextureMappingZone::Gradient2D);
         return int(TextureMappingZone::ImageTexture);
@@ -6276,11 +6365,11 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         before_gcode.preview_opacity_pct = TextureMappingZone::DefaultPreviewOpacityPct;
         before_gcode.preview_simulate_colors = TextureMappingZone::DefaultPreviewSimulateColors;
         before_gcode.preview_limit_resolution = TextureMappingZone::DefaultPreviewLimitResolution;
-        before_gcode.show_simple_gradient_direction_arrow = false;
+        before_gcode.show_linear_gradient_direction_arrow = false;
         after_gcode.preview_opacity_pct = TextureMappingZone::DefaultPreviewOpacityPct;
         after_gcode.preview_simulate_colors = TextureMappingZone::DefaultPreviewSimulateColors;
         after_gcode.preview_limit_resolution = TextureMappingZone::DefaultPreviewLimitResolution;
-        after_gcode.show_simple_gradient_direction_arrow = false;
+        after_gcode.show_linear_gradient_direction_arrow = false;
         return before != after && before_gcode == after_gcode;
     };
 
@@ -6298,11 +6387,12 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
     };
 
     auto texture_mapping_zone_affects_scene = [print_cfg](unsigned int zone_id) {
-        return model_uses_texture_mapping_zone_id(wxGetApp().model(), print_cfg, zone_id);
+        const Plater *plater = wxGetApp().plater();
+        return plater != nullptr && model_uses_texture_mapping_zone_id(plater->model(), print_cfg, zone_id);
     };
 
     auto persist_rows = [mgr_ptr, set_config_string, notify_change](bool affects_scene) {
-        set_config_string("texture_mapping_definitions", mgr_ptr->serialize_entries());
+        set_config_string("texture_mapping_definitions", serialize_texture_mapping_manager(mgr_ptr));
         notify_change(affects_scene);
     };
 
@@ -6350,7 +6440,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                               TextureMappingManager::effective_texture_component_ids(entry, num_physical, physical_colors) :
                               texture_mapping_selected_ids(entry, num_physical),
                           parse_texture_mapping_color(entry.display_color),
-                          entry.is_simple_gradient());
+                          entry.is_linear_gradient());
         header_sizer->Add(preview, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         row_sizer->Add(header, 0, wxEXPAND | wxTOP | wxBOTTOM, gap);
 
@@ -6372,7 +6462,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                       TextureMappingManager::effective_texture_component_ids(zone, num_physical, physical_colors) :
                                       texture_mapping_selected_ids(zone, num_physical),
                                   parse_texture_mapping_color(zone.display_color),
-                                  zone.is_simple_gradient());
+                                  zone.is_linear_gradient());
             }
             if (swatch != nullptr)
                 swatch->set_data(parse_texture_mapping_color(zone.display_color), zone_id);
@@ -6380,6 +6470,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
 
         auto apply_zone = [zone_index, mgr_ptr, num_physical, set_config_string, notify_change, refresh_texture_mapping_preview,
                            is_preview_only_texture_row_change, refresh_summary_preview, texture_mapping_zone_affects_scene](TextureMappingZone updated) {
+            if (mgr_ptr == nullptr)
+                return false;
             auto &rows = mgr_ptr->zones();
             if (zone_index >= rows.size())
                 return false;
@@ -6394,7 +6486,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             const bool affects_scene = texture_mapping_zone_affects_scene(before_zone_id) ||
                                        texture_mapping_zone_affects_scene(after_zone_id);
             refresh_summary_preview(rows[zone_index]);
-            set_config_string("texture_mapping_definitions", mgr_ptr->serialize_entries());
+            set_config_string("texture_mapping_definitions", serialize_texture_mapping_manager(mgr_ptr));
             if (preview_only_change) {
                 notify_change(false);
                 if (affects_scene)
@@ -6409,7 +6501,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         surface_row->Add(new wxStaticText(editor, wxID_ANY, _L("Surface Pattern")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         wxArrayString surface_choices;
         surface_choices.Add(_L("Image Texture"));
-        surface_choices.Add(_L("Simple Gradient"));
+        surface_choices.Add(_L("Linear Gradient"));
         surface_choices.Add(_L("2D Gradient"));
         auto *surface_choice = make_sidebar_combo(editor, surface_choices, surface_pattern_selection(entry), wxSize(FromDIP(170), -1));
         surface_row->Add(surface_choice, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
@@ -6430,37 +6522,42 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         }
         editor_sizer->Add(filaments_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
 
-        auto *simple_gradient_row = new wxWrapSizer(wxHORIZONTAL, wxWRAPSIZER_DEFAULT_FLAGS);
-        simple_gradient_row->Add(new wxStaticText(editor, wxID_ANY, _L("Gradient")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        auto *linear_gradient_row = new wxWrapSizer(wxHORIZONTAL, wxWRAPSIZER_DEFAULT_FLAGS);
+        linear_gradient_row->Add(new wxStaticText(editor, wxID_ANY, _L("Gradient")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         auto *start_filament_combo = make_filament_swatch_combo(editor, selected_ids.empty() ? 1 : selected_ids.front());
-        auto *end_filament_combo = make_filament_swatch_combo(editor, selected_ids.size() > 1 ? selected_ids[1] : 2);
+        auto *end_filament_combo = make_filament_swatch_combo(editor, selected_ids.size() > 1 ? selected_ids[1] : (selected_ids.empty() ? 1 : selected_ids.front()));
+        const bool can_choose_linear_gradient_filaments = std::min<size_t>(num_physical, 9) > 1;
+        if (start_filament_combo != nullptr)
+            start_filament_combo->Enable(can_choose_linear_gradient_filaments);
+        if (end_filament_combo != nullptr)
+            end_filament_combo->Enable(can_choose_linear_gradient_filaments);
         auto *set_start_btn = new wxButton(editor, wxID_ANY, _L("Set Start"));
         auto *set_end_btn = new wxButton(editor, wxID_ANY, _L("Set End"));
         auto *clear_points_btn = new wxButton(editor, wxID_ANY, _L("Clear Points"));
         ::CheckBox *show_direction_arrow_chk = nullptr;
-        simple_gradient_row->Add(new wxStaticText(editor, wxID_ANY, _L("Start")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
-        simple_gradient_row->Add(start_filament_combo, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-        simple_gradient_row->Add(new wxStaticText(editor, wxID_ANY, _L("End")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
-        simple_gradient_row->Add(end_filament_combo, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-        editor_sizer->Add(simple_gradient_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+        linear_gradient_row->Add(new wxStaticText(editor, wxID_ANY, _L("Start")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+        linear_gradient_row->Add(start_filament_combo, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        linear_gradient_row->Add(new wxStaticText(editor, wxID_ANY, _L("End")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+        linear_gradient_row->Add(end_filament_combo, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        editor_sizer->Add(linear_gradient_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
 
-        auto *simple_gradient_buttons_row = new wxWrapSizer(wxHORIZONTAL, wxWRAPSIZER_DEFAULT_FLAGS);
-        simple_gradient_buttons_row->Add(set_start_btn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-        simple_gradient_buttons_row->Add(set_end_btn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-        simple_gradient_buttons_row->Add(clear_points_btn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-        editor_sizer->Add(simple_gradient_buttons_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+        auto *linear_gradient_buttons_row = new wxWrapSizer(wxHORIZONTAL, wxWRAPSIZER_DEFAULT_FLAGS);
+        linear_gradient_buttons_row->Add(set_start_btn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        linear_gradient_buttons_row->Add(set_end_btn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        linear_gradient_buttons_row->Add(clear_points_btn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        editor_sizer->Add(linear_gradient_buttons_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
 
         auto *show_direction_arrow_row = make_sidebar_checkbox_row(editor,
                                                                    show_direction_arrow_chk,
                                                                    _L("Show Direction Arrow"),
-                                                                   entry.show_simple_gradient_direction_arrow);
+                                                                   entry.show_linear_gradient_direction_arrow);
         editor_sizer->Add(show_direction_arrow_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
 
         wxWeakRef<wxButton> set_start_btn_ref(set_start_btn);
         wxWeakRef<wxButton> set_end_btn_ref(set_end_btn);
         wxWindowRef editor_ref(editor);
         wxWindowRef row_ref(row);
-        auto set_simple_gradient_picker_button_labels = [this,
+        auto set_linear_gradient_picker_button_labels = [this,
                                                          set_start_btn_ref,
                                                          set_end_btn_ref,
                                                          editor_ref,
@@ -6523,19 +6620,19 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         editor_sizer->Add(button_row, 0, wxEXPAND | wxALL, gap);
 
         auto apply_controls = [zone_index, mgr_ptr, num_physical, filament_checks, surface_choice,
-                               start_filament_combo, end_filament_combo, filament_combo_id,
-                               surface_pattern_from_selection, mode_choice, preview_colors_chk, show_direction_arrow_chk, contrast_spin, apply_zone]() {
+                               start_filament_combo, end_filament_combo,
+                               linear_gradient_filament_ids, surface_pattern_from_selection, mode_choice, preview_colors_chk,
+                               show_direction_arrow_chk, contrast_spin, apply_zone](int changed_side = 0) {
+            if (mgr_ptr == nullptr)
+                return;
             auto &rows = mgr_ptr->zones();
             if (zone_index >= rows.size())
                 return;
             TextureMappingZone updated = rows[zone_index];
             const int surface_pattern = surface_pattern_from_selection(surface_choice != nullptr ? surface_choice->GetSelection() : 0);
             std::vector<unsigned int> ids;
-            if (surface_pattern == int(TextureMappingZone::SimpleGradient)) {
-                ids = {filament_combo_id(start_filament_combo, updated.component_a),
-                       filament_combo_id(end_filament_combo, updated.component_b)};
-                if (ids[0] == ids[1] && num_physical >= 2)
-                    ids[1] = ids[0] == 1 ? 2 : 1;
+            if (surface_pattern == int(TextureMappingZone::LinearGradient)) {
+                ids = linear_gradient_filament_ids(start_filament_combo, end_filament_combo, updated, changed_side);
             } else {
                 for (size_t idx = 0; idx < filament_checks.size(); ++idx)
                     if (filament_checks[idx] != nullptr && filament_checks[idx]->GetValue())
@@ -6553,7 +6650,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 updated.filament_color_mode;
             updated.preview_simulate_colors =
                 updated.is_image_texture() && preview_colors_chk != nullptr && preview_colors_chk->GetValue();
-            updated.show_simple_gradient_direction_arrow = show_direction_arrow_chk != nullptr && show_direction_arrow_chk->GetValue();
+            updated.show_linear_gradient_direction_arrow = show_direction_arrow_chk != nullptr && show_direction_arrow_chk->GetValue();
             updated.contrast_pct = contrast_spin != nullptr ? std::clamp(float(contrast_spin->GetValue()), 25.f, 300.f) : updated.contrast_pct;
             updated.high_resolution_sampling = true;
             apply_zone(std::move(updated));
@@ -6569,14 +6666,14 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             }
             evt.Skip();
         });
-        auto update_pattern_visibility = [this, editor_sizer, filaments_row, simple_gradient_row, simple_gradient_buttons_row, show_direction_arrow_row, mode_row, contrast_row, preview_colors_row, offset_btn, advanced_btn, surface_choice, row, editor, update_texture_mapping_area_height]() {
+        auto update_pattern_visibility = [this, editor_sizer, filaments_row, linear_gradient_row, linear_gradient_buttons_row, show_direction_arrow_row, mode_row, contrast_row, preview_colors_row, offset_btn, advanced_btn, surface_choice, row, editor, update_texture_mapping_area_height]() {
             const int selection = surface_choice == nullptr ? 0 : surface_choice->GetSelection();
             const bool image_texture = selection == 0;
-            const bool simple_gradient = selection == 1;
-            editor_sizer->Show(filaments_row, !simple_gradient, true);
-            editor_sizer->Show(simple_gradient_row, simple_gradient, true);
-            editor_sizer->Show(simple_gradient_buttons_row, simple_gradient, true);
-            editor_sizer->Show(show_direction_arrow_row, simple_gradient, true);
+            const bool linear_gradient = selection == 1;
+            editor_sizer->Show(filaments_row, !linear_gradient, true);
+            editor_sizer->Show(linear_gradient_row, linear_gradient, true);
+            editor_sizer->Show(linear_gradient_buttons_row, linear_gradient, true);
+            editor_sizer->Show(show_direction_arrow_row, linear_gradient, true);
             editor_sizer->Show(mode_row, image_texture, true);
             editor_sizer->Show(contrast_row, image_texture, true);
             editor_sizer->Show(preview_colors_row, image_texture, true);
@@ -6603,9 +6700,9 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                     evt.Skip();
                 });
         if (start_filament_combo != nullptr)
-            start_filament_combo->Bind(wxEVT_COMBOBOX, [apply_controls](wxCommandEvent &) { apply_controls(); });
+            start_filament_combo->Bind(wxEVT_COMBOBOX, [apply_controls](wxCommandEvent &) { apply_controls(1); });
         if (end_filament_combo != nullptr)
-            end_filament_combo->Bind(wxEVT_COMBOBOX, [apply_controls](wxCommandEvent &) { apply_controls(); });
+            end_filament_combo->Bind(wxEVT_COMBOBOX, [apply_controls](wxCommandEvent &) { apply_controls(2); });
         int last_mode_selection = mode_choice->GetSelection();
         auto on_mode_choice = [this,
                                zone_index,
@@ -6615,7 +6712,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                filament_checks,
                                start_filament_combo,
                                end_filament_combo,
-                               filament_combo_id,
+                               linear_gradient_filament_ids,
                                mode_choice,
                                surface_choice,
                                preview_colors_chk,
@@ -6632,17 +6729,14 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 }
                 last_mode_selection = selection;
             }
-            if (zone_index >= mgr_ptr->zones().size())
+            if (mgr_ptr == nullptr || zone_index >= mgr_ptr->zones().size())
                 return;
 
             TextureMappingZone updated = mgr_ptr->zones()[zone_index];
             const int surface_pattern = surface_pattern_from_selection(surface_choice != nullptr ? surface_choice->GetSelection() : 0);
             std::vector<unsigned int> ids;
-            if (surface_pattern == int(TextureMappingZone::SimpleGradient)) {
-                ids = {filament_combo_id(start_filament_combo, updated.component_a),
-                       filament_combo_id(end_filament_combo, updated.component_b)};
-                if (ids[0] == ids[1] && num_physical >= 2)
-                    ids[1] = ids[0] == 1 ? 2 : 1;
+            if (surface_pattern == int(TextureMappingZone::LinearGradient)) {
+                ids = linear_gradient_filament_ids(start_filament_combo, end_filament_combo, updated, 0);
             } else {
                 for (size_t idx = 0; idx < filament_checks.size(); ++idx)
                     if (filament_checks[idx] != nullptr && filament_checks[idx]->GetValue())
@@ -6703,37 +6797,69 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             apply_controls();
             evt.Skip();
         });
-        auto make_simple_gradient_anchor = [](const GLGizmoTextureGradientPointPicker::Pick &pick) {
-            TextureMappingZone::SimpleGradientAnchor anchor;
+        auto make_linear_gradient_anchor = [this](const GLGizmoTextureGradientPointPicker::Pick &pick) {
+            TextureMappingZone::LinearGradientAnchor anchor;
             anchor.valid = true;
             anchor.object_id = pick.object_id;
             anchor.instance_id = pick.instance_id;
+            if (pick.object_idx >= 0) {
+                anchor.object_index_valid = true;
+                anchor.object_index = size_t(pick.object_idx);
+            }
+            if (pick.instance_idx >= 0) {
+                anchor.instance_index_valid = true;
+                anchor.instance_index = size_t(pick.instance_idx);
+            }
+            if (p->plater != nullptr && anchor.object_index_valid) {
+                Model &model = p->plater->model();
+                if (anchor.object_index < model.objects.size()) {
+                    ModelObject *object = model.objects[anchor.object_index];
+                    if (object != nullptr) {
+                        anchor.object_backup_id = model.get_object_backup_id(*object);
+                        if (anchor.instance_index_valid && anchor.instance_index < object->instances.size()) {
+                            const ModelInstance *instance = object->instances[anchor.instance_index];
+                            if (instance != nullptr)
+                                anchor.instance_loaded_id = instance->loaded_id;
+                        }
+                    }
+                }
+            }
             anchor.local_point = { { pick.local_point.x(), pick.local_point.y(), pick.local_point.z() } };
             anchor.global_point = { { pick.global_point.x(), pick.global_point.y(), pick.global_point.z() } };
             return anchor;
         };
-        auto apply_simple_gradient_pick = [this, zone_index, mgr_ptr, apply_zone, make_simple_gradient_anchor](const GLGizmoTextureGradientPointPicker::Pick &pick,
+        auto apply_linear_gradient_pick = [this, zone_index, mgr_ptr, apply_zone, make_linear_gradient_anchor](const GLGizmoTextureGradientPointPicker::Pick &pick,
                                                                                                              bool start_point) {
-            if (zone_index >= mgr_ptr->zones().size())
+            if (mgr_ptr == nullptr || zone_index >= mgr_ptr->zones().size())
                 return;
             TextureMappingZone updated = mgr_ptr->zones()[zone_index];
-            TextureMappingZone::SimpleGradientAnchor anchor = make_simple_gradient_anchor(pick);
+            TextureMappingZone::LinearGradientAnchor anchor = make_linear_gradient_anchor(pick);
             if (start_point)
-                updated.simple_gradient_start = anchor;
+                updated.linear_gradient_start = anchor;
             else
-                updated.simple_gradient_end = anchor;
-            updated.surface_pattern = int(TextureMappingZone::SimpleGradient);
-            apply_zone(std::move(updated));
+                updated.linear_gradient_end = anchor;
+            updated.surface_pattern = int(TextureMappingZone::LinearGradient);
+            if (updated == mgr_ptr->zones()[zone_index])
+                return;
+            sync_current_model_texture_mapping_definitions(serialize_texture_mapping_manager(mgr_ptr));
+            if (p->plater != nullptr) {
+                Plater::TakeSnapshot snapshot(p->plater, start_point ? "Set Linear Gradient Start Point" : "Set Linear Gradient End Point");
+                apply_zone(std::move(updated));
+                sync_current_model_texture_mapping_definitions(serialize_texture_mapping_manager(mgr_ptr));
+            } else {
+                apply_zone(std::move(updated));
+                sync_current_model_texture_mapping_definitions(serialize_texture_mapping_manager(mgr_ptr));
+            }
             CallAfter([this]() { update_texture_mapping_panel(false); });
         };
-        auto open_simple_gradient_picker = [this,
+        auto open_linear_gradient_picker = [this,
                                             zone_index,
                                             mgr_ptr,
                                             apply_controls,
-                                            apply_simple_gradient_pick,
-                                            make_simple_gradient_anchor,
+                                            apply_linear_gradient_pick,
+                                            make_linear_gradient_anchor,
                                             set_config_string,
-                                            set_simple_gradient_picker_button_labels](bool start_point) {
+                                            set_linear_gradient_picker_button_labels](bool start_point) {
             if (p->plater == nullptr)
                 return;
             GLCanvas3D *canvas = p->plater->get_current_canvas3D(true);
@@ -6755,13 +6881,13 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             if (gizmos.get_current_type() == GLGizmosManager::TextureGradientPointPicker)
                 picker->cancel_hover_preview();
             apply_controls();
-            if (zone_index >= mgr_ptr->zones().size())
+            if (mgr_ptr == nullptr || zone_index >= mgr_ptr->zones().size())
                 return;
             const TextureMappingZone original = mgr_ptr->zones()[zone_index];
-            const std::string original_serialized = mgr_ptr->serialize_entries();
+            const std::string original_serialized = serialize_texture_mapping_manager(mgr_ptr);
             TextureMappingZone active_preview = original;
-            active_preview.surface_pattern = int(TextureMappingZone::SimpleGradient);
-            active_preview.show_simple_gradient_direction_arrow = true;
+            active_preview.surface_pattern = int(TextureMappingZone::LinearGradient);
+            active_preview.show_linear_gradient_direction_arrow = true;
             auto live_preview_applied = std::make_shared<bool>(false);
             auto redraw_live_preview = [this]() {
                 if (p->plater == nullptr)
@@ -6785,7 +6911,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                          set_config_string,
                                          live_preview_applied,
                                          redraw_live_preview]() {
-                if (!*live_preview_applied || zone_index >= mgr_ptr->zones().size())
+                if (!*live_preview_applied || mgr_ptr == nullptr || zone_index >= mgr_ptr->zones().size())
                     return;
                 mgr_ptr->zones()[zone_index] = original;
                 set_config_string("texture_mapping_definitions", original_serialized);
@@ -6797,50 +6923,50 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                        set_config_string,
                                        live_preview_applied,
                                        redraw_live_preview](TextureMappingZone preview) {
-                if (zone_index >= mgr_ptr->zones().size())
+                if (mgr_ptr == nullptr || zone_index >= mgr_ptr->zones().size())
                     return;
                 if (mgr_ptr->zones()[zone_index] == preview)
                     return;
                 mgr_ptr->zones()[zone_index] = std::move(preview);
-                set_config_string("texture_mapping_definitions", mgr_ptr->serialize_entries());
+                set_config_string("texture_mapping_definitions", serialize_texture_mapping_manager(mgr_ptr));
                 *live_preview_applied = true;
                 redraw_live_preview();
             };
-            auto cancel_live_selection = [restore_live_preview, set_simple_gradient_picker_button_labels]() {
+            auto cancel_live_selection = [restore_live_preview, set_linear_gradient_picker_button_labels]() {
                 restore_live_preview();
-                set_simple_gradient_picker_button_labels(GLGizmoTextureGradientPointPicker::Target::None);
+                set_linear_gradient_picker_button_labels(GLGizmoTextureGradientPointPicker::Target::None);
             };
             apply_live_preview(active_preview);
-            picker->set_pick_callback([apply_simple_gradient_pick, start_point](const GLGizmoTextureGradientPointPicker::Pick &pick) {
-                apply_simple_gradient_pick(pick, start_point);
+            picker->set_pick_callback([apply_linear_gradient_pick, start_point](const GLGizmoTextureGradientPointPicker::Pick &pick) {
+                apply_linear_gradient_pick(pick, start_point);
             }, target, [active_preview,
                         start_point,
-                        make_simple_gradient_anchor,
+                        make_linear_gradient_anchor,
                         apply_live_preview](const GLGizmoTextureGradientPointPicker::Pick *hover_pick) {
                 if (hover_pick == nullptr) {
                     apply_live_preview(active_preview);
                     return;
                 }
                 TextureMappingZone preview = active_preview;
-                const TextureMappingZone::SimpleGradientAnchor anchor = make_simple_gradient_anchor(*hover_pick);
+                const TextureMappingZone::LinearGradientAnchor anchor = make_linear_gradient_anchor(*hover_pick);
                 if (start_point)
-                    preview.simple_gradient_start = anchor;
+                    preview.linear_gradient_start = anchor;
                 else
-                    preview.simple_gradient_end = anchor;
-                preview.surface_pattern = int(TextureMappingZone::SimpleGradient);
+                    preview.linear_gradient_end = anchor;
+                preview.surface_pattern = int(TextureMappingZone::LinearGradient);
                 apply_live_preview(std::move(preview));
             }, cancel_live_selection);
             if (gizmos.get_current_type() != GLGizmosManager::TextureGradientPointPicker)
                 gizmos.open_gizmo(GLGizmosManager::TextureGradientPointPicker);
             else
                 canvas->set_as_dirty();
-            set_simple_gradient_picker_button_labels(target);
+            set_linear_gradient_picker_button_labels(target);
         };
-        set_start_btn->Bind(wxEVT_BUTTON, [open_simple_gradient_picker](wxCommandEvent &) {
-            open_simple_gradient_picker(true);
+        set_start_btn->Bind(wxEVT_BUTTON, [open_linear_gradient_picker](wxCommandEvent &) {
+            open_linear_gradient_picker(true);
         });
-        set_end_btn->Bind(wxEVT_BUTTON, [open_simple_gradient_picker](wxCommandEvent &) {
-            open_simple_gradient_picker(false);
+        set_end_btn->Bind(wxEVT_BUTTON, [open_linear_gradient_picker](wxCommandEvent &) {
+            open_linear_gradient_picker(false);
         });
         clear_points_btn->Bind(wxEVT_BUTTON, [this, zone_index, mgr_ptr, apply_zone](wxCommandEvent &) {
             if (p->plater != nullptr) {
@@ -6850,12 +6976,22 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                         gizmos.open_gizmo(GLGizmosManager::TextureGradientPointPicker);
                 }
             }
-            if (zone_index >= mgr_ptr->zones().size())
+            if (mgr_ptr == nullptr || zone_index >= mgr_ptr->zones().size())
                 return;
             TextureMappingZone updated = mgr_ptr->zones()[zone_index];
-            updated.clear_simple_gradient_points();
-            updated.surface_pattern = int(TextureMappingZone::SimpleGradient);
-            apply_zone(std::move(updated));
+            updated.clear_linear_gradient_points();
+            updated.surface_pattern = int(TextureMappingZone::LinearGradient);
+            if (updated == mgr_ptr->zones()[zone_index])
+                return;
+            sync_current_model_texture_mapping_definitions(serialize_texture_mapping_manager(mgr_ptr));
+            if (p->plater != nullptr) {
+                Plater::TakeSnapshot snapshot(p->plater, "Clear Linear Gradient Points");
+                apply_zone(std::move(updated));
+                sync_current_model_texture_mapping_definitions(serialize_texture_mapping_manager(mgr_ptr));
+            } else {
+                apply_zone(std::move(updated));
+                sync_current_model_texture_mapping_definitions(serialize_texture_mapping_manager(mgr_ptr));
+            }
             CallAfter([this]() { update_texture_mapping_panel(false); });
         });
         offset_btn->Bind(wxEVT_BUTTON, [this,
@@ -6865,10 +7001,10 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                         nozzle_diameters,
                                         apply_zone,
                                         set_config_string](wxCommandEvent &) {
-            if (zone_index >= mgr_ptr->zones().size())
+            if (mgr_ptr == nullptr || zone_index >= mgr_ptr->zones().size())
                 return;
             const TextureMappingZone original = mgr_ptr->zones()[zone_index];
-            const std::string original_serialized = mgr_ptr->serialize_entries();
+            const std::string original_serialized = serialize_texture_mapping_manager(mgr_ptr);
             TextureMappingZone updated = original;
             bool live_preview_applied = false;
             auto redraw_live_preview = [this]() {
@@ -6886,18 +7022,18 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 mark_canvas_dirty(p->plater->get_assmeble_canvas3D());
             };
             auto live_preview = [zone_index, mgr_ptr, &live_preview_applied, redraw_live_preview, set_config_string](const TextureMappingZone &preview) {
-                if (zone_index >= mgr_ptr->zones().size())
+                if (mgr_ptr == nullptr || zone_index >= mgr_ptr->zones().size())
                     return;
                 if (mgr_ptr->zones()[zone_index] == preview)
                     return;
                 mgr_ptr->zones()[zone_index] = preview;
-                set_config_string("texture_mapping_definitions", mgr_ptr->serialize_entries());
+                set_config_string("texture_mapping_definitions", serialize_texture_mapping_manager(mgr_ptr));
                 live_preview_applied = true;
                 redraw_live_preview();
             };
             TextureMappingOffsetGradientDialog dlg(this, updated, palette.size(), nozzle_diameters, palette, live_preview);
             const int dialog_result = dlg.ShowModal();
-            if (zone_index >= mgr_ptr->zones().size())
+            if (mgr_ptr == nullptr || zone_index >= mgr_ptr->zones().size())
                 return;
             if (live_preview_applied)
                 mgr_ptr->zones()[zone_index] = original;
@@ -6922,7 +7058,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                           set_config_string,
                                           notify_change,
                                           refresh_texture_mapping_preview](wxCommandEvent &) {
-            if (zone_index >= mgr_ptr->zones().size())
+            if (mgr_ptr == nullptr || zone_index >= mgr_ptr->zones().size())
                 return;
             TextureMappingZone updated = mgr_ptr->zones()[zone_index];
             std::vector<unsigned int> ids = updated.is_image_texture() ?
@@ -7109,6 +7245,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             menu.Append(duplicate_id, _L("Duplicate"));
             menu.Append(delete_id, _L("Delete"));
             menu.Bind(wxEVT_COMMAND_MENU_SELECTED, [this, zone_index, num_physical, physical_colors, mgr_ptr, persist_rows, duplicate_id, delete_id, bundle, set_config_string, texture_mapping_zone_affects_scene](wxCommandEvent &evt) {
+                if (mgr_ptr == nullptr)
+                    return;
                 auto &rows = mgr_ptr->zones();
                 if (zone_index >= rows.size())
                     return;
@@ -15199,6 +15337,10 @@ void Plater::priv::undo_redo_to(std::vector<UndoRedo::Snapshot>::const_iterator 
 void Plater::priv::update_after_undo_redo(const UndoRedo::Snapshot& snapshot, bool /* temp_snapshot_was_taken */)
 {
     get_current_canvas3D()->get_canvas_type() == GLCanvas3D::CanvasAssembleView ? assemble_view->get_canvas3d()->get_selection().clear() : this->view3D->get_canvas3d()->get_selection().clear();
+    if (model.texture_mapping_definitions_valid) {
+        if (PresetBundle *bundle = wxGetApp().preset_bundle; bundle != nullptr)
+            load_texture_mapping_definitions(*bundle, model.texture_mapping_definitions);
+    }
     // Update volumes from the deserializd model, always stop / update the background processing (for both the SLA and FFF technologies).
     this->update((unsigned int)UpdateParams::FORCE_BACKGROUND_PROCESSING_UPDATE | (unsigned int)UpdateParams::POSTPONE_VALIDATION_ERROR_MESSAGE);
     // Release old snapshots if the memory allocated is excessive. This may remove the top most snapshot if jumping to the very first snapshot.

@@ -73,28 +73,88 @@ bool texture_mapping_vec3_is_finite(const Vec3f &point)
     return std::isfinite(point.x()) && std::isfinite(point.y()) && std::isfinite(point.z());
 }
 
-std::optional<Vec3f> texture_mapping_simple_gradient_anchor_global_point(const Print &print,
-                                                                         const TextureMappingZone::SimpleGradientAnchor &anchor)
+int texture_mapping_model_object_backup_id(const ModelObject *object)
+{
+    const Model *model = object != nullptr ? object->get_model() : nullptr;
+    return model != nullptr ? model->find_object_backup_id(*object) : -1;
+}
+
+bool texture_mapping_anchor_matches_model_object(const ModelObject *object,
+                                                 const TextureMappingZone::LinearGradientAnchor &anchor)
+{
+    if (object == nullptr)
+        return false;
+    if (anchor.object_backup_id >= 0 && texture_mapping_model_object_backup_id(object) == anchor.object_backup_id)
+        return true;
+    if (anchor.object_id != 0 && object->id().id == anchor.object_id)
+        return true;
+    const Model *model = object->get_model();
+    return model != nullptr && anchor.object_index_valid && anchor.object_index < model->objects.size() &&
+           model->objects[anchor.object_index] == object;
+}
+
+const ModelObject *texture_mapping_anchor_model_object(const Print &print,
+                                                       const TextureMappingZone::LinearGradientAnchor &anchor)
+{
+    if (anchor.object_backup_id >= 0) {
+        for (const PrintObject *print_object : print.objects()) {
+            const ModelObject *model_object = print_object != nullptr ? print_object->model_object() : nullptr;
+            if (texture_mapping_model_object_backup_id(model_object) == anchor.object_backup_id)
+                return model_object;
+        }
+    }
+    if (anchor.object_id != 0) {
+        for (const PrintObject *print_object : print.objects()) {
+            const ModelObject *model_object = print_object != nullptr ? print_object->model_object() : nullptr;
+            if (model_object != nullptr && model_object->id().id == anchor.object_id)
+                return model_object;
+        }
+    }
+    if (anchor.object_index_valid) {
+        for (const PrintObject *print_object : print.objects()) {
+            const ModelObject *model_object = print_object != nullptr ? print_object->model_object() : nullptr;
+            const Model *model = model_object != nullptr ? model_object->get_model() : nullptr;
+            if (model != nullptr && anchor.object_index < model->objects.size() &&
+                model->objects[anchor.object_index] == model_object)
+                return model_object;
+        }
+    }
+    return nullptr;
+}
+
+const ModelInstance *texture_mapping_anchor_model_instance(const ModelObject *object,
+                                                          const TextureMappingZone::LinearGradientAnchor &anchor)
+{
+    if (object == nullptr)
+        return nullptr;
+    if (anchor.instance_loaded_id != 0) {
+        for (const ModelInstance *instance : object->instances)
+            if (instance != nullptr && instance->loaded_id == anchor.instance_loaded_id)
+                return instance;
+    }
+    if (anchor.instance_id != 0) {
+        for (const ModelInstance *instance : object->instances)
+            if (instance != nullptr && instance->id().id == anchor.instance_id)
+                return instance;
+    }
+    if (anchor.instance_index_valid && anchor.instance_index < object->instances.size())
+        return object->instances[anchor.instance_index];
+    return object->instances.size() == 1 ? object->instances.front() : nullptr;
+}
+
+std::optional<Vec3f> texture_mapping_linear_gradient_anchor_global_point(const Print &print,
+                                                                         const TextureMappingZone::LinearGradientAnchor &anchor)
 {
     if (!anchor.valid)
         return std::nullopt;
 
     const Vec3f local = texture_mapping_array_point(anchor.local_point);
-    if (anchor.object_id != 0 && anchor.instance_id != 0) {
-        for (const PrintObject *print_object : print.objects()) {
-            if (print_object == nullptr || print_object->model_object() == nullptr)
-                continue;
-            const ModelObject *model_object = print_object->model_object();
-            if (model_object->id().id != anchor.object_id)
-                continue;
-            for (const ModelInstance *instance : model_object->instances) {
-                if (instance != nullptr && instance->id().id == anchor.instance_id) {
-                    const Vec3f global = (instance->get_matrix() * local.cast<double>()).cast<float>();
-                    if (texture_mapping_vec3_is_finite(global))
-                        return global;
-                }
-            }
-        }
+    const ModelObject *model_object = texture_mapping_anchor_model_object(print, anchor);
+    const ModelInstance *instance = texture_mapping_anchor_model_instance(model_object, anchor);
+    if (instance != nullptr) {
+        const Vec3f global = (instance->get_matrix() * local.cast<double>()).cast<float>();
+        if (texture_mapping_vec3_is_finite(global))
+            return global;
     }
 
     const Vec3f fallback = texture_mapping_array_point(anchor.global_point);
@@ -113,8 +173,8 @@ Vec2d texture_mapping_print_object_plate_origin_mm(const PrintObject &print_obje
     return Vec2d::Zero();
 }
 
-std::optional<Vec3f> texture_mapping_simple_gradient_anchor_print_point(const PrintObject &print_object,
-                                                                        const TextureMappingZone::SimpleGradientAnchor &anchor,
+std::optional<Vec3f> texture_mapping_linear_gradient_anchor_print_point(const PrintObject &print_object,
+                                                                        const TextureMappingZone::LinearGradientAnchor &anchor,
                                                                         const std::optional<Vec2d> &plate_origin_mm_override)
 {
     if (!anchor.valid)
@@ -122,7 +182,7 @@ std::optional<Vec3f> texture_mapping_simple_gradient_anchor_print_point(const Pr
 
     const ModelObject *model_object = print_object.model_object();
     const Print *print = print_object.print();
-    if (model_object != nullptr && model_object->id().id == anchor.object_id) {
+    if (texture_mapping_anchor_matches_model_object(model_object, anchor)) {
         const Vec3f local = texture_mapping_array_point(anchor.local_point);
         const Vec3f print_point = (print_object.trafo_centered() * local.cast<double>()).cast<float>();
         if (texture_mapping_vec3_is_finite(print_point))
@@ -132,7 +192,7 @@ std::optional<Vec3f> texture_mapping_simple_gradient_anchor_print_point(const Pr
     if (print == nullptr)
         return std::nullopt;
 
-    const std::optional<Vec3f> global = texture_mapping_simple_gradient_anchor_global_point(*print, anchor);
+    const std::optional<Vec3f> global = texture_mapping_linear_gradient_anchor_global_point(*print, anchor);
     if (!global)
         return std::nullopt;
     const Vec2d plate_origin_mm = texture_mapping_print_object_plate_origin_mm(print_object, plate_origin_mm_override);
@@ -142,7 +202,7 @@ std::optional<Vec3f> texture_mapping_simple_gradient_anchor_print_point(const Pr
     return texture_mapping_vec3_is_finite(print_point) ? std::optional<Vec3f>(print_point) : std::nullopt;
 }
 
-std::pair<Vec3f, Vec3f> texture_mapping_default_simple_gradient_points(const PrintObject &print_object)
+std::pair<Vec3f, Vec3f> texture_mapping_default_linear_gradient_points(const PrintObject &print_object)
 {
     const BoundingBox bbox = print_object.bounding_box();
     const float cx = 0.5f * (unscale<float>(bbox.min.x()) + unscale<float>(bbox.max.x()));
@@ -2653,7 +2713,7 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
         return std::nullopt;
 
     const bool vertex_color_match_mode = zone.is_image_texture();
-    const bool simple_gradient_mode = zone.is_simple_gradient();
+    const bool linear_gradient_mode = zone.is_linear_gradient();
     std::vector<unsigned int> component_ids = decode_texture_mapping_offset_component_ids(zone, num_physical);
     if (vertex_color_match_mode) {
         const std::vector<unsigned int> effective_component_ids =
@@ -2661,9 +2721,9 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
         if (!effective_component_ids.empty())
             component_ids = effective_component_ids;
     }
-    if (simple_gradient_mode && component_ids.size() > 2)
+    if (linear_gradient_mode && component_ids.size() > 2)
         component_ids.resize(2);
-    if (simple_gradient_mode && component_ids.size() < 2) {
+    if (linear_gradient_mode && component_ids.size() < 2) {
         component_ids.clear();
         for (size_t i = 1; i <= std::min<size_t>(num_physical, 2); ++i)
             component_ids.emplace_back(unsigned(i));
@@ -2760,7 +2820,7 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
         a = normalize_texture_mapping_offset_angle_deg(a);
 
     bool has_nonzero_distance = false;
-    if (vertex_color_match_mode || simple_gradient_mode) {
+    if (vertex_color_match_mode || linear_gradient_mode) {
         distances_mm.assign(component_ids.size(), max_allowed_distance_mm);
         has_nonzero_distance = max_allowed_distance_mm > EPSILON;
     } else {
@@ -2868,7 +2928,7 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     }
 
     float rotation_deg = 0.f;
-    if (!simple_gradient_mode && zone.offset_rotation_enabled) {
+    if (!linear_gradient_mode && zone.offset_rotation_enabled) {
         const float p = clamp01f(z_progress);
         const float r = std::max(1.f, zone.offset_repeats);
         float repeated_pos = p * r;
@@ -2887,40 +2947,40 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     for (float &a : rotated_angles)
         a = normalize_texture_mapping_offset_angle_deg(a + rotation_deg);
 
-    const float signed_fade_factor = simple_gradient_mode ? 1.f : texture_mapping_offset_fade_factor(zone.offset_fade_mode, z_progress);
+    const float signed_fade_factor = linear_gradient_mode ? 1.f : texture_mapping_offset_fade_factor(zone.offset_fade_mode, z_progress);
     const float fade_factor = std::abs(signed_fade_factor);
     if (fade_factor <= EPSILON)
         return std::nullopt;
 
     TextureMappingOffsetContext context;
     context.vertex_color_match_mode = vertex_color_match_mode;
-    context.simple_gradient_mode = simple_gradient_mode;
+    context.linear_gradient_mode = linear_gradient_mode;
     context.object_center_mode =
         !vertex_color_match_mode &&
-        !simple_gradient_mode &&
+        !linear_gradient_mode &&
         zone.offset_angle_mode != int(TextureMappingZone::OffsetAngleSurfaceNormal);
     context.high_resolution_texture_sampling = high_resolution_texture_sampling;
-    context.compact_offset_mode = compact_offset_mode || simple_gradient_mode;
+    context.compact_offset_mode = compact_offset_mode || linear_gradient_mode;
     context.dithering_enabled = dithering_enabled;
     context.halftone_dithering_enabled = halftone_dithering_enabled;
     context.halftone_increased_detail_enabled = halftone_increased_detail_enabled;
     context.nonlinear_offset_adjustment = zone.nonlinear_offset_adjustment;
     context.object_center = print_object.bounding_box().center();
-    if (simple_gradient_mode) {
-        auto default_points = texture_mapping_default_simple_gradient_points(print_object);
+    if (linear_gradient_mode) {
+        auto default_points = texture_mapping_default_linear_gradient_points(print_object);
         std::optional<Vec3f> start =
-            texture_mapping_simple_gradient_anchor_print_point(print_object,
-                                                               zone.simple_gradient_start,
+            texture_mapping_linear_gradient_anchor_print_point(print_object,
+                                                               zone.linear_gradient_start,
                                                                plate_origin_mm_override);
         std::optional<Vec3f> end =
-            texture_mapping_simple_gradient_anchor_print_point(print_object,
-                                                               zone.simple_gradient_end,
+            texture_mapping_linear_gradient_anchor_print_point(print_object,
+                                                               zone.linear_gradient_end,
                                                                plate_origin_mm_override);
-        context.simple_gradient_start_mm = start ? *start : default_points.first;
-        context.simple_gradient_end_mm = end ? *end : default_points.second;
-        if ((context.simple_gradient_end_mm - context.simple_gradient_start_mm).squaredNorm() <= 1e-8f) {
-            context.simple_gradient_start_mm = default_points.first;
-            context.simple_gradient_end_mm = default_points.second;
+        context.linear_gradient_start_mm = start ? *start : default_points.first;
+        context.linear_gradient_end_mm = end ? *end : default_points.second;
+        if ((context.linear_gradient_end_mm - context.linear_gradient_start_mm).squaredNorm() <= 1e-8f) {
+            context.linear_gradient_start_mm = default_points.first;
+            context.linear_gradient_end_mm = default_points.second;
         }
     }
     context.active_component_id = active_component_id;
@@ -2936,13 +2996,13 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     context.dither_pitch_mm = dither_pitch_mm;
     context.halftone_dot_size_mm = halftone_dot_size_mm;
     context.active_halftone_angle_deg = halftone_screen_angle_deg(filament_color_mode, active_component_idx);
-    context.active_component_strength_factor = simple_gradient_mode ?
+    context.active_component_strength_factor = linear_gradient_mode ?
         1.f :
         texture_mapping_offset_filament_strength_factor(zone, active_component_id);
-    context.active_component_minimum_offset_factor = simple_gradient_mode ?
+    context.active_component_minimum_offset_factor = linear_gradient_mode ?
         0.f :
         texture_mapping_offset_filament_minimum_offset_factor(zone, active_component_id);
-    context.active_component_td_width_factor = simple_gradient_mode ?
+    context.active_component_td_width_factor = linear_gradient_mode ?
         1.f :
         transmission_distance_width_factor(td_calibration_context, active_component_idx, previous_component_idx);
     context.base_outer_width_mm = base_outer_width_mm;
@@ -2991,8 +3051,8 @@ float texture_mapping_offset_surface_inset_mm(const TextureMappingOffsetContext 
                 0.f;
         }
         inset_strength = std::clamp(1.f - desired_strength, 0.f, 1.f);
-    } else if (context.simple_gradient_mode) {
-        const Vec3f gradient_vec = context.simple_gradient_end_mm - context.simple_gradient_start_mm;
+    } else if (context.linear_gradient_mode) {
+        const Vec3f gradient_vec = context.linear_gradient_end_mm - context.linear_gradient_start_mm;
         const float denom = gradient_vec.squaredNorm();
         if (denom <= 1e-8f) {
             inset_strength = 0.f;
@@ -3003,7 +3063,7 @@ float texture_mapping_offset_surface_inset_mm(const TextureMappingOffsetContext 
             if (!std::isfinite(z_mm))
                 z_mm = 0.f;
             const Vec3f sample(unscale<float>(point.x()), unscale<float>(point.y()), z_mm);
-            const float t = clamp01f((sample - context.simple_gradient_start_mm).dot(gradient_vec) / denom);
+            const float t = clamp01f((sample - context.linear_gradient_start_mm).dot(gradient_vec) / denom);
             float desired_strength = context.active_component_idx == 0 ? 1.f - t :
                                      context.active_component_idx == 1 ? t :
                                      0.f;

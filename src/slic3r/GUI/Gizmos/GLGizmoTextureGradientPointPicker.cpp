@@ -63,7 +63,7 @@ bool GLGizmoTextureGradientPointPicker::on_init()
 
 std::string GLGizmoTextureGradientPointPicker::on_get_name() const
 {
-    return _u8L("Set simple gradient point");
+    return _u8L("Set linear gradient point");
 }
 
 void GLGizmoTextureGradientPointPicker::on_set_state()
@@ -221,6 +221,8 @@ bool GLGizmoTextureGradientPointPicker::on_mouse(const wxMouseEvent &mouse_event
     if (mouse_event.LeftDown()) {
         if (m_has_hover && m_pick_callback) {
             Pick picked = m_hover_pick;
+            PickCallback pick_callback = std::move(m_pick_callback);
+            m_pick_callback = nullptr;
             CancelCallback cancel_callback = std::move(m_cancel_callback);
             m_cancel_callback = nullptr;
             HoverCallback hover_callback = std::move(m_hover_callback);
@@ -231,7 +233,7 @@ bool GLGizmoTextureGradientPointPicker::on_mouse(const wxMouseEvent &mouse_event
                 hover_callback(nullptr);
             m_hover_preview_emitted = false;
             m_last_hover_preview_had_hit = false;
-            m_pick_callback(picked);
+            pick_callback(picked);
         }
         if (m_parent.get_gizmos_manager().get_current_type() == GLGizmosManager::TextureGradientPointPicker)
             m_parent.get_gizmos_manager().open_gizmo(GLGizmosManager::TextureGradientPointPicker);
@@ -251,34 +253,39 @@ void GLGizmoTextureGradientPointPicker::on_render_input_window(float, float, flo
         return;
 
     const Size canvas_size = m_parent.get_canvas_size();
-    ImGui::SetNextWindowPos(ImVec2(0.f, 0.f), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(float(canvas_size.get_width()), float(canvas_size.get_height())), ImGuiCond_Always);
+    const float scale = wxGetApp().imgui() != nullptr ? wxGetApp().imgui()->get_style_scaling() : 1.f;
+    const float margin = 16.f * scale;
+    const float stacked_offset = 44.f * scale;
+    ImGui::SetNextWindowPos(ImVec2(margin, float(canvas_size.get_height()) - margin - stacked_offset), ImGuiCond_Always, ImVec2(0.f, 1.f));
     const int flags = ImGuiWindowFlags_NoTitleBar |
                       ImGuiWindowFlags_NoResize |
                       ImGuiWindowFlags_NoMove |
                       ImGuiWindowFlags_NoScrollbar |
                       ImGuiWindowFlags_NoSavedSettings |
                       ImGuiWindowFlags_NoInputs |
-                      ImGuiWindowFlags_NoBackground;
-    if (ImGui::Begin("simple_gradient_point_picker_overlay", nullptr, flags)) {
-        ImDrawList *draw_list = ImGui::GetWindowDrawList();
+                      ImGuiWindowFlags_AlwaysAutoResize |
+                      ImGuiWindowFlags_NoDecoration |
+                      ImGuiWindowFlags_NoFocusOnAppearing;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 4.f * scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.f * scale, 8.f * scale));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.08f, 0.09f, 0.10f, 0.88f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 1.f, 1.f, 1.f));
+    if (ImGui::Begin("linear_gradient_point_picker_overlay", nullptr, flags)) {
         const std::string message = m_target == Target::End ?
             _u8L("Click an object to set gradient end point") :
             _u8L("Click an object to set gradient start point");
-        const ImVec2 text_size = ImGui::CalcTextSize(message.c_str());
-        const ImVec2 text_pos(std::max(12.f, 0.5f * (float(canvas_size.get_width()) - text_size.x)), 24.f);
-        draw_list->AddText(ImVec2(text_pos.x - 1.f, text_pos.y), IM_COL32(0, 0, 0, 240), message.c_str());
-        draw_list->AddText(ImVec2(text_pos.x + 1.f, text_pos.y), IM_COL32(0, 0, 0, 240), message.c_str());
-        draw_list->AddText(ImVec2(text_pos.x, text_pos.y - 1.f), IM_COL32(0, 0, 0, 240), message.c_str());
-        draw_list->AddText(ImVec2(text_pos.x, text_pos.y + 1.f), IM_COL32(0, 0, 0, 240), message.c_str());
-        draw_list->AddText(text_pos, IM_COL32(255, 255, 255, 245), message.c_str());
-        if (m_has_hover) {
-            const ImVec2 center(float(m_mouse_pos.x()), float(m_mouse_pos.y()));
-            draw_list->AddCircle(center, 16.f, IM_COL32(255, 255, 255, 235), 48, 3.f);
-            draw_list->AddCircle(center, 19.f, IM_COL32(0, 0, 0, 180), 48, 1.5f);
-        }
+        ImGui::TextUnformatted(message.c_str());
     }
     ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(2);
+
+    if (m_has_hover) {
+        ImDrawList *draw_list = ImGui::GetForegroundDrawList();
+        const ImVec2 center(float(m_mouse_pos.x()), float(m_mouse_pos.y()));
+        draw_list->AddCircle(center, 16.f, IM_COL32(255, 255, 255, 235), 48, 3.f);
+        draw_list->AddCircle(center, 19.f, IM_COL32(0, 0, 0, 180), 48, 1.5f);
+    }
 }
 
 } // namespace GUI

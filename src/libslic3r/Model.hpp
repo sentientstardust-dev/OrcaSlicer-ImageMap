@@ -1834,6 +1834,8 @@ public:
     std::vector<std::string> md_value;
     TextureMappingPrimeTowerImage texture_mapping_prime_tower_image;
     TextureMappingPrimeTowerImage texture_mapping_prime_tower_image_back;
+    std::string texture_mapping_definitions;
+    bool texture_mapping_definitions_valid { false };
 
     void SetDesigner(std::string designer, std::string designer_user_id) {
         if (design_info == nullptr) {
@@ -1929,6 +1931,7 @@ public:
     void         set_object_backup_id(ModelObject const & object, int uuid);
     int          get_object_backup_id(ModelObject const & object); // generate new if needed
     int          get_object_backup_id(ModelObject const & object) const; // generate new if needed
+    int          find_object_backup_id(ModelObject const & object) const;
 
     ModelMaterial* add_material(t_model_material_id material_id);
     ModelMaterial* add_material(t_model_material_id material_id, const ModelMaterial &other);
@@ -2010,11 +2013,11 @@ private:
 	friend class UndoRedo::StackImpl;
     template<class Archive> void load(Archive& ar) {
         Internal::StaticSerializationWrapper<ModelWipeTower> wipe_tower_wrapper(wipe_tower);
-        ar(materials, objects, wipe_tower_wrapper);
+        ar(materials, objects, wipe_tower_wrapper, texture_mapping_definitions, texture_mapping_definitions_valid);
     }
     template<class Archive> void save(Archive& ar) const {
         Internal::StaticSerializationWrapper<ModelWipeTower const> wipe_tower_wrapper(wipe_tower);
-        ar(materials, objects, wipe_tower_wrapper);
+        ar(materials, objects, wipe_tower_wrapper, texture_mapping_definitions, texture_mapping_definitions_valid);
     }
 
     //BBS: add aux temp directory
