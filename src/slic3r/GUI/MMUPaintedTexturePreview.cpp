@@ -124,6 +124,7 @@ struct SurfaceGradientPreviewSettings
     Vec3f linear_start = Vec3f::Zero();
     Vec3f linear_end = Vec3f::UnitZ();
     float linear_radius_mm = 1.f;
+    std::vector<TextureMappingZone::LinearGradientStop> linear_gradient_stops;
     std::vector<std::array<float, 3>> linear_gradient_lut_colors;
 };
 
@@ -395,27 +396,6 @@ std::array<float, 3> decode_color(const std::string &color)
         float(rgba[1]) / 255.f,
         float(rgba[2]) / 255.f
     };
-}
-
-std::vector<float> compact_linear_gradient_weights(float t, size_t component_count)
-{
-    std::vector<float> weights(component_count, 0.f);
-    if (component_count == 0)
-        return weights;
-    if (component_count == 1) {
-        weights[0] = 1.f;
-        return weights;
-    }
-
-    weights[0] = 1.f - std::clamp(t, 0.f, 1.f);
-    weights[1] = std::clamp(t, 0.f, 1.f);
-    float max_weight = 0.f;
-    for (const float weight : weights)
-        max_weight = std::max(max_weight, std::clamp(weight, 0.f, 1.f));
-    if (max_weight > k_epsilon)
-        for (float &weight : weights)
-            weight = std::clamp(weight / max_weight, 0.f, 1.f);
-    return weights;
 }
 
 ColorRGBA blend_component_colors(const std::vector<std::array<float, 3>> &colors, const std::vector<float> &weights)
@@ -1065,6 +1045,8 @@ bool texture_preview_settings_invalid_for_filament(unsigned int filament_id, siz
         return false;
     if (is_image_zone(*zone))
         return TextureMappingManager::component_count_mismatch(*zone, num_physical);
+    if (is_gradient_zone(*zone) && zone->is_linear_gradient())
+        return TextureMappingManager::selected_component_ids(*zone, num_physical).empty();
     if (is_gradient_zone(*zone))
         return TextureMappingManager::selected_component_ids(*zone, num_physical).size() < 2;
     return false;
@@ -4112,6 +4094,9 @@ bool build_simulated_image_texture_halftone_preview_model_for_state(
 
 std::vector<unsigned int> decode_surface_gradient_component_ids(const TextureMappingZone &zone, size_t num_physical)
 {
+    if (zone.is_linear_gradient())
+        return TextureMappingManager::linear_gradient_component_ids_from_stops(zone, num_physical);
+
     std::vector<unsigned int> ids;
     bool seen[10] = { false };
     for (const char c : zone.component_ids) {
@@ -4357,10 +4342,9 @@ std::optional<SurfaceGradientPreviewSettings> surface_gradient_preview_settings_
     const std::vector<std::string> colors = physical_filament_colors_for_texture_preview(num_physical);
     SurfaceGradientPreviewSettings settings;
     settings.component_ids = decode_surface_gradient_component_ids(zone, num_physical);
-    if (zone.is_linear_gradient() && settings.component_ids.size() > 2)
-        settings.component_ids.resize(2);
     if (settings.component_ids.size() < 2)
-        return std::nullopt;
+        if (!zone.is_linear_gradient())
+            return std::nullopt;
 
     settings.component_colors.reserve(settings.component_ids.size());
     settings.strength_factors.reserve(settings.component_ids.size());
@@ -4380,12 +4364,14 @@ std::optional<SurfaceGradientPreviewSettings> surface_gradient_preview_settings_
     const ColorRGBA base_color = blend_component_colors(settings.component_colors, base_weights);
     settings.base_color = { base_color.r(), base_color.g(), base_color.b() };
     if (zone.is_linear_gradient()) {
+        settings.linear_gradient_stops = TextureMappingManager::normalized_linear_gradient_stops(zone, num_physical);
         settings.linear_gradient_lut_colors.reserve(k_surface_gradient_preview_lut_size);
         for (size_t idx = 0; idx < k_surface_gradient_preview_lut_size; ++idx) {
             const float t = k_surface_gradient_preview_lut_size > 1 ?
                 float(idx) / float(k_surface_gradient_preview_lut_size - 1) :
                 0.f;
-            const std::vector<float> weights = compact_linear_gradient_weights(t, settings.component_colors.size());
+            const std::vector<float> weights =
+                TextureMappingManager::linear_gradient_compact_weights(t, settings.linear_gradient_stops, settings.component_ids);
             const std::array<float, 3> rgb =
                 mix_color_solver_components(settings.component_colors, weights, ColorSolverMixModel::PigmentPainter);
             settings.linear_gradient_lut_colors.push_back({ std::clamp(rgb[0], 0.f, 1.f),
@@ -5228,6 +5214,10 @@ static void texture_preview_mix_zone_baked_model_settings(size_t &signature,
         };
         mix_anchor(zone.linear_gradient_start);
         mix_anchor(zone.linear_gradient_end);
+        for (const TextureMappingZone::LinearGradientStop &stop : TextureMappingManager::normalized_linear_gradient_stops(zone, num_physical)) {
+            signature_mix_float(stop.position, 10000.f);
+            signature_mix(std::hash<unsigned int>{}(stop.filament_id));
+        }
     }
 
     const std::vector<std::string> physical_colors = physical_filament_colors_for_texture_preview(num_physical);

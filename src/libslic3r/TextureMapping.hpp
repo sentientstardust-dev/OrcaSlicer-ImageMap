@@ -167,6 +167,11 @@ struct TextureMappingZone
         std::array<float, 3> global_point { { 0.f, 0.f, 0.f } };
     };
 
+    struct LinearGradientStop {
+        float position = 0.f;
+        unsigned int filament_id = 1;
+    };
+
     uint64_t     stable_id = 0;
     unsigned int zone_id = 0;
     bool         enabled = true;
@@ -229,6 +234,7 @@ struct TextureMappingZone
     bool                 linear_gradient_radius_percent = DefaultLinearGradientRadiusPercent;
     float                linear_gradient_radius_pct = DefaultLinearGradientRadiusPct;
     bool                 show_linear_gradient_direction_arrow = true;
+    std::vector<LinearGradientStop> linear_gradient_stops;
 
     bool is_image_texture() const { return surface_pattern == int(ImageTexture); }
     bool is_2d_gradient() const { return surface_pattern == int(Gradient2D); }
@@ -287,6 +293,7 @@ struct TextureMappingZone
         linear_gradient_radius_mm = DefaultLinearGradientRadiusMm;
         linear_gradient_radius_percent = DefaultLinearGradientRadiusPercent;
         linear_gradient_radius_pct = DefaultLinearGradientRadiusPct;
+        linear_gradient_stops.clear();
         filament_strengths_pct.clear();
         filament_minimum_offsets_pct.clear();
         filament_transmission_distances_mm.clear();
@@ -432,6 +439,13 @@ public:
     static bool auto_adjust_texture_component_ids(TextureMappingZone            &zone,
                                                   size_t                         num_physical,
                                                   const std::vector<std::string> &filament_colours);
+    static std::vector<TextureMappingZone::LinearGradientStop> normalized_linear_gradient_stops(const TextureMappingZone &zone,
+                                                                                                size_t                    num_physical);
+    static std::vector<unsigned int> linear_gradient_component_ids_from_stops(const TextureMappingZone &zone,
+                                                                              size_t                    num_physical);
+    static std::vector<float> linear_gradient_compact_weights(float t,
+                                                              const std::vector<TextureMappingZone::LinearGradientStop> &stops,
+                                                              const std::vector<unsigned int> &component_ids);
     static std::vector<TextureMappingColorMatch> texture_component_color_matches(const TextureMappingZone      &zone,
                                                                                  size_t                         num_physical,
                                                                                  const std::vector<std::string> &filament_colours);

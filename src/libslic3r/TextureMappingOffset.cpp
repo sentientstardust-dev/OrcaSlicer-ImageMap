@@ -2675,6 +2675,9 @@ std::optional<std::array<float, 3>> sample_weight_field_rgb(const TextureMapping
 
 std::vector<unsigned int> decode_texture_mapping_offset_component_ids(const TextureMappingZone &zone, size_t num_physical)
 {
+    if (zone.is_linear_gradient())
+        return TextureMappingManager::linear_gradient_component_ids_from_stops(zone, num_physical);
+
     std::vector<unsigned int> out;
     for (const char c : zone.component_ids) {
         if (c < '1' || c > '9')
@@ -2770,13 +2773,6 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
             TextureMappingManager::effective_texture_component_ids(zone, num_physical, print_config.filament_colour.values);
         if (!effective_component_ids.empty())
             component_ids = effective_component_ids;
-    }
-    if (linear_gradient_mode && component_ids.size() > 2)
-        component_ids.resize(2);
-    if (linear_gradient_mode && component_ids.size() < 2) {
-        component_ids.clear();
-        for (size_t i = 1; i <= std::min<size_t>(num_physical, 2); ++i)
-            component_ids.emplace_back(unsigned(i));
     }
     if (component_ids.empty())
         return std::nullopt;
@@ -3046,6 +3042,8 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     context.active_component_id = active_component_id;
     context.active_component_idx = active_component_idx;
     context.component_ids = std::move(component_ids);
+    if (linear_gradient_mode)
+        context.linear_gradient_stops = TextureMappingManager::normalized_linear_gradient_stops(zone, num_physical);
     context.component_distances_mm = std::move(distances_mm);
     context.rotated_angles = std::move(rotated_angles);
     context.weight_field = std::move(weight_field);
@@ -3129,12 +3127,11 @@ float texture_mapping_offset_surface_inset_mm(const TextureMappingOffsetContext 
                 t = clamp01f((sample - context.linear_gradient_start_mm).dot(gradient_vec) / denom);
         }
         if (context.linear_gradient_radial_mode || (context.linear_gradient_end_mm - context.linear_gradient_start_mm).squaredNorm() > 1e-8f) {
-            float desired_strength = context.active_component_idx == 0 ? 1.f - t :
-                                     context.active_component_idx == 1 ? t :
-                                     0.f;
-            const float max_strength = std::max(1.f - t, t);
-            if (max_strength > EPSILON)
-                desired_strength = clamp01f(desired_strength / max_strength);
+            const std::vector<float> weights =
+                TextureMappingManager::linear_gradient_compact_weights(t, context.linear_gradient_stops, context.component_ids);
+            const float desired_strength = context.active_component_idx < weights.size() ?
+                clamp01f(weights[context.active_component_idx]) :
+                0.f;
             inset_strength = std::clamp(1.f - desired_strength, 0.f, 1.f);
         } else {
             inset_strength = 0.f;

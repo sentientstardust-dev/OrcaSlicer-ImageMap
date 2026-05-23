@@ -66,6 +66,7 @@ struct TextureMappingOffsetContext {
     Vec3f                           linear_gradient_end_mm { Vec3f::Zero() };
     bool                            linear_gradient_radial_mode { false };
     float                           linear_gradient_radius_mm { 0.f };
+    std::vector<TextureMappingZone::LinearGradientStop> linear_gradient_stops;
     unsigned int                    active_component_id { 0 };
     size_t                          active_component_idx { size_t(-1) };
     std::vector<unsigned int>       component_ids;

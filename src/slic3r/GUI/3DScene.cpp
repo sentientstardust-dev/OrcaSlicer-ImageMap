@@ -364,10 +364,8 @@ std::vector<unsigned int> linear_gradient_component_ids_for_arrow(const TextureM
         return id == 0 || id > num_physical;
     }), ids.end());
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
-    if (ids.size() > 2)
-        ids.resize(2);
-    if (ids.size() < 2 && num_physical >= 2)
-        ids = {1, 2};
+    if (ids.empty() && num_physical >= 1)
+        ids = {1};
     return ids;
 }
 
@@ -381,14 +379,22 @@ std::array<float, 3> linear_gradient_filament_color(unsigned int filament_id, co
     return { 0.5f, 0.5f, 0.5f };
 }
 
-ColorRGBA linear_gradient_arrow_color(const std::array<float, 3> &start_color,
-                                      const std::array<float, 3> &end_color,
+ColorRGBA linear_gradient_arrow_color(const std::vector<std::array<float, 3>> &component_colors,
+                                      const std::vector<TextureMappingZone::LinearGradientStop> &stops,
+                                      const std::vector<unsigned int> &component_ids,
                                       float t)
 {
-    std::vector<std::array<float, 3>> colors { start_color, end_color };
-    std::vector<float> weights { std::clamp(1.f - t, 0.f, 1.f), std::clamp(t, 0.f, 1.f) };
-    const std::array<float, 3> mixed = mix_color_solver_components(colors, weights, ColorSolverMixModel::PigmentPainter);
+    const std::vector<float> weights = TextureMappingManager::linear_gradient_compact_weights(t, stops, component_ids);
+    const std::array<float, 3> mixed = mix_color_solver_components(component_colors, weights, ColorSolverMixModel::PigmentPainter);
     return { std::clamp(mixed[0], 0.f, 1.f), std::clamp(mixed[1], 0.f, 1.f), std::clamp(mixed[2], 0.f, 1.f), 1.f };
+}
+
+float linear_gradient_arrow_t(const Vec3f &point,
+                              const Vec3f &arrow_start,
+                              const Vec3f &axis,
+                              float arrow_length)
+{
+    return std::clamp((point - arrow_start).dot(axis) / std::max(0.0001f, arrow_length), 0.f, 1.f);
 }
 
 struct LinearGradientArrowUsage {
@@ -493,39 +499,43 @@ void append_linear_gradient_cylinder(GUI::GLModel::Geometry &geometry,
                                      const Vec3f &u,
                                      const Vec3f &v,
                                      float radius,
-                                     const std::array<float, 3> &start_color,
-                                     const std::array<float, 3> &end_color,
+                                     const std::vector<std::array<float, 3>> &component_colors,
+                                     const std::vector<TextureMappingZone::LinearGradientStop> &stops,
+                                     const std::vector<unsigned int> &component_ids,
                                      bool black)
 {
     constexpr int sectors = 32;
+    constexpr int axial_steps = 72;
     const ColorRGBA black_color = ColorRGBA::BLACK();
-    const float safe_arrow_length = std::max(0.0001f, arrow_length);
-    const float center_t = std::clamp((start - arrow_start).dot(axis) / safe_arrow_length, 0.f, 1.f);
+    std::vector<std::vector<unsigned int>> ring_ids(size_t(axial_steps + 1), std::vector<unsigned int>(size_t(sectors + 1), 0));
+    for (int step = 0; step <= axial_steps; ++step) {
+        const float step_t = float(step) / float(axial_steps);
+        const Vec3f center = start + (end - start) * step_t;
+        const float arrow_t = linear_gradient_arrow_t(center, arrow_start, axis, arrow_length);
+        const ColorRGBA color = black ? black_color : linear_gradient_arrow_color(component_colors, stops, component_ids, arrow_t);
+        for (int sector = 0; sector <= sectors; ++sector) {
+            const float a = 2.f * float(PI) * float(sector) / float(sectors);
+            const Vec3f radial = std::cos(a) * u + std::sin(a) * v;
+            ring_ids[size_t(step)][size_t(sector)] =
+                linear_gradient_add_vertex(geometry, center + radius * radial, radial, color);
+        }
+    }
+
     const unsigned int start_center =
         linear_gradient_add_vertex(geometry,
                                    start,
                                    -axis,
-                                   black ? black_color : linear_gradient_arrow_color(start_color, end_color, center_t));
+                                   black ? black_color : linear_gradient_arrow_color(component_colors, stops, component_ids, linear_gradient_arrow_t(start, arrow_start, axis, arrow_length)));
     for (int i = 0; i < sectors; ++i) {
-        const float a0 = 2.f * float(PI) * float(i) / float(sectors);
-        const float a1 = 2.f * float(PI) * float(i + 1) / float(sectors);
-        const Vec3f r0 = std::cos(a0) * u + std::sin(a0) * v;
-        const Vec3f r1 = std::cos(a1) * u + std::sin(a1) * v;
-        const Vec3f p0 = start + radius * r0;
-        const Vec3f p1 = start + radius * r1;
-        const Vec3f p2 = end + radius * r0;
-        const Vec3f p3 = end + radius * r1;
-        const float t0 = std::clamp((p0 - arrow_start).dot(axis) / safe_arrow_length, 0.f, 1.f);
-        const float t1 = std::clamp((p2 - arrow_start).dot(axis) / safe_arrow_length, 0.f, 1.f);
-        const ColorRGBA c0 = black ? black_color : linear_gradient_arrow_color(start_color, end_color, t0);
-        const ColorRGBA c1 = black ? black_color : linear_gradient_arrow_color(start_color, end_color, t1);
-        const unsigned int i0 = linear_gradient_add_vertex(geometry, p0, r0, c0);
-        const unsigned int i1 = linear_gradient_add_vertex(geometry, p1, r1, c0);
-        const unsigned int i2 = linear_gradient_add_vertex(geometry, p2, r0, c1);
-        const unsigned int i3 = linear_gradient_add_vertex(geometry, p3, r1, c1);
-        geometry.add_triangle(i0, i2, i1);
-        geometry.add_triangle(i1, i2, i3);
-        geometry.add_triangle(start_center, i1, i0);
+        geometry.add_triangle(start_center, ring_ids[0][size_t(i + 1)], ring_ids[0][size_t(i)]);
+        for (int step = 0; step < axial_steps; ++step) {
+            const unsigned int i0 = ring_ids[size_t(step)][size_t(i)];
+            const unsigned int i1 = ring_ids[size_t(step)][size_t(i + 1)];
+            const unsigned int i2 = ring_ids[size_t(step + 1)][size_t(i)];
+            const unsigned int i3 = ring_ids[size_t(step + 1)][size_t(i + 1)];
+            geometry.add_triangle(i0, i2, i1);
+            geometry.add_triangle(i1, i2, i3);
+        }
     }
 }
 
@@ -538,30 +548,44 @@ void append_linear_gradient_cone(GUI::GLModel::Geometry &geometry,
                                  const Vec3f &u,
                                  const Vec3f &v,
                                  float radius,
-                                 const std::array<float, 3> &start_color,
-                                 const std::array<float, 3> &end_color,
+                                 const std::vector<std::array<float, 3>> &component_colors,
+                                 const std::vector<TextureMappingZone::LinearGradientStop> &stops,
+                                 const std::vector<unsigned int> &component_ids,
                                  bool black)
 {
     constexpr int sectors = 32;
+    constexpr int axial_steps = 24;
     const ColorRGBA black_color = ColorRGBA::BLACK();
-    const float safe_arrow_length = std::max(0.0001f, arrow_length);
-    const float tip_t = std::clamp((tip - arrow_start).dot(axis) / safe_arrow_length, 0.f, 1.f);
-    const ColorRGBA tip_color = black ? black_color : linear_gradient_arrow_color(start_color, end_color, tip_t);
+    const ColorRGBA tip_color = black ? black_color : linear_gradient_arrow_color(component_colors, stops, component_ids, linear_gradient_arrow_t(tip, arrow_start, axis, arrow_length));
+    std::vector<std::vector<unsigned int>> ring_ids(size_t(axial_steps), std::vector<unsigned int>(size_t(sectors + 1), 0));
+    const Vec3f cone_axis = tip - base;
+    for (int step = 0; step < axial_steps; ++step) {
+        const float step_t = float(step) / float(axial_steps);
+        const Vec3f center = base + cone_axis * step_t;
+        const float ring_radius = radius * (1.f - step_t);
+        const ColorRGBA color = black ? black_color : linear_gradient_arrow_color(component_colors, stops, component_ids, linear_gradient_arrow_t(center, arrow_start, axis, arrow_length));
+        for (int sector = 0; sector <= sectors; ++sector) {
+            const float a = 2.f * float(PI) * float(sector) / float(sectors);
+            const Vec3f radial = std::cos(a) * u + std::sin(a) * v;
+            const Vec3f normal = (radial + axis * 0.35f).normalized();
+            ring_ids[size_t(step)][size_t(sector)] =
+                linear_gradient_add_vertex(geometry, center + ring_radius * radial, normal, color);
+        }
+    }
+
     for (int i = 0; i < sectors; ++i) {
-        const float a0 = 2.f * float(PI) * float(i) / float(sectors);
-        const float a1 = 2.f * float(PI) * float(i + 1) / float(sectors);
-        const Vec3f r0 = std::cos(a0) * u + std::sin(a0) * v;
-        const Vec3f r1 = std::cos(a1) * u + std::sin(a1) * v;
-        const Vec3f p0 = base + radius * r0;
-        const Vec3f p1 = base + radius * r1;
-        const float base_t = std::clamp((base - arrow_start).dot(axis) / safe_arrow_length, 0.f, 1.f);
-        const ColorRGBA base_color = black ? black_color : linear_gradient_arrow_color(start_color, end_color, base_t);
-        const Vec3f n0 = (r0 + axis * 0.35f).normalized();
-        const Vec3f n1 = (r1 + axis * 0.35f).normalized();
-        const unsigned int i0 = linear_gradient_add_vertex(geometry, p0, n0, base_color);
-        const unsigned int i1 = linear_gradient_add_vertex(geometry, p1, n1, base_color);
-        const unsigned int i2 = linear_gradient_add_vertex(geometry, tip, axis, tip_color);
-        geometry.add_triangle(i0, i2, i1);
+        for (int step = 0; step + 1 < axial_steps; ++step) {
+            const unsigned int i0 = ring_ids[size_t(step)][size_t(i)];
+            const unsigned int i1 = ring_ids[size_t(step)][size_t(i + 1)];
+            const unsigned int i2 = ring_ids[size_t(step + 1)][size_t(i)];
+            const unsigned int i3 = ring_ids[size_t(step + 1)][size_t(i + 1)];
+            geometry.add_triangle(i0, i2, i1);
+            geometry.add_triangle(i1, i2, i3);
+        }
+        const unsigned int i0 = ring_ids[size_t(axial_steps - 1)][size_t(i)];
+        const unsigned int i1 = ring_ids[size_t(axial_steps - 1)][size_t(i + 1)];
+        const unsigned int tip_idx = linear_gradient_add_vertex(geometry, tip, axis, tip_color);
+        geometry.add_triangle(i0, tip_idx, i1);
     }
 }
 
@@ -661,8 +685,9 @@ void append_linear_gradient_arrow(GUI::GLModel::Geometry &geometry,
                                   float radius,
                                   float head_radius,
                                   float head_length,
-                                  const std::array<float, 3> &start_color,
-                                  const std::array<float, 3> &end_color,
+                                  const std::vector<std::array<float, 3>> &component_colors,
+                                  const std::vector<TextureMappingZone::LinearGradientStop> &stops,
+                                  const std::vector<unsigned int> &component_ids,
                                   bool black)
 {
     const Vec3f delta = end - start;
@@ -676,8 +701,8 @@ void append_linear_gradient_arrow(GUI::GLModel::Geometry &geometry,
     float clamped_head_length = std::min(head_length, length * 0.75f);
     clamped_head_length = std::max(clamped_head_length, std::min(radius * 2.f, length * 0.5f));
     const Vec3f shaft_end = start + axis * std::max(radius, length - clamped_head_length);
-    append_linear_gradient_cylinder(geometry, start, shaft_end, start, length, axis, u, v, radius, start_color, end_color, black);
-    append_linear_gradient_cone(geometry, shaft_end, end, start, length, axis, u, v, head_radius, start_color, end_color, black);
+    append_linear_gradient_cylinder(geometry, start, shaft_end, start, length, axis, u, v, radius, component_colors, stops, component_ids, black);
+    append_linear_gradient_cone(geometry, shaft_end, end, start, length, axis, u, v, head_radius, component_colors, stops, component_ids, black);
 }
 
 } // namespace
@@ -3173,8 +3198,14 @@ void GLVolumeCollection::render_linear_gradient_direction_arrows(const Transform
             continue;
 
         const std::vector<unsigned int> component_ids = linear_gradient_component_ids_for_arrow(zone, num_physical);
-        if (component_ids.size() < 2)
+        if (component_ids.empty())
             continue;
+        const std::vector<TextureMappingZone::LinearGradientStop> gradient_stops =
+            TextureMappingManager::normalized_linear_gradient_stops(zone, num_physical);
+        std::vector<std::array<float, 3>> component_colors;
+        component_colors.reserve(component_ids.size());
+        for (const unsigned int component_id : component_ids)
+            component_colors.emplace_back(linear_gradient_filament_color(component_id, filament_colors));
 
         const LinearGradientArrowUsage usage = linear_gradient_arrow_usage(volumes, zone.zone_id);
         const std::optional<Vec3f> start_anchor = linear_gradient_anchor_global_point(volumes, zone.linear_gradient_start);
@@ -3219,8 +3250,6 @@ void GLVolumeCollection::render_linear_gradient_direction_arrows(const Transform
             delta = end - start;
         }
 
-        const std::array<float, 3> start_color = linear_gradient_filament_color(component_ids[0], filament_colors);
-        const std::array<float, 3> end_color = linear_gradient_filament_color(component_ids[1], filament_colors);
         const float shaft_radius = std::clamp(length * 0.018f, 0.35f, 2.2f);
         const float head_length = std::min(length * 0.24f, std::max(shaft_radius * 4.f, length * 0.12f));
         const float head_radius = shaft_radius * 3.1f;
@@ -3230,8 +3259,9 @@ void GLVolumeCollection::render_linear_gradient_direction_arrows(const Transform
                                      shaft_radius * 1.55f,
                                      head_radius * 1.28f,
                                      head_length,
-                                     start_color,
-                                     end_color,
+                                     component_colors,
+                                     gradient_stops,
+                                     component_ids,
                                      true);
         append_linear_gradient_arrow(color_geometry,
                                      start,
@@ -3239,8 +3269,9 @@ void GLVolumeCollection::render_linear_gradient_direction_arrows(const Transform
                                      shaft_radius,
                                      head_radius,
                                      head_length,
-                                     start_color,
-                                     end_color,
+                                     component_colors,
+                                     gradient_stops,
+                                     component_ids,
                                      false);
 
         const float sphere_radius = shaft_radius * 2.45f;
