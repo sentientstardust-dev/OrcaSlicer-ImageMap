@@ -400,13 +400,45 @@ static std::vector<const MMU_Graph::Arc *> get_next_arc(
     return sorted_arcs.front().first;
 }
 
-static bool is_profile_self_interaction(Polygon poly)
+static bool is_profile_self_interaction(const Polygon &poly)
 {
     auto  lines = poly.lines();
+    struct LineBounds {
+        coord_t min_x;
+        coord_t max_x;
+        coord_t min_y;
+        coord_t max_y;
+    };
+    std::vector<LineBounds> bounds;
+    bounds.reserve(lines.size());
+    for (const Line &line : lines) {
+        bounds.push_back({std::min(line.a.x(), line.b.x()),
+                          std::max(line.a.x(), line.b.x()),
+                          std::min(line.a.y(), line.b.y()),
+                          std::max(line.a.y(), line.b.y())});
+    }
+    auto bounds_overlap = [](const LineBounds &lhs, const LineBounds &rhs) {
+        return lhs.min_x <= rhs.max_x && rhs.min_x <= lhs.max_x &&
+               lhs.min_y <= rhs.max_y && rhs.min_y <= lhs.max_y;
+    };
+    std::vector<size_t> order(lines.size());
+    for (size_t idx = 0; idx < order.size(); ++idx)
+        order[idx] = idx;
+    std::sort(order.begin(), order.end(), [&bounds](size_t lhs, size_t rhs) {
+        return bounds[lhs].min_x < bounds[rhs].min_x;
+    });
+    auto are_adjacent = [&lines](size_t lhs, size_t rhs) {
+        const size_t diff = lhs > rhs ? lhs - rhs : rhs - lhs;
+        return diff <= 1 || diff + 1 == lines.size();
+    };
     Point intersection;
-    for (int i = 0; i < lines.size(); ++i) {
-        for (int j = i + 2; j < std::min(lines.size(), lines.size() + i - 1); ++j) {
-            if (lines[i].intersection(lines[j], &intersection)) return true;
+    for (size_t order_i = 0; order_i < order.size(); ++order_i) {
+        const size_t i = order[order_i];
+        for (size_t order_j = order_i + 1; order_j < order.size(); ++order_j) {
+            const size_t j = order[order_j];
+            if (bounds[j].min_x > bounds[i].max_x)
+                break;
+            if (!are_adjacent(i, j) && bounds_overlap(bounds[i], bounds[j]) && lines[i].intersection(lines[j], &intersection)) return true;
         }
     }
     return false;

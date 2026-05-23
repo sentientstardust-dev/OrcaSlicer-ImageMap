@@ -1430,6 +1430,8 @@ public:
                                         bool recolor_small_perimeter_loops,
                                         bool recolor_top_visible_perimeter_sections,
                                         int top_visible_perimeter_recolor_aggressiveness,
+                                        int top_visible_perimeter_recolor_above_layers,
+                                        bool top_visible_perimeter_recolor_point_sampling,
                                         bool compact_offset_mode,
                                         bool use_legacy_fixed_color_mode,
                                         bool minimum_visibility_offset_enabled,
@@ -1737,7 +1739,29 @@ public:
                        int(TextureMappingZone::TopVisibleRecolorConservative),
                        int(TextureMappingZone::TopVisibleRecolorAggressive)));
         top_visible_recolor_row->Add(m_top_visible_perimeter_recolor_aggressiveness_choice, 1, wxALIGN_CENTER_VERTICAL);
-        print_settings_box->Add(top_visible_recolor_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, gap);
+        print_settings_box->Add(top_visible_recolor_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+        auto *top_visible_recolor_layers_row = new wxBoxSizer(wxHORIZONTAL);
+        m_top_visible_perimeter_recolor_above_layers_label =
+            new wxStaticText(print_settings_page, wxID_ANY, _L("Visible layer lookahead:"));
+        top_visible_recolor_layers_row->Add(m_top_visible_perimeter_recolor_above_layers_label,
+                                            0,
+                                            wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                                            gap);
+        m_top_visible_perimeter_recolor_above_layers_spin =
+            new wxSpinCtrl(print_settings_page,
+                           wxID_ANY,
+                           wxEmptyString,
+                           wxDefaultPosition,
+                           wxSize(FromDIP(70), -1),
+                           wxSP_ARROW_KEYS | wxALIGN_RIGHT,
+                           TextureMappingZone::MinTopVisiblePerimeterRecolorAboveLayers,
+                           TextureMappingZone::MaxTopVisiblePerimeterRecolorAboveLayers,
+                           std::clamp(top_visible_perimeter_recolor_above_layers,
+                                      TextureMappingZone::MinTopVisiblePerimeterRecolorAboveLayers,
+                                      TextureMappingZone::MaxTopVisiblePerimeterRecolorAboveLayers));
+        top_visible_recolor_layers_row->Add(m_top_visible_perimeter_recolor_above_layers_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+        top_visible_recolor_layers_row->Add(new wxStaticText(print_settings_page, wxID_ANY, _L("layers")), 0, wxALIGN_CENTER_VERTICAL);
+        print_settings_box->Add(top_visible_recolor_layers_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, gap);
         print_settings_root->Add(print_settings_box, 0, wxEXPAND | wxALL, gap);
 
         auto *experimental_box = new wxStaticBoxSizer(wxVERTICAL, experimental_page, _L("Surface Texture"));
@@ -1763,6 +1787,12 @@ public:
             new wxCheckBox(experimental_page, wxID_ANY, _L("Use modulated overhang geometry in support generation"));
         m_use_modulated_overhang_geometry_for_support_checkbox->SetValue(use_modulated_overhang_geometry_for_support);
         experimental_box->Add(m_use_modulated_overhang_geometry_for_support_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        m_top_visible_perimeter_recolor_point_sampling_checkbox =
+            new wxCheckBox(experimental_page, wxID_ANY, _L("Point-sample visible layer-line recolor"));
+        m_top_visible_perimeter_recolor_point_sampling_checkbox->SetValue(top_visible_perimeter_recolor_point_sampling);
+        m_top_visible_perimeter_recolor_point_sampling_checkbox->SetToolTip(
+            _L("Uses dense point samples instead of clipped vector areas to decide which top-visible perimeter sections should be recolored."));
+        experimental_box->Add(m_top_visible_perimeter_recolor_point_sampling_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
         m_dithering_resolution_panel = new wxPanel(experimental_page, wxID_ANY);
         auto *dithering_resolution_row = new wxBoxSizer(wxHORIZONTAL);
         m_dithering_resolution_panel->SetSizer(dithering_resolution_row);
@@ -2062,6 +2092,19 @@ public:
                        int(TextureMappingZone::TopVisibleRecolorConservative),
                        int(TextureMappingZone::TopVisibleRecolorAggressive)) :
             TextureMappingZone::DefaultTopVisiblePerimeterRecolorAggressiveness;
+    }
+    int top_visible_perimeter_recolor_above_layers() const
+    {
+        return m_top_visible_perimeter_recolor_above_layers_spin ?
+            std::clamp(m_top_visible_perimeter_recolor_above_layers_spin->GetValue(),
+                       TextureMappingZone::MinTopVisiblePerimeterRecolorAboveLayers,
+                       TextureMappingZone::MaxTopVisiblePerimeterRecolorAboveLayers) :
+            TextureMappingZone::DefaultTopVisiblePerimeterRecolorAboveLayers;
+    }
+    bool top_visible_perimeter_recolor_point_sampling() const
+    {
+        return m_top_visible_perimeter_recolor_point_sampling_checkbox != nullptr &&
+               m_top_visible_perimeter_recolor_point_sampling_checkbox->GetValue();
     }
     bool use_legacy_fixed_color_mode() const { return m_use_legacy_fixed_color_mode_checkbox && m_use_legacy_fixed_color_mode_checkbox->GetValue(); }
     bool high_speed_image_texture_sampling() const { return true; }
@@ -2408,6 +2451,8 @@ private:
             m_recolor_top_visible_perimeter_sections_checkbox->Enable(perimeter_path_mode);
         if (m_use_modulated_overhang_geometry_for_support_checkbox != nullptr)
             m_use_modulated_overhang_geometry_for_support_checkbox->Enable(perimeter_path_v2_mode);
+        if (m_top_visible_perimeter_recolor_point_sampling_checkbox != nullptr)
+            m_top_visible_perimeter_recolor_point_sampling_checkbox->Enable(perimeter_path_v2_mode);
         const bool top_visible_enabled =
             perimeter_path_mode &&
             top_visible_checked;
@@ -2415,6 +2460,10 @@ private:
             m_top_visible_perimeter_recolor_aggressiveness_label->Enable(top_visible_enabled);
         if (m_top_visible_perimeter_recolor_aggressiveness_choice != nullptr)
             m_top_visible_perimeter_recolor_aggressiveness_choice->Enable(top_visible_enabled);
+        if (m_top_visible_perimeter_recolor_above_layers_label != nullptr)
+            m_top_visible_perimeter_recolor_above_layers_label->Enable(top_visible_enabled);
+        if (m_top_visible_perimeter_recolor_above_layers_spin != nullptr)
+            m_top_visible_perimeter_recolor_above_layers_spin->Enable(top_visible_enabled);
         layout_current_options_page();
         if (!fit_dialog)
             return;
@@ -2478,6 +2527,9 @@ private:
     wxCheckBox *m_recolor_top_visible_perimeter_sections_checkbox {nullptr};
     wxStaticText *m_top_visible_perimeter_recolor_aggressiveness_label {nullptr};
     wxChoice *m_top_visible_perimeter_recolor_aggressiveness_choice {nullptr};
+    wxStaticText *m_top_visible_perimeter_recolor_above_layers_label {nullptr};
+    wxSpinCtrl *m_top_visible_perimeter_recolor_above_layers_spin {nullptr};
+    wxCheckBox *m_top_visible_perimeter_recolor_point_sampling_checkbox {nullptr};
     wxCheckBox *m_compact_offset_mode_checkbox {nullptr};
     wxCheckBox *m_dithering_enabled_checkbox {nullptr};
     wxChoice *m_dithering_method_choice {nullptr};
@@ -6662,6 +6714,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.recolor_small_perimeter_loops,
                                                     updated.recolor_top_visible_perimeter_sections,
                                                     updated.top_visible_perimeter_recolor_aggressiveness,
+                                                    updated.top_visible_perimeter_recolor_above_layers,
+                                                    updated.top_visible_perimeter_recolor_point_sampling,
                                                     updated.compact_offset_mode,
                                                     updated.use_legacy_fixed_color_mode,
                                                     updated.minimum_visibility_offset_enabled,
@@ -6704,6 +6758,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.recolor_small_perimeter_loops = dlg.recolor_small_perimeter_loops();
             updated.recolor_top_visible_perimeter_sections = dlg.recolor_top_visible_perimeter_sections();
             updated.top_visible_perimeter_recolor_aggressiveness = dlg.top_visible_perimeter_recolor_aggressiveness();
+            updated.top_visible_perimeter_recolor_above_layers = dlg.top_visible_perimeter_recolor_above_layers();
+            updated.top_visible_perimeter_recolor_point_sampling = dlg.top_visible_perimeter_recolor_point_sampling();
             updated.compact_offset_mode = dlg.compact_offset_mode();
             updated.use_legacy_fixed_color_mode = dlg.use_legacy_fixed_color_mode();
             updated.high_resolution_sampling = true;

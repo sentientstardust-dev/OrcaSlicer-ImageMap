@@ -119,6 +119,10 @@ struct TextureMappingZone
     static constexpr bool  DefaultRecolorSmallPerimeterLoops = false;
     static constexpr bool  DefaultRecolorTopVisiblePerimeterSections = false;
     static constexpr int   DefaultTopVisiblePerimeterRecolorAggressiveness = int(TopVisibleRecolorAggressive);
+    static constexpr int   MinTopVisiblePerimeterRecolorAboveLayers = 1;
+    static constexpr int   MaxTopVisiblePerimeterRecolorAboveLayers = 5;
+    static constexpr int   DefaultTopVisiblePerimeterRecolorAboveLayers = 2;
+    static constexpr bool  DefaultTopVisiblePerimeterRecolorPointSampling = true;
     static constexpr bool  DefaultCompactOffsetMode = true;
     static constexpr bool  DefaultUseLegacyFixedColorMode = false;
     static constexpr bool  DefaultHighSpeedImageTextureSampling = true;
@@ -176,6 +180,8 @@ struct TextureMappingZone
     bool        recolor_small_perimeter_loops = DefaultRecolorSmallPerimeterLoops;
     bool        recolor_top_visible_perimeter_sections = DefaultRecolorTopVisiblePerimeterSections;
     int         top_visible_perimeter_recolor_aggressiveness = DefaultTopVisiblePerimeterRecolorAggressiveness;
+    int         top_visible_perimeter_recolor_above_layers = DefaultTopVisiblePerimeterRecolorAboveLayers;
+    bool        top_visible_perimeter_recolor_point_sampling = DefaultTopVisiblePerimeterRecolorPointSampling;
     bool        compact_offset_mode = DefaultCompactOffsetMode;
     bool        use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
     bool        high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;
@@ -237,6 +243,8 @@ struct TextureMappingZone
         recolor_small_perimeter_loops = DefaultRecolorSmallPerimeterLoops;
         recolor_top_visible_perimeter_sections = DefaultRecolorTopVisiblePerimeterSections;
         top_visible_perimeter_recolor_aggressiveness = DefaultTopVisiblePerimeterRecolorAggressiveness;
+        top_visible_perimeter_recolor_above_layers = DefaultTopVisiblePerimeterRecolorAboveLayers;
+        top_visible_perimeter_recolor_point_sampling = DefaultTopVisiblePerimeterRecolorPointSampling;
         compact_offset_mode = DefaultCompactOffsetMode;
         use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
         high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;

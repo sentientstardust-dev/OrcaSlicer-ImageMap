@@ -869,6 +869,8 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            recolor_small_perimeter_loops == rhs.recolor_small_perimeter_loops &&
            recolor_top_visible_perimeter_sections == rhs.recolor_top_visible_perimeter_sections &&
            top_visible_perimeter_recolor_aggressiveness == rhs.top_visible_perimeter_recolor_aggressiveness &&
+           top_visible_perimeter_recolor_above_layers == rhs.top_visible_perimeter_recolor_above_layers &&
+           top_visible_perimeter_recolor_point_sampling == rhs.top_visible_perimeter_recolor_point_sampling &&
            compact_offset_mode == rhs.compact_offset_mode &&
            use_legacy_fixed_color_mode == rhs.use_legacy_fixed_color_mode &&
            high_speed_image_texture_sampling == rhs.high_speed_image_texture_sampling &&
@@ -1128,6 +1130,11 @@ std::string TextureMappingManager::serialize_entries()
         texture["recolor_top_visible_perimeter_sections"] = zone.recolor_top_visible_perimeter_sections;
         texture["top_visible_perimeter_recolor_aggressiveness"] =
             top_visible_recolor_aggressiveness_name(zone.top_visible_perimeter_recolor_aggressiveness);
+        texture["top_visible_perimeter_recolor_above_layers"] =
+            clamp_int(zone.top_visible_perimeter_recolor_above_layers,
+                      TextureMappingZone::MinTopVisiblePerimeterRecolorAboveLayers,
+                      TextureMappingZone::MaxTopVisiblePerimeterRecolorAboveLayers);
+        texture["top_visible_perimeter_recolor_point_sampling"] = zone.top_visible_perimeter_recolor_point_sampling;
         texture["compact_offset_mode"] = zone.compact_offset_mode;
         texture["use_legacy_fixed_color_mode"] = zone.use_legacy_fixed_color_mode;
         texture["high_speed_image_texture_sampling"] = true;
@@ -1285,6 +1292,14 @@ void TextureMappingManager::load_entries(const std::string &serialized,
             top_visible_recolor_aggressiveness_from_name(
                 texture.value("top_visible_perimeter_recolor_aggressiveness",
                               top_visible_recolor_aggressiveness_name(TextureMappingZone::DefaultTopVisiblePerimeterRecolorAggressiveness)));
+        zone.top_visible_perimeter_recolor_above_layers =
+            clamp_int(texture.value("top_visible_perimeter_recolor_above_layers",
+                                    TextureMappingZone::DefaultTopVisiblePerimeterRecolorAboveLayers),
+                      TextureMappingZone::MinTopVisiblePerimeterRecolorAboveLayers,
+                      TextureMappingZone::MaxTopVisiblePerimeterRecolorAboveLayers);
+        zone.top_visible_perimeter_recolor_point_sampling =
+            texture.value("top_visible_perimeter_recolor_point_sampling",
+                          TextureMappingZone::DefaultTopVisiblePerimeterRecolorPointSampling);
         zone.compact_offset_mode = texture.value("compact_offset_mode", TextureMappingZone::DefaultCompactOffsetMode);
         zone.use_legacy_fixed_color_mode =
             texture.value("use_legacy_fixed_color_mode", TextureMappingZone::DefaultUseLegacyFixedColorMode);
