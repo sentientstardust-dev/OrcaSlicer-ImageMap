@@ -1793,6 +1793,7 @@ private:
         if (!apply_to(preview))
             return;
         preview.surface_pattern = int(TextureMappingZone::Gradient2D);
+        preview.apply_default_modulation_mode();
         m_live_preview(preview);
     }
 
@@ -1848,6 +1849,7 @@ public:
                                         bool seam_hiding,
                                         bool nonlinear_offset_adjustment,
                                         int modulation_mode,
+                                        bool modulation_mode_manually_changed,
                                         bool recolor_small_perimeter_loops,
                                         bool recolor_top_visible_perimeter_sections,
                                         int top_visible_perimeter_recolor_aggressiveness,
@@ -1875,6 +1877,7 @@ public:
     {
         (void) generic_solver_mix_model;
         (void) reduce_outer_surface_texture;
+        m_modulation_mode_manually_changed = modulation_mode_manually_changed;
         m_strength_offsets_expanded = initial_strength_offsets_expanded;
         const int gap = FromDIP(8);
         auto *root = new wxBoxSizer(wxVERTICAL);
@@ -2128,7 +2131,10 @@ public:
                                                           int(TextureMappingZone::ModulationPerimeterPath)));
         modulation_mode_row->Add(m_modulation_mode_choice, 1, wxALIGN_CENTER_VERTICAL);
         print_settings_root->Add(modulation_mode_row, 0, wxEXPAND | wxALL, gap);
-        m_modulation_mode_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) { update_modulation_mode_options_visibility(false); });
+        m_modulation_mode_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) {
+            m_modulation_mode_manually_changed = true;
+            update_modulation_mode_options_visibility(false);
+        });
 
         auto *print_settings_box = new wxStaticBoxSizer(wxVERTICAL,
                                                         print_settings_page,
@@ -2458,6 +2464,7 @@ public:
                        int(TextureMappingZone::ModulationPerimeterPath)) :
             TextureMappingZone::DefaultModulationMode;
     }
+    bool modulation_mode_manually_changed() const { return m_modulation_mode_manually_changed; }
     bool compact_offset_mode() const { return dithering_enabled() || (m_compact_offset_mode_checkbox && m_compact_offset_mode_checkbox->GetValue()); }
     bool recolor_small_perimeter_loops() const
     {
@@ -2880,6 +2887,7 @@ private:
     wxCheckBox *m_seam_hiding_checkbox {nullptr};
     wxCheckBox *m_nonlinear_offset_adjustment_checkbox {nullptr};
     wxChoice *m_modulation_mode_choice {nullptr};
+    bool m_modulation_mode_manually_changed {false};
     wxCheckBox *m_recolor_small_perimeter_loops_checkbox {nullptr};
     wxCheckBox *m_recolor_top_visible_perimeter_sections_checkbox {nullptr};
     wxStaticText *m_top_visible_perimeter_recolor_aggressiveness_label {nullptr};
@@ -6806,6 +6814,27 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             canvas->reload_scene(true, true);
     };
 
+    auto selected_texture_mapping_object_idxs = [this]() {
+        std::vector<size_t> object_idxs;
+        auto append_selection = [this, &object_idxs](const Selection &selection) {
+            if (selection.is_empty() || selection.is_wipe_tower())
+                return;
+            for (const auto &item : selection.get_content()) {
+                if (item.first < 0 || p->plater == nullptr || size_t(item.first) >= p->plater->model().objects.size())
+                    continue;
+                const size_t obj_idx = size_t(item.first);
+                if (std::find(object_idxs.begin(), object_idxs.end(), obj_idx) == object_idxs.end())
+                    object_idxs.emplace_back(obj_idx);
+            }
+        };
+        if (p->plater != nullptr) {
+            if (GLCanvas3D *canvas = p->plater->get_current_canvas3D())
+                append_selection(canvas->get_selection());
+            append_selection(p->plater->get_selection());
+        }
+        return object_idxs;
+    };
+
     auto texture_mapping_zone_affects_scene = [print_cfg](unsigned int zone_id) {
         const Plater *plater = wxGetApp().plater();
         return plater != nullptr && model_uses_texture_mapping_zone_id(plater->model(), print_cfg, zone_id);
@@ -6907,17 +6936,21 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             rows[zone_index] = std::move(updated);
             mgr_ptr->normalize_zone_ids(num_physical);
             const unsigned int after_zone_id = rows[zone_index].zone_id;
+            const bool linear_gradient_preview_change = before.is_linear_gradient() || rows[zone_index].is_linear_gradient();
             const bool affects_scene = texture_mapping_zone_affects_scene(before_zone_id) ||
                                        texture_mapping_zone_affects_scene(after_zone_id);
             refresh_summary_preview(rows[zone_index]);
             set_config_string("texture_mapping_definitions", serialize_texture_mapping_manager(mgr_ptr));
             if (preview_only_change) {
                 notify_change(false);
-                if (affects_scene)
+                if (affects_scene || linear_gradient_preview_change)
                     refresh_texture_mapping_preview();
             }
-            else
+            else {
                 notify_change(affects_scene);
+                if (linear_gradient_preview_change)
+                    refresh_texture_mapping_preview();
+            }
             return affects_scene;
         };
 
@@ -7055,12 +7088,14 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                          set_start_btn_ref,
                                                          set_end_btn_ref,
                                                          clear_points_btn_ref,
+                                                         surface_choice,
                                                          linear_gradient_mode_choice,
                                                          editor_ref,
                                                          row_ref,
                                                          update_texture_mapping_area_height](GLGizmoTextureGradientPointPicker::Target active_target) {
             const TextureMappingZone *zone = mgr_ptr != nullptr && zone_index < mgr_ptr->zones().size() ? &mgr_ptr->zones()[zone_index] : nullptr;
-            const bool radial_gradient = linear_gradient_mode_choice != nullptr && linear_gradient_mode_choice->GetSelection() == 1;
+            const bool linear_gradient = surface_choice != nullptr && surface_choice->GetSelection() == 1;
+            const bool radial_gradient = linear_gradient && linear_gradient_mode_choice != nullptr && linear_gradient_mode_choice->GetSelection() == 1;
             const bool has_start = zone != nullptr && zone->linear_gradient_start.valid;
             const bool has_end = zone != nullptr && zone->linear_gradient_end.valid;
             if (wxButton *button = set_start_btn_ref.get()) {
@@ -7068,18 +7103,22 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                     (has_start ? _L("Set Center") : _L("Add Center")) :
                     (has_start ? _L("Set Start") : _L("Add Start"));
                 button->SetLabel(active_target == GLGizmoTextureGradientPointPicker::Target::Start ? _L("Cancel selection") : inactive_label);
+                button->Show(linear_gradient);
+                button->Enable(linear_gradient);
                 button->InvalidateBestSize();
                 button->Fit();
             }
             if (wxButton *button = set_end_btn_ref.get()) {
                 button->SetLabel(active_target == GLGizmoTextureGradientPointPicker::Target::End ? _L("Cancel selection") : (has_end ? _L("Set End") : _L("Add End")));
-                button->Show(!radial_gradient);
-                button->Enable(!radial_gradient);
+                button->Show(linear_gradient && !radial_gradient);
+                button->Enable(linear_gradient && !radial_gradient);
                 button->InvalidateBestSize();
                 button->Fit();
             }
-            if (wxButton *button = clear_points_btn_ref.get())
-                button->Enable(has_start || has_end);
+            if (wxButton *button = clear_points_btn_ref.get()) {
+                button->Show(linear_gradient);
+                button->Enable(linear_gradient && (has_start || has_end));
+            }
             if (wxWindow *window = editor_ref.get())
                 window->Layout();
             if (wxWindow *window = row_ref.get())
@@ -7189,6 +7228,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             }
             updated.enabled = true;
             updated.surface_pattern = surface_pattern;
+            updated.apply_default_modulation_mode();
             updated.component_ids = encode_texture_mapping_component_ids(ids);
             if (updated.is_linear_gradient() && !updated.linear_gradient_stops.empty()) {
                 updated.component_a = updated.linear_gradient_stops.front().filament_id;
@@ -7365,6 +7405,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
 
             updated.enabled = true;
             updated.surface_pattern = surface_pattern;
+            updated.apply_default_modulation_mode();
             updated.component_ids = encode_texture_mapping_component_ids(ids);
             if (updated.is_linear_gradient() && !updated.linear_gradient_stops.empty()) {
                 updated.component_a = updated.linear_gradient_stops.front().filament_id;
@@ -7451,6 +7492,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             });
         if (linear_gradient_radius_spin != nullptr) {
             linear_gradient_radius_spin->Bind(wxEVT_SPINCTRLDOUBLE, [apply_controls](wxSpinDoubleEvent &) { apply_controls(); });
+            linear_gradient_radius_spin->Bind(wxEVT_TEXT, [apply_controls](wxCommandEvent &) { apply_controls(); });
             linear_gradient_radius_spin->Bind(wxEVT_TEXT_ENTER, [apply_controls](wxCommandEvent &) { apply_controls(); });
             linear_gradient_radius_spin->Bind(wxEVT_KILL_FOCUS, [apply_controls](wxFocusEvent &evt) {
                 apply_controls();
@@ -7515,6 +7557,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             else
                 updated.linear_gradient_end = anchor;
             updated.surface_pattern = int(TextureMappingZone::LinearGradient);
+            updated.apply_default_modulation_mode();
             if (updated == mgr_ptr->zones()[zone_index])
                 return;
             sync_current_model_texture_mapping_definitions(serialize_texture_mapping_manager(mgr_ptr));
@@ -7567,6 +7610,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             const std::string original_serialized = serialize_texture_mapping_manager(mgr_ptr);
             TextureMappingZone active_preview = original;
             active_preview.surface_pattern = int(TextureMappingZone::LinearGradient);
+            active_preview.apply_default_modulation_mode();
             active_preview.show_linear_gradient_direction_arrow = true;
             auto live_preview_applied = std::make_shared<bool>(false);
             auto redraw_live_preview = [this]() {
@@ -7634,6 +7678,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 else
                     preview.linear_gradient_end = anchor;
                 preview.surface_pattern = int(TextureMappingZone::LinearGradient);
+                preview.apply_default_modulation_mode();
                 apply_live_preview(std::move(preview));
             }, cancel_live_selection);
             if (gizmos.get_current_type() != GLGizmosManager::TextureGradientPointPicker)
@@ -7661,6 +7706,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             TextureMappingZone updated = mgr_ptr->zones()[zone_index];
             updated.clear_linear_gradient_points();
             updated.surface_pattern = int(TextureMappingZone::LinearGradient);
+            updated.apply_default_modulation_mode();
             if (updated == mgr_ptr->zones()[zone_index])
                 return;
             sync_current_model_texture_mapping_definitions(serialize_texture_mapping_manager(mgr_ptr));
@@ -7725,6 +7771,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 return;
             }
             updated.surface_pattern = int(TextureMappingZone::Gradient2D);
+            updated.apply_default_modulation_mode();
             apply_zone(std::move(updated));
             CallAfter([this]() { update_texture_mapping_panel(false); });
         });
@@ -7777,6 +7824,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.seam_hiding,
                                                     updated.nonlinear_offset_adjustment,
                                                     updated.modulation_mode,
+                                                    updated.modulation_mode_manually_changed,
                                                     updated.recolor_small_perimeter_loops,
                                                     updated.recolor_top_visible_perimeter_sections,
                                                     updated.top_visible_perimeter_recolor_aggressiveness,
@@ -7818,6 +7866,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.seam_hiding = dlg.seam_hiding();
             updated.nonlinear_offset_adjustment = dlg.nonlinear_offset_adjustment();
             updated.modulation_mode = dlg.modulation_mode();
+            updated.modulation_mode_manually_changed = dlg.modulation_mode_manually_changed();
+            updated.apply_default_modulation_mode();
             updated.recolor_small_perimeter_loops = dlg.recolor_small_perimeter_loops();
             updated.recolor_top_visible_perimeter_sections = dlg.recolor_top_visible_perimeter_sections();
             updated.top_visible_perimeter_recolor_aggressiveness = dlg.top_visible_perimeter_recolor_aggressiveness();
@@ -7916,20 +7966,43 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             evt.StopPropagation();
             evt.Skip();
         });
-        menu_btn->Bind(wxEVT_BUTTON, [this, zone_index, num_physical, physical_colors, mgr_ptr, persist_rows, menu_btn, bundle, set_config_string, texture_mapping_zone_affects_scene](wxCommandEvent &) {
+        menu_btn->Bind(wxEVT_BUTTON, [this, zone_index, num_physical, physical_colors, mgr_ptr, persist_rows, menu_btn, bundle, set_config_string,
+                                      texture_mapping_zone_affects_scene, selected_texture_mapping_object_idxs, refresh_texture_mapping_preview](wxCommandEvent &) {
             if (menu_btn == nullptr)
                 return;
             wxMenu menu;
+            const int assign_selected_objects_id = wxWindow::NewControlId();
             const int duplicate_id = wxWindow::NewControlId();
             const int delete_id = wxWindow::NewControlId();
+            const int delete_all_id = wxWindow::NewControlId();
+            wxMenuItem *assign_selected_objects_item = menu.Append(assign_selected_objects_id, _L("Assign to selected objects"));
+            if (assign_selected_objects_item != nullptr)
+                assign_selected_objects_item->Enable(!selected_texture_mapping_object_idxs().empty());
             menu.Append(duplicate_id, _L("Duplicate"));
             menu.Append(delete_id, _L("Delete"));
-            menu.Bind(wxEVT_COMMAND_MENU_SELECTED, [this, zone_index, num_physical, physical_colors, mgr_ptr, persist_rows, duplicate_id, delete_id, bundle, set_config_string, texture_mapping_zone_affects_scene](wxCommandEvent &evt) {
+            menu.Append(delete_all_id, _L("Delete All Texture Mapping Zones"));
+            menu.Bind(wxEVT_COMMAND_MENU_SELECTED, [this, zone_index, num_physical, physical_colors, mgr_ptr, persist_rows, assign_selected_objects_id,
+                                                     duplicate_id, delete_id, delete_all_id, bundle, set_config_string,
+                                                     texture_mapping_zone_affects_scene, selected_texture_mapping_object_idxs,
+                                                     refresh_texture_mapping_preview, menu_btn](wxCommandEvent &evt) {
                 if (mgr_ptr == nullptr)
                     return;
                 auto &rows = mgr_ptr->zones();
                 if (zone_index >= rows.size())
                     return;
+                if (evt.GetId() == assign_selected_objects_id) {
+                    std::vector<size_t> object_idxs = selected_texture_mapping_object_idxs();
+                    if (object_idxs.empty()) {
+                        MessageDialog(menu_btn, _L("No objects are currently selected."), _L("Assign to selected objects"), wxOK | wxICON_INFORMATION).ShowModal();
+                        return;
+                    }
+                    const unsigned int zone_id = rows[zone_index].zone_id;
+                    if (zone_id == 0 || obj_list() == nullptr)
+                        return;
+                    if (obj_list()->assign_extruder_to_objects_and_clear_filament_region_painting(object_idxs, int(zone_id)))
+                        refresh_texture_mapping_preview();
+                    return;
+                }
                 if (evt.GetId() == duplicate_id) {
                     mgr_ptr->duplicate_zone(zone_index, num_physical, physical_colors);
                     persist_rows(false);
@@ -7942,6 +8015,33 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                     rows.erase(rows.begin() + ptrdiff_t(zone_index));
                     if (deleted_stable_id != 0 &&
                         bundle->texture_mapping_global_settings.prime_tower_settings_zone_uid == deleted_stable_id) {
+                        TextureMappingGlobalSettings settings = bundle->texture_mapping_global_settings;
+                        settings.prime_tower_settings_zone_uid = 0;
+                        bundle->texture_mapping_global_settings = settings;
+                        set_config_string("texture_mapping_global_settings", bundle->texture_mapping_global_settings.serialize());
+                    }
+                    p->m_expanded_texture_mapping_rows.clear();
+                    persist_rows(affects_scene);
+                    CallAfter([this]() { update_texture_mapping_panel(false); });
+                    return;
+                }
+                if (evt.GetId() == delete_all_id) {
+                    if (MessageDialog(menu_btn,
+                                      _L("Delete all texture mapping zones?"),
+                                      wxString(SLIC3R_APP_FULL_NAME) + " - " + _L("Delete All Texture Mapping Zones"),
+                                      wxYES_NO | wxNO_DEFAULT | wxICON_WARNING).ShowModal() != wxID_YES)
+                        return;
+                    bool affects_scene = false;
+                    const uint64_t settings_zone_uid = bundle->texture_mapping_global_settings.prime_tower_settings_zone_uid;
+                    bool clear_settings_zone_uid = false;
+                    for (const TextureMappingZone &zone : rows) {
+                        if (!zone.enabled || zone.deleted)
+                            continue;
+                        affects_scene |= texture_mapping_zone_affects_scene(zone.zone_id);
+                        clear_settings_zone_uid |= settings_zone_uid != 0 && zone.stable_id == settings_zone_uid;
+                    }
+                    rows.clear();
+                    if (clear_settings_zone_uid) {
                         TextureMappingGlobalSettings settings = bundle->texture_mapping_global_settings;
                         settings.prime_tower_settings_zone_uid = 0;
                         bundle->texture_mapping_global_settings = settings;

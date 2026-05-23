@@ -125,7 +125,11 @@ struct TextureMappingZone
     static constexpr bool  DefaultReduceOuterSurfaceTexture = false;
     static constexpr bool  DefaultSeamHiding = false;
     static constexpr bool  DefaultNonlinearOffsetAdjustment = false;
-    static constexpr int   DefaultModulationMode = int(ModulationLineWidth);
+    static constexpr int   DefaultImageTextureModulationMode = int(ModulationLineWidth);
+    static constexpr int   Default2DGradientModulationMode = int(ModulationPerimeterPath);
+    static constexpr int   DefaultLinearGradientModulationMode = int(ModulationPerimeterPath);
+    static constexpr int   DefaultModulationMode = DefaultImageTextureModulationMode;
+    static constexpr bool  DefaultModulationModeManuallyChanged = false;
     static constexpr bool  DefaultRecolorSmallPerimeterLoops = false;
     static constexpr bool  DefaultRecolorTopVisiblePerimeterSections = false;
     static constexpr int   DefaultTopVisiblePerimeterRecolorAggressiveness = int(TopVisibleRecolorAggressive);
@@ -152,6 +156,15 @@ struct TextureMappingZone
     static constexpr bool  DefaultPreviewSimulateColors = false;
     static constexpr bool  DefaultPreviewLimitResolution = true;
     static constexpr bool  DefaultAutoAdjustFilamentSelection = true;
+
+    static constexpr int default_modulation_mode_for_surface_pattern(int surface_pattern)
+    {
+        switch (surface_pattern) {
+        case int(Gradient2D):      return Default2DGradientModulationMode;
+        case int(LinearGradient):  return DefaultLinearGradientModulationMode;
+        default:                   return DefaultImageTextureModulationMode;
+        }
+    }
 
     struct LinearGradientAnchor {
         bool valid = false;
@@ -201,6 +214,7 @@ struct TextureMappingZone
     bool        seam_hiding = DefaultSeamHiding;
     bool        nonlinear_offset_adjustment = DefaultNonlinearOffsetAdjustment;
     int         modulation_mode = DefaultModulationMode;
+    bool        modulation_mode_manually_changed = DefaultModulationModeManuallyChanged;
     bool        recolor_small_perimeter_loops = DefaultRecolorSmallPerimeterLoops;
     bool        recolor_top_visible_perimeter_sections = DefaultRecolorTopVisiblePerimeterSections;
     int         top_visible_perimeter_recolor_aggressiveness = DefaultTopVisiblePerimeterRecolorAggressiveness;
@@ -243,6 +257,12 @@ struct TextureMappingZone
     bool is_surface_gradient() const { return is_2d_gradient() || is_linear_gradient(); }
     bool uses_perimeter_path_modulation() const { return modulation_mode == int(ModulationPerimeterPath); }
 
+    void apply_default_modulation_mode()
+    {
+        if (!modulation_mode_manually_changed)
+            modulation_mode = default_modulation_mode_for_surface_pattern(surface_pattern);
+    }
+
     void reset_offset_settings()
     {
         offset_distances.clear();
@@ -265,7 +285,8 @@ struct TextureMappingZone
         reduce_outer_surface_texture = DefaultReduceOuterSurfaceTexture;
         seam_hiding = DefaultSeamHiding;
         nonlinear_offset_adjustment = DefaultNonlinearOffsetAdjustment;
-        modulation_mode = DefaultModulationMode;
+        modulation_mode = default_modulation_mode_for_surface_pattern(surface_pattern);
+        modulation_mode_manually_changed = DefaultModulationModeManuallyChanged;
         recolor_small_perimeter_loops = DefaultRecolorSmallPerimeterLoops;
         recolor_top_visible_perimeter_sections = DefaultRecolorTopVisiblePerimeterSections;
         top_visible_perimeter_recolor_aggressiveness = DefaultTopVisiblePerimeterRecolorAggressiveness;

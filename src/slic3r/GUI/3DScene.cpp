@@ -194,6 +194,18 @@ const ModelObject *linear_gradient_anchor_model_object(const Model &model,
     return nullptr;
 }
 
+bool linear_gradient_anchor_has_object_reference(const TextureMappingZone::LinearGradientAnchor &anchor)
+{
+    return anchor.object_backup_id >= 0 || anchor.object_id != 0 || anchor.object_index_valid;
+}
+
+bool linear_gradient_anchor_object_resolves(const TextureMappingZone::LinearGradientAnchor &anchor)
+{
+    if (!anchor.valid || !linear_gradient_anchor_has_object_reference(anchor))
+        return true;
+    return linear_gradient_anchor_model_object(GUI::wxGetApp().model(), anchor) != nullptr;
+}
+
 bool linear_gradient_anchor_matches_model_object(const Model &model,
                                                 const ModelObject *object,
                                                 const TextureMappingZone::LinearGradientAnchor &anchor)
@@ -3208,11 +3220,17 @@ void GLVolumeCollection::render_linear_gradient_direction_arrows(const Transform
             component_colors.emplace_back(linear_gradient_filament_color(component_id, filament_colors));
 
         const LinearGradientArrowUsage usage = linear_gradient_arrow_usage(volumes, zone.zone_id);
-        const std::optional<Vec3f> start_anchor = linear_gradient_anchor_global_point(volumes, zone.linear_gradient_start);
+        const bool stale_unused_start_anchor =
+            !usage.any && zone.linear_gradient_start.valid && !linear_gradient_anchor_object_resolves(zone.linear_gradient_start);
+        const bool stale_unused_end_anchor =
+            !usage.any && zone.linear_gradient_end.valid && !linear_gradient_anchor_object_resolves(zone.linear_gradient_end);
+        const std::optional<Vec3f> start_anchor = stale_unused_start_anchor ?
+            std::nullopt :
+            linear_gradient_anchor_global_point(volumes, zone.linear_gradient_start);
         const bool radial_mode = zone.linear_gradient_mode == int(TextureMappingZone::LinearGradientRadial);
         const std::optional<Vec3f> end_anchor = radial_mode ?
             std::nullopt :
-            linear_gradient_anchor_global_point(volumes, zone.linear_gradient_end);
+            (stale_unused_end_anchor ? std::nullopt : linear_gradient_anchor_global_point(volumes, zone.linear_gradient_end));
         if (!usage.any && !start_anchor && !end_anchor)
             continue;
 

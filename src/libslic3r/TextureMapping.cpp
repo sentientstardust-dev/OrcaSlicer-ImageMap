@@ -1008,6 +1008,7 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            seam_hiding == rhs.seam_hiding &&
            nonlinear_offset_adjustment == rhs.nonlinear_offset_adjustment &&
            modulation_mode == rhs.modulation_mode &&
+           modulation_mode_manually_changed == rhs.modulation_mode_manually_changed &&
            recolor_small_perimeter_loops == rhs.recolor_small_perimeter_loops &&
            recolor_top_visible_perimeter_sections == rhs.recolor_top_visible_perimeter_sections &&
            top_visible_perimeter_recolor_aggressiveness == rhs.top_visible_perimeter_recolor_aggressiveness &&
@@ -1081,6 +1082,7 @@ void TextureMappingManager::refresh(const std::vector<std::string> &filament_col
                 zone.component_b = zone.linear_gradient_stops.back().filament_id;
             }
         }
+        zone.apply_default_modulation_mode();
     }
 }
 
@@ -1168,6 +1170,7 @@ TextureMappingZone *TextureMappingManager::add_zone(size_t num_physical,
         surface_pattern == int(TextureMappingZone::Gradient2D) || surface_pattern == int(TextureMappingZone::LinearGradient) ?
             surface_pattern :
             int(TextureMappingZone::ImageTexture);
+    zone.apply_default_modulation_mode();
 
     std::vector<unsigned int> ids;
     for (size_t i = 1; i <= std::min<size_t>(num_physical, 9); ++i)
@@ -1267,6 +1270,7 @@ std::string TextureMappingManager::serialize_entries()
         zone.stable_id = normalize_stable_id(zone.stable_id);
         if (zone.display_color.empty() || zone.display_color[0] != '#')
             zone.display_color = random_display_color(zone.stable_id);
+        zone.apply_default_modulation_mode();
 
         std::vector<unsigned int> component_ids = decode_component_ids(zone.component_ids, 9);
         if (zone.is_linear_gradient()) {
@@ -1335,6 +1339,7 @@ std::string TextureMappingManager::serialize_entries()
         texture["hide_seams"] = zone.seam_hiding;
         texture["nonlinear_offset_adjustment"] = zone.nonlinear_offset_adjustment;
         texture["modulation_mode"] = modulation_mode_name(zone.modulation_mode);
+        texture["modulation_mode_manually_changed"] = zone.modulation_mode_manually_changed;
         texture["recolor_small_perimeter_loops"] = zone.recolor_small_perimeter_loops || zone.recolor_top_visible_perimeter_sections;
         texture["recolor_top_visible_perimeter_sections"] = zone.recolor_top_visible_perimeter_sections;
         texture["top_visible_perimeter_recolor_aggressiveness"] =
@@ -1506,9 +1511,16 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.reduce_outer_surface_texture = false;
         zone.seam_hiding = texture.value("hide_seams", false);
         zone.nonlinear_offset_adjustment = texture.value("nonlinear_offset_adjustment", false);
-        zone.modulation_mode =
-            modulation_mode_from_name(texture.value("modulation_mode",
-                                                    modulation_mode_name(TextureMappingZone::DefaultModulationMode)));
+        const auto modulation_mode_it = texture.find("modulation_mode");
+        const bool has_modulation_mode =
+            modulation_mode_it != texture.end() && modulation_mode_it->is_string();
+        zone.modulation_mode = has_modulation_mode ?
+            modulation_mode_from_name(modulation_mode_it->get<std::string>()) :
+            TextureMappingZone::default_modulation_mode_for_surface_pattern(zone.surface_pattern);
+        zone.modulation_mode_manually_changed =
+            texture.value("modulation_mode_manually_changed",
+                          has_modulation_mode && zone.modulation_mode != TextureMappingZone::ModulationLineWidth);
+        zone.apply_default_modulation_mode();
         zone.recolor_small_perimeter_loops =
             texture.value("recolor_small_perimeter_loops", TextureMappingZone::DefaultRecolorSmallPerimeterLoops);
         zone.recolor_top_visible_perimeter_sections =
