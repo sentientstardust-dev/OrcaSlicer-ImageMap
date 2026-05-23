@@ -271,9 +271,13 @@ void GLGizmoTextureGradientPointPicker::on_render_input_window(float, float, flo
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.08f, 0.09f, 0.10f, 0.88f));
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 1.f, 1.f, 1.f));
     if (ImGui::Begin("linear_gradient_point_picker_overlay", nullptr, flags)) {
-        const std::string message = m_target == Target::End ?
-            _u8L("Click an object to set gradient end point") :
-            _u8L("Click an object to set gradient start point");
+        const std::string message = m_radial_mode ?
+            (m_target == Target::End ?
+                _u8L("Click an object to set radial gradient radius point") :
+                _u8L("Click an object to set radial gradient center point")) :
+            (m_target == Target::End ?
+                _u8L("Click an object to set gradient end point") :
+                _u8L("Click an object to set gradient start point"));
         ImGui::TextUnformatted(message.c_str());
     }
     ImGui::End();

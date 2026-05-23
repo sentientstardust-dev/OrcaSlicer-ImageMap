@@ -19,6 +19,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <optional>
 #include <boost/algorithm/string.hpp>
 #include <boost/iterator/counting_iterator.hpp>
 #include <boost/optional.hpp>
@@ -981,7 +982,8 @@ static std::vector<wxString> texture_mapping_channel_labels(int filament_color_m
 static wxString texture_mapping_summary(const TextureMappingZone &zone, size_t num_physical)
 {
     const bool raw_offset = zone.is_image_texture() && zone.texture_mapping_mode == int(TextureMappingZone::TextureMappingRawValues);
-    wxString summary = zone.is_linear_gradient() ? _L("Linear Gradient") :
+    wxString summary = zone.is_radial_linear_gradient() ? _L("Radial Gradient") :
+        zone.is_linear_gradient() ? _L("Linear Gradient") :
         zone.is_2d_gradient() ? _L("2D Gradient") :
         from_u8(TextureMappingManager::filament_color_mode_name(zone.filament_color_mode));
     if (!zone.is_surface_gradient() && summary == "any")
@@ -1004,6 +1006,8 @@ static wxString texture_mapping_summary(const TextureMappingZone &zone, size_t n
 
 static wxString texture_mapping_menu_label(const TextureMappingZone &zone)
 {
+    if (zone.is_radial_linear_gradient())
+        return _L("Texture Mapping Radial Gradient");
     if (zone.is_linear_gradient())
         return _L("Texture Mapping Linear Gradient");
     if (zone.is_2d_gradient())
@@ -1050,12 +1054,14 @@ public:
     void set_data(const std::vector<wxColour> &palette,
                   const std::vector<unsigned int> &component_ids,
                   const wxColour &fallback,
-                  bool linear_gradient = false)
+                  bool linear_gradient = false,
+                  bool radial_gradient = false)
     {
         m_palette = palette;
         m_component_ids = component_ids;
         m_fallback = fallback.IsOk() ? fallback : wxColour("#26A69A");
         m_linear_gradient = linear_gradient;
+        m_radial_gradient = radial_gradient;
         Refresh();
     }
 
@@ -1081,16 +1087,32 @@ private:
         if (m_linear_gradient && m_component_ids.size() >= 2) {
             const wxColour start = color_for(m_component_ids[0]);
             const wxColour end = color_for(m_component_ids[1]);
-            const int h = std::max(1, rect.GetHeight());
-            for (int y = 0; y < h; ++y) {
-                const double t = h <= 1 ? 0.0 : double(h - 1 - y) / double(h - 1);
-                const auto mix = [t](unsigned char a, unsigned char b) {
-                    return static_cast<unsigned char>(std::lround(double(a) * (1.0 - t) + double(b) * t));
-                };
-                dc.SetBrush(wxBrush(wxColour(mix(start.Red(), end.Red()),
-                                             mix(start.Green(), end.Green()),
-                                             mix(start.Blue(), end.Blue()))));
-                dc.DrawRectangle(rect.GetLeft(), rect.GetTop() + y, rect.GetWidth(), 1);
+            auto mix_channel = [](double t, unsigned char a, unsigned char b) {
+                return static_cast<unsigned char>(std::lround(double(a) * (1.0 - t) + double(b) * t));
+            };
+            if (m_radial_gradient) {
+                const double cx = double(rect.GetLeft()) + 0.5 * double(rect.GetWidth() - 1);
+                const double cy = double(rect.GetTop()) + 0.5 * double(rect.GetHeight() - 1);
+                const double radius = std::max(1.0, std::hypot(0.5 * double(rect.GetWidth()), 0.5 * double(rect.GetHeight())));
+                for (int y = rect.GetTop(); y <= rect.GetBottom(); ++y) {
+                    for (int x = rect.GetLeft(); x <= rect.GetRight(); ++x) {
+                        const double t = std::clamp(std::hypot(double(x) - cx, double(y) - cy) / radius, 0.0, 1.0);
+                        dc.SetPen(wxPen(wxColour(mix_channel(t, start.Red(), end.Red()),
+                                                mix_channel(t, start.Green(), end.Green()),
+                                                mix_channel(t, start.Blue(), end.Blue()))));
+                        dc.DrawPoint(x, y);
+                    }
+                }
+                dc.SetPen(*wxTRANSPARENT_PEN);
+            } else {
+                const int h = std::max(1, rect.GetHeight());
+                for (int y = 0; y < h; ++y) {
+                    const double t = h <= 1 ? 0.0 : double(h - 1 - y) / double(h - 1);
+                    dc.SetBrush(wxBrush(wxColour(mix_channel(t, start.Red(), end.Red()),
+                                                 mix_channel(t, start.Green(), end.Green()),
+                                                 mix_channel(t, start.Blue(), end.Blue()))));
+                    dc.DrawRectangle(rect.GetLeft(), rect.GetTop() + y, rect.GetWidth(), 1);
+                }
             }
         } else if (!m_component_ids.empty()) {
             const int slots = int(m_component_ids.size());
@@ -1108,6 +1130,7 @@ private:
     std::vector<unsigned int> m_component_ids;
     wxColour                  m_fallback {wxColour("#26A69A")};
     bool                      m_linear_gradient { false };
+    bool                      m_radial_gradient { false };
 };
 
 class TextureMappingNumberSwatch : public wxPanel
@@ -2690,6 +2713,7 @@ struct Sidebar::priv
     wxStaticLine* m_staticline2;
     StaticBox* m_panel_texture_mapping_title = nullptr;
     wxScrolledWindow* m_panel_texture_mapping_content = nullptr;
+    wxPanel* m_panel_texture_mapping_resize_handle = nullptr;
     wxBoxSizer* m_sizer_texture_mapping_content = nullptr;
     ScalableButton* m_texture_mapping_icon = nullptr;
     wxStaticText* m_staticText_texture_mapping = nullptr;
@@ -2697,6 +2721,11 @@ struct Sidebar::priv
     std::unordered_set<size_t> m_expanded_texture_mapping_rows;
     int m_texture_mapping_advanced_options_tab = 0;
     bool m_texture_mapping_filament_strength_offsets_expanded = false;
+    int m_texture_mapping_base_height = 0;
+    int m_texture_mapping_user_height = 0;
+    bool m_texture_mapping_resizing = false;
+    int m_texture_mapping_resize_start_screen_y = 0;
+    int m_texture_mapping_resize_start_height = 0;
     wxPanel* m_panel_project_title;
     ScalableButton* m_filament_icon = nullptr;
     Button * m_flushing_volume_btn = nullptr;
@@ -2737,6 +2766,7 @@ struct Sidebar::priv
     bool sync_extruder_list(bool &only_external_material);
     bool switch_diameter(bool single);
     void update_sync_status(const MachineObject* obj);
+    void apply_texture_mapping_area_height(Sidebar *sidebar);
 
 #ifdef _WIN32
     wxString btn_reslice_tip;
@@ -2838,6 +2868,27 @@ Sidebar::priv::~priv()
 #if 0
     delete frequently_changed_parameters;
 #endif
+}
+
+void Sidebar::priv::apply_texture_mapping_area_height(Sidebar *sidebar)
+{
+    if (sidebar == nullptr || m_panel_texture_mapping_content == nullptr || m_panel_texture_mapping_content->GetSizer() == nullptr)
+        return;
+
+    m_panel_texture_mapping_content->Layout();
+    m_panel_texture_mapping_content->FitInside();
+
+    const int default_max_height = sidebar->FromDIP(260);
+    wxSize min_size = m_panel_texture_mapping_content->GetSizer()->GetMinSize();
+    m_texture_mapping_base_height = std::max(sidebar->FromDIP(1), std::min(min_size.y, default_max_height));
+
+    const int requested_height = m_texture_mapping_user_height > 0 ?
+        std::max(m_texture_mapping_user_height, m_texture_mapping_base_height) :
+        m_texture_mapping_base_height;
+    const int visible_height = std::max(sidebar->FromDIP(1), std::min(min_size.y, requested_height));
+
+    m_panel_texture_mapping_content->SetMaxSize(wxSize(-1, requested_height));
+    m_panel_texture_mapping_content->SetMinSize(wxSize(-1, visible_height));
 }
 
 void Sidebar::priv::show_preset_comboboxes()
@@ -4303,13 +4354,6 @@ Sidebar::Sidebar(Plater *parent)
     p->m_panel_filament_title = new StaticBox(p->scrolled, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxTAB_TRAVERSAL | wxBORDER_NONE);
     p->m_panel_filament_title->SetBackgroundColor(title_bg);
     p->m_panel_filament_title->SetBackgroundColor2(0xF1F1F1);
-    p->m_panel_filament_title->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent &e) {
-        if (e.GetPosition().x > (p->m_flushing_volume_btn->IsShown()
-                ? p->m_flushing_volume_btn->GetPosition().x : (p->m_bpButton_add_filament->GetPosition().x - FromDIP(30)))) // ORCA exclude area of del button from titlebar collapse/expand feature to fix undesired collapse when user spams del filament button 
-            return;
-        p->m_panel_filament_content->Show(!p->m_panel_filament_content->IsShown());
-        m_scrolled_sizer->Layout();
-    });
 
     wxBoxSizer* bSizer39;
     bSizer39 = new wxBoxSizer( wxHORIZONTAL );
@@ -4397,6 +4441,7 @@ Sidebar::Sidebar(Plater *parent)
 
     bSizer39->Add(set_btn, 0, wxALIGN_CENTER | wxLEFT, FromDIP(SidebarProps::WideSpacing()));
     bSizer39->AddSpacer(FromDIP(SidebarProps::TitlebarMargin()));
+    p->m_panel_filament_title->Layout();
 
     // add filament content
     p->m_panel_filament_content = new wxScrolledWindow( p->scrolled, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxTAB_TRAVERSAL );
@@ -4428,6 +4473,43 @@ Sidebar::Sidebar(Plater *parent)
     update_filaments_area_height(); // ORCA
 
     scrolled_sizer->Add(p->m_panel_filament_content, 0, wxEXPAND | wxTOP | wxBOTTOM, FromDIP(SidebarProps::ContentMarginV())); // ORCA use vertical margin on parent otherwise it shows scrollbar even on 1 filament
+
+    auto toggle_filament_content = [this]() {
+        if (p->m_panel_filament_content == nullptr)
+            return;
+        p->m_panel_filament_content->Show(!p->m_panel_filament_content->IsShown());
+        m_scrolled_sizer->Layout();
+    };
+    auto filament_title_button_hit = [this](const wxPoint &pos) {
+        for (wxWindow *window : {static_cast<wxWindow *>(p->m_filament_icon),
+                                 static_cast<wxWindow *>(p->m_flushing_volume_btn),
+                                 static_cast<wxWindow *>(p->m_bpButton_del_filament),
+                                 static_cast<wxWindow *>(p->m_bpButton_add_filament),
+                                 static_cast<wxWindow *>(p->m_bpButton_ams_filament),
+                                 static_cast<wxWindow *>(p->m_bpButton_set_filament)}) {
+            if (window == nullptr || !window->IsShown())
+                continue;
+            wxRect rect(window->GetPosition(), window->GetSize());
+            rect.Inflate(FromDIP(6), FromDIP(4));
+            if (rect.Contains(pos))
+                return true;
+        }
+        return false;
+    };
+    auto handle_filament_title_click = [this, toggle_filament_content, filament_title_button_hit](wxMouseEvent &e) {
+        wxWindow *event_window = dynamic_cast<wxWindow *>(e.GetEventObject());
+        wxPoint title_pos = e.GetPosition();
+        if (event_window != nullptr && event_window != p->m_panel_filament_title)
+            title_pos = p->m_panel_filament_title->ScreenToClient(event_window->ClientToScreen(e.GetPosition()));
+        if (filament_title_button_hit(title_pos))
+            return;
+        toggle_filament_content();
+    };
+    p->m_panel_filament_title->Bind(wxEVT_LEFT_UP, handle_filament_title_click);
+    p->m_staticText_filament_settings->Bind(wxEVT_LEFT_UP, handle_filament_title_click);
+    p->m_filament_icon->Bind(wxEVT_BUTTON, [toggle_filament_content](wxCommandEvent &) {
+        toggle_filament_content();
+    });
     }
 
     {
@@ -4516,6 +4598,44 @@ Sidebar::Sidebar(Plater *parent)
     p->m_panel_texture_mapping_content->SetSizer(p->m_sizer_texture_mapping_content);
     p->m_panel_texture_mapping_content->Layout();
     scrolled_sizer->Add(p->m_panel_texture_mapping_content, 0, wxEXPAND, 0);
+    p->m_panel_texture_mapping_resize_handle = new wxPanel(p->scrolled, wxID_ANY, wxDefaultPosition, wxSize(-1, FromDIP(5)), wxBORDER_NONE);
+    p->m_panel_texture_mapping_resize_handle->SetMinSize(wxSize(-1, FromDIP(5)));
+    p->m_panel_texture_mapping_resize_handle->SetMaxSize(wxSize(-1, FromDIP(5)));
+    p->m_panel_texture_mapping_resize_handle->SetCursor(wxCursor(wxCURSOR_SIZENS));
+    p->m_panel_texture_mapping_resize_handle->SetBackgroundColour(p->m_panel_texture_mapping_content->GetBackgroundColour());
+    scrolled_sizer->Add(p->m_panel_texture_mapping_resize_handle, 0, wxEXPAND, 0);
+
+    auto resize_texture_mapping_to = [this](int height) {
+        p->m_texture_mapping_user_height = std::max(p->m_texture_mapping_base_height, height);
+        p->apply_texture_mapping_area_height(this);
+        m_scrolled_sizer->Layout();
+        Layout();
+    };
+    p->m_panel_texture_mapping_resize_handle->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent &e) {
+        if (p->m_panel_texture_mapping_content == nullptr)
+            return;
+        p->m_texture_mapping_resizing = true;
+        p->m_texture_mapping_resize_start_screen_y = p->m_panel_texture_mapping_resize_handle->ClientToScreen(e.GetPosition()).y;
+        p->m_texture_mapping_resize_start_height = std::max(p->m_texture_mapping_user_height, p->m_texture_mapping_base_height);
+        if (p->m_panel_texture_mapping_resize_handle->HasCapture() == false)
+            p->m_panel_texture_mapping_resize_handle->CaptureMouse();
+    });
+    p->m_panel_texture_mapping_resize_handle->Bind(wxEVT_MOTION, [this, resize_texture_mapping_to](wxMouseEvent &e) {
+        if (!p->m_texture_mapping_resizing) {
+            e.Skip();
+            return;
+        }
+        const int delta = p->m_panel_texture_mapping_resize_handle->ClientToScreen(e.GetPosition()).y - p->m_texture_mapping_resize_start_screen_y;
+        resize_texture_mapping_to(p->m_texture_mapping_resize_start_height + delta);
+    });
+    p->m_panel_texture_mapping_resize_handle->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent &) {
+        p->m_texture_mapping_resizing = false;
+        if (p->m_panel_texture_mapping_resize_handle != nullptr && p->m_panel_texture_mapping_resize_handle->HasCapture())
+            p->m_panel_texture_mapping_resize_handle->ReleaseMouse();
+    });
+    p->m_panel_texture_mapping_resize_handle->Bind(wxEVT_MOUSE_CAPTURE_LOST, [this](wxMouseCaptureLostEvent &) {
+        p->m_texture_mapping_resizing = false;
+    });
 
     p->m_panel_texture_mapping_title->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent& e) {
         int button_left = p->m_panel_texture_mapping_title->GetClientSize().x;
@@ -4523,12 +4643,16 @@ Sidebar::Sidebar(Plater *parent)
             button_left = std::min(button_left, p->m_btn_add_texture_map->GetPosition().x);
         if (e.GetPosition().x > button_left - FromDIP(12))
             return;
-        p->m_panel_texture_mapping_content->Show(!p->m_panel_texture_mapping_content->IsShown());
+        const bool show_content = !p->m_panel_texture_mapping_content->IsShown();
+        p->m_panel_texture_mapping_content->Show(show_content);
+        if (p->m_panel_texture_mapping_resize_handle != nullptr)
+            p->m_panel_texture_mapping_resize_handle->Show(show_content);
         m_scrolled_sizer->Layout();
     });
 
     p->m_panel_texture_mapping_title->Hide();
     p->m_panel_texture_mapping_content->Hide();
+    p->m_panel_texture_mapping_resize_handle->Hide();
     }
 
     {
@@ -6167,16 +6291,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
     content_sizer->Clear(true);
     content_sizer->AddSpacer(FromDIP(SidebarProps::ContentMargin()));
     auto update_texture_mapping_area_height = [this]() {
-        if (p->m_panel_texture_mapping_content == nullptr || p->m_panel_texture_mapping_content->GetSizer() == nullptr)
-            return;
-        const int max_height = FromDIP(260);
-        p->m_panel_texture_mapping_content->SetMaxSize(wxSize(-1, max_height));
-        p->m_panel_texture_mapping_content->Layout();
-        p->m_panel_texture_mapping_content->FitInside();
-        wxSize min_size = p->m_panel_texture_mapping_content->GetSizer()->GetMinSize();
-        if (min_size.y > max_height)
-            min_size.y = max_height;
-        p->m_panel_texture_mapping_content->SetMinSize(wxSize(-1, std::max(FromDIP(1), min_size.y)));
+        p->apply_texture_mapping_area_height(this);
     };
 
     if (p->m_btn_add_texture_map != nullptr)
@@ -6185,6 +6300,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
     if (num_physical < 2) {
         p->m_panel_texture_mapping_title->Hide();
         p->m_panel_texture_mapping_content->Hide();
+        if (p->m_panel_texture_mapping_resize_handle != nullptr)
+            p->m_panel_texture_mapping_resize_handle->Hide();
         m_scrolled_sizer->Layout();
         Layout();
         return;
@@ -6192,6 +6309,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
 
     p->m_panel_texture_mapping_title->Show();
     p->m_panel_texture_mapping_content->Show();
+    if (p->m_panel_texture_mapping_resize_handle != nullptr)
+        p->m_panel_texture_mapping_resize_handle->Show();
 
     const bool is_dark = wxGetApp().dark_mode();
     const wxColour rows_bg = is_dark ? wxColour(45, 45, 49) : wxColour(246, 248, 251);
@@ -6200,6 +6319,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
     const wxColour summary_fg = is_dark ? wxColour(182, 182, 182) : wxColour(96, 96, 96);
     const int gap = FromDIP(6);
     p->m_panel_texture_mapping_content->SetBackgroundColour(rows_bg);
+    if (p->m_panel_texture_mapping_resize_handle != nullptr)
+        p->m_panel_texture_mapping_resize_handle->SetBackgroundColour(rows_bg);
 
     auto make_sidebar_combo = [](wxWindow *parent, const wxArrayString &choices, int selection, const wxSize &size) {
         auto *combo = new ::ComboBox(parent, wxID_ANY, wxString(), wxDefaultPosition, size, 0, nullptr, wxCB_READONLY);
@@ -6347,6 +6468,14 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         return int(TextureMappingZone::ImageTexture);
     };
 
+    auto linear_gradient_mode_selection = [](const TextureMappingZone &zone) {
+        return zone.linear_gradient_mode == int(TextureMappingZone::LinearGradientRadial) ? 1 : 0;
+    };
+
+    auto linear_gradient_mode_from_selection = [](int selection) {
+        return selection == 1 ? int(TextureMappingZone::LinearGradientRadial) : int(TextureMappingZone::LinearGradientLinear);
+    };
+
     if (visible_zone_indices.empty()) {
         auto *empty_label = new wxStaticText(p->m_panel_texture_mapping_content, wxID_ANY, _L("No texture maps yet."));
         empty_label->SetForegroundColour(summary_fg);
@@ -6440,7 +6569,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                               TextureMappingManager::effective_texture_component_ids(entry, num_physical, physical_colors) :
                               texture_mapping_selected_ids(entry, num_physical),
                           parse_texture_mapping_color(entry.display_color),
-                          entry.is_linear_gradient());
+                          entry.is_linear_gradient(),
+                          entry.is_radial_linear_gradient());
         header_sizer->Add(preview, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         row_sizer->Add(header, 0, wxEXPAND | wxTOP | wxBOTTOM, gap);
 
@@ -6462,7 +6592,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                       TextureMappingManager::effective_texture_component_ids(zone, num_physical, physical_colors) :
                                       texture_mapping_selected_ids(zone, num_physical),
                                   parse_texture_mapping_color(zone.display_color),
-                                  zone.is_linear_gradient());
+                                  zone.is_linear_gradient(),
+                                  zone.is_radial_linear_gradient());
             }
             if (swatch != nullptr)
                 swatch->set_data(parse_texture_mapping_color(zone.display_color), zone_id);
@@ -6522,7 +6653,19 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         }
         editor_sizer->Add(filaments_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
 
-        auto *linear_gradient_row = new wxWrapSizer(wxHORIZONTAL, wxWRAPSIZER_DEFAULT_FLAGS);
+        auto *linear_gradient_mode_row = new wxWrapSizer(wxHORIZONTAL, wxWRAPSIZER_DEFAULT_FLAGS);
+        linear_gradient_mode_row->Add(new wxStaticText(editor, wxID_ANY, _L("Gradient mode")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        wxArrayString linear_gradient_mode_choices;
+        linear_gradient_mode_choices.Add(_L("Linear"));
+        linear_gradient_mode_choices.Add(_L("Radial"));
+        auto *linear_gradient_mode_choice = make_sidebar_combo(editor,
+                                                               linear_gradient_mode_choices,
+                                                               linear_gradient_mode_selection(entry),
+                                                               wxSize(FromDIP(170), -1));
+        linear_gradient_mode_row->Add(linear_gradient_mode_choice, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        editor_sizer->Add(linear_gradient_mode_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+
+        auto *linear_gradient_row = new wxBoxSizer(wxHORIZONTAL);
         linear_gradient_row->Add(new wxStaticText(editor, wxID_ANY, _L("Gradient")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         auto *start_filament_combo = make_filament_swatch_combo(editor, selected_ids.empty() ? 1 : selected_ids.front());
         auto *end_filament_combo = make_filament_swatch_combo(editor, selected_ids.size() > 1 ? selected_ids[1] : (selected_ids.empty() ? 1 : selected_ids.front()));
@@ -6531,9 +6674,15 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             start_filament_combo->Enable(can_choose_linear_gradient_filaments);
         if (end_filament_combo != nullptr)
             end_filament_combo->Enable(can_choose_linear_gradient_filaments);
-        auto *set_start_btn = new wxButton(editor, wxID_ANY, _L("Set Start"));
-        auto *set_end_btn = new wxButton(editor, wxID_ANY, _L("Set End"));
+        const bool entry_radial_gradient = linear_gradient_mode_selection(entry) == 1;
+        auto *set_start_btn = new wxButton(editor,
+                                           wxID_ANY,
+                                           entry_radial_gradient ?
+                                               (entry.linear_gradient_start.valid ? _L("Set Center") : _L("Add Center")) :
+                                               (entry.linear_gradient_start.valid ? _L("Set Start") : _L("Add Start")));
+        auto *set_end_btn = new wxButton(editor, wxID_ANY, entry.linear_gradient_end.valid ? _L("Set End") : _L("Add End"));
         auto *clear_points_btn = new wxButton(editor, wxID_ANY, _L("Clear Points"));
+        clear_points_btn->Enable(entry.linear_gradient_start.valid || entry.linear_gradient_end.valid);
         ::CheckBox *show_direction_arrow_chk = nullptr;
         linear_gradient_row->Add(new wxStaticText(editor, wxID_ANY, _L("Start")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
         linear_gradient_row->Add(start_filament_combo, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
@@ -6547,6 +6696,33 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         linear_gradient_buttons_row->Add(clear_points_btn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         editor_sizer->Add(linear_gradient_buttons_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
 
+        auto *linear_gradient_radius_row = new wxWrapSizer(wxHORIZONTAL, wxWRAPSIZER_DEFAULT_FLAGS);
+        linear_gradient_radius_row->Add(new wxStaticText(editor, wxID_ANY, _L("Radius")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        const double linear_gradient_radius_value = entry.linear_gradient_radius_percent ?
+            std::clamp(double(entry.linear_gradient_radius_pct), 0.0, 100000.0) :
+            std::clamp(double(entry.linear_gradient_radius_mm), 0.0, 100000.0);
+        auto *linear_gradient_radius_spin = new wxSpinCtrlDouble(editor,
+                                                                 wxID_ANY,
+                                                                 wxEmptyString,
+                                                                 wxDefaultPosition,
+                                                                 wxSize(FromDIP(96), -1),
+                                                                 wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER,
+                                                                 0.0,
+                                                                 100000.0,
+                                                                 linear_gradient_radius_value,
+                                                                 1.0);
+        linear_gradient_radius_spin->SetDigits(2);
+        ::CheckBox *linear_gradient_radius_percent_chk = nullptr;
+        auto *linear_gradient_radius_unit_label = new wxStaticText(editor, wxID_ANY, entry.linear_gradient_radius_percent ? _L("%") : _L("mm"));
+        linear_gradient_radius_row->Add(linear_gradient_radius_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+        linear_gradient_radius_row->Add(linear_gradient_radius_unit_label, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        auto *linear_gradient_radius_percent_row = make_sidebar_checkbox_row(editor,
+                                                                            linear_gradient_radius_percent_chk,
+                                                                            _L("Percent"),
+                                                                            entry.linear_gradient_radius_percent);
+        linear_gradient_radius_row->Add(linear_gradient_radius_percent_row, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        editor_sizer->Add(linear_gradient_radius_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+
         auto *show_direction_arrow_row = make_sidebar_checkbox_row(editor,
                                                                    show_direction_arrow_chk,
                                                                    _L("Show Direction Arrow"),
@@ -6555,24 +6731,40 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
 
         wxWeakRef<wxButton> set_start_btn_ref(set_start_btn);
         wxWeakRef<wxButton> set_end_btn_ref(set_end_btn);
+        wxWeakRef<wxButton> clear_points_btn_ref(clear_points_btn);
         wxWindowRef editor_ref(editor);
         wxWindowRef row_ref(row);
         auto set_linear_gradient_picker_button_labels = [this,
+                                                         zone_index,
+                                                         mgr_ptr,
                                                          set_start_btn_ref,
                                                          set_end_btn_ref,
+                                                         clear_points_btn_ref,
+                                                         linear_gradient_mode_choice,
                                                          editor_ref,
                                                          row_ref,
                                                          update_texture_mapping_area_height](GLGizmoTextureGradientPointPicker::Target active_target) {
+            const TextureMappingZone *zone = mgr_ptr != nullptr && zone_index < mgr_ptr->zones().size() ? &mgr_ptr->zones()[zone_index] : nullptr;
+            const bool radial_gradient = linear_gradient_mode_choice != nullptr && linear_gradient_mode_choice->GetSelection() == 1;
+            const bool has_start = zone != nullptr && zone->linear_gradient_start.valid;
+            const bool has_end = zone != nullptr && zone->linear_gradient_end.valid;
             if (wxButton *button = set_start_btn_ref.get()) {
-                button->SetLabel(active_target == GLGizmoTextureGradientPointPicker::Target::Start ? _L("Cancel selection") : _L("Set Start"));
+                const wxString inactive_label = radial_gradient ?
+                    (has_start ? _L("Set Center") : _L("Add Center")) :
+                    (has_start ? _L("Set Start") : _L("Add Start"));
+                button->SetLabel(active_target == GLGizmoTextureGradientPointPicker::Target::Start ? _L("Cancel selection") : inactive_label);
                 button->InvalidateBestSize();
                 button->Fit();
             }
             if (wxButton *button = set_end_btn_ref.get()) {
-                button->SetLabel(active_target == GLGizmoTextureGradientPointPicker::Target::End ? _L("Cancel selection") : _L("Set End"));
+                button->SetLabel(active_target == GLGizmoTextureGradientPointPicker::Target::End ? _L("Cancel selection") : (has_end ? _L("Set End") : _L("Add End")));
+                button->Show(!radial_gradient);
+                button->Enable(!radial_gradient);
                 button->InvalidateBestSize();
                 button->Fit();
             }
+            if (wxButton *button = clear_points_btn_ref.get())
+                button->Enable(has_start || has_end);
             if (wxWindow *window = editor_ref.get())
                 window->Layout();
             if (wxWindow *window = row_ref.get())
@@ -6620,8 +6812,9 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         editor_sizer->Add(button_row, 0, wxEXPAND | wxALL, gap);
 
         auto apply_controls = [zone_index, mgr_ptr, num_physical, filament_checks, surface_choice,
-                               start_filament_combo, end_filament_combo,
-                               linear_gradient_filament_ids, surface_pattern_from_selection, mode_choice, preview_colors_chk,
+                               start_filament_combo, end_filament_combo, linear_gradient_mode_choice, linear_gradient_radius_spin,
+                               linear_gradient_radius_percent_chk,
+                               linear_gradient_filament_ids, surface_pattern_from_selection, linear_gradient_mode_from_selection, mode_choice, preview_colors_chk,
                                show_direction_arrow_chk, contrast_spin, apply_zone](int changed_side = 0) {
             if (mgr_ptr == nullptr)
                 return;
@@ -6645,6 +6838,19 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.component_ids = encode_texture_mapping_component_ids(ids);
             updated.component_a = ids.empty() ? 1 : ids.front();
             updated.component_b = ids.size() > 1 ? ids[1] : updated.component_a;
+            updated.linear_gradient_mode = linear_gradient_mode_from_selection(linear_gradient_mode_choice != nullptr ?
+                linear_gradient_mode_choice->GetSelection() :
+                0);
+            updated.linear_gradient_radius_percent = linear_gradient_radius_percent_chk != nullptr ?
+                linear_gradient_radius_percent_chk->GetValue() :
+                updated.linear_gradient_radius_percent;
+            if (linear_gradient_radius_spin != nullptr) {
+                const float radius_value = std::clamp(float(linear_gradient_radius_spin->GetValue()), 0.f, 100000.f);
+                if (updated.linear_gradient_radius_percent)
+                    updated.linear_gradient_radius_pct = radius_value;
+                else
+                    updated.linear_gradient_radius_mm = radius_value;
+            }
             updated.filament_color_mode = mode_choice != nullptr ?
                 texture_mapping_color_mode_from_selection(mode_choice->GetSelection(), updated.filament_color_mode) :
                 updated.filament_color_mode;
@@ -6666,13 +6872,16 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             }
             evt.Skip();
         });
-        auto update_pattern_visibility = [this, editor_sizer, filaments_row, linear_gradient_row, linear_gradient_buttons_row, show_direction_arrow_row, mode_row, contrast_row, preview_colors_row, offset_btn, advanced_btn, surface_choice, row, editor, update_texture_mapping_area_height]() {
+        auto update_pattern_visibility = [this, editor_sizer, filaments_row, linear_gradient_mode_row, linear_gradient_mode_choice, linear_gradient_row, linear_gradient_buttons_row, linear_gradient_radius_row, show_direction_arrow_row, mode_row, contrast_row, preview_colors_row, offset_btn, advanced_btn, surface_choice, row, editor, update_texture_mapping_area_height, set_linear_gradient_picker_button_labels]() {
             const int selection = surface_choice == nullptr ? 0 : surface_choice->GetSelection();
             const bool image_texture = selection == 0;
             const bool linear_gradient = selection == 1;
+            const bool radial_gradient = linear_gradient && linear_gradient_mode_choice != nullptr && linear_gradient_mode_choice->GetSelection() == 1;
             editor_sizer->Show(filaments_row, !linear_gradient, true);
+            editor_sizer->Show(linear_gradient_mode_row, linear_gradient, true);
             editor_sizer->Show(linear_gradient_row, linear_gradient, true);
             editor_sizer->Show(linear_gradient_buttons_row, linear_gradient, true);
+            editor_sizer->Show(linear_gradient_radius_row, radial_gradient, true);
             editor_sizer->Show(show_direction_arrow_row, linear_gradient, true);
             editor_sizer->Show(mode_row, image_texture, true);
             editor_sizer->Show(contrast_row, image_texture, true);
@@ -6681,6 +6890,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 offset_btn->Show(selection == 2);
             if (advanced_btn != nullptr)
                 advanced_btn->Show();
+            set_linear_gradient_picker_button_labels(GLGizmoTextureGradientPointPicker::Target::None);
             editor->Layout();
             row->Layout();
             update_texture_mapping_area_height();
@@ -6693,6 +6903,11 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             update_pattern_visibility();
             apply_controls();
         });
+        if (linear_gradient_mode_choice != nullptr)
+            linear_gradient_mode_choice->Bind(wxEVT_COMBOBOX, [update_pattern_visibility, apply_controls](wxCommandEvent &) {
+                update_pattern_visibility();
+                apply_controls();
+            });
         for (::CheckBox *chk : filament_checks)
             if (chk != nullptr)
                 chk->Bind(wxEVT_TOGGLEBUTTON, [apply_controls](wxCommandEvent &evt) {
@@ -6712,7 +6927,11 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                filament_checks,
                                start_filament_combo,
                                end_filament_combo,
+                               linear_gradient_mode_choice,
+                               linear_gradient_radius_spin,
+                               linear_gradient_radius_percent_chk,
                                linear_gradient_filament_ids,
+                               linear_gradient_mode_from_selection,
                                mode_choice,
                                surface_choice,
                                preview_colors_chk,
@@ -6750,6 +6969,19 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.component_ids = encode_texture_mapping_component_ids(ids);
             updated.component_a = ids.empty() ? 1 : ids.front();
             updated.component_b = ids.size() > 1 ? ids[1] : updated.component_a;
+            updated.linear_gradient_mode = linear_gradient_mode_from_selection(linear_gradient_mode_choice != nullptr ?
+                linear_gradient_mode_choice->GetSelection() :
+                0);
+            updated.linear_gradient_radius_percent = linear_gradient_radius_percent_chk != nullptr ?
+                linear_gradient_radius_percent_chk->GetValue() :
+                updated.linear_gradient_radius_percent;
+            if (linear_gradient_radius_spin != nullptr) {
+                const float radius_value = std::clamp(float(linear_gradient_radius_spin->GetValue()), 0.f, 100000.f);
+                if (updated.linear_gradient_radius_percent)
+                    updated.linear_gradient_radius_pct = radius_value;
+                else
+                    updated.linear_gradient_radius_mm = radius_value;
+            }
             updated.filament_color_mode = mode_choice != nullptr ?
                 texture_mapping_color_mode_from_selection(mode_choice->GetSelection(), updated.filament_color_mode) :
                 updated.filament_color_mode;
@@ -6791,6 +7023,46 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 apply_controls();
                 evt.Skip();
             });
+        auto update_linear_gradient_radius_unit = [linear_gradient_radius_percent_chk, linear_gradient_radius_unit_label]() {
+            if (linear_gradient_radius_unit_label != nullptr)
+                linear_gradient_radius_unit_label->SetLabel(linear_gradient_radius_percent_chk != nullptr && linear_gradient_radius_percent_chk->GetValue() ? _L("%") : _L("mm"));
+        };
+        if (linear_gradient_radius_percent_chk != nullptr)
+            linear_gradient_radius_percent_chk->Bind(wxEVT_TOGGLEBUTTON, [zone_index,
+                                                                          mgr_ptr,
+                                                                          linear_gradient_radius_spin,
+                                                                          linear_gradient_radius_percent_chk,
+                                                                          update_linear_gradient_radius_unit,
+                                                                          apply_controls](wxCommandEvent &evt) {
+                if (linear_gradient_radius_spin != nullptr && mgr_ptr != nullptr && zone_index < mgr_ptr->zones().size()) {
+                    const TextureMappingZone &zone = mgr_ptr->zones()[zone_index];
+                    const double value = linear_gradient_radius_percent_chk->GetValue() ?
+                        std::clamp(double(zone.linear_gradient_radius_pct), 0.0, 100000.0) :
+                        std::clamp(double(zone.linear_gradient_radius_mm), 0.0, 100000.0);
+                    linear_gradient_radius_spin->SetValue(value);
+                }
+                update_linear_gradient_radius_unit();
+                apply_controls();
+                evt.Skip();
+            });
+        if (linear_gradient_radius_spin != nullptr) {
+            linear_gradient_radius_spin->Bind(wxEVT_SPINCTRLDOUBLE, [apply_controls](wxSpinDoubleEvent &) { apply_controls(); });
+            linear_gradient_radius_spin->Bind(wxEVT_TEXT_ENTER, [apply_controls](wxCommandEvent &) { apply_controls(); });
+            linear_gradient_radius_spin->Bind(wxEVT_KILL_FOCUS, [apply_controls](wxFocusEvent &evt) {
+                apply_controls();
+                evt.Skip();
+            });
+            linear_gradient_radius_spin->Bind(wxEVT_CHAR_HOOK, [linear_gradient_radius_spin, apply_controls](wxKeyEvent &evt) {
+                const int key = evt.GetKeyCode();
+                if (key == WXK_UP || key == WXK_NUMPAD_UP || key == WXK_DOWN || key == WXK_NUMPAD_DOWN) {
+                    const double direction = (key == WXK_UP || key == WXK_NUMPAD_UP) ? 1.0 : -1.0;
+                    linear_gradient_radius_spin->SetValue(std::clamp(linear_gradient_radius_spin->GetValue() + direction, 0.0, 100000.0));
+                    apply_controls();
+                    return;
+                }
+                evt.Skip();
+            });
+        }
         contrast_spin->Bind(wxEVT_SPINCTRL, [apply_controls](wxCommandEvent &) { apply_controls(); });
         contrast_spin->Bind(wxEVT_TEXT_ENTER, [apply_controls](wxCommandEvent &) { apply_controls(); });
         contrast_spin->Bind(wxEVT_KILL_FOCUS, [apply_controls](wxFocusEvent &evt) {
@@ -6859,8 +7131,11 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                             apply_linear_gradient_pick,
                                             make_linear_gradient_anchor,
                                             set_config_string,
+                                            linear_gradient_mode_choice,
                                             set_linear_gradient_picker_button_labels](bool start_point) {
             if (p->plater == nullptr)
+                return;
+            if (!start_point && linear_gradient_mode_choice != nullptr && linear_gradient_mode_choice->GetSelection() == 1)
                 return;
             GLCanvas3D *canvas = p->plater->get_current_canvas3D(true);
             if (canvas == nullptr)
@@ -6884,6 +7159,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             if (mgr_ptr == nullptr || zone_index >= mgr_ptr->zones().size())
                 return;
             const TextureMappingZone original = mgr_ptr->zones()[zone_index];
+            picker->set_radial_mode(original.linear_gradient_mode == int(TextureMappingZone::LinearGradientRadial));
             const std::string original_serialized = serialize_texture_mapping_manager(mgr_ptr);
             TextureMappingZone active_preview = original;
             active_preview.surface_pattern = int(TextureMappingZone::LinearGradient);

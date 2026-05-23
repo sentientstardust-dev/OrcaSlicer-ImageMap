@@ -38,8 +38,10 @@ uniform vec3 gradient_center;
 uniform float gradient_z_min;
 uniform float gradient_z_max;
 uniform bool gradient_linear_mode;
+uniform bool gradient_linear_radial_mode;
 uniform vec3 gradient_linear_start;
 uniform vec3 gradient_linear_end;
+uniform float gradient_linear_radius_mm;
 uniform int gradient_linear_lut_count;
 uniform vec3 gradient_linear_lut_colors[MAX_LINEAR_GRADIENT_LUT_COLORS];
 
@@ -195,9 +197,14 @@ vec3 linear_gradient_lut_color(float t)
 
 vec3 linear_gradient_color(int count)
 {
-    vec3 direction_vec = gradient_linear_end - gradient_linear_start;
-    float denom = dot(direction_vec, direction_vec);
-    float t = denom > EPSILON ? clamp(dot(world_pos.xyz - gradient_linear_start, direction_vec) / denom, 0.0, 1.0) : 0.0;
+    float t = 0.0;
+    if (gradient_linear_radial_mode) {
+        t = clamp(length(world_pos.xyz - gradient_linear_start) / max(gradient_linear_radius_mm, EPSILON), 0.0, 1.0);
+    } else {
+        vec3 direction_vec = gradient_linear_end - gradient_linear_start;
+        float denom = dot(direction_vec, direction_vec);
+        t = denom > EPSILON ? clamp(dot(world_pos.xyz - gradient_linear_start, direction_vec) / denom, 0.0, 1.0) : 0.0;
+    }
     if (count <= 0)
         return clamp(gradient_base_color, 0.0, 1.0);
     return linear_gradient_lut_color(t);

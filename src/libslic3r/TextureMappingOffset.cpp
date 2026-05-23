@@ -122,6 +122,17 @@ const ModelObject *texture_mapping_anchor_model_object(const Print &print,
     return nullptr;
 }
 
+const PrintObject *texture_mapping_anchor_print_object(const Print &print,
+                                                       const TextureMappingZone::LinearGradientAnchor &anchor)
+{
+    for (const PrintObject *print_object : print.objects()) {
+        const ModelObject *model_object = print_object != nullptr ? print_object->model_object() : nullptr;
+        if (texture_mapping_anchor_matches_model_object(model_object, anchor))
+            return print_object;
+    }
+    return nullptr;
+}
+
 const ModelInstance *texture_mapping_anchor_model_instance(const ModelObject *object,
                                                           const TextureMappingZone::LinearGradientAnchor &anchor)
 {
@@ -210,6 +221,45 @@ std::pair<Vec3f, Vec3f> texture_mapping_default_linear_gradient_points(const Pri
     const float z_min = 0.f;
     const float z_max = std::max(0.01f, unscale<float>(print_object.height()));
     return { Vec3f(cx, cy, z_min), Vec3f(cx, cy, z_max) };
+}
+
+std::pair<Vec3f, float> texture_mapping_default_radial_gradient(const PrintObject &print_object)
+{
+    const BoundingBox bbox = print_object.bounding_box();
+    const float min_x = unscale<float>(bbox.min.x());
+    const float max_x = unscale<float>(bbox.max.x());
+    const float min_y = unscale<float>(bbox.min.y());
+    const float max_y = unscale<float>(bbox.max.y());
+    const float height = std::max(0.01f, unscale<float>(print_object.height()));
+    const Vec3f center(0.5f * (min_x + max_x), 0.5f * (min_y + max_y), 0.5f * height);
+    const Vec3f diagonal(std::max(0.f, max_x - min_x), std::max(0.f, max_y - min_y), height);
+    const float radius = std::max(0.01f, 0.5f * diagonal.norm());
+    return { center, radius };
+}
+
+float texture_mapping_linear_gradient_radius_mm(const PrintObject &print_object,
+                                                const TextureMappingZone &zone,
+                                                float default_radius_mm)
+{
+    if (!zone.linear_gradient_radius_percent) {
+        const float radius_mm = std::isfinite(zone.linear_gradient_radius_mm) ? zone.linear_gradient_radius_mm : default_radius_mm;
+        return std::max(0.01f, radius_mm);
+    }
+
+    const float radius_value = std::isfinite(zone.linear_gradient_radius_pct) ?
+        std::max(0.f, zone.linear_gradient_radius_pct) :
+        TextureMappingZone::DefaultLinearGradientRadiusPct;
+    if (zone.linear_gradient_start.valid) {
+        const Print *print = print_object.print();
+        const PrintObject *anchor_print_object = print != nullptr ?
+            texture_mapping_anchor_print_object(*print, zone.linear_gradient_start) :
+            nullptr;
+        if (anchor_print_object != nullptr)
+            return std::max(0.01f, texture_mapping_default_radial_gradient(*anchor_print_object).second * radius_value / 100.f);
+        return std::max(0.01f, radius_value);
+    }
+
+    return std::max(0.01f, default_radius_mm * radius_value / 100.f);
 }
 
 int texture_mapping_color_hex_digit(char ch)
@@ -2967,20 +3017,30 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     context.nonlinear_offset_adjustment = zone.nonlinear_offset_adjustment;
     context.object_center = print_object.bounding_box().center();
     if (linear_gradient_mode) {
+        const bool radial_mode = zone.linear_gradient_mode == int(TextureMappingZone::LinearGradientRadial);
         auto default_points = texture_mapping_default_linear_gradient_points(print_object);
+        auto default_radial = texture_mapping_default_radial_gradient(print_object);
         std::optional<Vec3f> start =
             texture_mapping_linear_gradient_anchor_print_point(print_object,
                                                                zone.linear_gradient_start,
                                                                plate_origin_mm_override);
-        std::optional<Vec3f> end =
-            texture_mapping_linear_gradient_anchor_print_point(print_object,
-                                                               zone.linear_gradient_end,
-                                                               plate_origin_mm_override);
-        context.linear_gradient_start_mm = start ? *start : default_points.first;
-        context.linear_gradient_end_mm = end ? *end : default_points.second;
-        if ((context.linear_gradient_end_mm - context.linear_gradient_start_mm).squaredNorm() <= 1e-8f) {
-            context.linear_gradient_start_mm = default_points.first;
-            context.linear_gradient_end_mm = default_points.second;
+        std::optional<Vec3f> end;
+        if (!radial_mode)
+            end = texture_mapping_linear_gradient_anchor_print_point(print_object,
+                                                                     zone.linear_gradient_end,
+                                                                     plate_origin_mm_override);
+        context.linear_gradient_radial_mode = radial_mode;
+        if (radial_mode) {
+            context.linear_gradient_start_mm = start ? *start : default_radial.first;
+            context.linear_gradient_radius_mm = texture_mapping_linear_gradient_radius_mm(print_object, zone, default_radial.second);
+            context.linear_gradient_end_mm = context.linear_gradient_start_mm + Vec3f::UnitX() * context.linear_gradient_radius_mm;
+        } else {
+            context.linear_gradient_start_mm = start ? *start : default_points.first;
+            context.linear_gradient_end_mm = end ? *end : default_points.second;
+            if ((context.linear_gradient_end_mm - context.linear_gradient_start_mm).squaredNorm() <= 1e-8f) {
+                context.linear_gradient_start_mm = default_points.first;
+                context.linear_gradient_end_mm = default_points.second;
+            }
         }
     }
     context.active_component_id = active_component_id;
@@ -3052,18 +3112,23 @@ float texture_mapping_offset_surface_inset_mm(const TextureMappingOffsetContext 
         }
         inset_strength = std::clamp(1.f - desired_strength, 0.f, 1.f);
     } else if (context.linear_gradient_mode) {
-        const Vec3f gradient_vec = context.linear_gradient_end_mm - context.linear_gradient_start_mm;
-        const float denom = gradient_vec.squaredNorm();
-        if (denom <= 1e-8f) {
-            inset_strength = 0.f;
+        float t = 0.f;
+        float z_mm = context.layer != nullptr ? float(context.layer->print_z) : 0.f;
+        if (std::isfinite(surface_v_mm))
+            z_mm = surface_v_mm;
+        if (!std::isfinite(z_mm))
+            z_mm = 0.f;
+        const Vec3f sample(unscale<float>(point.x()), unscale<float>(point.y()), z_mm);
+        if (context.linear_gradient_radial_mode) {
+            const float radius = std::max(0.01f, context.linear_gradient_radius_mm);
+            t = clamp01f((sample - context.linear_gradient_start_mm).norm() / radius);
         } else {
-            float z_mm = context.layer != nullptr ? float(context.layer->print_z) : 0.f;
-            if (std::isfinite(surface_v_mm))
-                z_mm = surface_v_mm;
-            if (!std::isfinite(z_mm))
-                z_mm = 0.f;
-            const Vec3f sample(unscale<float>(point.x()), unscale<float>(point.y()), z_mm);
-            const float t = clamp01f((sample - context.linear_gradient_start_mm).dot(gradient_vec) / denom);
+            const Vec3f gradient_vec = context.linear_gradient_end_mm - context.linear_gradient_start_mm;
+            const float denom = gradient_vec.squaredNorm();
+            if (denom > 1e-8f)
+                t = clamp01f((sample - context.linear_gradient_start_mm).dot(gradient_vec) / denom);
+        }
+        if (context.linear_gradient_radial_mode || (context.linear_gradient_end_mm - context.linear_gradient_start_mm).squaredNorm() > 1e-8f) {
             float desired_strength = context.active_component_idx == 0 ? 1.f - t :
                                      context.active_component_idx == 1 ? t :
                                      0.f;
@@ -3071,6 +3136,8 @@ float texture_mapping_offset_surface_inset_mm(const TextureMappingOffsetContext 
             if (max_strength > EPSILON)
                 desired_strength = clamp01f(desired_strength / max_strength);
             inset_strength = std::clamp(1.f - desired_strength, 0.f, 1.f);
+        } else {
+            inset_strength = 0.f;
         }
     } else {
         double theta_direction_x = outward_x;

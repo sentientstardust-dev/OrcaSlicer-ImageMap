@@ -6,15 +6,21 @@
 
 #include "libslic3r/Color.hpp"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/TextureMapping.hpp"
 #include "libslic3r/TriangleSelector.hpp"
 
 #include <array>
+#include <functional>
+#include <optional>
 #include <utility>
 #include <vector>
 
 namespace Slic3r {
 
 class TextureMappingManager;
+
+using SurfaceGradientAnchorResolver = std::function<std::optional<Vec3f>(const TextureMappingZone::LinearGradientAnchor &)>;
+using SurfaceGradientAnchorRadiusResolver = std::function<std::optional<float>(const TextureMappingZone::LinearGradientAnchor &)>;
 
 bool build_mmu_texture_preview_models(
     const ModelVolume                                                    &model_volume,
@@ -149,7 +155,9 @@ void render_model_vertex_color_preview_models(
     const std::array<float, 4>      &print_volume_xy = std::array<float, 4>{ 0.f, 0.f, 0.f, 0.f },
     const std::array<float, 2>      &print_volume_z = std::array<float, 2>{ 0.f, 0.f },
     bool                             opaque = false,
-    const ModelVolume               *model_volume = nullptr);
+    const ModelVolume               *model_volume = nullptr,
+    const SurfaceGradientAnchorResolver *surface_gradient_anchor_resolver = nullptr,
+    const SurfaceGradientAnchorRadiusResolver *surface_gradient_anchor_radius_resolver = nullptr);
 
 } // namespace Slic3r
 

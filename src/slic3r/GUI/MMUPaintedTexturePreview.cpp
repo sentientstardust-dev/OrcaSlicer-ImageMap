@@ -120,8 +120,10 @@ struct SurfaceGradientPreviewSettings
     float z_min = 0.f;
     float z_max = 0.f;
     bool linear_gradient = false;
+    bool linear_gradient_radial = false;
     Vec3f linear_start = Vec3f::Zero();
     Vec3f linear_end = Vec3f::UnitZ();
+    float linear_radius_mm = 1.f;
     std::vector<std::array<float, 3>> linear_gradient_lut_colors;
 };
 
@@ -4233,7 +4235,8 @@ std::optional<Vec3f> surface_gradient_anchor_global_point(const TextureMappingZo
 
 std::optional<Vec3f> surface_gradient_anchor_world_point_for_volume(const ModelVolume &model_volume,
                                                                     const Transform3d &world_matrix,
-                                                                    const TextureMappingZone::LinearGradientAnchor &anchor)
+                                                                    const TextureMappingZone::LinearGradientAnchor &anchor,
+                                                                    const SurfaceGradientAnchorResolver *surface_gradient_anchor_resolver)
 {
     if (!anchor.valid)
         return std::nullopt;
@@ -4248,13 +4251,105 @@ std::optional<Vec3f> surface_gradient_anchor_world_point_for_volume(const ModelV
             return world;
     }
 
+    if (surface_gradient_anchor_resolver != nullptr) {
+        const std::optional<Vec3f> live_global = (*surface_gradient_anchor_resolver)(anchor);
+        if (live_global && surface_gradient_anchor_vec_finite(*live_global))
+            return live_global;
+    }
+
     return surface_gradient_anchor_global_point(anchor);
+}
+
+std::optional<float> surface_gradient_anchor_object_radius(const TextureMappingZone::LinearGradientAnchor &anchor)
+{
+    if (!anchor.valid)
+        return std::nullopt;
+
+    const Model &model = GUI::wxGetApp().model();
+    const ModelObject *object = surface_gradient_anchor_model_object(model, anchor);
+    if (object == nullptr)
+        return std::nullopt;
+
+    const ModelInstance *anchor_instance = surface_gradient_anchor_model_instance(object, anchor);
+    BoundingBoxf3 bbox;
+    bool defined = false;
+    auto merge_instance = [&bbox, &defined, object](const ModelInstance *instance) {
+        if (instance == nullptr)
+            return;
+        for (const ModelVolume *volume : object->volumes) {
+            if (volume == nullptr)
+                continue;
+            bbox.merge(volume->mesh().transformed_bounding_box(instance->get_matrix() * volume->get_matrix(), 0.0));
+            defined = true;
+        }
+    };
+    if (anchor_instance != nullptr)
+        merge_instance(anchor_instance);
+    else
+        for (const ModelInstance *instance : object->instances)
+            merge_instance(instance);
+
+    if (!defined)
+        return std::nullopt;
+    const float radius = 0.5f * (bbox.max.cast<float>() - bbox.min.cast<float>()).norm();
+    return std::isfinite(radius) && radius > 0.f ? std::optional<float>(radius) : std::nullopt;
+}
+
+float surface_gradient_linear_radius_mm(const TextureMappingZone &zone,
+                                        float default_radius_mm,
+                                        const SurfaceGradientAnchorRadiusResolver *surface_gradient_anchor_radius_resolver)
+{
+    if (!zone.linear_gradient_radius_percent) {
+        const float radius_mm = std::isfinite(zone.linear_gradient_radius_mm) ? zone.linear_gradient_radius_mm : default_radius_mm;
+        return std::max(0.01f, radius_mm);
+    }
+
+    const float radius_value = std::isfinite(zone.linear_gradient_radius_pct) ?
+        std::max(0.f, zone.linear_gradient_radius_pct) :
+        TextureMappingZone::DefaultLinearGradientRadiusPct;
+    if (zone.linear_gradient_start.valid) {
+        std::optional<float> anchor_radius;
+        if (surface_gradient_anchor_radius_resolver != nullptr)
+            anchor_radius = (*surface_gradient_anchor_radius_resolver)(zone.linear_gradient_start);
+        if (!anchor_radius)
+            anchor_radius = surface_gradient_anchor_object_radius(zone.linear_gradient_start);
+        if (anchor_radius)
+            return std::max(0.01f, *anchor_radius * radius_value / 100.f);
+        return std::max(0.01f, radius_value);
+    }
+
+    return std::max(0.01f, default_radius_mm * radius_value / 100.f);
+}
+
+float surface_gradient_object_radius_for_volume(const ModelVolume &model_volume,
+                                                const Transform3d &world_matrix,
+                                                float fallback_radius)
+{
+    const ModelObject *object = model_volume.get_object();
+    if (object == nullptr)
+        return fallback_radius;
+
+    const Transform3d instance_matrix = world_matrix * model_volume.get_matrix().inverse();
+    BoundingBoxf3 bbox;
+    bool defined = false;
+    for (const ModelVolume *volume : object->volumes) {
+        if (volume == nullptr)
+            continue;
+        bbox.merge(volume->mesh().transformed_bounding_box(instance_matrix * volume->get_matrix(), 0.0));
+        defined = true;
+    }
+    if (!defined)
+        return fallback_radius;
+    const float radius = 0.5f * (bbox.max.cast<float>() - bbox.min.cast<float>()).norm();
+    return std::isfinite(radius) && radius > 0.f ? radius : fallback_radius;
 }
 
 std::optional<SurfaceGradientPreviewSettings> surface_gradient_preview_settings_for_zone(const ModelVolume &model_volume,
                                                                                         const Transform3d &world_matrix,
                                                                                         const TextureMappingZone &zone,
-                                                                                        size_t num_physical)
+                                                                                        size_t num_physical,
+                                                                                        const SurfaceGradientAnchorResolver *surface_gradient_anchor_resolver = nullptr,
+                                                                                        const SurfaceGradientAnchorRadiusResolver *surface_gradient_anchor_radius_resolver = nullptr)
 {
     if (!is_gradient_zone(zone))
         return std::nullopt;
@@ -4355,17 +4450,31 @@ std::optional<SurfaceGradientPreviewSettings> surface_gradient_preview_settings_
     settings.z_min = min_pt.z();
     settings.z_max = max_pt.z();
     if (settings.linear_gradient) {
-        settings.linear_start = Vec3f(settings.center.x(), settings.center.y(), settings.z_min);
-        settings.linear_end = Vec3f(settings.center.x(), settings.center.y(), settings.z_max);
-        if (std::optional<Vec3f> start =
-                surface_gradient_anchor_world_point_for_volume(model_volume, world_matrix, zone.linear_gradient_start))
-            settings.linear_start = *start;
-        if (std::optional<Vec3f> end =
-                surface_gradient_anchor_world_point_for_volume(model_volume, world_matrix, zone.linear_gradient_end))
-            settings.linear_end = *end;
-        if ((settings.linear_end - settings.linear_start).squaredNorm() <= 1e-8f) {
+        settings.linear_gradient_radial = zone.linear_gradient_mode == int(TextureMappingZone::LinearGradientRadial);
+        const Vec3f bbox_diagonal = max_pt - min_pt;
+        const float default_radius = surface_gradient_object_radius_for_volume(model_volume,
+                                                                               world_matrix,
+                                                                               std::max(0.01f, 0.5f * bbox_diagonal.norm()));
+        if (settings.linear_gradient_radial) {
+            settings.linear_start = settings.center;
+            if (std::optional<Vec3f> start =
+                    surface_gradient_anchor_world_point_for_volume(model_volume, world_matrix, zone.linear_gradient_start, surface_gradient_anchor_resolver))
+                settings.linear_start = *start;
+            settings.linear_radius_mm = surface_gradient_linear_radius_mm(zone, default_radius, surface_gradient_anchor_radius_resolver);
+            settings.linear_end = settings.linear_start + Vec3f::UnitX() * settings.linear_radius_mm;
+        } else {
             settings.linear_start = Vec3f(settings.center.x(), settings.center.y(), settings.z_min);
             settings.linear_end = Vec3f(settings.center.x(), settings.center.y(), settings.z_max);
+            if (std::optional<Vec3f> start =
+                    surface_gradient_anchor_world_point_for_volume(model_volume, world_matrix, zone.linear_gradient_start, surface_gradient_anchor_resolver))
+                settings.linear_start = *start;
+            if (std::optional<Vec3f> end =
+                    surface_gradient_anchor_world_point_for_volume(model_volume, world_matrix, zone.linear_gradient_end, surface_gradient_anchor_resolver))
+                settings.linear_end = *end;
+            if ((settings.linear_end - settings.linear_start).squaredNorm() <= 1e-8f) {
+                settings.linear_start = Vec3f(settings.center.x(), settings.center.y(), settings.z_min);
+                settings.linear_end = Vec3f(settings.center.x(), settings.center.y(), settings.z_max);
+            }
         }
     }
     return settings;
@@ -4509,12 +4618,14 @@ void set_surface_gradient_preview_uniforms(GLShaderProgram &shader, const Surfac
     shader.set_uniform("gradient_clockwise", settings == nullptr || settings->clockwise);
     shader.set_uniform("gradient_fade_mode", settings != nullptr ? settings->fade_mode : int(TextureMappingZone::OffsetFadeNone));
     shader.set_uniform("gradient_linear_mode", settings != nullptr && settings->linear_gradient);
+    shader.set_uniform("gradient_linear_radial_mode", settings != nullptr && settings->linear_gradient_radial);
     const Vec3f center = settings != nullptr ? settings->center : Vec3f::Zero();
     shader.set_uniform("gradient_center", center);
     shader.set_uniform("gradient_z_min", settings != nullptr ? settings->z_min : 0.f);
     shader.set_uniform("gradient_z_max", settings != nullptr ? settings->z_max : 0.f);
     shader.set_uniform("gradient_linear_start", settings != nullptr ? settings->linear_start : Vec3f::Zero());
     shader.set_uniform("gradient_linear_end", settings != nullptr ? settings->linear_end : Vec3f::UnitZ());
+    shader.set_uniform("gradient_linear_radius_mm", settings != nullptr ? settings->linear_radius_mm : 1.f);
     const size_t lut_count = settings == nullptr ? size_t(0) :
         std::min(settings->linear_gradient_lut_colors.size(), k_surface_gradient_preview_lut_size);
     shader.set_uniform("gradient_linear_lut_count", int(lut_count));
@@ -5085,6 +5196,10 @@ static void texture_preview_mix_zone_baked_model_settings(size_t &signature,
     signature_mix(std::hash<int>{}(zone.preview_limit_resolution ? 1 : 0));
     signature_mix_float(zone.contrast_pct, 100.f);
     signature_mix_float(zone.tone_gamma);
+    signature_mix(std::hash<int>{}(zone.linear_gradient_mode));
+    signature_mix_float(zone.linear_gradient_radius_mm, 1000.f);
+    signature_mix(std::hash<int>{}(zone.linear_gradient_radius_percent ? 1 : 0));
+    signature_mix_float(zone.linear_gradient_radius_pct, 1000.f);
     for (const float strength_pct : zone.filament_strengths_pct)
         signature_mix_float(strength_pct, 100.f);
     for (const float minimum_offset_pct : zone.filament_minimum_offsets_pct)
@@ -5351,7 +5466,9 @@ void render_model_vertex_color_preview_models(
     const std::array<float, 4>      &print_volume_xy,
     const std::array<float, 2>      &print_volume_z,
     bool                             opaque,
-    const ModelVolume               *model_volume)
+    const ModelVolume               *model_volume,
+    const SurfaceGradientAnchorResolver *surface_gradient_anchor_resolver,
+    const SurfaceGradientAnchorRadiusResolver *surface_gradient_anchor_radius_resolver)
 {
     if (models.empty() || colors.size() != models.size() || filament_ids.size() != models.size())
         return;
@@ -5403,7 +5520,7 @@ void render_model_vertex_color_preview_models(
             if (model_volume == nullptr || gradient_shader == nullptr)
                 continue;
             const std::optional<SurfaceGradientPreviewSettings> settings =
-                surface_gradient_preview_settings_for_zone(*model_volume, model_matrix, *zone, num_physical);
+                surface_gradient_preview_settings_for_zone(*model_volume, model_matrix, *zone, num_physical, surface_gradient_anchor_resolver, surface_gradient_anchor_radius_resolver);
             if (!settings && !invalid)
                 continue;
             if (!use_shader(gradient_shader))

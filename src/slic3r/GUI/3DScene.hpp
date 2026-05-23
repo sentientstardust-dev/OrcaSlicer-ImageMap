@@ -15,6 +15,7 @@
 #include "GLModel.hpp"
 #include "GLTexture.hpp"
 #include "GLShader.hpp"
+#include "MMUPaintedTexturePreview.hpp"
 #include "MeshUtils.hpp"
 
 #include <functional>
@@ -370,7 +371,9 @@ public:
                                     int print_volume_type = -1,
                                     const std::array<float, 4> &print_volume_xy = std::array<float, 4>{ 0.f, 0.f, 0.f, 0.f },
                                     const std::array<float, 2> &print_volume_z = std::array<float, 2>{ 0.f, 0.f },
-                                    bool opaque = false);
+                                    bool opaque = false,
+                                    const SurfaceGradientAnchorResolver *surface_gradient_anchor_resolver = nullptr,
+                                    const SurfaceGradientAnchorRadiusResolver *surface_gradient_anchor_radius_resolver = nullptr);
     void invalidate_texture_mapping_preview();
 
     void                set_bounding_boxes_as_dirty() {

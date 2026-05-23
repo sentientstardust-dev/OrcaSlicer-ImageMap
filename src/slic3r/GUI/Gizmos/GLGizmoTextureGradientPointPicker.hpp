@@ -40,6 +40,7 @@ public:
                            HoverCallback hover_callback = HoverCallback(),
                            CancelCallback cancel_callback = CancelCallback());
     void cancel_hover_preview();
+    void set_radial_mode(bool radial_mode) { m_radial_mode = radial_mode; }
     Target target() const { return m_target; }
 
 private:
@@ -65,6 +66,7 @@ private:
     bool m_has_hover { false };
     bool m_hover_preview_emitted { false };
     bool m_last_hover_preview_had_hit { false };
+    bool m_radial_mode { false };
     Vec2d m_mouse_pos { Vec2d::Zero() };
 };
 

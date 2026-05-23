@@ -2042,7 +2042,6 @@ void GLCanvas3D::render(bool only_init)
         _render_platelist(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), only_current, true, hover_id);
         // BBS: GUI refactor: add canvas size as parameters
         _render_gcode(cnv_size.get_width(), cnv_size.get_height());
-        m_volumes.render_linear_gradient_direction_arrows(camera.get_view_matrix(), camera.get_projection_matrix());
     }
     /* assemble render*/
     else if (m_canvas_type == ECanvasType::CanvasAssembleView) {

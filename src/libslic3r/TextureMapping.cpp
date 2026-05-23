@@ -552,6 +552,16 @@ static int surface_pattern_from_name(const std::string &name)
     return int(TextureMappingZone::ImageTexture);
 }
 
+static std::string linear_gradient_mode_name(int mode)
+{
+    return mode == int(TextureMappingZone::LinearGradientRadial) ? "radial" : "linear";
+}
+
+static int linear_gradient_mode_from_name(const std::string &name)
+{
+    return name == "radial" ? int(TextureMappingZone::LinearGradientRadial) : int(TextureMappingZone::LinearGradientLinear);
+}
+
 static nlohmann::json weights_to_json(const std::string &weights, size_t expected_count)
 {
     nlohmann::json out = nlohmann::json::array();
@@ -976,6 +986,10 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            floats_equal(filament_transmission_distances_mm, rhs.filament_transmission_distances_mm) &&
            anchors_equal(linear_gradient_start, rhs.linear_gradient_start) &&
            anchors_equal(linear_gradient_end, rhs.linear_gradient_end) &&
+           linear_gradient_mode == rhs.linear_gradient_mode &&
+           std::abs(linear_gradient_radius_mm - rhs.linear_gradient_radius_mm) <= eps &&
+           linear_gradient_radius_percent == rhs.linear_gradient_radius_percent &&
+           std::abs(linear_gradient_radius_pct - rhs.linear_gradient_radius_pct) <= eps &&
            show_linear_gradient_direction_arrow == rhs.show_linear_gradient_direction_arrow;
 }
 
@@ -1216,6 +1230,14 @@ std::string TextureMappingManager::serialize_entries()
             nlohmann::json linear_gradient;
             linear_gradient["start"] = linear_gradient_anchor_to_json(zone.linear_gradient_start);
             linear_gradient["end"] = linear_gradient_anchor_to_json(zone.linear_gradient_end);
+            linear_gradient["mode"] = linear_gradient_mode_name(zone.linear_gradient_mode);
+            linear_gradient["radius_mm"] = std::isfinite(zone.linear_gradient_radius_mm) ?
+                std::max(0.f, zone.linear_gradient_radius_mm) :
+                TextureMappingZone::DefaultLinearGradientRadiusMm;
+            linear_gradient["radius_percent"] = zone.linear_gradient_radius_percent;
+            linear_gradient["radius_pct"] = std::isfinite(zone.linear_gradient_radius_pct) ?
+                std::max(0.f, zone.linear_gradient_radius_pct) :
+                TextureMappingZone::DefaultLinearGradientRadiusPct;
             linear_gradient["show_direction_arrow"] = zone.show_linear_gradient_direction_arrow;
             entry["linear_gradient"] = std::move(linear_gradient);
         }
@@ -1373,6 +1395,12 @@ void TextureMappingManager::load_entries(const std::string &serialized,
             const nlohmann::json linear_gradient = entry.value("linear_gradient", nlohmann::json::object());
             zone.linear_gradient_start = linear_gradient_anchor_from_json(linear_gradient.value("start", nlohmann::json::object()));
             zone.linear_gradient_end = linear_gradient_anchor_from_json(linear_gradient.value("end", nlohmann::json::object()));
+            zone.linear_gradient_mode = linear_gradient_mode_from_name(linear_gradient.value("mode", std::string("linear")));
+            const float radius_mm = linear_gradient.value("radius_mm", TextureMappingZone::DefaultLinearGradientRadiusMm);
+            zone.linear_gradient_radius_mm = std::isfinite(radius_mm) ? std::max(0.f, radius_mm) : TextureMappingZone::DefaultLinearGradientRadiusMm;
+            zone.linear_gradient_radius_percent = linear_gradient.value("radius_percent", TextureMappingZone::DefaultLinearGradientRadiusPercent);
+            const float radius_pct = linear_gradient.value("radius_pct", TextureMappingZone::DefaultLinearGradientRadiusPct);
+            zone.linear_gradient_radius_pct = std::isfinite(radius_pct) ? std::max(0.f, radius_pct) : TextureMappingZone::DefaultLinearGradientRadiusPct;
             zone.show_linear_gradient_direction_arrow = linear_gradient.value("show_direction_arrow", true);
         }
 

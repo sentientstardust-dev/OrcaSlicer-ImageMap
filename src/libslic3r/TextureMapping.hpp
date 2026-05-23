@@ -24,6 +24,11 @@ struct TextureMappingZone
         LinearGradient = 2
     };
 
+    enum LinearGradientMode : uint8_t {
+        LinearGradientLinear = 0,
+        LinearGradientRadial = 1
+    };
+
     enum OffsetControlMode : uint8_t {
         OffsetBasic = 0,
         OffsetAdvanced = 1
@@ -102,6 +107,10 @@ struct TextureMappingZone
     };
 
     static constexpr int   DefaultSurfacePattern = int(ImageTexture);
+    static constexpr int   DefaultLinearGradientMode = int(LinearGradientLinear);
+    static constexpr float DefaultLinearGradientRadiusMm = 0.f;
+    static constexpr bool  DefaultLinearGradientRadiusPercent = true;
+    static constexpr float DefaultLinearGradientRadiusPct = 100.f;
     static constexpr int   DefaultOffsetMode = int(OffsetBasic);
     static constexpr bool  DefaultOffsetRotationEnabled = true;
     static constexpr float DefaultOffsetRotations = 1.f;
@@ -215,11 +224,16 @@ struct TextureMappingZone
     std::vector<float> filament_transmission_distances_mm;
     LinearGradientAnchor linear_gradient_start;
     LinearGradientAnchor linear_gradient_end;
-    bool show_linear_gradient_direction_arrow = true;
+    int                  linear_gradient_mode = DefaultLinearGradientMode;
+    float                linear_gradient_radius_mm = DefaultLinearGradientRadiusMm;
+    bool                 linear_gradient_radius_percent = DefaultLinearGradientRadiusPercent;
+    float                linear_gradient_radius_pct = DefaultLinearGradientRadiusPct;
+    bool                 show_linear_gradient_direction_arrow = true;
 
     bool is_image_texture() const { return surface_pattern == int(ImageTexture); }
     bool is_2d_gradient() const { return surface_pattern == int(Gradient2D); }
     bool is_linear_gradient() const { return surface_pattern == int(LinearGradient); }
+    bool is_radial_linear_gradient() const { return is_linear_gradient() && linear_gradient_mode == int(LinearGradientRadial); }
     bool is_surface_gradient() const { return is_2d_gradient() || is_linear_gradient(); }
     bool uses_perimeter_path_modulation() const { return modulation_mode == int(ModulationPerimeterPath); }
 
@@ -269,6 +283,10 @@ struct TextureMappingZone
         preview_simulate_colors = DefaultPreviewSimulateColors;
         preview_limit_resolution = DefaultPreviewLimitResolution;
         auto_adjust_filament_selection = DefaultAutoAdjustFilamentSelection;
+        linear_gradient_mode = DefaultLinearGradientMode;
+        linear_gradient_radius_mm = DefaultLinearGradientRadiusMm;
+        linear_gradient_radius_percent = DefaultLinearGradientRadiusPercent;
+        linear_gradient_radius_pct = DefaultLinearGradientRadiusPct;
         filament_strengths_pct.clear();
         filament_minimum_offsets_pct.clear();
         filament_transmission_distances_mm.clear();
