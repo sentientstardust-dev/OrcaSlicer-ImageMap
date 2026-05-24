@@ -6880,6 +6880,74 @@ void ObjectList::set_extruder_for_selected_items(const int extruder)
     Refresh();
 }
 
+bool ObjectList::assign_extruder_to_objects(const std::vector<size_t>& object_idxs, const int extruder, bool erase_filament_region_painting)
+{
+    std::vector<std::string> colors = wxGetApp().plater()->get_extruder_colors_from_plater_config();
+    if (extruder <= 0 || extruder > int(colors.size()))
+        return false;
+
+    std::vector<size_t> valid_object_idxs;
+    for (size_t obj_idx : object_idxs) {
+        if (m_objects == nullptr || obj_idx >= m_objects->size() || (*m_objects)[obj_idx] == nullptr)
+            continue;
+        if (std::find(valid_object_idxs.begin(), valid_object_idxs.end(), obj_idx) == valid_object_idxs.end())
+            valid_object_idxs.emplace_back(obj_idx);
+    }
+
+    if (valid_object_idxs.empty())
+        return false;
+
+    bool changed = false;
+    for (size_t obj_idx : valid_object_idxs) {
+        ModelObject *model_object = (*m_objects)[obj_idx];
+        const int current_extruder = model_object->config.has("extruder") ? model_object->config.opt_int("extruder") : 1;
+        changed |= current_extruder != extruder;
+        for (ModelVolume *mv : model_object->volumes) {
+            if (mv->type() == ModelVolumeType::MODEL_PART && mv->config.has("extruder"))
+                changed = true;
+            if (erase_filament_region_painting && !mv->mmu_segmentation_facets.empty())
+                changed = true;
+        }
+    }
+
+    if (!changed)
+        return false;
+
+    take_snapshot("Assign Texture Mapping Zone");
+
+    if (erase_filament_region_painting) {
+        if (Plater *plater = wxGetApp().plater(); plater != nullptr)
+            if (GLCanvas3D *canvas = plater->canvas3D(); canvas != nullptr)
+                canvas->get_gizmos_manager().reset_all_states();
+    }
+
+    for (size_t obj_idx : valid_object_idxs) {
+        ModelObject *model_object = (*m_objects)[obj_idx];
+        if (model_object->config.has("extruder"))
+            model_object->config.set("extruder", extruder);
+        else
+            model_object->config.set_key_value("extruder", new ConfigOptionInt(extruder));
+
+        for (ModelVolume *mv : model_object->volumes) {
+            if (mv->type() == ModelVolumeType::MODEL_PART && mv->config.has("extruder"))
+                mv->config.erase("extruder");
+            if (erase_filament_region_painting && !mv->mmu_segmentation_facets.empty())
+                mv->mmu_segmentation_facets.reset();
+        }
+
+        wxDataViewItem item = m_objects_model->GetItemById(int(obj_idx));
+        if (item.IsOk()) {
+            m_objects_model->SetExtruder(wxString::Format("%d", extruder), item);
+            update_info_items(obj_idx);
+        }
+    }
+
+    wxGetApp().plater()->update();
+    wxGetApp().plater()->object_list_changed();
+    Refresh();
+    return true;
+}
+
 void ObjectList::on_plate_added(PartPlate* part_plate)
 {
     wxDataViewItem plate_item = m_objects_model->AddPlate(part_plate);

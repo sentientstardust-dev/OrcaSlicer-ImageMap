@@ -531,7 +531,7 @@ void PrintObject::make_perimeters()
                zone->enabled &&
                !zone->deleted &&
                zone->uses_perimeter_path_modulation_v2() &&
-               (zone->is_2d_gradient() || zone->is_image_texture());
+               (zone->is_surface_gradient() || zone->is_image_texture());
     };
     bool report_v2_wall_geometry_progress = false;
     for (const Layer *layer : m_layers) {
@@ -963,7 +963,7 @@ void PrintObject::generate_support_material()
                    !zone->deleted &&
                    zone->uses_perimeter_path_modulation_v2() &&
                    !zone->use_modulated_overhang_geometry_for_support &&
-                   (zone->is_2d_gradient() || zone->is_image_texture());
+                   (zone->is_surface_gradient() || zone->is_image_texture());
         };
 
         auto restore_support_geometry = [&]() {

@@ -5,6 +5,7 @@
 
 #include "slic3r/GUI/GLModel.hpp"
 #include "slic3r/GUI/GLTexture.hpp"
+#include "slic3r/GUI/MMUPaintedTexturePreview.hpp"
 
 #include "libslic3r/ObjectID.hpp"
 #include "libslic3r/TriangleSelector.hpp"
@@ -15,6 +16,7 @@
 
 #include <array>
 #include <memory>
+#include <optional>
 
 
 namespace Slic3r::GUI {
@@ -133,7 +135,17 @@ public:
     void set_texture_preview_needed(bool needed) { m_texture_preview_needed = needed; }
     void set_texture_preview_opaque(bool opaque) { m_texture_preview_opaque = opaque; }
     void set_texture_mapping_color_preview(const ColorFacetsAnnotation *preview) { m_texture_mapping_color_preview = preview; }
-    void set_full_texture_preview_forced(bool forced) { m_force_full_texture_preview = forced; }
+    void set_full_texture_preview_forced(bool forced)
+    {
+        if (m_force_full_texture_preview != forced) {
+            m_force_full_texture_preview = forced;
+            request_update_render_data(true);
+        }
+    }
+    void set_texture_preview_color_match_settings(const std::optional<TexturePreviewColorMatchSettings> &settings)
+    {
+        m_texture_preview_color_match = settings;
+    }
     void set_surface_offset(float surface_offset)
     {
         if (m_surface_offset != surface_offset) {
@@ -214,6 +226,7 @@ protected:
     bool                        m_texture_preview_opaque = false;
     bool                        m_force_full_texture_preview = false;
     float                       m_surface_offset = 0.f;
+    std::optional<TexturePreviewColorMatchSettings> m_texture_preview_color_match;
 
 private:
     void update_render_data();

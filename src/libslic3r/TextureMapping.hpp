@@ -4,7 +4,9 @@
 #define slic3r_TextureMapping_hpp_
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -18,7 +20,13 @@ struct TextureMappingZone
 
     enum SurfacePattern : uint8_t {
         ImageTexture = 0,
-        Gradient2D   = 1
+        Gradient2D   = 1,
+        LinearGradient = 2
+    };
+
+    enum LinearGradientMode : uint8_t {
+        LinearGradientLinear = 0,
+        LinearGradientRadial = 1
     };
 
     enum OffsetControlMode : uint8_t {
@@ -90,7 +98,8 @@ struct TextureMappingZone
         DitheringFloydSteinberg = 1,
         DitheringOrderedBayer = 2,
         DitheringHalftone = 3,
-        DitheringHalftoneIncreasedDetail = 4
+        DitheringHalftoneIncreasedDetail = 4,
+        DitheringHalftoneV2 = 5
     };
 
     enum TransmissionDistanceCalibrationMode : uint8_t {
@@ -100,6 +109,10 @@ struct TextureMappingZone
     };
 
     static constexpr int   DefaultSurfacePattern = int(ImageTexture);
+    static constexpr int   DefaultLinearGradientMode = int(LinearGradientLinear);
+    static constexpr float DefaultLinearGradientRadiusMm = 0.f;
+    static constexpr bool  DefaultLinearGradientRadiusPercent = true;
+    static constexpr float DefaultLinearGradientRadiusPct = 100.f;
     static constexpr int   DefaultOffsetMode = int(OffsetBasic);
     static constexpr bool  DefaultOffsetRotationEnabled = true;
     static constexpr float DefaultOffsetRotations = 1.f;
@@ -114,7 +127,11 @@ struct TextureMappingZone
     static constexpr bool  DefaultReduceOuterSurfaceTexture = false;
     static constexpr bool  DefaultSeamHiding = false;
     static constexpr bool  DefaultNonlinearOffsetAdjustment = false;
-    static constexpr int   DefaultModulationMode = int(ModulationLineWidth);
+    static constexpr int   DefaultImageTextureModulationMode = int(ModulationLineWidth);
+    static constexpr int   Default2DGradientModulationMode = int(ModulationPerimeterPath);
+    static constexpr int   DefaultLinearGradientModulationMode = int(ModulationPerimeterPath);
+    static constexpr int   DefaultModulationMode = DefaultImageTextureModulationMode;
+    static constexpr bool  DefaultModulationModeManuallyChanged = false;
     static constexpr bool  DefaultUseModulatedOverhangGeometryForSupport = false;
     static constexpr bool  DefaultRecolorSmallPerimeterLoops = false;
     static constexpr bool  DefaultRecolorTopVisiblePerimeterSections = false;
@@ -132,7 +149,7 @@ struct TextureMappingZone
     static constexpr int   DefaultGenericSolverMode = int(GenericSolverV2);
     static constexpr int   DefaultGenericSolverMixModel = int(GenericSolverPigmentPainter);
     static constexpr bool  DefaultDitheringEnabled = false;
-    static constexpr int   DefaultDitheringMethod = int(DitheringHalftone);
+    static constexpr int   DefaultDitheringMethod = int(DitheringHalftoneV2);
     static constexpr float MinDitheringResolutionMm = 0.04f;
     static constexpr float MaxDitheringResolutionMm = 10.f;
     static constexpr float DefaultDitheringResolutionMm = 0.4f;
@@ -146,6 +163,34 @@ struct TextureMappingZone
     static constexpr bool  DefaultPreviewSimulateColors = false;
     static constexpr bool  DefaultPreviewLimitResolution = true;
     static constexpr bool  DefaultAutoAdjustFilamentSelection = true;
+
+    static constexpr int default_modulation_mode_for_surface_pattern(int surface_pattern)
+    {
+        switch (surface_pattern) {
+        case int(Gradient2D):      return Default2DGradientModulationMode;
+        case int(LinearGradient):  return DefaultLinearGradientModulationMode;
+        default:                   return DefaultImageTextureModulationMode;
+        }
+    }
+
+    struct LinearGradientAnchor {
+        bool valid = false;
+        size_t object_id = 0;
+        size_t instance_id = 0;
+        int object_backup_id = -1;
+        bool object_index_valid = false;
+        size_t object_index = 0;
+        bool instance_index_valid = false;
+        size_t instance_index = 0;
+        size_t instance_loaded_id = 0;
+        std::array<float, 3> local_point { { 0.f, 0.f, 0.f } };
+        std::array<float, 3> global_point { { 0.f, 0.f, 0.f } };
+    };
+
+    struct LinearGradientStop {
+        float position = 0.f;
+        unsigned int filament_id = 1;
+    };
 
     uint64_t     stable_id = 0;
     unsigned int zone_id = 0;
@@ -177,6 +222,7 @@ struct TextureMappingZone
     bool        nonlinear_offset_adjustment = DefaultNonlinearOffsetAdjustment;
     int         modulation_mode = DefaultModulationMode;
     bool        use_modulated_overhang_geometry_for_support = DefaultUseModulatedOverhangGeometryForSupport;
+    bool        modulation_mode_manually_changed = DefaultModulationModeManuallyChanged;
     bool        recolor_small_perimeter_loops = DefaultRecolorSmallPerimeterLoops;
     bool        recolor_top_visible_perimeter_sections = DefaultRecolorTopVisiblePerimeterSections;
     int         top_visible_perimeter_recolor_aggressiveness = DefaultTopVisiblePerimeterRecolorAggressiveness;
@@ -205,6 +251,14 @@ struct TextureMappingZone
     std::vector<float> filament_strengths_pct;
     std::vector<float> filament_minimum_offsets_pct;
     std::vector<float> filament_transmission_distances_mm;
+    LinearGradientAnchor linear_gradient_start;
+    LinearGradientAnchor linear_gradient_end;
+    int                  linear_gradient_mode = DefaultLinearGradientMode;
+    float                linear_gradient_radius_mm = DefaultLinearGradientRadiusMm;
+    bool                 linear_gradient_radius_percent = DefaultLinearGradientRadiusPercent;
+    float                linear_gradient_radius_pct = DefaultLinearGradientRadiusPct;
+    bool                 show_linear_gradient_direction_arrow = true;
+    std::vector<LinearGradientStop> linear_gradient_stops;
 
     bool is_image_texture() const { return surface_pattern == int(ImageTexture); }
     bool is_2d_gradient() const { return surface_pattern == int(Gradient2D); }
@@ -215,6 +269,15 @@ struct TextureMappingZone
     }
     bool uses_legacy_perimeter_path_modulation() const { return modulation_mode == int(ModulationPerimeterPath); }
     bool uses_perimeter_path_modulation_v2() const { return modulation_mode == int(ModulationPerimeterPathV2); }
+    bool is_linear_gradient() const { return surface_pattern == int(LinearGradient); }
+    bool is_radial_linear_gradient() const { return is_linear_gradient() && linear_gradient_mode == int(LinearGradientRadial); }
+    bool is_surface_gradient() const { return is_2d_gradient() || is_linear_gradient(); }
+
+    void apply_default_modulation_mode()
+    {
+        if (!modulation_mode_manually_changed)
+            modulation_mode = default_modulation_mode_for_surface_pattern(surface_pattern);
+    }
 
     void reset_offset_settings()
     {
@@ -238,8 +301,9 @@ struct TextureMappingZone
         reduce_outer_surface_texture = DefaultReduceOuterSurfaceTexture;
         seam_hiding = DefaultSeamHiding;
         nonlinear_offset_adjustment = DefaultNonlinearOffsetAdjustment;
-        modulation_mode = DefaultModulationMode;
         use_modulated_overhang_geometry_for_support = DefaultUseModulatedOverhangGeometryForSupport;
+        modulation_mode = default_modulation_mode_for_surface_pattern(surface_pattern);
+        modulation_mode_manually_changed = DefaultModulationModeManuallyChanged;
         recolor_small_perimeter_loops = DefaultRecolorSmallPerimeterLoops;
         recolor_top_visible_perimeter_sections = DefaultRecolorTopVisiblePerimeterSections;
         top_visible_perimeter_recolor_aggressiveness = DefaultTopVisiblePerimeterRecolorAggressiveness;
@@ -265,9 +329,20 @@ struct TextureMappingZone
         preview_simulate_colors = DefaultPreviewSimulateColors;
         preview_limit_resolution = DefaultPreviewLimitResolution;
         auto_adjust_filament_selection = DefaultAutoAdjustFilamentSelection;
+        linear_gradient_mode = DefaultLinearGradientMode;
+        linear_gradient_radius_mm = DefaultLinearGradientRadiusMm;
+        linear_gradient_radius_percent = DefaultLinearGradientRadiusPercent;
+        linear_gradient_radius_pct = DefaultLinearGradientRadiusPct;
+        linear_gradient_stops.clear();
         filament_strengths_pct.clear();
         filament_minimum_offsets_pct.clear();
         filament_transmission_distances_mm.clear();
+    }
+
+    void clear_linear_gradient_points()
+    {
+        linear_gradient_start = {};
+        linear_gradient_end = {};
     }
 
     bool has_custom_offset_settings() const
@@ -404,6 +479,13 @@ public:
     static bool auto_adjust_texture_component_ids(TextureMappingZone            &zone,
                                                   size_t                         num_physical,
                                                   const std::vector<std::string> &filament_colours);
+    static std::vector<TextureMappingZone::LinearGradientStop> normalized_linear_gradient_stops(const TextureMappingZone &zone,
+                                                                                                size_t                    num_physical);
+    static std::vector<unsigned int> linear_gradient_component_ids_from_stops(const TextureMappingZone &zone,
+                                                                              size_t                    num_physical);
+    static std::vector<float> linear_gradient_compact_weights(float t,
+                                                              const std::vector<TextureMappingZone::LinearGradientStop> &stops,
+                                                              const std::vector<unsigned int> &component_ids);
     static std::vector<TextureMappingColorMatch> texture_component_color_matches(const TextureMappingZone      &zone,
                                                                                  size_t                         num_physical,
                                                                                  const std::vector<std::string> &filament_colours);

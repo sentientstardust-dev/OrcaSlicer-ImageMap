@@ -53,14 +53,21 @@ struct TextureMappingOffsetWeightField {
 
 struct TextureMappingOffsetContext {
     bool                            vertex_color_match_mode { false };
+    bool                            linear_gradient_mode { false };
     bool                            object_center_mode { false };
     bool                            high_resolution_texture_sampling { false };
     bool                            compact_offset_mode { false };
     bool                            dithering_enabled { false };
     bool                            halftone_dithering_enabled { false };
     bool                            halftone_increased_detail_enabled { false };
+    bool                            halftone_v2_enabled { false };
     bool                            nonlinear_offset_adjustment { false };
     Point                           object_center;
+    Vec3f                           linear_gradient_start_mm { Vec3f::Zero() };
+    Vec3f                           linear_gradient_end_mm { Vec3f::Zero() };
+    bool                            linear_gradient_radial_mode { false };
+    float                           linear_gradient_radius_mm { 0.f };
+    std::vector<TextureMappingZone::LinearGradientStop> linear_gradient_stops;
     unsigned int                    active_component_id { 0 };
     size_t                          active_component_idx { size_t(-1) };
     std::vector<unsigned int>       component_ids;
@@ -95,7 +102,8 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     unsigned int             texture_zone_id,
     unsigned int             active_component_id_override = 0,
     std::optional<float>     base_outer_width_mm_override = std::nullopt,
-    std::optional<float>     layer_height_mm_override = std::nullopt);
+    std::optional<float>     layer_height_mm_override = std::nullopt,
+    std::optional<Vec2d>     plate_origin_mm_override = std::nullopt);
 
 std::vector<float> sample_weight_field_components(const TextureMappingOffsetWeightField &weight_field,
                                                   float                                  x_mm,

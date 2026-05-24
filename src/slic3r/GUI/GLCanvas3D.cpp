@@ -2031,6 +2031,7 @@ void GLCanvas3D::render(bool only_init)
         if (!no_partplate) //BBS: add outline logic
             _render_platelist(camera.get_view_matrix(), camera.get_projection_matrix(), !camera.is_looking_downward(), only_current, only_body, hover_id, true, show_grid);
         _render_objects(GLVolumeCollection::ERenderType::Transparent, !m_gizmos.is_running());
+        m_volumes.render_linear_gradient_direction_arrows(camera.get_view_matrix(), camera.get_projection_matrix());
     }
     /* preview render */
     else if (m_canvas_type == ECanvasType::CanvasPreview && m_render_preview) {
@@ -2056,6 +2057,7 @@ void GLCanvas3D::render(bool only_init)
         //_render_selection();
         // BBS: add outline logic
         _render_objects(GLVolumeCollection::ERenderType::Transparent, !m_gizmos.is_running());
+        m_volumes.render_linear_gradient_direction_arrows(camera.get_view_matrix(), camera.get_projection_matrix());
     }
 
     _render_sequential_clearance();

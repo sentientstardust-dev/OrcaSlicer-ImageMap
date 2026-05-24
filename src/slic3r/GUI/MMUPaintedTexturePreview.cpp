@@ -10,6 +10,7 @@
 #include "libslic3r/Config.hpp"
 #include "libslic3r/Geometry.hpp"
 #include "libslic3r/ImageMapRawFilamentOffsetAtlas.hpp"
+#include "libslic3r/Model.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/TextureMapping.hpp"
 #include "libslic3r/ColorSolver.hpp"
@@ -42,6 +43,7 @@ constexpr unsigned int k_temporary_simulated_texture_preview_max_edge = 1024;
 constexpr size_t k_temporary_simulated_texture_preview_max_pixels = 1024ull * 1024ull;
 constexpr size_t k_temporary_simulated_texture_preview_min_source_pixels = k_temporary_simulated_texture_preview_max_pixels * 3 / 2;
 constexpr size_t k_surface_gradient_preview_max_components = 10;
+constexpr size_t k_surface_gradient_preview_lut_size = 33;
 constexpr const char *TEXTURE_MAPPING_BACKGROUND_COLOR_CONFIG_KEY = "texture_mapping_background_color";
 
 struct TexturePreviewMixCandidate
@@ -117,6 +119,13 @@ struct SurfaceGradientPreviewSettings
     Vec3f center = Vec3f::Zero();
     float z_min = 0.f;
     float z_max = 0.f;
+    bool linear_gradient = false;
+    bool linear_gradient_radial = false;
+    Vec3f linear_start = Vec3f::Zero();
+    Vec3f linear_end = Vec3f::UnitZ();
+    float linear_radius_mm = 1.f;
+    std::vector<TextureMappingZone::LinearGradientStop> linear_gradient_stops;
+    std::vector<std::array<float, 3>> linear_gradient_lut_colors;
 };
 
 struct TexturePreviewSimulationResult
@@ -1018,7 +1027,7 @@ bool is_image_zone(const TextureMappingZone &zone)
 
 bool is_gradient_zone(const TextureMappingZone &zone)
 {
-    return zone.enabled && !zone.deleted && zone.is_2d_gradient();
+    return zone.enabled && !zone.deleted && zone.is_surface_gradient();
 }
 
 float texture_preview_mix_for_filament(unsigned int filament_id, size_t num_physical, const TextureMappingManager *texture_mgr)
@@ -1036,6 +1045,8 @@ bool texture_preview_settings_invalid_for_filament(unsigned int filament_id, siz
         return false;
     if (is_image_zone(*zone))
         return TextureMappingManager::component_count_mismatch(*zone, num_physical);
+    if (is_gradient_zone(*zone) && zone->is_linear_gradient())
+        return TextureMappingManager::selected_component_ids(*zone, num_physical).empty();
     if (is_gradient_zone(*zone))
         return TextureMappingManager::selected_component_ids(*zone, num_physical).size() < 2;
     return false;
@@ -1758,9 +1769,10 @@ bool is_halftone_dithering_method_for_texture_preview(int method)
 {
     const int clamped_method = std::clamp(method,
                                           int(TextureMappingZone::DitheringClosest),
-                                          int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                                          int(TextureMappingZone::DitheringHalftoneV2));
     return clamped_method == int(TextureMappingZone::DitheringHalftone) ||
-           clamped_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail);
+           clamped_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail) ||
+           clamped_method == int(TextureMappingZone::DitheringHalftoneV2);
 }
 
 float halftone_screen_angle_deg_for_texture_preview(int filament_color_mode, size_t component_idx)
@@ -2033,8 +2045,7 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
 
     if (settings.dithering_enabled &&
         settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
-        settings.dithering_method != int(TextureMappingZone::DitheringHalftone) &&
-        settings.dithering_method != int(TextureMappingZone::DitheringHalftoneIncreasedDetail)) {
+        !is_halftone_dithering_method_for_texture_preview(settings.dithering_method)) {
         const std::vector<TexturePreviewBinaryDitherCandidate> candidates = binary_dither_candidates_for_texture_preview(settings);
         const std::array<float, 3> target_oklab = texture_preview_target_oklab(settings, sample_rgba);
         const size_t candidate_idx = nearest_binary_dither_candidate_for_texture_preview(candidates, target_oklab);
@@ -2211,7 +2222,7 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
         settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues);
     settings.dithering_method = std::clamp(zone->dithering_method,
                                            int(TextureMappingZone::DitheringClosest),
-                                           int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                                           int(TextureMappingZone::DitheringHalftoneV2));
     settings.dithering_resolution_mm = std::clamp(zone->dithering_resolution_mm,
                                                   TextureMappingZone::MinDitheringResolutionMm,
                                                   TextureMappingZone::MaxDitheringResolutionMm);
@@ -2220,8 +2231,7 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
                                                TextureMappingZone::MaxHalftoneDotSizeMm);
     const bool halftone_dithering_enabled =
         settings.dithering_enabled &&
-        (settings.dithering_method == int(TextureMappingZone::DitheringHalftone) ||
-         settings.dithering_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+        is_halftone_dithering_method_for_texture_preview(settings.dithering_method);
     settings.compact_offset_mode =
         halftone_dithering_enabled ? false : zone->compact_offset_mode || settings.dithering_enabled;
     settings.use_legacy_fixed_color_mode = zone->use_legacy_fixed_color_mode;
@@ -2300,8 +2310,7 @@ size_t texture_preview_simulation_signature(const ModelVolume &model_volume,
     mix(std::hash<int>{}(settings.use_legacy_fixed_color_mode ? 1 : 0));
     mix(std::hash<int>{}(settings.dithering_enabled ? 1 : 0));
     mix(std::hash<int>{}(settings.dithering_method));
-    if (settings.dithering_method == int(TextureMappingZone::DitheringHalftone) ||
-        settings.dithering_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail))
+    if (is_halftone_dithering_method_for_texture_preview(settings.dithering_method))
         mix(std::hash<int>{}(int(std::lround(settings.halftone_dot_size_mm * 1000.f))));
     else
         mix(std::hash<int>{}(int(std::lround(settings.dithering_resolution_mm * 1000.f))));
@@ -2360,8 +2369,7 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
     const bool use_binary_dithering =
         settings.dithering_enabled &&
         settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
-        settings.dithering_method != int(TextureMappingZone::DitheringHalftone) &&
-        settings.dithering_method != int(TextureMappingZone::DitheringHalftoneIncreasedDetail) &&
+        !is_halftone_dithering_method_for_texture_preview(settings.dithering_method) &&
         !use_raw_offsets;
     const bool use_halftone_dithering =
         settings.dithering_enabled &&
@@ -2549,7 +2557,7 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                     std::array<float, 3> target_oklab = texture_preview_target_oklab(settings, sample_rgba);
                     const int clamped_method = std::clamp(settings.dithering_method,
                                                           int(TextureMappingZone::DitheringClosest),
-                                                          int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                                                          int(TextureMappingZone::DitheringHalftoneV2));
                     if (clamped_method == int(TextureMappingZone::DitheringFloydSteinberg)) {
                         for (size_t axis = 0; axis < 3; ++axis)
                             target_oklab[axis] += floyd_error_current[x][axis];
@@ -2629,7 +2637,7 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
         if (use_binary_dithering &&
             std::clamp(settings.dithering_method,
                        int(TextureMappingZone::DitheringClosest),
-                       int(TextureMappingZone::DitheringHalftoneIncreasedDetail)) == int(TextureMappingZone::DitheringFloydSteinberg)) {
+                       int(TextureMappingZone::DitheringHalftoneV2)) == int(TextureMappingZone::DitheringFloydSteinberg)) {
             floyd_error_current.swap(floyd_error_next);
             std::fill(floyd_error_next.begin(), floyd_error_next.end(), std::array<float, 3>{ { 0.f, 0.f, 0.f } });
         }
@@ -4083,6 +4091,9 @@ bool build_simulated_image_texture_halftone_preview_model_for_state(
 
 std::vector<unsigned int> decode_surface_gradient_component_ids(const TextureMappingZone &zone, size_t num_physical)
 {
+    if (zone.is_linear_gradient())
+        return TextureMappingManager::linear_gradient_component_ids_from_stops(zone, num_physical);
+
     std::vector<unsigned int> ids;
     bool seen[10] = { false };
     for (const char c : zone.component_ids) {
@@ -4118,10 +4129,209 @@ float surface_gradient_preview_config_float(const char *key, float fallback)
     return texture_preview_config_float(key, fallback);
 }
 
+Vec3f surface_gradient_anchor_array_point(const std::array<float, 3> &point)
+{
+    return Vec3f(point[0], point[1], point[2]);
+}
+
+bool surface_gradient_anchor_vec_finite(const Vec3f &point)
+{
+    return std::isfinite(point.x()) && std::isfinite(point.y()) && std::isfinite(point.z());
+}
+
+int surface_gradient_model_object_backup_id(const ModelObject *object)
+{
+    const Model *model = object != nullptr ? object->get_model() : nullptr;
+    return model != nullptr ? model->find_object_backup_id(*object) : -1;
+}
+
+const ModelObject *surface_gradient_anchor_model_object(const Model &model,
+                                                        const TextureMappingZone::LinearGradientAnchor &anchor)
+{
+    if (anchor.object_backup_id >= 0) {
+        for (const ModelObject *object : model.objects)
+            if (surface_gradient_model_object_backup_id(object) == anchor.object_backup_id)
+                return object;
+    }
+    if (anchor.object_id != 0) {
+        for (const ModelObject *object : model.objects)
+            if (object != nullptr && object->id().id == anchor.object_id)
+                return object;
+    }
+    if (anchor.object_index_valid && anchor.object_index < model.objects.size())
+        return model.objects[anchor.object_index];
+    return nullptr;
+}
+
+bool surface_gradient_anchor_matches_model_object(const Model &model,
+                                                  const ModelObject *object,
+                                                  const TextureMappingZone::LinearGradientAnchor &anchor)
+{
+    if (object == nullptr)
+        return false;
+    if (anchor.object_backup_id >= 0 && surface_gradient_model_object_backup_id(object) == anchor.object_backup_id)
+        return true;
+    if (anchor.object_id != 0 && object->id().id == anchor.object_id)
+        return true;
+    return anchor.object_index_valid && anchor.object_index < model.objects.size() && model.objects[anchor.object_index] == object;
+}
+
+const ModelInstance *surface_gradient_anchor_model_instance(const ModelObject *object,
+                                                           const TextureMappingZone::LinearGradientAnchor &anchor)
+{
+    if (object == nullptr)
+        return nullptr;
+    if (anchor.instance_loaded_id != 0) {
+        for (const ModelInstance *instance : object->instances)
+            if (instance != nullptr && instance->loaded_id == anchor.instance_loaded_id)
+                return instance;
+    }
+    if (anchor.instance_id != 0) {
+        for (const ModelInstance *instance : object->instances)
+            if (instance != nullptr && instance->id().id == anchor.instance_id)
+                return instance;
+    }
+    if (anchor.instance_index_valid && anchor.instance_index < object->instances.size())
+        return object->instances[anchor.instance_index];
+    return object->instances.size() == 1 ? object->instances.front() : nullptr;
+}
+
+std::optional<Vec3f> surface_gradient_anchor_global_point(const TextureMappingZone::LinearGradientAnchor &anchor)
+{
+    if (!anchor.valid)
+        return std::nullopt;
+
+    const Vec3f local = surface_gradient_anchor_array_point(anchor.local_point);
+    const Model &model = GUI::wxGetApp().model();
+    const ModelObject *object = surface_gradient_anchor_model_object(model, anchor);
+    const ModelInstance *instance = surface_gradient_anchor_model_instance(object, anchor);
+    if (instance != nullptr) {
+        const Vec3f global = (instance->get_matrix() * local.cast<double>()).cast<float>();
+        if (surface_gradient_anchor_vec_finite(global))
+            return global;
+    }
+
+    const Vec3f fallback = surface_gradient_anchor_array_point(anchor.global_point);
+    return surface_gradient_anchor_vec_finite(fallback) ? std::optional<Vec3f>(fallback) : std::nullopt;
+}
+
+std::optional<Vec3f> surface_gradient_anchor_world_point_for_volume(const ModelVolume &model_volume,
+                                                                    const Transform3d &world_matrix,
+                                                                    const TextureMappingZone::LinearGradientAnchor &anchor,
+                                                                    const SurfaceGradientAnchorResolver *surface_gradient_anchor_resolver)
+{
+    if (!anchor.valid)
+        return std::nullopt;
+
+    const ModelObject *object = model_volume.get_object();
+    const Model *model = object != nullptr ? object->get_model() : nullptr;
+    if (model != nullptr && surface_gradient_anchor_matches_model_object(*model, object, anchor)) {
+        const Vec3f local = surface_gradient_anchor_array_point(anchor.local_point);
+        const Transform3d instance_matrix = world_matrix * model_volume.get_matrix().inverse();
+        const Vec3f world = (instance_matrix * local.cast<double>()).cast<float>();
+        if (surface_gradient_anchor_vec_finite(world))
+            return world;
+    }
+
+    if (surface_gradient_anchor_resolver != nullptr) {
+        const std::optional<Vec3f> live_global = (*surface_gradient_anchor_resolver)(anchor);
+        if (live_global && surface_gradient_anchor_vec_finite(*live_global))
+            return live_global;
+    }
+
+    return surface_gradient_anchor_global_point(anchor);
+}
+
+std::optional<float> surface_gradient_anchor_object_radius(const TextureMappingZone::LinearGradientAnchor &anchor)
+{
+    if (!anchor.valid)
+        return std::nullopt;
+
+    const Model &model = GUI::wxGetApp().model();
+    const ModelObject *object = surface_gradient_anchor_model_object(model, anchor);
+    if (object == nullptr)
+        return std::nullopt;
+
+    const ModelInstance *anchor_instance = surface_gradient_anchor_model_instance(object, anchor);
+    BoundingBoxf3 bbox;
+    bool defined = false;
+    auto merge_instance = [&bbox, &defined, object](const ModelInstance *instance) {
+        if (instance == nullptr)
+            return;
+        for (const ModelVolume *volume : object->volumes) {
+            if (volume == nullptr)
+                continue;
+            bbox.merge(volume->mesh().transformed_bounding_box(instance->get_matrix() * volume->get_matrix(), 0.0));
+            defined = true;
+        }
+    };
+    if (anchor_instance != nullptr)
+        merge_instance(anchor_instance);
+    else
+        for (const ModelInstance *instance : object->instances)
+            merge_instance(instance);
+
+    if (!defined)
+        return std::nullopt;
+    const float radius = 0.5f * (bbox.max.cast<float>() - bbox.min.cast<float>()).norm();
+    return std::isfinite(radius) && radius > 0.f ? std::optional<float>(radius) : std::nullopt;
+}
+
+float surface_gradient_linear_radius_mm(const TextureMappingZone &zone,
+                                        float default_radius_mm,
+                                        const SurfaceGradientAnchorRadiusResolver *surface_gradient_anchor_radius_resolver)
+{
+    if (!zone.linear_gradient_radius_percent) {
+        const float radius_mm = std::isfinite(zone.linear_gradient_radius_mm) ? zone.linear_gradient_radius_mm : default_radius_mm;
+        return std::max(0.01f, radius_mm);
+    }
+
+    const float radius_value = std::isfinite(zone.linear_gradient_radius_pct) ?
+        std::max(0.f, zone.linear_gradient_radius_pct) :
+        TextureMappingZone::DefaultLinearGradientRadiusPct;
+    if (zone.linear_gradient_start.valid) {
+        std::optional<float> anchor_radius;
+        if (surface_gradient_anchor_radius_resolver != nullptr)
+            anchor_radius = (*surface_gradient_anchor_radius_resolver)(zone.linear_gradient_start);
+        if (!anchor_radius)
+            anchor_radius = surface_gradient_anchor_object_radius(zone.linear_gradient_start);
+        if (anchor_radius)
+            return std::max(0.01f, *anchor_radius * radius_value / 100.f);
+        return std::max(0.01f, radius_value);
+    }
+
+    return std::max(0.01f, default_radius_mm * radius_value / 100.f);
+}
+
+float surface_gradient_object_radius_for_volume(const ModelVolume &model_volume,
+                                                const Transform3d &world_matrix,
+                                                float fallback_radius)
+{
+    const ModelObject *object = model_volume.get_object();
+    if (object == nullptr)
+        return fallback_radius;
+
+    const Transform3d instance_matrix = world_matrix * model_volume.get_matrix().inverse();
+    BoundingBoxf3 bbox;
+    bool defined = false;
+    for (const ModelVolume *volume : object->volumes) {
+        if (volume == nullptr)
+            continue;
+        bbox.merge(volume->mesh().transformed_bounding_box(instance_matrix * volume->get_matrix(), 0.0));
+        defined = true;
+    }
+    if (!defined)
+        return fallback_radius;
+    const float radius = 0.5f * (bbox.max.cast<float>() - bbox.min.cast<float>()).norm();
+    return std::isfinite(radius) && radius > 0.f ? radius : fallback_radius;
+}
+
 std::optional<SurfaceGradientPreviewSettings> surface_gradient_preview_settings_for_zone(const ModelVolume &model_volume,
                                                                                         const Transform3d &world_matrix,
                                                                                         const TextureMappingZone &zone,
-                                                                                        size_t num_physical)
+                                                                                        size_t num_physical,
+                                                                                        const SurfaceGradientAnchorResolver *surface_gradient_anchor_resolver = nullptr,
+                                                                                        const SurfaceGradientAnchorRadiusResolver *surface_gradient_anchor_radius_resolver = nullptr)
 {
     if (!is_gradient_zone(zone))
         return std::nullopt;
@@ -4130,7 +4340,8 @@ std::optional<SurfaceGradientPreviewSettings> surface_gradient_preview_settings_
     SurfaceGradientPreviewSettings settings;
     settings.component_ids = decode_surface_gradient_component_ids(zone, num_physical);
     if (settings.component_ids.size() < 2)
-        return std::nullopt;
+        if (!zone.is_linear_gradient())
+            return std::nullopt;
 
     settings.component_colors.reserve(settings.component_ids.size());
     settings.strength_factors.reserve(settings.component_ids.size());
@@ -4149,26 +4360,51 @@ std::optional<SurfaceGradientPreviewSettings> surface_gradient_preview_settings_
     const std::vector<float> base_weights(settings.component_colors.size(), 1.f);
     const ColorRGBA base_color = blend_component_colors(settings.component_colors, base_weights);
     settings.base_color = { base_color.r(), base_color.g(), base_color.b() };
+    if (zone.is_linear_gradient()) {
+        settings.linear_gradient_stops = TextureMappingManager::normalized_linear_gradient_stops(zone, num_physical);
+        settings.linear_gradient_lut_colors.reserve(k_surface_gradient_preview_lut_size);
+        for (size_t idx = 0; idx < k_surface_gradient_preview_lut_size; ++idx) {
+            const float t = k_surface_gradient_preview_lut_size > 1 ?
+                float(idx) / float(k_surface_gradient_preview_lut_size - 1) :
+                0.f;
+            const std::vector<float> weights =
+                TextureMappingManager::linear_gradient_compact_weights(t, settings.linear_gradient_stops, settings.component_ids);
+            const std::array<float, 3> rgb =
+                mix_color_solver_components(settings.component_colors, weights, ColorSolverMixModel::PigmentPainter);
+            settings.linear_gradient_lut_colors.push_back({ std::clamp(rgb[0], 0.f, 1.f),
+                                                            std::clamp(rgb[1], 0.f, 1.f),
+                                                            std::clamp(rgb[2], 0.f, 1.f) });
+        }
+    }
 
     const float max_distance_mm = TextureMappingManager::max_component_surface_offset_mm();
     settings.max_component_distance_mm = max_distance_mm;
-    settings.distances_mm = TextureMappingManager::effective_offset_distances(zone, settings.component_ids.size());
+    settings.distances_mm = zone.is_linear_gradient() ?
+        std::vector<float>(settings.component_ids.size(), max_distance_mm) :
+        TextureMappingManager::effective_offset_distances(zone, settings.component_ids.size());
     for (float &distance_mm : settings.distances_mm) {
         distance_mm = std::clamp(distance_mm, 0.f, max_distance_mm);
     }
 
-    settings.angles_deg = TextureMappingManager::effective_offset_angles(zone, settings.component_ids.size());
-    settings.angle_mode = std::clamp(zone.offset_angle_mode,
-                                     int(TextureMappingZone::OffsetAngleConfigured),
-                                     int(TextureMappingZone::OffsetAngleObjectCenter));
-    settings.rotation_enabled = zone.offset_rotation_enabled;
-    settings.rotations = std::isfinite(zone.offset_rotations) ? zone.offset_rotations : 1.f;
-    settings.repeats = std::isfinite(zone.offset_repeats) ? std::max(1.f, zone.offset_repeats) : 1.f;
-    settings.reverse_repeats = zone.offset_reverse_repeats;
-    settings.clockwise = zone.offset_clockwise;
-    settings.fade_mode = std::clamp(zone.offset_fade_mode,
-                                    int(TextureMappingZone::OffsetFadeNone),
-                                    int(TextureMappingZone::OffsetFadeOutInReversed));
+    settings.linear_gradient = zone.is_linear_gradient();
+    settings.angles_deg = settings.linear_gradient ?
+        TextureMappingManager::default_offset_angles(settings.component_ids.size()) :
+        TextureMappingManager::effective_offset_angles(zone, settings.component_ids.size());
+    settings.angle_mode = settings.linear_gradient ?
+        int(TextureMappingZone::OffsetAngleObjectCenter) :
+        std::clamp(zone.offset_angle_mode,
+                   int(TextureMappingZone::OffsetAngleConfigured),
+                   int(TextureMappingZone::OffsetAngleObjectCenter));
+    settings.rotation_enabled = !settings.linear_gradient && zone.offset_rotation_enabled;
+    settings.rotations = !settings.linear_gradient && std::isfinite(zone.offset_rotations) ? zone.offset_rotations : 1.f;
+    settings.repeats = !settings.linear_gradient && std::isfinite(zone.offset_repeats) ? std::max(1.f, zone.offset_repeats) : 1.f;
+    settings.reverse_repeats = !settings.linear_gradient && zone.offset_reverse_repeats;
+    settings.clockwise = settings.linear_gradient || zone.offset_clockwise;
+    settings.fade_mode = settings.linear_gradient ?
+        int(TextureMappingZone::OffsetFadeNone) :
+        std::clamp(zone.offset_fade_mode,
+                   int(TextureMappingZone::OffsetFadeNone),
+                   int(TextureMappingZone::OffsetFadeOutInReversed));
     settings.limit_texture_resolution = zone.preview_limit_resolution;
     const float base_outer_width_mm = std::max(0.05f, surface_gradient_preview_config_float("texture_mapping_outer_wall_gradient_max_line_width", 0.95f));
     const float min_outer_width_mm = std::clamp(surface_gradient_preview_config_float("texture_mapping_outer_wall_gradient_min_line_width", 0.32f),
@@ -4196,6 +4432,34 @@ std::optional<SurfaceGradientPreviewSettings> surface_gradient_preview_settings_
     settings.center = 0.5f * (min_pt + max_pt);
     settings.z_min = min_pt.z();
     settings.z_max = max_pt.z();
+    if (settings.linear_gradient) {
+        settings.linear_gradient_radial = zone.linear_gradient_mode == int(TextureMappingZone::LinearGradientRadial);
+        const Vec3f bbox_diagonal = max_pt - min_pt;
+        const float default_radius = surface_gradient_object_radius_for_volume(model_volume,
+                                                                               world_matrix,
+                                                                               std::max(0.01f, 0.5f * bbox_diagonal.norm()));
+        if (settings.linear_gradient_radial) {
+            settings.linear_start = settings.center;
+            if (std::optional<Vec3f> start =
+                    surface_gradient_anchor_world_point_for_volume(model_volume, world_matrix, zone.linear_gradient_start, surface_gradient_anchor_resolver))
+                settings.linear_start = *start;
+            settings.linear_radius_mm = surface_gradient_linear_radius_mm(zone, default_radius, surface_gradient_anchor_radius_resolver);
+            settings.linear_end = settings.linear_start + Vec3f::UnitX() * settings.linear_radius_mm;
+        } else {
+            settings.linear_start = Vec3f(settings.center.x(), settings.center.y(), settings.z_min);
+            settings.linear_end = Vec3f(settings.center.x(), settings.center.y(), settings.z_max);
+            if (std::optional<Vec3f> start =
+                    surface_gradient_anchor_world_point_for_volume(model_volume, world_matrix, zone.linear_gradient_start, surface_gradient_anchor_resolver))
+                settings.linear_start = *start;
+            if (std::optional<Vec3f> end =
+                    surface_gradient_anchor_world_point_for_volume(model_volume, world_matrix, zone.linear_gradient_end, surface_gradient_anchor_resolver))
+                settings.linear_end = *end;
+            if ((settings.linear_end - settings.linear_start).squaredNorm() <= 1e-8f) {
+                settings.linear_start = Vec3f(settings.center.x(), settings.center.y(), settings.z_min);
+                settings.linear_end = Vec3f(settings.center.x(), settings.center.y(), settings.z_max);
+            }
+        }
+    }
     return settings;
 }
 
@@ -4316,6 +4580,24 @@ void set_common_uniforms(GLShaderProgram &shader,
     shader.set_uniform("print_volume.z_data", print_volume_z);
 }
 
+void set_color_match_preview_uniforms(GLShaderProgram &shader, const TexturePreviewColorMatchSettings *color_match)
+{
+    const bool active = color_match != nullptr && color_match->active;
+    shader.set_uniform("color_match_preview_active", active);
+    shader.set_uniform("color_match_target_oklab", active ? color_match->target_oklab : std::array<float, 3>{ 0.f, 0.f, 0.f });
+    shader.set_uniform("color_match_tolerance_sq", active ? color_match->tolerance_sq : 0.f);
+    shader.set_uniform("color_match_highlight_color", active ? color_match->highlight_color : ColorRGBA(1.f, 1.f, 1.f, 1.f));
+    shader.set_uniform("color_match_background_color", active ? color_match->background_color : ColorRGBA(1.f, 1.f, 1.f, 1.f));
+}
+
+bool color_match_preview_allows_filament(const TexturePreviewColorMatchSettings *color_match, unsigned int filament_id)
+{
+    if (color_match == nullptr || !color_match->active || color_match->override_all)
+        return true;
+    return std::find(color_match->override_filament_ids.begin(), color_match->override_filament_ids.end(), filament_id) !=
+           color_match->override_filament_ids.end();
+}
+
 std::string gradient_array_uniform_name(const char *name, size_t idx)
 {
     return std::string(name) + "[" + std::to_string(idx) + "]";
@@ -4336,10 +4618,18 @@ void set_surface_gradient_preview_uniforms(GLShaderProgram &shader, const Surfac
     shader.set_uniform("gradient_reverse_repeats", settings != nullptr && settings->reverse_repeats);
     shader.set_uniform("gradient_clockwise", settings == nullptr || settings->clockwise);
     shader.set_uniform("gradient_fade_mode", settings != nullptr ? settings->fade_mode : int(TextureMappingZone::OffsetFadeNone));
+    shader.set_uniform("gradient_linear_mode", settings != nullptr && settings->linear_gradient);
+    shader.set_uniform("gradient_linear_radial_mode", settings != nullptr && settings->linear_gradient_radial);
     const Vec3f center = settings != nullptr ? settings->center : Vec3f::Zero();
     shader.set_uniform("gradient_center", center);
     shader.set_uniform("gradient_z_min", settings != nullptr ? settings->z_min : 0.f);
     shader.set_uniform("gradient_z_max", settings != nullptr ? settings->z_max : 0.f);
+    shader.set_uniform("gradient_linear_start", settings != nullptr ? settings->linear_start : Vec3f::Zero());
+    shader.set_uniform("gradient_linear_end", settings != nullptr ? settings->linear_end : Vec3f::UnitZ());
+    shader.set_uniform("gradient_linear_radius_mm", settings != nullptr ? settings->linear_radius_mm : 1.f);
+    const size_t lut_count = settings == nullptr ? size_t(0) :
+        std::min(settings->linear_gradient_lut_colors.size(), k_surface_gradient_preview_lut_size);
+    shader.set_uniform("gradient_linear_lut_count", int(lut_count));
 
     for (size_t idx = 0; idx < k_surface_gradient_preview_max_components; ++idx) {
         const std::array<float, 3> color = settings != nullptr && idx < count ?
@@ -4354,6 +4644,12 @@ void set_surface_gradient_preview_uniforms(GLShaderProgram &shader, const Surfac
         shader.set_uniform(gradient_array_uniform_name("gradient_angles_deg", idx).c_str(), angle_deg);
         shader.set_uniform(gradient_array_uniform_name("gradient_strength_factors", idx).c_str(), strength);
         shader.set_uniform(gradient_array_uniform_name("gradient_minimum_offset_factors", idx).c_str(), minimum);
+    }
+    for (size_t idx = 0; idx < k_surface_gradient_preview_lut_size; ++idx) {
+        const std::array<float, 3> color = settings != nullptr && idx < lut_count ?
+            settings->linear_gradient_lut_colors[idx] :
+            std::array<float, 3>{ 0.f, 0.f, 0.f };
+        shader.set_uniform(gradient_array_uniform_name("gradient_linear_lut_colors", idx).c_str(), color);
     }
 }
 
@@ -4775,8 +5071,7 @@ static size_t texture_preview_settings_signature_impl(size_t num_physical,
         signature_mix(std::hash<int>{}(zone.use_legacy_fixed_color_mode ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.dithering_enabled ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.dithering_method));
-        if (zone.dithering_method == int(TextureMappingZone::DitheringHalftone) ||
-            zone.dithering_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail))
+        if (is_halftone_dithering_method_for_texture_preview(zone.dithering_method))
             signature_mix_float(zone.halftone_dot_size_mm, 1000.f);
         else
             signature_mix_float(zone.dithering_resolution_mm, 1000.f);
@@ -4835,16 +5130,15 @@ static bool texture_preview_zone_uses_halftone_model(const TextureMappingZone &z
                                         int(TextureMappingZone::TextureMappingRawValues));
     const int method = std::clamp(zone.dithering_method,
                                   int(TextureMappingZone::DitheringClosest),
-                                  int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                                  int(TextureMappingZone::DitheringHalftoneV2));
     return mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
            zone.dithering_enabled &&
-           (method == int(TextureMappingZone::DitheringHalftone) ||
-            method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+           is_halftone_dithering_method_for_texture_preview(method);
 }
 
 static bool texture_preview_gradient_zone_uses_model(const TextureMappingZone &zone, size_t num_physical)
 {
-    if (!zone.enabled || zone.deleted || !zone.is_2d_gradient())
+    if (!zone.enabled || zone.deleted || !zone.is_surface_gradient())
         return false;
     if (TextureMappingManager::selected_component_ids(zone, num_physical).size() < 2)
         return true;
@@ -4887,8 +5181,7 @@ static void texture_preview_mix_zone_baked_model_settings(size_t &signature,
     signature_mix(std::hash<int>{}(zone.use_legacy_fixed_color_mode ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.dithering_enabled ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.dithering_method));
-    if (zone.dithering_method == int(TextureMappingZone::DitheringHalftone) ||
-        zone.dithering_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail))
+    if (is_halftone_dithering_method_for_texture_preview(zone.dithering_method))
         signature_mix_float(zone.halftone_dot_size_mm, 1000.f);
     else
         signature_mix_float(zone.dithering_resolution_mm, 1000.f);
@@ -4901,15 +5194,42 @@ static void texture_preview_mix_zone_baked_model_settings(size_t &signature,
     signature_mix(std::hash<int>{}(zone.preview_limit_resolution ? 1 : 0));
     signature_mix_float(zone.contrast_pct, 100.f);
     signature_mix_float(zone.tone_gamma);
+    signature_mix(std::hash<int>{}(zone.linear_gradient_mode));
+    signature_mix_float(zone.linear_gradient_radius_mm, 1000.f);
+    signature_mix(std::hash<int>{}(zone.linear_gradient_radius_percent ? 1 : 0));
+    signature_mix_float(zone.linear_gradient_radius_pct, 1000.f);
     for (const float strength_pct : zone.filament_strengths_pct)
         signature_mix_float(strength_pct, 100.f);
     for (const float minimum_offset_pct : zone.filament_minimum_offsets_pct)
         signature_mix_float(minimum_offset_pct, 100.f);
 
-    if (zone.is_2d_gradient()) {
+    if (zone.is_surface_gradient()) {
         signature_mix_float(texture_preview_config_float("texture_mapping_outer_wall_gradient_global_strength", 100.f), 100.f);
         signature_mix_float(texture_preview_config_float("texture_mapping_outer_wall_gradient_max_line_width", 0.95f), 1000.f);
         signature_mix_float(texture_preview_config_float("texture_mapping_outer_wall_gradient_min_line_width", 0.32f), 1000.f);
+    }
+    if (zone.is_linear_gradient()) {
+        auto mix_anchor = [&signature_mix, &signature_mix_float](const TextureMappingZone::LinearGradientAnchor &anchor) {
+            signature_mix(std::hash<int>{}(anchor.valid ? 1 : 0));
+            signature_mix(std::hash<size_t>{}(anchor.object_id));
+            signature_mix(std::hash<size_t>{}(anchor.instance_id));
+            signature_mix(std::hash<int>{}(anchor.object_backup_id));
+            signature_mix(std::hash<int>{}(anchor.object_index_valid ? 1 : 0));
+            signature_mix(std::hash<size_t>{}(anchor.object_index));
+            signature_mix(std::hash<int>{}(anchor.instance_index_valid ? 1 : 0));
+            signature_mix(std::hash<size_t>{}(anchor.instance_index));
+            signature_mix(std::hash<size_t>{}(anchor.instance_loaded_id));
+            for (float value : anchor.local_point)
+                signature_mix_float(value, 1000.f);
+            for (float value : anchor.global_point)
+                signature_mix_float(value, 1000.f);
+        };
+        mix_anchor(zone.linear_gradient_start);
+        mix_anchor(zone.linear_gradient_end);
+        for (const TextureMappingZone::LinearGradientStop &stop : TextureMappingManager::normalized_linear_gradient_stops(zone, num_physical)) {
+            signature_mix_float(stop.position, 10000.f);
+            signature_mix(std::hash<unsigned int>{}(stop.filament_id));
+        }
     }
 
     const std::vector<std::string> physical_colors = physical_filament_colors_for_texture_preview(num_physical);
@@ -4962,7 +5282,7 @@ size_t texture_preview_model_settings_signature(size_t num_physical,
         signature_mix(std::hash<int>{}(zone.surface_pattern));
 
         const bool image_zone = zone.enabled && !zone.deleted && zone.is_image_texture();
-        const bool gradient_zone = zone.enabled && !zone.deleted && zone.is_2d_gradient();
+        const bool gradient_zone = zone.enabled && !zone.deleted && zone.is_surface_gradient();
         const bool halftone_model = texture_preview_zone_uses_halftone_model(zone);
         const bool simulated_vertex_color_model =
             image_zone &&
@@ -4995,7 +5315,8 @@ void render_model_texture_preview_models(
     int                              print_volume_type,
     const std::array<float, 4>      &print_volume_xy,
     const std::array<float, 2>      &print_volume_z,
-    bool                             opaque)
+    bool                             opaque,
+    const TexturePreviewColorMatchSettings *color_match)
 {
     if (models.empty() || colors.size() != models.size() || filament_ids.size() != models.size())
         return;
@@ -5015,12 +5336,16 @@ void render_model_texture_preview_models(
                         print_volume_type,
                         print_volume_xy,
                         print_volume_z);
+    set_color_match_preview_uniforms(*shader, color_match);
     glsafe(::glActiveTexture(GL_TEXTURE0));
     shader->set_uniform("uniform_texture", 0);
 
     const size_t texture_signature = model_volume_texture_preview_signature(model_volume);
     GLuint bound_texture_id = 0;
+    const bool color_match_active = color_match != nullptr && color_match->active;
     for (size_t idx = 0; idx < models.size(); ++idx) {
+        if (color_match_active && !color_match_preview_allows_filament(color_match, filament_ids[idx]))
+            continue;
         const bool raw_vertex_color_preview = filament_ids[idx] == 0;
         const float mix = raw_vertex_color_preview ?
             1.f :
@@ -5028,11 +5353,11 @@ void render_model_texture_preview_models(
         const bool invalid = raw_vertex_color_preview ?
             false :
             texture_preview_settings_invalid_for_filament(filament_ids[idx], num_physical, texture_mgr);
-        if (mix <= 0.f && !invalid)
+        if (!color_match_active && mix <= 0.f && !invalid)
             continue;
 
         const bool force_original_texture =
-            texture_preview_halftone_simulation_enabled_for_filament(filament_ids[idx], num_physical, texture_mgr);
+            color_match_active || texture_preview_halftone_simulation_enabled_for_filament(filament_ids[idx], num_physical, texture_mgr);
         const GUI::GLTexture *preview_texture = force_original_texture ?
             &texture :
             simulated_texture_preview_texture_for_filament(model_volume,
@@ -5049,7 +5374,7 @@ void render_model_texture_preview_models(
             bound_texture_id = preview_texture->get_id();
         }
 
-        shader->set_uniform("texture_preview_mix", mix);
+        shader->set_uniform("texture_preview_mix", color_match_active ? 1.f : mix);
         shader->set_uniform("invalid_texture_mapping", invalid);
         models[idx].set_color(colors[idx]);
         models[idx].render();
@@ -5077,7 +5402,8 @@ void render_model_texture_preview_model(
     int                              print_volume_type,
     const std::array<float, 4>      &print_volume_xy,
     const std::array<float, 2>      &print_volume_z,
-    bool                             opaque)
+    bool                             opaque,
+    const TexturePreviewColorMatchSettings *color_match)
 {
     if (!GUI::GLModel::Geometry::has_tex_coord(model.get_geometry().format))
         return;
@@ -5088,12 +5414,15 @@ void render_model_texture_preview_model(
 
     const float mix = texture_preview_mix_for_filament(filament_id, num_physical, texture_mgr);
     const bool invalid = texture_preview_settings_invalid_for_filament(filament_id, num_physical, texture_mgr);
-    if (mix <= 0.f && !invalid)
+    const bool color_match_active = color_match != nullptr && color_match->active;
+    if (color_match_active && !color_match_preview_allows_filament(color_match, filament_id))
+        return;
+    if (!color_match_active && mix <= 0.f && !invalid)
         return;
 
     const size_t texture_signature = model_volume_texture_preview_signature(model_volume);
     const bool force_original_texture =
-        texture_preview_halftone_simulation_enabled_for_filament(filament_id, num_physical, texture_mgr);
+        color_match_active || texture_preview_halftone_simulation_enabled_for_filament(filament_id, num_physical, texture_mgr);
     const GUI::GLTexture *preview_texture = force_original_texture ?
         &texture :
         simulated_texture_preview_texture_for_filament(model_volume,
@@ -5116,11 +5445,12 @@ void render_model_texture_preview_model(
                         print_volume_type,
                         print_volume_xy,
                         print_volume_z);
+    set_color_match_preview_uniforms(*shader, color_match);
 
     glsafe(::glActiveTexture(GL_TEXTURE0));
     glsafe(::glBindTexture(GL_TEXTURE_2D, preview_texture->get_id()));
     shader->set_uniform("uniform_texture", 0);
-    shader->set_uniform("texture_preview_mix", mix);
+    shader->set_uniform("texture_preview_mix", color_match_active ? 1.f : mix);
     shader->set_uniform("invalid_texture_mapping", invalid);
     model.set_color(color);
     if (render_range == std::make_pair<size_t, size_t>(0, -1))
@@ -5148,7 +5478,10 @@ void render_model_vertex_color_preview_models(
     const std::array<float, 4>      &print_volume_xy,
     const std::array<float, 2>      &print_volume_z,
     bool                             opaque,
-    const ModelVolume               *model_volume)
+    const ModelVolume               *model_volume,
+    const SurfaceGradientAnchorResolver *surface_gradient_anchor_resolver,
+    const SurfaceGradientAnchorRadiusResolver *surface_gradient_anchor_radius_resolver,
+    const TexturePreviewColorMatchSettings *color_match)
 {
     if (models.empty() || colors.size() != models.size() || filament_ids.size() != models.size())
         return;
@@ -5178,40 +5511,47 @@ void render_model_vertex_color_preview_models(
                             print_volume_type,
                             print_volume_xy,
                             print_volume_z);
+        if (active_shader != gradient_shader)
+            set_color_match_preview_uniforms(*active_shader, color_match);
         return true;
     };
 
+    const bool color_match_active = color_match != nullptr && color_match->active;
     for (size_t idx = 0; idx < models.size(); ++idx) {
+        if (color_match_active && !color_match_preview_allows_filament(color_match, filament_ids[idx]))
+            continue;
         const bool raw_vertex_color_preview = filament_ids[idx] == 0;
         const TextureMappingZone *zone = raw_vertex_color_preview ?
             nullptr :
             zone_for_filament(filament_ids[idx], num_physical, texture_mgr);
         const bool gradient_preview = zone != nullptr && is_gradient_zone(*zone);
+        if (color_match_active && gradient_preview)
+            continue;
         const float mix = raw_vertex_color_preview ?
             1.f :
             texture_preview_mix_for_filament(filament_ids[idx], num_physical, texture_mgr);
         const bool invalid = raw_vertex_color_preview ?
             false :
             texture_preview_settings_invalid_for_filament(filament_ids[idx], num_physical, texture_mgr);
-        if (mix <= 0.f && !invalid)
+        if (!color_match_active && mix <= 0.f && !invalid)
             continue;
 
         if (gradient_preview) {
             if (model_volume == nullptr || gradient_shader == nullptr)
                 continue;
             const std::optional<SurfaceGradientPreviewSettings> settings =
-                surface_gradient_preview_settings_for_zone(*model_volume, model_matrix, *zone, num_physical);
+                surface_gradient_preview_settings_for_zone(*model_volume, model_matrix, *zone, num_physical, surface_gradient_anchor_resolver, surface_gradient_anchor_radius_resolver);
             if (!settings && !invalid)
                 continue;
             if (!use_shader(gradient_shader))
                 continue;
-            gradient_shader->set_uniform("texture_preview_mix", mix);
+            gradient_shader->set_uniform("texture_preview_mix", color_match_active ? 1.f : mix);
             gradient_shader->set_uniform("invalid_texture_mapping", invalid);
             set_surface_gradient_preview_uniforms(*gradient_shader, settings ? &*settings : nullptr);
         } else {
             if (vertex_shader == nullptr || !use_shader(vertex_shader))
                 continue;
-            vertex_shader->set_uniform("texture_preview_mix", mix);
+            vertex_shader->set_uniform("texture_preview_mix", color_match_active ? 1.f : mix);
             vertex_shader->set_uniform("invalid_texture_mapping", invalid);
         }
         models[idx].set_color(colors[idx]);

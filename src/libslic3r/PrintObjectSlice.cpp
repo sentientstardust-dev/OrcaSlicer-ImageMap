@@ -132,7 +132,7 @@ static std::vector<std::string> collect_texture_mapping_outer_wall_gradient_line
     for (const TextureMappingZone &zone : print->texture_mapping_manager().zones()) {
         if (!zone.enabled || zone.deleted)
             continue;
-        if (zone.is_2d_gradient() || zone.is_image_texture() || zone.has_custom_offset_settings()) {
+        if (zone.is_surface_gradient() || zone.is_image_texture() || zone.has_custom_offset_settings()) {
             has_offset_profiles = true;
             break;
         }

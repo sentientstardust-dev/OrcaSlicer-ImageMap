@@ -6331,7 +6331,7 @@ static float local_surface_stair_step_distance_for_gcode(const Layer *layer,
 
 static bool is_horizontal_overhang_gradient_row_for_gcode(const TextureMappingZone &zone)
 {
-    return zone.enabled && !zone.deleted && !zone.uses_perimeter_path_modulation() && (zone.is_2d_gradient() || zone.is_image_texture());
+    return zone.enabled && !zone.deleted && !zone.uses_perimeter_path_modulation() && (zone.is_surface_gradient() || zone.is_image_texture());
 }
 
 static bool is_vertex_color_match_overhang_row_for_gcode(const TextureMappingZone &zone)
@@ -6342,6 +6342,11 @@ static bool is_vertex_color_match_overhang_row_for_gcode(const TextureMappingZon
 static bool is_2d_offset_gradient_row_for_gcode(const TextureMappingZone &zone)
 {
     return zone.enabled && !zone.deleted && !zone.uses_perimeter_path_modulation() && zone.is_2d_gradient();
+}
+
+static bool is_surface_offset_gradient_row_for_gcode(const TextureMappingZone &zone)
+{
+    return zone.enabled && !zone.deleted && !zone.uses_perimeter_path_modulation() && zone.is_surface_gradient();
 }
 
 static std::array<float, 4> unpack_rgba_u32(uint32_t packed_rgba)
@@ -7022,9 +7027,10 @@ static bool is_halftone_dithering_method_for_gcode(int method)
 {
     const int clamped_method = std::clamp(method,
                                           int(TextureMappingZone::DitheringClosest),
-                                          int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                                          int(TextureMappingZone::DitheringHalftoneV2));
     return clamped_method == int(TextureMappingZone::DitheringHalftone) ||
-           clamped_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail);
+           clamped_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail) ||
+           clamped_method == int(TextureMappingZone::DitheringHalftoneV2);
 }
 
 static float dither_pitch_for_gcode(float base_outer_width_mm,
@@ -7035,7 +7041,7 @@ static float dither_pitch_for_gcode(float base_outer_width_mm,
     const float high_res_step_mm = std::clamp(base_outer_width_mm * 0.20f, 0.04f, 0.12f);
     const int clamped_method = std::clamp(dithering_method,
                                           int(TextureMappingZone::DitheringClosest),
-                                          int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                                          int(TextureMappingZone::DitheringHalftoneV2));
     if (is_halftone_dithering_method_for_gcode(clamped_method)) {
         const float dot_sample_step_mm =
             std::clamp(std::clamp(halftone_dot_size_mm,
@@ -8714,7 +8720,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
     const int clamped_binary_dither_method =
         std::clamp(dithering_method,
                    int(TextureMappingZone::DitheringClosest),
-                   int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                   int(TextureMappingZone::DitheringHalftoneV2));
     std::vector<uint32_t> binary_dither_masks;
     const bool can_binary_dither =
         dithering_enabled &&
@@ -9438,7 +9444,7 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
         zone->texture_mapping_mode != int(TextureMappingZone::TextureMappingRawValues);
     const int dithering_method = std::clamp(zone->dithering_method,
                                             int(TextureMappingZone::DitheringClosest),
-                                            int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                                            int(TextureMappingZone::DitheringHalftoneV2));
     const bool halftone_dithering_enabled =
         dithering_enabled && is_halftone_dithering_method_for_gcode(dithering_method);
     const float seam_texture_base_width_mm =
@@ -10868,7 +10874,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             if (zone != nullptr &&
                 is_horizontal_overhang_gradient_row_for_gcode(*zone) &&
                 (vertex_color_match_mode ||
-                 is_2d_offset_gradient_row_for_gcode(*zone) ||
+                 is_surface_offset_gradient_row_for_gcode(*zone) ||
                  has_explicit_offset_gradient_profile_for_gcode(*zone))) {
                 std::vector<unsigned int> component_ids = decode_texture_mapping_offset_component_ids(*zone, num_physical);
                 if (vertex_color_match_mode) {
@@ -10978,7 +10984,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                                                                                 texture_zone_id,
                                                                                                 active_component_id,
                                                                                                 base_outer_width_mm,
-                                                                                                layer_height_mm);
+                                                                                                layer_height_mm,
+                                                                                                m_origin);
                             }
                             const bool high_resolution_texture_sampling =
                                 offset_context ? offset_context->high_resolution_texture_sampling : zone->high_resolution_sampling;

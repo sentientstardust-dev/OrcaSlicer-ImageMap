@@ -92,6 +92,7 @@ public:
         Assembly,
         Simplify,
         BrimEars,
+        TextureGradientPointPicker,
         //SlaSupports,
         // BBS
         //FaceRecognition,

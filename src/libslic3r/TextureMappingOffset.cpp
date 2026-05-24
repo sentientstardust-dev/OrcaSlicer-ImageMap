@@ -63,6 +63,205 @@ float clamp01f(float v)
     return std::clamp(v, 0.f, 1.f);
 }
 
+Vec3f texture_mapping_array_point(const std::array<float, 3> &point)
+{
+    return Vec3f(point[0], point[1], point[2]);
+}
+
+bool texture_mapping_vec3_is_finite(const Vec3f &point)
+{
+    return std::isfinite(point.x()) && std::isfinite(point.y()) && std::isfinite(point.z());
+}
+
+int texture_mapping_model_object_backup_id(const ModelObject *object)
+{
+    const Model *model = object != nullptr ? object->get_model() : nullptr;
+    return model != nullptr ? model->find_object_backup_id(*object) : -1;
+}
+
+bool texture_mapping_anchor_matches_model_object(const ModelObject *object,
+                                                 const TextureMappingZone::LinearGradientAnchor &anchor)
+{
+    if (object == nullptr)
+        return false;
+    if (anchor.object_backup_id >= 0 && texture_mapping_model_object_backup_id(object) == anchor.object_backup_id)
+        return true;
+    if (anchor.object_id != 0 && object->id().id == anchor.object_id)
+        return true;
+    const Model *model = object->get_model();
+    return model != nullptr && anchor.object_index_valid && anchor.object_index < model->objects.size() &&
+           model->objects[anchor.object_index] == object;
+}
+
+const ModelObject *texture_mapping_anchor_model_object(const Print &print,
+                                                       const TextureMappingZone::LinearGradientAnchor &anchor)
+{
+    if (anchor.object_backup_id >= 0) {
+        for (const PrintObject *print_object : print.objects()) {
+            const ModelObject *model_object = print_object != nullptr ? print_object->model_object() : nullptr;
+            if (texture_mapping_model_object_backup_id(model_object) == anchor.object_backup_id)
+                return model_object;
+        }
+    }
+    if (anchor.object_id != 0) {
+        for (const PrintObject *print_object : print.objects()) {
+            const ModelObject *model_object = print_object != nullptr ? print_object->model_object() : nullptr;
+            if (model_object != nullptr && model_object->id().id == anchor.object_id)
+                return model_object;
+        }
+    }
+    if (anchor.object_index_valid) {
+        for (const PrintObject *print_object : print.objects()) {
+            const ModelObject *model_object = print_object != nullptr ? print_object->model_object() : nullptr;
+            const Model *model = model_object != nullptr ? model_object->get_model() : nullptr;
+            if (model != nullptr && anchor.object_index < model->objects.size() &&
+                model->objects[anchor.object_index] == model_object)
+                return model_object;
+        }
+    }
+    return nullptr;
+}
+
+const PrintObject *texture_mapping_anchor_print_object(const Print &print,
+                                                       const TextureMappingZone::LinearGradientAnchor &anchor)
+{
+    for (const PrintObject *print_object : print.objects()) {
+        const ModelObject *model_object = print_object != nullptr ? print_object->model_object() : nullptr;
+        if (texture_mapping_anchor_matches_model_object(model_object, anchor))
+            return print_object;
+    }
+    return nullptr;
+}
+
+const ModelInstance *texture_mapping_anchor_model_instance(const ModelObject *object,
+                                                          const TextureMappingZone::LinearGradientAnchor &anchor)
+{
+    if (object == nullptr)
+        return nullptr;
+    if (anchor.instance_loaded_id != 0) {
+        for (const ModelInstance *instance : object->instances)
+            if (instance != nullptr && instance->loaded_id == anchor.instance_loaded_id)
+                return instance;
+    }
+    if (anchor.instance_id != 0) {
+        for (const ModelInstance *instance : object->instances)
+            if (instance != nullptr && instance->id().id == anchor.instance_id)
+                return instance;
+    }
+    if (anchor.instance_index_valid && anchor.instance_index < object->instances.size())
+        return object->instances[anchor.instance_index];
+    return object->instances.size() == 1 ? object->instances.front() : nullptr;
+}
+
+std::optional<Vec3f> texture_mapping_linear_gradient_anchor_global_point(const Print &print,
+                                                                         const TextureMappingZone::LinearGradientAnchor &anchor)
+{
+    if (!anchor.valid)
+        return std::nullopt;
+
+    const Vec3f local = texture_mapping_array_point(anchor.local_point);
+    const ModelObject *model_object = texture_mapping_anchor_model_object(print, anchor);
+    const ModelInstance *instance = texture_mapping_anchor_model_instance(model_object, anchor);
+    if (instance != nullptr) {
+        const Vec3f global = (instance->get_matrix() * local.cast<double>()).cast<float>();
+        if (texture_mapping_vec3_is_finite(global))
+            return global;
+    }
+
+    const Vec3f fallback = texture_mapping_array_point(anchor.global_point);
+    return texture_mapping_vec3_is_finite(fallback) ? std::optional<Vec3f>(fallback) : std::nullopt;
+}
+
+Vec2d texture_mapping_print_object_plate_origin_mm(const PrintObject &print_object,
+                                                   const std::optional<Vec2d> &plate_origin_mm_override)
+{
+    if (plate_origin_mm_override)
+        return *plate_origin_mm_override;
+    if (!print_object.instances().empty()) {
+        const Point &shift = print_object.instances().front().shift;
+        return Vec2d(unscale<double>(shift.x()), unscale<double>(shift.y()));
+    }
+    return Vec2d::Zero();
+}
+
+std::optional<Vec3f> texture_mapping_linear_gradient_anchor_print_point(const PrintObject &print_object,
+                                                                        const TextureMappingZone::LinearGradientAnchor &anchor,
+                                                                        const std::optional<Vec2d> &plate_origin_mm_override)
+{
+    if (!anchor.valid)
+        return std::nullopt;
+
+    const ModelObject *model_object = print_object.model_object();
+    const Print *print = print_object.print();
+    if (texture_mapping_anchor_matches_model_object(model_object, anchor)) {
+        const Vec3f local = texture_mapping_array_point(anchor.local_point);
+        const Vec3f print_point = (print_object.trafo_centered() * local.cast<double>()).cast<float>();
+        if (texture_mapping_vec3_is_finite(print_point))
+            return print_point;
+    }
+
+    if (print == nullptr)
+        return std::nullopt;
+
+    const std::optional<Vec3f> global = texture_mapping_linear_gradient_anchor_global_point(*print, anchor);
+    if (!global)
+        return std::nullopt;
+    const Vec2d plate_origin_mm = texture_mapping_print_object_plate_origin_mm(print_object, plate_origin_mm_override);
+    const Vec3f print_point(global->x() - float(plate_origin_mm.x()),
+                            global->y() - float(plate_origin_mm.y()),
+                            global->z());
+    return texture_mapping_vec3_is_finite(print_point) ? std::optional<Vec3f>(print_point) : std::nullopt;
+}
+
+std::pair<Vec3f, Vec3f> texture_mapping_default_linear_gradient_points(const PrintObject &print_object)
+{
+    const BoundingBox bbox = print_object.bounding_box();
+    const float cx = 0.5f * (unscale<float>(bbox.min.x()) + unscale<float>(bbox.max.x()));
+    const float cy = 0.5f * (unscale<float>(bbox.min.y()) + unscale<float>(bbox.max.y()));
+    const float z_min = 0.f;
+    const float z_max = std::max(0.01f, unscale<float>(print_object.height()));
+    return { Vec3f(cx, cy, z_min), Vec3f(cx, cy, z_max) };
+}
+
+std::pair<Vec3f, float> texture_mapping_default_radial_gradient(const PrintObject &print_object)
+{
+    const BoundingBox bbox = print_object.bounding_box();
+    const float min_x = unscale<float>(bbox.min.x());
+    const float max_x = unscale<float>(bbox.max.x());
+    const float min_y = unscale<float>(bbox.min.y());
+    const float max_y = unscale<float>(bbox.max.y());
+    const float height = std::max(0.01f, unscale<float>(print_object.height()));
+    const Vec3f center(0.5f * (min_x + max_x), 0.5f * (min_y + max_y), 0.5f * height);
+    const Vec3f diagonal(std::max(0.f, max_x - min_x), std::max(0.f, max_y - min_y), height);
+    const float radius = std::max(0.01f, 0.5f * diagonal.norm());
+    return { center, radius };
+}
+
+float texture_mapping_linear_gradient_radius_mm(const PrintObject &print_object,
+                                                const TextureMappingZone &zone,
+                                                float default_radius_mm)
+{
+    if (!zone.linear_gradient_radius_percent) {
+        const float radius_mm = std::isfinite(zone.linear_gradient_radius_mm) ? zone.linear_gradient_radius_mm : default_radius_mm;
+        return std::max(0.01f, radius_mm);
+    }
+
+    const float radius_value = std::isfinite(zone.linear_gradient_radius_pct) ?
+        std::max(0.f, zone.linear_gradient_radius_pct) :
+        TextureMappingZone::DefaultLinearGradientRadiusPct;
+    if (zone.linear_gradient_start.valid) {
+        const Print *print = print_object.print();
+        const PrintObject *anchor_print_object = print != nullptr ?
+            texture_mapping_anchor_print_object(*print, zone.linear_gradient_start) :
+            nullptr;
+        if (anchor_print_object != nullptr)
+            return std::max(0.01f, texture_mapping_default_radial_gradient(*anchor_print_object).second * radius_value / 100.f);
+        return std::max(0.01f, radius_value);
+    }
+
+    return std::max(0.01f, default_radius_mm * radius_value / 100.f);
+}
+
 int texture_mapping_color_hex_digit(char ch)
 {
     return ch >= '0' && ch <= '9' ? ch - '0' :
@@ -879,9 +1078,10 @@ bool is_halftone_dithering_method(int method)
 {
     const int clamped_method = std::clamp(method,
                                           int(TextureMappingZone::DitheringClosest),
-                                          int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                                          int(TextureMappingZone::DitheringHalftoneV2));
     return clamped_method == int(TextureMappingZone::DitheringHalftone) ||
-           clamped_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail);
+           clamped_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail) ||
+           clamped_method == int(TextureMappingZone::DitheringHalftoneV2);
 }
 
 float halftone_threshold(float x_mm, float y_mm, float dot_size_mm)
@@ -935,6 +1135,65 @@ float halftone_screen_angle_deg(int filament_color_mode, size_t component_idx)
     return fallback_angles[component_idx % (sizeof(fallback_angles) / sizeof(fallback_angles[0]))];
 }
 
+int halftone_surface_axis(float normal_x, float normal_y, float normal_z)
+{
+    const float ax = std::abs(normal_x);
+    const float ay = std::abs(normal_y);
+    const float az = std::abs(normal_z);
+    if (ax >= ay && ax >= az)
+        return 0;
+    if (ay >= ax && ay >= az)
+        return 1;
+    return 2;
+}
+
+std::array<float, 2> halftone_surface_coords(float x_mm, float y_mm, float z_mm, int axis)
+{
+    if (axis == 0)
+        return { y_mm, z_mm };
+    if (axis == 1)
+        return { x_mm, z_mm };
+    return { x_mm, y_mm };
+}
+
+std::array<float, 2> halftone_cell_center_surface_coords(float surface_u_mm,
+                                                         float surface_v_mm,
+                                                         float dot_size_mm,
+                                                         float angle_deg)
+{
+    const float period = std::clamp(dot_size_mm,
+                                    TextureMappingZone::MinHalftoneDotSizeMm,
+                                    TextureMappingZone::MaxHalftoneDotSizeMm);
+    if (!std::isfinite(surface_u_mm) || !std::isfinite(surface_v_mm) || period <= EPSILON)
+        return { surface_u_mm, surface_v_mm };
+
+    const float radians = angle_deg * float(PI) / 180.f;
+    const float c = std::cos(radians);
+    const float s = std::sin(radians);
+    const float screen_x = c * surface_u_mm + s * surface_v_mm;
+    const float screen_y = -s * surface_u_mm + c * surface_v_mm;
+    const int cell_x = int(std::floor(screen_x / period));
+    const int cell_y = int(std::floor(screen_y / period));
+    const float center_screen_x = (float(cell_x) + 0.5f) * period;
+    const float center_screen_y = (float(cell_y) + 0.5f) * period;
+    return {
+        c * center_screen_x - s * center_screen_y,
+        s * center_screen_x + c * center_screen_y
+    };
+}
+
+std::array<float, 2> halftone_sample_xy_from_surface_coords(float x_mm,
+                                                            float y_mm,
+                                                            const std::array<float, 2> &surface_coords,
+                                                            int axis)
+{
+    if (axis == 0)
+        return { x_mm, surface_coords[0] };
+    if (axis == 1)
+        return { surface_coords[0], y_mm };
+    return surface_coords;
+}
+
 bool halftone_screen_on(float coverage,
                         float surface_u_mm,
                         float surface_v_mm,
@@ -965,7 +1224,7 @@ float dither_pitch(float base_outer_width_mm,
     const float high_res_step_mm = std::clamp(base_outer_width_mm * 0.20f, 0.04f, 0.12f);
     const int clamped_method = std::clamp(dithering_method,
                                           int(TextureMappingZone::DitheringClosest),
-                                          int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                                          int(TextureMappingZone::DitheringHalftoneV2));
     if (is_halftone_dithering_method(clamped_method)) {
         const float dot_sample_step_mm =
             std::clamp(std::clamp(halftone_dot_size_mm,
@@ -1543,7 +1802,7 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
     const int clamped_binary_dither_method =
         std::clamp(dithering_method,
                    int(TextureMappingZone::DitheringClosest),
-                   int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                   int(TextureMappingZone::DitheringHalftoneV2));
     std::vector<uint32_t> binary_dither_masks;
     const bool can_binary_dither =
         dithering_enabled &&
@@ -2476,6 +2735,9 @@ std::optional<std::array<float, 3>> sample_weight_field_rgb(const TextureMapping
 
 std::vector<unsigned int> decode_texture_mapping_offset_component_ids(const TextureMappingZone &zone, size_t num_physical)
 {
+    if (zone.is_linear_gradient())
+        return TextureMappingManager::linear_gradient_component_ids_from_stops(zone, num_physical);
+
     std::vector<unsigned int> out;
     for (const char c : zone.component_ids) {
         if (c < '1' || c > '9')
@@ -2550,7 +2812,8 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     unsigned int             texture_zone_id,
     unsigned int             active_component_id_override,
     std::optional<float>     base_outer_width_mm_override,
-    std::optional<float>     layer_height_mm_override)
+    std::optional<float>     layer_height_mm_override,
+    std::optional<Vec2d>     plate_origin_mm_override)
 {
     const Print *print = print_object.print();
     if (print == nullptr)
@@ -2563,6 +2826,7 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
         return std::nullopt;
 
     const bool vertex_color_match_mode = zone.is_image_texture();
+    const bool linear_gradient_mode = zone.is_linear_gradient();
     std::vector<unsigned int> component_ids = decode_texture_mapping_offset_component_ids(zone, num_physical);
     if (vertex_color_match_mode) {
         const std::vector<unsigned int> effective_component_ids =
@@ -2662,7 +2926,7 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
         a = normalize_texture_mapping_offset_angle_deg(a);
 
     bool has_nonzero_distance = false;
-    if (vertex_color_match_mode) {
+    if (vertex_color_match_mode || linear_gradient_mode) {
         distances_mm.assign(component_ids.size(), max_allowed_distance_mm);
         has_nonzero_distance = max_allowed_distance_mm > EPSILON;
     } else {
@@ -2703,11 +2967,13 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     const bool dithering_enabled = zone.dithering_enabled && !raw_texture_mapping_mode;
     const int dithering_method = std::clamp(zone.dithering_method,
                                             int(TextureMappingZone::DitheringClosest),
-                                            int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                                            int(TextureMappingZone::DitheringHalftoneV2));
     const bool halftone_dithering_enabled =
         dithering_enabled && is_halftone_dithering_method(dithering_method);
     const bool halftone_increased_detail_enabled =
         dithering_enabled && dithering_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail);
+    const bool halftone_v2_enabled =
+        dithering_enabled && dithering_method == int(TextureMappingZone::DitheringHalftoneV2);
     const float dither_pitch_mm =
         dither_pitch(base_outer_width_mm,
                      dithering_method,
@@ -2770,7 +3036,7 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     }
 
     float rotation_deg = 0.f;
-    if (zone.offset_rotation_enabled) {
+    if (!linear_gradient_mode && zone.offset_rotation_enabled) {
         const float p = clamp01f(z_progress);
         const float r = std::max(1.f, zone.offset_repeats);
         float repeated_pos = p * r;
@@ -2789,26 +3055,58 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     for (float &a : rotated_angles)
         a = normalize_texture_mapping_offset_angle_deg(a + rotation_deg);
 
-    const float signed_fade_factor = texture_mapping_offset_fade_factor(zone.offset_fade_mode, z_progress);
+    const float signed_fade_factor = linear_gradient_mode ? 1.f : texture_mapping_offset_fade_factor(zone.offset_fade_mode, z_progress);
     const float fade_factor = std::abs(signed_fade_factor);
     if (fade_factor <= EPSILON)
         return std::nullopt;
 
     TextureMappingOffsetContext context;
     context.vertex_color_match_mode = vertex_color_match_mode;
+    context.linear_gradient_mode = linear_gradient_mode;
     context.object_center_mode =
         !vertex_color_match_mode &&
+        !linear_gradient_mode &&
         zone.offset_angle_mode != int(TextureMappingZone::OffsetAngleSurfaceNormal);
     context.high_resolution_texture_sampling = high_resolution_texture_sampling;
-    context.compact_offset_mode = compact_offset_mode;
+    context.compact_offset_mode = compact_offset_mode || linear_gradient_mode;
     context.dithering_enabled = dithering_enabled;
     context.halftone_dithering_enabled = halftone_dithering_enabled;
     context.halftone_increased_detail_enabled = halftone_increased_detail_enabled;
+    context.halftone_v2_enabled = halftone_v2_enabled;
     context.nonlinear_offset_adjustment = zone.nonlinear_offset_adjustment;
     context.object_center = print_object.bounding_box().center();
+    if (linear_gradient_mode) {
+        const bool radial_mode = zone.linear_gradient_mode == int(TextureMappingZone::LinearGradientRadial);
+        auto default_points = texture_mapping_default_linear_gradient_points(print_object);
+        auto default_radial = texture_mapping_default_radial_gradient(print_object);
+        std::optional<Vec3f> start =
+            texture_mapping_linear_gradient_anchor_print_point(print_object,
+                                                               zone.linear_gradient_start,
+                                                               plate_origin_mm_override);
+        std::optional<Vec3f> end;
+        if (!radial_mode)
+            end = texture_mapping_linear_gradient_anchor_print_point(print_object,
+                                                                     zone.linear_gradient_end,
+                                                                     plate_origin_mm_override);
+        context.linear_gradient_radial_mode = radial_mode;
+        if (radial_mode) {
+            context.linear_gradient_start_mm = start ? *start : default_radial.first;
+            context.linear_gradient_radius_mm = texture_mapping_linear_gradient_radius_mm(print_object, zone, default_radial.second);
+            context.linear_gradient_end_mm = context.linear_gradient_start_mm + Vec3f::UnitX() * context.linear_gradient_radius_mm;
+        } else {
+            context.linear_gradient_start_mm = start ? *start : default_points.first;
+            context.linear_gradient_end_mm = end ? *end : default_points.second;
+            if ((context.linear_gradient_end_mm - context.linear_gradient_start_mm).squaredNorm() <= 1e-8f) {
+                context.linear_gradient_start_mm = default_points.first;
+                context.linear_gradient_end_mm = default_points.second;
+            }
+        }
+    }
     context.active_component_id = active_component_id;
     context.active_component_idx = active_component_idx;
     context.component_ids = std::move(component_ids);
+    if (linear_gradient_mode)
+        context.linear_gradient_stops = TextureMappingManager::normalized_linear_gradient_stops(zone, num_physical);
     context.component_distances_mm = std::move(distances_mm);
     context.rotated_angles = std::move(rotated_angles);
     context.weight_field = std::move(weight_field);
@@ -2819,9 +3117,14 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     context.dither_pitch_mm = dither_pitch_mm;
     context.halftone_dot_size_mm = halftone_dot_size_mm;
     context.active_halftone_angle_deg = halftone_screen_angle_deg(filament_color_mode, active_component_idx);
-    context.active_component_strength_factor = texture_mapping_offset_filament_strength_factor(zone, active_component_id);
-    context.active_component_minimum_offset_factor = texture_mapping_offset_filament_minimum_offset_factor(zone, active_component_id);
-    context.active_component_td_width_factor =
+    context.active_component_strength_factor = linear_gradient_mode ?
+        1.f :
+        texture_mapping_offset_filament_strength_factor(zone, active_component_id);
+    context.active_component_minimum_offset_factor = linear_gradient_mode ?
+        0.f :
+        texture_mapping_offset_filament_minimum_offset_factor(zone, active_component_id);
+    context.active_component_td_width_factor = linear_gradient_mode ?
+        1.f :
         transmission_distance_width_factor(td_calibration_context, active_component_idx, previous_component_idx);
     context.base_outer_width_mm = base_outer_width_mm;
     context.layer_height_mm = layer_height_mm;
@@ -2856,19 +3159,70 @@ float texture_mapping_offset_surface_inset_mm(const TextureMappingOffsetContext 
             float z_mm = context.layer != nullptr ? float(context.layer->print_z) : 0.f;
             if (!std::isfinite(z_mm))
                 z_mm = 0.f;
-            if (!std::isfinite(surface_u_mm))
-                surface_u_mm = std::abs(outward_x) >= std::abs(outward_y) ? y_mm : x_mm;
-            if (!std::isfinite(surface_v_mm))
-                surface_v_mm = z_mm;
-            desired_strength = halftone_screen_on(desired_strength,
-                                                  surface_u_mm,
-                                                  surface_v_mm,
+            float halftone_u_mm = surface_u_mm;
+            float halftone_v_mm = surface_v_mm;
+            float coverage = desired_strength;
+            if (context.halftone_v2_enabled) {
+                const int surface_axis = halftone_surface_axis(float(outward_x), float(outward_y), 0.f);
+                const std::array<float, 2> surface_coord = halftone_surface_coords(x_mm, y_mm, z_mm, surface_axis);
+                halftone_u_mm = surface_coord[0];
+                halftone_v_mm = surface_coord[1];
+                const std::array<float, 2> cell_center =
+                    halftone_cell_center_surface_coords(halftone_u_mm,
+                                                        halftone_v_mm,
+                                                        context.halftone_dot_size_mm,
+                                                        context.active_halftone_angle_deg);
+                const std::array<float, 2> sample_xy =
+                    halftone_sample_xy_from_surface_coords(x_mm, y_mm, cell_center, surface_axis);
+                if (std::isfinite(sample_xy[0]) && std::isfinite(sample_xy[1]))
+                    coverage = sample_weight_field(context.weight_field,
+                                                   sample_xy[0],
+                                                   sample_xy[1],
+                                                   context.active_component_idx,
+                                                   context.high_resolution_texture_sampling,
+                                                   context.compact_offset_mode);
+            } else {
+                if (!std::isfinite(halftone_u_mm))
+                    halftone_u_mm = std::abs(outward_x) >= std::abs(outward_y) ? y_mm : x_mm;
+                if (!std::isfinite(halftone_v_mm))
+                    halftone_v_mm = z_mm;
+            }
+            desired_strength = halftone_screen_on(coverage,
+                                                  halftone_u_mm,
+                                                  halftone_v_mm,
                                                   context.halftone_dot_size_mm,
                                                   context.active_halftone_angle_deg) ?
                 1.f :
                 0.f;
         }
         inset_strength = std::clamp(1.f - desired_strength, 0.f, 1.f);
+    } else if (context.linear_gradient_mode) {
+        float t = 0.f;
+        float z_mm = context.layer != nullptr ? float(context.layer->print_z) : 0.f;
+        if (std::isfinite(surface_v_mm))
+            z_mm = surface_v_mm;
+        if (!std::isfinite(z_mm))
+            z_mm = 0.f;
+        const Vec3f sample(unscale<float>(point.x()), unscale<float>(point.y()), z_mm);
+        if (context.linear_gradient_radial_mode) {
+            const float radius = std::max(0.01f, context.linear_gradient_radius_mm);
+            t = clamp01f((sample - context.linear_gradient_start_mm).norm() / radius);
+        } else {
+            const Vec3f gradient_vec = context.linear_gradient_end_mm - context.linear_gradient_start_mm;
+            const float denom = gradient_vec.squaredNorm();
+            if (denom > 1e-8f)
+                t = clamp01f((sample - context.linear_gradient_start_mm).dot(gradient_vec) / denom);
+        }
+        if (context.linear_gradient_radial_mode || (context.linear_gradient_end_mm - context.linear_gradient_start_mm).squaredNorm() > 1e-8f) {
+            const std::vector<float> weights =
+                TextureMappingManager::linear_gradient_compact_weights(t, context.linear_gradient_stops, context.component_ids);
+            const float desired_strength = context.active_component_idx < weights.size() ?
+                clamp01f(weights[context.active_component_idx]) :
+                0.f;
+            inset_strength = std::clamp(1.f - desired_strength, 0.f, 1.f);
+        } else {
+            inset_strength = 0.f;
+        }
     } else {
         double theta_direction_x = outward_x;
         double theta_direction_y = outward_y;

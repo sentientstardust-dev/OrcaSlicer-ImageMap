@@ -482,6 +482,125 @@ static nlohmann::json floats_to_json(const std::vector<float> &values)
     return out;
 }
 
+static nlohmann::json point3_to_json(const std::array<float, 3> &point)
+{
+    return nlohmann::json::array({ point[0], point[1], point[2] });
+}
+
+static std::array<float, 3> point3_from_json(const nlohmann::json &value)
+{
+    std::array<float, 3> out { { 0.f, 0.f, 0.f } };
+    if (!value.is_array())
+        return out;
+    for (size_t i = 0; i < 3 && i < value.size(); ++i)
+        if (value[i].is_number())
+            out[i] = value[i].get<float>();
+    return out;
+}
+
+static nlohmann::json linear_gradient_anchor_to_json(const TextureMappingZone::LinearGradientAnchor &anchor)
+{
+    nlohmann::json out;
+    out["valid"] = anchor.valid;
+    out["object_id"] = anchor.object_id;
+    out["instance_id"] = anchor.instance_id;
+    out["object_backup_id"] = anchor.object_backup_id;
+    out["object_index_valid"] = anchor.object_index_valid;
+    out["object_index"] = anchor.object_index;
+    out["instance_index_valid"] = anchor.instance_index_valid;
+    out["instance_index"] = anchor.instance_index;
+    out["instance_loaded_id"] = anchor.instance_loaded_id;
+    out["local_point"] = point3_to_json(anchor.local_point);
+    out["global_point"] = point3_to_json(anchor.global_point);
+    return out;
+}
+
+static TextureMappingZone::LinearGradientAnchor linear_gradient_anchor_from_json(const nlohmann::json &value)
+{
+    TextureMappingZone::LinearGradientAnchor out;
+    if (!value.is_object())
+        return out;
+    out.valid = value.value("valid", false);
+    out.object_id = value.value("object_id", size_t(0));
+    out.instance_id = value.value("instance_id", size_t(0));
+    out.object_backup_id = value.value("object_backup_id", -1);
+    out.object_index_valid = value.value("object_index_valid", false);
+    out.object_index = value.value("object_index", size_t(0));
+    out.instance_index_valid = value.value("instance_index_valid", false);
+    out.instance_index = value.value("instance_index", size_t(0));
+    out.instance_loaded_id = value.value("instance_loaded_id", size_t(0));
+    out.local_point = point3_from_json(value.value("local_point", nlohmann::json::array()));
+    out.global_point = point3_from_json(value.value("global_point", nlohmann::json::array()));
+    return out;
+}
+
+static nlohmann::json linear_gradient_stop_to_json(const TextureMappingZone::LinearGradientStop &stop)
+{
+    nlohmann::json out;
+    out["position"] = std::clamp(std::isfinite(stop.position) ? stop.position : 0.f, 0.f, 1.f);
+    out["filament_id"] = stop.filament_id;
+    return out;
+}
+
+static TextureMappingZone::LinearGradientStop linear_gradient_stop_from_json(const nlohmann::json &value)
+{
+    TextureMappingZone::LinearGradientStop out;
+    if (!value.is_object())
+        return out;
+    const float position = value.value("position", 0.f);
+    out.position = std::clamp(std::isfinite(position) ? position : 0.f, 0.f, 1.f);
+    out.filament_id = value.value("filament_id", 1u);
+    return out;
+}
+
+static nlohmann::json linear_gradient_stops_to_json(const std::vector<TextureMappingZone::LinearGradientStop> &stops)
+{
+    nlohmann::json out = nlohmann::json::array();
+    for (const TextureMappingZone::LinearGradientStop &stop : stops)
+        out.push_back(linear_gradient_stop_to_json(stop));
+    return out;
+}
+
+static std::vector<TextureMappingZone::LinearGradientStop> linear_gradient_stops_from_json(const nlohmann::json &value)
+{
+    std::vector<TextureMappingZone::LinearGradientStop> out;
+    if (!value.is_array())
+        return out;
+    out.reserve(value.size());
+    for (const nlohmann::json &item : value)
+        if (item.is_object())
+            out.emplace_back(linear_gradient_stop_from_json(item));
+    return out;
+}
+
+static std::string surface_pattern_name(int surface_pattern)
+{
+    if (surface_pattern == int(TextureMappingZone::Gradient2D))
+        return "2d_gradient";
+    if (surface_pattern == int(TextureMappingZone::LinearGradient))
+        return "linear_gradient";
+    return "image_texture";
+}
+
+static int surface_pattern_from_name(const std::string &name)
+{
+    if (name == "2d_gradient" || name == "surface_gradient")
+        return int(TextureMappingZone::Gradient2D);
+    if (name == "linear_gradient")
+        return int(TextureMappingZone::LinearGradient);
+    return int(TextureMappingZone::ImageTexture);
+}
+
+static std::string linear_gradient_mode_name(int mode)
+{
+    return mode == int(TextureMappingZone::LinearGradientRadial) ? "radial" : "linear";
+}
+
+static int linear_gradient_mode_from_name(const std::string &name)
+{
+    return name == "radial" ? int(TextureMappingZone::LinearGradientRadial) : int(TextureMappingZone::LinearGradientLinear);
+}
+
 static nlohmann::json weights_to_json(const std::string &weights, size_t expected_count)
 {
     nlohmann::json out = nlohmann::json::array();
@@ -646,11 +765,12 @@ static std::string dithering_method_name(int mode)
 {
     switch (clamp_int(mode,
                       int(TextureMappingZone::DitheringClosest),
-                      int(TextureMappingZone::DitheringHalftoneIncreasedDetail))) {
+                      int(TextureMappingZone::DitheringHalftoneV2))) {
     case int(TextureMappingZone::DitheringClosest):                 return "closest";
     case int(TextureMappingZone::DitheringOrderedBayer):            return "ordered_bayer";
     case int(TextureMappingZone::DitheringHalftone):                return "halftone";
     case int(TextureMappingZone::DitheringHalftoneIncreasedDetail): return "halftone_increased_detail";
+    case int(TextureMappingZone::DitheringHalftoneV2):              return "halftone_v2";
     default:                                                       return "floyd_steinberg";
     }
 }
@@ -666,6 +786,8 @@ static int dithering_method_from_name(std::string name)
         return int(TextureMappingZone::DitheringHalftone);
     if (name == "halftone_increased_detail" || name == "halftone_detail" || name == "halftone_high_detail")
         return int(TextureMappingZone::DitheringHalftoneIncreasedDetail);
+    if (name == "halftone_v2" || name == "halftone2")
+        return int(TextureMappingZone::DitheringHalftoneV2);
     return int(TextureMappingZone::DitheringFloydSteinberg);
 }
 
@@ -837,6 +959,36 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
                 return false;
         return true;
     };
+    auto anchors_equal = [eps](const TextureMappingZone::LinearGradientAnchor &lhs,
+                               const TextureMappingZone::LinearGradientAnchor &rhs_values) {
+        if (lhs.valid != rhs_values.valid ||
+            lhs.object_id != rhs_values.object_id ||
+            lhs.instance_id != rhs_values.instance_id ||
+            lhs.object_backup_id != rhs_values.object_backup_id ||
+            lhs.object_index_valid != rhs_values.object_index_valid ||
+            lhs.object_index != rhs_values.object_index ||
+            lhs.instance_index_valid != rhs_values.instance_index_valid ||
+            lhs.instance_index != rhs_values.instance_index ||
+            lhs.instance_loaded_id != rhs_values.instance_loaded_id)
+            return false;
+        for (size_t i = 0; i < 3; ++i) {
+            if (std::abs(lhs.local_point[i] - rhs_values.local_point[i]) > eps ||
+                std::abs(lhs.global_point[i] - rhs_values.global_point[i]) > eps)
+                return false;
+        }
+        return true;
+    };
+    auto stops_equal = [eps](const std::vector<TextureMappingZone::LinearGradientStop> &lhs,
+                             const std::vector<TextureMappingZone::LinearGradientStop> &rhs_values) {
+        if (lhs.size() != rhs_values.size())
+            return false;
+        for (size_t i = 0; i < lhs.size(); ++i) {
+            if (std::abs(lhs[i].position - rhs_values[i].position) > eps ||
+                lhs[i].filament_id != rhs_values[i].filament_id)
+                return false;
+        }
+        return true;
+    };
 
     return stable_id == rhs.stable_id &&
            zone_id == rhs.zone_id &&
@@ -866,6 +1018,7 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            nonlinear_offset_adjustment == rhs.nonlinear_offset_adjustment &&
            modulation_mode == rhs.modulation_mode &&
            use_modulated_overhang_geometry_for_support == rhs.use_modulated_overhang_geometry_for_support &&
+           modulation_mode_manually_changed == rhs.modulation_mode_manually_changed &&
            recolor_small_perimeter_loops == rhs.recolor_small_perimeter_loops &&
            recolor_top_visible_perimeter_sections == rhs.recolor_top_visible_perimeter_sections &&
            top_visible_perimeter_recolor_aggressiveness == rhs.top_visible_perimeter_recolor_aggressiveness &&
@@ -893,7 +1046,15 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            auto_adjust_filament_selection == rhs.auto_adjust_filament_selection &&
            floats_equal(filament_strengths_pct, rhs.filament_strengths_pct) &&
            floats_equal(filament_minimum_offsets_pct, rhs.filament_minimum_offsets_pct) &&
-           floats_equal(filament_transmission_distances_mm, rhs.filament_transmission_distances_mm);
+           floats_equal(filament_transmission_distances_mm, rhs.filament_transmission_distances_mm) &&
+           anchors_equal(linear_gradient_start, rhs.linear_gradient_start) &&
+           anchors_equal(linear_gradient_end, rhs.linear_gradient_end) &&
+           linear_gradient_mode == rhs.linear_gradient_mode &&
+           std::abs(linear_gradient_radius_mm - rhs.linear_gradient_radius_mm) <= eps &&
+           linear_gradient_radius_percent == rhs.linear_gradient_radius_percent &&
+           std::abs(linear_gradient_radius_pct - rhs.linear_gradient_radius_pct) <= eps &&
+           show_linear_gradient_direction_arrow == rhs.show_linear_gradient_direction_arrow &&
+           stops_equal(linear_gradient_stops, rhs.linear_gradient_stops);
 }
 
 uint64_t TextureMappingManager::allocate_stable_id()
@@ -924,6 +1085,16 @@ void TextureMappingManager::refresh(const std::vector<std::string> &filament_col
         zone.stable_id = normalize_stable_id(zone.stable_id);
         if (zone.display_color.empty() || zone.display_color[0] != '#')
             zone.display_color = random_display_color(zone.stable_id);
+        if (zone.is_linear_gradient()) {
+            zone.linear_gradient_stops = normalized_linear_gradient_stops(zone, m_filament_colours.size());
+            const std::vector<unsigned int> ids = linear_gradient_component_ids_from_stops(zone, m_filament_colours.size());
+            zone.component_ids = encode_component_ids(ids);
+            if (!zone.linear_gradient_stops.empty()) {
+                zone.component_a = zone.linear_gradient_stops.front().filament_id;
+                zone.component_b = zone.linear_gradient_stops.back().filament_id;
+            }
+        }
+        zone.apply_default_modulation_mode();
     }
 }
 
@@ -947,6 +1118,8 @@ void TextureMappingManager::remove_physical_filament(unsigned int deleted_filame
     for (TextureMappingZone &zone : m_zones) {
         zone.component_a = remap_id(zone.component_a);
         zone.component_b = remap_id(zone.component_b);
+        for (TextureMappingZone::LinearGradientStop &stop : zone.linear_gradient_stops)
+            stop.filament_id = remap_id(stop.filament_id);
 
         std::vector<unsigned int> ids = decode_component_ids(zone.component_ids, 9);
         for (unsigned int &id : ids)
@@ -966,7 +1139,18 @@ void TextureMappingManager::remove_physical_filament(unsigned int deleted_filame
             zone.component_a = ids[0];
             zone.component_b = ids[1];
         }
-        if (new_physical_count < 2)
+        if (zone.is_linear_gradient()) {
+            zone.linear_gradient_stops = normalized_linear_gradient_stops(zone, new_physical_count);
+            ids = linear_gradient_component_ids_from_stops(zone, new_physical_count);
+            if (!zone.linear_gradient_stops.empty()) {
+                zone.component_a = zone.linear_gradient_stops.front().filament_id;
+                zone.component_b = zone.linear_gradient_stops.back().filament_id;
+            }
+        } else if (ids.size() >= 2) {
+            zone.component_a = ids[0];
+            zone.component_b = ids[1];
+        }
+        if (new_physical_count == 0 || (!zone.is_linear_gradient() && new_physical_count < 2))
             zone.enabled = false;
         zone.component_ids = encode_component_ids(ids);
 
@@ -985,7 +1169,8 @@ TextureMappingZone *TextureMappingManager::add_zone(size_t num_physical,
                                                     const std::vector<std::string> &filament_colours,
                                                     int surface_pattern)
 {
-    if (num_physical < 2)
+    const bool linear_gradient = surface_pattern == int(TextureMappingZone::LinearGradient);
+    if (num_physical == 0 || (!linear_gradient && num_physical < 2))
         return nullptr;
 
     TextureMappingZone zone;
@@ -993,9 +1178,11 @@ TextureMappingZone *TextureMappingManager::add_zone(size_t num_physical,
     zone.zone_id = allocate_zone_id(num_physical);
     if (zone.zone_id == 0)
         return nullptr;
-    zone.surface_pattern = surface_pattern == int(TextureMappingZone::Gradient2D) ?
-        int(TextureMappingZone::Gradient2D) :
-        int(TextureMappingZone::ImageTexture);
+    zone.surface_pattern =
+        surface_pattern == int(TextureMappingZone::Gradient2D) || surface_pattern == int(TextureMappingZone::LinearGradient) ?
+            surface_pattern :
+            int(TextureMappingZone::ImageTexture);
+    zone.apply_default_modulation_mode();
 
     std::vector<unsigned int> ids;
     for (size_t i = 1; i <= std::min<size_t>(num_physical, 9); ++i)
@@ -1003,6 +1190,13 @@ TextureMappingZone *TextureMappingManager::add_zone(size_t num_physical,
     zone.component_ids = encode_component_ids(ids);
     zone.component_a = ids[0];
     zone.component_b = ids.size() > 1 ? ids[1] : ids[0];
+    if (zone.is_linear_gradient()) {
+        zone.linear_gradient_stops = {
+            {0.f, zone.component_a},
+            {1.f, zone.component_b}
+        };
+        zone.component_ids = encode_component_ids(linear_gradient_component_ids_from_stops(zone, num_physical));
+    }
     zone.display_color = random_display_color(zone.stable_id);
     if (zone.is_image_texture())
         auto_adjust_texture_component_ids(zone, num_physical, filament_colours);
@@ -1016,10 +1210,12 @@ bool TextureMappingManager::duplicate_zone(size_t zone_index,
                                            size_t num_physical,
                                            const std::vector<std::string> &filament_colours)
 {
-    if (zone_index >= m_zones.size() || num_physical < 2)
+    if (zone_index >= m_zones.size() || num_physical == 0)
         return false;
 
     TextureMappingZone copy = m_zones[zone_index];
+    if (!copy.is_linear_gradient() && num_physical < 2)
+        return false;
     copy.stable_id = allocate_stable_id();
     copy.zone_id = allocate_zone_id(num_physical);
     if (copy.zone_id == 0)
@@ -1086,14 +1282,26 @@ std::string TextureMappingManager::serialize_entries()
         zone.stable_id = normalize_stable_id(zone.stable_id);
         if (zone.display_color.empty() || zone.display_color[0] != '#')
             zone.display_color = random_display_color(zone.stable_id);
+        zone.apply_default_modulation_mode();
 
         std::vector<unsigned int> component_ids = decode_component_ids(zone.component_ids, 9);
-        if (component_ids.size() < 2) {
+        if (zone.is_linear_gradient()) {
+            zone.linear_gradient_stops = normalized_linear_gradient_stops(zone, m_filament_colours.size());
+            component_ids = linear_gradient_component_ids_from_stops(zone, m_filament_colours.size());
+            if (!zone.linear_gradient_stops.empty()) {
+                zone.component_a = zone.linear_gradient_stops.front().filament_id;
+                zone.component_b = zone.linear_gradient_stops.back().filament_id;
+            }
+            zone.component_ids = encode_component_ids(component_ids);
+        }
+        if (!zone.is_linear_gradient() && component_ids.size() < 2) {
             component_ids = {zone.component_a, zone.component_b};
             component_ids.erase(std::remove_if(component_ids.begin(), component_ids.end(), [](unsigned int id) {
                 return id == 0 || id > 9;
             }), component_ids.end());
         }
+        unsigned int anchor_a = zone.component_a;
+        unsigned int anchor_b = zone.component_b;
 
         const std::string normalized_weights = normalize_weights(zone.component_weights, component_ids.size());
         const std::string normalized_distances =
@@ -1109,11 +1317,29 @@ std::string TextureMappingManager::serialize_entries()
         entry["uid"] = zone.stable_id;
         entry["zone_id"] = zone.zone_id;
         entry["enabled"] = zone.enabled;
-        entry["surface_pattern"] = zone.is_2d_gradient() ? "2d_gradient" : "image_texture";
-        entry["anchor_filaments"] = {zone.component_a, zone.component_b};
-        entry["component_filaments"] = ids_to_json(component_ids);
-        entry["component_weights_pct"] = weights_to_json(normalized_weights, component_ids.size());
+        entry["surface_pattern"] = surface_pattern_name(zone.surface_pattern);
+        if (!zone.is_linear_gradient()) {
+            entry["anchor_filaments"] = {anchor_a, anchor_b};
+            entry["component_filaments"] = ids_to_json(component_ids);
+            entry["component_weights_pct"] = weights_to_json(normalized_weights, component_ids.size());
+        }
         entry["display_color"] = zone.display_color;
+        if (zone.is_linear_gradient()) {
+            nlohmann::json linear_gradient;
+            linear_gradient["start"] = linear_gradient_anchor_to_json(zone.linear_gradient_start);
+            linear_gradient["end"] = linear_gradient_anchor_to_json(zone.linear_gradient_end);
+            linear_gradient["stops"] = linear_gradient_stops_to_json(zone.linear_gradient_stops);
+            linear_gradient["mode"] = linear_gradient_mode_name(zone.linear_gradient_mode);
+            linear_gradient["radius_mm"] = std::isfinite(zone.linear_gradient_radius_mm) ?
+                std::max(0.f, zone.linear_gradient_radius_mm) :
+                TextureMappingZone::DefaultLinearGradientRadiusMm;
+            linear_gradient["radius_percent"] = zone.linear_gradient_radius_percent;
+            linear_gradient["radius_pct"] = std::isfinite(zone.linear_gradient_radius_pct) ?
+                std::max(0.f, zone.linear_gradient_radius_pct) :
+                TextureMappingZone::DefaultLinearGradientRadiusPct;
+            linear_gradient["show_direction_arrow"] = zone.show_linear_gradient_direction_arrow;
+            entry["linear_gradient"] = std::move(linear_gradient);
+        }
 
         nlohmann::json texture;
         texture["mode"] = mapping_mode_name(clamp_int(zone.texture_mapping_mode,
@@ -1126,6 +1352,7 @@ std::string TextureMappingManager::serialize_entries()
         texture["nonlinear_offset_adjustment"] = zone.nonlinear_offset_adjustment;
         texture["modulation_mode"] = modulation_mode_name(zone.modulation_mode);
         texture["use_modulated_overhang_geometry_for_support"] = zone.use_modulated_overhang_geometry_for_support;
+        texture["modulation_mode_manually_changed"] = zone.modulation_mode_manually_changed;
         texture["recolor_small_perimeter_loops"] = zone.recolor_small_perimeter_loops || zone.recolor_top_visible_perimeter_sections;
         texture["recolor_top_visible_perimeter_sections"] = zone.recolor_top_visible_perimeter_sections;
         texture["top_visible_perimeter_recolor_aggressiveness"] =
@@ -1201,7 +1428,7 @@ void TextureMappingManager::load_entries(const std::string &serialized,
     refresh(filament_colours);
 
     const size_t n = filament_colours.size();
-    if (serialized.empty() || n < 2)
+    if (serialized.empty() || n == 0)
         return;
 
     nlohmann::json root;
@@ -1233,22 +1460,32 @@ void TextureMappingManager::load_entries(const std::string &serialized,
             continue;
         }
 
+        const int surface_pattern = surface_pattern_from_name(entry.value("surface_pattern", std::string("image_texture")));
+        const bool linear_gradient = surface_pattern == int(TextureMappingZone::LinearGradient);
         std::vector<unsigned int> component_ids = ids_from_json(entry.value("component_filaments", nlohmann::json::array()), n);
-        if (component_ids.size() < 2) {
+        if (!linear_gradient && component_ids.size() < 2) {
             component_ids.clear();
             for (size_t i = 1; i <= std::min<size_t>(n, 9); ++i)
                 component_ids.emplace_back(unsigned(i));
         }
-        if (component_ids.size() < 2) {
+        if (!linear_gradient && component_ids.size() < 2) {
             ++skipped_rows;
             continue;
         }
-
         std::vector<unsigned int> anchors = ids_from_json(entry.value("anchor_filaments", nlohmann::json::array()), n);
-        if (anchors.size() < 2)
+        if (anchors.size() < 2 && component_ids.size() >= 2)
             anchors = {component_ids[0], component_ids[1]};
-        if (anchors[0] == anchors[1])
+        else if (anchors.empty()) {
+            const unsigned int anchor_a = component_ids.empty() ? 1u : component_ids.front();
+            const unsigned int anchor_b = component_ids.size() >= 2 ? component_ids[1] : (n >= 2 && anchor_a == 1 ? 2u : anchor_a);
+            anchors = {anchor_a, anchor_b};
+        }
+        while (anchors.size() < 2)
+            anchors.emplace_back(anchors.front());
+        if (!linear_gradient && anchors[0] == anchors[1] && n >= 2)
             anchors[1] = anchors[0] == 1 ? 2 : 1;
+        if (linear_gradient && component_ids.empty())
+            component_ids = {anchors[0], anchors[1]};
 
         TextureMappingZone zone;
         zone.component_a = anchors[0];
@@ -1257,17 +1494,33 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.zone_id = entry.value("zone_id", entry.value("filament_id", 0u));
         zone.enabled = entry.value("enabled", true);
         zone.deleted = false;
-        zone.surface_pattern =
-            entry.value("surface_pattern", std::string("image_texture")) == "2d_gradient" ||
-            entry.value("surface_pattern", std::string("image_texture")) == "surface_gradient" ?
-                int(TextureMappingZone::Gradient2D) :
-                int(TextureMappingZone::ImageTexture);
+        zone.surface_pattern = surface_pattern;
         zone.component_ids = encode_component_ids(component_ids);
         zone.component_weights =
             weights_from_json(entry.value("component_weights_pct", nlohmann::json::array()), component_ids.size());
         zone.display_color = entry.value("display_color", std::string());
         if (zone.display_color.empty() || zone.display_color[0] != '#')
             zone.display_color = random_display_color(zone.stable_id);
+        if (zone.is_linear_gradient()) {
+            const nlohmann::json linear_gradient = entry.value("linear_gradient", nlohmann::json::object());
+            zone.linear_gradient_start = linear_gradient_anchor_from_json(linear_gradient.value("start", nlohmann::json::object()));
+            zone.linear_gradient_end = linear_gradient_anchor_from_json(linear_gradient.value("end", nlohmann::json::object()));
+            zone.linear_gradient_stops = linear_gradient_stops_from_json(linear_gradient.value("stops", nlohmann::json::array()));
+            zone.linear_gradient_stops = normalized_linear_gradient_stops(zone, n);
+            component_ids = linear_gradient_component_ids_from_stops(zone, n);
+            if (!zone.linear_gradient_stops.empty()) {
+                zone.component_a = zone.linear_gradient_stops.front().filament_id;
+                zone.component_b = zone.linear_gradient_stops.back().filament_id;
+            }
+            zone.component_ids = encode_component_ids(component_ids);
+            zone.linear_gradient_mode = linear_gradient_mode_from_name(linear_gradient.value("mode", std::string("linear")));
+            const float radius_mm = linear_gradient.value("radius_mm", TextureMappingZone::DefaultLinearGradientRadiusMm);
+            zone.linear_gradient_radius_mm = std::isfinite(radius_mm) ? std::max(0.f, radius_mm) : TextureMappingZone::DefaultLinearGradientRadiusMm;
+            zone.linear_gradient_radius_percent = linear_gradient.value("radius_percent", TextureMappingZone::DefaultLinearGradientRadiusPercent);
+            const float radius_pct = linear_gradient.value("radius_pct", TextureMappingZone::DefaultLinearGradientRadiusPct);
+            zone.linear_gradient_radius_pct = std::isfinite(radius_pct) ? std::max(0.f, radius_pct) : TextureMappingZone::DefaultLinearGradientRadiusPct;
+            zone.show_linear_gradient_direction_arrow = linear_gradient.value("show_direction_arrow", true);
+        }
 
         const nlohmann::json texture = entry.value("texture_options", nlohmann::json::object());
         zone.texture_mapping_mode = mapping_mode_from_name(texture.value("mode", std::string("target_color")));
@@ -1276,12 +1529,19 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.reduce_outer_surface_texture = false;
         zone.seam_hiding = texture.value("hide_seams", false);
         zone.nonlinear_offset_adjustment = texture.value("nonlinear_offset_adjustment", false);
-        zone.modulation_mode =
-            modulation_mode_from_name(texture.value("modulation_mode",
-                                                    modulation_mode_name(TextureMappingZone::DefaultModulationMode)));
         zone.use_modulated_overhang_geometry_for_support =
             texture.value("use_modulated_overhang_geometry_for_support",
                           TextureMappingZone::DefaultUseModulatedOverhangGeometryForSupport);
+        const auto modulation_mode_it = texture.find("modulation_mode");
+        const bool has_modulation_mode =
+            modulation_mode_it != texture.end() && modulation_mode_it->is_string();
+        zone.modulation_mode = has_modulation_mode ?
+            modulation_mode_from_name(modulation_mode_it->get<std::string>()) :
+            TextureMappingZone::default_modulation_mode_for_surface_pattern(zone.surface_pattern);
+        zone.modulation_mode_manually_changed =
+            texture.value("modulation_mode_manually_changed",
+                          has_modulation_mode && zone.modulation_mode != TextureMappingZone::ModulationLineWidth);
+        zone.apply_default_modulation_mode();
         zone.recolor_small_perimeter_loops =
             texture.value("recolor_small_perimeter_loops", TextureMappingZone::DefaultRecolorSmallPerimeterLoops);
         zone.recolor_top_visible_perimeter_sections =
@@ -1556,11 +1816,129 @@ bool TextureMappingManager::component_count_mismatch(const TextureMappingZone &z
     return expected != 0 && selected_component_ids(zone, num_physical).size() != expected;
 }
 
+std::vector<TextureMappingZone::LinearGradientStop> TextureMappingManager::normalized_linear_gradient_stops(const TextureMappingZone &zone,
+                                                                                                            size_t                    num_physical)
+{
+    const unsigned int max_id = unsigned(std::min<size_t>(num_physical, 9));
+    std::vector<TextureMappingZone::LinearGradientStop> stops;
+    if (max_id == 0)
+        return stops;
+
+    stops.reserve(zone.linear_gradient_stops.size());
+    for (TextureMappingZone::LinearGradientStop stop : zone.linear_gradient_stops) {
+        if (stop.filament_id < 1 || stop.filament_id > max_id)
+            continue;
+        stop.position = std::clamp(std::isfinite(stop.position) ? stop.position : 0.f, 0.f, 1.f);
+        stops.emplace_back(stop);
+    }
+
+    if (stops.size() < 2) {
+        std::vector<unsigned int> ids = decode_component_ids(zone.component_ids, num_physical);
+        if (ids.size() < 2) {
+            ids.clear();
+            if (zone.component_a >= 1 && zone.component_a <= max_id)
+                ids.emplace_back(zone.component_a);
+            if (zone.component_b >= 1 && zone.component_b <= max_id)
+                ids.emplace_back(zone.component_b);
+        }
+        if (ids.empty())
+            ids.emplace_back(1);
+        while (ids.size() < 2)
+            ids.emplace_back(ids.front());
+        stops = {
+            {0.f, std::clamp(ids[0], 1u, max_id)},
+            {1.f, std::clamp(ids[1], 1u, max_id)}
+        };
+    }
+
+    std::stable_sort(stops.begin(), stops.end(), [](const auto &lhs, const auto &rhs) {
+        return lhs.position < rhs.position;
+    });
+    return stops;
+}
+
+std::vector<unsigned int> TextureMappingManager::linear_gradient_component_ids_from_stops(const TextureMappingZone &zone,
+                                                                                          size_t                    num_physical)
+{
+    std::vector<unsigned int> ids;
+    bool seen[10] = { false };
+    for (const TextureMappingZone::LinearGradientStop &stop : normalized_linear_gradient_stops(zone, num_physical)) {
+        const unsigned int id = stop.filament_id;
+        if (id == 0 || id > num_physical || id > 9 || seen[id])
+            continue;
+        seen[id] = true;
+        ids.emplace_back(id);
+    }
+    return ids;
+}
+
+std::vector<float> TextureMappingManager::linear_gradient_compact_weights(float t,
+                                                                          const std::vector<TextureMappingZone::LinearGradientStop> &stops,
+                                                                          const std::vector<unsigned int> &component_ids)
+{
+    std::vector<float> weights(component_ids.size(), 0.f);
+    if (stops.empty() || component_ids.empty())
+        return weights;
+
+    auto add_weight = [&weights, &component_ids](unsigned int filament_id, float weight) {
+        if (weight <= 0.f)
+            return;
+        for (size_t idx = 0; idx < component_ids.size(); ++idx) {
+            if (component_ids[idx] == filament_id) {
+                weights[idx] = std::max(weights[idx], std::clamp(weight, 0.f, 1.f));
+                return;
+            }
+        }
+    };
+
+    const float clamped_t = std::clamp(std::isfinite(t) ? t : 0.f, 0.f, 1.f);
+    if (clamped_t <= stops.front().position) {
+        add_weight(stops.front().filament_id, 1.f);
+        return weights;
+    }
+    if (clamped_t >= stops.back().position) {
+        add_weight(stops.back().filament_id, 1.f);
+        return weights;
+    }
+
+    size_t right = 1;
+    while (right < stops.size() && clamped_t > stops[right].position)
+        ++right;
+    if (right >= stops.size()) {
+        add_weight(stops.back().filament_id, 1.f);
+        return weights;
+    }
+
+    const TextureMappingZone::LinearGradientStop &lhs = stops[right - 1];
+    const TextureMappingZone::LinearGradientStop &rhs = stops[right];
+    const float denom = rhs.position - lhs.position;
+    if (lhs.filament_id == rhs.filament_id || denom <= 1e-6f) {
+        add_weight(rhs.filament_id, 1.f);
+        return weights;
+    }
+
+    const float local_t = std::clamp((clamped_t - lhs.position) / denom, 0.f, 1.f);
+    float lhs_weight = 1.f - local_t;
+    float rhs_weight = local_t;
+    const float max_weight = std::max(lhs_weight, rhs_weight);
+    if (max_weight > 1e-6f) {
+        lhs_weight /= max_weight;
+        rhs_weight /= max_weight;
+    }
+    add_weight(lhs.filament_id, lhs_weight);
+    add_weight(rhs.filament_id, rhs_weight);
+    return weights;
+}
+
 std::vector<unsigned int> TextureMappingManager::selected_component_ids(const TextureMappingZone &zone, size_t num_physical)
 {
+    if (zone.is_linear_gradient())
+        return linear_gradient_component_ids_from_stops(zone, num_physical);
+
     std::vector<unsigned int> ids = decode_component_ids(zone.component_ids, num_physical);
-    if (!ids.empty())
+    if (!ids.empty()) {
         return ids;
+    }
 
     if (zone.component_a >= 1 && zone.component_a <= num_physical)
         ids.emplace_back(zone.component_a);

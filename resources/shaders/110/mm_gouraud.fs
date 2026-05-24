@@ -182,6 +182,9 @@ void main()
             vec3 preview_color_b = slope.highlight_color.rgb * 0.25 + preview_accent * 0.75;
             color = mix(preview_color_a, preview_color_b, preview_check);
             alpha = max(alpha, slope.highlight_color.a);
+        } else if (slope.preview_mode == 5) {
+            color = slope.highlight_color.rgb;
+            alpha = max(alpha, slope.highlight_color.a);
         } else {
             int effective_state = slope.current_state == 0 ? slope.base_state : slope.current_state;
             if (slopeOverrideMatches(effective_state) && slopePreviewMatches(smooth_world_normal_z)) {

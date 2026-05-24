@@ -456,6 +456,7 @@ public:
 
     //BBS: remove const qualifier
     void set_extruder_for_selected_items(const int extruder);
+    bool assign_extruder_to_objects(const std::vector<size_t>& object_idxs, const int extruder, bool erase_filament_region_painting);
     wxDataViewItemArray reorder_volumes_and_get_selection(int obj_idx, std::function<bool(const ModelVolume*)> add_to_selection = nullptr);
     void apply_volumes_order();
 
