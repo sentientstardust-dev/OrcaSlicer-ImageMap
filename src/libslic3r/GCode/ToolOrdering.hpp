@@ -158,6 +158,7 @@ public:
     std::vector<unsigned int> 	extruders;
     std::vector<unsigned int>   texture_mapping_extruders;
     std::vector<unsigned int>   texture_mapping_component_extruders;
+    std::vector<unsigned int>   top_surface_image_no_fixed_desired_extruders;
     // If per layer extruder switches are inserted by the G-code preview slider, this value contains the new (1 based) extruder, with which the whole object layer is being printed with.
     // If not overriden, it is set to 0.
     unsigned int 				extruder_override = 0;

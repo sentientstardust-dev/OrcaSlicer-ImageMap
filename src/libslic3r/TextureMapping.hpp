@@ -66,6 +66,11 @@ struct TextureMappingZone
         TopVisibleRecolorAggressive = 2
     };
 
+    enum TopSurfaceImagePrintingMethod : uint8_t {
+        TopSurfaceImageSameAngle45Width = 0,
+        TopSurfaceImageSameLayer45Partition = 1
+    };
+
     enum FilamentColorMode : uint8_t {
         FilamentColorAny = 0,
         FilamentColorRGB = 1,
@@ -140,6 +145,16 @@ struct TextureMappingZone
     static constexpr int   MaxTopVisiblePerimeterRecolorAboveLayers = 5;
     static constexpr int   DefaultTopVisiblePerimeterRecolorAboveLayers = 2;
     static constexpr bool  DefaultTopVisiblePerimeterRecolorPointSampling = true;
+    static constexpr bool  DefaultTopSurfaceImagePrintingEnabled = false;
+    static constexpr int   DefaultTopSurfaceImagePrintingMethod = int(TopSurfaceImageSameAngle45Width);
+    static constexpr float MinTopSurfaceImageLineWidthMm = 0.32f;
+    static constexpr float MaxTopSurfaceImageLineWidthMm = 0.80f;
+    static constexpr float DefaultTopSurfaceImageMinLineWidthMm = 0.32f;
+    static constexpr float DefaultTopSurfaceImageMaxLineWidthMm = 0.80f;
+    static constexpr int   MinTopSurfaceImageColoredTopLayers = 1;
+    static constexpr int   MaxTopSurfaceImageColoredTopLayers = 20;
+    static constexpr int   DefaultTopSurfaceImageColoredTopLayers = 3;
+    static constexpr bool  DefaultTopSurfaceImageFixedColoringFilaments = true;
     static constexpr bool  DefaultCompactOffsetMode = true;
     static constexpr bool  DefaultUseLegacyFixedColorMode = false;
     static constexpr bool  DefaultHighSpeedImageTextureSampling = true;
@@ -228,6 +243,12 @@ struct TextureMappingZone
     int         top_visible_perimeter_recolor_aggressiveness = DefaultTopVisiblePerimeterRecolorAggressiveness;
     int         top_visible_perimeter_recolor_above_layers = DefaultTopVisiblePerimeterRecolorAboveLayers;
     bool        top_visible_perimeter_recolor_point_sampling = DefaultTopVisiblePerimeterRecolorPointSampling;
+    bool        top_surface_image_printing_enabled = DefaultTopSurfaceImagePrintingEnabled;
+    int         top_surface_image_printing_method = DefaultTopSurfaceImagePrintingMethod;
+    float       top_surface_image_min_line_width_mm = DefaultTopSurfaceImageMinLineWidthMm;
+    float       top_surface_image_max_line_width_mm = DefaultTopSurfaceImageMaxLineWidthMm;
+    int         top_surface_image_colored_top_layers = DefaultTopSurfaceImageColoredTopLayers;
+    bool        top_surface_image_fixed_coloring_filaments = DefaultTopSurfaceImageFixedColoringFilaments;
     bool        compact_offset_mode = DefaultCompactOffsetMode;
     bool        use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
     bool        high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;
@@ -272,6 +293,13 @@ struct TextureMappingZone
     bool is_linear_gradient() const { return surface_pattern == int(LinearGradient); }
     bool is_radial_linear_gradient() const { return is_linear_gradient() && linear_gradient_mode == int(LinearGradientRadial); }
     bool is_surface_gradient() const { return is_2d_gradient() || is_linear_gradient(); }
+    bool top_surface_image_printing_active() const
+    {
+        return top_surface_image_printing_enabled &&
+               is_image_texture() &&
+               (top_surface_image_printing_method == int(TopSurfaceImageSameAngle45Width) ||
+                top_surface_image_printing_method == int(TopSurfaceImageSameLayer45Partition));
+    }
 
     void apply_default_modulation_mode()
     {
@@ -309,6 +337,12 @@ struct TextureMappingZone
         top_visible_perimeter_recolor_aggressiveness = DefaultTopVisiblePerimeterRecolorAggressiveness;
         top_visible_perimeter_recolor_above_layers = DefaultTopVisiblePerimeterRecolorAboveLayers;
         top_visible_perimeter_recolor_point_sampling = DefaultTopVisiblePerimeterRecolorPointSampling;
+        top_surface_image_printing_enabled = DefaultTopSurfaceImagePrintingEnabled;
+        top_surface_image_printing_method = DefaultTopSurfaceImagePrintingMethod;
+        top_surface_image_min_line_width_mm = DefaultTopSurfaceImageMinLineWidthMm;
+        top_surface_image_max_line_width_mm = DefaultTopSurfaceImageMaxLineWidthMm;
+        top_surface_image_colored_top_layers = DefaultTopSurfaceImageColoredTopLayers;
+        top_surface_image_fixed_coloring_filaments = DefaultTopSurfaceImageFixedColoringFilaments;
         compact_offset_mode = DefaultCompactOffsetMode;
         use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
         high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;

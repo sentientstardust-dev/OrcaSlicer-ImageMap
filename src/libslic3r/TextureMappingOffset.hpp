@@ -103,7 +103,9 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     unsigned int             active_component_id_override = 0,
     std::optional<float>     base_outer_width_mm_override = std::nullopt,
     std::optional<float>     layer_height_mm_override = std::nullopt,
-    std::optional<Vec2d>     plate_origin_mm_override = std::nullopt);
+    std::optional<Vec2d>     plate_origin_mm_override = std::nullopt,
+    std::optional<float>     min_outer_width_mm_override = std::nullopt,
+    std::optional<std::array<float, 4>> image_background_rgba_override = std::nullopt);
 
 std::vector<float> sample_weight_field_components(const TextureMappingOffsetWeightField &weight_field,
                                                   float                                  x_mm,

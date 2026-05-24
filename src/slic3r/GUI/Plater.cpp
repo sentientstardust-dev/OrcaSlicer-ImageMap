@@ -1867,6 +1867,12 @@ public:
                                         int dithering_method,
                                         float dithering_resolution_mm,
                                         float halftone_dot_size_mm,
+                                        bool top_surface_image_printing_enabled,
+                                        int top_surface_image_printing_method,
+                                        float top_surface_image_min_line_width_mm,
+                                        float top_surface_image_max_line_width_mm,
+                                        int top_surface_image_colored_top_layers,
+                                        bool top_surface_image_fixed_coloring_filaments,
                                         const TextureMappingManager &texture_mapping_zones,
                                         const TextureMappingGlobalSettings &global_settings,
                                         const TextureMappingPrimeTowerImage &prime_tower_image,
@@ -1892,9 +1898,10 @@ public:
         tab_choices.Add(_L("Modulation Mode"));
         tab_choices.Add(_L("Preview Options"));
         tab_choices.Add(_L("Experimental Options"));
+        tab_choices.Add(_L("Top-surface coloring (experimental)"));
         tab_choices.Add(_L("Prime Tower Texture Mapping"));
         m_options_tab_choice = new wxChoice(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, tab_choices);
-        m_options_tab_choice->SetSelection(std::clamp(initial_options_tab, 0, 5));
+        m_options_tab_choice->SetSelection(std::clamp(initial_options_tab, 0, 6));
         tab_row->Add(m_options_tab_choice, 1, wxALIGN_CENTER_VERTICAL);
         root->Add(tab_row, 0, wxEXPAND | wxALL, gap);
 
@@ -1914,6 +1921,9 @@ public:
         auto *experimental_page = new wxPanel(m_options_book, wxID_ANY);
         auto *experimental_root = new wxBoxSizer(wxVERTICAL);
         experimental_page->SetSizer(experimental_root);
+        auto *top_surface_page = new wxPanel(m_options_book, wxID_ANY);
+        auto *top_surface_root = new wxBoxSizer(wxVERTICAL);
+        top_surface_page->SetSizer(top_surface_root);
         auto *global_page = new wxPanel(m_options_book, wxID_ANY);
         auto *global_root = new wxBoxSizer(wxVERTICAL);
         global_page->SetSizer(global_root);
@@ -2315,6 +2325,104 @@ public:
         update_modulation_mode_options_visibility(false);
         experimental_root->Add(experimental_box, 0, wxEXPAND | wxALL, gap);
 
+        auto *top_surface_box = new wxStaticBoxSizer(wxVERTICAL, top_surface_page, _L("Top-surface coloring"));
+        m_top_surface_image_printing_enabled_checkbox =
+            new wxCheckBox(top_surface_page, wxID_ANY, _L("Enable top-surface image coloring"));
+        m_top_surface_image_printing_enabled_checkbox->SetValue(top_surface_image_printing_enabled);
+        top_surface_box->Add(m_top_surface_image_printing_enabled_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+        auto *top_surface_method_row = new wxBoxSizer(wxHORIZONTAL);
+        top_surface_method_row->Add(new wxStaticText(top_surface_page, wxID_ANY, _L("Method")),
+                                    0,
+                                    wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                                    gap);
+        wxArrayString top_surface_method_choices;
+        top_surface_method_choices.Add(_L("45 degree width modulation"));
+        top_surface_method_choices.Add(_L("Same-layer 45 partition"));
+        m_top_surface_image_method_choice =
+            new wxChoice(top_surface_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, top_surface_method_choices);
+        m_top_surface_image_method_choice->SetSelection(std::clamp(top_surface_image_printing_method,
+                                                                   int(TextureMappingZone::TopSurfaceImageSameAngle45Width),
+                                                                   int(TextureMappingZone::TopSurfaceImageSameLayer45Partition)));
+        top_surface_method_row->Add(m_top_surface_image_method_choice, 1, wxALIGN_CENTER_VERTICAL);
+        top_surface_box->Add(top_surface_method_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+        auto *top_surface_width_row = new wxBoxSizer(wxHORIZONTAL);
+        top_surface_width_row->Add(new wxStaticText(top_surface_page, wxID_ANY, _L("Line width")),
+                                   0,
+                                   wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                                   gap);
+        m_top_surface_image_min_line_width_spin =
+            new wxSpinCtrlDouble(top_surface_page,
+                                 wxID_ANY,
+                                 wxEmptyString,
+                                 wxDefaultPosition,
+                                 wxSize(FromDIP(84), -1),
+                                 wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER,
+                                 double(TextureMappingZone::MinTopSurfaceImageLineWidthMm),
+                                 double(TextureMappingZone::MaxTopSurfaceImageLineWidthMm),
+                                 std::clamp(double(top_surface_image_min_line_width_mm),
+                                            double(TextureMappingZone::MinTopSurfaceImageLineWidthMm),
+                                            double(TextureMappingZone::MaxTopSurfaceImageLineWidthMm)),
+                                 0.01);
+        m_top_surface_image_min_line_width_spin->SetDigits(2);
+        top_surface_width_row->Add(m_top_surface_image_min_line_width_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+        top_surface_width_row->Add(new wxStaticText(top_surface_page, wxID_ANY, _L("to")),
+                                   0,
+                                   wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                                   gap / 2);
+        m_top_surface_image_max_line_width_spin =
+            new wxSpinCtrlDouble(top_surface_page,
+                                 wxID_ANY,
+                                 wxEmptyString,
+                                 wxDefaultPosition,
+                                 wxSize(FromDIP(84), -1),
+                                 wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER,
+                                 double(TextureMappingZone::MinTopSurfaceImageLineWidthMm),
+                                 double(TextureMappingZone::MaxTopSurfaceImageLineWidthMm),
+                                 std::clamp(double(top_surface_image_max_line_width_mm),
+                                            double(TextureMappingZone::MinTopSurfaceImageLineWidthMm),
+                                            double(TextureMappingZone::MaxTopSurfaceImageLineWidthMm)),
+                                 0.01);
+        m_top_surface_image_max_line_width_spin->SetDigits(2);
+        top_surface_width_row->Add(m_top_surface_image_max_line_width_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+        top_surface_width_row->Add(new wxStaticText(top_surface_page, wxID_ANY, _L("mm")), 0, wxALIGN_CENTER_VERTICAL);
+        top_surface_box->Add(top_surface_width_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+        m_top_surface_image_colored_top_layers_panel = new wxPanel(top_surface_page, wxID_ANY);
+        auto *top_surface_colored_layers_row = new wxBoxSizer(wxHORIZONTAL);
+        m_top_surface_image_colored_top_layers_panel->SetSizer(top_surface_colored_layers_row);
+        top_surface_colored_layers_row->Add(new wxStaticText(m_top_surface_image_colored_top_layers_panel, wxID_ANY, _L("Colored top layers")),
+                                            0,
+                                            wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                                            gap);
+        m_top_surface_image_colored_top_layers_spin =
+            new wxSpinCtrl(m_top_surface_image_colored_top_layers_panel,
+                           wxID_ANY,
+                           wxEmptyString,
+                           wxDefaultPosition,
+                           wxSize(FromDIP(70), -1),
+                           wxSP_ARROW_KEYS | wxALIGN_RIGHT,
+                           TextureMappingZone::MinTopSurfaceImageColoredTopLayers,
+                           TextureMappingZone::MaxTopSurfaceImageColoredTopLayers,
+                           std::clamp(top_surface_image_colored_top_layers,
+                                      TextureMappingZone::MinTopSurfaceImageColoredTopLayers,
+                                      TextureMappingZone::MaxTopSurfaceImageColoredTopLayers));
+        top_surface_colored_layers_row->Add(m_top_surface_image_colored_top_layers_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+        top_surface_colored_layers_row->Add(new wxStaticText(m_top_surface_image_colored_top_layers_panel, wxID_ANY, _L("layers")),
+                                            0,
+                                            wxALIGN_CENTER_VERTICAL);
+        top_surface_box->Add(m_top_surface_image_colored_top_layers_panel, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+        m_top_surface_image_fixed_coloring_filaments_checkbox =
+            new wxCheckBox(top_surface_page, wxID_ANY, _L("Fixed top-surface coloring filaments"));
+        m_top_surface_image_fixed_coloring_filaments_checkbox->SetValue(top_surface_image_fixed_coloring_filaments);
+        top_surface_box->Add(m_top_surface_image_fixed_coloring_filaments_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, gap);
+        m_top_surface_image_printing_enabled_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+            update_top_surface_image_options_visibility(false);
+        });
+        m_top_surface_image_method_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) {
+            update_top_surface_image_options_visibility(true);
+        });
+        top_surface_root->Add(top_surface_box, 0, wxEXPAND | wxALL, gap);
+        update_top_surface_image_options_visibility(false);
+
         m_prime_tower_mapping_enabled_checkbox = new wxCheckBox(global_page, wxID_ANY, _L("Enable prime tower image mapping"));
         m_prime_tower_mapping_enabled_checkbox->SetValue(m_global_settings.enabled);
         global_root->Add(m_prime_tower_mapping_enabled_checkbox, 0, wxEXPAND | wxALL, gap);
@@ -2451,14 +2559,15 @@ public:
         m_options_book->AddPage(print_settings_page, _L("Modulation Mode"));
         m_options_book->AddPage(preview_page, _L("Preview Options"));
         m_options_book->AddPage(experimental_page, _L("Experimental Options"));
+        m_options_book->AddPage(top_surface_page, _L("Top-surface coloring (experimental)"));
         m_options_book->AddPage(global_page, _L("Prime Tower Texture Mapping"));
         update_options_book_min_size();
         m_options_tab_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &evt) {
             if (m_options_book)
-                m_options_book->SetSelection(std::clamp(evt.GetSelection(), 0, 5));
+                m_options_book->SetSelection(std::clamp(evt.GetSelection(), 0, 6));
         });
         if (m_options_book)
-            m_options_book->SetSelection(std::clamp(initial_options_tab, 0, 5));
+            m_options_book->SetSelection(std::clamp(initial_options_tab, 0, 6));
         root->Add(m_options_book, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
         if (wxSizer *buttons = CreateStdDialogButtonSizer(wxOK | wxCANCEL))
             root->Add(buttons, 0, wxEXPAND | wxALL, gap);
@@ -2563,6 +2672,55 @@ public:
                                 double(TextureMappingZone::MinHalftoneDotSizeMm),
                                 double(TextureMappingZone::MaxHalftoneDotSizeMm)));
     }
+    bool top_surface_image_printing_enabled() const
+    {
+        return m_top_surface_image_printing_enabled_checkbox != nullptr &&
+               m_top_surface_image_printing_enabled_checkbox->GetValue();
+    }
+    int top_surface_image_printing_method() const
+    {
+        return m_top_surface_image_method_choice ?
+            std::clamp(m_top_surface_image_method_choice->GetSelection(),
+                       int(TextureMappingZone::TopSurfaceImageSameAngle45Width),
+                       int(TextureMappingZone::TopSurfaceImageSameLayer45Partition)) :
+            TextureMappingZone::DefaultTopSurfaceImagePrintingMethod;
+    }
+    float top_surface_image_min_line_width_mm() const
+    {
+        const double max_width = m_top_surface_image_max_line_width_spin != nullptr ?
+            m_top_surface_image_max_line_width_spin->GetValue() :
+            double(TextureMappingZone::DefaultTopSurfaceImageMaxLineWidthMm);
+        const double value = m_top_surface_image_min_line_width_spin != nullptr ?
+            m_top_surface_image_min_line_width_spin->GetValue() :
+            double(TextureMappingZone::DefaultTopSurfaceImageMinLineWidthMm);
+        return float(std::clamp(value,
+                                double(TextureMappingZone::MinTopSurfaceImageLineWidthMm),
+                                std::clamp(max_width,
+                                           double(TextureMappingZone::MinTopSurfaceImageLineWidthMm),
+                                           double(TextureMappingZone::MaxTopSurfaceImageLineWidthMm))));
+    }
+    float top_surface_image_max_line_width_mm() const
+    {
+        const double value = m_top_surface_image_max_line_width_spin != nullptr ?
+            m_top_surface_image_max_line_width_spin->GetValue() :
+            double(TextureMappingZone::DefaultTopSurfaceImageMaxLineWidthMm);
+        return float(std::clamp(value,
+                                double(TextureMappingZone::MinTopSurfaceImageLineWidthMm),
+                                double(TextureMappingZone::MaxTopSurfaceImageLineWidthMm)));
+    }
+    int top_surface_image_colored_top_layers() const
+    {
+        return m_top_surface_image_colored_top_layers_spin ?
+            std::clamp(m_top_surface_image_colored_top_layers_spin->GetValue(),
+                       TextureMappingZone::MinTopSurfaceImageColoredTopLayers,
+                       TextureMappingZone::MaxTopSurfaceImageColoredTopLayers) :
+            TextureMappingZone::DefaultTopSurfaceImageColoredTopLayers;
+    }
+    bool top_surface_image_fixed_coloring_filaments() const
+    {
+        return m_top_surface_image_fixed_coloring_filaments_checkbox == nullptr ||
+               m_top_surface_image_fixed_coloring_filaments_checkbox->GetValue();
+    }
     bool minimum_visibility_offset_enabled() const
     {
         return m_minimum_visibility_offset_checkbox && m_minimum_visibility_offset_checkbox->GetValue();
@@ -2638,7 +2796,7 @@ public:
 
     const TextureMappingPrimeTowerImage& prime_tower_image() const { return m_prime_tower_image; }
     const TextureMappingPrimeTowerImage& prime_tower_image_back() const { return m_prime_tower_image_back; }
-    int selected_options_tab() const { return std::clamp(m_options_tab_choice ? m_options_tab_choice->GetSelection() : 0, 0, 5); }
+    int selected_options_tab() const { return std::clamp(m_options_tab_choice ? m_options_tab_choice->GetSelection() : 0, 0, 6); }
     bool strength_offsets_expanded() const { return m_strength_offsets_expanded; }
 
     std::vector<float> component_strengths_pct() const
@@ -2937,6 +3095,37 @@ private:
         }
     }
 
+    void update_top_surface_image_options_visibility(bool fit_dialog)
+    {
+        const bool enabled =
+            m_top_surface_image_printing_enabled_checkbox != nullptr &&
+            m_top_surface_image_printing_enabled_checkbox->GetValue();
+        if (m_top_surface_image_method_choice != nullptr)
+            m_top_surface_image_method_choice->Enable(enabled);
+        if (m_top_surface_image_min_line_width_spin != nullptr)
+            m_top_surface_image_min_line_width_spin->Enable(enabled);
+        if (m_top_surface_image_max_line_width_spin != nullptr)
+            m_top_surface_image_max_line_width_spin->Enable(enabled);
+        const bool same_layer =
+            enabled &&
+            m_top_surface_image_method_choice != nullptr &&
+            m_top_surface_image_method_choice->GetSelection() == int(TextureMappingZone::TopSurfaceImageSameLayer45Partition);
+        if (m_top_surface_image_colored_top_layers_panel != nullptr)
+            m_top_surface_image_colored_top_layers_panel->Show(same_layer);
+        if (m_top_surface_image_colored_top_layers_spin != nullptr)
+            m_top_surface_image_colored_top_layers_spin->Enable(same_layer);
+        if (m_top_surface_image_fixed_coloring_filaments_checkbox != nullptr)
+            m_top_surface_image_fixed_coloring_filaments_checkbox->Enable(enabled);
+        layout_current_options_page();
+        if (!fit_dialog)
+            return;
+        update_options_book_min_size();
+        if (GetSizer() != nullptr) {
+            Layout();
+            Fit();
+        }
+    }
+
     wxChoice *m_options_tab_choice {nullptr};
     wxSimplebook *m_options_book {nullptr};
     wxChoice *m_texture_mapping_mode_choice {nullptr};
@@ -2969,6 +3158,13 @@ private:
     wxSpinCtrlDouble *m_dithering_resolution_spin {nullptr};
     wxPanel *m_halftone_dot_size_panel {nullptr};
     wxSpinCtrlDouble *m_halftone_dot_size_spin {nullptr};
+    wxCheckBox *m_top_surface_image_printing_enabled_checkbox {nullptr};
+    wxChoice *m_top_surface_image_method_choice {nullptr};
+    wxSpinCtrlDouble *m_top_surface_image_min_line_width_spin {nullptr};
+    wxSpinCtrlDouble *m_top_surface_image_max_line_width_spin {nullptr};
+    wxPanel *m_top_surface_image_colored_top_layers_panel {nullptr};
+    wxSpinCtrl *m_top_surface_image_colored_top_layers_spin {nullptr};
+    wxCheckBox *m_top_surface_image_fixed_coloring_filaments_checkbox {nullptr};
     wxCheckBox *m_use_legacy_fixed_color_mode_checkbox {nullptr};
     wxCheckBox *m_minimum_visibility_offset_checkbox {nullptr};
     wxSpinCtrl *m_minimum_visibility_offset_spin {nullptr};
@@ -7912,6 +8108,12 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.dithering_method,
                                                     updated.dithering_resolution_mm,
                                                     updated.halftone_dot_size_mm,
+                                                    updated.top_surface_image_printing_enabled,
+                                                    updated.top_surface_image_printing_method,
+                                                    updated.top_surface_image_min_line_width_mm,
+                                                    updated.top_surface_image_max_line_width_mm,
+                                                    updated.top_surface_image_colored_top_layers,
+                                                    updated.top_surface_image_fixed_coloring_filaments,
                                                     bundle->texture_mapping_zones,
                                                     bundle->texture_mapping_global_settings,
                                                     wxGetApp().model().texture_mapping_prime_tower_image,
@@ -7955,6 +8157,12 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.dithering_method = dlg.dithering_method();
             updated.dithering_resolution_mm = dlg.dithering_resolution_mm();
             updated.halftone_dot_size_mm = dlg.halftone_dot_size_mm();
+            updated.top_surface_image_printing_enabled = dlg.top_surface_image_printing_enabled();
+            updated.top_surface_image_printing_method = dlg.top_surface_image_printing_method();
+            updated.top_surface_image_min_line_width_mm = dlg.top_surface_image_min_line_width_mm();
+            updated.top_surface_image_max_line_width_mm = dlg.top_surface_image_max_line_width_mm();
+            updated.top_surface_image_colored_top_layers = dlg.top_surface_image_colored_top_layers();
+            updated.top_surface_image_fixed_coloring_filaments = dlg.top_surface_image_fixed_coloring_filaments();
             if (updated.dithering_enabled)
                 updated.compact_offset_mode = true;
             updated.minimum_visibility_offset_enabled = dlg.minimum_visibility_offset_enabled();

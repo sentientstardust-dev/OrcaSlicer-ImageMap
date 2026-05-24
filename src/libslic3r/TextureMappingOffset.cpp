@@ -1510,7 +1510,8 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
     float layer_z_mm,
     float layer_z_falloff_mm,
     bool high_resolution_texture_sampling,
-    bool high_speed_image_texture_sampling)
+    bool high_speed_image_texture_sampling,
+    std::optional<std::array<float, 4>> image_background_rgba_override)
 {
     TextureMappingOffsetWeightField weight_field;
     if (component_colors.empty())
@@ -1616,7 +1617,8 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
 
         const indexed_triangle_set &its = mesh_ptr->its;
         const Transform3d volume_trafo = object_trafo * volume->get_matrix();
-        const std::array<float, 4> background_color = texture_mapping_background_color(*volume);
+        const std::array<float, 4> background_color =
+            image_background_rgba_override ? *image_background_rgba_override : texture_mapping_background_color(*volume);
 
         if (!volume->texture_mapping_color_facets.empty()) {
             std::vector<ColorFacetTriangle> color_facets;
@@ -2813,7 +2815,9 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     unsigned int             active_component_id_override,
     std::optional<float>     base_outer_width_mm_override,
     std::optional<float>     layer_height_mm_override,
-    std::optional<Vec2d>     plate_origin_mm_override)
+    std::optional<Vec2d>     plate_origin_mm_override,
+    std::optional<float>     min_outer_width_mm_override,
+    std::optional<std::array<float, 4>> image_background_rgba_override)
 {
     const Print *print = print_object.print();
     if (print == nullptr)
@@ -2946,10 +2950,11 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     const float base_outer_width_mm = base_outer_width_mm_override ?
         std::max(0.05f, *base_outer_width_mm_override) :
         std::max(0.05f, float(print_config.texture_mapping_outer_wall_gradient_max_line_width.value));
-    const float config_min_gradient_width_mm = std::clamp(
-        float(print_config.texture_mapping_outer_wall_gradient_min_line_width.value),
-        0.05f,
-        base_outer_width_mm);
+    const float config_min_gradient_width_mm = min_outer_width_mm_override ?
+        std::clamp(*min_outer_width_mm_override, 0.05f, base_outer_width_mm) :
+        std::clamp(float(print_config.texture_mapping_outer_wall_gradient_min_line_width.value),
+                   0.05f,
+                   base_outer_width_mm);
     const float layer_height_mm = layer_height_mm_override ?
         std::max(0.01f, *layer_height_mm_override) :
         std::max(0.01f, float(layer.height));
@@ -3019,7 +3024,8 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
                                                            float(layer.print_z),
                                                            layer_sample_falloff_mm,
                                                            high_resolution_texture_sampling,
-                                                           zone.high_speed_image_texture_sampling);
+                                                           zone.high_speed_image_texture_sampling,
+                                                           image_background_rgba_override);
         if (weight_field.empty())
             return std::nullopt;
     }

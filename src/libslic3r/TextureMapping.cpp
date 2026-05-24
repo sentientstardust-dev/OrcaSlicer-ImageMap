@@ -666,6 +666,20 @@ static int modulation_mode_from_name(const std::string &name)
     return int(TextureMappingZone::ModulationLineWidth);
 }
 
+static std::string top_surface_image_printing_method_name(int method)
+{
+    if (method == int(TextureMappingZone::TopSurfaceImageSameLayer45Partition))
+        return std::string("same_layer_45_partition");
+    return std::string("same_angle_45_width");
+}
+
+static int top_surface_image_printing_method_from_name(const std::string &name)
+{
+    if (name == "same_layer_45_partition")
+        return int(TextureMappingZone::TopSurfaceImageSameLayer45Partition);
+    return int(TextureMappingZone::TopSurfaceImageSameAngle45Width);
+}
+
 static std::string top_visible_recolor_aggressiveness_name(int mode)
 {
     switch (clamp_int(mode,
@@ -1024,6 +1038,12 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            top_visible_perimeter_recolor_aggressiveness == rhs.top_visible_perimeter_recolor_aggressiveness &&
            top_visible_perimeter_recolor_above_layers == rhs.top_visible_perimeter_recolor_above_layers &&
            top_visible_perimeter_recolor_point_sampling == rhs.top_visible_perimeter_recolor_point_sampling &&
+           top_surface_image_printing_enabled == rhs.top_surface_image_printing_enabled &&
+           top_surface_image_printing_method == rhs.top_surface_image_printing_method &&
+           std::abs(top_surface_image_min_line_width_mm - rhs.top_surface_image_min_line_width_mm) <= eps &&
+           std::abs(top_surface_image_max_line_width_mm - rhs.top_surface_image_max_line_width_mm) <= eps &&
+           top_surface_image_colored_top_layers == rhs.top_surface_image_colored_top_layers &&
+           top_surface_image_fixed_coloring_filaments == rhs.top_surface_image_fixed_coloring_filaments &&
            compact_offset_mode == rhs.compact_offset_mode &&
            use_legacy_fixed_color_mode == rhs.use_legacy_fixed_color_mode &&
            high_speed_image_texture_sampling == rhs.high_speed_image_texture_sampling &&
@@ -1362,6 +1382,25 @@ std::string TextureMappingManager::serialize_entries()
                       TextureMappingZone::MinTopVisiblePerimeterRecolorAboveLayers,
                       TextureMappingZone::MaxTopVisiblePerimeterRecolorAboveLayers);
         texture["top_visible_perimeter_recolor_point_sampling"] = zone.top_visible_perimeter_recolor_point_sampling;
+        texture["top_surface_image_printing_enabled"] = zone.top_surface_image_printing_enabled;
+        texture["top_surface_image_printing_method"] =
+            top_surface_image_printing_method_name(zone.top_surface_image_printing_method);
+        const float top_surface_max_width =
+            std::clamp(finite_or(zone.top_surface_image_max_line_width_mm,
+                                 TextureMappingZone::DefaultTopSurfaceImageMaxLineWidthMm),
+                       TextureMappingZone::MinTopSurfaceImageLineWidthMm,
+                       TextureMappingZone::MaxTopSurfaceImageLineWidthMm);
+        texture["top_surface_image_min_line_width_mm"] =
+            std::clamp(finite_or(zone.top_surface_image_min_line_width_mm,
+                                 TextureMappingZone::DefaultTopSurfaceImageMinLineWidthMm),
+                       TextureMappingZone::MinTopSurfaceImageLineWidthMm,
+                       top_surface_max_width);
+        texture["top_surface_image_max_line_width_mm"] = top_surface_max_width;
+        texture["top_surface_image_colored_top_layers"] =
+            clamp_int(zone.top_surface_image_colored_top_layers,
+                      TextureMappingZone::MinTopSurfaceImageColoredTopLayers,
+                      TextureMappingZone::MaxTopSurfaceImageColoredTopLayers);
+        texture["top_surface_image_fixed_coloring_filaments"] = zone.top_surface_image_fixed_coloring_filaments;
         texture["compact_offset_mode"] = zone.compact_offset_mode;
         texture["use_legacy_fixed_color_mode"] = zone.use_legacy_fixed_color_mode;
         texture["high_speed_image_texture_sampling"] = true;
@@ -1560,6 +1599,33 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.top_visible_perimeter_recolor_point_sampling =
             texture.value("top_visible_perimeter_recolor_point_sampling",
                           TextureMappingZone::DefaultTopVisiblePerimeterRecolorPointSampling);
+        zone.top_surface_image_printing_enabled =
+            texture.value("top_surface_image_printing_enabled",
+                          TextureMappingZone::DefaultTopSurfaceImagePrintingEnabled);
+        zone.top_surface_image_printing_method =
+            top_surface_image_printing_method_from_name(
+                texture.value("top_surface_image_printing_method",
+                              top_surface_image_printing_method_name(TextureMappingZone::DefaultTopSurfaceImagePrintingMethod)));
+        zone.top_surface_image_max_line_width_mm =
+            std::clamp(finite_or(texture.value("top_surface_image_max_line_width_mm",
+                                               TextureMappingZone::DefaultTopSurfaceImageMaxLineWidthMm),
+                                 TextureMappingZone::DefaultTopSurfaceImageMaxLineWidthMm),
+                       TextureMappingZone::MinTopSurfaceImageLineWidthMm,
+                       TextureMappingZone::MaxTopSurfaceImageLineWidthMm);
+        zone.top_surface_image_min_line_width_mm =
+            std::clamp(finite_or(texture.value("top_surface_image_min_line_width_mm",
+                                               TextureMappingZone::DefaultTopSurfaceImageMinLineWidthMm),
+                                 TextureMappingZone::DefaultTopSurfaceImageMinLineWidthMm),
+                       TextureMappingZone::MinTopSurfaceImageLineWidthMm,
+                       zone.top_surface_image_max_line_width_mm);
+        zone.top_surface_image_colored_top_layers =
+            clamp_int(texture.value("top_surface_image_colored_top_layers",
+                                    TextureMappingZone::DefaultTopSurfaceImageColoredTopLayers),
+                      TextureMappingZone::MinTopSurfaceImageColoredTopLayers,
+                      TextureMappingZone::MaxTopSurfaceImageColoredTopLayers);
+        zone.top_surface_image_fixed_coloring_filaments =
+            texture.value("top_surface_image_fixed_coloring_filaments",
+                          TextureMappingZone::DefaultTopSurfaceImageFixedColoringFilaments);
         zone.compact_offset_mode = texture.value("compact_offset_mode", TextureMappingZone::DefaultCompactOffsetMode);
         zone.use_legacy_fixed_color_mode =
             texture.value("use_legacy_fixed_color_mode", TextureMappingZone::DefaultUseLegacyFixedColorMode);

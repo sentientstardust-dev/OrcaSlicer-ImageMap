@@ -32,9 +32,41 @@ public:
     ExtrusionEntitiesPtr entities;     // we own these entities
     bool no_sort;
     int texture_mapping_extruder_override;
-    ExtrusionEntityCollection(): no_sort(false), texture_mapping_extruder_override(-1) {}
-    ExtrusionEntityCollection(const ExtrusionEntityCollection &other) : no_sort(other.no_sort), texture_mapping_extruder_override(other.texture_mapping_extruder_override), is_reverse(other.is_reverse) { this->append(other.entities); }
-    ExtrusionEntityCollection(ExtrusionEntityCollection &&other) : entities(std::move(other.entities)), no_sort(other.no_sort), texture_mapping_extruder_override(other.texture_mapping_extruder_override), is_reverse(other.is_reverse) {}
+    bool texture_mapping_top_surface_image;
+    unsigned int texture_mapping_top_surface_zone_id;
+    unsigned int texture_mapping_top_surface_desired_component_id;
+    int texture_mapping_top_surface_stack_depth;
+    bool texture_mapping_top_surface_fixed_coloring;
+    ExtrusionEntityCollection()
+        : no_sort(false)
+        , texture_mapping_extruder_override(-1)
+        , texture_mapping_top_surface_image(false)
+        , texture_mapping_top_surface_zone_id(0)
+        , texture_mapping_top_surface_desired_component_id(0)
+        , texture_mapping_top_surface_stack_depth(-1)
+        , texture_mapping_top_surface_fixed_coloring(true)
+    {}
+    ExtrusionEntityCollection(const ExtrusionEntityCollection &other)
+        : no_sort(other.no_sort)
+        , texture_mapping_extruder_override(other.texture_mapping_extruder_override)
+        , texture_mapping_top_surface_image(other.texture_mapping_top_surface_image)
+        , texture_mapping_top_surface_zone_id(other.texture_mapping_top_surface_zone_id)
+        , texture_mapping_top_surface_desired_component_id(other.texture_mapping_top_surface_desired_component_id)
+        , texture_mapping_top_surface_stack_depth(other.texture_mapping_top_surface_stack_depth)
+        , texture_mapping_top_surface_fixed_coloring(other.texture_mapping_top_surface_fixed_coloring)
+        , is_reverse(other.is_reverse)
+    { this->append(other.entities); }
+    ExtrusionEntityCollection(ExtrusionEntityCollection &&other)
+        : entities(std::move(other.entities))
+        , no_sort(other.no_sort)
+        , texture_mapping_extruder_override(other.texture_mapping_extruder_override)
+        , texture_mapping_top_surface_image(other.texture_mapping_top_surface_image)
+        , texture_mapping_top_surface_zone_id(other.texture_mapping_top_surface_zone_id)
+        , texture_mapping_top_surface_desired_component_id(other.texture_mapping_top_surface_desired_component_id)
+        , texture_mapping_top_surface_stack_depth(other.texture_mapping_top_surface_stack_depth)
+        , texture_mapping_top_surface_fixed_coloring(other.texture_mapping_top_surface_fixed_coloring)
+        , is_reverse(other.is_reverse)
+    {}
     explicit ExtrusionEntityCollection(const ExtrusionPaths &paths);
     ExtrusionEntityCollection& operator=(const ExtrusionEntityCollection &other);
     ExtrusionEntityCollection& operator=(ExtrusionEntityCollection &&other)
@@ -42,6 +74,11 @@ public:
         this->entities = std::move(other.entities);
         this->no_sort  = other.no_sort;
         this->texture_mapping_extruder_override = other.texture_mapping_extruder_override;
+        this->texture_mapping_top_surface_image = other.texture_mapping_top_surface_image;
+        this->texture_mapping_top_surface_zone_id = other.texture_mapping_top_surface_zone_id;
+        this->texture_mapping_top_surface_desired_component_id = other.texture_mapping_top_surface_desired_component_id;
+        this->texture_mapping_top_surface_stack_depth = other.texture_mapping_top_surface_stack_depth;
+        this->texture_mapping_top_surface_fixed_coloring = other.texture_mapping_top_surface_fixed_coloring;
         is_reverse     = other.is_reverse;
         return *this;
     }
