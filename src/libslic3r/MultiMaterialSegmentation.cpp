@@ -1994,17 +1994,13 @@ static bool is_valid_colored_contour(const ColoredLines &lines)
     return polygon.points.size() >= 3 && std::isfinite(polygon.area()) && polygon.is_valid();
 }
 
-std::vector<ExPolygons> segmentation_by_colored_contours(const std::vector<ColoredLines> &colorized_contours,
-                                                         size_t                           num_facets_states)
+static std::vector<ColoredLines> filter_valid_colored_contours(const std::vector<ColoredLines> &colorized_contours)
 {
-    std::vector<ExPolygons> out(num_facets_states);
     std::vector<ColoredLines> contours;
     contours.reserve(colorized_contours.size());
     for (const ColoredLines &lines : colorized_contours)
         if (is_valid_colored_contour(lines))
             contours.emplace_back(lines);
-    if (contours.empty())
-        return out;
 
     size_t poly_idx = 0;
     for (ColoredLines &lines : contours) {
@@ -2016,6 +2012,17 @@ std::vector<ExPolygons> segmentation_by_colored_contours(const std::vector<Color
         }
         ++poly_idx;
     }
+
+    return contours;
+}
+
+std::vector<ExPolygons> segmentation_by_colored_contours(const std::vector<ColoredLines> &colorized_contours,
+                                                         size_t                           num_facets_states)
+{
+    std::vector<ExPolygons> out(num_facets_states);
+    std::vector<ColoredLines> contours = filter_valid_colored_contours(colorized_contours);
+    if (contours.empty())
+        return out;
 
     if (has_layer_only_one_color(contours)) {
         const int color = contours.front().front().color;
@@ -2221,6 +2228,13 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
 #endif // MM_SEGMENTATION_DEBUG_PAINTED_LINES
 
                 std::vector<ColoredLines> color_poly = colorize_contours(edge_grids[layer_idx].contours(), post_processed_painted_lines);
+                std::vector<ColoredLines> valid_color_poly = filter_valid_colored_contours(color_poly);
+                if (valid_color_poly.size() != color_poly.size())
+                    BOOST_LOG_TRIVIAL(debug) << "Print object segmentation - layer " << layer_idx << " dropped "
+                                             << (color_poly.size() - valid_color_poly.size()) << " invalid colorized contours";
+                color_poly = std::move(valid_color_poly);
+                if (color_poly.empty())
+                    continue;
 
 #ifdef MM_SEGMENTATION_DEBUG_COLORIZED_POLYGONS
                 export_colorized_polygons_to_svg(debug_out_path("2-mm-colorized_polygons-%d-%d.svg", layer_idx, iRun), color_poly, input_expolygons[layer_idx]);
