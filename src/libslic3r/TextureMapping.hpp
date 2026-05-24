@@ -97,7 +97,8 @@ struct TextureMappingZone
         DitheringFloydSteinberg = 1,
         DitheringOrderedBayer = 2,
         DitheringHalftone = 3,
-        DitheringHalftoneIncreasedDetail = 4
+        DitheringHalftoneIncreasedDetail = 4,
+        DitheringHalftoneV2 = 5
     };
 
     enum TransmissionDistanceCalibrationMode : uint8_t {
@@ -142,7 +143,7 @@ struct TextureMappingZone
     static constexpr int   DefaultGenericSolverMode = int(GenericSolverV2);
     static constexpr int   DefaultGenericSolverMixModel = int(GenericSolverPigmentPainter);
     static constexpr bool  DefaultDitheringEnabled = false;
-    static constexpr int   DefaultDitheringMethod = int(DitheringHalftone);
+    static constexpr int   DefaultDitheringMethod = int(DitheringHalftoneV2);
     static constexpr float MinDitheringResolutionMm = 0.04f;
     static constexpr float MaxDitheringResolutionMm = 10.f;
     static constexpr float DefaultDitheringResolutionMm = 0.4f;

@@ -7027,9 +7027,10 @@ static bool is_halftone_dithering_method_for_gcode(int method)
 {
     const int clamped_method = std::clamp(method,
                                           int(TextureMappingZone::DitheringClosest),
-                                          int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                                          int(TextureMappingZone::DitheringHalftoneV2));
     return clamped_method == int(TextureMappingZone::DitheringHalftone) ||
-           clamped_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail);
+           clamped_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail) ||
+           clamped_method == int(TextureMappingZone::DitheringHalftoneV2);
 }
 
 static float dither_pitch_for_gcode(float base_outer_width_mm,
@@ -7040,7 +7041,7 @@ static float dither_pitch_for_gcode(float base_outer_width_mm,
     const float high_res_step_mm = std::clamp(base_outer_width_mm * 0.20f, 0.04f, 0.12f);
     const int clamped_method = std::clamp(dithering_method,
                                           int(TextureMappingZone::DitheringClosest),
-                                          int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                                          int(TextureMappingZone::DitheringHalftoneV2));
     if (is_halftone_dithering_method_for_gcode(clamped_method)) {
         const float dot_sample_step_mm =
             std::clamp(std::clamp(halftone_dot_size_mm,
@@ -8719,7 +8720,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
     const int clamped_binary_dither_method =
         std::clamp(dithering_method,
                    int(TextureMappingZone::DitheringClosest),
-                   int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                   int(TextureMappingZone::DitheringHalftoneV2));
     std::vector<uint32_t> binary_dither_masks;
     const bool can_binary_dither =
         dithering_enabled &&
@@ -9443,7 +9444,7 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
         zone->texture_mapping_mode != int(TextureMappingZone::TextureMappingRawValues);
     const int dithering_method = std::clamp(zone->dithering_method,
                                             int(TextureMappingZone::DitheringClosest),
-                                            int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                                            int(TextureMappingZone::DitheringHalftoneV2));
     const bool halftone_dithering_enabled =
         dithering_enabled && is_halftone_dithering_method_for_gcode(dithering_method);
     const float seam_texture_base_width_mm =

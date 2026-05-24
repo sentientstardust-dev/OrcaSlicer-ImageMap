@@ -60,6 +60,7 @@ struct TextureMappingOffsetContext {
     bool                            dithering_enabled { false };
     bool                            halftone_dithering_enabled { false };
     bool                            halftone_increased_detail_enabled { false };
+    bool                            halftone_v2_enabled { false };
     bool                            nonlinear_offset_adjustment { false };
     Point                           object_center;
     Vec3f                           linear_gradient_start_mm { Vec3f::Zero() };

@@ -1769,9 +1769,10 @@ bool is_halftone_dithering_method_for_texture_preview(int method)
 {
     const int clamped_method = std::clamp(method,
                                           int(TextureMappingZone::DitheringClosest),
-                                          int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                                          int(TextureMappingZone::DitheringHalftoneV2));
     return clamped_method == int(TextureMappingZone::DitheringHalftone) ||
-           clamped_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail);
+           clamped_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail) ||
+           clamped_method == int(TextureMappingZone::DitheringHalftoneV2);
 }
 
 float halftone_screen_angle_deg_for_texture_preview(int filament_color_mode, size_t component_idx)
@@ -2044,8 +2045,7 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
 
     if (settings.dithering_enabled &&
         settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
-        settings.dithering_method != int(TextureMappingZone::DitheringHalftone) &&
-        settings.dithering_method != int(TextureMappingZone::DitheringHalftoneIncreasedDetail)) {
+        !is_halftone_dithering_method_for_texture_preview(settings.dithering_method)) {
         const std::vector<TexturePreviewBinaryDitherCandidate> candidates = binary_dither_candidates_for_texture_preview(settings);
         const std::array<float, 3> target_oklab = texture_preview_target_oklab(settings, sample_rgba);
         const size_t candidate_idx = nearest_binary_dither_candidate_for_texture_preview(candidates, target_oklab);
@@ -2222,7 +2222,7 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
         settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues);
     settings.dithering_method = std::clamp(zone->dithering_method,
                                            int(TextureMappingZone::DitheringClosest),
-                                           int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                                           int(TextureMappingZone::DitheringHalftoneV2));
     settings.dithering_resolution_mm = std::clamp(zone->dithering_resolution_mm,
                                                   TextureMappingZone::MinDitheringResolutionMm,
                                                   TextureMappingZone::MaxDitheringResolutionMm);
@@ -2231,8 +2231,7 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
                                                TextureMappingZone::MaxHalftoneDotSizeMm);
     const bool halftone_dithering_enabled =
         settings.dithering_enabled &&
-        (settings.dithering_method == int(TextureMappingZone::DitheringHalftone) ||
-         settings.dithering_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+        is_halftone_dithering_method_for_texture_preview(settings.dithering_method);
     settings.compact_offset_mode =
         halftone_dithering_enabled ? false : zone->compact_offset_mode || settings.dithering_enabled;
     settings.use_legacy_fixed_color_mode = zone->use_legacy_fixed_color_mode;
@@ -2311,8 +2310,7 @@ size_t texture_preview_simulation_signature(const ModelVolume &model_volume,
     mix(std::hash<int>{}(settings.use_legacy_fixed_color_mode ? 1 : 0));
     mix(std::hash<int>{}(settings.dithering_enabled ? 1 : 0));
     mix(std::hash<int>{}(settings.dithering_method));
-    if (settings.dithering_method == int(TextureMappingZone::DitheringHalftone) ||
-        settings.dithering_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail))
+    if (is_halftone_dithering_method_for_texture_preview(settings.dithering_method))
         mix(std::hash<int>{}(int(std::lround(settings.halftone_dot_size_mm * 1000.f))));
     else
         mix(std::hash<int>{}(int(std::lround(settings.dithering_resolution_mm * 1000.f))));
@@ -2371,8 +2369,7 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
     const bool use_binary_dithering =
         settings.dithering_enabled &&
         settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
-        settings.dithering_method != int(TextureMappingZone::DitheringHalftone) &&
-        settings.dithering_method != int(TextureMappingZone::DitheringHalftoneIncreasedDetail) &&
+        !is_halftone_dithering_method_for_texture_preview(settings.dithering_method) &&
         !use_raw_offsets;
     const bool use_halftone_dithering =
         settings.dithering_enabled &&
@@ -2560,7 +2557,7 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                     std::array<float, 3> target_oklab = texture_preview_target_oklab(settings, sample_rgba);
                     const int clamped_method = std::clamp(settings.dithering_method,
                                                           int(TextureMappingZone::DitheringClosest),
-                                                          int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                                                          int(TextureMappingZone::DitheringHalftoneV2));
                     if (clamped_method == int(TextureMappingZone::DitheringFloydSteinberg)) {
                         for (size_t axis = 0; axis < 3; ++axis)
                             target_oklab[axis] += floyd_error_current[x][axis];
@@ -2640,7 +2637,7 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
         if (use_binary_dithering &&
             std::clamp(settings.dithering_method,
                        int(TextureMappingZone::DitheringClosest),
-                       int(TextureMappingZone::DitheringHalftoneIncreasedDetail)) == int(TextureMappingZone::DitheringFloydSteinberg)) {
+                       int(TextureMappingZone::DitheringHalftoneV2)) == int(TextureMappingZone::DitheringFloydSteinberg)) {
             floyd_error_current.swap(floyd_error_next);
             std::fill(floyd_error_next.begin(), floyd_error_next.end(), std::array<float, 3>{ { 0.f, 0.f, 0.f } });
         }
@@ -5074,8 +5071,7 @@ static size_t texture_preview_settings_signature_impl(size_t num_physical,
         signature_mix(std::hash<int>{}(zone.use_legacy_fixed_color_mode ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.dithering_enabled ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.dithering_method));
-        if (zone.dithering_method == int(TextureMappingZone::DitheringHalftone) ||
-            zone.dithering_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail))
+        if (is_halftone_dithering_method_for_texture_preview(zone.dithering_method))
             signature_mix_float(zone.halftone_dot_size_mm, 1000.f);
         else
             signature_mix_float(zone.dithering_resolution_mm, 1000.f);
@@ -5134,11 +5130,10 @@ static bool texture_preview_zone_uses_halftone_model(const TextureMappingZone &z
                                         int(TextureMappingZone::TextureMappingRawValues));
     const int method = std::clamp(zone.dithering_method,
                                   int(TextureMappingZone::DitheringClosest),
-                                  int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                                  int(TextureMappingZone::DitheringHalftoneV2));
     return mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
            zone.dithering_enabled &&
-           (method == int(TextureMappingZone::DitheringHalftone) ||
-            method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+           is_halftone_dithering_method_for_texture_preview(method);
 }
 
 static bool texture_preview_gradient_zone_uses_model(const TextureMappingZone &zone, size_t num_physical)
@@ -5186,8 +5181,7 @@ static void texture_preview_mix_zone_baked_model_settings(size_t &signature,
     signature_mix(std::hash<int>{}(zone.use_legacy_fixed_color_mode ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.dithering_enabled ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.dithering_method));
-    if (zone.dithering_method == int(TextureMappingZone::DitheringHalftone) ||
-        zone.dithering_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail))
+    if (is_halftone_dithering_method_for_texture_preview(zone.dithering_method))
         signature_mix_float(zone.halftone_dot_size_mm, 1000.f);
     else
         signature_mix_float(zone.dithering_resolution_mm, 1000.f);

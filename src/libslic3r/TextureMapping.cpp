@@ -759,11 +759,12 @@ static std::string dithering_method_name(int mode)
 {
     switch (clamp_int(mode,
                       int(TextureMappingZone::DitheringClosest),
-                      int(TextureMappingZone::DitheringHalftoneIncreasedDetail))) {
+                      int(TextureMappingZone::DitheringHalftoneV2))) {
     case int(TextureMappingZone::DitheringClosest):                 return "closest";
     case int(TextureMappingZone::DitheringOrderedBayer):            return "ordered_bayer";
     case int(TextureMappingZone::DitheringHalftone):                return "halftone";
     case int(TextureMappingZone::DitheringHalftoneIncreasedDetail): return "halftone_increased_detail";
+    case int(TextureMappingZone::DitheringHalftoneV2):              return "halftone_v2";
     default:                                                       return "floyd_steinberg";
     }
 }
@@ -779,6 +780,8 @@ static int dithering_method_from_name(std::string name)
         return int(TextureMappingZone::DitheringHalftone);
     if (name == "halftone_increased_detail" || name == "halftone_detail" || name == "halftone_high_detail")
         return int(TextureMappingZone::DitheringHalftoneIncreasedDetail);
+    if (name == "halftone_v2" || name == "halftone2")
+        return int(TextureMappingZone::DitheringHalftoneV2);
     return int(TextureMappingZone::DitheringFloydSteinberg);
 }
 

@@ -1944,10 +1944,11 @@ public:
         dithering_choices.Add(_L("Ordered Bayer - not recommended"));
         dithering_choices.Add(_L("Halftone"));
         dithering_choices.Add(_L("Halftone (increased detail) - not recommended"));
+        dithering_choices.Add(_L("Halftone v2"));
         m_dithering_method_choice = new wxChoice(image_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, dithering_choices);
         m_dithering_method_choice->SetSelection(std::clamp(dithering_method,
                                                            int(TextureMappingZone::DitheringClosest),
-                                                           int(TextureMappingZone::DitheringHalftoneIncreasedDetail)));
+                                                           int(TextureMappingZone::DitheringHalftoneV2)));
         dithering_row->Add(m_dithering_method_choice, 1, wxALIGN_CENTER_VERTICAL);
         m_dithering_enabled_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
             update_dithering_options_visibility(true);
@@ -2489,7 +2490,7 @@ public:
         return m_dithering_method_choice ?
             std::clamp(m_dithering_method_choice->GetSelection(),
                        int(TextureMappingZone::DitheringClosest),
-                       int(TextureMappingZone::DitheringHalftoneIncreasedDetail)) :
+                       int(TextureMappingZone::DitheringHalftoneV2)) :
             TextureMappingZone::DefaultDitheringMethod;
     }
     float dithering_resolution_mm() const
@@ -2845,11 +2846,12 @@ private:
         const int method = m_dithering_method_choice != nullptr ?
             std::clamp(m_dithering_method_choice->GetSelection(),
                        int(TextureMappingZone::DitheringClosest),
-                       int(TextureMappingZone::DitheringHalftoneIncreasedDetail)) :
+                       int(TextureMappingZone::DitheringHalftoneV2)) :
             TextureMappingZone::DefaultDitheringMethod;
         const bool halftone = enabled &&
             (method == int(TextureMappingZone::DitheringHalftone) ||
-             method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+             method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail) ||
+             method == int(TextureMappingZone::DitheringHalftoneV2));
         if (m_dithering_method_choice != nullptr)
             m_dithering_method_choice->Enable(enabled);
         if (m_dithering_resolution_panel != nullptr)

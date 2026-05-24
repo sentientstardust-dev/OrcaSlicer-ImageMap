@@ -1078,9 +1078,10 @@ bool is_halftone_dithering_method(int method)
 {
     const int clamped_method = std::clamp(method,
                                           int(TextureMappingZone::DitheringClosest),
-                                          int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                                          int(TextureMappingZone::DitheringHalftoneV2));
     return clamped_method == int(TextureMappingZone::DitheringHalftone) ||
-           clamped_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail);
+           clamped_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail) ||
+           clamped_method == int(TextureMappingZone::DitheringHalftoneV2);
 }
 
 float halftone_threshold(float x_mm, float y_mm, float dot_size_mm)
@@ -1134,6 +1135,65 @@ float halftone_screen_angle_deg(int filament_color_mode, size_t component_idx)
     return fallback_angles[component_idx % (sizeof(fallback_angles) / sizeof(fallback_angles[0]))];
 }
 
+int halftone_surface_axis(float normal_x, float normal_y, float normal_z)
+{
+    const float ax = std::abs(normal_x);
+    const float ay = std::abs(normal_y);
+    const float az = std::abs(normal_z);
+    if (ax >= ay && ax >= az)
+        return 0;
+    if (ay >= ax && ay >= az)
+        return 1;
+    return 2;
+}
+
+std::array<float, 2> halftone_surface_coords(float x_mm, float y_mm, float z_mm, int axis)
+{
+    if (axis == 0)
+        return { y_mm, z_mm };
+    if (axis == 1)
+        return { x_mm, z_mm };
+    return { x_mm, y_mm };
+}
+
+std::array<float, 2> halftone_cell_center_surface_coords(float surface_u_mm,
+                                                         float surface_v_mm,
+                                                         float dot_size_mm,
+                                                         float angle_deg)
+{
+    const float period = std::clamp(dot_size_mm,
+                                    TextureMappingZone::MinHalftoneDotSizeMm,
+                                    TextureMappingZone::MaxHalftoneDotSizeMm);
+    if (!std::isfinite(surface_u_mm) || !std::isfinite(surface_v_mm) || period <= EPSILON)
+        return { surface_u_mm, surface_v_mm };
+
+    const float radians = angle_deg * float(PI) / 180.f;
+    const float c = std::cos(radians);
+    const float s = std::sin(radians);
+    const float screen_x = c * surface_u_mm + s * surface_v_mm;
+    const float screen_y = -s * surface_u_mm + c * surface_v_mm;
+    const int cell_x = int(std::floor(screen_x / period));
+    const int cell_y = int(std::floor(screen_y / period));
+    const float center_screen_x = (float(cell_x) + 0.5f) * period;
+    const float center_screen_y = (float(cell_y) + 0.5f) * period;
+    return {
+        c * center_screen_x - s * center_screen_y,
+        s * center_screen_x + c * center_screen_y
+    };
+}
+
+std::array<float, 2> halftone_sample_xy_from_surface_coords(float x_mm,
+                                                            float y_mm,
+                                                            const std::array<float, 2> &surface_coords,
+                                                            int axis)
+{
+    if (axis == 0)
+        return { x_mm, surface_coords[0] };
+    if (axis == 1)
+        return { surface_coords[0], y_mm };
+    return surface_coords;
+}
+
 bool halftone_screen_on(float coverage,
                         float surface_u_mm,
                         float surface_v_mm,
@@ -1164,7 +1224,7 @@ float dither_pitch(float base_outer_width_mm,
     const float high_res_step_mm = std::clamp(base_outer_width_mm * 0.20f, 0.04f, 0.12f);
     const int clamped_method = std::clamp(dithering_method,
                                           int(TextureMappingZone::DitheringClosest),
-                                          int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                                          int(TextureMappingZone::DitheringHalftoneV2));
     if (is_halftone_dithering_method(clamped_method)) {
         const float dot_sample_step_mm =
             std::clamp(std::clamp(halftone_dot_size_mm,
@@ -1742,7 +1802,7 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
     const int clamped_binary_dither_method =
         std::clamp(dithering_method,
                    int(TextureMappingZone::DitheringClosest),
-                   int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                   int(TextureMappingZone::DitheringHalftoneV2));
     std::vector<uint32_t> binary_dither_masks;
     const bool can_binary_dither =
         dithering_enabled &&
@@ -2907,11 +2967,13 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     const bool dithering_enabled = zone.dithering_enabled && !raw_texture_mapping_mode;
     const int dithering_method = std::clamp(zone.dithering_method,
                                             int(TextureMappingZone::DitheringClosest),
-                                            int(TextureMappingZone::DitheringHalftoneIncreasedDetail));
+                                            int(TextureMappingZone::DitheringHalftoneV2));
     const bool halftone_dithering_enabled =
         dithering_enabled && is_halftone_dithering_method(dithering_method);
     const bool halftone_increased_detail_enabled =
         dithering_enabled && dithering_method == int(TextureMappingZone::DitheringHalftoneIncreasedDetail);
+    const bool halftone_v2_enabled =
+        dithering_enabled && dithering_method == int(TextureMappingZone::DitheringHalftoneV2);
     const float dither_pitch_mm =
         dither_pitch(base_outer_width_mm,
                      dithering_method,
@@ -3010,6 +3072,7 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     context.dithering_enabled = dithering_enabled;
     context.halftone_dithering_enabled = halftone_dithering_enabled;
     context.halftone_increased_detail_enabled = halftone_increased_detail_enabled;
+    context.halftone_v2_enabled = halftone_v2_enabled;
     context.nonlinear_offset_adjustment = zone.nonlinear_offset_adjustment;
     context.object_center = print_object.bounding_box().center();
     if (linear_gradient_mode) {
@@ -3096,13 +3159,37 @@ float texture_mapping_offset_surface_inset_mm(const TextureMappingOffsetContext 
             float z_mm = context.layer != nullptr ? float(context.layer->print_z) : 0.f;
             if (!std::isfinite(z_mm))
                 z_mm = 0.f;
-            if (!std::isfinite(surface_u_mm))
-                surface_u_mm = std::abs(outward_x) >= std::abs(outward_y) ? y_mm : x_mm;
-            if (!std::isfinite(surface_v_mm))
-                surface_v_mm = z_mm;
-            desired_strength = halftone_screen_on(desired_strength,
-                                                  surface_u_mm,
-                                                  surface_v_mm,
+            float halftone_u_mm = surface_u_mm;
+            float halftone_v_mm = surface_v_mm;
+            float coverage = desired_strength;
+            if (context.halftone_v2_enabled) {
+                const int surface_axis = halftone_surface_axis(float(outward_x), float(outward_y), 0.f);
+                const std::array<float, 2> surface_coord = halftone_surface_coords(x_mm, y_mm, z_mm, surface_axis);
+                halftone_u_mm = surface_coord[0];
+                halftone_v_mm = surface_coord[1];
+                const std::array<float, 2> cell_center =
+                    halftone_cell_center_surface_coords(halftone_u_mm,
+                                                        halftone_v_mm,
+                                                        context.halftone_dot_size_mm,
+                                                        context.active_halftone_angle_deg);
+                const std::array<float, 2> sample_xy =
+                    halftone_sample_xy_from_surface_coords(x_mm, y_mm, cell_center, surface_axis);
+                if (std::isfinite(sample_xy[0]) && std::isfinite(sample_xy[1]))
+                    coverage = sample_weight_field(context.weight_field,
+                                                   sample_xy[0],
+                                                   sample_xy[1],
+                                                   context.active_component_idx,
+                                                   context.high_resolution_texture_sampling,
+                                                   context.compact_offset_mode);
+            } else {
+                if (!std::isfinite(halftone_u_mm))
+                    halftone_u_mm = std::abs(outward_x) >= std::abs(outward_y) ? y_mm : x_mm;
+                if (!std::isfinite(halftone_v_mm))
+                    halftone_v_mm = z_mm;
+            }
+            desired_strength = halftone_screen_on(coverage,
+                                                  halftone_u_mm,
+                                                  halftone_v_mm,
                                                   context.halftone_dot_size_mm,
                                                   context.active_halftone_angle_deg) ?
                 1.f :
