@@ -1295,8 +1295,11 @@ bool TriangleSelector::apply_state_by_triangle_sampler_recursive(
     const std::function<bool(EnforcerBlockerType, size_t, const Vec3f &, const Vec3f &)> &predicate,
     float max_world_edge_sqr,
     int max_depth,
-    bool clear_non_matching)
+    bool clear_non_matching,
+    const std::function<bool()> &cancel)
 {
+    if (cancel && cancel())
+        return false;
     if (facet_idx < 0 || facet_idx >= int(m_triangles.size()) || !m_triangles[size_t(facet_idx)].valid())
         return false;
 
@@ -1305,6 +1308,8 @@ bool TriangleSelector::apply_state_by_triangle_sampler_recursive(
         bool changed = false;
         const int child_count = tr->number_of_split_sides() + 1;
         for (int child_idx = 0; child_idx < child_count; ++child_idx) {
+            if (cancel && cancel())
+                break;
             changed |= apply_state_by_triangle_sampler_recursive(tr->children[size_t(child_idx)],
                                                                  child_neighbors(*tr, neighbors, child_idx),
                                                                  trafo,
@@ -1312,7 +1317,8 @@ bool TriangleSelector::apply_state_by_triangle_sampler_recursive(
                                                                  predicate,
                                                                  max_world_edge_sqr,
                                                                  max_depth,
-                                                                 clear_non_matching);
+                                                                 clear_non_matching,
+                                                                 cancel);
             tr = &m_triangles[size_t(facet_idx)];
         }
         return changed;
@@ -1328,6 +1334,8 @@ bool TriangleSelector::apply_state_by_triangle_sampler_recursive(
     std::array<bool, 4> matches;
     int match_count = 0;
     for (size_t sample_idx = 0; sample_idx < sample_points.size(); ++sample_idx) {
+        if (cancel && cancel())
+            return false;
         const Vec3f barycentric = barycentric_for_triangle_sample(m_mesh.its, tr->source_triangle, sample_points[sample_idx]);
         matches[sample_idx] = predicate(current_state, size_t(std::max(tr->source_triangle, 0)), sample_points[sample_idx], barycentric);
         if (matches[sample_idx])
@@ -1356,6 +1364,8 @@ bool TriangleSelector::apply_state_by_triangle_sampler_recursive(
         tr = &m_triangles[size_t(facet_idx)];
         const int child_count = tr->number_of_split_sides() + 1;
         for (int child_idx = 0; child_idx < child_count; ++child_idx) {
+            if (cancel && cancel())
+                break;
             changed |= apply_state_by_triangle_sampler_recursive(tr->children[size_t(child_idx)],
                                                                  child_neighbors(*tr, neighbors, child_idx),
                                                                  trafo,
@@ -1363,7 +1373,8 @@ bool TriangleSelector::apply_state_by_triangle_sampler_recursive(
                                                                  predicate,
                                                                  max_world_edge_sqr,
                                                                  max_depth - 1,
-                                                                 clear_non_matching);
+                                                                 clear_non_matching,
+                                                                 cancel);
             tr = &m_triangles[size_t(facet_idx)];
         }
         return changed;
@@ -1383,7 +1394,9 @@ bool TriangleSelector::apply_state_by_triangle_sampler(
     const std::function<bool(EnforcerBlockerType, size_t, const Vec3f &, const Vec3f &)> &predicate,
     float max_world_edge,
     int max_depth,
-    bool clear_non_matching)
+    bool clear_non_matching,
+    const std::function<void(size_t, size_t)> &progress,
+    const std::function<bool()> &cancel)
 {
     if (!predicate)
         return false;
@@ -1393,6 +1406,8 @@ bool TriangleSelector::apply_state_by_triangle_sampler(
     bool changed = false;
 
     for (int facet_idx = 0; facet_idx < m_orig_size_indices; ++facet_idx) {
+        if (cancel && cancel())
+            break;
         changed |= apply_state_by_triangle_sampler_recursive(facet_idx,
                                                              m_neighbors[size_t(facet_idx)],
                                                              trafo,
@@ -1400,10 +1415,13 @@ bool TriangleSelector::apply_state_by_triangle_sampler(
                                                              predicate,
                                                              max_world_edge_sqr,
                                                              max_depth,
-                                                             clear_non_matching);
+                                                             clear_non_matching,
+                                                             cancel);
+        if (progress)
+            progress(size_t(facet_idx + 1), size_t(m_orig_size_indices));
     }
 
-    if (changed) {
+    if (changed && !(cancel && cancel())) {
         for (int facet_idx = 0; facet_idx < m_orig_size_indices; ++facet_idx)
             if (m_triangles[size_t(facet_idx)].valid() && m_triangles[size_t(facet_idx)].is_split())
                 remove_useless_children(facet_idx);

@@ -52,9 +52,10 @@ struct SlopeAutoPaintSettings
 struct ColorAutoPaintSettings
 {
     ColorRGBA target_color = ColorRGBA(1.f, 1.f, 1.f, 1.f);
-    float tolerance_pct = 5.f;
+    float tolerance_pct = 40.f;
     unsigned int target_filament_id = 1;
     bool override_all = true;
+    bool show_result_area = true;
     std::vector<unsigned int> override_filament_ids;
 };
 
@@ -121,6 +122,7 @@ public:
     ~GLGizmoMmuSegmentation() override;
 
     void render_painter_gizmo() override;
+    bool gizmo_event(SLAGizmoEventType action, const Vec2d& mouse_position, bool shift_down, bool alt_down, bool control_down) override;
 
     void data_changed(bool is_serializing) override;
 
@@ -200,10 +202,18 @@ private:
     bool apply_slope_auto_paint(const SlopeAutoPaintSettings &settings, bool preview);
     void set_render_triangle_slope_uniforms(GLShaderProgram *shader, const ModelVolume *model_volume, const Matrix3f &normal_matrix) const override;
     bool should_render_triangle_texture_preview() const override;
+    bool color_auto_paint_shader_preview_active() const;
+    void update_color_auto_paint_shader_preview_settings();
     void open_color_auto_paint_overlay();
     void render_color_auto_paint_overlay();
+    bool pick_color_auto_paint_source_from_model(const Vec2d &mouse_position);
+    bool sample_color_auto_paint_source_from_model(const Vec2d &mouse_position, ColorRGBA &color) const;
+    void set_color_auto_paint_target_color(const ColorRGBA &color);
+    void set_color_auto_paint_picker_active(bool active);
+    void refresh_color_auto_paint_common_colors();
     void update_color_auto_paint_preview(const ColorAutoPaintSettings &settings);
     void start_color_auto_paint_preview_worker();
+    void request_color_auto_paint_preview_worker_cancel();
     void finish_color_auto_paint_preview_update(uint64_t generation,
                                                 const ColorAutoPaintSettings &settings,
                                                 bool active,
@@ -216,7 +226,9 @@ private:
                                             TriangleSelector &selector,
                                             const Transform3d &trafo_no_translate,
                                             const ColorAutoPaintSettings &settings,
-                                            bool clear_non_matching) const;
+                                            bool clear_non_matching,
+                                            const std::function<void(size_t, size_t)> &progress = {},
+                                            const std::function<bool()> &cancel = {}) const;
     void render_extra_triangle_overlays(int mesh_id,
                                         const Transform3d &matrix,
                                         const Transform3d &view_matrix,
@@ -257,12 +269,17 @@ private:
     bool m_show_color_auto_paint_overlay = false;
     bool m_color_auto_paint_overlay_positioned = false;
     bool m_color_auto_paint_preview_active = false;
+    bool m_color_auto_paint_picker_active = false;
+    bool m_color_auto_paint_picker_restore_show_result_area = false;
     bool m_color_auto_paint_preview_update_pending = false;
     bool m_color_auto_paint_preview_worker_running = false;
+    std::atomic<int> m_color_auto_paint_preview_progress_pct { 0 };
+    std::atomic_bool m_color_auto_paint_preview_worker_cancel { false };
     uint64_t m_color_auto_paint_preview_generation = 0;
     ColorAutoPaintSettings m_color_auto_paint_requested_settings;
     std::thread m_color_auto_paint_preview_thread;
     std::vector<std::unique_ptr<TriangleSelectorPatch>> m_color_auto_paint_preview_selectors;
+    std::vector<ColorRGBA> m_color_auto_paint_common_colors;
 };
 
 class GLGizmoTrueColorPainting : public GLGizmoPainterBase

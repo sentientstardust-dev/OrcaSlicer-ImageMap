@@ -13,6 +13,11 @@ struct PrintVolumeDetection
 uniform vec4 uniform_color;
 uniform float texture_preview_mix;
 uniform bool invalid_texture_mapping;
+uniform bool color_match_preview_active;
+uniform vec3 color_match_target_oklab;
+uniform float color_match_tolerance_sq;
+uniform vec4 color_match_highlight_color;
+uniform vec4 color_match_background_color;
 uniform PrintVolumeDetection print_volume;
 
 in vec2 intensity;
@@ -34,6 +39,25 @@ float invalid_texture_mapping_checker()
     return mod(floor(checker_pos.x * INVALID_TEXTURE_CHECKER_SCALE) + floor(checker_pos.y * INVALID_TEXTURE_CHECKER_SCALE), 2.0);
 }
 
+float srgb_channel_to_linear(float c)
+{
+    return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}
+
+vec3 oklab_from_srgb(vec3 c)
+{
+    vec3 linear = vec3(srgb_channel_to_linear(c.r), srgb_channel_to_linear(c.g), srgb_channel_to_linear(c.b));
+    float l = 0.4122214708 * linear.r + 0.5363325363 * linear.g + 0.0514459929 * linear.b;
+    float m = 0.2119034982 * linear.r + 0.6806995451 * linear.g + 0.1073969566 * linear.b;
+    float s = 0.0883024619 * linear.r + 0.2817188376 * linear.g + 0.6299787005 * linear.b;
+    float l_ = pow(max(l, 0.0), 1.0 / 3.0);
+    float m_ = pow(max(m, 0.0), 1.0 / 3.0);
+    float s_ = pow(max(s, 0.0), 1.0 / 3.0);
+    return vec3(0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+                1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+                0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_);
+}
+
 void main()
 {
     if (any(lessThan(clipping_planes_dots, ZERO)))
@@ -41,11 +65,20 @@ void main()
 
     vec4 color = uniform_color;
     float mix_factor = clamp(texture_preview_mix, 0.0, 1.0);
-    color.rgb = mix(color.rgb, vertex_color.rgb, mix_factor);
-    if (invalid_texture_mapping) {
-        float checker = invalid_texture_mapping_checker();
-        vec3 checker_color = mix(vec3(0.0), vec3(1.0), checker);
-        color.rgb = mix(color.rgb, checker_color, 0.62);
+    if (color_match_preview_active) {
+        float source_alpha = clamp(vertex_color.a, 0.0, 1.0);
+        vec3 source_rgb = vertex_color.rgb * source_alpha + color_match_background_color.rgb * (1.0 - source_alpha);
+        vec3 delta = oklab_from_srgb(source_rgb) - color_match_target_oklab;
+        if (dot(delta, delta) > color_match_tolerance_sq)
+            discard;
+        color = color_match_highlight_color;
+    } else {
+        color.rgb = mix(color.rgb, vertex_color.rgb, mix_factor);
+        if (invalid_texture_mapping) {
+            float checker = invalid_texture_mapping_checker();
+            vec3 checker_color = mix(vec3(0.0), vec3(1.0), checker);
+            color.rgb = mix(color.rgb, checker_color, 0.62);
+        }
     }
 
     vec3 pv_check_min = ZERO;

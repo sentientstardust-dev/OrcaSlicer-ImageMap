@@ -6880,7 +6880,7 @@ void ObjectList::set_extruder_for_selected_items(const int extruder)
     Refresh();
 }
 
-bool ObjectList::assign_extruder_to_objects_and_clear_filament_region_painting(const std::vector<size_t>& object_idxs, const int extruder)
+bool ObjectList::assign_extruder_to_objects(const std::vector<size_t>& object_idxs, const int extruder, bool erase_filament_region_painting)
 {
     std::vector<std::string> colors = wxGetApp().plater()->get_extruder_colors_from_plater_config();
     if (extruder <= 0 || extruder > int(colors.size()))
@@ -6905,7 +6905,7 @@ bool ObjectList::assign_extruder_to_objects_and_clear_filament_region_painting(c
         for (ModelVolume *mv : model_object->volumes) {
             if (mv->type() == ModelVolumeType::MODEL_PART && mv->config.has("extruder"))
                 changed = true;
-            if (!mv->mmu_segmentation_facets.empty())
+            if (erase_filament_region_painting && !mv->mmu_segmentation_facets.empty())
                 changed = true;
         }
     }
@@ -6915,9 +6915,11 @@ bool ObjectList::assign_extruder_to_objects_and_clear_filament_region_painting(c
 
     take_snapshot("Assign Texture Mapping Zone");
 
-    if (Plater *plater = wxGetApp().plater(); plater != nullptr)
-        if (GLCanvas3D *canvas = plater->canvas3D(); canvas != nullptr)
-            canvas->get_gizmos_manager().reset_all_states();
+    if (erase_filament_region_painting) {
+        if (Plater *plater = wxGetApp().plater(); plater != nullptr)
+            if (GLCanvas3D *canvas = plater->canvas3D(); canvas != nullptr)
+                canvas->get_gizmos_manager().reset_all_states();
+    }
 
     for (size_t obj_idx : valid_object_idxs) {
         ModelObject *model_object = (*m_objects)[obj_idx];
@@ -6929,7 +6931,7 @@ bool ObjectList::assign_extruder_to_objects_and_clear_filament_region_painting(c
         for (ModelVolume *mv : model_object->volumes) {
             if (mv->type() == ModelVolumeType::MODEL_PART && mv->config.has("extruder"))
                 mv->config.erase("extruder");
-            if (!mv->mmu_segmentation_facets.empty())
+            if (erase_filament_region_painting && !mv->mmu_segmentation_facets.empty())
                 mv->mmu_segmentation_facets.reset();
         }
 

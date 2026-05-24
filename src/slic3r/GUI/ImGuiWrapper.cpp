@@ -550,6 +550,12 @@ void ImGuiWrapper::new_frame()
         if ((io.KeyMods & key.first) != 0 && !wxGetKeyState(key.second))
             io.KeyMods &= ~key.first;
     }
+    if (io.KeyCtrl && !wxGetKeyState(WXK_CONTROL))
+        io.KeyCtrl = false;
+    if (io.KeyShift && !wxGetKeyState(WXK_SHIFT))
+        io.KeyShift = false;
+    if (io.KeyAlt && !wxGetKeyState(WXK_ALT))
+        io.KeyAlt = false;
 
     // Not sure if it is neccessary
     // values from 33 to 126 are reserved for the standard ASCII characters

@@ -4583,6 +4583,24 @@ void set_common_uniforms(GLShaderProgram &shader,
     shader.set_uniform("print_volume.z_data", print_volume_z);
 }
 
+void set_color_match_preview_uniforms(GLShaderProgram &shader, const TexturePreviewColorMatchSettings *color_match)
+{
+    const bool active = color_match != nullptr && color_match->active;
+    shader.set_uniform("color_match_preview_active", active);
+    shader.set_uniform("color_match_target_oklab", active ? color_match->target_oklab : std::array<float, 3>{ 0.f, 0.f, 0.f });
+    shader.set_uniform("color_match_tolerance_sq", active ? color_match->tolerance_sq : 0.f);
+    shader.set_uniform("color_match_highlight_color", active ? color_match->highlight_color : ColorRGBA(1.f, 1.f, 1.f, 1.f));
+    shader.set_uniform("color_match_background_color", active ? color_match->background_color : ColorRGBA(1.f, 1.f, 1.f, 1.f));
+}
+
+bool color_match_preview_allows_filament(const TexturePreviewColorMatchSettings *color_match, unsigned int filament_id)
+{
+    if (color_match == nullptr || !color_match->active || color_match->override_all)
+        return true;
+    return std::find(color_match->override_filament_ids.begin(), color_match->override_filament_ids.end(), filament_id) !=
+           color_match->override_filament_ids.end();
+}
+
 std::string gradient_array_uniform_name(const char *name, size_t idx)
 {
     return std::string(name) + "[" + std::to_string(idx) + "]";
@@ -5303,7 +5321,8 @@ void render_model_texture_preview_models(
     int                              print_volume_type,
     const std::array<float, 4>      &print_volume_xy,
     const std::array<float, 2>      &print_volume_z,
-    bool                             opaque)
+    bool                             opaque,
+    const TexturePreviewColorMatchSettings *color_match)
 {
     if (models.empty() || colors.size() != models.size() || filament_ids.size() != models.size())
         return;
@@ -5323,12 +5342,16 @@ void render_model_texture_preview_models(
                         print_volume_type,
                         print_volume_xy,
                         print_volume_z);
+    set_color_match_preview_uniforms(*shader, color_match);
     glsafe(::glActiveTexture(GL_TEXTURE0));
     shader->set_uniform("uniform_texture", 0);
 
     const size_t texture_signature = model_volume_texture_preview_signature(model_volume);
     GLuint bound_texture_id = 0;
+    const bool color_match_active = color_match != nullptr && color_match->active;
     for (size_t idx = 0; idx < models.size(); ++idx) {
+        if (color_match_active && !color_match_preview_allows_filament(color_match, filament_ids[idx]))
+            continue;
         const bool raw_vertex_color_preview = filament_ids[idx] == 0;
         const float mix = raw_vertex_color_preview ?
             1.f :
@@ -5336,11 +5359,11 @@ void render_model_texture_preview_models(
         const bool invalid = raw_vertex_color_preview ?
             false :
             texture_preview_settings_invalid_for_filament(filament_ids[idx], num_physical, texture_mgr);
-        if (mix <= 0.f && !invalid)
+        if (!color_match_active && mix <= 0.f && !invalid)
             continue;
 
         const bool force_original_texture =
-            texture_preview_halftone_simulation_enabled_for_filament(filament_ids[idx], num_physical, texture_mgr);
+            color_match_active || texture_preview_halftone_simulation_enabled_for_filament(filament_ids[idx], num_physical, texture_mgr);
         const GUI::GLTexture *preview_texture = force_original_texture ?
             &texture :
             simulated_texture_preview_texture_for_filament(model_volume,
@@ -5357,7 +5380,7 @@ void render_model_texture_preview_models(
             bound_texture_id = preview_texture->get_id();
         }
 
-        shader->set_uniform("texture_preview_mix", mix);
+        shader->set_uniform("texture_preview_mix", color_match_active ? 1.f : mix);
         shader->set_uniform("invalid_texture_mapping", invalid);
         models[idx].set_color(colors[idx]);
         models[idx].render();
@@ -5385,7 +5408,8 @@ void render_model_texture_preview_model(
     int                              print_volume_type,
     const std::array<float, 4>      &print_volume_xy,
     const std::array<float, 2>      &print_volume_z,
-    bool                             opaque)
+    bool                             opaque,
+    const TexturePreviewColorMatchSettings *color_match)
 {
     if (!GUI::GLModel::Geometry::has_tex_coord(model.get_geometry().format))
         return;
@@ -5396,12 +5420,15 @@ void render_model_texture_preview_model(
 
     const float mix = texture_preview_mix_for_filament(filament_id, num_physical, texture_mgr);
     const bool invalid = texture_preview_settings_invalid_for_filament(filament_id, num_physical, texture_mgr);
-    if (mix <= 0.f && !invalid)
+    const bool color_match_active = color_match != nullptr && color_match->active;
+    if (color_match_active && !color_match_preview_allows_filament(color_match, filament_id))
+        return;
+    if (!color_match_active && mix <= 0.f && !invalid)
         return;
 
     const size_t texture_signature = model_volume_texture_preview_signature(model_volume);
     const bool force_original_texture =
-        texture_preview_halftone_simulation_enabled_for_filament(filament_id, num_physical, texture_mgr);
+        color_match_active || texture_preview_halftone_simulation_enabled_for_filament(filament_id, num_physical, texture_mgr);
     const GUI::GLTexture *preview_texture = force_original_texture ?
         &texture :
         simulated_texture_preview_texture_for_filament(model_volume,
@@ -5424,11 +5451,12 @@ void render_model_texture_preview_model(
                         print_volume_type,
                         print_volume_xy,
                         print_volume_z);
+    set_color_match_preview_uniforms(*shader, color_match);
 
     glsafe(::glActiveTexture(GL_TEXTURE0));
     glsafe(::glBindTexture(GL_TEXTURE_2D, preview_texture->get_id()));
     shader->set_uniform("uniform_texture", 0);
-    shader->set_uniform("texture_preview_mix", mix);
+    shader->set_uniform("texture_preview_mix", color_match_active ? 1.f : mix);
     shader->set_uniform("invalid_texture_mapping", invalid);
     model.set_color(color);
     if (render_range == std::make_pair<size_t, size_t>(0, -1))
@@ -5458,7 +5486,8 @@ void render_model_vertex_color_preview_models(
     bool                             opaque,
     const ModelVolume               *model_volume,
     const SurfaceGradientAnchorResolver *surface_gradient_anchor_resolver,
-    const SurfaceGradientAnchorRadiusResolver *surface_gradient_anchor_radius_resolver)
+    const SurfaceGradientAnchorRadiusResolver *surface_gradient_anchor_radius_resolver,
+    const TexturePreviewColorMatchSettings *color_match)
 {
     if (models.empty() || colors.size() != models.size() || filament_ids.size() != models.size())
         return;
@@ -5488,22 +5517,29 @@ void render_model_vertex_color_preview_models(
                             print_volume_type,
                             print_volume_xy,
                             print_volume_z);
+        if (active_shader != gradient_shader)
+            set_color_match_preview_uniforms(*active_shader, color_match);
         return true;
     };
 
+    const bool color_match_active = color_match != nullptr && color_match->active;
     for (size_t idx = 0; idx < models.size(); ++idx) {
+        if (color_match_active && !color_match_preview_allows_filament(color_match, filament_ids[idx]))
+            continue;
         const bool raw_vertex_color_preview = filament_ids[idx] == 0;
         const TextureMappingZone *zone = raw_vertex_color_preview ?
             nullptr :
             zone_for_filament(filament_ids[idx], num_physical, texture_mgr);
         const bool gradient_preview = zone != nullptr && is_gradient_zone(*zone);
+        if (color_match_active && gradient_preview)
+            continue;
         const float mix = raw_vertex_color_preview ?
             1.f :
             texture_preview_mix_for_filament(filament_ids[idx], num_physical, texture_mgr);
         const bool invalid = raw_vertex_color_preview ?
             false :
             texture_preview_settings_invalid_for_filament(filament_ids[idx], num_physical, texture_mgr);
-        if (mix <= 0.f && !invalid)
+        if (!color_match_active && mix <= 0.f && !invalid)
             continue;
 
         if (gradient_preview) {
@@ -5515,13 +5551,13 @@ void render_model_vertex_color_preview_models(
                 continue;
             if (!use_shader(gradient_shader))
                 continue;
-            gradient_shader->set_uniform("texture_preview_mix", mix);
+            gradient_shader->set_uniform("texture_preview_mix", color_match_active ? 1.f : mix);
             gradient_shader->set_uniform("invalid_texture_mapping", invalid);
             set_surface_gradient_preview_uniforms(*gradient_shader, settings ? &*settings : nullptr);
         } else {
             if (vertex_shader == nullptr || !use_shader(vertex_shader))
                 continue;
-            vertex_shader->set_uniform("texture_preview_mix", mix);
+            vertex_shader->set_uniform("texture_preview_mix", color_match_active ? 1.f : mix);
             vertex_shader->set_uniform("invalid_texture_mapping", invalid);
         }
         models[idx].set_color(colors[idx]);

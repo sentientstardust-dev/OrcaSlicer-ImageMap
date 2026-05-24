@@ -2045,6 +2045,8 @@ void TriangleSelectorPatch::render_texture_preview(const Transform3d&          m
 
     if (!m_texture_preview_models.empty() &&
         ensure_model_volume_texture_preview(*m_model_volume, m_texture_preview, m_texture_preview_signature)) {
+        const TexturePreviewColorMatchSettings *color_match =
+            m_texture_preview_color_match && m_texture_preview_color_match->active ? &*m_texture_preview_color_match : nullptr;
         render_model_texture_preview_models(m_texture_preview_models,
                                             adjusted_preview_colors(m_texture_preview_filament_ids, m_texture_preview_colors),
                                             m_texture_preview_filament_ids,
@@ -2060,10 +2062,13 @@ void TriangleSelectorPatch::render_texture_preview(const Transform3d&          m
                                             -1,
                                             std::array<float, 4>{ 0.f, 0.f, 0.f, 0.f },
                                             std::array<float, 2>{ 0.f, 0.f },
-                                            m_texture_preview_opaque);
+                                            m_texture_preview_opaque,
+                                            color_match);
     }
 
     if (!m_vertex_color_preview_models.empty()) {
+        const TexturePreviewColorMatchSettings *color_match =
+            m_texture_preview_color_match && m_texture_preview_color_match->active ? &*m_texture_preview_color_match : nullptr;
         render_model_vertex_color_preview_models(m_vertex_color_preview_models,
                                                  adjusted_preview_colors(m_vertex_color_preview_filament_ids, m_vertex_color_preview_colors),
                                                  m_vertex_color_preview_filament_ids,
@@ -2078,7 +2083,10 @@ void TriangleSelectorPatch::render_texture_preview(const Transform3d&          m
                                                  std::array<float, 4>{ 0.f, 0.f, 0.f, 0.f },
                                                  std::array<float, 2>{ 0.f, 0.f },
                                                  m_texture_preview_opaque,
-                                                 m_model_volume);
+                                                 m_model_volume,
+                                                 nullptr,
+                                                 nullptr,
+                                                 color_match);
     }
 }
 

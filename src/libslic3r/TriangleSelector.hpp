@@ -363,10 +363,12 @@ public:
                                          const std::function<bool(EnforcerBlockerType,
                                                                   size_t,
                                                                   const Vec3f &,
-                                                                  const Vec3f &)> &predicate,
+                                                                 const Vec3f &)> &predicate,
                                          float max_world_edge,
                                          int max_depth,
-                                         bool clear_non_matching);
+                                         bool clear_non_matching,
+                                         const std::function<void(size_t, size_t)> &progress = {},
+                                         const std::function<bool()> &cancel = {});
 
     // Clear everything and make the tree empty.
     void reset();
@@ -533,7 +535,8 @@ private:
                                                                             const Vec3f &)> &predicate,
                                                    float max_world_edge_sqr,
                                                    int max_depth,
-                                                   bool clear_non_matching);
+                                                   bool clear_non_matching,
+                                                   const std::function<bool()> &cancel);
     void remove_useless_children(int facet_idx); // No hidden meaning. Triangles are meant.
     bool is_facet_clipped(int facet_idx, const ClippingPlane &clp) const;
     int  push_triangle(int a, int b, int c, int source_triangle, EnforcerBlockerType state = EnforcerBlockerType{0});

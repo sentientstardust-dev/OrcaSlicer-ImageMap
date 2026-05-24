@@ -73,6 +73,9 @@ constexpr size_t SlopePreviewOverrideIdCount = size_t(EnforcerBlockerType::Extru
 constexpr float SlopeAutoPaintMaxEdgeMm = 0.03f;
 constexpr int SlopeAutoPaintMaxDepth = 13;
 constexpr float SlopeAutoPaintMaxAngleDeg = 180.f;
+constexpr size_t ColorAutoPaintCommonColorCount = 8;
+constexpr size_t ColorAutoPaintMaxCommonColorSamples = 8192;
+constexpr int ColorAutoPaintKMeansIterations = 12;
 constexpr float ProjectionTextRasterBaseFontSize = 200.f;
 constexpr int ProjectionTextRasterMaxDimension = 2048;
 constexpr int ProjectionTextRasterMinFontSize = 18;
@@ -306,6 +309,10 @@ void GLGizmoMmuSegmentation::on_shutdown()
     m_slope_auto_paint_preview_active = false;
     m_show_color_auto_paint_overlay = false;
     m_color_auto_paint_preview_active = false;
+    m_color_auto_paint_picker_active = false;
+    m_color_auto_paint_picker_restore_show_result_area = false;
+    m_color_auto_paint_preview_progress_pct.store(0);
+    m_color_auto_paint_common_colors.clear();
     cancel_color_auto_paint_preview_worker();
     m_color_auto_paint_preview_selectors.clear();
     m_parent.use_slope(false);
@@ -433,6 +440,50 @@ static std::vector<ColorRGBA> mmu_segmentation_selector_colors_for_volume(const 
     colors.emplace_back(extruder_colors[extruder_color_idx]);
     colors.insert(colors.end(), extruder_colors.begin(), extruder_colors.end());
     return colors;
+}
+
+static ColorRGBA color_auto_paint_filament_color(unsigned int filament_id, const std::vector<ColorRGBA> &extruder_colors)
+{
+    if (extruder_colors.empty())
+        return ColorRGBA(0.15f, 0.65f, 0.6f, 1.f);
+
+    ColorRGBA color = extruder_colors[extruder_color_index_for_filament_id(filament_id, extruder_colors.size())];
+    color.a(1.f);
+    return color;
+}
+
+static ColorRGBA color_auto_paint_result_area_background_color(const ColorRGBA &filament_color)
+{
+    constexpr float grey = 0.55f;
+    constexpr float close_to_grey_distance_sq = 0.16f;
+    const float dr = std::clamp(filament_color.r(), 0.f, 1.f) - grey;
+    const float dg = std::clamp(filament_color.g(), 0.f, 1.f) - grey;
+    const float db = std::clamp(filament_color.b(), 0.f, 1.f) - grey;
+    if (dr * dr + dg * dg + db * db < close_to_grey_distance_sq)
+        return ColorRGBA::BLACK();
+    return ColorRGBA(grey, grey, grey, 1.f);
+}
+
+static void set_color_auto_paint_solid_preview_uniforms(GLShaderProgram *shader,
+                                                        const Matrix3f &normal_matrix,
+                                                        const ColorRGBA &color,
+                                                        int base_state)
+{
+    const std::array<float, 4> empty_mask { 0.f, 0.f, 0.f, 0.f };
+    shader->set_uniform("slope.actived", true);
+    shader->set_uniform("slope.volume_world_normal_matrix", normal_matrix);
+    shader->set_uniform("slope.normal_z", 0.f);
+    shader->set_uniform("slope.preview_mode", 5);
+    shader->set_uniform("slope.top_z", 1.f);
+    shader->set_uniform("slope.bottom_z", -1.f);
+    shader->set_uniform("slope.highlight_color", color);
+    shader->set_uniform("slope.override_all", true);
+    shader->set_uniform("slope.current_state", 0);
+    shader->set_uniform("slope.base_state", base_state);
+    shader->set_uniform("slope.override_mask0", empty_mask);
+    shader->set_uniform("slope.override_mask1", empty_mask);
+    shader->set_uniform("slope.override_mask2", empty_mask);
+    shader->set_uniform("slope.override_mask3", empty_mask);
 }
 
 static bool slope_auto_paint_matches_normal(const SlopeAutoPaintSettings &settings, float world_normal_z)
@@ -3487,7 +3538,7 @@ static bool resize_object_image_textures(ModelObject& object, double scale)
 
     bool changed = false;
     for (ModelVolume* volume : object.volumes) {
-        if (volume == nullptr || !volume->is_model_part() || !model_volume_has_imported_image_texture_data(volume))
+        if (volume == nullptr || !volume->is_model_part() || !model_volume_has_bakeable_image_texture_data(volume))
             continue;
         const uint32_t resized_width  = std::max<uint32_t>(1, uint32_t(std::llround(double(volume->imported_texture_width) * scale)));
         const uint32_t resized_height = std::max<uint32_t>(1, uint32_t(std::llround(double(volume->imported_texture_height) * scale)));
@@ -4313,11 +4364,293 @@ static std::optional<ColorRGBA> sample_color_auto_paint_source(const ModelObject
     return std::nullopt;
 }
 
+static ColorRGBA color_auto_paint_opaque_color(const ColorRGBA &color)
+{
+    return ColorRGBA(std::clamp(color.r(), 0.f, 1.f),
+                     std::clamp(color.g(), 0.f, 1.f),
+                     std::clamp(color.b(), 0.f, 1.f),
+                     1.f);
+}
+
+static float color_auto_paint_color_distance_sq(const ColorRGBA &lhs, const ColorRGBA &rhs)
+{
+    const float dr = lhs.r() - rhs.r();
+    const float dg = lhs.g() - rhs.g();
+    const float db = lhs.b() - rhs.b();
+    return dr * dr + dg * dg + db * db;
+}
+
+static uint32_t color_auto_paint_quantized_key(const ColorRGBA &color)
+{
+    auto quantize = [](float value) -> uint32_t {
+        return uint32_t(std::clamp(int(std::floor(std::clamp(value, 0.f, 1.f) * 31.f + 0.5f)), 0, 31));
+    };
+    return (quantize(color.r()) << 10) | (quantize(color.g()) << 5) | quantize(color.b());
+}
+
+struct ColorAutoPaintColorBin
+{
+    double r = 0.0;
+    double g = 0.0;
+    double b = 0.0;
+    size_t count = 0;
+};
+
+static bool append_color_auto_paint_image_texture_samples(const ModelObject &object, std::vector<ColorRGBA> &samples)
+{
+    bool added = false;
+    for (const ModelVolume *volume : object.volumes) {
+        if (samples.size() >= ColorAutoPaintMaxCommonColorSamples)
+            break;
+        if (volume == nullptr || !volume->is_model_part() || !model_volume_has_bakeable_image_texture_data(volume))
+            continue;
+
+        size_t source_size = 0;
+        if (!checked_texture_buffer_size(volume->imported_texture_width, volume->imported_texture_height, 4, source_size) ||
+            volume->imported_texture_rgba.size() < source_size)
+            continue;
+
+        const size_t remaining = ColorAutoPaintMaxCommonColorSamples - samples.size();
+        if (remaining == 0)
+            break;
+
+        const size_t pixel_count = size_t(volume->imported_texture_width) * size_t(volume->imported_texture_height);
+        const size_t step = std::max<size_t>(1, size_t(std::ceil(std::sqrt(double(pixel_count) / double(remaining)))));
+        const ColorRGBA background =
+            configured_texture_mapping_background_color_for_volume(*volume).value_or(managed_color_data_background_color(&object));
+
+        for (size_t y = 0; y < size_t(volume->imported_texture_height) && samples.size() < ColorAutoPaintMaxCommonColorSamples; y += step) {
+            for (size_t x = 0; x < size_t(volume->imported_texture_width) && samples.size() < ColorAutoPaintMaxCommonColorSamples; x += step) {
+                const size_t idx = (y * size_t(volume->imported_texture_width) + x) * 4;
+                if (idx + 3 >= volume->imported_texture_rgba.size())
+                    continue;
+                const ColorRGBA sample(float(volume->imported_texture_rgba[idx + 0]) / 255.f,
+                                       float(volume->imported_texture_rgba[idx + 1]) / 255.f,
+                                       float(volume->imported_texture_rgba[idx + 2]) / 255.f,
+                                       float(volume->imported_texture_rgba[idx + 3]) / 255.f);
+                samples.emplace_back(color_auto_paint_opaque_color(composite_color_over_background(sample, background)));
+                added = true;
+            }
+        }
+    }
+    return added;
+}
+
+static void append_color_auto_paint_mesh_source_samples(const ModelObject &object, std::vector<ColorRGBA> &samples)
+{
+    for (const ModelVolume *volume : object.volumes) {
+        if (samples.size() >= ColorAutoPaintMaxCommonColorSamples)
+            break;
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+
+        const indexed_triangle_set &its = volume->mesh().its;
+        if (its.indices.empty() || its.vertices.empty())
+            continue;
+
+        const size_t remaining = ColorAutoPaintMaxCommonColorSamples - samples.size();
+        if (remaining == 0)
+            break;
+
+        const size_t step = std::max<size_t>(1, (its.indices.size() + remaining - 1) / remaining);
+        const VolumeColorSource source = build_volume_color_source(*volume);
+        const Vec3f barycentric(1.f / 3.f, 1.f / 3.f, 1.f / 3.f);
+        for (size_t tri_idx = 0; tri_idx < its.indices.size() && samples.size() < ColorAutoPaintMaxCommonColorSamples; tri_idx += step) {
+            const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
+            if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0 ||
+                size_t(tri[0]) >= its.vertices.size() ||
+                size_t(tri[1]) >= its.vertices.size() ||
+                size_t(tri[2]) >= its.vertices.size())
+                continue;
+            const Vec3f point = (its.vertices[size_t(tri[0])].cast<float>() +
+                                 its.vertices[size_t(tri[1])].cast<float>() +
+                                 its.vertices[size_t(tri[2])].cast<float>()) / 3.f;
+            if (std::optional<ColorRGBA> sample =
+                    sample_color_auto_paint_source(&object, *volume, source, tri_idx, point, barycentric))
+                samples.emplace_back(color_auto_paint_opaque_color(*sample));
+        }
+    }
+}
+
+static std::vector<ColorRGBA> color_auto_paint_kmeans_common_colors(const std::vector<ColorRGBA> &samples, size_t color_count)
+{
+    std::vector<ColorRGBA> centers;
+    if (samples.empty() || color_count == 0)
+        return centers;
+
+    std::unordered_map<uint32_t, ColorAutoPaintColorBin> bins;
+    bins.reserve(samples.size());
+    for (const ColorRGBA &sample : samples) {
+        ColorAutoPaintColorBin &bin = bins[color_auto_paint_quantized_key(sample)];
+        bin.r += sample.r();
+        bin.g += sample.g();
+        bin.b += sample.b();
+        ++bin.count;
+    }
+
+    std::vector<ColorAutoPaintColorBin> sorted_bins;
+    sorted_bins.reserve(bins.size());
+    for (const auto &entry : bins)
+        sorted_bins.emplace_back(entry.second);
+    std::sort(sorted_bins.begin(), sorted_bins.end(), [](const ColorAutoPaintColorBin &lhs, const ColorAutoPaintColorBin &rhs) {
+        return lhs.count > rhs.count;
+    });
+
+    centers.reserve(std::min(color_count, sorted_bins.size()));
+    for (const ColorAutoPaintColorBin &bin : sorted_bins) {
+        if (centers.size() >= color_count)
+            break;
+        if (bin.count == 0)
+            continue;
+        const float inv = 1.f / float(bin.count);
+        centers.emplace_back(ColorRGBA(float(bin.r) * inv, float(bin.g) * inv, float(bin.b) * inv, 1.f));
+    }
+
+    while (centers.size() < color_count) {
+        float best_distance = 0.f;
+        const ColorRGBA *best_sample = nullptr;
+        for (const ColorRGBA &sample : samples) {
+            float nearest_distance = std::numeric_limits<float>::max();
+            for (const ColorRGBA &center : centers)
+                nearest_distance = std::min(nearest_distance, color_auto_paint_color_distance_sq(sample, center));
+            if (nearest_distance > best_distance) {
+                best_distance = nearest_distance;
+                best_sample = &sample;
+            }
+        }
+        if (best_sample == nullptr || best_distance <= 1e-6f)
+            break;
+        centers.emplace_back(*best_sample);
+    }
+
+    for (int iteration = 0; iteration < ColorAutoPaintKMeansIterations; ++iteration) {
+        std::vector<ColorAutoPaintColorBin> accum(centers.size());
+        for (const ColorRGBA &sample : samples) {
+            size_t nearest_idx = 0;
+            float nearest_distance = std::numeric_limits<float>::max();
+            for (size_t idx = 0; idx < centers.size(); ++idx) {
+                const float distance = color_auto_paint_color_distance_sq(sample, centers[idx]);
+                if (distance < nearest_distance) {
+                    nearest_distance = distance;
+                    nearest_idx = idx;
+                }
+            }
+            ColorAutoPaintColorBin &bin = accum[nearest_idx];
+            bin.r += sample.r();
+            bin.g += sample.g();
+            bin.b += sample.b();
+            ++bin.count;
+        }
+        for (size_t idx = 0; idx < centers.size(); ++idx) {
+            if (accum[idx].count == 0)
+                continue;
+            const float inv = 1.f / float(accum[idx].count);
+            centers[idx] = ColorRGBA(float(accum[idx].r) * inv,
+                                     float(accum[idx].g) * inv,
+                                     float(accum[idx].b) * inv,
+                                     1.f);
+        }
+    }
+
+    std::vector<size_t> counts(centers.size(), 0);
+    for (const ColorRGBA &sample : samples) {
+        size_t nearest_idx = 0;
+        float nearest_distance = std::numeric_limits<float>::max();
+        for (size_t idx = 0; idx < centers.size(); ++idx) {
+            const float distance = color_auto_paint_color_distance_sq(sample, centers[idx]);
+            if (distance < nearest_distance) {
+                nearest_distance = distance;
+                nearest_idx = idx;
+            }
+        }
+        ++counts[nearest_idx];
+    }
+
+    std::vector<size_t> order(centers.size());
+    for (size_t idx = 0; idx < order.size(); ++idx)
+        order[idx] = idx;
+    std::sort(order.begin(), order.end(), [&counts](size_t lhs, size_t rhs) {
+        return counts[lhs] > counts[rhs];
+    });
+
+    std::vector<ColorRGBA> result;
+    result.reserve(centers.size());
+    for (const size_t idx : order) {
+        if (counts[idx] == 0)
+            continue;
+        result.emplace_back(color_auto_paint_opaque_color(centers[idx]));
+    }
+    return result;
+}
+
+static std::vector<ColorRGBA> color_auto_paint_common_colors_for_object(const ModelObject &object)
+{
+    std::vector<ColorRGBA> samples;
+    samples.reserve(ColorAutoPaintMaxCommonColorSamples);
+
+    const bool has_managed_rgb_source = std::any_of(object.volumes.begin(), object.volumes.end(), [](const ModelVolume *volume) {
+        return volume != nullptr && volume->is_model_part() && !volume->texture_mapping_color_facets.empty();
+    });
+    if (has_managed_rgb_source)
+        append_color_auto_paint_mesh_source_samples(object, samples);
+    if (samples.empty() && !append_color_auto_paint_image_texture_samples(object, samples))
+        append_color_auto_paint_mesh_source_samples(object, samples);
+    return color_auto_paint_kmeans_common_colors(samples, ColorAutoPaintCommonColorCount);
+}
+
 static std::array<float, 3> color_auto_paint_oklab(const ColorRGBA &color)
 {
     return color_solver_oklab_from_srgb({ std::clamp(color.r(), 0.f, 1.f),
                                           std::clamp(color.g(), 0.f, 1.f),
                                           std::clamp(color.b(), 0.f, 1.f) });
+}
+
+static std::optional<unsigned int> first_color_auto_paint_physical_filament_id(const std::vector<unsigned int> &filament_ids,
+                                                                               const std::vector<ColorRGBA>    &extruder_colors)
+{
+    if (extruder_colors.empty())
+        return std::nullopt;
+
+    for (const unsigned int filament_id : filament_ids)
+        if (filament_id >= 1 && filament_id <= extruder_colors.size() && !is_texture_mapping_filament_id(filament_id))
+            return filament_id;
+
+    return 1u;
+}
+
+static std::optional<unsigned int> closest_color_auto_paint_physical_filament_id(const ColorRGBA                   &target_color,
+                                                                                 const std::vector<unsigned int> &filament_ids,
+                                                                                 const std::vector<ColorRGBA>    &extruder_colors)
+{
+    if (extruder_colors.empty())
+        return std::nullopt;
+
+    const std::array<float, 3> target_oklab = color_auto_paint_oklab(target_color);
+    std::optional<unsigned int> best_filament_id;
+    float best_distance = std::numeric_limits<float>::max();
+
+    auto consider_filament = [&](unsigned int filament_id) {
+        if (filament_id < 1 || filament_id > extruder_colors.size() || is_texture_mapping_filament_id(filament_id))
+            return;
+        const std::array<float, 3> filament_oklab = color_auto_paint_oklab(extruder_colors[size_t(filament_id - 1)]);
+        const float dl = filament_oklab[0] - target_oklab[0];
+        const float da = filament_oklab[1] - target_oklab[1];
+        const float db = filament_oklab[2] - target_oklab[2];
+        const float distance = dl * dl + da * da + db * db;
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_filament_id = filament_id;
+        }
+    };
+
+    for (const unsigned int filament_id : filament_ids)
+        consider_filament(filament_id);
+
+    if (!best_filament_id)
+        for (unsigned int filament_id = 1; filament_id <= extruder_colors.size(); ++filament_id)
+            consider_filament(filament_id);
+
+    return best_filament_id;
 }
 
 static float color_auto_paint_max_oklab_distance()
@@ -4349,6 +4682,15 @@ static float color_auto_paint_max_oklab_distance()
     return max_distance;
 }
 
+static float color_auto_paint_tolerance_oklab_distance_sq(float tolerance_pct)
+{
+    tolerance_pct = std::clamp(tolerance_pct, 0.f, 100.f);
+    if (tolerance_pct >= 100.f)
+        return std::numeric_limits<float>::max();
+    const float tolerance = tolerance_pct * 0.01f * color_auto_paint_max_oklab_distance();
+    return tolerance * tolerance;
+}
+
 static bool color_auto_paint_matches_target(const ColorRGBA &sample, const ColorAutoPaintSettings &settings)
 {
     const float tolerance_pct = std::clamp(settings.tolerance_pct, 0.f, 100.f);
@@ -4360,8 +4702,7 @@ static bool color_auto_paint_matches_target(const ColorRGBA &sample, const Color
     const float dl = sample_oklab[0] - target_oklab[0];
     const float da = sample_oklab[1] - target_oklab[1];
     const float db = sample_oklab[2] - target_oklab[2];
-    const float tolerance = tolerance_pct * 0.01f * color_auto_paint_max_oklab_distance();
-    return dl * dl + da * da + db * db <= tolerance * tolerance;
+    return dl * dl + da * da + db * db <= color_auto_paint_tolerance_oklab_distance_sq(tolerance_pct);
 }
 
 static bool snapshot_has_bakeable_image_texture_data(const TrueColorRgbDataConversionVolumeSnapshot &snapshot)
@@ -10078,6 +10419,7 @@ GLGizmoMmuSegmentation::GLGizmoMmuSegmentation(GLCanvas3D& parent, const std::st
 void GLGizmoMmuSegmentation::render_painter_gizmo()
 {
     const Selection& selection = m_parent.get_selection();
+    update_color_auto_paint_shader_preview_settings();
 
     glsafe(::glEnable(GL_BLEND));
     glsafe(::glEnable(GL_DEPTH_TEST));
@@ -10091,10 +10433,109 @@ void GLGizmoMmuSegmentation::render_painter_gizmo()
     glsafe(::glDisable(GL_BLEND));
 }
 
+bool GLGizmoMmuSegmentation::color_auto_paint_shader_preview_active() const
+{
+    return m_show_color_auto_paint_overlay &&
+           !m_color_auto_paint_picker_active &&
+           (m_color_auto_paint_preview_update_pending || m_color_auto_paint_preview_worker_running);
+}
+
+void GLGizmoMmuSegmentation::update_color_auto_paint_shader_preview_settings()
+{
+    const bool active = color_auto_paint_shader_preview_active();
+    const ModelObject *object = m_c->selection_info()->model_object();
+    if (object == nullptr) {
+        for (const auto &selector_ptr : m_triangle_selectors) {
+            TriangleSelectorPatch *selector = dynamic_cast<TriangleSelectorPatch *>(selector_ptr.get());
+            if (selector != nullptr) {
+                selector->set_full_texture_preview_forced(false);
+                selector->set_texture_preview_color_match_settings(std::nullopt);
+            }
+        }
+        return;
+    }
+
+    int selector_idx = -1;
+    for (const ModelVolume *volume : object->volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+        ++selector_idx;
+        if (selector_idx < 0 || size_t(selector_idx) >= m_triangle_selectors.size() || m_triangle_selectors[size_t(selector_idx)] == nullptr)
+            continue;
+
+        TriangleSelectorPatch *selector = dynamic_cast<TriangleSelectorPatch *>(m_triangle_selectors[size_t(selector_idx)].get());
+        if (selector == nullptr)
+            continue;
+
+        selector->set_full_texture_preview_forced(active &&
+                                                  m_color_auto_paint_settings.override_all &&
+                                                  model_volume_has_bakeable_image_texture_data(volume));
+        if (!active) {
+            selector->set_texture_preview_color_match_settings(std::nullopt);
+            continue;
+        }
+
+        TexturePreviewColorMatchSettings settings;
+        settings.active = true;
+        settings.target_oklab = color_auto_paint_oklab(m_color_auto_paint_settings.target_color);
+        settings.tolerance_sq = color_auto_paint_tolerance_oklab_distance_sq(m_color_auto_paint_settings.tolerance_pct);
+        settings.highlight_color = color_auto_paint_filament_color(m_color_auto_paint_settings.target_filament_id, m_extruders_colors);
+        settings.highlight_color.a(m_color_auto_paint_settings.show_result_area ? 1.f : 0.95f);
+        settings.background_color =
+            configured_texture_mapping_background_color_for_volume(*volume).value_or(managed_color_data_background_color(object));
+        settings.override_all = m_color_auto_paint_settings.override_all;
+        settings.override_filament_ids = m_color_auto_paint_settings.override_filament_ids;
+        selector->set_texture_preview_color_match_settings(settings);
+    }
+}
+
+bool GLGizmoMmuSegmentation::gizmo_event(SLAGizmoEventType action,
+                                         const Vec2d& mouse_position,
+                                         bool shift_down,
+                                         bool alt_down,
+                                         bool control_down)
+{
+    const bool painting_event =
+        action == SLAGizmoEventType::LeftDown ||
+        action == SLAGizmoEventType::RightDown ||
+        action == SLAGizmoEventType::Dragging ||
+        action == SLAGizmoEventType::LeftUp ||
+        action == SLAGizmoEventType::RightUp ||
+        action == SLAGizmoEventType::Moving;
+
+    if (m_color_auto_paint_picker_active) {
+        if (action == SLAGizmoEventType::LeftDown) {
+            pick_color_auto_paint_source_from_model(mouse_position);
+            m_parent.set_as_dirty();
+            return true;
+        }
+        if (action == SLAGizmoEventType::RightDown) {
+            m_parent.set_as_dirty();
+            return true;
+        }
+        if (painting_event)
+            return true;
+    }
+
+    return GLGizmoPainterBase::gizmo_event(action, mouse_position, shift_down, alt_down, control_down);
+}
+
 void GLGizmoMmuSegmentation::set_render_triangle_slope_uniforms(GLShaderProgram *shader,
                                                                 const ModelVolume *model_volume,
                                                                 const Matrix3f &normal_matrix) const
 {
+    if (m_show_color_auto_paint_overlay && m_color_auto_paint_settings.show_result_area && !m_color_auto_paint_picker_active && shader != nullptr) {
+        const ColorRGBA filament_color =
+            color_auto_paint_filament_color(m_color_auto_paint_settings.target_filament_id, m_extruders_colors);
+        const unsigned int base_filament_id =
+            model_volume != nullptr && model_volume->extruder_id() > 0 ? unsigned(model_volume->extruder_id()) : 1u;
+        set_color_auto_paint_solid_preview_uniforms(shader,
+                                                    normal_matrix,
+                                                    color_auto_paint_result_area_background_color(filament_color),
+                                                    int(base_filament_id));
+        return;
+    }
+
     if (!m_slope_auto_paint_preview_active || shader == nullptr) {
         GLGizmoPainterBase::set_render_triangle_slope_uniforms(shader, model_volume, normal_matrix);
         return;
@@ -10144,7 +10585,9 @@ void GLGizmoMmuSegmentation::set_render_triangle_slope_uniforms(GLShaderProgram 
 
 bool GLGizmoMmuSegmentation::should_render_triangle_texture_preview() const
 {
-    return !m_slope_auto_paint_preview_active;
+    return !m_slope_auto_paint_preview_active &&
+           (color_auto_paint_shader_preview_active() ||
+            !(m_show_color_auto_paint_overlay && m_color_auto_paint_settings.show_result_area && !m_color_auto_paint_picker_active));
 }
 
 void GLGizmoMmuSegmentation::render_extra_triangle_overlays(int mesh_id,
@@ -10158,7 +10601,9 @@ void GLGizmoMmuSegmentation::render_extra_triangle_overlays(int mesh_id,
     (void)projection_matrix;
     (void)z_range;
     (void)clipping_plane;
-    if (!m_color_auto_paint_preview_active ||
+    if (m_color_auto_paint_picker_active ||
+        color_auto_paint_shader_preview_active() ||
+        !m_color_auto_paint_preview_active ||
         mesh_id < 0 ||
         size_t(mesh_id) >= m_color_auto_paint_preview_selectors.size() ||
         m_color_auto_paint_preview_selectors[size_t(mesh_id)] == nullptr)
@@ -10168,12 +10613,9 @@ void GLGizmoMmuSegmentation::render_extra_triangle_overlays(int mesh_id,
     if (shader == nullptr)
         return;
 
-    const size_t target_color_idx =
-        extruder_color_index_for_filament_id(m_color_auto_paint_preview_settings.target_filament_id, m_extruders_colors.size());
-    ColorRGBA highlight_color = m_extruders_colors.empty() ?
-        ColorRGBA(0.15f, 0.65f, 0.6f, 1.f) :
-        m_extruders_colors[target_color_idx];
-    highlight_color.a(0.95f);
+    ColorRGBA highlight_color =
+        color_auto_paint_filament_color(m_color_auto_paint_settings.target_filament_id, m_extruders_colors);
+    highlight_color.a(m_color_auto_paint_settings.show_result_area ? 1.f : 0.95f);
     const Matrix3f normal_matrix = static_cast<Matrix3f>(matrix.matrix().block(0, 0, 3, 3).inverse().transpose().cast<float>());
     const std::array<float, 4> empty_mask { 0.f, 0.f, 0.f, 0.f };
 
@@ -10185,20 +10627,24 @@ void GLGizmoMmuSegmentation::render_extra_triangle_overlays(int mesh_id,
     glsafe(::glGetFloatv(GL_POLYGON_OFFSET_FACTOR, &polygon_offset_factor));
     glsafe(::glGetFloatv(GL_POLYGON_OFFSET_UNITS, &polygon_offset_units));
 
-    shader->set_uniform("slope.actived", true);
-    shader->set_uniform("slope.volume_world_normal_matrix", normal_matrix);
-    shader->set_uniform("slope.normal_z", 0.f);
-    shader->set_uniform("slope.preview_mode", 4);
-    shader->set_uniform("slope.top_z", 1.f);
-    shader->set_uniform("slope.bottom_z", -1.f);
-    shader->set_uniform("slope.highlight_color", highlight_color);
-    shader->set_uniform("slope.override_all", true);
-    shader->set_uniform("slope.current_state", 0);
-    shader->set_uniform("slope.base_state", 1);
-    shader->set_uniform("slope.override_mask0", empty_mask);
-    shader->set_uniform("slope.override_mask1", empty_mask);
-    shader->set_uniform("slope.override_mask2", empty_mask);
-    shader->set_uniform("slope.override_mask3", empty_mask);
+    if (m_color_auto_paint_settings.show_result_area) {
+        set_color_auto_paint_solid_preview_uniforms(shader, normal_matrix, highlight_color, 1);
+    } else {
+        shader->set_uniform("slope.actived", true);
+        shader->set_uniform("slope.volume_world_normal_matrix", normal_matrix);
+        shader->set_uniform("slope.normal_z", 0.f);
+        shader->set_uniform("slope.preview_mode", 4);
+        shader->set_uniform("slope.top_z", 1.f);
+        shader->set_uniform("slope.bottom_z", -1.f);
+        shader->set_uniform("slope.highlight_color", highlight_color);
+        shader->set_uniform("slope.override_all", true);
+        shader->set_uniform("slope.current_state", 0);
+        shader->set_uniform("slope.base_state", 1);
+        shader->set_uniform("slope.override_mask0", empty_mask);
+        shader->set_uniform("slope.override_mask1", empty_mask);
+        shader->set_uniform("slope.override_mask2", empty_mask);
+        shader->set_uniform("slope.override_mask3", empty_mask);
+    }
 
     glsafe(::glDepthFunc(GL_LEQUAL));
     glsafe(::glEnable(GL_POLYGON_OFFSET_FILL));
@@ -10399,6 +10845,8 @@ void GLGizmoMmuSegmentation::open_slope_auto_paint_overlay()
 
     m_show_color_auto_paint_overlay = false;
     m_color_auto_paint_overlay_positioned = false;
+    if (m_color_auto_paint_picker_active)
+        set_color_auto_paint_picker_active(false);
     clear_color_auto_paint_preview();
 
     m_slope_auto_paint_settings = SlopeAutoPaintSettings();
@@ -10495,12 +10943,117 @@ bool GLGizmoMmuSegmentation::apply_slope_auto_paint(const SlopeAutoPaintSettings
     return changed;
 }
 
+void GLGizmoMmuSegmentation::set_color_auto_paint_target_color(const ColorRGBA &color)
+{
+    m_color_auto_paint_settings.target_color = color_auto_paint_opaque_color(color);
+}
+
+void GLGizmoMmuSegmentation::set_color_auto_paint_picker_active(bool active)
+{
+    if (m_color_auto_paint_picker_active == active)
+        return;
+
+    if (active) {
+        m_color_auto_paint_picker_restore_show_result_area = m_color_auto_paint_settings.show_result_area;
+        if (m_color_auto_paint_settings.show_result_area) {
+            m_color_auto_paint_settings.show_result_area = false;
+            m_color_auto_paint_preview_settings.show_result_area = false;
+        }
+        m_color_auto_paint_picker_active = true;
+    } else {
+        m_color_auto_paint_picker_active = false;
+        if (m_color_auto_paint_picker_restore_show_result_area) {
+            m_color_auto_paint_settings.show_result_area = true;
+            m_color_auto_paint_preview_settings.show_result_area = true;
+        }
+        m_color_auto_paint_picker_restore_show_result_area = false;
+    }
+
+    m_parent.set_as_dirty();
+    m_parent.schedule_extra_frame(0);
+}
+
+void GLGizmoMmuSegmentation::refresh_color_auto_paint_common_colors()
+{
+    m_color_auto_paint_common_colors.clear();
+    const ModelObject *object = m_c->selection_info()->model_object();
+    if (object != nullptr)
+        m_color_auto_paint_common_colors = color_auto_paint_common_colors_for_object(*object);
+}
+
+bool GLGizmoMmuSegmentation::pick_color_auto_paint_source_from_model(const Vec2d &mouse_position)
+{
+    ColorRGBA color;
+    if (!sample_color_auto_paint_source_from_model(mouse_position, color))
+        return false;
+
+    set_color_auto_paint_target_color(color);
+    update_color_auto_paint_preview(m_color_auto_paint_settings);
+    return true;
+}
+
+bool GLGizmoMmuSegmentation::sample_color_auto_paint_source_from_model(const Vec2d &mouse_position, ColorRGBA &color) const
+{
+    const ModelObject *object = m_c->selection_info()->model_object();
+    if (object == nullptr)
+        return false;
+
+    int mesh_idx = -1;
+    Vec3f hit = Vec3f::Zero();
+    size_t tri_idx = 0;
+    if (!raycast_to_selected_mesh(mouse_position, mesh_idx, hit, tri_idx) || mesh_idx < 0)
+        return false;
+
+    const ModelVolume *volume = nullptr;
+    int part_idx = -1;
+    for (const ModelVolume *candidate : object->volumes) {
+        if (candidate == nullptr || !candidate->is_model_part())
+            continue;
+        ++part_idx;
+        if (part_idx == mesh_idx) {
+            volume = candidate;
+            break;
+        }
+    }
+    if (volume == nullptr)
+        return false;
+
+    const indexed_triangle_set &its = volume->mesh().its;
+    if (tri_idx >= its.indices.size())
+        return false;
+
+    const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
+    if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0 ||
+        size_t(tri[0]) >= its.vertices.size() ||
+        size_t(tri[1]) >= its.vertices.size() ||
+        size_t(tri[2]) >= its.vertices.size())
+        return false;
+
+    Vec3f barycentric = Vec3f::Zero();
+    if (!barycentric_weights_for_region_vertex_colors(hit,
+                                                      its.vertices[size_t(tri[0])].cast<float>(),
+                                                      its.vertices[size_t(tri[1])].cast<float>(),
+                                                      its.vertices[size_t(tri[2])].cast<float>(),
+                                                      barycentric))
+        return false;
+
+    const VolumeColorSource source = build_volume_color_source(*volume);
+    std::optional<ColorRGBA> sampled = sample_color_auto_paint_source(object, *volume, source, tri_idx, hit, barycentric);
+    if (!sampled)
+        return false;
+
+    color = color_auto_paint_opaque_color(*sampled);
+    return true;
+}
+
 void GLGizmoMmuSegmentation::render_color_auto_paint_overlay()
 {
     if (!m_show_color_auto_paint_overlay)
         return;
 
     if (!selected_object_has_color_auto_paint_source()) {
+        if (m_color_auto_paint_picker_active)
+            set_color_auto_paint_picker_active(false);
         m_show_color_auto_paint_overlay = false;
         clear_color_auto_paint_preview();
         return;
@@ -10570,15 +11123,46 @@ void GLGizmoMmuSegmentation::render_color_auto_paint_overlay()
     ImGui::AlignTextToFramePadding();
     m_imgui->text(_L("Color"));
     ImGui::SameLine(label_width);
-    ImGui::PushItemWidth(item_width);
+    const float color_swatch_width = std::max(ImGui::GetFrameHeight() * 2.f, m_imgui->scaled(3.f));
+    ImGui::PushItemWidth(color_swatch_width);
     ImGuiColorEditFlags color_flags = ImGuiColorEditFlags_DisplayRGB |
                                       ImGuiColorEditFlags_InputRGB |
                                       ImGuiColorEditFlags_NoInputs;
     if (ImGui::ColorEdit3("##color_auto_paint_picker", target_color.data(), color_flags)) {
-        m_color_auto_paint_settings.target_color = ColorRGBA(target_color[0], target_color[1], target_color[2], 1.f);
+        set_color_auto_paint_target_color(ColorRGBA(target_color[0], target_color[1], target_color[2], 1.f));
         changed = true;
     }
     ImGui::PopItemWidth();
+    ImGui::SameLine();
+    const wxString picker_label = m_color_auto_paint_picker_active ? _L("Stop picking") : _L("Pick from model");
+    m_imgui->push_cancel_button_style();
+    if (m_imgui->bbl_button(picker_label))
+        set_color_auto_paint_picker_active(!m_color_auto_paint_picker_active);
+    m_imgui->pop_cancel_button_style();
+
+    if (!m_color_auto_paint_common_colors.empty()) {
+        ImGui::AlignTextToFramePadding();
+        m_imgui->text(_L("Colors"));
+        ImGui::SameLine(label_width);
+        const float swatch_size = ImGui::GetTextLineHeight();
+        ImGuiColorEditFlags swatch_flags = ImGuiColorEditFlags_NoAlpha | ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel |
+                                           ImGuiColorEditFlags_NoPicker;
+        ImGui::PushID("color_auto_paint_common_colors");
+        for (size_t idx = 0; idx < m_color_auto_paint_common_colors.size(); ++idx) {
+            if (idx > 0)
+                ImGui::SameLine();
+            ImGui::PushID(int(idx));
+            if (ImGui::ColorButton("##common_swatch",
+                                   ImGuiWrapper::to_ImVec4(m_color_auto_paint_common_colors[idx]),
+                                   swatch_flags,
+                                   ImVec2(swatch_size, swatch_size))) {
+                set_color_auto_paint_target_color(m_color_auto_paint_common_colors[idx]);
+                changed = true;
+            }
+            ImGui::PopID();
+        }
+        ImGui::PopID();
+    }
 
     ImGui::AlignTextToFramePadding();
     m_imgui->text(_L("Tolerance"));
@@ -10589,6 +11173,14 @@ void GLGizmoMmuSegmentation::render_color_auto_paint_overlay()
         changed = true;
     }
     ImGui::PopItemWidth();
+
+    m_imgui->disabled_begin(m_color_auto_paint_picker_active);
+    if (m_imgui->bbl_checkbox(_L("Show result area"), m_color_auto_paint_settings.show_result_area)) {
+        m_color_auto_paint_preview_settings.show_result_area = m_color_auto_paint_settings.show_result_area;
+        m_parent.set_as_dirty();
+        m_parent.schedule_extra_frame(0);
+    }
+    m_imgui->disabled_end();
 
     ImGui::Separator();
     m_imgui->text(_L("Mask:"));
@@ -10674,12 +11266,16 @@ void GLGizmoMmuSegmentation::render_color_auto_paint_overlay()
     if (preview_processing) {
         ImGui::SameLine();
         m_imgui->text(_L("Processing..."));
+        ImGui::SameLine();
+        ImGui::Text("%d%%", std::clamp(m_color_auto_paint_preview_progress_pct.load(), 0, 100));
     }
 
     m_imgui->end();
     m_imgui->pop_common_window_style();
 
     if (!open || close_overlay) {
+        if (m_color_auto_paint_picker_active)
+            set_color_auto_paint_picker_active(false);
         m_show_color_auto_paint_overlay = false;
         m_color_auto_paint_overlay_positioned = false;
         clear_color_auto_paint_preview();
@@ -10696,22 +11292,35 @@ void GLGizmoMmuSegmentation::open_color_auto_paint_overlay()
     clear_slope_auto_paint_preview();
 
     m_color_auto_paint_settings = ColorAutoPaintSettings();
-    m_color_auto_paint_settings.target_filament_id = m_selected_extruder_idx < m_display_filament_ids.size() ?
-        m_display_filament_ids[m_selected_extruder_idx] :
-        1u;
-    if (!m_display_filament_ids.empty() &&
-        std::find(m_display_filament_ids.begin(), m_display_filament_ids.end(), m_color_auto_paint_settings.target_filament_id) ==
-            m_display_filament_ids.end())
-        m_color_auto_paint_settings.target_filament_id = m_display_filament_ids.front();
-    const size_t color_idx =
-        extruder_color_index_for_filament_id(m_color_auto_paint_settings.target_filament_id, m_extruders_colors.size());
-    if (!m_extruders_colors.empty()) {
-        m_color_auto_paint_settings.target_color = m_extruders_colors[color_idx];
+    m_color_auto_paint_picker_active = false;
+    m_color_auto_paint_picker_restore_show_result_area = false;
+    std::optional<unsigned int> default_filament_id;
+    if (m_selected_extruder_idx < m_display_filament_ids.size()) {
+        const unsigned int selected_filament_id = m_display_filament_ids[m_selected_extruder_idx];
+        if (selected_filament_id >= 1 &&
+            selected_filament_id <= m_extruders_colors.size() &&
+            !is_texture_mapping_filament_id(selected_filament_id))
+            default_filament_id = selected_filament_id;
+    }
+    if (!default_filament_id)
+        default_filament_id = first_color_auto_paint_physical_filament_id(m_display_filament_ids, m_extruders_colors);
+    m_color_auto_paint_settings.target_filament_id = default_filament_id.value_or(1u);
+    if (!m_extruders_colors.empty() && m_color_auto_paint_settings.target_filament_id >= 1 &&
+        m_color_auto_paint_settings.target_filament_id <= m_extruders_colors.size()) {
+        m_color_auto_paint_settings.target_color = m_extruders_colors[size_t(m_color_auto_paint_settings.target_filament_id - 1)];
         m_color_auto_paint_settings.target_color.a(1.f);
     }
 
     m_show_color_auto_paint_overlay = true;
     m_color_auto_paint_overlay_positioned = false;
+    refresh_color_auto_paint_common_colors();
+    if (!m_color_auto_paint_common_colors.empty())
+        set_color_auto_paint_target_color(m_color_auto_paint_common_colors.front());
+    if (std::optional<unsigned int> closest_filament_id =
+            closest_color_auto_paint_physical_filament_id(m_color_auto_paint_settings.target_color,
+                                                          m_display_filament_ids,
+                                                          m_extruders_colors))
+        m_color_auto_paint_settings.target_filament_id = *closest_filament_id;
     update_color_auto_paint_preview(m_color_auto_paint_settings);
 }
 
@@ -10720,7 +11329,9 @@ bool GLGizmoMmuSegmentation::apply_color_auto_paint_to_selector(const ModelObjec
                                                                 TriangleSelector &selector,
                                                                 const Transform3d &trafo_no_translate,
                                                                 const ColorAutoPaintSettings &settings,
-                                                                bool clear_non_matching) const
+                                                                bool clear_non_matching,
+                                                                const std::function<void(size_t, size_t)> &progress,
+                                                                const std::function<bool()> &cancel) const
 {
     const VolumeColorSource source = build_volume_color_source(volume);
     const std::unordered_set<unsigned int> override_ids(settings.override_filament_ids.begin(), settings.override_filament_ids.end());
@@ -10743,15 +11354,28 @@ bool GLGizmoMmuSegmentation::apply_color_auto_paint_to_selector(const ModelObjec
         },
         SlopeAutoPaintMaxEdgeMm,
         SlopeAutoPaintMaxDepth,
-        clear_non_matching);
+        clear_non_matching,
+        progress,
+        cancel);
 }
 
 void GLGizmoMmuSegmentation::update_color_auto_paint_preview(const ColorAutoPaintSettings &settings)
 {
     m_color_auto_paint_requested_settings = settings;
     m_color_auto_paint_preview_update_pending = true;
+    m_color_auto_paint_preview_progress_pct.store(0);
     ++m_color_auto_paint_preview_generation;
-    start_color_auto_paint_preview_worker();
+    if (m_color_auto_paint_preview_worker_running)
+        request_color_auto_paint_preview_worker_cancel();
+    else
+        start_color_auto_paint_preview_worker();
+    m_parent.schedule_extra_frame(0);
+}
+
+void GLGizmoMmuSegmentation::request_color_auto_paint_preview_worker_cancel()
+{
+    m_color_auto_paint_preview_worker_cancel.store(true);
+    m_parent.set_as_dirty();
     m_parent.schedule_extra_frame(0);
 }
 
@@ -10774,6 +11398,8 @@ void GLGizmoMmuSegmentation::start_color_auto_paint_preview_worker()
         m_color_auto_paint_preview_selectors.clear();
         m_color_auto_paint_preview_active = false;
         m_color_auto_paint_preview_update_pending = false;
+        m_color_auto_paint_preview_progress_pct.store(0);
+        m_color_auto_paint_preview_worker_cancel.store(false);
         m_parent.set_as_dirty();
         m_parent.schedule_extra_frame(0);
         return;
@@ -10816,13 +11442,48 @@ void GLGizmoMmuSegmentation::start_color_auto_paint_preview_worker()
 
     const uint64_t generation = m_color_auto_paint_preview_generation;
     const ColorAutoPaintSettings settings = m_color_auto_paint_requested_settings;
+    m_color_auto_paint_preview_progress_pct.store(0);
+    m_color_auto_paint_preview_worker_cancel.store(false);
     m_color_auto_paint_preview_worker_running = true;
     m_color_auto_paint_preview_thread = std::thread([this, generation, settings, tasks = std::move(tasks)]() mutable {
         auto selectors = std::make_shared<std::vector<std::unique_ptr<TriangleSelectorPatch>>>();
         selectors->reserve(tasks.size());
-        for (const ColorAutoPaintPreviewTask &task : tasks) {
+        auto cancel_requested = [this]() {
+            return m_color_auto_paint_preview_worker_cancel.load();
+        };
+        size_t total_work = 0;
+        for (const ColorAutoPaintPreviewTask &task : tasks)
+            total_work += task.valid && task.volume != nullptr ? std::max<size_t>(task.volume->mesh().its.indices.size(), 1) : 1;
+        total_work = std::max<size_t>(total_work, 1);
+        size_t completed_work = 0;
+        int last_reported_pct = -1;
+        auto report_progress = [this, generation, &last_reported_pct](int pct) {
+            pct = std::clamp(pct, 0, 100);
+            m_color_auto_paint_preview_progress_pct.store(pct);
+            if (pct == last_reported_pct)
+                return;
+            const bool schedule_frame = last_reported_pct < 0 || pct == 100 || pct / 5 != last_reported_pct / 5;
+            last_reported_pct = pct;
+            if (schedule_frame) {
+                wxGetApp().CallAfter([this, generation]() {
+                    if (generation == m_color_auto_paint_preview_generation && m_show_color_auto_paint_overlay) {
+                        m_parent.set_as_dirty();
+                        m_parent.schedule_extra_frame(0);
+                    }
+                });
+            }
+        };
+        report_progress(0);
+        for (size_t task_idx = 0; task_idx < tasks.size(); ++task_idx) {
+            if (cancel_requested())
+                break;
+            const ColorAutoPaintPreviewTask &task = tasks[task_idx];
+            const size_t task_work =
+                task.valid && task.volume != nullptr ? std::max<size_t>(task.volume->mesh().its.indices.size(), 1) : 1;
             if (!task.valid || task.object == nullptr || task.volume == nullptr) {
                 selectors->emplace_back();
+                completed_work += task_work;
+                report_progress(int(completed_work * 100 / total_work));
                 continue;
             }
 
@@ -10832,18 +11493,31 @@ void GLGizmoMmuSegmentation::start_color_auto_paint_preview_worker()
             preview_selector->set_none_state_rendered(false);
             preview_selector->set_texture_preview_needed(false);
             preview_selector->set_wireframe_needed(false);
+            auto progress = [&](size_t done, size_t total) {
+                if (cancel_requested())
+                    return;
+                const size_t clamped_done = std::min(done, std::max<size_t>(total, 1));
+                report_progress(int((completed_work + std::min(clamped_done, task_work)) * 100 / total_work));
+            };
             apply_color_auto_paint_to_selector(*task.object,
                                                *task.volume,
                                                *preview_selector,
                                                task.trafo_no_translate,
                                                settings,
-                                               true);
+                                               true,
+                                               progress,
+                                               cancel_requested);
+            if (cancel_requested())
+                break;
             preview_selector->request_update_render_data(true);
             selectors->emplace_back(std::move(preview_selector));
+            completed_work += task_work;
+            report_progress(int(completed_work * 100 / total_work));
         }
 
-        wxGetApp().CallAfter([this, generation, settings, selectors]() mutable {
-            finish_color_auto_paint_preview_update(generation, settings, true, std::move(*selectors));
+        const bool active = !cancel_requested();
+        wxGetApp().CallAfter([this, generation, settings, active, selectors]() mutable {
+            finish_color_auto_paint_preview_update(generation, settings, active, std::move(*selectors));
         });
     });
 }
@@ -10857,12 +11531,14 @@ void GLGizmoMmuSegmentation::finish_color_auto_paint_preview_update(
     if (m_color_auto_paint_preview_thread.joinable())
         m_color_auto_paint_preview_thread.join();
     m_color_auto_paint_preview_worker_running = false;
+    m_color_auto_paint_preview_worker_cancel.store(false);
 
     if (generation == m_color_auto_paint_preview_generation && m_show_color_auto_paint_overlay) {
         m_color_auto_paint_preview_selectors = std::move(selectors);
         m_color_auto_paint_preview_settings = settings;
         m_color_auto_paint_preview_active = active;
         m_color_auto_paint_preview_update_pending = false;
+        m_color_auto_paint_preview_progress_pct.store(active ? 100 : 0);
         m_parent.set_as_dirty();
         m_parent.schedule_extra_frame(0);
     }
@@ -10875,9 +11551,12 @@ void GLGizmoMmuSegmentation::cancel_color_auto_paint_preview_worker()
 {
     ++m_color_auto_paint_preview_generation;
     m_color_auto_paint_preview_update_pending = false;
+    m_color_auto_paint_preview_progress_pct.store(0);
+    m_color_auto_paint_preview_worker_cancel.store(true);
     if (m_color_auto_paint_preview_thread.joinable())
         m_color_auto_paint_preview_thread.join();
     m_color_auto_paint_preview_worker_running = false;
+    m_color_auto_paint_preview_worker_cancel.store(false);
 }
 
 void GLGizmoMmuSegmentation::clear_color_auto_paint_preview()
@@ -10885,7 +11564,10 @@ void GLGizmoMmuSegmentation::clear_color_auto_paint_preview()
     ++m_color_auto_paint_preview_generation;
     m_color_auto_paint_preview_active = false;
     m_color_auto_paint_preview_update_pending = false;
+    m_color_auto_paint_preview_progress_pct.store(0);
+    request_color_auto_paint_preview_worker_cancel();
     m_color_auto_paint_preview_selectors.clear();
+    m_color_auto_paint_common_colors.clear();
     m_parent.set_as_dirty();
     m_parent.schedule_extra_frame(0);
 }
@@ -11499,12 +12181,14 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
         }
     }
     if (ImGui::IsItemHovered())
-        m_imgui->tooltip(_L("Paint color regions by surface slope with a live preview."), max_tooltip_width);
+        m_imgui->tooltip(_L("Paint color regions based on the surface slope."), max_tooltip_width);
 
     const bool can_paint_by_color = selected_object_has_color_auto_paint_source();
     m_imgui->disabled_begin(!can_paint_by_color);
     if (m_imgui->button(_L("Paint by color"))) {
         if (m_show_color_auto_paint_overlay) {
+            if (m_color_auto_paint_picker_active)
+                set_color_auto_paint_picker_active(false);
             m_show_color_auto_paint_overlay = false;
             m_color_auto_paint_overlay_positioned = false;
             clear_color_auto_paint_preview();
@@ -11514,7 +12198,7 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
     }
     if (ImGui::IsItemHovered()) {
         if (can_paint_by_color)
-            m_imgui->tooltip(_L("Paint color regions by matching the visible source color with a live preview."), max_tooltip_width);
+            m_imgui->tooltip(_L("Paint filament regions based on the object texture color."), max_tooltip_width);
         else
             m_imgui->tooltip(_L("This object does not have RGBA, image texture, or vertex color data."), max_tooltip_width);
     }
@@ -11708,9 +12392,15 @@ void GLGizmoMmuSegmentation::init_model_triangle_selectors()
     m_triangle_selectors.clear();
     m_slope_auto_paint_preview_active = false;
     m_color_auto_paint_preview_active = false;
+    if (m_color_auto_paint_picker_active)
+        set_color_auto_paint_picker_active(false);
+    else
+        m_color_auto_paint_picker_restore_show_result_area = false;
     ++m_color_auto_paint_preview_generation;
     m_color_auto_paint_preview_update_pending = false;
+    m_color_auto_paint_preview_progress_pct.store(0);
     m_color_auto_paint_preview_selectors.clear();
+    m_color_auto_paint_common_colors.clear();
     m_volumes_extruder_idxs.clear();
 
     // Don't continue when extruders colors are not initialized

@@ -7972,17 +7972,22 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 return;
             wxMenu menu;
             const int assign_selected_objects_id = wxWindow::NewControlId();
+            const int assign_selected_objects_erase_id = wxWindow::NewControlId();
             const int duplicate_id = wxWindow::NewControlId();
             const int delete_id = wxWindow::NewControlId();
             const int delete_all_id = wxWindow::NewControlId();
+            const bool has_selected_objects = !selected_texture_mapping_object_idxs().empty();
             wxMenuItem *assign_selected_objects_item = menu.Append(assign_selected_objects_id, _L("Assign to selected objects"));
             if (assign_selected_objects_item != nullptr)
-                assign_selected_objects_item->Enable(!selected_texture_mapping_object_idxs().empty());
+                assign_selected_objects_item->Enable(has_selected_objects);
+            wxMenuItem *assign_selected_objects_erase_item = menu.Append(assign_selected_objects_erase_id, _L("Assign to selected objects (erase region painting)"));
+            if (assign_selected_objects_erase_item != nullptr)
+                assign_selected_objects_erase_item->Enable(has_selected_objects);
             menu.Append(duplicate_id, _L("Duplicate"));
             menu.Append(delete_id, _L("Delete"));
             menu.Append(delete_all_id, _L("Delete All Texture Mapping Zones"));
             menu.Bind(wxEVT_COMMAND_MENU_SELECTED, [this, zone_index, num_physical, physical_colors, mgr_ptr, persist_rows, assign_selected_objects_id,
-                                                     duplicate_id, delete_id, delete_all_id, bundle, set_config_string,
+                                                     assign_selected_objects_erase_id, duplicate_id, delete_id, delete_all_id, bundle, set_config_string,
                                                      texture_mapping_zone_affects_scene, selected_texture_mapping_object_idxs,
                                                      refresh_texture_mapping_preview, menu_btn](wxCommandEvent &evt) {
                 if (mgr_ptr == nullptr)
@@ -7990,7 +7995,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 auto &rows = mgr_ptr->zones();
                 if (zone_index >= rows.size())
                     return;
-                if (evt.GetId() == assign_selected_objects_id) {
+                if (evt.GetId() == assign_selected_objects_id || evt.GetId() == assign_selected_objects_erase_id) {
                     std::vector<size_t> object_idxs = selected_texture_mapping_object_idxs();
                     if (object_idxs.empty()) {
                         MessageDialog(menu_btn, _L("No objects are currently selected."), _L("Assign to selected objects"), wxOK | wxICON_INFORMATION).ShowModal();
@@ -7999,7 +8004,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                     const unsigned int zone_id = rows[zone_index].zone_id;
                     if (zone_id == 0 || obj_list() == nullptr)
                         return;
-                    if (obj_list()->assign_extruder_to_objects_and_clear_filament_region_painting(object_idxs, int(zone_id)))
+                    if (obj_list()->assign_extruder_to_objects(object_idxs, int(zone_id), evt.GetId() == assign_selected_objects_erase_id))
                         refresh_texture_mapping_preview();
                     return;
                 }
