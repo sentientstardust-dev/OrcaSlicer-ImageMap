@@ -7,6 +7,7 @@
 #include "SurfaceCollection.hpp"
 #include "ExtrusionEntityCollection.hpp"
 #include "BoundingBox.hpp"
+#include <functional>
 namespace Slic3r {
 
 class ExPolygon;
@@ -193,7 +194,10 @@ public:
     void                    make_perimeters();
     // Phony version of make_fills() without parameters for Perl integration only.
     void                    make_fills() { this->make_fills(nullptr, nullptr); }
-    void                    make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree, FillLightning::Generator* lightning_generator = nullptr);
+    void                    make_fills(FillAdaptive::Octree* adaptive_fill_octree,
+                                       FillAdaptive::Octree* support_fill_octree,
+                                       FillLightning::Generator* lightning_generator = nullptr,
+                                       std::function<void()> throw_if_canceled = {});
     Polylines               generate_sparse_infill_polylines_for_anchoring(FillAdaptive::Octree *adaptive_fill_octree,
                                                                            FillAdaptive::Octree *support_fill_octree,
                                                                            FillLightning::Generator* lightning_generator) const;

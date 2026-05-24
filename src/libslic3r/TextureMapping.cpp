@@ -668,6 +668,8 @@ static int modulation_mode_from_name(const std::string &name)
 
 static std::string top_surface_image_printing_method_name(int method)
 {
+    if (method == int(TextureMappingZone::TopSurfaceImageContoning))
+        return std::string("contoning");
     if (method == int(TextureMappingZone::TopSurfaceImageSameLayer45Partition))
         return std::string("same_layer_45_partition");
     return std::string("same_angle_45_width");
@@ -675,6 +677,8 @@ static std::string top_surface_image_printing_method_name(int method)
 
 static int top_surface_image_printing_method_from_name(const std::string &name)
 {
+    if (name == "contoning")
+        return int(TextureMappingZone::TopSurfaceImageContoning);
     if (name == "same_layer_45_partition")
         return int(TextureMappingZone::TopSurfaceImageSameLayer45Partition);
     return int(TextureMappingZone::TopSurfaceImageSameAngle45Width);
@@ -1044,6 +1048,11 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            std::abs(top_surface_image_max_line_width_mm - rhs.top_surface_image_max_line_width_mm) <= eps &&
            top_surface_image_colored_top_layers == rhs.top_surface_image_colored_top_layers &&
            top_surface_image_fixed_coloring_filaments == rhs.top_surface_image_fixed_coloring_filaments &&
+           std::abs(top_surface_contoning_angle_threshold_deg - rhs.top_surface_contoning_angle_threshold_deg) <= eps &&
+           top_surface_contoning_stack_layers == rhs.top_surface_contoning_stack_layers &&
+           std::abs(top_surface_contoning_min_feature_mm - rhs.top_surface_contoning_min_feature_mm) <= eps &&
+           top_surface_contoning_color_lower_surfaces == rhs.top_surface_contoning_color_lower_surfaces &&
+           top_surface_contoning_only_color_surface_infill == rhs.top_surface_contoning_only_color_surface_infill &&
            compact_offset_mode == rhs.compact_offset_mode &&
            use_legacy_fixed_color_mode == rhs.use_legacy_fixed_color_mode &&
            high_speed_image_texture_sampling == rhs.high_speed_image_texture_sampling &&
@@ -1401,6 +1410,22 @@ std::string TextureMappingManager::serialize_entries()
                       TextureMappingZone::MinTopSurfaceImageColoredTopLayers,
                       TextureMappingZone::MaxTopSurfaceImageColoredTopLayers);
         texture["top_surface_image_fixed_coloring_filaments"] = zone.top_surface_image_fixed_coloring_filaments;
+        texture["top_surface_contoning_angle_threshold_deg"] =
+            std::clamp(finite_or(zone.top_surface_contoning_angle_threshold_deg,
+                                 TextureMappingZone::DefaultTopSurfaceContoningAngleThresholdDeg),
+                       TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg,
+                       TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg);
+        texture["top_surface_contoning_stack_layers"] =
+            clamp_int(zone.top_surface_contoning_stack_layers,
+                      TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                      TextureMappingZone::MaxTopSurfaceContoningStackLayers);
+        texture["top_surface_contoning_min_feature_mm"] =
+            std::clamp(finite_or(zone.top_surface_contoning_min_feature_mm,
+                                 TextureMappingZone::DefaultTopSurfaceContoningMinFeatureMm),
+                       TextureMappingZone::MinTopSurfaceContoningMinFeatureMm,
+                       TextureMappingZone::MaxTopSurfaceContoningMinFeatureMm);
+        texture["top_surface_contoning_color_lower_surfaces"] = zone.top_surface_contoning_color_lower_surfaces;
+        texture["top_surface_contoning_only_color_surface_infill"] = zone.top_surface_contoning_only_color_surface_infill;
         texture["compact_offset_mode"] = zone.compact_offset_mode;
         texture["use_legacy_fixed_color_mode"] = zone.use_legacy_fixed_color_mode;
         texture["high_speed_image_texture_sampling"] = true;
@@ -1626,6 +1651,29 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.top_surface_image_fixed_coloring_filaments =
             texture.value("top_surface_image_fixed_coloring_filaments",
                           TextureMappingZone::DefaultTopSurfaceImageFixedColoringFilaments);
+        zone.top_surface_contoning_angle_threshold_deg =
+            std::clamp(finite_or(texture.value("top_surface_contoning_angle_threshold_deg",
+                                               TextureMappingZone::DefaultTopSurfaceContoningAngleThresholdDeg),
+                                 TextureMappingZone::DefaultTopSurfaceContoningAngleThresholdDeg),
+                       TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg,
+                       TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg);
+        zone.top_surface_contoning_stack_layers =
+            clamp_int(texture.value("top_surface_contoning_stack_layers",
+                                    TextureMappingZone::DefaultTopSurfaceContoningStackLayers),
+                      TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                      TextureMappingZone::MaxTopSurfaceContoningStackLayers);
+        zone.top_surface_contoning_min_feature_mm =
+            std::clamp(finite_or(texture.value("top_surface_contoning_min_feature_mm",
+                                               TextureMappingZone::DefaultTopSurfaceContoningMinFeatureMm),
+                                 TextureMappingZone::DefaultTopSurfaceContoningMinFeatureMm),
+                       TextureMappingZone::MinTopSurfaceContoningMinFeatureMm,
+                       TextureMappingZone::MaxTopSurfaceContoningMinFeatureMm);
+        zone.top_surface_contoning_color_lower_surfaces =
+            texture.value("top_surface_contoning_color_lower_surfaces",
+                          TextureMappingZone::DefaultTopSurfaceContoningColorLowerSurfaces);
+        zone.top_surface_contoning_only_color_surface_infill =
+            texture.value("top_surface_contoning_only_color_surface_infill",
+                          TextureMappingZone::DefaultTopSurfaceContoningOnlyColorSurfaceInfill);
         zone.compact_offset_mode = texture.value("compact_offset_mode", TextureMappingZone::DefaultCompactOffsetMode);
         zone.use_legacy_fixed_color_mode =
             texture.value("use_legacy_fixed_color_mode", TextureMappingZone::DefaultUseLegacyFixedColorMode);

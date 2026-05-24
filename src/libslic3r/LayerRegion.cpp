@@ -9,6 +9,7 @@
 #include "BoundingBox.hpp"
 #include "SVG.hpp"
 #include "TextureMapping.hpp"
+#include "TextureMappingContoning.hpp"
 #include "TextureMappingOffset.hpp"
 #include "MultiMaterialSegmentation.hpp"
 #include "Algorithm/RegionExpansion.hpp"
@@ -452,9 +453,13 @@ static std::optional<unsigned int> perimeter_texture_choose_gradient_recolor_com
 
 struct PerimeterTextureRecolorSampler {
     bool image_texture { false };
+    bool contoning { false };
     size_t num_physical { 0 };
     std::optional<TextureMappingOffsetContext> image_context;
     std::vector<std::array<float, 3>> image_component_colors;
+    TextureMappingContoningSolver contoning_solver;
+    int contoning_stack_layers { TextureMappingZone::DefaultTopSurfaceContoningStackLayers };
+    float contoning_angle_threshold_deg { TextureMappingZone::DefaultTopSurfaceContoningAngleThresholdDeg };
     std::vector<unsigned int> component_ids;
     std::vector<TextureMappingOffsetContext> gradient_contexts;
 };
@@ -502,6 +507,21 @@ static std::optional<PerimeterTextureRecolorSampler> perimeter_texture_make_reco
                 sampler.image_component_colors.push_back({ 0.f, 0.f, 0.f });
             }
         }
+        if (zone.top_surface_contoning_perimeters_active()) {
+            sampler.contoning = true;
+            sampler.contoning_solver =
+                TextureMappingContoningSolver(zone, print_config, sampler.image_context->component_ids);
+            sampler.contoning_stack_layers =
+                std::clamp(zone.top_surface_contoning_stack_layers,
+                           TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                           TextureMappingZone::MaxTopSurfaceContoningStackLayers);
+            sampler.contoning_angle_threshold_deg =
+                std::clamp(zone.top_surface_contoning_angle_threshold_deg,
+                           TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg,
+                           TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg);
+            if (!sampler.contoning_solver.valid())
+                sampler.contoning = false;
+        }
         return sampler;
     }
 
@@ -532,6 +552,32 @@ static std::optional<unsigned int> perimeter_texture_choose_recolor_component_wi
     if (sampler.image_texture) {
         if (!sampler.image_context)
             return std::nullopt;
+        if (sampler.contoning) {
+            std::optional<std::array<float, 3>> rgb =
+                perimeter_texture_average_visible_image_rgb(visible, *sampler.image_context);
+            if (!rgb && fallback_entity != nullptr) {
+                std::vector<double> accum(sampler.image_context->component_ids.size(), 0.0);
+                double total_weight = 0.0;
+                perimeter_texture_accumulate_path_image_weights(*fallback_entity, *sampler.image_context, accum, total_weight);
+                if (total_weight > EPSILON) {
+                    std::array<float, 3> fallback_rgb{ 0.f, 0.f, 0.f };
+                    for (size_t idx = 0; idx < accum.size() && idx < sampler.image_component_colors.size(); ++idx) {
+                        const double w = accum[idx] / total_weight;
+                        fallback_rgb[0] += float(sampler.image_component_colors[idx][0] * w);
+                        fallback_rgb[1] += float(sampler.image_component_colors[idx][1] * w);
+                        fallback_rgb[2] += float(sampler.image_component_colors[idx][2] * w);
+                    }
+                    rgb = fallback_rgb;
+                }
+            }
+            if (!rgb)
+                return std::nullopt;
+            const unsigned int component_id =
+                sampler.contoning_solver.component_for_depth(*rgb, sampler.contoning_stack_layers, 0);
+            if (component_id >= 1 && component_id <= sampler.num_physical)
+                return component_id;
+            return std::nullopt;
+        }
         std::optional<unsigned int> chosen =
             perimeter_texture_choose_image_recolor_component(visible,
                                                              fallback_entity,
@@ -940,7 +986,9 @@ static void perimeter_texture_sample_segment_visible_points(float               
 
 static std::optional<unsigned int> perimeter_texture_choose_recolor_component_from_point_samples(
     const std::vector<PerimeterTextureVisiblePointSample> &samples,
-    const PerimeterTextureRecolorSampler                  &sampler)
+    const PerimeterTextureRecolorSampler                  &sampler,
+    int                                                    depth_from_top = 0,
+    int                                                    contoning_stack_layers = 0)
 {
     if (samples.empty())
         return std::nullopt;
@@ -948,6 +996,30 @@ static std::optional<unsigned int> perimeter_texture_choose_recolor_component_fr
     if (sampler.image_texture) {
         if (!sampler.image_context)
             return std::nullopt;
+        if (sampler.contoning) {
+            std::array<double, 3> rgb_accum{ 0.0, 0.0, 0.0 };
+            double rgb_total_weight = 0.0;
+            for (const PerimeterTextureVisiblePointSample &sample : samples) {
+                perimeter_texture_accumulate_image_rgb_at_point(*sampler.image_context, sample.point, sample.weight, rgb_accum, rgb_total_weight);
+            }
+            if (rgb_total_weight <= EPSILON)
+                return std::nullopt;
+            const std::array<float, 3> rgb{
+                float(std::clamp(rgb_accum[0] / rgb_total_weight, 0.0, 1.0)),
+                float(std::clamp(rgb_accum[1] / rgb_total_weight, 0.0, 1.0)),
+                float(std::clamp(rgb_accum[2] / rgb_total_weight, 0.0, 1.0))
+            };
+            const int stack_layers = contoning_stack_layers > 0 ?
+                std::clamp(contoning_stack_layers,
+                           TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                           sampler.contoning_stack_layers) :
+                sampler.contoning_stack_layers;
+            const unsigned int component_id =
+                sampler.contoning_solver.component_for_depth(rgb, stack_layers, depth_from_top);
+            if (component_id >= 1 && component_id <= sampler.num_physical)
+                return component_id;
+            return std::nullopt;
+        }
         if (!sampler.image_context->weight_field.raw_component_weights_from_texture) {
             std::array<double, 3> rgb_accum{ 0.0, 0.0, 0.0 };
             double rgb_total_weight = 0.0;
@@ -1425,6 +1497,9 @@ struct PerimeterTextureRecolorEntityPiece {
 struct PerimeterTexturePathRecolorContext {
     PerimeterTextureMaskIndex           path_mask;
     const PerimeterTextureRecolorSampler *sampler { nullptr };
+    float                               min_recolor_run_length_mm { 0.f };
+    int                                 path_depth_from_top { 0 };
+    int                                 contoning_stack_layers { TextureMappingZone::DefaultTopSurfaceContoningStackLayers };
 };
 
 struct PerimeterTexturePathSegment {
@@ -1639,23 +1714,22 @@ static void perimeter_texture_clear_short_recolor_runs(std::vector<PerimeterText
     }
 }
 
-static unsigned int perimeter_texture_recolor_component_for_segment(const PerimeterTexturePathRecolorContext &context,
-                                                                    const Point                                  &a,
-                                                                    const Point                                  &b)
+static void perimeter_texture_collect_visible_samples_for_segment(const PerimeterTexturePathRecolorContext &context,
+                                                                  const Point                              &a,
+                                                                  const Point                              &b,
+                                                                  std::vector<PerimeterTextureVisiblePointSample> &visible_samples)
 {
     if (context.sampler == nullptr || context.path_mask.empty() || a == b)
-        return 0;
+        return;
 
     const double dx = double(b.x()) - double(a.x());
     const double dy = double(b.y()) - double(a.y());
     const double len = std::hypot(dx, dy);
     if (!std::isfinite(len) || len <= EPSILON)
-        return 0;
+        return;
 
     const double inward_x = -dy / len;
     const double inward_y = dx / len;
-    std::vector<PerimeterTextureVisiblePointSample> visible_samples;
-    visible_samples.reserve(3);
     const std::array<Point, 3> sample_points{
         perimeter_texture_interpolate_point(a, b, 0.25),
         perimeter_texture_interpolate_point(a, b, 0.50),
@@ -1664,9 +1738,24 @@ static unsigned int perimeter_texture_recolor_component_for_segment(const Perime
     for (const Point &sample : sample_points)
         if (perimeter_texture_mask_index_contains_point(context.path_mask, sample))
             visible_samples.push_back(PerimeterTextureVisiblePointSample{ sample, 1.0, inward_x, inward_y });
+}
+
+static unsigned int perimeter_texture_recolor_component_for_segment(const PerimeterTexturePathRecolorContext &context,
+                                                                    const Point                              &a,
+                                                                    const Point                              &b)
+{
+    if (context.sampler == nullptr)
+        return 0;
+
+    std::vector<PerimeterTextureVisiblePointSample> visible_samples;
+    visible_samples.reserve(3);
+    perimeter_texture_collect_visible_samples_for_segment(context, a, b, visible_samples);
 
     const std::optional<unsigned int> component =
-        perimeter_texture_choose_recolor_component_from_point_samples(visible_samples, *context.sampler);
+        perimeter_texture_choose_recolor_component_from_point_samples(visible_samples,
+                                                                      *context.sampler,
+                                                                      context.path_depth_from_top,
+                                                                      context.contoning_stack_layers);
     return component && *component > 0 ? *component : 0;
 }
 
@@ -1691,13 +1780,94 @@ static void perimeter_texture_append_recolor_path_piece(std::vector<PerimeterTex
         unscale<double>(polyline.length()) + unscale<double>(std::max<double>(1.0, double(SCALED_EPSILON))) <
             2.0 * double(source.width))
         extruder_override = -1;
-    pieces.push_back(PerimeterTextureRecolorEntityPiece{ extruder_override, new ExtrusionPath(std::move(polyline), source) });
+    ExtrusionPath *path = new ExtrusionPath(std::move(polyline), source);
+    path->inset_idx = source.inset_idx;
+    pieces.push_back(PerimeterTextureRecolorEntityPiece{ extruder_override, path });
+}
+
+static bool perimeter_texture_entity_has_recolorable_path(const ExtrusionEntity &entity)
+{
+    if (const ExtrusionPath *path = dynamic_cast<const ExtrusionPath *>(&entity))
+        return perimeter_texture_path_role_can_top_visible_recolor(path->role());
+    if (const ExtrusionMultiPath *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity))
+        return std::any_of(multipath->paths.begin(), multipath->paths.end(), [](const ExtrusionPath &path) {
+            return perimeter_texture_path_role_can_top_visible_recolor(path.role());
+        });
+    if (const ExtrusionLoop *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
+        return std::any_of(loop->paths.begin(), loop->paths.end(), [](const ExtrusionPath &path) {
+            return perimeter_texture_path_role_can_top_visible_recolor(path.role());
+        });
+    if (const ExtrusionEntityCollection *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+        return std::any_of(collection->entities.begin(), collection->entities.end(), [](const ExtrusionEntity *child) {
+            return child != nullptr && perimeter_texture_entity_has_recolorable_path(*child);
+        });
+    return false;
+}
+
+static int perimeter_texture_entity_depth_from_top(const ExtrusionEntity &entity, int fallback_depth)
+{
+    if (entity.inset_idx >= 0)
+        return entity.inset_idx;
+    if (is_external_perimeter(entity.role()))
+        return 0;
+    if (is_internal_perimeter(entity.role()) || entity.role() == erOverhangPerimeter)
+        return std::max(1, fallback_depth);
+    return std::max(0, fallback_depth);
+}
+
+static void perimeter_texture_collect_recolorable_inset_depths(const ExtrusionEntity &entity, int &max_inset_idx)
+{
+    if (const ExtrusionPath *path = dynamic_cast<const ExtrusionPath *>(&entity)) {
+        if (perimeter_texture_path_role_can_top_visible_recolor(path->role()) && path->inset_idx >= 0)
+            max_inset_idx = std::max(max_inset_idx, path->inset_idx);
+        return;
+    }
+    if (const ExtrusionMultiPath *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
+        if (perimeter_texture_path_role_can_top_visible_recolor(multipath->role()) && multipath->inset_idx >= 0)
+            max_inset_idx = std::max(max_inset_idx, multipath->inset_idx);
+        for (const ExtrusionPath &path : multipath->paths)
+            if (perimeter_texture_path_role_can_top_visible_recolor(path.role()) && path.inset_idx >= 0)
+                max_inset_idx = std::max(max_inset_idx, path.inset_idx);
+        return;
+    }
+    if (const ExtrusionLoop *loop = dynamic_cast<const ExtrusionLoop *>(&entity)) {
+        if (perimeter_texture_path_role_can_top_visible_recolor(loop->role()) && loop->inset_idx >= 0)
+            max_inset_idx = std::max(max_inset_idx, loop->inset_idx);
+        for (const ExtrusionPath &path : loop->paths)
+            if (perimeter_texture_path_role_can_top_visible_recolor(path.role()) && path.inset_idx >= 0)
+                max_inset_idx = std::max(max_inset_idx, path.inset_idx);
+        return;
+    }
+    if (const ExtrusionEntityCollection *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
+        for (const ExtrusionEntity *child : collection->entities)
+            if (child != nullptr)
+                perimeter_texture_collect_recolorable_inset_depths(*child, max_inset_idx);
+    }
+}
+
+static int perimeter_texture_available_contoning_shell_slots(const ExtrusionEntityCollection &perimeters,
+                                                             int                              fallback_wall_loops,
+                                                             int                              configured_stack_layers)
+{
+    int max_inset_idx = -1;
+    for (const ExtrusionEntity *entity : perimeters.entities)
+        if (entity != nullptr)
+            perimeter_texture_collect_recolorable_inset_depths(*entity, max_inset_idx);
+    const int configured_layers =
+        std::clamp(configured_stack_layers,
+                   TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                   TextureMappingZone::MaxTopSurfaceContoningStackLayers);
+    const int available_slots = max_inset_idx >= 0 ? max_inset_idx + 1 : std::max(1, fallback_wall_loops);
+    return std::clamp(available_slots,
+                      TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                      configured_layers);
 }
 
 static bool perimeter_texture_split_path_by_recolor_masks(const ExtrusionPath                           &path,
                                                           const PerimeterTexturePathRecolorContext      &context,
                                                           std::vector<PerimeterTextureRecolorEntityPiece> &pieces,
-                                                          bool                                           emit_unchanged)
+                                                          bool                                           emit_unchanged,
+                                                          int                                            path_depth_from_top)
 {
     if (!perimeter_texture_path_role_can_top_visible_recolor(path.role()) || path.polyline.points.size() < 2) {
         if (emit_unchanged)
@@ -1707,6 +1877,10 @@ static bool perimeter_texture_split_path_by_recolor_masks(const ExtrusionPath   
 
     std::vector<PerimeterTexturePathSegment> path_segments;
     path_segments.reserve(path.polyline.points.size() - 1);
+    std::vector<std::vector<PerimeterTextureVisiblePointSample>> segment_visible_samples;
+    const bool use_chunked_contoning = context.sampler != nullptr && context.sampler->contoning;
+    if (use_chunked_contoning)
+        segment_visible_samples.reserve(path.polyline.points.size() - 1);
     bool saw_segment = false;
     bool saw_override = false;
 
@@ -1716,11 +1890,80 @@ static bool perimeter_texture_split_path_by_recolor_masks(const ExtrusionPath   
         if (a == b)
             continue;
         saw_segment = true;
-        const unsigned int component = perimeter_texture_recolor_component_for_segment(context, a, b);
-        const int extruder_override = component > 0 ? int(component) - 1 : -1;
+        PerimeterTexturePathRecolorContext segment_context = context;
+        segment_context.path_depth_from_top = path_depth_from_top;
+        int extruder_override = -1;
+        if (use_chunked_contoning) {
+            segment_visible_samples.emplace_back();
+            segment_visible_samples.back().reserve(3);
+            perimeter_texture_collect_visible_samples_for_segment(segment_context, a, b, segment_visible_samples.back());
+        } else {
+            const unsigned int component = perimeter_texture_recolor_component_for_segment(segment_context, a, b);
+            extruder_override = component > 0 ? int(component) - 1 : -1;
+        }
         if (extruder_override >= 0)
             saw_override = true;
         path_segments.push_back(PerimeterTexturePathSegment{ a, b, extruder_override });
+    }
+
+    if (use_chunked_contoning && context.sampler != nullptr) {
+        PerimeterTexturePathRecolorContext segment_context = context;
+        segment_context.path_depth_from_top = path_depth_from_top;
+        const double min_chunk_length_scaled =
+            double(scale_(std::max(std::isfinite(path.width) && path.width > 0.f ? 2.f * path.width : 0.f,
+                                   context.min_recolor_run_length_mm)));
+        for (size_t start = 0; start < path_segments.size();) {
+            while (start < path_segments.size() &&
+                   (start >= segment_visible_samples.size() || segment_visible_samples[start].empty()))
+                ++start;
+            if (start >= path_segments.size())
+                break;
+
+            size_t run_end = start;
+            while (run_end < path_segments.size() &&
+                   run_end < segment_visible_samples.size() &&
+                   !segment_visible_samples[run_end].empty())
+                ++run_end;
+
+            for (size_t chunk_start = start; chunk_start < run_end;) {
+                size_t chunk_end = chunk_start;
+                double chunk_length_scaled = 0.0;
+                std::vector<PerimeterTextureVisiblePointSample> chunk_samples;
+                while (chunk_end < run_end &&
+                       (chunk_end == chunk_start || chunk_length_scaled < min_chunk_length_scaled)) {
+                    chunk_length_scaled += perimeter_texture_path_segment_length_scaled(path_segments[chunk_end]);
+                    chunk_samples.insert(chunk_samples.end(),
+                                         segment_visible_samples[chunk_end].begin(),
+                                         segment_visible_samples[chunk_end].end());
+                    ++chunk_end;
+                }
+                if (chunk_end < run_end) {
+                    const double remaining_length_scaled =
+                        perimeter_texture_path_segments_length_scaled(path_segments, chunk_end, run_end);
+                    if (remaining_length_scaled < min_chunk_length_scaled * 0.5) {
+                        for (; chunk_end < run_end; ++chunk_end) {
+                            chunk_samples.insert(chunk_samples.end(),
+                                                 segment_visible_samples[chunk_end].begin(),
+                                                 segment_visible_samples[chunk_end].end());
+                        }
+                    }
+                }
+                const std::optional<unsigned int> component =
+                    perimeter_texture_choose_recolor_component_from_point_samples(chunk_samples,
+                                                                                  *context.sampler,
+                                                                                  segment_context.path_depth_from_top,
+                                                                                  segment_context.contoning_stack_layers);
+                const int extruder_override = component && *component > 0 ? int(*component) - 1 : -1;
+                if (extruder_override >= 0) {
+                    saw_override = true;
+                    for (size_t idx = chunk_start; idx < chunk_end; ++idx)
+                        path_segments[idx].extruder_override = extruder_override;
+                }
+                chunk_start = chunk_end;
+            }
+
+            start = run_end;
+        }
     }
 
     if (!saw_segment || !saw_override) {
@@ -1730,7 +1973,8 @@ static bool perimeter_texture_split_path_by_recolor_masks(const ExtrusionPath   
     }
 
     if (std::isfinite(path.width) && path.width > 0.f) {
-        const double min_recolor_length_scaled = double(scale_(2.f * path.width));
+        const double min_recolor_length_scaled =
+            double(scale_(std::max(2.f * path.width, context.min_recolor_run_length_mm)));
         perimeter_texture_expand_short_recolor_runs(path_segments, min_recolor_length_scaled);
         perimeter_texture_clear_short_recolor_runs(path_segments, min_recolor_length_scaled);
     }
@@ -1777,18 +2021,22 @@ static bool perimeter_texture_split_path_by_recolor_masks(const ExtrusionPath   
 static bool perimeter_texture_split_entity_by_recolor_masks(const ExtrusionEntity                         &entity,
                                                             const PerimeterTexturePathRecolorContext      &context,
                                                             std::vector<PerimeterTextureRecolorEntityPiece> &pieces,
-                                                            bool                                           emit_unchanged);
+                                                            bool                                           emit_unchanged,
+                                                            int                                            path_depth_from_top);
 
 static bool perimeter_texture_split_paths_by_recolor_masks(const ExtrusionPaths                          &paths,
                                                            const ExtrusionEntity                         &fallback_entity,
                                                            const PerimeterTexturePathRecolorContext      &context,
                                                            std::vector<PerimeterTextureRecolorEntityPiece> &pieces,
-                                                           bool                                           emit_unchanged)
+                                                           bool                                           emit_unchanged,
+                                                           int                                            path_depth_from_top)
 {
     std::vector<PerimeterTextureRecolorEntityPiece> path_pieces;
     bool changed = false;
-    for (const ExtrusionPath &path : paths)
-        changed |= perimeter_texture_split_path_by_recolor_masks(path, context, path_pieces, true);
+    for (const ExtrusionPath &path : paths) {
+        const int effective_depth = path.inset_idx >= 0 ? path.inset_idx : path_depth_from_top;
+        changed |= perimeter_texture_split_path_by_recolor_masks(path, context, path_pieces, true, effective_depth);
+    }
 
     if (!changed) {
         perimeter_texture_delete_recolor_entity_pieces(path_pieces);
@@ -1806,17 +2054,26 @@ static bool perimeter_texture_split_paths_by_recolor_masks(const ExtrusionPaths 
 static bool perimeter_texture_split_collection_children_by_recolor_masks(const ExtrusionEntityCollection              &collection,
                                                                          const PerimeterTexturePathRecolorContext      &context,
                                                                          std::vector<PerimeterTextureRecolorEntityPiece> &pieces,
-                                                                         bool                                           emit_unchanged)
+                                                                         bool                                           emit_unchanged,
+                                                                         int                                            path_depth_from_top)
 {
     std::vector<PerimeterTextureRecolorEntityPiece> child_pieces;
     bool changed = collection.texture_mapping_extruder_override >= 0;
+    int local_depth = path_depth_from_top;
     for (const ExtrusionEntity *child : collection.entities) {
         if (child == nullptr)
             continue;
+        const int child_depth = perimeter_texture_entity_depth_from_top(*child, local_depth);
         if (collection.texture_mapping_extruder_override >= 0) {
             child_pieces.push_back(PerimeterTextureRecolorEntityPiece{ collection.texture_mapping_extruder_override, child->clone() });
         } else {
-            changed |= perimeter_texture_split_entity_by_recolor_masks(*child, context, child_pieces, true);
+            changed |= perimeter_texture_split_entity_by_recolor_masks(*child, context, child_pieces, true, child_depth);
+        }
+        if (child->inset_idx < 0 && perimeter_texture_entity_has_recolorable_path(*child)) {
+            if (is_external_perimeter(child->role()))
+                local_depth = 1;
+            else
+                ++local_depth;
         }
     }
 
@@ -1840,16 +2097,17 @@ static bool perimeter_texture_split_collection_children_by_recolor_masks(const E
 static bool perimeter_texture_split_entity_by_recolor_masks(const ExtrusionEntity                         &entity,
                                                             const PerimeterTexturePathRecolorContext      &context,
                                                             std::vector<PerimeterTextureRecolorEntityPiece> &pieces,
-                                                            bool                                           emit_unchanged)
+                                                            bool                                           emit_unchanged,
+                                                            int                                            path_depth_from_top)
 {
     if (const ExtrusionPath *path = dynamic_cast<const ExtrusionPath *>(&entity))
-        return perimeter_texture_split_path_by_recolor_masks(*path, context, pieces, emit_unchanged);
+        return perimeter_texture_split_path_by_recolor_masks(*path, context, pieces, emit_unchanged, path_depth_from_top);
     if (const ExtrusionMultiPath *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity))
-        return perimeter_texture_split_paths_by_recolor_masks(multipath->paths, *multipath, context, pieces, emit_unchanged);
+        return perimeter_texture_split_paths_by_recolor_masks(multipath->paths, *multipath, context, pieces, emit_unchanged, path_depth_from_top);
     if (const ExtrusionLoop *loop = dynamic_cast<const ExtrusionLoop *>(&entity))
-        return perimeter_texture_split_paths_by_recolor_masks(loop->paths, *loop, context, pieces, emit_unchanged);
+        return perimeter_texture_split_paths_by_recolor_masks(loop->paths, *loop, context, pieces, emit_unchanged, path_depth_from_top);
     if (const ExtrusionEntityCollection *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity))
-        return perimeter_texture_split_collection_children_by_recolor_masks(*collection, context, pieces, emit_unchanged);
+        return perimeter_texture_split_collection_children_by_recolor_masks(*collection, context, pieces, emit_unchanged, path_depth_from_top);
 
     if (emit_unchanged)
         pieces.push_back(PerimeterTextureRecolorEntityPiece{ -1, entity.clone() });
@@ -1892,7 +2150,8 @@ static void perimeter_texture_apply_top_visible_recolor_to_perimeters(const Laye
                                                                       const ExPolygons              &path_mask,
                                                                       const TextureMappingZone      &zone,
                                                                       unsigned int                   texture_zone_id,
-                                                                      float                          texture_external_width_mm)
+                                                                      float                          texture_external_width_mm,
+                                                                      float                          min_recolor_run_length_mm = 0.f)
 {
     if (perimeters.entities.empty() || path_mask.empty())
         return;
@@ -1905,6 +2164,12 @@ static void perimeter_texture_apply_top_visible_recolor_to_perimeters(const Laye
     PerimeterTexturePathRecolorContext context;
     context.path_mask = perimeter_texture_make_mask_index(&path_mask);
     context.sampler = &*sampler;
+    context.min_recolor_run_length_mm = std::max(0.f, min_recolor_run_length_mm);
+    context.contoning_stack_layers = sampler->contoning ?
+        perimeter_texture_available_contoning_shell_slots(perimeters,
+                                                          std::max(1, layer_region.region().config().wall_loops.value),
+                                                          sampler->contoning_stack_layers) :
+        sampler->contoning_stack_layers;
     if (context.path_mask.empty())
         return;
 
@@ -1920,9 +2185,9 @@ static void perimeter_texture_apply_top_visible_recolor_to_perimeters(const Laye
                 recolored_entities.emplace_back(collection->clone());
                 continue;
             }
-            perimeter_texture_split_collection_children_by_recolor_masks(*collection, context, pieces, true);
+            perimeter_texture_split_collection_children_by_recolor_masks(*collection, context, pieces, true, 0);
         } else {
-            perimeter_texture_split_entity_by_recolor_masks(*entity, context, pieces, true);
+            perimeter_texture_split_entity_by_recolor_masks(*entity, context, pieces, true, 0);
         }
 
         const bool entity_changed = std::any_of(pieces.begin(), pieces.end(), [](const PerimeterTextureRecolorEntityPiece &piece) {
@@ -2392,7 +2657,9 @@ void Layer::apply_perimeter_path_modulation_v2()
                                               layerm->slices,
                                               *zone,
                                               texture_zone_id,
-                                              std::nullopt,
+                                              zone->top_surface_contoning_perimeters_active() ?
+                                                  std::optional<float>(std::max(0.05f, float(layerm->flow(frExternalPerimeter).width()))) :
+                                                  std::nullopt,
                                               nullptr,
                                               nullptr,
                                               nullptr);
@@ -2475,26 +2742,58 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
 
     const float texture_external_width_mm =
         std::max(0.05f, float(print_config.texture_mapping_outer_wall_gradient_max_line_width.value));
+    const float normal_external_width_mm = std::max(0.05f, float(this->flow(frExternalPerimeter).width()));
 
     SurfaceCollection modulated_slices;
     const SurfaceCollection *perimeter_slices = &slices;
     ExPolygons top_visible_recolor_path_mask;
     std::vector<ExPolygons> top_visible_recolor_masks;
     PerimeterTextureTopVisibleRecolorThresholds top_visible_recolor_thresholds;
+    float contoning_min_recolor_run_length_mm = 0.f;
     std::optional<TextureMappingOffsetContext> reusable_modulation_context;
     unsigned int perimeter_texture_zone_id = 0;
     bool use_perimeter_path_modulation = false;
     bool use_legacy_perimeter_path_modulation = false;
     bool use_perimeter_path_modulation_v2 = false;
+    bool use_contoning_perimeter = false;
+    float active_external_width_mm = texture_external_width_mm;
     const TextureMappingZone *perimeter_path_zone =
         perimeter_path_modulation_zone_for_region(*this->layer()->object()->print(), region_config, perimeter_texture_zone_id);
     if (perimeter_path_zone != nullptr) {
-        if (perimeter_path_zone->recolor_top_visible_perimeter_sections) {
+        use_contoning_perimeter = perimeter_path_zone->top_surface_contoning_perimeters_active();
+        active_external_width_mm = use_contoning_perimeter ? normal_external_width_mm : texture_external_width_mm;
+        if (use_contoning_perimeter) {
+            ExPolygons wall_band;
+            const float wall_depth_mm =
+                active_external_width_mm +
+                std::max(0, region_config.wall_loops.value - 1) * float(this->flow(frPerimeter).spacing());
+            top_visible_recolor_path_mask =
+                perimeter_texture_top_visible_wall_band_mask(*this,
+                                                             slices,
+                                                             wall_depth_mm,
+                                                             perimeter_path_zone->top_visible_perimeter_recolor_above_layers,
+                                                             &wall_band);
+            if (perimeter_path_zone->top_surface_contoning_angle_threshold_deg >=
+                TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg - 1e-4f)
+                top_visible_recolor_path_mask = std::move(wall_band);
+            contoning_min_recolor_run_length_mm =
+                texture_mapping_contoning_min_feature_mm(*perimeter_path_zone,
+                                                         print_config,
+                                                         TextureMappingManager::effective_texture_component_ids(
+                                                             *perimeter_path_zone,
+                                                             print_config.filament_colour.values.size(),
+                                                             print_config.filament_colour.values),
+                                                         active_external_width_mm);
+            top_visible_recolor_thresholds = perimeter_texture_top_visible_recolor_thresholds(
+                int(TextureMappingZone::TopVisibleRecolorConservative));
+            top_visible_recolor_thresholds.min_run_length_mm = contoning_min_recolor_run_length_mm;
+            top_visible_recolor_thresholds.min_visible_area_mm2 = contoning_min_recolor_run_length_mm * contoning_min_recolor_run_length_mm * 0.25f;
+        } else if (perimeter_path_zone->recolor_top_visible_perimeter_sections) {
             perimeter_texture_top_visible_recolor_data(*this,
                                                        slices,
                                                        *perimeter_path_zone,
                                                        perimeter_texture_zone_id,
-                                                       texture_external_width_mm,
+                                                       active_external_width_mm,
                                                        top_visible_recolor_masks,
                                                        top_visible_recolor_path_mask,
                                                        top_visible_recolor_thresholds,
@@ -2598,7 +2897,8 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
                                                                           top_visible_recolor_path_mask,
                                                                           *perimeter_path_zone,
                                                                           perimeter_texture_zone_id,
-                                                                          active_texture_external_width_mm.value_or(texture_external_width_mm));
+                                                                          active_texture_external_width_mm.value_or(active_external_width_mm),
+                                                                          contoning_min_recolor_run_length_mm);
         };
 
     SurfaceCollection fill_surfaces_before;
@@ -2609,7 +2909,7 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
     }
 
     const std::optional<float> initial_texture_external_width_mm =
-        use_perimeter_path_modulation ? std::optional<float>(texture_external_width_mm) : std::optional<float>();
+        use_perimeter_path_modulation ? std::optional<float>(active_external_width_mm) : std::optional<float>();
     process_slices_with_top_visible_recolor(perimeter_slices, initial_texture_external_width_mm);
 
     if ((use_legacy_perimeter_path_modulation || use_perimeter_path_modulation_v2) &&
@@ -2621,18 +2921,18 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
         *fill_no_overlap = fill_no_overlap_before;
         fill_surfaces_before = *fill_surfaces;
         fill_no_overlap_before = *fill_no_overlap;
-        process_slices(fallback_original_slices, std::optional<float>(texture_external_width_mm));
+        process_slices(fallback_original_slices, std::optional<float>(active_external_width_mm));
         const bool original_texture_has_extrusions =
             !this->perimeters.entities.empty() || !this->thin_fills.entities.empty();
         const std::optional<float> reduced_external_width_mm = perimeter_texture_min_external_width(this->perimeters);
         const bool has_reduced_external_width =
             reduced_external_width_mm &&
-            *reduced_external_width_mm < texture_external_width_mm - float(EPSILON);
+            *reduced_external_width_mm < active_external_width_mm - float(EPSILON);
         if (has_reduced_external_width && perimeter_path_zone->recolor_small_perimeter_loops) {
             if (perimeter_texture_apply_recolor_small_perimeter_loops(*this,
                                                                       *perimeter_path_zone,
                                                                       perimeter_texture_zone_id,
-                                                                      texture_external_width_mm)) {
+                                                                      active_external_width_mm)) {
                 set_perimeter_path_modulation_v2_fallback_slices(*fallback_original_slices, false);
                 return;
             }
@@ -2662,7 +2962,7 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
             *fill_surfaces = fill_surfaces_before;
             *fill_no_overlap = fill_no_overlap_before;
             const std::optional<float> fallback_texture_external_width_mm =
-                original_texture_has_extrusions ? std::optional<float>(texture_external_width_mm) : std::optional<float>();
+                original_texture_has_extrusions ? std::optional<float>(active_external_width_mm) : std::optional<float>();
             process_slices(fallback_original_slices, fallback_texture_external_width_mm);
             set_perimeter_path_modulation_v2_fallback_slices(*fallback_original_slices, false);
         }

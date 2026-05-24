@@ -1,5 +1,7 @@
 #include <assert.h>
 #include <stdio.h>
+#include <array>
+#include <map>
 #include <memory>
 
 #include "../ClipperUtils.hpp"
@@ -11,6 +13,7 @@
 #include "../PrintConfig.hpp"
 #include "../Surface.hpp"
 #include "../TextureMapping.hpp"
+#include "../TextureMappingContoning.hpp"
 #include "../TextureMappingOffset.hpp"
 
 #include "AABBTreeLines.hpp"
@@ -25,10 +28,20 @@
 #include "libslic3r.h"
 
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <optional>
+#include <utility>
 
 namespace Slic3r {
+
+using ThrowIfCanceled = std::function<void()>;
+
+static void check_canceled(const ThrowIfCanceled *throw_if_canceled)
+{
+    if (throw_if_canceled != nullptr)
+        (*throw_if_canceled)();
+}
 
 // Calculate infill rotation angle (in radians) for a given layer from a rotation template.
 // Grammar subset handled (rotation only):
@@ -287,6 +300,7 @@ struct SurfaceFillParams
     float texture_mapping_top_surface_min_width_mm = TextureMappingZone::DefaultTopSurfaceImageMinLineWidthMm;
     float texture_mapping_top_surface_max_width_mm = TextureMappingZone::DefaultTopSurfaceImageMaxLineWidthMm;
     bool texture_mapping_top_surface_same_layer_partition = false;
+    bool texture_mapping_top_surface_contoning = false;
     int texture_mapping_top_surface_component_index = 0;
     int texture_mapping_top_surface_component_count = 0;
 
@@ -330,6 +344,7 @@ struct SurfaceFillParams
         RETURN_COMPARE_NON_EQUAL(texture_mapping_top_surface_min_width_mm);
         RETURN_COMPARE_NON_EQUAL(texture_mapping_top_surface_max_width_mm);
         RETURN_COMPARE_NON_EQUAL(texture_mapping_top_surface_same_layer_partition);
+        RETURN_COMPARE_NON_EQUAL(texture_mapping_top_surface_contoning);
         RETURN_COMPARE_NON_EQUAL(texture_mapping_top_surface_component_index);
         RETURN_COMPARE_NON_EQUAL(texture_mapping_top_surface_component_count);
 
@@ -368,6 +383,7 @@ struct SurfaceFillParams
                 this->texture_mapping_top_surface_min_width_mm == rhs.texture_mapping_top_surface_min_width_mm &&
                 this->texture_mapping_top_surface_max_width_mm == rhs.texture_mapping_top_surface_max_width_mm &&
                 this->texture_mapping_top_surface_same_layer_partition == rhs.texture_mapping_top_surface_same_layer_partition &&
+                this->texture_mapping_top_surface_contoning == rhs.texture_mapping_top_surface_contoning &&
                 this->texture_mapping_top_surface_component_index == rhs.texture_mapping_top_surface_component_index &&
                 this->texture_mapping_top_surface_component_count == rhs.texture_mapping_top_surface_component_count;
 	}
@@ -391,6 +407,8 @@ struct TopSurfaceImageStackSlice {
     size_t component_index = 0;
     size_t component_count = 0;
     bool same_layer_partition = false;
+    bool contoning = false;
+    bool lower_surface = false;
     float angle_rad = float(PI / 4.0);
     ExPolygons area;
 };
@@ -404,7 +422,17 @@ struct TopSurfaceImageRegionPlan {
     float max_width_mm = TextureMappingZone::DefaultTopSurfaceImageMaxLineWidthMm;
     bool fixed_coloring = true;
     bool same_layer_partition = false;
+    bool contoning = false;
+    bool color_lower_surfaces = true;
     int colored_top_layers = TextureMappingZone::DefaultTopSurfaceImageColoredTopLayers;
+    int contoning_stack_layers = TextureMappingZone::DefaultTopSurfaceContoningStackLayers;
+    float contoning_min_feature_mm = 2.f;
+    float contoning_external_width_mm = 0.4f;
+};
+
+enum class TopSurfaceImageSourceSurface {
+    Top,
+    Bottom
 };
 
 static float top_surface_image_filament_luminance(const PrintConfig &config, unsigned int component_id)
@@ -472,20 +500,674 @@ static std::optional<std::array<float, 4>> top_surface_image_equal_blend_backgro
     return std::array<float, 4> { mixed[0], mixed[1], mixed[2], 1.f };
 }
 
-static ExPolygons top_surface_image_visible_top_mask(const Layer &layer, unsigned int zone_id)
+static ExPolygons top_surface_image_visible_surface_mask(const Layer &layer,
+                                                         unsigned int zone_id,
+                                                         TopSurfaceImageSourceSurface source_surface)
 {
     ExPolygons mask;
     for (const LayerRegion *layerm : layer.regions()) {
         if (layerm == nullptr || unsigned(std::max(0, layerm->region().config().solid_infill_filament.value)) != zone_id)
             continue;
         for (const Surface &surface : layerm->fill_surfaces.surfaces)
-            if (surface.is_top())
+            if ((source_surface == TopSurfaceImageSourceSurface::Top && surface.is_top()) ||
+                (source_surface == TopSurfaceImageSourceSurface::Bottom && surface.surface_type == stBottom))
                 mask.emplace_back(surface.expolygon);
     }
     return mask.size() > 1 ? union_ex(mask) : mask;
 }
 
-static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(const Layer &layer)
+static ExPolygons top_surface_image_visible_top_mask(const Layer &layer, unsigned int zone_id)
+{
+    return top_surface_image_visible_surface_mask(layer, zone_id, TopSurfaceImageSourceSurface::Top);
+}
+
+static ExPolygons top_surface_image_colorable_shell_mask(const Layer &layer,
+                                                         unsigned int zone_id,
+                                                         TopSurfaceImageSourceSurface source_surface)
+{
+    ExPolygons mask;
+    for (const LayerRegion *layerm : layer.regions()) {
+        if (layerm == nullptr || unsigned(std::max(0, layerm->region().config().solid_infill_filament.value)) != zone_id)
+            continue;
+        for (const Surface &surface : layerm->fill_surfaces.surfaces)
+            if (surface.surface_type == stInternalSolid ||
+                (source_surface == TopSurfaceImageSourceSurface::Top && surface.is_top()) ||
+                (source_surface == TopSurfaceImageSourceSurface::Bottom && surface.surface_type == stBottom))
+                mask.emplace_back(surface.expolygon);
+    }
+    return mask.size() > 1 ? union_ex(mask) : mask;
+}
+
+static ExPolygon top_surface_image_cell_expolygon(coord_t min_x, coord_t min_y, coord_t max_x, coord_t max_y)
+{
+    Polygon polygon;
+    polygon.points.reserve(4);
+    polygon.points.emplace_back(min_x, min_y);
+    polygon.points.emplace_back(max_x, min_y);
+    polygon.points.emplace_back(max_x, max_y);
+    polygon.points.emplace_back(min_x, max_y);
+    polygon.make_counter_clockwise();
+    return ExPolygon(std::move(polygon));
+}
+
+static bool top_surface_image_contoning_sample_eligible(const TextureMappingOffsetContext &context,
+                                                        float                              x_mm,
+                                                        float                              y_mm,
+                                                        float                              threshold_deg,
+                                                        TopSurfaceImageSourceSurface       source_surface)
+{
+    const std::optional<float> normal_z =
+        sample_weight_field_normal_z(context.weight_field, x_mm, y_mm, context.high_resolution_texture_sampling);
+    const float oriented_normal_z =
+        normal_z && source_surface == TopSurfaceImageSourceSurface::Bottom ? -*normal_z : (normal_z ? *normal_z : 1.f);
+    return !normal_z || texture_mapping_contoning_normal_eligible(oriented_normal_z, threshold_deg);
+}
+
+static std::vector<ExPolygons> top_surface_image_contoning_stack_areas(const Layer &source_layer,
+                                                                       unsigned int zone_id,
+                                                                       int stack_layers,
+                                                                       TopSurfaceImageSourceSurface source_surface,
+                                                                       const ThrowIfCanceled *throw_if_canceled)
+{
+    std::vector<ExPolygons> out;
+    out.reserve(size_t(std::max(0, stack_layers)));
+    const Layer *stack_layer = &source_layer;
+    for (int depth = 0; depth < stack_layers && stack_layer != nullptr; ++depth) {
+        check_canceled(throw_if_canceled);
+        ExPolygons area = depth == 0 ?
+            top_surface_image_visible_surface_mask(*stack_layer, zone_id, source_surface) :
+            top_surface_image_colorable_shell_mask(*stack_layer, zone_id, source_surface);
+        out.emplace_back(std::move(area));
+        stack_layer = source_surface == TopSurfaceImageSourceSurface::Top ?
+            stack_layer->lower_layer :
+            stack_layer->upper_layer;
+    }
+    return out;
+}
+
+static double top_surface_image_scaled_area_mm2(double scaled_area)
+{
+    return std::abs(scaled_area) * SCALING_FACTOR * SCALING_FACTOR;
+}
+
+static bool top_surface_image_expolygons_contain_point(const ExPolygons &expolygons, const Point &point)
+{
+    for (const ExPolygon &expolygon : expolygons)
+        if (expolygon.contains(point, true))
+            return true;
+    return false;
+}
+
+static int top_surface_image_contoning_local_stack_layers_at_point(const Point &point,
+                                                                   const std::vector<ExPolygons> &stack_areas,
+                                                                   int max_stack_layers)
+{
+    int layers = 0;
+    for (const ExPolygons &stack_area : stack_areas) {
+        if (layers >= max_stack_layers)
+            break;
+        if (stack_area.empty() || !top_surface_image_expolygons_contain_point(stack_area, point))
+            break;
+        ++layers;
+    }
+    return layers;
+}
+
+static ExPolygons top_surface_image_contoning_clean_area(ExPolygons &&component_area,
+                                                         const ExPolygons &clip_area,
+                                                         const ExPolygons &blocked_area,
+                                                         float min_feature_mm,
+                                                         const ThrowIfCanceled *throw_if_canceled)
+{
+    if (component_area.empty())
+        return {};
+    check_canceled(throw_if_canceled);
+    ExPolygons out = union_ex(component_area);
+    const float closing_radius = float(scale_(std::clamp(min_feature_mm * 0.18f, 0.05f, 0.45f)));
+    if (closing_radius > float(SCALED_EPSILON))
+        out = closing_ex(out, closing_radius, ClipperLib::jtRound);
+    if (out.empty())
+        return {};
+    check_canceled(throw_if_canceled);
+    out = intersection_ex(out, clip_area, ApplySafetyOffset::Yes);
+    if (!blocked_area.empty())
+        out = diff_ex(out, blocked_area, ApplySafetyOffset::Yes);
+    if (out.empty())
+        return {};
+    check_canceled(throw_if_canceled);
+
+    ExPolygons simplified;
+    const double tolerance = scale_(std::clamp(min_feature_mm * 0.12f, 0.03f, 0.25f));
+    for (const ExPolygon &expolygon : out) {
+        check_canceled(throw_if_canceled);
+        append(simplified, expolygon.simplify(tolerance));
+    }
+    if (simplified.empty())
+        return {};
+
+    ExPolygons filtered;
+    const double min_area_mm2 = std::max(0.05, double(min_feature_mm) * double(min_feature_mm) * 0.08);
+    for (ExPolygon &expolygon : simplified)
+        if (top_surface_image_scaled_area_mm2(expolygon.area()) >= min_area_mm2)
+            filtered.emplace_back(std::move(expolygon));
+    return filtered.empty() ? ExPolygons() : union_ex(filtered);
+}
+
+struct TopSurfaceImageContoningVectorLabel {
+    std::vector<unsigned int> bottom_to_top;
+    std::array<float, 3> rgb { { 0.f, 0.f, 0.f } };
+    std::array<float, 3> oklab { { 0.f, 0.f, 0.f } };
+};
+
+struct TopSurfaceImageContoningVectorRegion {
+    std::vector<unsigned int> bottom_to_top;
+    ExPolygons area;
+    int cell_count { 0 };
+};
+
+static float top_surface_image_contoning_oklab_error(const std::array<float, 3> &lhs,
+                                                     const std::array<float, 3> &rhs)
+{
+    const float dl = lhs[0] - rhs[0];
+    const float da = lhs[1] - rhs[1];
+    const float db = lhs[2] - rhs[2];
+    return dl * dl + 4.f * da * da + 4.f * db * db;
+}
+
+static std::optional<std::array<float, 3>> top_surface_image_contoning_stack_rgb(
+    const std::vector<unsigned int> &bottom_to_top,
+    const PrintConfig               &print_config)
+{
+    if (bottom_to_top.empty())
+        return std::nullopt;
+    std::vector<std::array<float, 3>> colors;
+    std::vector<float> weights;
+    colors.reserve(bottom_to_top.size());
+    weights.reserve(bottom_to_top.size());
+    const float weight = 1.f / float(bottom_to_top.size());
+    for (unsigned int component_id : bottom_to_top) {
+        if (component_id == 0 || component_id > print_config.filament_colour.values.size())
+            return std::nullopt;
+        ColorRGB color;
+        if (!decode_color(print_config.filament_colour.get_at(size_t(component_id - 1)), color))
+            return std::nullopt;
+        colors.push_back({ color.r(), color.g(), color.b() });
+        weights.emplace_back(weight);
+    }
+    return mix_color_solver_components(colors, weights, ColorSolverMixModel::PigmentPainter);
+}
+
+static std::optional<std::array<float, 3>> top_surface_image_contoning_component_rgb(
+    unsigned int       component_id,
+    const PrintConfig &print_config)
+{
+    if (component_id == 0 || component_id > print_config.filament_colour.values.size())
+        return std::nullopt;
+    ColorRGB color;
+    if (!decode_color(print_config.filament_colour.get_at(size_t(component_id - 1)), color))
+        return std::nullopt;
+    return std::array<float, 3>{ color.r(), color.g(), color.b() };
+}
+
+static void top_surface_image_contoning_sort_stack_for_top_color(std::vector<unsigned int> &bottom_to_top,
+                                                                 const std::array<float, 3> &mix_rgb,
+                                                                 const PrintConfig &print_config)
+{
+    if (bottom_to_top.size() < 2)
+        return;
+    const std::array<float, 3> mix_oklab = color_solver_oklab_from_srgb(mix_rgb);
+    std::stable_sort(bottom_to_top.begin(), bottom_to_top.end(), [&mix_oklab, &print_config](unsigned int lhs, unsigned int rhs) {
+        const std::optional<std::array<float, 3>> lhs_rgb =
+            top_surface_image_contoning_component_rgb(lhs, print_config);
+        const std::optional<std::array<float, 3>> rhs_rgb =
+            top_surface_image_contoning_component_rgb(rhs, print_config);
+        const float lhs_error = lhs_rgb ?
+            top_surface_image_contoning_oklab_error(color_solver_oklab_from_srgb(*lhs_rgb), mix_oklab) :
+            std::numeric_limits<float>::max();
+        const float rhs_error = rhs_rgb ?
+            top_surface_image_contoning_oklab_error(color_solver_oklab_from_srgb(*rhs_rgb), mix_oklab) :
+            std::numeric_limits<float>::max();
+        return lhs_error > rhs_error;
+    });
+}
+
+static float top_surface_image_contoning_sample_pitch_mm(const TopSurfaceImageRegionPlan &plan,
+                                                         const BoundingBox               &bbox)
+{
+    float pitch = std::clamp(plan.contoning_external_width_mm,
+                             0.25f,
+                             std::max(0.25f, plan.contoning_min_feature_mm * 0.5f));
+    const double width_mm = unscale<double>(bbox.max.x() - bbox.min.x());
+    const double height_mm = unscale<double>(bbox.max.y() - bbox.min.y());
+    const double max_samples = 350000.0;
+    if (width_mm > 0.0 && height_mm > 0.0) {
+        const double estimated = std::ceil(width_mm / double(pitch)) * std::ceil(height_mm / double(pitch));
+        if (estimated > max_samples)
+            pitch = float(std::sqrt(width_mm * height_mm / max_samples));
+    }
+    return std::clamp(pitch, 0.25f, std::max(0.25f, plan.contoning_min_feature_mm));
+}
+
+static bool top_surface_image_contoning_grid_component_printable(int cell_count,
+                                                                 int min_col,
+                                                                 int max_col,
+                                                                 int min_row,
+                                                                 int max_row,
+                                                                 float pitch_mm,
+                                                                 float min_feature_mm,
+                                                                 float line_width_mm)
+{
+    if (cell_count <= 0)
+        return false;
+    const double area_mm2 = double(cell_count) * double(pitch_mm) * double(pitch_mm);
+    const double width_mm = double(max_col - min_col + 1) * double(pitch_mm);
+    const double height_mm = double(max_row - min_row + 1) * double(pitch_mm);
+    const double min_area_mm2 =
+        std::max(double(line_width_mm) * double(min_feature_mm),
+                 double(min_feature_mm) * double(min_feature_mm) * 0.20);
+    const double min_width_mm = std::max(double(line_width_mm), double(pitch_mm));
+    if (area_mm2 < min_area_mm2)
+        return false;
+    if (width_mm < double(min_feature_mm) && height_mm < double(min_feature_mm))
+        return false;
+    if (std::min(width_mm, height_mm) < min_width_mm &&
+        std::max(width_mm, height_mm) < 2.0 * double(min_feature_mm))
+        return false;
+    return true;
+}
+
+static void top_surface_image_contoning_merge_small_grid_regions(
+    std::vector<int>                                      &grid,
+    int                                                    cols,
+    int                                                    rows,
+    const std::vector<TopSurfaceImageContoningVectorLabel> &labels,
+    float                                                  pitch_mm,
+    float                                                  min_feature_mm,
+    float                                                  line_width_mm,
+    const ThrowIfCanceled                                  *throw_if_canceled)
+{
+    if (grid.empty() || cols <= 0 || rows <= 0 || labels.empty())
+        return;
+
+    for (int pass = 0; pass < 8; ++pass) {
+        check_canceled(throw_if_canceled);
+        std::vector<unsigned char> visited(grid.size(), 0);
+        bool changed = false;
+        for (int row = 0; row < rows; ++row) {
+            if ((row & 15) == 0)
+                check_canceled(throw_if_canceled);
+            for (int col = 0; col < cols; ++col) {
+                const int start_idx = row * cols + col;
+                const int source_label = grid[size_t(start_idx)];
+                if (source_label < 0 || visited[size_t(start_idx)])
+                    continue;
+
+                std::vector<int> queue;
+                std::vector<int> cells;
+                std::map<int, int> neighbor_counts;
+                queue.push_back(start_idx);
+                visited[size_t(start_idx)] = 1;
+                int min_col = col;
+                int max_col = col;
+                int min_row = row;
+                int max_row = row;
+                for (size_t queue_idx = 0; queue_idx < queue.size(); ++queue_idx) {
+                    if ((queue_idx & 255) == 0)
+                        check_canceled(throw_if_canceled);
+                    const int idx = queue[queue_idx];
+                    cells.push_back(idx);
+                    const int r = idx / cols;
+                    const int c = idx - r * cols;
+                    min_col = std::min(min_col, c);
+                    max_col = std::max(max_col, c);
+                    min_row = std::min(min_row, r);
+                    max_row = std::max(max_row, r);
+                    const std::array<std::pair<int, int>, 4> neighbors{
+                        std::pair<int, int>{ c - 1, r },
+                        std::pair<int, int>{ c + 1, r },
+                        std::pair<int, int>{ c, r - 1 },
+                        std::pair<int, int>{ c, r + 1 }
+                    };
+                    for (const std::pair<int, int> &neighbor : neighbors) {
+                        const int nc = neighbor.first;
+                        const int nr = neighbor.second;
+                        if (nc < 0 || nc >= cols || nr < 0 || nr >= rows)
+                            continue;
+                        const int nidx = nr * cols + nc;
+                        const int nlabel = grid[size_t(nidx)];
+                        if (nlabel == source_label) {
+                            if (!visited[size_t(nidx)]) {
+                                visited[size_t(nidx)] = 1;
+                                queue.push_back(nidx);
+                            }
+                        } else if (nlabel >= 0) {
+                            ++neighbor_counts[nlabel];
+                        }
+                    }
+                }
+
+                if (top_surface_image_contoning_grid_component_printable(int(cells.size()),
+                                                                         min_col,
+                                                                         max_col,
+                                                                         min_row,
+                                                                         max_row,
+                                                                         pitch_mm,
+                                                                         min_feature_mm,
+                                                                         line_width_mm))
+                    continue;
+
+                int best_label = -1;
+                float best_error = std::numeric_limits<float>::max();
+                int best_contact = -1;
+                for (const auto &entry : neighbor_counts) {
+                    const int neighbor_label = entry.first;
+                    if (neighbor_label < 0 ||
+                        neighbor_label >= int(labels.size()) ||
+                        source_label >= int(labels.size()))
+                        continue;
+                    const float error =
+                        top_surface_image_contoning_oklab_error(labels[size_t(source_label)].oklab,
+                                                                labels[size_t(neighbor_label)].oklab);
+                    if (error < best_error - 1e-6f ||
+                        (std::abs(error - best_error) <= 1e-6f && entry.second > best_contact)) {
+                        best_label = neighbor_label;
+                        best_error = error;
+                        best_contact = entry.second;
+                    }
+                }
+                if (best_label < 0)
+                    continue;
+                check_canceled(throw_if_canceled);
+                for (int idx : cells)
+                    grid[size_t(idx)] = best_label;
+                changed = true;
+            }
+        }
+        if (!changed)
+            break;
+    }
+}
+
+static ExPolygons top_surface_image_contoning_area_from_grid_label(const std::vector<int> &grid,
+                                                                   int                     cols,
+                                                                   int                     rows,
+                                                                   int                     label,
+                                                                   coord_t                 min_x,
+                                                                   coord_t                 min_y,
+                                                                   coord_t                 step,
+                                                                   const BoundingBox      &bbox,
+                                                                   const ExPolygons       &clip_area,
+                                                                   const ExPolygons       &blocked_area,
+                                                                   float                   min_feature_mm,
+                                                                   const ThrowIfCanceled  *throw_if_canceled)
+{
+    ExPolygons cells;
+    for (int row = 0; row < rows; ++row) {
+        if ((row & 15) == 0)
+            check_canceled(throw_if_canceled);
+        for (int col = 0; col < cols; ++col) {
+            const int idx = row * cols + col;
+            if (grid[size_t(idx)] != label)
+                continue;
+            const coord_t x0 = min_x + coord_t(col) * step;
+            const coord_t y0 = min_y + coord_t(row) * step;
+            const coord_t x1 = std::min<coord_t>(x0 + step, bbox.max.x());
+            const coord_t y1 = std::min<coord_t>(y0 + step, bbox.max.y());
+            if (x1 <= x0 || y1 <= y0)
+                continue;
+            cells.emplace_back(top_surface_image_cell_expolygon(x0, y0, x1, y1));
+        }
+    }
+    return top_surface_image_contoning_clean_area(std::move(cells), clip_area, blocked_area, min_feature_mm, throw_if_canceled);
+}
+
+static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_contoning_vector_regions(
+    const TopSurfaceImageRegionPlan      &plan,
+    const Layer                          &source_layer,
+    const ExPolygons                     &area,
+    const PrintObject                    &object,
+    const TextureMappingZone             &zone,
+    const PrintConfig                    &print_config,
+    int                                   depth,
+    const TextureMappingContoningSolver  &solver,
+    TopSurfaceImageSourceSurface          source_surface,
+    const ThrowIfCanceled                *throw_if_canceled)
+{
+    std::vector<TopSurfaceImageContoningVectorRegion> regions;
+    if (area.empty() || !solver.valid())
+        return regions;
+    check_canceled(throw_if_canceled);
+
+    std::optional<float> sample_z_mm;
+    if (source_surface == TopSurfaceImageSourceSurface::Bottom)
+        sample_z_mm = float(source_layer.bottom_z());
+    std::optional<TextureMappingOffsetContext> context =
+        build_texture_mapping_offset_context_for_layer(object,
+                                                       source_layer,
+                                                       zone,
+                                                       plan.zone_id,
+                                                       solver.component_ids().front(),
+                                                       plan.max_width_mm,
+                                                       float(source_layer.height),
+                                                       std::nullopt,
+                                                       plan.min_width_mm,
+                                                       top_surface_image_equal_blend_background(print_config, solver.component_ids()),
+                                                       sample_z_mm);
+    if (!context)
+        return regions;
+
+    const BoundingBox bbox = get_extents(area);
+    if (!bbox.defined)
+        return regions;
+
+    const float pitch_mm = top_surface_image_contoning_sample_pitch_mm(plan, bbox);
+    const coord_t step = std::max<coord_t>(1, scale_(double(pitch_mm)));
+    const coord_t min_x = (bbox.min.x() / step) * step;
+    const coord_t min_y = (bbox.min.y() / step) * step;
+    const int cols = std::max(0, int(std::ceil(double(bbox.max.x() - min_x) / double(step))));
+    const int rows = std::max(0, int(std::ceil(double(bbox.max.y() - min_y) / double(step))));
+    if (cols <= 0 || rows <= 0)
+        return regions;
+
+    std::vector<int> grid(size_t(cols) * size_t(rows), -1);
+    std::vector<TopSurfaceImageContoningVectorLabel> labels;
+    std::map<std::vector<unsigned int>, int> label_by_stack;
+    const float threshold_deg =
+        std::clamp(zone.top_surface_contoning_angle_threshold_deg,
+                   TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg,
+                   TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg);
+    const int stack_layers = std::clamp(plan.contoning_stack_layers,
+                                        TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                                        TextureMappingZone::MaxTopSurfaceContoningStackLayers);
+    const std::vector<ExPolygons> source_stack_areas =
+        top_surface_image_contoning_stack_areas(source_layer, plan.zone_id, stack_layers, source_surface, throw_if_canceled);
+
+    for (int row = 0; row < rows; ++row) {
+        if ((row & 15) == 0)
+            check_canceled(throw_if_canceled);
+        for (int col = 0; col < cols; ++col) {
+            const coord_t x0 = min_x + coord_t(col) * step;
+            const coord_t y0 = min_y + coord_t(row) * step;
+            const coord_t x1 = std::min<coord_t>(x0 + step, bbox.max.x());
+            const coord_t y1 = std::min<coord_t>(y0 + step, bbox.max.y());
+            if (x1 <= x0 || y1 <= y0)
+                continue;
+            const Point sample_point((x0 + x1) / 2, (y0 + y1) / 2);
+            if (!top_surface_image_expolygons_contain_point(area, sample_point))
+                continue;
+            const int local_stack_layers =
+                top_surface_image_contoning_local_stack_layers_at_point(sample_point, source_stack_areas, stack_layers);
+            if (depth >= local_stack_layers)
+                continue;
+            const int solve_layers = std::min({ local_stack_layers, stack_layers, 4 });
+            if (solve_layers <= 0)
+                continue;
+            const float sample_x_mm = unscale<float>(sample_point.x());
+            const float sample_y_mm = unscale<float>(sample_point.y());
+            if (!top_surface_image_contoning_sample_eligible(*context, sample_x_mm, sample_y_mm, threshold_deg, source_surface))
+                continue;
+            const std::optional<std::array<float, 3>> rgb =
+                sample_weight_field_rgb(context->weight_field,
+                                        sample_x_mm,
+                                        sample_y_mm,
+                                        context->high_resolution_texture_sampling);
+            if (!rgb)
+                continue;
+            TextureMappingContoningStack stack = solver.solve(*rgb, solve_layers);
+            if (stack.bottom_to_top.empty())
+                continue;
+            std::optional<std::array<float, 3>> stack_rgb =
+                top_surface_image_contoning_stack_rgb(stack.bottom_to_top, print_config);
+            if (!stack_rgb)
+                continue;
+            top_surface_image_contoning_sort_stack_for_top_color(stack.bottom_to_top, *stack_rgb, print_config);
+            auto label_it = label_by_stack.find(stack.bottom_to_top);
+            int label = -1;
+            if (label_it == label_by_stack.end()) {
+                TopSurfaceImageContoningVectorLabel label_data;
+                label_data.bottom_to_top = stack.bottom_to_top;
+                label_data.rgb = *stack_rgb;
+                label_data.oklab = color_solver_oklab_from_srgb(*stack_rgb);
+                label = int(labels.size());
+                labels.emplace_back(std::move(label_data));
+                label_by_stack.emplace(labels.back().bottom_to_top, label);
+            } else {
+                label = label_it->second;
+            }
+            grid[size_t(row * cols + col)] = label;
+        }
+    }
+
+    if (labels.empty())
+        return regions;
+
+    top_surface_image_contoning_merge_small_grid_regions(grid,
+                                                         cols,
+                                                         rows,
+                                                         labels,
+                                                         pitch_mm,
+                                                         plan.contoning_min_feature_mm,
+                                                         plan.contoning_external_width_mm,
+                                                         throw_if_canceled);
+    check_canceled(throw_if_canceled);
+
+    std::vector<int> cell_counts(labels.size(), 0);
+    for (int label : grid)
+        if (label >= 0 && label < int(cell_counts.size()))
+            ++cell_counts[size_t(label)];
+
+    std::vector<int> label_order;
+    for (size_t idx = 0; idx < cell_counts.size(); ++idx)
+        if (cell_counts[idx] > 0)
+            label_order.emplace_back(int(idx));
+    std::sort(label_order.begin(), label_order.end(), [&cell_counts](int lhs, int rhs) {
+        return cell_counts[size_t(lhs)] > cell_counts[size_t(rhs)];
+    });
+
+    ExPolygons taken;
+    for (int label : label_order) {
+        check_canceled(throw_if_canceled);
+        ExPolygons label_area =
+            top_surface_image_contoning_area_from_grid_label(grid,
+                                                             cols,
+                                                             rows,
+                                                             label,
+                                                             min_x,
+                                                             min_y,
+                                                             step,
+                                                             bbox,
+                                                             area,
+                                                             taken,
+                                                             plan.contoning_min_feature_mm,
+                                                             throw_if_canceled);
+        if (label_area.empty())
+            continue;
+        append(taken, label_area);
+        TopSurfaceImageContoningVectorRegion region;
+        region.bottom_to_top = labels[size_t(label)].bottom_to_top;
+        region.cell_count = cell_counts[size_t(label)];
+        region.area = std::move(label_area);
+        regions.emplace_back(std::move(region));
+    }
+
+    if (!regions.empty()) {
+        check_canceled(throw_if_canceled);
+        ExPolygons covered = union_ex(taken);
+        ExPolygons leftover = diff_ex(area, covered, ApplySafetyOffset::Yes);
+        if (!leftover.empty()) {
+            append(regions.front().area, std::move(leftover));
+            regions.front().area = union_ex(regions.front().area);
+        }
+    }
+
+    return regions;
+}
+
+static void top_surface_image_append_contoning_slices(TopSurfaceImageRegionPlan          &plan,
+                                                      const Layer                        &source_layer,
+                                                      const ExPolygons                   &area,
+                                                      const PrintObject                  &object,
+                                                      const TextureMappingZone           &zone,
+                                                      const PrintConfig                  &print_config,
+                                                      int                                 depth,
+                                                      const TextureMappingContoningSolver &solver,
+                                                      TopSurfaceImageSourceSurface         source_surface,
+                                                      const ThrowIfCanceled               *throw_if_canceled)
+{
+    if (area.empty() || !solver.valid())
+        return;
+    check_canceled(throw_if_canceled);
+
+    std::vector<ExPolygons> by_component(print_config.filament_colour.values.size() + 1);
+    const std::vector<TopSurfaceImageContoningVectorRegion> stack_regions =
+        top_surface_image_contoning_vector_regions(plan,
+                                                   source_layer,
+                                                   area,
+                                                   object,
+                                                   zone,
+                                                   print_config,
+                                                   depth,
+                                                   solver,
+                                                   source_surface,
+                                                   throw_if_canceled);
+    for (const TopSurfaceImageContoningVectorRegion &region : stack_regions) {
+        check_canceled(throw_if_canceled);
+        if (depth < 0 || region.bottom_to_top.empty() || region.area.empty())
+            continue;
+        const int pattern_depth = depth % int(region.bottom_to_top.size());
+        const unsigned int component_id =
+            region.bottom_to_top[size_t(int(region.bottom_to_top.size()) - 1 - pattern_depth)];
+        if (component_id == 0 || component_id >= by_component.size())
+            continue;
+        append(by_component[component_id], region.area);
+    }
+
+    ExPolygons depth_taken;
+    for (unsigned int component_id = 1; component_id < by_component.size(); ++component_id) {
+        check_canceled(throw_if_canceled);
+        if (by_component[component_id].empty())
+            continue;
+        ExPolygons component_area = union_ex(by_component[component_id]);
+        if (!depth_taken.empty())
+            component_area = diff_ex(component_area, depth_taken, ApplySafetyOffset::Yes);
+        if (component_area.empty())
+            continue;
+        append(depth_taken, component_area);
+        TopSurfaceImageStackSlice slice;
+        slice.component_id = component_id;
+        slice.depth = depth;
+        slice.component_index = size_t(depth % std::max(1, std::min(plan.contoning_stack_layers, 4)));
+        slice.component_count = size_t(std::min(plan.contoning_stack_layers, 4));
+        slice.contoning = true;
+        slice.lower_surface = source_surface == TopSurfaceImageSourceSurface::Bottom;
+        slice.angle_rad = (depth & 1) ? float(-PI / 4.0) : float(PI / 4.0);
+        slice.area = std::move(component_area);
+        plan.slices.emplace_back(std::move(slice));
+    }
+}
+
+static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(const Layer &layer,
+                                                                             const ThrowIfCanceled *throw_if_canceled)
 {
     std::vector<TopSurfaceImageRegionPlan> plans(layer.regions().size());
     const PrintObject *object = layer.object();
@@ -500,11 +1182,14 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(con
         return plans;
 
     Polygons current_layer_perimeters;
-    for (const LayerRegion *layerm : layer.regions())
+    for (const LayerRegion *layerm : layer.regions()) {
+        check_canceled(throw_if_canceled);
         if (layerm != nullptr)
             layerm->perimeters.polygons_covered_by_width(current_layer_perimeters, 0.f);
+    }
 
     for (size_t region_id = 0; region_id < layer.regions().size(); ++region_id) {
+        check_canceled(throw_if_canceled);
         const LayerRegion *layerm = layer.regions()[region_id];
         if (layerm == nullptr)
             continue;
@@ -532,9 +1217,12 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(con
         plan.zone_id = zone_id;
         plan.same_layer_partition =
             zone->top_surface_image_printing_method == int(TextureMappingZone::TopSurfaceImageSameLayer45Partition);
+        plan.contoning = zone->top_surface_contoning_active();
         plan.components_bottom_to_top = plan.same_layer_partition ?
             components :
-            top_surface_image_components_bottom_to_top(*zone, print_config, components);
+            (plan.contoning ?
+                 texture_mapping_contoning_components_bottom_to_top(*zone, print_config, components) :
+                 top_surface_image_components_bottom_to_top(*zone, print_config, components));
         if (plan.components_bottom_to_top.empty())
             continue;
         plan.max_width_mm = std::clamp(zone->top_surface_image_max_line_width_mm,
@@ -544,49 +1232,106 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(con
                                        TextureMappingZone::MinTopSurfaceImageLineWidthMm,
                                        plan.max_width_mm);
         plan.fixed_coloring = zone->top_surface_image_fixed_coloring_filaments;
+        plan.color_lower_surfaces = zone->top_surface_contoning_color_lower_surfaces;
         plan.colored_top_layers = std::clamp(zone->top_surface_image_colored_top_layers,
                                              TextureMappingZone::MinTopSurfaceImageColoredTopLayers,
                                              TextureMappingZone::MaxTopSurfaceImageColoredTopLayers);
+        plan.contoning_stack_layers = std::clamp(zone->top_surface_contoning_stack_layers,
+                                                 TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                                                 TextureMappingZone::MaxTopSurfaceContoningStackLayers);
+        plan.contoning_external_width_mm = float(layerm->flow(frExternalPerimeter).width());
+        plan.contoning_min_feature_mm =
+            texture_mapping_contoning_min_feature_mm(*zone, print_config, components, plan.contoning_external_width_mm);
+        const TextureMappingContoningSolver contoning_solver(*zone, print_config, components);
 
-        const int stack_depth = plan.same_layer_partition ?
+        const int stack_depth = plan.contoning ?
+            plan.contoning_stack_layers :
+            (plan.same_layer_partition ?
             plan.colored_top_layers :
-            int(plan.components_bottom_to_top.size());
-        for (int depth = 0; depth < stack_depth; ++depth) {
-            const Layer *top_layer = &layer;
-            for (int i = 0; i < depth && top_layer != nullptr; ++i)
-                top_layer = top_layer->upper_layer;
-            if (top_layer == nullptr)
-                break;
+            int(plan.components_bottom_to_top.size()));
+        if (plan.contoning) {
+            auto append_contoning_surface = [&](TopSurfaceImageSourceSurface source_surface) {
+                std::vector<const Layer *> contoning_depth_layers(size_t(stack_depth), nullptr);
+                std::vector<ExPolygons> contoning_depth_areas(static_cast<size_t>(stack_depth));
+                for (int depth = 0; depth < stack_depth; ++depth) {
+                    check_canceled(throw_if_canceled);
+                    const Layer *source_layer = &layer;
+                    for (int i = 0; i < depth && source_layer != nullptr; ++i)
+                        source_layer = source_surface == TopSurfaceImageSourceSurface::Top ?
+                            source_layer->upper_layer :
+                            source_layer->lower_layer;
+                    if (source_layer == nullptr)
+                        break;
 
-            ExPolygons area = top_surface_image_visible_top_mask(*top_layer, zone_id);
-            if (area.empty())
-                continue;
-            if (!current_layer_perimeters.empty())
-                area = diff_ex(area, current_layer_perimeters, ApplySafetyOffset::Yes);
-            if (area.empty())
-                continue;
+                    ExPolygons area = top_surface_image_visible_surface_mask(*source_layer, zone_id, source_surface);
+                    if (area.empty())
+                        continue;
+                    if (!current_layer_perimeters.empty())
+                        area = diff_ex(area, current_layer_perimeters, ApplySafetyOffset::Yes);
+                    if (area.empty())
+                        continue;
+                    contoning_depth_layers[size_t(depth)] = source_layer;
+                    contoning_depth_areas[size_t(depth)] = std::move(area);
+                }
+                for (int depth = 0; depth < stack_depth; ++depth) {
+                    check_canceled(throw_if_canceled);
+                    if (contoning_depth_layers[size_t(depth)] == nullptr || contoning_depth_areas[size_t(depth)].empty())
+                        continue;
+                    top_surface_image_append_contoning_slices(plan,
+                                                              *contoning_depth_layers[size_t(depth)],
+                                                              contoning_depth_areas[size_t(depth)],
+                                                              *object,
+                                                              *zone,
+                                                              print_config,
+                                                              depth,
+                                                              contoning_solver,
+                                                              source_surface,
+                                                              throw_if_canceled);
+                }
+            };
+            append_contoning_surface(TopSurfaceImageSourceSurface::Top);
+            if (plan.color_lower_surfaces)
+                append_contoning_surface(TopSurfaceImageSourceSurface::Bottom);
+        } else {
+            for (int depth = 0; depth < stack_depth; ++depth) {
+                check_canceled(throw_if_canceled);
+                const Layer *top_layer = &layer;
+                for (int i = 0; i < depth && top_layer != nullptr; ++i)
+                    top_layer = top_layer->upper_layer;
+                if (top_layer == nullptr)
+                    break;
 
-            if (plan.same_layer_partition) {
-                const ExPolygons depth_area = area;
-                for (size_t component_idx = 0; component_idx < plan.components_bottom_to_top.size(); ++component_idx) {
+                ExPolygons area = top_surface_image_visible_top_mask(*top_layer, zone_id);
+                if (area.empty())
+                    continue;
+                if (!current_layer_perimeters.empty())
+                    area = diff_ex(area, current_layer_perimeters, ApplySafetyOffset::Yes);
+                if (area.empty())
+                    continue;
+
+                if (plan.same_layer_partition) {
+                    const ExPolygons depth_area = area;
+                    for (size_t component_idx = 0; component_idx < plan.components_bottom_to_top.size(); ++component_idx) {
+                        check_canceled(throw_if_canceled);
+                        TopSurfaceImageStackSlice slice;
+                        slice.component_id = plan.components_bottom_to_top[component_idx];
+                        slice.depth = depth;
+                        slice.component_index = component_idx;
+                        slice.component_count = plan.components_bottom_to_top.size();
+                        slice.same_layer_partition = true;
+                        slice.angle_rad = (depth & 1) ? float(-PI / 4.0) : float(PI / 4.0);
+                        slice.area = depth_area;
+                        plan.slices.emplace_back(std::move(slice));
+                    }
+                } else {
                     TopSurfaceImageStackSlice slice;
-                    slice.component_id = plan.components_bottom_to_top[component_idx];
+                    slice.component_id = plan.components_bottom_to_top[size_t(stack_depth - 1 - depth)];
                     slice.depth = depth;
-                    slice.component_index = component_idx;
+                    slice.component_index = size_t(stack_depth - 1 - depth);
                     slice.component_count = plan.components_bottom_to_top.size();
-                    slice.same_layer_partition = true;
-                    slice.angle_rad = (depth & 1) ? float(-PI / 4.0) : float(PI / 4.0);
-                    slice.area = depth_area;
+                    slice.area = std::move(area);
                     plan.slices.emplace_back(std::move(slice));
                 }
-            } else {
-                TopSurfaceImageStackSlice slice;
-                slice.component_id = plan.components_bottom_to_top[size_t(stack_depth - 1 - depth)];
-                slice.depth = depth;
-                slice.component_index = size_t(stack_depth - 1 - depth);
-                slice.component_count = plan.components_bottom_to_top.size();
-                slice.area = std::move(area);
-                plan.slices.emplace_back(std::move(slice));
             }
         }
 
@@ -631,6 +1376,13 @@ static void append_surface_fill_expolygons(SurfaceFill &fill,
     }
 }
 
+static bool top_surface_image_slice_matches_surface(const TopSurfaceImageStackSlice &slice, const Surface &surface)
+{
+    return slice.lower_surface ?
+        (surface.surface_type == stBottom || surface.surface_type == stInternalSolid) :
+        (surface.is_top() || surface.surface_type == stInternalSolid);
+}
+
 static SurfaceFillParams top_surface_image_params_for_slice(const Layer &layer,
                                                             const Surface &surface,
                                                             const SurfaceFillParams &base_params,
@@ -648,16 +1400,21 @@ static SurfaceFillParams top_surface_image_params_for_slice(const Layer &layer,
     params.multiline = 1;
     params.anchor_length = 1000.f;
     params.anchor_length_max = 1000.f;
-    params.extrusion_role = surface.is_top() ? erTopSolidInfill : erSolidInfill;
+    params.extrusion_role = surface.is_top() ? erTopSolidInfill : (surface.surface_type == stBottom ? erBottomSurface : erSolidInfill);
     const PrintConfig &print_config = layer.object()->print()->config();
     const float nozzle = slice.component_id > 0 && size_t(slice.component_id - 1) < print_config.nozzle_diameter.values.size() ?
         float(print_config.nozzle_diameter.get_at(size_t(slice.component_id - 1))) :
         float(print_config.nozzle_diameter.values.empty() ? 0.4 : print_config.nozzle_diameter.values.front());
     const float height = float((surface.thickness == -1) ? layer.height : surface.thickness);
-    params.flow = Flow(plan.max_width_mm, height, nozzle);
-    params.spacing = slice.same_layer_partition && slice.component_count > 0 ?
-        (plan.min_width_mm * float(slice.component_count) + (plan.max_width_mm - plan.min_width_mm)) :
-        params.flow.spacing();
+    if (slice.contoning) {
+        params.flow = base_params.flow;
+        params.spacing = base_params.spacing;
+    } else {
+        params.flow = Flow(plan.max_width_mm, height, nozzle);
+        params.spacing = slice.same_layer_partition && slice.component_count > 0 ?
+            (plan.min_width_mm * float(slice.component_count) + (plan.max_width_mm - plan.min_width_mm)) :
+            params.flow.spacing();
+    }
     params.texture_mapping_top_surface_image = true;
     params.texture_mapping_top_surface_zone_id = plan.zone_id;
     params.texture_mapping_top_surface_component_id = slice.component_id;
@@ -666,6 +1423,7 @@ static SurfaceFillParams top_surface_image_params_for_slice(const Layer &layer,
     params.texture_mapping_top_surface_min_width_mm = plan.min_width_mm;
     params.texture_mapping_top_surface_max_width_mm = plan.max_width_mm;
     params.texture_mapping_top_surface_same_layer_partition = slice.same_layer_partition;
+    params.texture_mapping_top_surface_contoning = slice.contoning;
     params.texture_mapping_top_surface_component_index = int(slice.component_index);
     params.texture_mapping_top_surface_component_count = int(slice.component_count);
     return params;
@@ -675,14 +1433,18 @@ static ExtrusionPaths top_surface_image_split_path(const ExtrusionPath &path,
                                                    const TextureMappingOffsetContext &context,
                                                    float min_width_mm,
                                                    float max_width_mm,
-                                                   float nozzle_diameter)
+                                                   float nozzle_diameter,
+                                                   const ThrowIfCanceled *throw_if_canceled)
 {
     ExtrusionPaths out;
     if (path.polyline.points.size() < 2)
         return out;
+    check_canceled(throw_if_canceled);
     const float height = path.height > 0.f ? path.height : context.layer_height_mm;
     const float sample_step_mm = std::clamp(max_width_mm * 0.5f, 0.16f, 0.40f);
     for (size_t point_idx = 1; point_idx < path.polyline.points.size(); ++point_idx) {
+        if ((point_idx & 63) == 1)
+            check_canceled(throw_if_canceled);
         const Point p0 = path.polyline.points[point_idx - 1];
         const Point p1 = path.polyline.points[point_idx];
         const double len_mm = unscale<double>(p0.distance_to(p1));
@@ -725,10 +1487,11 @@ static ExtrusionEntity* top_surface_image_modulated_entity(const ExtrusionEntity
                                                            const TextureMappingOffsetContext &context,
                                                            float min_width_mm,
                                                            float max_width_mm,
-                                                           float nozzle_diameter)
+                                                           float nozzle_diameter,
+                                                           const ThrowIfCanceled *throw_if_canceled)
 {
     if (const ExtrusionPath *path = dynamic_cast<const ExtrusionPath *>(&entity)) {
-        ExtrusionPaths paths = top_surface_image_split_path(*path, context, min_width_mm, max_width_mm, nozzle_diameter);
+        ExtrusionPaths paths = top_surface_image_split_path(*path, context, min_width_mm, max_width_mm, nozzle_diameter, throw_if_canceled);
         if (paths.empty())
             return entity.clone();
         return new ExtrusionMultiPath(std::move(paths));
@@ -736,7 +1499,8 @@ static ExtrusionEntity* top_surface_image_modulated_entity(const ExtrusionEntity
     if (const ExtrusionMultiPath *multi_path = dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
         ExtrusionPaths paths;
         for (const ExtrusionPath &path : multi_path->paths) {
-            ExtrusionPaths split = top_surface_image_split_path(path, context, min_width_mm, max_width_mm, nozzle_diameter);
+            check_canceled(throw_if_canceled);
+            ExtrusionPaths split = top_surface_image_split_path(path, context, min_width_mm, max_width_mm, nozzle_diameter, throw_if_canceled);
             append(paths, std::move(split));
         }
         if (paths.empty())
@@ -749,7 +1513,8 @@ static ExtrusionEntity* top_surface_image_modulated_entity(const ExtrusionEntity
     if (const ExtrusionLoop *loop = dynamic_cast<const ExtrusionLoop *>(&entity)) {
         ExtrusionPaths paths;
         for (const ExtrusionPath &path : loop->paths) {
-            ExtrusionPaths split = top_surface_image_split_path(path, context, min_width_mm, max_width_mm, nozzle_diameter);
+            check_canceled(throw_if_canceled);
+            ExtrusionPaths split = top_surface_image_split_path(path, context, min_width_mm, max_width_mm, nozzle_diameter, throw_if_canceled);
             append(paths, std::move(split));
         }
         if (paths.empty())
@@ -759,8 +1524,9 @@ static ExtrusionEntity* top_surface_image_modulated_entity(const ExtrusionEntity
     if (const ExtrusionEntityCollection *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
         ExtrusionEntityCollection *out = new ExtrusionEntityCollection(*collection);
         for (ExtrusionEntity *&child : out->entities) {
+            check_canceled(throw_if_canceled);
             ExtrusionEntity *replacement =
-                top_surface_image_modulated_entity(*child, context, min_width_mm, max_width_mm, nozzle_diameter);
+                top_surface_image_modulated_entity(*child, context, min_width_mm, max_width_mm, nozzle_diameter, throw_if_canceled);
             delete child;
             child = replacement;
         }
@@ -803,8 +1569,10 @@ static std::vector<float> top_surface_image_same_layer_fractions(const std::opti
 static void top_surface_image_same_layer_partition_fill(ExtrusionEntityCollection                       &collection,
                                                         const Surface                                  &surface,
                                                         const SurfaceFillParams                        &params,
-                                                        const std::optional<TextureMappingOffsetContext> &context)
+                                                        const std::optional<TextureMappingOffsetContext> &context,
+                                                        const ThrowIfCanceled                           *throw_if_canceled)
 {
+    check_canceled(throw_if_canceled);
     int component_count = std::max(1, params.texture_mapping_top_surface_component_count);
     int component_index = std::clamp(params.texture_mapping_top_surface_component_index, 0, component_count - 1);
     if (context && int(context->component_ids.size()) == component_count) {
@@ -852,9 +1620,11 @@ static void top_surface_image_same_layer_partition_fill(ExtrusionEntityCollectio
     const int band_end = int(std::ceil((max_v + pitch) / double(pitch)));
     const ExPolygons clip { surface.expolygon };
     for (int band = band_start; band <= band_end; ++band) {
+        check_canceled(throw_if_canceled);
         const double band_v = double(band) * double(pitch);
         const double sample_v = band_v + double(pitch) * 0.5;
         for (double u0 = u_start; u0 < u_end - EPSILON; u0 += sample_step) {
+            check_canceled(throw_if_canceled);
             const double u1 = std::min(u0 + sample_step, u_end);
             const double um = 0.5 * (u0 + u1);
             const double sample_x = um * cos_t - sample_v * sin_t;
@@ -898,8 +1668,10 @@ static void top_surface_image_same_layer_partition_fill(ExtrusionEntityCollectio
 
 static void apply_top_surface_image_collection_metadata(ExtrusionEntityCollection &collection,
                                                         const SurfaceFillParams &params,
-                                                        const std::optional<TextureMappingOffsetContext> &context)
+                                                        const std::optional<TextureMappingOffsetContext> &context,
+                                                        const ThrowIfCanceled *throw_if_canceled)
 {
+    check_canceled(throw_if_canceled);
     collection.texture_mapping_top_surface_image = true;
     collection.texture_mapping_top_surface_zone_id = params.texture_mapping_top_surface_zone_id;
     collection.texture_mapping_top_surface_desired_component_id = params.texture_mapping_top_surface_component_id;
@@ -908,16 +1680,19 @@ static void apply_top_surface_image_collection_metadata(ExtrusionEntityCollectio
     if (params.texture_mapping_top_surface_fixed_coloring &&
         params.texture_mapping_top_surface_component_id > 0)
         collection.texture_mapping_extruder_override = int(params.texture_mapping_top_surface_component_id - 1);
-    if (!context)
+    if (!context || params.texture_mapping_top_surface_contoning)
         return;
     ExtrusionEntitiesPtr replacement;
     replacement.reserve(collection.entities.size());
-    for (const ExtrusionEntity *entity : collection.entities)
+    for (const ExtrusionEntity *entity : collection.entities) {
+        check_canceled(throw_if_canceled);
         replacement.emplace_back(top_surface_image_modulated_entity(*entity,
                                                                     *context,
                                                                     params.texture_mapping_top_surface_min_width_mm,
                                                                     params.texture_mapping_top_surface_max_width_mm,
-                                                                    params.flow.nozzle_diameter()));
+                                                                    params.flow.nozzle_diameter(),
+                                                                    throw_if_canceled));
+    }
     collection.clear();
     collection.entities = std::move(replacement);
 }
@@ -1403,8 +2178,9 @@ void split_solid_surface(size_t layer_id, const SurfaceFill &fill, ExPolygons &n
 #endif
 }
 
-std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_param)
+std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_param, const ThrowIfCanceled *throw_if_canceled = nullptr)
 {
+    check_canceled(throw_if_canceled);
 	std::vector<SurfaceFill> surface_fills;
 	// Fill in a map of a region & surface to SurfaceFillParams.
 	std::set<SurfaceFillParams> 						set_surface_params;
@@ -1412,7 +2188,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
     SurfaceFillParams									params;
     bool 												has_internal_voids = false;
 	const PrintObjectConfig&							object_config = layer.object()->config();
-    const std::vector<TopSurfaceImageRegionPlan>        top_surface_plans = top_surface_image_region_plans(layer);
+    const std::vector<TopSurfaceImageRegionPlan>        top_surface_plans = top_surface_image_region_plans(layer, throw_if_canceled);
 
 	auto append_flow_param = [](std::map<Flow, ExPolygons> &flow_params, Flow flow, const ExPolygon &exp) {
         auto it = flow_params.find(flow);
@@ -1431,6 +2207,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
     };
 
 	for (size_t region_id = 0; region_id < layer.regions().size(); ++ region_id) {
+        check_canceled(throw_if_canceled);
 		const LayerRegion  &layerm = *layer.regions()[region_id];
 		region_to_surface_params[region_id].assign(layerm.fill_surfaces.size(), nullptr);
 	    for (const Surface &surface : layerm.fill_surfaces.surfaces)
@@ -1579,11 +2356,13 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 
 	surface_fills.reserve(set_surface_params.size());
 	for (const SurfaceFillParams &params : set_surface_params) {
+        check_canceled(throw_if_canceled);
 		const_cast<SurfaceFillParams&>(params).idx = surface_fills.size();
 		surface_fills.emplace_back(params);
 	}
 
 	for (size_t region_id = 0; region_id < layer.regions().size(); ++ region_id) {
+        check_canceled(throw_if_canceled);
 		const LayerRegion &layerm = *layer.regions()[region_id];
 	    for (const Surface &surface : layerm.fill_surfaces.surfaces)
 	        if (surface.surface_type != stInternalVoid) {
@@ -1592,32 +2371,48 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                     ExPolygons remaining = { surface.expolygon };
                     if (region_id < top_surface_plans.size() &&
                         top_surface_plans[region_id].zone != nullptr &&
-                        (surface.is_top() || surface.surface_type == stInternalSolid) &&
+                        (surface.is_top() || surface.surface_type == stInternalSolid || surface.surface_type == stBottom) &&
                         !surface.is_bridge()) {
                         const TopSurfaceImageRegionPlan &plan = top_surface_plans[region_id];
                         for (size_t slice_idx = 0; slice_idx < plan.slices.size();) {
+                            check_canceled(throw_if_canceled);
                             const TopSurfaceImageStackSlice &slice = plan.slices[slice_idx];
+                            if (!top_surface_image_slice_matches_surface(slice, surface)) {
+                                ++slice_idx;
+                                continue;
+                            }
                             if (remaining.empty())
                                 break;
                             ExPolygons image_expolygons = intersection_ex(remaining, slice.area, ApplySafetyOffset::Yes);
-                            if (image_expolygons.empty()) {
+                            if (image_expolygons.empty() && !slice.contoning) {
                                 ++slice_idx;
                                 continue;
                             }
                             ExPolygons image_clip = image_expolygons;
-                            if (slice.same_layer_partition) {
+                            if (slice.same_layer_partition || slice.contoning) {
                                 size_t same_depth_end = slice_idx;
                                 while (same_depth_end < plan.slices.size() &&
-                                       plan.slices[same_depth_end].same_layer_partition &&
+                                       plan.slices[same_depth_end].same_layer_partition == slice.same_layer_partition &&
+                                       plan.slices[same_depth_end].contoning == slice.contoning &&
+                                       plan.slices[same_depth_end].lower_surface == slice.lower_surface &&
                                        plan.slices[same_depth_end].depth == slice.depth)
                                     ++same_depth_end;
+                                ExPolygons depth_clip;
                                 for (size_t same_idx = slice_idx; same_idx < same_depth_end; ++same_idx) {
+                                    check_canceled(throw_if_canceled);
                                     SurfaceFillParams image_params =
                                         top_surface_image_params_for_slice(layer, surface, *params, plan, plan.slices[same_idx]);
-                                    ExPolygons component_expolygons = image_expolygons;
-                                    SurfaceFill &image_fill = surface_fill_for_params(surface_fills, image_params);
-                                    append_surface_fill_expolygons(image_fill, region_id, surface, std::move(component_expolygons), layerm);
+                                    ExPolygons component_expolygons = slice.same_layer_partition ?
+                                        image_expolygons :
+                                        intersection_ex(remaining, plan.slices[same_idx].area, ApplySafetyOffset::Yes);
+                                    if (!component_expolygons.empty()) {
+                                        append(depth_clip, component_expolygons);
+                                        SurfaceFill &image_fill = surface_fill_for_params(surface_fills, image_params);
+                                        append_surface_fill_expolygons(image_fill, region_id, surface, std::move(component_expolygons), layerm);
+                                    }
                                 }
+                                if (!depth_clip.empty())
+                                    image_clip = union_ex(depth_clip);
                                 slice_idx = same_depth_end;
                             } else {
                                 SurfaceFillParams image_params =
@@ -1641,6 +2436,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 		Polygons all_polygons;
 		for (SurfaceFill &fill : surface_fills)
 			if (! fill.expolygons.empty()) {
+                check_canceled(throw_if_canceled);
                 if (fill.params.texture_mapping_top_surface_same_layer_partition)
                     continue;
 				if (fill.expolygons.size() > 1 || ! all_polygons.empty()) {
@@ -1664,6 +2460,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
     // TODO: detect and investigate whether there could be narrow regions without
     // any void neighbors
     if (has_internal_voids) {
+        check_canceled(throw_if_canceled);
     	// Internal voids are generated only if "infill_only_where_needed" or "infill_every_layers" are active.
         coord_t  distance_between_surfaces = 0;
         Polygons surfaces_polygons;
@@ -1673,6 +2470,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 		int		 region_some_infill = -1;
     	for (SurfaceFill &surface_fill : surface_fills)
 			if (! surface_fill.expolygons.empty()) {
+                check_canceled(throw_if_canceled);
     			distance_between_surfaces = std::max(distance_between_surfaces, surface_fill.params.flow.scaled_spacing());
 				append((surface_fill.surface.surface_type == stInternalVoid) ? voids : surfaces_polygons, to_polygons(surface_fill.expolygons));
 				if (surface_fill.surface.surface_type == stInternalSolid)
@@ -1683,6 +2481,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 					region_some_infill = (int)surface_fill.region_id;
 			}
     	if (! voids.empty() && ! surfaces_polygons.empty()) {
+            check_canceled(throw_if_canceled);
     		// First clip voids by the printing polygons, as the voids were ignored by the loop above during mutual clipping.
     		voids = diff(voids, surfaces_polygons);
 	        // Corners of infill regions, which would not be filled with an extrusion path with a radius of distance_between_surfaces/2
@@ -1743,6 +2542,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 	if (layer.object()->config().detect_narrow_internal_solid_infill) {
 		size_t surface_fills_size = surface_fills.size();
 		for (size_t i = 0; i < surface_fills_size; i++) {
+            check_canceled(throw_if_canceled);
 			if (surface_fills[i].surface.surface_type != stInternalSolid ||
                 surface_fills[i].params.texture_mapping_top_surface_image)
 				continue;
@@ -1801,8 +2601,13 @@ void export_group_fills_to_svg(const char *path, const std::vector<SurfaceFill> 
 #endif
 
 // friend to Layer
-void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree, FillLightning::Generator* lightning_generator)
+void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree,
+                       FillAdaptive::Octree* support_fill_octree,
+                       FillLightning::Generator* lightning_generator,
+                       std::function<void()> throw_if_canceled)
 {
+    const ThrowIfCanceled *throw_if_canceled_ptr = throw_if_canceled ? &throw_if_canceled : nullptr;
+    check_canceled(throw_if_canceled_ptr);
 	for (LayerRegion *layerm : m_regions)
 		layerm->fills.clear();
 
@@ -1811,9 +2616,10 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 //	this->export_region_fill_surfaces_to_svg_debug("10_fill-initial");
 #endif /* SLIC3R_DEBUG_SLICE_PROCESSING */
     LockRegionParam lock_param;
-    std::vector<SurfaceFill>     surface_fills = group_fills(*this, lock_param);
+    std::vector<SurfaceFill>     surface_fills = group_fills(*this, lock_param, throw_if_canceled_ptr);
 	const Slic3r::BoundingBox bbox 			= this->object()->bounding_box();
 	const auto                resolution 	= this->object()->print()->config().resolution.value;
+    check_canceled(throw_if_canceled_ptr);
 
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
 	{
@@ -1823,6 +2629,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 #endif /* SLIC3R_DEBUG_SLICE_PROCESSING */
 
     for (SurfaceFill &surface_fill : surface_fills) {
+        check_canceled(throw_if_canceled_ptr);
         // Create the filler object.
         std::unique_ptr<Fill> f = std::unique_ptr<Fill>(Fill::new_from_type(surface_fill.params.pattern));
         f->set_bounding_box(bbox);
@@ -1867,6 +2674,12 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 
         // apply half spacing using this flow's own spacing and generate infill
         FillParams params;
+        if (throw_if_canceled_ptr != nullptr) {
+            params.throw_if_canceled = [](void *context) {
+                (*static_cast<const ThrowIfCanceled *>(context))();
+            };
+            params.throw_if_canceled_context = const_cast<ThrowIfCanceled *>(throw_if_canceled_ptr);
+        }
         params.density 		     = float(0.01 * surface_fill.params.density);
         params.multiline         = surface_fill.params.multiline;
 		params.dont_adjust		 = false; //  surface_fill.params.dont_adjust;
@@ -1911,7 +2724,9 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 			params.can_reverse = false;
 
         std::optional<TextureMappingOffsetContext> top_surface_image_context;
-        if (surface_fill.params.texture_mapping_top_surface_image) {
+        if (surface_fill.params.texture_mapping_top_surface_image &&
+            !surface_fill.params.texture_mapping_top_surface_contoning) {
+            check_canceled(throw_if_canceled_ptr);
             const Print *print = this->object()->print();
             const TextureMappingZone *zone = print != nullptr ?
                 print->texture_mapping_manager().zone_from_id(surface_fill.params.texture_mapping_top_surface_zone_id) :
@@ -1941,8 +2756,10 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
         }
 
 		for (ExPolygon& expoly : surface_fill.expolygons) {
+            check_canceled(throw_if_canceled_ptr);
 
       f->no_overlap_expolygons = intersection_ex(surface_fill.no_overlap_expolygons, ExPolygons() = {expoly}, ApplySafetyOffset::Yes);
+            check_canceled(throw_if_canceled_ptr);
             if (params.symmetric_infill_y_axis) {
                 params.symmetric_y_axis = f->extended_object_bounding_box().center().x();
                 expoly.symmetric_y(params.symmetric_y_axis);
@@ -1970,16 +2787,15 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
             // make fill
             ExtrusionEntitiesPtr &fill_entities = m_regions[surface_fill.region_id]->fills.entities;
             if (surface_fill.params.texture_mapping_top_surface_same_layer_partition) {
-                ExtrusionEntityCollection *collection = new ExtrusionEntityCollection();
+                std::unique_ptr<ExtrusionEntityCollection> collection(new ExtrusionEntityCollection());
                 top_surface_image_same_layer_partition_fill(*collection,
                                                             surface_fill.surface,
                                                             surface_fill.params,
-                                                            top_surface_image_context);
+                                                            top_surface_image_context,
+                                                            throw_if_canceled_ptr);
                 if (!collection->empty()) {
-                    apply_top_surface_image_collection_metadata(*collection, surface_fill.params, std::nullopt);
-                    fill_entities.push_back(collection);
-                } else {
-                    delete collection;
+                    apply_top_surface_image_collection_metadata(*collection, surface_fill.params, std::nullopt, throw_if_canceled_ptr);
+                    fill_entities.push_back(collection.release());
                 }
             } else {
                 const size_t fill_entities_before = fill_entities.size();
@@ -1989,7 +2805,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
                 if (surface_fill.params.texture_mapping_top_surface_image) {
                     for (size_t i = fill_entities_before; i < fill_entities.size(); ++i)
                         if (ExtrusionEntityCollection *collection = dynamic_cast<ExtrusionEntityCollection *>(fill_entities[i]))
-                            apply_top_surface_image_collection_metadata(*collection, surface_fill.params, top_surface_image_context);
+                            apply_top_surface_image_collection_metadata(*collection, surface_fill.params, top_surface_image_context, throw_if_canceled_ptr);
                 }
             }
 		}
@@ -2001,6 +2817,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
     // Why the paths are unpacked?
 	for (LayerRegion *layerm : m_regions)
 	    for (const ExtrusionEntity *thin_fill : layerm->thin_fills.entities) {
+            check_canceled(throw_if_canceled_ptr);
 	        ExtrusionEntityCollection &collection = *(new ExtrusionEntityCollection());
             if (const auto *thin_fill_collection = dynamic_cast<const ExtrusionEntityCollection *>(thin_fill)) {
                 collection.texture_mapping_extruder_override = thin_fill_collection->texture_mapping_extruder_override;

@@ -27,6 +27,7 @@
 #include <atomic>
 #include <cmath>
 #include <float.h>
+#include <functional>
 #include <oneapi/tbb/blocked_range.h>
 #include <oneapi/tbb/concurrent_vector.h>
 #include <oneapi/tbb/parallel_for.h>
@@ -832,17 +833,28 @@ void PrintObject::infill()
     this->prepare_infill();
 
     if (this->set_started(posInfill)) {
-        m_print->set_status(35, L("Generating infill toolpath"));
+        const size_t total_layers = m_layers.size();
+        std::atomic<size_t> completed_layers { 0 };
+        auto set_infill_progress = [this, total_layers](size_t completed) {
+            if (total_layers == 0)
+                m_print->set_status(35, L("Generating infill toolpath"));
+            else
+                m_print->set_status(35, Slic3r::format(L("Generating infill toolpath (%1%/%2%)"), completed, total_layers));
+        };
+        set_infill_progress(0);
         const auto& adaptive_fill_octree = this->m_adaptive_fill_octrees.first;
         const auto& support_fill_octree = this->m_adaptive_fill_octrees.second;
+        const std::function<void()> throw_if_canceled = [this]() { m_print->throw_if_canceled(); };
 
         BOOST_LOG_TRIVIAL(debug) << "Filling layers in parallel - start";
         tbb::parallel_for(
             tbb::blocked_range<size_t>(0, m_layers.size()),
-            [this, &adaptive_fill_octree = adaptive_fill_octree, &support_fill_octree = support_fill_octree](const tbb::blocked_range<size_t>& range) {
+            [this, &adaptive_fill_octree = adaptive_fill_octree, &support_fill_octree = support_fill_octree, &throw_if_canceled, &completed_layers, &set_infill_progress](const tbb::blocked_range<size_t>& range) {
                 for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
                     m_print->throw_if_canceled();
-                    m_layers[layer_idx]->make_fills(adaptive_fill_octree.get(), support_fill_octree.get(), this->m_lightning_generator.get());
+                    m_layers[layer_idx]->make_fills(adaptive_fill_octree.get(), support_fill_octree.get(), this->m_lightning_generator.get(), throw_if_canceled);
+                    const size_t completed = completed_layers.fetch_add(1, std::memory_order_relaxed) + 1;
+                    set_infill_progress(completed);
                 }
             }
         );

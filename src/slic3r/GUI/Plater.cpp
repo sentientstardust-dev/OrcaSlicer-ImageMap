@@ -1873,6 +1873,11 @@ public:
                                         float top_surface_image_max_line_width_mm,
                                         int top_surface_image_colored_top_layers,
                                         bool top_surface_image_fixed_coloring_filaments,
+                                        float top_surface_contoning_angle_threshold_deg,
+                                        int top_surface_contoning_stack_layers,
+                                        float top_surface_contoning_min_feature_mm,
+                                        bool top_surface_contoning_color_lower_surfaces,
+                                        bool top_surface_contoning_only_color_surface_infill,
                                         const TextureMappingManager &texture_mapping_zones,
                                         const TextureMappingGlobalSettings &global_settings,
                                         const TextureMappingPrimeTowerImage &prime_tower_image,
@@ -2338,11 +2343,12 @@ public:
         wxArrayString top_surface_method_choices;
         top_surface_method_choices.Add(_L("45 degree width modulation"));
         top_surface_method_choices.Add(_L("Same-layer 45 partition"));
+        top_surface_method_choices.Add(_L("Contoning"));
         m_top_surface_image_method_choice =
             new wxChoice(top_surface_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, top_surface_method_choices);
         m_top_surface_image_method_choice->SetSelection(std::clamp(top_surface_image_printing_method,
                                                                    int(TextureMappingZone::TopSurfaceImageSameAngle45Width),
-                                                                   int(TextureMappingZone::TopSurfaceImageSameLayer45Partition)));
+                                                                   int(TextureMappingZone::TopSurfaceImageContoning)));
         top_surface_method_row->Add(m_top_surface_image_method_choice, 1, wxALIGN_CENTER_VERTICAL);
         top_surface_box->Add(top_surface_method_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
         auto *top_surface_width_row = new wxBoxSizer(wxHORIZONTAL);
@@ -2410,10 +2416,86 @@ public:
                                             0,
                                             wxALIGN_CENTER_VERTICAL);
         top_surface_box->Add(m_top_surface_image_colored_top_layers_panel, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+        m_top_surface_contoning_panel = new wxPanel(top_surface_page, wxID_ANY);
+        auto *top_surface_contoning_root = new wxBoxSizer(wxVERTICAL);
+        m_top_surface_contoning_panel->SetSizer(top_surface_contoning_root);
+        auto *contoning_angle_row = new wxBoxSizer(wxHORIZONTAL);
+        contoning_angle_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Surface angle threshold")),
+                                 0,
+                                 wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                                 gap);
+        m_top_surface_contoning_angle_threshold_spin =
+            new wxSpinCtrlDouble(m_top_surface_contoning_panel,
+                                 wxID_ANY,
+                                 wxEmptyString,
+                                 wxDefaultPosition,
+                                 wxSize(FromDIP(84), -1),
+                                 wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER,
+                                 double(TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg),
+                                 double(TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg),
+                                 std::clamp(double(top_surface_contoning_angle_threshold_deg),
+                                            double(TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg),
+                                            double(TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg)),
+                                 1.0);
+        m_top_surface_contoning_angle_threshold_spin->SetDigits(0);
+        contoning_angle_row->Add(m_top_surface_contoning_angle_threshold_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+        contoning_angle_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("deg")), 0, wxALIGN_CENTER_VERTICAL);
+        top_surface_contoning_root->Add(contoning_angle_row, 0, wxEXPAND | wxBOTTOM, gap);
+        auto *contoning_layers_row = new wxBoxSizer(wxHORIZONTAL);
+        contoning_layers_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Stack layers")),
+                                  0,
+                                  wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                                  gap);
+        m_top_surface_contoning_stack_layers_spin =
+            new wxSpinCtrl(m_top_surface_contoning_panel,
+                           wxID_ANY,
+                           wxEmptyString,
+                           wxDefaultPosition,
+                           wxSize(FromDIP(70), -1),
+                           wxSP_ARROW_KEYS | wxALIGN_RIGHT,
+                           TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                           TextureMappingZone::MaxTopSurfaceContoningStackLayers,
+                           std::clamp(top_surface_contoning_stack_layers,
+                                      TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                                      TextureMappingZone::MaxTopSurfaceContoningStackLayers));
+        contoning_layers_row->Add(m_top_surface_contoning_stack_layers_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+        contoning_layers_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("layers")), 0, wxALIGN_CENTER_VERTICAL);
+        top_surface_contoning_root->Add(contoning_layers_row, 0, wxEXPAND | wxBOTTOM, gap);
+        auto *contoning_feature_row = new wxBoxSizer(wxHORIZONTAL);
+        contoning_feature_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Minimum feature")),
+                                   0,
+                                   wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                                   gap);
+        m_top_surface_contoning_min_feature_spin =
+            new wxSpinCtrlDouble(m_top_surface_contoning_panel,
+                                 wxID_ANY,
+                                 wxEmptyString,
+                                 wxDefaultPosition,
+                                 wxSize(FromDIP(84), -1),
+                                 wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER,
+                                 double(TextureMappingZone::MinTopSurfaceContoningMinFeatureMm),
+                                 double(TextureMappingZone::MaxTopSurfaceContoningMinFeatureMm),
+                                 std::clamp(double(top_surface_contoning_min_feature_mm),
+                                            double(TextureMappingZone::MinTopSurfaceContoningMinFeatureMm),
+                                            double(TextureMappingZone::MaxTopSurfaceContoningMinFeatureMm)),
+                                 0.1);
+        m_top_surface_contoning_min_feature_spin->SetDigits(1);
+        contoning_feature_row->Add(m_top_surface_contoning_min_feature_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+        contoning_feature_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("mm")), 0, wxALIGN_CENTER_VERTICAL);
+        top_surface_contoning_root->Add(contoning_feature_row, 0, wxEXPAND);
+        top_surface_box->Add(m_top_surface_contoning_panel, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
         m_top_surface_image_fixed_coloring_filaments_checkbox =
             new wxCheckBox(top_surface_page, wxID_ANY, _L("Fixed top-surface coloring filaments"));
         m_top_surface_image_fixed_coloring_filaments_checkbox->SetValue(top_surface_image_fixed_coloring_filaments);
-        top_surface_box->Add(m_top_surface_image_fixed_coloring_filaments_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, gap);
+        top_surface_box->Add(m_top_surface_image_fixed_coloring_filaments_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+        m_top_surface_contoning_color_lower_surfaces_checkbox =
+            new wxCheckBox(top_surface_page, wxID_ANY, _L("Also color lower surfaces"));
+        m_top_surface_contoning_color_lower_surfaces_checkbox->SetValue(top_surface_contoning_color_lower_surfaces);
+        top_surface_box->Add(m_top_surface_contoning_color_lower_surfaces_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+        m_top_surface_contoning_only_color_surface_infill_checkbox =
+            new wxCheckBox(top_surface_page, wxID_ANY, _L("Only color surface infill"));
+        m_top_surface_contoning_only_color_surface_infill_checkbox->SetValue(top_surface_contoning_only_color_surface_infill);
+        top_surface_box->Add(m_top_surface_contoning_only_color_surface_infill_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, gap);
         m_top_surface_image_printing_enabled_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
             update_top_surface_image_options_visibility(false);
         });
@@ -2682,7 +2764,7 @@ public:
         return m_top_surface_image_method_choice ?
             std::clamp(m_top_surface_image_method_choice->GetSelection(),
                        int(TextureMappingZone::TopSurfaceImageSameAngle45Width),
-                       int(TextureMappingZone::TopSurfaceImageSameLayer45Partition)) :
+                       int(TextureMappingZone::TopSurfaceImageContoning)) :
             TextureMappingZone::DefaultTopSurfaceImagePrintingMethod;
     }
     float top_surface_image_min_line_width_mm() const
@@ -2720,6 +2802,40 @@ public:
     {
         return m_top_surface_image_fixed_coloring_filaments_checkbox == nullptr ||
                m_top_surface_image_fixed_coloring_filaments_checkbox->GetValue();
+    }
+    float top_surface_contoning_angle_threshold_deg() const
+    {
+        return float(std::clamp(m_top_surface_contoning_angle_threshold_spin != nullptr ?
+                                    m_top_surface_contoning_angle_threshold_spin->GetValue() :
+                                    double(TextureMappingZone::DefaultTopSurfaceContoningAngleThresholdDeg),
+                                double(TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg),
+                                double(TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg)));
+    }
+    int top_surface_contoning_stack_layers() const
+    {
+        return m_top_surface_contoning_stack_layers_spin ?
+            std::clamp(m_top_surface_contoning_stack_layers_spin->GetValue(),
+                       TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                       TextureMappingZone::MaxTopSurfaceContoningStackLayers) :
+            TextureMappingZone::DefaultTopSurfaceContoningStackLayers;
+    }
+    float top_surface_contoning_min_feature_mm() const
+    {
+        return float(std::clamp(m_top_surface_contoning_min_feature_spin != nullptr ?
+                                    m_top_surface_contoning_min_feature_spin->GetValue() :
+                                    double(TextureMappingZone::DefaultTopSurfaceContoningMinFeatureMm),
+                                double(TextureMappingZone::MinTopSurfaceContoningMinFeatureMm),
+                                double(TextureMappingZone::MaxTopSurfaceContoningMinFeatureMm)));
+    }
+    bool top_surface_contoning_color_lower_surfaces() const
+    {
+        return m_top_surface_contoning_color_lower_surfaces_checkbox == nullptr ||
+               m_top_surface_contoning_color_lower_surfaces_checkbox->GetValue();
+    }
+    bool top_surface_contoning_only_color_surface_infill() const
+    {
+        return m_top_surface_contoning_only_color_surface_infill_checkbox != nullptr &&
+               m_top_surface_contoning_only_color_surface_infill_checkbox->GetValue();
     }
     bool minimum_visibility_offset_enabled() const
     {
@@ -3106,6 +3222,15 @@ private:
             m_top_surface_image_min_line_width_spin->Enable(enabled);
         if (m_top_surface_image_max_line_width_spin != nullptr)
             m_top_surface_image_max_line_width_spin->Enable(enabled);
+        const bool contoning =
+            enabled &&
+            m_top_surface_image_method_choice != nullptr &&
+            m_top_surface_image_method_choice->GetSelection() == int(TextureMappingZone::TopSurfaceImageContoning);
+        if (contoning && m_modulation_mode_choice != nullptr) {
+            m_modulation_mode_choice->SetSelection(int(TextureMappingZone::ModulationPerimeterPathV2));
+            m_modulation_mode_manually_changed = true;
+            update_modulation_mode_options_visibility(false);
+        }
         const bool same_layer =
             enabled &&
             m_top_surface_image_method_choice != nullptr &&
@@ -3114,6 +3239,22 @@ private:
             m_top_surface_image_colored_top_layers_panel->Show(same_layer);
         if (m_top_surface_image_colored_top_layers_spin != nullptr)
             m_top_surface_image_colored_top_layers_spin->Enable(same_layer);
+        if (m_top_surface_contoning_panel != nullptr)
+            m_top_surface_contoning_panel->Show(contoning);
+        if (m_top_surface_contoning_angle_threshold_spin != nullptr)
+            m_top_surface_contoning_angle_threshold_spin->Enable(contoning);
+        if (m_top_surface_contoning_stack_layers_spin != nullptr)
+            m_top_surface_contoning_stack_layers_spin->Enable(contoning);
+        if (m_top_surface_contoning_min_feature_spin != nullptr)
+            m_top_surface_contoning_min_feature_spin->Enable(contoning);
+        if (m_top_surface_contoning_color_lower_surfaces_checkbox != nullptr) {
+            m_top_surface_contoning_color_lower_surfaces_checkbox->Show(contoning);
+            m_top_surface_contoning_color_lower_surfaces_checkbox->Enable(contoning);
+        }
+        if (m_top_surface_contoning_only_color_surface_infill_checkbox != nullptr) {
+            m_top_surface_contoning_only_color_surface_infill_checkbox->Show(contoning);
+            m_top_surface_contoning_only_color_surface_infill_checkbox->Enable(contoning);
+        }
         if (m_top_surface_image_fixed_coloring_filaments_checkbox != nullptr)
             m_top_surface_image_fixed_coloring_filaments_checkbox->Enable(enabled);
         layout_current_options_page();
@@ -3165,6 +3306,12 @@ private:
     wxPanel *m_top_surface_image_colored_top_layers_panel {nullptr};
     wxSpinCtrl *m_top_surface_image_colored_top_layers_spin {nullptr};
     wxCheckBox *m_top_surface_image_fixed_coloring_filaments_checkbox {nullptr};
+    wxPanel *m_top_surface_contoning_panel {nullptr};
+    wxSpinCtrlDouble *m_top_surface_contoning_angle_threshold_spin {nullptr};
+    wxSpinCtrl *m_top_surface_contoning_stack_layers_spin {nullptr};
+    wxSpinCtrlDouble *m_top_surface_contoning_min_feature_spin {nullptr};
+    wxCheckBox *m_top_surface_contoning_color_lower_surfaces_checkbox {nullptr};
+    wxCheckBox *m_top_surface_contoning_only_color_surface_infill_checkbox {nullptr};
     wxCheckBox *m_use_legacy_fixed_color_mode_checkbox {nullptr};
     wxCheckBox *m_minimum_visibility_offset_checkbox {nullptr};
     wxSpinCtrl *m_minimum_visibility_offset_spin {nullptr};
@@ -8114,6 +8261,11 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.top_surface_image_max_line_width_mm,
                                                     updated.top_surface_image_colored_top_layers,
                                                     updated.top_surface_image_fixed_coloring_filaments,
+                                                    updated.top_surface_contoning_angle_threshold_deg,
+                                                    updated.top_surface_contoning_stack_layers,
+                                                    updated.top_surface_contoning_min_feature_mm,
+                                                    updated.top_surface_contoning_color_lower_surfaces,
+                                                    updated.top_surface_contoning_only_color_surface_infill,
                                                     bundle->texture_mapping_zones,
                                                     bundle->texture_mapping_global_settings,
                                                     wxGetApp().model().texture_mapping_prime_tower_image,
@@ -8163,6 +8315,16 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.top_surface_image_max_line_width_mm = dlg.top_surface_image_max_line_width_mm();
             updated.top_surface_image_colored_top_layers = dlg.top_surface_image_colored_top_layers();
             updated.top_surface_image_fixed_coloring_filaments = dlg.top_surface_image_fixed_coloring_filaments();
+            updated.top_surface_contoning_angle_threshold_deg = dlg.top_surface_contoning_angle_threshold_deg();
+            updated.top_surface_contoning_stack_layers = dlg.top_surface_contoning_stack_layers();
+            updated.top_surface_contoning_min_feature_mm = dlg.top_surface_contoning_min_feature_mm();
+            updated.top_surface_contoning_color_lower_surfaces = dlg.top_surface_contoning_color_lower_surfaces();
+            updated.top_surface_contoning_only_color_surface_infill = dlg.top_surface_contoning_only_color_surface_infill();
+            if (updated.top_surface_image_printing_enabled &&
+                updated.top_surface_image_printing_method == int(TextureMappingZone::TopSurfaceImageContoning)) {
+                updated.modulation_mode = int(TextureMappingZone::ModulationPerimeterPathV2);
+                updated.modulation_mode_manually_changed = true;
+            }
             if (updated.dithering_enabled)
                 updated.compact_offset_mode = true;
             updated.minimum_visibility_offset_enabled = dlg.minimum_visibility_offset_enabled();
