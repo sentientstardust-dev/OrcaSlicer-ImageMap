@@ -1214,7 +1214,7 @@ TextureMappingZone *TextureMappingManager::add_zone(size_t num_physical,
     zone.apply_default_modulation_mode();
 
     std::vector<unsigned int> ids;
-    for (size_t i = 1; i <= std::min<size_t>(num_physical, 9); ++i)
+    for (size_t i = 1; i <= std::min<size_t>(num_physical, 4); ++i)
         ids.emplace_back(unsigned(i));
     zone.component_ids = encode_component_ids(ids);
     zone.component_a = ids[0];

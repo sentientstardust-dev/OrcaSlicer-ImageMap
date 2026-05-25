@@ -5990,6 +5990,36 @@ static bool projection_image_rect_has_paintable_alpha(const ProjectionPaintableI
     return count > 0;
 }
 
+static bool projection_image_rect_is_fully_paintable_alpha(const ProjectionPaintableImageMask &mask,
+                                                           int                                 min_x,
+                                                           int                                 min_y,
+                                                           int                                 max_x,
+                                                           int                                 max_y)
+{
+    if (mask.width == 0 || mask.height == 0)
+        return false;
+    if (max_x < min_x || max_y < min_y)
+        return false;
+    if (min_x < 0 || min_y < 0 || max_x >= int(mask.width) || max_y >= int(mask.height))
+        return false;
+    if (mask.all_paintable)
+        return true;
+    if (mask.prefix.empty())
+        return false;
+
+    const size_t stride = size_t(mask.width) + 1;
+    const size_t x0 = size_t(min_x);
+    const size_t y0 = size_t(min_y);
+    const size_t x1 = size_t(max_x) + 1;
+    const size_t y1 = size_t(max_y) + 1;
+    const uint32_t count = mask.prefix[y1 * stride + x1] -
+                           mask.prefix[y0 * stride + x1] -
+                           mask.prefix[y1 * stride + x0] +
+                           mask.prefix[y0 * stride + x0];
+    const uint64_t area = uint64_t(max_x - min_x + 1) * uint64_t(max_y - min_y + 1);
+    return uint64_t(count) == area;
+}
+
 static bool projection_triangle_image_pixel_bounds(const ProjectionContext     &context,
                                                    const Transform3d          &world_matrix,
                                                    const std::array<Vec3f, 3> &vertices,
@@ -6046,6 +6076,45 @@ static bool projection_triangle_intersects_paintable_image(const ProjectionConte
                                                      int(std::ceil(max_y)) + 1);
 }
 
+static bool projection_triangle_is_fully_inside_paintable_image(const ProjectionContext            &context,
+                                                                const ProjectionPaintableImageMask &mask,
+                                                                const Transform3d                 &world_matrix,
+                                                                const std::array<Vec3f, 3>        &vertices)
+{
+    if (mask.width == 0 || mask.height == 0)
+        return false;
+
+    float min_x = std::numeric_limits<float>::max();
+    float min_y = std::numeric_limits<float>::max();
+    float max_x = std::numeric_limits<float>::lowest();
+    float max_y = std::numeric_limits<float>::lowest();
+
+    for (const Vec3f &vertex : vertices) {
+        const Vec3d world_point = world_matrix * vertex.cast<double>();
+        if (!projection_world_point_visible_in_section(context, world_point))
+            return false;
+
+        Vec2f screen = Vec2f::Zero();
+        if (!project_point_to_screen(context, world_point, screen))
+            return false;
+
+        Vec2f image_pixel = Vec2f::Zero();
+        if (!projection_screen_to_image_pixel(context, screen, image_pixel, true))
+            return false;
+
+        min_x = std::min(min_x, image_pixel.x());
+        min_y = std::min(min_y, image_pixel.y());
+        max_x = std::max(max_x, image_pixel.x());
+        max_y = std::max(max_y, image_pixel.y());
+    }
+
+    return projection_image_rect_is_fully_paintable_alpha(mask,
+                                                          int(std::floor(min_x)) - 1,
+                                                          int(std::floor(min_y)) - 1,
+                                                          int(std::ceil(max_x)) + 1,
+                                                          int(std::ceil(max_y)) + 1);
+}
+
 static bool projection_triangle_has_visible_sample(const ProjectionVisibility &visibility,
                                                    const ProjectionContext    &context,
                                                    const Transform3d         &world_matrix,
@@ -6088,6 +6157,73 @@ static bool projection_triangle_has_visible_sample(const ProjectionVisibility &v
     return false;
 }
 
+static bool projection_screen_triangle_is_fully_visible(const ProjectionVisibility   &visibility,
+                                                        const std::array<Vec2f, 3>  &screen,
+                                                        const std::array<float, 3>  &depths,
+                                                        uint64_t                     triangle_key)
+{
+    if (!projection_visibility_valid(visibility))
+        return true;
+
+    const float min_screen_x = std::min({ screen[0].x(), screen[1].x(), screen[2].x() });
+    const float max_screen_x = std::max({ screen[0].x(), screen[1].x(), screen[2].x() });
+    const float min_screen_y = std::min({ screen[0].y(), screen[1].y(), screen[2].y() });
+    const float max_screen_y = std::max({ screen[0].y(), screen[1].y(), screen[2].y() });
+    const float visibility_right = visibility.left + float(visibility.width) / visibility.scale;
+    const float visibility_bottom = visibility.top + float(visibility.height) / visibility.scale;
+    if (max_screen_x < visibility.left ||
+        min_screen_x > visibility_right ||
+        max_screen_y < visibility.top ||
+        min_screen_y > visibility_bottom)
+        return false;
+
+    const int min_x = std::clamp(int(std::floor((min_screen_x - visibility.left) * visibility.scale)) - 1, 0, visibility.width - 1);
+    const int max_x = std::clamp(int(std::ceil((max_screen_x - visibility.left) * visibility.scale)) + 1, 0, visibility.width - 1);
+    const int min_y = std::clamp(int(std::floor((min_screen_y - visibility.top) * visibility.scale)) - 1, 0, visibility.height - 1);
+    const int max_y = std::clamp(int(std::ceil((max_screen_y - visibility.top) * visibility.scale)) + 1, 0, visibility.height - 1);
+
+    bool covered = false;
+    for (int y = min_y; y <= max_y; ++y) {
+        for (int x = min_x; x <= max_x; ++x) {
+            const Vec2f pixel(visibility.left + (float(x) + 0.5f) / visibility.scale,
+                              visibility.top + (float(y) + 0.5f) / visibility.scale);
+            Vec3f weights = Vec3f::Zero();
+            if (!conservative_barycentric_weights_2d(pixel, screen[0], screen[1], screen[2], 0.f, weights))
+                continue;
+
+            covered = true;
+            const float depth = depths[0] * weights.x() + depths[1] * weights.y() + depths[2] * weights.z();
+            if (!projection_visibility_depth_matches_sample(visibility, x, y, depth, triangle_key))
+                return false;
+        }
+    }
+
+    return covered;
+}
+
+static bool projection_triangle_is_fully_visible(const ProjectionVisibility &visibility,
+                                                 const ProjectionContext    &context,
+                                                 const Transform3d         &world_matrix,
+                                                 const std::array<Vec3f, 3> &vertices,
+                                                 uint64_t                   triangle_key)
+{
+    if (!projection_visibility_valid(visibility))
+        return true;
+
+    const std::vector<Vec3d> polygon = projection_visible_world_polygon(context, world_matrix, vertices);
+    if (polygon.size() != 3)
+        return false;
+
+    std::array<Vec2f, 3> screen;
+    std::array<float, 3> depths;
+    for (size_t idx = 0; idx < polygon.size(); ++idx) {
+        if (!project_point_to_depth_clipped_screen(context, polygon[idx], screen[idx], &depths[idx]))
+            return false;
+    }
+
+    return projection_screen_triangle_is_fully_visible(visibility, screen, depths, triangle_key);
+}
+
 static bool projection_triangle_should_project(const ProjectionContext            &context,
                                                const ProjectionVisibility         &visibility,
                                                const ProjectionPaintableImageMask &paintable_mask,
@@ -6098,6 +6234,23 @@ static bool projection_triangle_should_project(const ProjectionContext          
     return projection_triangle_intersects_overlay(context, world_matrix, vertices) &&
            projection_triangle_intersects_paintable_image(context, paintable_mask, world_matrix, vertices) &&
            projection_triangle_has_visible_sample(visibility, context, world_matrix, vertices, triangle_key);
+}
+
+static bool projection_region_triangle_is_fully_projected(const ProjectionContext            &context,
+                                                          const ProjectionVisibility         &visibility,
+                                                          const ProjectionPaintableImageMask &paintable_mask,
+                                                          const Transform3d                 &world_matrix,
+                                                          const std::array<Vec3f, 3>        &vertices,
+                                                          uint64_t                           triangle_key,
+                                                          bool                               pass_through_model)
+{
+    if (!projection_triangle_is_fully_inside_paintable_image(context, paintable_mask, world_matrix, vertices))
+        return false;
+    if (pass_through_model)
+        return true;
+    if (projection_section_view_active(context))
+        return false;
+    return projection_triangle_is_fully_visible(visibility, context, world_matrix, vertices, triangle_key);
 }
 
 struct ProjectionRegionStateSource
@@ -6505,8 +6658,10 @@ static bool project_texture_mapping_zone_to_regions(ModelObject             &obj
         const Matrix3d world_normal_matrix = world_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
         const std::vector<Vec3d> vertex_normals = projection_smoothed_vertex_normals(its);
         std::vector<bool> projected_triangles(its.indices.size(), false);
+        std::vector<bool> fully_projected_triangles(its.indices.size(), false);
         std::vector<int> projected_triangle_depths(its.indices.size(), 0);
         size_t projected_triangle_count = 0;
+        size_t fully_projected_triangle_count = 0;
 
         for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
             if (check_cancel)
@@ -6538,6 +6693,16 @@ static bool project_texture_mapping_zone_to_regions(ModelObject             &obj
                 texture_mapping_depth_from_span(projection_triangle_overlay_image_pixel_span(context, world_matrix, vertices),
                                                 projection_target_span,
                                                 7);
+            if (projection_region_triangle_is_fully_projected(context,
+                                                              visibility,
+                                                              paintable_mask,
+                                                              world_matrix,
+                                                              vertices,
+                                                              projection_visibility_triangle_key(volume_idx, tri_idx),
+                                                              pass_through_model)) {
+                fully_projected_triangles[tri_idx] = true;
+                ++fully_projected_triangle_count;
+            }
             ++projected_triangle_count;
         }
 
@@ -6547,11 +6712,17 @@ static bool project_texture_mapping_zone_to_regions(ModelObject             &obj
         }
 
         const TriangleSelector::TriangleSplittingData &old_data = volume->mmu_segmentation_facets.get_data();
-        const std::vector<int> existing_depths = projection_region_existing_source_triangle_depths(old_data, its.indices.size());
-        const std::vector<int> rgb_depths =
-            rgb_existing_source_triangle_depths(volume->texture_mapping_color_facets.get_data(), its.indices.size());
-        const ProjectionRegionStateSource state_source = build_projection_region_state_source(*volume);
-        const int projected_safe_max_depth = texture_mapping_depth_for_budget(projected_triangle_count, 7, 2200000);
+        const size_t sampled_projected_triangle_count = projected_triangle_count - fully_projected_triangle_count;
+        std::vector<int> existing_depths;
+        std::vector<int> rgb_depths;
+        ProjectionRegionStateSource state_source;
+        int projected_safe_max_depth = 0;
+        if (sampled_projected_triangle_count > 0) {
+            existing_depths = projection_region_existing_source_triangle_depths(old_data, its.indices.size());
+            rgb_depths = rgb_existing_source_triangle_depths(volume->texture_mapping_color_facets.get_data(), its.indices.size());
+            state_source = build_projection_region_state_source(*volume);
+            projected_safe_max_depth = texture_mapping_depth_for_budget(sampled_projected_triangle_count, 7, 2200000);
+        }
 
         TriangleSelector::TriangleSplittingData new_data;
         new_data.triangles_to_split.reserve(std::max(old_data.triangles_to_split.size(), projected_triangle_count));
@@ -6611,6 +6782,12 @@ static bool project_texture_mapping_zone_to_regions(ModelObject             &obj
 
             if (tri_idx >= projected_triangles.size() || !projected_triangles[tri_idx]) {
                 projection_region_append_preserved_triangle(old_data, new_data, tri_idx);
+                continue;
+            }
+
+            if (tri_idx < fully_projected_triangles.size() && fully_projected_triangles[tri_idx]) {
+                new_data.triangles_to_split.emplace_back(int(tri_idx), int(new_data.bitstream.size()));
+                projection_region_append_leaf(new_data, texture_mapping_filament_id);
                 continue;
             }
 

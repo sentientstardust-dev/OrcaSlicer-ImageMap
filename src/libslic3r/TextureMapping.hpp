@@ -128,7 +128,7 @@ struct TextureMappingZone
     static constexpr int   DefaultOffsetFadeMode = int(OffsetFadeNone);
     static constexpr int   DefaultOffsetAngleMode = int(OffsetAngleObjectCenter);
     static constexpr int   DefaultTextureMappingMode = int(TextureMappingFilamentBlending);
-    static constexpr int   DefaultFilamentColorMode = int(FilamentColorCMYK);
+    static constexpr int   DefaultFilamentColorMode = int(FilamentColorAny);
     static constexpr bool  DefaultForceSequentialFilaments = false;
     static constexpr bool  DefaultReduceOuterSurfaceTexture = false;
     static constexpr bool  DefaultSeamHiding = false;
