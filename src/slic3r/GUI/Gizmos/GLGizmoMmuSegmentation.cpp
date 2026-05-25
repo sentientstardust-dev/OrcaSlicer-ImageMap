@@ -938,6 +938,16 @@ static float triangle_max_edge_length(const std::array<Vec3f, 3> &vertices)
                       (vertices[0] - vertices[2]).norm() });
 }
 
+static float transformed_triangle_max_edge_length(const Transform3d &matrix, const std::array<Vec3f, 3> &vertices)
+{
+    const std::array<Vec3f, 3> transformed_vertices = {
+        (matrix * vertices[0].cast<double>()).cast<float>(),
+        (matrix * vertices[1].cast<double>()).cast<float>(),
+        (matrix * vertices[2].cast<double>()).cast<float>()
+    };
+    return triangle_max_edge_length(transformed_vertices);
+}
+
 static float mesh_max_axis_span(const indexed_triangle_set &its)
 {
     if (its.vertices.empty())
@@ -981,6 +991,7 @@ static constexpr float TRUE_COLOR_BRUSH_SUBDIVISION_FRACTION = 1.f / 8.f;
 static constexpr float TRUE_COLOR_BRUSH_MIN_SUBDIVISION_EDGE_MM = 0.1f;
 static constexpr float IMAGE_PROJECTION_RGB_TARGET_TRIANGLE_IMAGE_FRACTION = 1.f / 128.f;
 static constexpr float IMAGE_PROJECTION_RGB_MIN_TARGET_TRIANGLE_IMAGE_PX = 2.f;
+static constexpr float IMAGE_PROJECTION_REGION_TARGET_EDGE_MM = 0.5f;
 
 static float true_color_brush_subdivision_target(float brush_radius)
 {
@@ -6519,6 +6530,7 @@ static std::array<std::array<Vec3f, 3>, 4> projection_region_split_triangle(cons
 }
 
 using ProjectionRegionStateSampler = std::function<unsigned int(size_t, const Vec3f &, const Vec3f &)>;
+using ProjectionRegionTrianglePredicate = std::function<bool(const std::array<Vec3f, 3> &)>;
 
 static bool projection_region_append_sampled_triangle(TriangleSelector::TriangleSplittingData &data,
                                                       const ProjectionRegionStateSampler      &sampler,
@@ -6526,8 +6538,15 @@ static bool projection_region_append_sampled_triangle(TriangleSelector::Triangle
                                                       const std::array<Vec3f, 3>              &vertices,
                                                       const std::array<Vec3f, 3>              &barycentrics,
                                                       int                                      depth,
-                                                      int                                      target_depth)
+                                                      int                                      target_depth,
+                                                      const ProjectionRegionTrianglePredicate &fully_projected = {},
+                                                      unsigned int                             fully_projected_state = 0)
 {
+    if (depth > 0 && fully_projected && fully_projected(vertices)) {
+        projection_region_append_leaf(data, fully_projected_state);
+        return fully_projected_state != 0;
+    }
+
     if (depth < target_depth) {
         projection_region_append_nibble(data.bitstream, 3u);
         const std::array<std::array<Vec3f, 3>, 4> child_vertices = projection_region_split_triangle(vertices);
@@ -6540,7 +6559,9 @@ static bool projection_region_append_sampled_triangle(TriangleSelector::Triangle
                                                                            child_vertices[size_t(child_idx)],
                                                                            child_barycentrics[size_t(child_idx)],
                                                                            depth + 1,
-                                                                           target_depth);
+                                                                           target_depth,
+                                                                           fully_projected,
+                                                                           fully_projected_state);
         return has_painted_state;
     }
 
@@ -6808,6 +6829,27 @@ static bool project_texture_mapping_zone_to_regions(ModelObject             &obj
             if (tri_idx < rgb_depths.size())
                 target_depth = std::max(target_depth, rgb_depths[tri_idx]);
             target_depth = std::clamp(target_depth, 0, 7);
+            target_depth = std::min(target_depth,
+                                    texture_mapping_depth_from_span(transformed_triangle_max_edge_length(world_matrix, vertices),
+                                                                    IMAGE_PROJECTION_REGION_TARGET_EDGE_MM,
+                                                                    7));
+
+            const ProjectionRegionTrianglePredicate fully_projected_subtriangle =
+                [&context,
+                 &world_matrix,
+                 pass_through_model,
+                 volume_idx,
+                 tri_idx,
+                 &visibility,
+                 &paintable_mask](const std::array<Vec3f, 3> &sub_vertices) {
+                return projection_region_triangle_is_fully_projected(context,
+                                                                     visibility,
+                                                                     paintable_mask,
+                                                                     world_matrix,
+                                                                     sub_vertices,
+                                                                     projection_visibility_triangle_key(volume_idx, tri_idx),
+                                                                     pass_through_model);
+            };
 
             const size_t bitstream_start = new_data.bitstream.size();
             new_data.triangles_to_split.emplace_back(int(tri_idx), int(bitstream_start));
@@ -6817,7 +6859,9 @@ static bool project_texture_mapping_zone_to_regions(ModelObject             &obj
                                                            vertices,
                                                            root_barycentrics,
                                                            0,
-                                                           target_depth)) {
+                                                           target_depth,
+                                                           fully_projected_subtriangle,
+                                                           texture_mapping_filament_id)) {
                 new_data.triangles_to_split.pop_back();
                 new_data.bitstream.resize(bitstream_start);
             }
@@ -13123,6 +13167,7 @@ void GLGizmoMmuSegmentation::update_model_object()
         const ModelObjectPtrs &mos = wxGetApp().model().objects;
         size_t obj_idx = std::find(mos.begin(), mos.end(), mo) - mos.begin();
         wxGetApp().obj_list()->update_info_items(obj_idx);
+        wxGetApp().sidebar().update_texture_mapping_panel(false);
         wxGetApp().plater()->get_partplate_list().notify_instance_update(obj_idx, 0);
         m_parent.post_event(SimpleEvent(EVT_GLCANVAS_SCHEDULE_BACKGROUND_PROCESS));
     }
@@ -18536,6 +18581,7 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object,
 void GLGizmoImageProjection::refresh_projected_object(ModelObject *object)
 {
     m_parent.update_volumes_colors_by_extruder();
+    wxGetApp().sidebar().update_texture_mapping_panel(false);
     m_parent.set_as_dirty();
     m_parent.request_extra_frame();
 
@@ -18901,6 +18947,7 @@ void GLGizmoMmuSegmentation::remap_filament_assignments()
         wxGetApp().plater()->get_notification_manager()->push_notification(
             _L("Filament remapping finished.").ToStdString());
         update_model_object();
+        wxGetApp().sidebar().update_texture_mapping_panel(false);
         m_parent.set_as_dirty();
     }
 }

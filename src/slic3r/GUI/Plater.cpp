@@ -1146,6 +1146,32 @@ private:
     bool                      m_radial_gradient { false };
 };
 
+class TextureMappingUsageDot : public wxPanel
+{
+public:
+    explicit TextureMappingUsageDot(wxWindow *parent)
+        : wxPanel(parent, wxID_ANY, wxDefaultPosition, from_dip_for_parent(parent, wxSize(10, 10)), wxBORDER_NONE)
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetMinSize(wxSize(FromDIP(10), FromDIP(10)));
+        SetMaxSize(wxSize(FromDIP(10), FromDIP(10)));
+        Bind(wxEVT_PAINT, &TextureMappingUsageDot::on_paint, this);
+    }
+
+private:
+    void on_paint(wxPaintEvent &)
+    {
+        wxAutoBufferedPaintDC dc(this);
+        dc.SetBackground(wxBrush(GetBackgroundColour()));
+        dc.Clear();
+        const wxSize size = GetClientSize();
+        const int radius = std::max(2, std::min(size.x, size.y) / 2 - FromDIP(1));
+        dc.SetPen(*wxTRANSPARENT_PEN);
+        dc.SetBrush(wxBrush(wxColour(0, 122, 255)));
+        dc.DrawCircle(wxPoint(size.x / 2, size.y / 2), radius);
+    }
+};
+
 class LinearGradientStopsBar : public wxPanel
 {
 public:
@@ -7282,6 +7308,36 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         return object_idxs;
     };
 
+    const std::set<unsigned int> selected_texture_mapping_zone_ids = [this, &selected_texture_mapping_object_idxs, mgr_ptr]() {
+        std::set<unsigned int> zone_ids;
+        if (p->plater == nullptr || mgr_ptr == nullptr)
+            return zone_ids;
+        const Model &model = p->plater->model();
+        auto add_zone_id = [&zone_ids, mgr_ptr](int filament_id) {
+            if (filament_id > 0 && mgr_ptr->is_texture_mapping_zone_id(unsigned(filament_id)))
+                zone_ids.insert(unsigned(filament_id));
+        };
+        for (const size_t obj_idx : selected_texture_mapping_object_idxs()) {
+            if (obj_idx >= model.objects.size() || model.objects[obj_idx] == nullptr)
+                continue;
+            const ModelObject *object = model.objects[obj_idx];
+            if (const ConfigOption *opt = object->config.option("extruder"); opt != nullptr)
+                add_zone_id(opt->getInt());
+            for (const ModelVolume *volume : object->volumes) {
+                if (volume == nullptr || !volume->is_model_part())
+                    continue;
+                add_zone_id(volume->extruder_id());
+                if (volume->mmu_segmentation_facets.empty())
+                    continue;
+                const std::vector<bool> &used_states = volume->mmu_segmentation_facets.get_data().used_states;
+                for (size_t state_idx = 1; state_idx < used_states.size(); ++state_idx)
+                    if (used_states[state_idx])
+                        add_zone_id(int(state_idx));
+            }
+        }
+        return zone_ids;
+    }();
+
     auto texture_mapping_zone_affects_scene = [print_cfg](unsigned int zone_id) {
         const Plater *plater = wxGetApp().plater();
         return plater != nullptr && model_uses_texture_mapping_zone_id(plater->model(), print_cfg, zone_id);
@@ -7317,13 +7373,29 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         swatch->set_data(parse_texture_mapping_color(entry.display_color), zone_id);
         header_sizer->Add(swatch, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, gap);
 
-        auto *title = new wxStaticText(header, wxID_ANY, _L("Texture Mapping"));
-        title->SetForegroundColour(text_fg);
-        header_sizer->Add(title, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, gap);
+        auto *label_panel = new wxPanel(header, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE);
+        label_panel->SetBackgroundColour(row_bg);
+        auto *label_sizer = new wxBoxSizer(wxHORIZONTAL);
+        label_panel->SetSizer(label_sizer);
 
-        auto *summary = new wxStaticText(header, wxID_ANY, texture_mapping_summary(entry, num_physical));
+        auto *title = new wxStaticText(label_panel, wxID_ANY, _L("Texture Mapping"));
+        title->SetForegroundColour(text_fg);
+        label_sizer->Add(title, 0, wxALIGN_CENTER_VERTICAL);
+
+        auto *summary = new wxStaticText(label_panel, wxID_ANY, texture_mapping_summary(entry, num_physical));
         summary->SetForegroundColour(summary_fg);
-        header_sizer->Add(summary, 1, wxALIGN_CENTER_VERTICAL | wxLEFT, gap);
+        label_sizer->Add(summary, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, gap);
+
+        TextureMappingUsageDot *usage_dot = nullptr;
+        if (selected_texture_mapping_zone_ids.count(zone_id) != 0) {
+            usage_dot = new TextureMappingUsageDot(label_panel);
+            usage_dot->SetBackgroundColour(row_bg);
+            usage_dot->SetToolTip(_L("Used by selected objects"));
+            label_sizer->Add(usage_dot, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, std::max(FromDIP(2), gap / 2));
+        }
+
+        label_sizer->AddStretchSpacer();
+        header_sizer->Add(label_panel, 1, wxALIGN_CENTER_VERTICAL | wxLEFT, gap);
 
         auto *menu_btn = new ScalableButton(header, wxID_ANY, "menu_filament");
         menu_btn->SetToolTip(_L("Texture map actions"));
@@ -8437,7 +8509,9 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             win->Bind(wxEVT_LEFT_UP, [toggle_editor](wxMouseEvent &) { toggle_editor(); });
         };
         bind_toggle(header);
+        bind_toggle(label_panel);
         bind_toggle(title);
+        bind_toggle(usage_dot);
         bind_toggle(summary);
         bind_toggle(swatch);
         bind_toggle(preview);
@@ -8484,8 +8558,10 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                     const unsigned int zone_id = rows[zone_index].zone_id;
                     if (zone_id == 0 || obj_list() == nullptr)
                         return;
-                    if (obj_list()->assign_extruder_to_objects(object_idxs, int(zone_id), evt.GetId() == assign_selected_objects_erase_id))
+                    if (obj_list()->assign_extruder_to_objects(object_idxs, int(zone_id), evt.GetId() == assign_selected_objects_erase_id)) {
                         refresh_texture_mapping_preview();
+                        CallAfter([this]() { update_texture_mapping_panel(false); });
+                    }
                     return;
                 }
                 if (evt.GetId() == duplicate_id) {
@@ -12184,6 +12260,9 @@ void Plater::priv::selection_changed()
     } else {
         view3D->render();
     }
+
+    if (sidebar != nullptr)
+        sidebar->update_texture_mapping_panel(false);
 }
 
 void Plater::priv::object_list_changed()
@@ -12210,6 +12289,8 @@ void Plater::priv::select_curr_plate_all()
 {
     view3D->select_curr_plate_all();
     this->sidebar->obj_list()->update_selections();
+    if (sidebar != nullptr)
+        sidebar->update_texture_mapping_panel(false);
 }
 
 void Plater::priv::remove_curr_plate_all()
@@ -12223,6 +12304,8 @@ void Plater::priv::select_all()
 {
     view3D->select_all();
     this->sidebar->obj_list()->update_selections();
+    if (sidebar != nullptr)
+        sidebar->update_texture_mapping_panel(false);
 }
 
 void Plater::priv::deselect_all()
@@ -16622,6 +16705,8 @@ void Plater::priv::update_after_undo_redo(const UndoRedo::Snapshot& snapshot, bo
         this->view3D->get_canvas3d()->get_gizmos_manager().update_after_undo_redo(snapshot);
 
     wxGetApp().obj_list()->update_after_undo_redo();
+    if (sidebar != nullptr)
+        sidebar->update_texture_mapping_panel(false);
 
     if (wxGetApp().get_mode() == comSimple && model_has_advanced_features(this->model)) {
         // If the user jumped to a snapshot that require user interface with advanced features, switch to the advanced mode without asking.
