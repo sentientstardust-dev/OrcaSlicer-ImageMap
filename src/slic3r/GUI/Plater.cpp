@@ -2341,8 +2341,8 @@ public:
                                     wxALIGN_CENTER_VERTICAL | wxRIGHT,
                                     gap);
         wxArrayString top_surface_method_choices;
-        top_surface_method_choices.Add(_L("45 degree width modulation"));
-        top_surface_method_choices.Add(_L("Same-layer 45 partition"));
+        top_surface_method_choices.Add(_L("45 degree width modulation - not recommended"));
+        top_surface_method_choices.Add(_L("Same-layer 45 partition - not recommended"));
         top_surface_method_choices.Add(_L("Contoning"));
         m_top_surface_image_method_choice =
             new wxChoice(top_surface_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, top_surface_method_choices);
@@ -2800,6 +2800,8 @@ public:
     }
     bool top_surface_image_fixed_coloring_filaments() const
     {
+        if (top_surface_image_printing_method() == int(TextureMappingZone::TopSurfaceImageContoning))
+            return true;
         return m_top_surface_image_fixed_coloring_filaments_checkbox == nullptr ||
                m_top_surface_image_fixed_coloring_filaments_checkbox->GetValue();
     }
@@ -2834,8 +2836,9 @@ public:
     }
     bool top_surface_contoning_only_color_surface_infill() const
     {
-        return m_top_surface_contoning_only_color_surface_infill_checkbox != nullptr &&
-               m_top_surface_contoning_only_color_surface_infill_checkbox->GetValue();
+        return m_top_surface_contoning_only_color_surface_infill_checkbox != nullptr ?
+            m_top_surface_contoning_only_color_surface_infill_checkbox->GetValue() :
+            TextureMappingZone::DefaultTopSurfaceContoningOnlyColorSurfaceInfill;
     }
     bool minimum_visibility_offset_enabled() const
     {
@@ -3222,10 +3225,10 @@ private:
             m_top_surface_image_min_line_width_spin->Enable(enabled);
         if (m_top_surface_image_max_line_width_spin != nullptr)
             m_top_surface_image_max_line_width_spin->Enable(enabled);
-        const bool contoning =
-            enabled &&
+        const bool contoning_selected =
             m_top_surface_image_method_choice != nullptr &&
             m_top_surface_image_method_choice->GetSelection() == int(TextureMappingZone::TopSurfaceImageContoning);
+        const bool contoning = enabled && contoning_selected;
         if (contoning && m_modulation_mode_choice != nullptr) {
             m_modulation_mode_choice->SetSelection(int(TextureMappingZone::ModulationPerimeterPathV2));
             m_modulation_mode_manually_changed = true;
@@ -3255,8 +3258,10 @@ private:
             m_top_surface_contoning_only_color_surface_infill_checkbox->Show(contoning);
             m_top_surface_contoning_only_color_surface_infill_checkbox->Enable(contoning);
         }
-        if (m_top_surface_image_fixed_coloring_filaments_checkbox != nullptr)
-            m_top_surface_image_fixed_coloring_filaments_checkbox->Enable(enabled);
+        if (m_top_surface_image_fixed_coloring_filaments_checkbox != nullptr) {
+            m_top_surface_image_fixed_coloring_filaments_checkbox->Show(!contoning_selected);
+            m_top_surface_image_fixed_coloring_filaments_checkbox->Enable(enabled && !contoning_selected);
+        }
         layout_current_options_page();
         if (!fit_dialog)
             return;
