@@ -113,6 +113,14 @@ unsigned int LayerTools::extruder(const ExtrusionEntityCollection &extrusions, c
         (this->num_physical_filaments == 0 || unsigned(extrusions.texture_mapping_extruder_override) < this->num_physical_filaments))
         return unsigned(extrusions.texture_mapping_extruder_override);
 
+    if (extrusions.texture_mapping_top_surface_image &&
+        !extrusions.texture_mapping_top_surface_fixed_coloring &&
+        extrusions.texture_mapping_top_surface_desired_component_id > 0) {
+        const unsigned int desired = extrusions.texture_mapping_top_surface_desired_component_id - 1;
+        if (this->has_extruder(desired))
+            return desired;
+    }
+
 	assert(region.config().wall_filament.value > 0);
 	assert(region.config().sparse_infill_filament.value > 0);
 	assert(region.config().solid_infill_filament.value > 0);
@@ -214,6 +222,19 @@ static FilamentChangeStats calc_filament_change_info_by_toolorder(const PrintCon
 
 static void apply_first_layer_order(const DynamicPrintConfig* config, std::vector<unsigned int>& tool_order);
 
+static void apply_top_surface_no_fixed_carry(LayerTools &lt, unsigned int last_extruder_id)
+{
+    if (last_extruder_id == 0 || lt.extruders.empty())
+        return;
+    if (std::find(lt.extruders.begin(), lt.extruders.end(), last_extruder_id) != lt.extruders.end())
+        return;
+    for (unsigned int desired : lt.top_surface_image_no_fixed_desired_extruders)
+        if (desired == last_extruder_id) {
+            lt.extruders.insert(lt.extruders.begin(), desired);
+            return;
+        }
+}
+
 void ToolOrdering::handle_dontcare_extruder(const std::vector<unsigned int>& tool_order_layer0)
 {
     if(m_layer_tools.empty() || tool_order_layer0.empty())
@@ -267,6 +288,7 @@ void ToolOrdering::handle_dontcare_extruder(const std::vector<unsigned int>& too
                     break;
                 }
         }
+        apply_top_surface_no_fixed_carry(lt, last_extruder_id);
         last_extruder_id = lt.extruders.back();
     }
 
@@ -311,7 +333,8 @@ void ToolOrdering::handle_dontcare_extruder(unsigned int last_extruder_id)
         ++ last_extruder_id;
     }
 
-    for (LayerTools &lt : m_layer_tools) {
+    for (size_t layer_idx = 0; layer_idx < m_layer_tools.size(); ++layer_idx) {
+        LayerTools &lt = m_layer_tools[layer_idx];
         if (lt.extruders.empty())
             continue;
         if (lt.extruders.size() == 1 && lt.extruders.front() == 0)
@@ -345,6 +368,8 @@ void ToolOrdering::handle_dontcare_extruder(unsigned int last_extruder_id)
             }
 
         }
+        if (layer_idx > 0)
+            apply_top_surface_no_fixed_carry(lt, last_extruder_id);
         last_extruder_id = lt.extruders.back();
     }
 
@@ -847,6 +872,13 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
                     has_texture_override_fill = true;
                     continue;
                 }
+                if (fill->texture_mapping_top_surface_image &&
+                    !fill->texture_mapping_top_surface_fixed_coloring &&
+                    fill->texture_mapping_top_surface_desired_component_id >= 1 &&
+                    (layer_tools.num_physical_filaments == 0 ||
+                     fill->texture_mapping_top_surface_desired_component_id <= layer_tools.num_physical_filaments))
+                    layer_tools.top_surface_image_no_fixed_desired_extruders.emplace_back(
+                        fill->texture_mapping_top_surface_desired_component_id);
                 ExtrusionRole role = fill->entities.empty() ? erNone : fill->entities.front()->role();
                 if (is_solid_infill(role))
                     has_solid_infill = true;
@@ -933,6 +965,7 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
         sort_remove_duplicates(layer.extruders);
         sort_remove_duplicates(layer.texture_mapping_extruders);
         sort_remove_duplicates(layer.texture_mapping_component_extruders);
+        sort_remove_duplicates(layer.top_surface_image_no_fixed_desired_extruders);
 
         // make sure that there are some tools for each object layer (e.g. tall wiping object will result in empty extruders vector)
         if (layer.extruders.empty() && layer.has_object)

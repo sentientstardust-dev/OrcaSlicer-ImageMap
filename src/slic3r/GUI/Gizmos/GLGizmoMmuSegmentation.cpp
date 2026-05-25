@@ -16,6 +16,7 @@
 #include "slic3r/GUI/Tab.hpp"
 #include "slic3r/GUI/3DScene.hpp"
 #include "slic3r/GUI/MMUPaintedTexturePreview.hpp"
+#include "slic3r/GUI/Jobs/Worker.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/Model.hpp"
@@ -79,6 +80,7 @@ constexpr int ColorAutoPaintKMeansIterations = 12;
 constexpr float ProjectionTextRasterBaseFontSize = 200.f;
 constexpr int ProjectionTextRasterMaxDimension = 2048;
 constexpr int ProjectionTextRasterMinFontSize = 18;
+constexpr uint32_t ProjectionImageRasterMaxDimension = 2048;
 constexpr double ProjectionSliderDoubleClickMaxSeconds = 0.24;
 
 static bool queue_color_data_crash_backup(ModelObject *object)
@@ -936,6 +938,16 @@ static float triangle_max_edge_length(const std::array<Vec3f, 3> &vertices)
                       (vertices[0] - vertices[2]).norm() });
 }
 
+static float transformed_triangle_max_edge_length(const Transform3d &matrix, const std::array<Vec3f, 3> &vertices)
+{
+    const std::array<Vec3f, 3> transformed_vertices = {
+        (matrix * vertices[0].cast<double>()).cast<float>(),
+        (matrix * vertices[1].cast<double>()).cast<float>(),
+        (matrix * vertices[2].cast<double>()).cast<float>()
+    };
+    return triangle_max_edge_length(transformed_vertices);
+}
+
 static float mesh_max_axis_span(const indexed_triangle_set &its)
 {
     if (its.vertices.empty())
@@ -979,6 +991,7 @@ static constexpr float TRUE_COLOR_BRUSH_SUBDIVISION_FRACTION = 1.f / 8.f;
 static constexpr float TRUE_COLOR_BRUSH_MIN_SUBDIVISION_EDGE_MM = 0.1f;
 static constexpr float IMAGE_PROJECTION_RGB_TARGET_TRIANGLE_IMAGE_FRACTION = 1.f / 128.f;
 static constexpr float IMAGE_PROJECTION_RGB_MIN_TARGET_TRIANGLE_IMAGE_PX = 2.f;
+static constexpr float IMAGE_PROJECTION_REGION_TARGET_EDGE_MM = 0.5f;
 
 static float true_color_brush_subdivision_target(float brush_radius)
 {
@@ -1521,11 +1534,35 @@ static std::optional<ColorRGBA> configured_texture_mapping_background_color_for_
     return std::nullopt;
 }
 
+static thread_local bool image_projection_worker_result_active = false;
+
+struct ImageProjectionWorkerResultScope
+{
+    bool previous = false;
+
+    explicit ImageProjectionWorkerResultScope(bool active)
+        : previous(image_projection_worker_result_active)
+    {
+        image_projection_worker_result_active = active;
+    }
+
+    ~ImageProjectionWorkerResultScope()
+    {
+        image_projection_worker_result_active = previous;
+    }
+};
+
+static bool image_projection_should_refresh_ids()
+{
+    return !image_projection_worker_result_active;
+}
+
 static void refresh_imported_texture_storage(ModelVolume &volume)
 {
     std::vector<uint8_t> refreshed(volume.imported_texture_rgba.begin(), volume.imported_texture_rgba.end());
     volume.imported_texture_rgba.swap(refreshed);
-    volume.imported_texture_rgba.set_new_unique_id();
+    if (image_projection_should_refresh_ids())
+        volume.imported_texture_rgba.set_new_unique_id();
 }
 
 static void refresh_imported_texture_raw_storage(ModelVolume &volume)
@@ -1533,11 +1570,14 @@ static void refresh_imported_texture_raw_storage(ModelVolume &volume)
     std::vector<uint8_t> refreshed(volume.imported_texture_raw_filament_offsets.begin(),
                                    volume.imported_texture_raw_filament_offsets.end());
     volume.imported_texture_raw_filament_offsets.swap(refreshed);
-    volume.imported_texture_raw_filament_offsets.set_new_unique_id();
+    if (image_projection_should_refresh_ids())
+        volume.imported_texture_raw_filament_offsets.set_new_unique_id();
 }
 
 static void touch_imported_texture_data(ModelVolume &volume)
 {
+    if (!image_projection_should_refresh_ids())
+        return;
     volume.imported_texture_uvs_per_face.set_new_unique_id();
     volume.imported_texture_uv_valid.set_new_unique_id();
     volume.imported_texture_rgba.set_new_unique_id();
@@ -1553,7 +1593,7 @@ static void clear_imported_texture_raw_atlas(ModelVolume &volume)
     volume.imported_texture_raw_filament_offsets.clear();
     volume.imported_texture_raw_channels = 0;
     volume.imported_texture_raw_metadata_json.clear();
-    if (changed)
+    if (changed && image_projection_should_refresh_ids())
         volume.imported_texture_raw_filament_offsets.set_new_unique_id();
 }
 
@@ -1982,7 +2022,7 @@ static bool merge_imported_texture_raw_atlas(ModelVolume &volume, const RawAtlas
     volume.imported_texture_raw_channels = merged_channels;
     volume.imported_texture_raw_metadata_json = metadata;
     volume.imported_texture_raw_filament_offsets = std::move(merged);
-    if (changed)
+    if (changed && image_projection_should_refresh_ids())
         volume.imported_texture_raw_filament_offsets.set_new_unique_id();
     return changed;
 }
@@ -3009,6 +3049,87 @@ struct ProjectionContext
     float                        overlay_rotation_deg = 0.f;
     bool                         apply_transparency_as_background = false;
     ClippingPlane                section_clipping_plane;
+    std::vector<Transform3d>     volume_world_matrices;
+};
+
+struct GLGizmoImageProjection::ProjectionInput
+{
+    ProjectionMode               mode = ProjectionMode::RGBData;
+    ProjectionContext            context;
+    std::vector<uint8_t>         image_rgba;
+    std::vector<ColorRGBA>       volume_base_colors;
+    std::vector<unsigned int>    image_texture_zone_ids;
+    int                          instance_idx = 0;
+    bool                         pass_through_model = false;
+    bool                         raw_atlas_valid = false;
+    ImageMapRawFilamentOffsetAtlas raw_atlas;
+    bool                         convert_existing_colors_to_raw_offsets = true;
+    bool                         project_regions = false;
+    bool                         erase_region_painting = true;
+    bool                         text_mode = false;
+    int                          raw_projection_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
+};
+
+using ImageProjectionProgressFn = std::function<void(int)>;
+using ImageProjectionCancelCheckFn = std::function<void()>;
+
+class ImageProjectionCanceledException : public std::exception
+{
+};
+
+struct ImageProjectionProgressCounter
+{
+    ImageProjectionProgressFn fn;
+    size_t completed = 0;
+    size_t total = 0;
+    int last_percent = -1;
+
+    ImageProjectionProgressCounter(const ImageProjectionProgressFn &progress_fn, size_t total_units)
+        : fn(progress_fn), total(total_units)
+    {
+        report();
+    }
+
+    void set_completed(size_t value)
+    {
+        completed = total == 0 ? value : std::min(value, total);
+        report();
+    }
+
+    void step(size_t value = 1)
+    {
+        set_completed(completed + value);
+    }
+
+    void finish()
+    {
+        set_completed(total);
+    }
+
+    void report()
+    {
+        if (!fn)
+            return;
+        const int percent = total == 0 ?
+            100 :
+            int((uint64_t(completed) * 100u) / uint64_t(total));
+        if (percent != last_percent) {
+            last_percent = percent;
+            fn(std::clamp(percent, 0, 100));
+        }
+    }
+};
+
+struct ImageProjectionProgressStep
+{
+    ImageProjectionProgressCounter *counter = nullptr;
+
+    explicit ImageProjectionProgressStep(ImageProjectionProgressCounter &counter) : counter(&counter) {}
+    ~ImageProjectionProgressStep()
+    {
+        if (counter != nullptr)
+            counter->step();
+    }
 };
 
 struct ProjectionScreenBounds
@@ -3480,6 +3601,86 @@ static std::string resized_raw_texture_metadata_json(const std::string& metadata
     return root.dump();
 }
 
+static bool projection_resized_image_dimensions(uint32_t width,
+                                                uint32_t height,
+                                                uint32_t max_dimension,
+                                                uint32_t &resized_width,
+                                                uint32_t &resized_height)
+{
+    resized_width = width;
+    resized_height = height;
+    const uint32_t max_axis = std::max(width, height);
+    if (width == 0 || height == 0 || max_dimension == 0 || max_axis <= max_dimension)
+        return false;
+
+    const double scale = double(max_dimension) / double(max_axis);
+    resized_width = std::max<uint32_t>(1, uint32_t(std::llround(double(width) * scale)));
+    resized_height = std::max<uint32_t>(1, uint32_t(std::llround(double(height) * scale)));
+    if (width >= height)
+        resized_width = max_dimension;
+    if (height >= width)
+        resized_height = max_dimension;
+    return resized_width != width || resized_height != height;
+}
+
+static bool resize_projection_rgba_to_max_dimension(std::vector<uint8_t> &rgba,
+                                                    uint32_t             &width,
+                                                    uint32_t             &height,
+                                                    uint32_t              max_dimension)
+{
+    uint32_t resized_width = width;
+    uint32_t resized_height = height;
+    if (!projection_resized_image_dimensions(width, height, max_dimension, resized_width, resized_height))
+        return true;
+
+    std::vector<uint8_t> resized = resize_rgba_texture_bilinear(rgba, width, height, resized_width, resized_height);
+    if (resized.empty())
+        return false;
+    rgba = std::move(resized);
+    width = resized_width;
+    height = resized_height;
+    return true;
+}
+
+static bool resize_projection_raw_atlas_to_max_dimension(ImageMapRawFilamentOffsetAtlas &atlas, uint32_t max_dimension)
+{
+    uint32_t resized_width = atlas.width;
+    uint32_t resized_height = atlas.height;
+    if (!projection_resized_image_dimensions(atlas.width, atlas.height, max_dimension, resized_width, resized_height))
+        return true;
+    if (!atlas.valid())
+        return false;
+
+    std::vector<uint8_t> resized_offsets = resize_raw_offsets_bilinear(atlas.offsets,
+                                                                       atlas.width,
+                                                                       atlas.height,
+                                                                       atlas.channels,
+                                                                       resized_width,
+                                                                       resized_height);
+    if (resized_offsets.empty())
+        return false;
+
+    std::vector<uint8_t> resized_mask;
+    if (!atlas.mask.empty()) {
+        resized_mask = resize_raw_offsets_bilinear(atlas.mask,
+                                                   atlas.width,
+                                                   atlas.height,
+                                                   1,
+                                                   resized_width,
+                                                   resized_height);
+        if (resized_mask.empty())
+            return false;
+    }
+
+    atlas.width = resized_width;
+    atlas.height = resized_height;
+    atlas.offsets = std::move(resized_offsets);
+    if (!resized_mask.empty())
+        atlas.mask = std::move(resized_mask);
+    atlas.metadata_json = resized_raw_texture_metadata_json(atlas.metadata_json, atlas.width, atlas.height, atlas.channels);
+    return true;
+}
+
 static bool resize_volume_image_texture(ModelVolume& volume, uint32_t resized_width, uint32_t resized_height)
 {
     if (!model_volume_has_imported_image_texture_data(&volume) || resized_width == 0 || resized_height == 0)
@@ -3616,6 +3817,49 @@ static bool wx_image_to_rgba(const wxImage &image, std::vector<uint8_t> &rgba, u
                 (alpha == nullptr ? 255 : alpha[idx]);
     }
     return true;
+}
+
+static bool wx_image_looks_like_raw_filament_offset_atlas(const wxImage &image)
+{
+    constexpr const char *magic = "imagemap_raw_filament_offset";
+    constexpr size_t magic_size = 28;
+    if (!image.IsOk() || image.GetWidth() <= 0 || image.GetHeight() <= 0)
+        return false;
+    if (size_t(image.GetWidth()) * size_t(image.GetHeight()) < magic_size * 8)
+        return false;
+
+    const unsigned char *rgb = image.GetData();
+    if (rgb == nullptr)
+        return false;
+
+    for (size_t byte_idx = 0; byte_idx < magic_size; ++byte_idx) {
+        uint8_t value = 0;
+        for (size_t bit_idx = 0; bit_idx < 8; ++bit_idx) {
+            const size_t pixel_idx = byte_idx * 8 + bit_idx;
+            const size_t rgb_idx = pixel_idx * 3;
+            const unsigned int average = (unsigned(rgb[rgb_idx + 0]) + unsigned(rgb[rgb_idx + 1]) + unsigned(rgb[rgb_idx + 2])) / 3u;
+            value = uint8_t((value << 1) | (average >= 128u ? 1u : 0u));
+        }
+        if (value != uint8_t(magic[byte_idx]))
+            return false;
+    }
+    return true;
+}
+
+static bool resize_wx_projection_image_to_max_dimension(wxImage &image, uint32_t max_dimension)
+{
+    if (!image.IsOk() || image.GetWidth() <= 0 || image.GetHeight() <= 0)
+        return false;
+
+    uint32_t width = uint32_t(image.GetWidth());
+    uint32_t height = uint32_t(image.GetHeight());
+    uint32_t resized_width = width;
+    uint32_t resized_height = height;
+    if (!projection_resized_image_dimensions(width, height, max_dimension, resized_width, resized_height))
+        return true;
+
+    image.Rescale(int(resized_width), int(resized_height), wxIMAGE_QUALITY_HIGH);
+    return image.IsOk() && image.GetWidth() == int(resized_width) && image.GetHeight() == int(resized_height);
 }
 
 static std::vector<std::string> projection_text_font_names()
@@ -4893,6 +5137,13 @@ static ColorRGBA projection_base_color_for_volume(const ModelVolume &volume)
     return ColorRGBA(0.15f, 0.65f, 0.6f, 1.f);
 }
 
+static ColorRGBA projection_base_color_for_input_volume(const std::vector<ColorRGBA> &base_colors,
+                                                        size_t                       volume_idx,
+                                                        const ModelVolume           &volume)
+{
+    return volume_idx < base_colors.size() ? base_colors[volume_idx] : projection_base_color_for_volume(volume);
+}
+
 static constexpr uint32_t GENERATED_IMAGE_TEXTURE_SIZE = 4096;
 static constexpr int GENERATED_IMAGE_TEXTURE_UV_MAP_VERSION = 1;
 
@@ -4990,13 +5241,16 @@ static bool make_generated_image_texture_island(const indexed_triangle_set &its,
 static bool pack_generated_image_texture_islands(std::vector<GeneratedImageTextureIsland> &islands,
                                                  uint32_t                                  texture_size,
                                                  int                                       padding_px,
-                                                 float                                     scale)
+                                                 float                                     scale,
+                                                 const ImageProjectionCancelCheckFn        &check_cancel = {})
 {
     if (islands.empty() || texture_size == 0 || !std::isfinite(scale) || scale <= 0.f)
         return false;
 
     const int atlas_size = int(texture_size);
     for (GeneratedImageTextureIsland &island : islands) {
+        if (check_cancel)
+            check_cancel();
         const int content_width = std::max(1, int(std::ceil(island.width * scale))) + 1;
         const int content_height = std::max(1, int(std::ceil(island.height * scale))) + 1;
         island.rect_width = content_width + padding_px * 2;
@@ -5022,6 +5276,8 @@ static bool pack_generated_image_texture_islands(std::vector<GeneratedImageTextu
     int y = 0;
     int row_height = 0;
     for (const size_t island_idx : order) {
+        if (check_cancel)
+            check_cancel();
         GeneratedImageTextureIsland &island = islands[island_idx];
         if (x + island.rect_width > atlas_size) {
             y += row_height;
@@ -5039,14 +5295,19 @@ static bool pack_generated_image_texture_islands(std::vector<GeneratedImageTextu
     return true;
 }
 
-static bool pack_generated_image_texture_atlas(GeneratedImageTextureAtlas &atlas, uint32_t texture_size)
+static bool pack_generated_image_texture_atlas(GeneratedImageTextureAtlas &atlas,
+                                               uint32_t                    texture_size,
+                                               const ImageProjectionCancelCheckFn &check_cancel = {})
 {
     if (atlas.islands.empty())
         return false;
 
     float max_dimension = 0.f;
-    for (const GeneratedImageTextureIsland &island : atlas.islands)
+    for (const GeneratedImageTextureIsland &island : atlas.islands) {
+        if (check_cancel)
+            check_cancel();
         max_dimension = std::max({ max_dimension, island.width, island.height });
+    }
     if (!std::isfinite(max_dimension) || max_dimension <= EPSILON)
         return false;
 
@@ -5065,8 +5326,10 @@ static bool pack_generated_image_texture_atlas(GeneratedImageTextureAtlas &atlas
         float best_scale = 0.f;
         float upper = high;
         for (int attempt = 0; attempt < 12; ++attempt) {
+            if (check_cancel)
+                check_cancel();
             std::vector<GeneratedImageTextureIsland> candidate = atlas.islands;
-            if (pack_generated_image_texture_islands(candidate, texture_size, padding_px, high)) {
+            if (pack_generated_image_texture_islands(candidate, texture_size, padding_px, high, check_cancel)) {
                 found = true;
                 best = std::move(candidate);
                 best_scale = high;
@@ -5081,9 +5344,11 @@ static bool pack_generated_image_texture_atlas(GeneratedImageTextureAtlas &atlas
         float low = best_scale;
         high = upper;
         for (int iter = 0; iter < 24; ++iter) {
+            if (check_cancel)
+                check_cancel();
             const float mid = (low + high) * 0.5f;
             std::vector<GeneratedImageTextureIsland> candidate = atlas.islands;
-            if (pack_generated_image_texture_islands(candidate, texture_size, padding_px, mid)) {
+            if (pack_generated_image_texture_islands(candidate, texture_size, padding_px, mid, check_cancel)) {
                 low = mid;
                 best = std::move(candidate);
                 best_scale = mid;
@@ -5108,7 +5373,8 @@ static bool pack_generated_image_texture_atlas(GeneratedImageTextureAtlas &atlas
 static bool initialize_generated_image_texture(ModelVolume                &volume,
                                                const ColorRGBA            &background,
                                                GeneratedImageTextureAtlas *atlas_out,
-                                               const Transform3d          *metric_matrix = nullptr)
+                                               const Transform3d          *metric_matrix = nullptr,
+                                               const ImageProjectionCancelCheckFn &check_cancel = {})
 {
     const indexed_triangle_set &its = volume.mesh().its;
     if (its.vertices.empty() || its.indices.empty())
@@ -5118,11 +5384,13 @@ static bool initialize_generated_image_texture(ModelVolume                &volum
     atlas.island_by_triangle.assign(its.indices.size(), -1);
     atlas.islands.reserve(its.indices.size());
     for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+        if (check_cancel)
+            check_cancel();
         GeneratedImageTextureIsland island;
         if (make_generated_image_texture_island(its, tri_idx, metric_matrix, island))
             atlas.islands.emplace_back(island);
     }
-    if (!pack_generated_image_texture_atlas(atlas, GENERATED_IMAGE_TEXTURE_SIZE))
+    if (!pack_generated_image_texture_atlas(atlas, GENERATED_IMAGE_TEXTURE_SIZE, check_cancel))
         return false;
 
     const uint8_t r = uint8_t(std::clamp(background.r(), 0.f, 1.f) * 255.f + 0.5f);
@@ -5136,6 +5404,8 @@ static bool initialize_generated_image_texture(ModelVolume                &volum
     volume.uv_map_generator_version = GENERATED_IMAGE_TEXTURE_UV_MAP_VERSION;
     clear_imported_texture_raw_atlas(volume);
     for (size_t idx = 0; idx < size_t(GENERATED_IMAGE_TEXTURE_SIZE) * size_t(GENERATED_IMAGE_TEXTURE_SIZE); ++idx) {
+        if ((idx & 16383u) == 0u && check_cancel)
+            check_cancel();
         volume.imported_texture_rgba[idx * 4 + 0] = r;
         volume.imported_texture_rgba[idx * 4 + 1] = g;
         volume.imported_texture_rgba[idx * 4 + 2] = b;
@@ -5146,6 +5416,8 @@ static bool initialize_generated_image_texture(ModelVolume                &volum
 
     const float texture_size = float(GENERATED_IMAGE_TEXTURE_SIZE);
     for (const GeneratedImageTextureIsland &island : atlas.islands) {
+        if (check_cancel)
+            check_cancel();
         if (island.tri_idx >= its.indices.size())
             continue;
         volume.imported_texture_uv_valid[island.tri_idx] = 1;
@@ -5254,6 +5526,18 @@ static Transform3d projection_world_matrix_for_volume(const GLCanvas3D &parent,
     if (parent.get_canvas_type() == GLCanvas3D::CanvasAssembleView)
         return instance->get_assemble_transformation().get_matrix() * volume->get_matrix();
     return instance->get_transformation().get_matrix() * volume->get_matrix();
+}
+
+static Transform3d projection_world_matrix_for_context(const ProjectionContext &context,
+                                                       const GLCanvas3D       &parent,
+                                                       const ModelObject      *object,
+                                                       const ModelVolume      *volume,
+                                                       size_t                  volume_idx,
+                                                       int                     instance_idx)
+{
+    if (volume_idx < context.volume_world_matrices.size())
+        return context.volume_world_matrices[volume_idx];
+    return projection_world_matrix_for_volume(parent, object, volume, instance_idx);
 }
 
 static std::vector<Vec3d> projection_smoothed_vertex_normals(const indexed_triangle_set &its)
@@ -5469,7 +5753,8 @@ static bool projection_visibility_depth_matches_sample(const ProjectionVisibilit
 static ProjectionVisibility build_projection_visibility(const ProjectionContext &context,
                                                         const GLCanvas3D       &parent,
                                                         const ModelObject      *object,
-                                                        int                     instance_idx)
+                                                        int                     instance_idx,
+                                                        const ImageProjectionCancelCheckFn &check_cancel = {})
 {
     ProjectionVisibility visibility;
     if (object == nullptr || context.overlay_width <= 0.f || context.overlay_height <= 0.f)
@@ -5490,7 +5775,7 @@ static ProjectionVisibility build_projection_visibility(const ProjectionContext 
     visibility.depth.assign(size_t(visibility.width) * size_t(visibility.height), std::numeric_limits<float>::max());
     visibility.triangle_keys.assign(visibility.depth.size(), PROJECTION_VISIBILITY_INVALID_TRIANGLE_KEY);
 
-    auto rasterize_triangle = [&visibility](const std::array<Vec2f, 3> &screen, const std::array<float, 3> &depths, uint64_t triangle_key) {
+    auto rasterize_triangle = [&visibility, &check_cancel](const std::array<Vec2f, 3> &screen, const std::array<float, 3> &depths, uint64_t triangle_key) {
         const float min_screen_x = std::min({ screen[0].x(), screen[1].x(), screen[2].x() });
         const float max_screen_x = std::max({ screen[0].x(), screen[1].x(), screen[2].x() });
         const float min_screen_y = std::min({ screen[0].y(), screen[1].y(), screen[2].y() });
@@ -5501,6 +5786,8 @@ static ProjectionVisibility build_projection_visibility(const ProjectionContext 
         const int max_y = std::clamp(int(std::ceil((max_screen_y - visibility.top) * visibility.scale)) + 1, 0, visibility.height - 1);
 
         for (int y = min_y; y <= max_y; ++y) {
+            if (check_cancel)
+                check_cancel();
             for (int x = min_x; x <= max_x; ++x) {
                 const Vec2f pixel(visibility.left + (float(x) + 0.5f) / visibility.scale,
                                   visibility.top + (float(y) + 0.5f) / visibility.scale);
@@ -5532,8 +5819,10 @@ static ProjectionVisibility build_projection_visibility(const ProjectionContext 
         if (its.vertices.empty() || its.indices.empty())
             continue;
 
-        const Transform3d world_matrix = projection_world_matrix_for_volume(parent, object, volume, instance_idx);
+        const Transform3d world_matrix = projection_world_matrix_for_context(context, parent, object, volume, volume_idx, instance_idx);
         for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+            if (check_cancel)
+                check_cancel();
             const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
             if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
                 continue;
@@ -5712,6 +6001,36 @@ static bool projection_image_rect_has_paintable_alpha(const ProjectionPaintableI
     return count > 0;
 }
 
+static bool projection_image_rect_is_fully_paintable_alpha(const ProjectionPaintableImageMask &mask,
+                                                           int                                 min_x,
+                                                           int                                 min_y,
+                                                           int                                 max_x,
+                                                           int                                 max_y)
+{
+    if (mask.width == 0 || mask.height == 0)
+        return false;
+    if (max_x < min_x || max_y < min_y)
+        return false;
+    if (min_x < 0 || min_y < 0 || max_x >= int(mask.width) || max_y >= int(mask.height))
+        return false;
+    if (mask.all_paintable)
+        return true;
+    if (mask.prefix.empty())
+        return false;
+
+    const size_t stride = size_t(mask.width) + 1;
+    const size_t x0 = size_t(min_x);
+    const size_t y0 = size_t(min_y);
+    const size_t x1 = size_t(max_x) + 1;
+    const size_t y1 = size_t(max_y) + 1;
+    const uint32_t count = mask.prefix[y1 * stride + x1] -
+                           mask.prefix[y0 * stride + x1] -
+                           mask.prefix[y1 * stride + x0] +
+                           mask.prefix[y0 * stride + x0];
+    const uint64_t area = uint64_t(max_x - min_x + 1) * uint64_t(max_y - min_y + 1);
+    return uint64_t(count) == area;
+}
+
 static bool projection_triangle_image_pixel_bounds(const ProjectionContext     &context,
                                                    const Transform3d          &world_matrix,
                                                    const std::array<Vec3f, 3> &vertices,
@@ -5768,6 +6087,45 @@ static bool projection_triangle_intersects_paintable_image(const ProjectionConte
                                                      int(std::ceil(max_y)) + 1);
 }
 
+static bool projection_triangle_is_fully_inside_paintable_image(const ProjectionContext            &context,
+                                                                const ProjectionPaintableImageMask &mask,
+                                                                const Transform3d                 &world_matrix,
+                                                                const std::array<Vec3f, 3>        &vertices)
+{
+    if (mask.width == 0 || mask.height == 0)
+        return false;
+
+    float min_x = std::numeric_limits<float>::max();
+    float min_y = std::numeric_limits<float>::max();
+    float max_x = std::numeric_limits<float>::lowest();
+    float max_y = std::numeric_limits<float>::lowest();
+
+    for (const Vec3f &vertex : vertices) {
+        const Vec3d world_point = world_matrix * vertex.cast<double>();
+        if (!projection_world_point_visible_in_section(context, world_point))
+            return false;
+
+        Vec2f screen = Vec2f::Zero();
+        if (!project_point_to_screen(context, world_point, screen))
+            return false;
+
+        Vec2f image_pixel = Vec2f::Zero();
+        if (!projection_screen_to_image_pixel(context, screen, image_pixel, true))
+            return false;
+
+        min_x = std::min(min_x, image_pixel.x());
+        min_y = std::min(min_y, image_pixel.y());
+        max_x = std::max(max_x, image_pixel.x());
+        max_y = std::max(max_y, image_pixel.y());
+    }
+
+    return projection_image_rect_is_fully_paintable_alpha(mask,
+                                                          int(std::floor(min_x)) - 1,
+                                                          int(std::floor(min_y)) - 1,
+                                                          int(std::ceil(max_x)) + 1,
+                                                          int(std::ceil(max_y)) + 1);
+}
+
 static bool projection_triangle_has_visible_sample(const ProjectionVisibility &visibility,
                                                    const ProjectionContext    &context,
                                                    const Transform3d         &world_matrix,
@@ -5810,6 +6168,73 @@ static bool projection_triangle_has_visible_sample(const ProjectionVisibility &v
     return false;
 }
 
+static bool projection_screen_triangle_is_fully_visible(const ProjectionVisibility   &visibility,
+                                                        const std::array<Vec2f, 3>  &screen,
+                                                        const std::array<float, 3>  &depths,
+                                                        uint64_t                     triangle_key)
+{
+    if (!projection_visibility_valid(visibility))
+        return true;
+
+    const float min_screen_x = std::min({ screen[0].x(), screen[1].x(), screen[2].x() });
+    const float max_screen_x = std::max({ screen[0].x(), screen[1].x(), screen[2].x() });
+    const float min_screen_y = std::min({ screen[0].y(), screen[1].y(), screen[2].y() });
+    const float max_screen_y = std::max({ screen[0].y(), screen[1].y(), screen[2].y() });
+    const float visibility_right = visibility.left + float(visibility.width) / visibility.scale;
+    const float visibility_bottom = visibility.top + float(visibility.height) / visibility.scale;
+    if (max_screen_x < visibility.left ||
+        min_screen_x > visibility_right ||
+        max_screen_y < visibility.top ||
+        min_screen_y > visibility_bottom)
+        return false;
+
+    const int min_x = std::clamp(int(std::floor((min_screen_x - visibility.left) * visibility.scale)) - 1, 0, visibility.width - 1);
+    const int max_x = std::clamp(int(std::ceil((max_screen_x - visibility.left) * visibility.scale)) + 1, 0, visibility.width - 1);
+    const int min_y = std::clamp(int(std::floor((min_screen_y - visibility.top) * visibility.scale)) - 1, 0, visibility.height - 1);
+    const int max_y = std::clamp(int(std::ceil((max_screen_y - visibility.top) * visibility.scale)) + 1, 0, visibility.height - 1);
+
+    bool covered = false;
+    for (int y = min_y; y <= max_y; ++y) {
+        for (int x = min_x; x <= max_x; ++x) {
+            const Vec2f pixel(visibility.left + (float(x) + 0.5f) / visibility.scale,
+                              visibility.top + (float(y) + 0.5f) / visibility.scale);
+            Vec3f weights = Vec3f::Zero();
+            if (!conservative_barycentric_weights_2d(pixel, screen[0], screen[1], screen[2], 0.f, weights))
+                continue;
+
+            covered = true;
+            const float depth = depths[0] * weights.x() + depths[1] * weights.y() + depths[2] * weights.z();
+            if (!projection_visibility_depth_matches_sample(visibility, x, y, depth, triangle_key))
+                return false;
+        }
+    }
+
+    return covered;
+}
+
+static bool projection_triangle_is_fully_visible(const ProjectionVisibility &visibility,
+                                                 const ProjectionContext    &context,
+                                                 const Transform3d         &world_matrix,
+                                                 const std::array<Vec3f, 3> &vertices,
+                                                 uint64_t                   triangle_key)
+{
+    if (!projection_visibility_valid(visibility))
+        return true;
+
+    const std::vector<Vec3d> polygon = projection_visible_world_polygon(context, world_matrix, vertices);
+    if (polygon.size() != 3)
+        return false;
+
+    std::array<Vec2f, 3> screen;
+    std::array<float, 3> depths;
+    for (size_t idx = 0; idx < polygon.size(); ++idx) {
+        if (!project_point_to_depth_clipped_screen(context, polygon[idx], screen[idx], &depths[idx]))
+            return false;
+    }
+
+    return projection_screen_triangle_is_fully_visible(visibility, screen, depths, triangle_key);
+}
+
 static bool projection_triangle_should_project(const ProjectionContext            &context,
                                                const ProjectionVisibility         &visibility,
                                                const ProjectionPaintableImageMask &paintable_mask,
@@ -5820,6 +6245,23 @@ static bool projection_triangle_should_project(const ProjectionContext          
     return projection_triangle_intersects_overlay(context, world_matrix, vertices) &&
            projection_triangle_intersects_paintable_image(context, paintable_mask, world_matrix, vertices) &&
            projection_triangle_has_visible_sample(visibility, context, world_matrix, vertices, triangle_key);
+}
+
+static bool projection_region_triangle_is_fully_projected(const ProjectionContext            &context,
+                                                          const ProjectionVisibility         &visibility,
+                                                          const ProjectionPaintableImageMask &paintable_mask,
+                                                          const Transform3d                 &world_matrix,
+                                                          const std::array<Vec3f, 3>        &vertices,
+                                                          uint64_t                           triangle_key,
+                                                          bool                               pass_through_model)
+{
+    if (!projection_triangle_is_fully_inside_paintable_image(context, paintable_mask, world_matrix, vertices))
+        return false;
+    if (pass_through_model)
+        return true;
+    if (projection_section_view_active(context))
+        return false;
+    return projection_triangle_is_fully_visible(visibility, context, world_matrix, vertices, triangle_key);
 }
 
 struct ProjectionRegionStateSource
@@ -6088,6 +6530,7 @@ static std::array<std::array<Vec3f, 3>, 4> projection_region_split_triangle(cons
 }
 
 using ProjectionRegionStateSampler = std::function<unsigned int(size_t, const Vec3f &, const Vec3f &)>;
+using ProjectionRegionTrianglePredicate = std::function<bool(const std::array<Vec3f, 3> &)>;
 
 static bool projection_region_append_sampled_triangle(TriangleSelector::TriangleSplittingData &data,
                                                       const ProjectionRegionStateSampler      &sampler,
@@ -6095,8 +6538,15 @@ static bool projection_region_append_sampled_triangle(TriangleSelector::Triangle
                                                       const std::array<Vec3f, 3>              &vertices,
                                                       const std::array<Vec3f, 3>              &barycentrics,
                                                       int                                      depth,
-                                                      int                                      target_depth)
+                                                      int                                      target_depth,
+                                                      const ProjectionRegionTrianglePredicate &fully_projected = {},
+                                                      unsigned int                             fully_projected_state = 0)
 {
+    if (depth > 0 && fully_projected && fully_projected(vertices)) {
+        projection_region_append_leaf(data, fully_projected_state);
+        return fully_projected_state != 0;
+    }
+
     if (depth < target_depth) {
         projection_region_append_nibble(data.bitstream, 3u);
         const std::array<std::array<Vec3f, 3>, 4> child_vertices = projection_region_split_triangle(vertices);
@@ -6109,7 +6559,9 @@ static bool projection_region_append_sampled_triangle(TriangleSelector::Triangle
                                                                            child_vertices[size_t(child_idx)],
                                                                            child_barycentrics[size_t(child_idx)],
                                                                            depth + 1,
-                                                                           target_depth);
+                                                                           target_depth,
+                                                                           fully_projected,
+                                                                           fully_projected_state);
         return has_painted_state;
     }
 
@@ -6184,22 +6636,29 @@ static int generic_solver_mix_model_for_projection_object(const ModelObject *obj
     return TextureMappingZone::DefaultGenericSolverMixModel;
 }
 
+static size_t image_projection_model_part_triangle_count(const ModelObject &object);
+
 static bool project_texture_mapping_zone_to_regions(ModelObject             &object,
                                                     const GLCanvas3D       &parent,
                                                     const ProjectionContext &context,
                                                     int                      instance_idx,
                                                     bool                     pass_through_model,
-                                                    unsigned int             texture_mapping_filament_id)
+                                                    unsigned int             texture_mapping_filament_id,
+                                                    const ImageProjectionProgressFn &progress_fn = {},
+                                                    const ImageProjectionCancelCheckFn &check_cancel = {})
 {
     if (texture_mapping_filament_id == 0)
         return false;
 
+    if (check_cancel)
+        check_cancel();
     const ProjectionVisibility visibility = pass_through_model ?
         ProjectionVisibility() :
-        build_projection_visibility(context, parent, &object, instance_idx);
+        build_projection_visibility(context, parent, &object, instance_idx, check_cancel);
     const ProjectionPaintableImageMask paintable_mask = build_projection_paintable_image_mask(context);
     const float projection_target_span = image_projection_rgb_target_triangle_pixel_span(context);
     bool changed = false;
+    ImageProjectionProgressCounter progress(progress_fn, image_projection_model_part_triangle_count(object) * 2);
 
     const std::array<Vec3f, 3> root_barycentrics = {
         Vec3f(1.f, 0.f, 0.f),
@@ -6216,14 +6675,19 @@ static bool project_texture_mapping_zone_to_regions(ModelObject             &obj
         if (its.vertices.empty() || its.indices.empty())
             continue;
 
-        const Transform3d world_matrix = projection_world_matrix_for_volume(parent, &object, volume, instance_idx);
+        const Transform3d world_matrix = projection_world_matrix_for_context(context, parent, &object, volume, volume_idx, instance_idx);
         const Matrix3d world_normal_matrix = world_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
         const std::vector<Vec3d> vertex_normals = projection_smoothed_vertex_normals(its);
         std::vector<bool> projected_triangles(its.indices.size(), false);
+        std::vector<bool> fully_projected_triangles(its.indices.size(), false);
         std::vector<int> projected_triangle_depths(its.indices.size(), 0);
         size_t projected_triangle_count = 0;
+        size_t fully_projected_triangle_count = 0;
 
         for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+            if (check_cancel)
+                check_cancel();
+            ImageProjectionProgressStep progress_step(progress);
             const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
             if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
                 continue;
@@ -6250,18 +6714,36 @@ static bool project_texture_mapping_zone_to_regions(ModelObject             &obj
                 texture_mapping_depth_from_span(projection_triangle_overlay_image_pixel_span(context, world_matrix, vertices),
                                                 projection_target_span,
                                                 7);
+            if (projection_region_triangle_is_fully_projected(context,
+                                                              visibility,
+                                                              paintable_mask,
+                                                              world_matrix,
+                                                              vertices,
+                                                              projection_visibility_triangle_key(volume_idx, tri_idx),
+                                                              pass_through_model)) {
+                fully_projected_triangles[tri_idx] = true;
+                ++fully_projected_triangle_count;
+            }
             ++projected_triangle_count;
         }
 
-        if (projected_triangle_count == 0)
+        if (projected_triangle_count == 0) {
+            progress.step(its.indices.size());
             continue;
+        }
 
         const TriangleSelector::TriangleSplittingData &old_data = volume->mmu_segmentation_facets.get_data();
-        const std::vector<int> existing_depths = projection_region_existing_source_triangle_depths(old_data, its.indices.size());
-        const std::vector<int> rgb_depths =
-            rgb_existing_source_triangle_depths(volume->texture_mapping_color_facets.get_data(), its.indices.size());
-        const ProjectionRegionStateSource state_source = build_projection_region_state_source(*volume);
-        const int projected_safe_max_depth = texture_mapping_depth_for_budget(projected_triangle_count, 7, 2200000);
+        const size_t sampled_projected_triangle_count = projected_triangle_count - fully_projected_triangle_count;
+        std::vector<int> existing_depths;
+        std::vector<int> rgb_depths;
+        ProjectionRegionStateSource state_source;
+        int projected_safe_max_depth = 0;
+        if (sampled_projected_triangle_count > 0) {
+            existing_depths = projection_region_existing_source_triangle_depths(old_data, its.indices.size());
+            rgb_depths = rgb_existing_source_triangle_depths(volume->texture_mapping_color_facets.get_data(), its.indices.size());
+            state_source = build_projection_region_state_source(*volume);
+            projected_safe_max_depth = texture_mapping_depth_for_budget(sampled_projected_triangle_count, 7, 2200000);
+        }
 
         TriangleSelector::TriangleSplittingData new_data;
         new_data.triangles_to_split.reserve(std::max(old_data.triangles_to_split.size(), projected_triangle_count));
@@ -6278,7 +6760,10 @@ static bool project_texture_mapping_zone_to_regions(ModelObject             &obj
              &visibility,
              &vertex_normals,
              &projected_triangles,
-             &state_source](size_t tri_idx, const Vec3f &point, const Vec3f &barycentric) {
+             &state_source,
+             &check_cancel](size_t tri_idx, const Vec3f &point, const Vec3f &barycentric) {
+            if (check_cancel)
+                check_cancel();
             unsigned int state = sample_projection_region_state(state_source, int(tri_idx), point);
             if (tri_idx < projected_triangles.size() && projected_triangles[tri_idx]) {
                 const stl_triangle_vertex_indices &tri = volume->mesh().its.indices[tri_idx];
@@ -6305,6 +6790,9 @@ static bool project_texture_mapping_zone_to_regions(ModelObject             &obj
         };
 
         for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+            if (check_cancel)
+                check_cancel();
+            ImageProjectionProgressStep progress_step(progress);
             const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
             if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
                 continue;
@@ -6315,6 +6803,12 @@ static bool project_texture_mapping_zone_to_regions(ModelObject             &obj
 
             if (tri_idx >= projected_triangles.size() || !projected_triangles[tri_idx]) {
                 projection_region_append_preserved_triangle(old_data, new_data, tri_idx);
+                continue;
+            }
+
+            if (tri_idx < fully_projected_triangles.size() && fully_projected_triangles[tri_idx]) {
+                new_data.triangles_to_split.emplace_back(int(tri_idx), int(new_data.bitstream.size()));
+                projection_region_append_leaf(new_data, texture_mapping_filament_id);
                 continue;
             }
 
@@ -6335,6 +6829,27 @@ static bool project_texture_mapping_zone_to_regions(ModelObject             &obj
             if (tri_idx < rgb_depths.size())
                 target_depth = std::max(target_depth, rgb_depths[tri_idx]);
             target_depth = std::clamp(target_depth, 0, 7);
+            target_depth = std::min(target_depth,
+                                    texture_mapping_depth_from_span(transformed_triangle_max_edge_length(world_matrix, vertices),
+                                                                    IMAGE_PROJECTION_REGION_TARGET_EDGE_MM,
+                                                                    7));
+
+            const ProjectionRegionTrianglePredicate fully_projected_subtriangle =
+                [&context,
+                 &world_matrix,
+                 pass_through_model,
+                 volume_idx,
+                 tri_idx,
+                 &visibility,
+                 &paintable_mask](const std::array<Vec3f, 3> &sub_vertices) {
+                return projection_region_triangle_is_fully_projected(context,
+                                                                     visibility,
+                                                                     paintable_mask,
+                                                                     world_matrix,
+                                                                     sub_vertices,
+                                                                     projection_visibility_triangle_key(volume_idx, tri_idx),
+                                                                     pass_through_model);
+            };
 
             const size_t bitstream_start = new_data.bitstream.size();
             new_data.triangles_to_split.emplace_back(int(tri_idx), int(bitstream_start));
@@ -6344,7 +6859,9 @@ static bool project_texture_mapping_zone_to_regions(ModelObject             &obj
                                                            vertices,
                                                            root_barycentrics,
                                                            0,
-                                                           target_depth)) {
+                                                           target_depth,
+                                                           fully_projected_subtriangle,
+                                                           texture_mapping_filament_id)) {
                 new_data.triangles_to_split.pop_back();
                 new_data.bitstream.resize(bitstream_start);
             }
@@ -6358,6 +6875,7 @@ static bool project_texture_mapping_zone_to_regions(ModelObject             &obj
         changed |= volume->mmu_segmentation_facets.set(selector);
     }
 
+    progress.finish();
     return changed;
 }
 
@@ -6432,6 +6950,191 @@ static bool object_has_rgba_data(const ModelObject &object)
         if (volume != nullptr && volume->is_model_part() && !volume->texture_mapping_color_facets.empty())
             return true;
     return false;
+}
+
+static bool object_has_raw_atlas_texture_data(const ModelObject &object)
+{
+    for (const ModelVolume *volume : object.volumes)
+        if (volume != nullptr && volume->is_model_part() && model_volume_has_raw_atlas_texture_data(volume))
+            return true;
+    return false;
+}
+
+static size_t image_projection_model_part_triangle_count(const ModelObject &object)
+{
+    size_t count = 0;
+    for (const ModelVolume *volume : object.volumes)
+        if (volume != nullptr && volume->is_model_part())
+            count += volume->mesh().its.indices.size();
+    return count;
+}
+
+static size_t image_projection_model_part_vertex_count(const ModelObject &object)
+{
+    size_t count = 0;
+    for (const ModelVolume *volume : object.volumes)
+        if (volume != nullptr && volume->is_model_part())
+            count += volume->mesh().its.vertices.size();
+    return count;
+}
+
+struct ImageProjectionVolumeSignature
+{
+    ObjectID volume_id;
+    ObjectBase::Timestamp volume_config_timestamp = 0;
+    ObjectBase::Timestamp mmu_segmentation_timestamp = 0;
+    ObjectBase::Timestamp texture_mapping_color_timestamp = 0;
+    ObjectID imported_vertex_colors_id;
+    ObjectID imported_texture_uvs_id;
+    ObjectID imported_texture_uv_valid_id;
+    ObjectID imported_texture_rgba_id;
+    ObjectID imported_texture_raw_id;
+    size_t imported_vertex_colors_size = 0;
+    size_t imported_texture_uvs_size = 0;
+    size_t imported_texture_uv_valid_size = 0;
+    size_t imported_texture_rgba_size = 0;
+    size_t imported_texture_raw_size = 0;
+    uint32_t imported_texture_width = 0;
+    uint32_t imported_texture_height = 0;
+    uint32_t imported_texture_raw_channels = 0;
+    int uv_map_generator_version = 0;
+};
+
+struct ImageProjectionObjectSignature
+{
+    ObjectID object_id;
+    ObjectBase::Timestamp object_config_timestamp = 0;
+    std::vector<ImageProjectionVolumeSignature> volumes;
+};
+
+static ObjectBase::Timestamp image_projection_config_timestamp(const ModelConfigObject &config)
+{
+    return static_cast<const ModelConfig &>(config).timestamp();
+}
+
+static ImageProjectionObjectSignature image_projection_object_signature(const ModelObject &object)
+{
+    ImageProjectionObjectSignature signature;
+    signature.object_id = object.id();
+    signature.object_config_timestamp = image_projection_config_timestamp(object.config);
+    signature.volumes.reserve(object.volumes.size());
+    for (const ModelVolume *volume : object.volumes) {
+        if (volume == nullptr)
+            continue;
+        ImageProjectionVolumeSignature volume_signature;
+        volume_signature.volume_id = volume->id();
+        volume_signature.volume_config_timestamp = image_projection_config_timestamp(volume->config);
+        volume_signature.mmu_segmentation_timestamp = volume->mmu_segmentation_facets.timestamp();
+        volume_signature.texture_mapping_color_timestamp = volume->texture_mapping_color_facets.timestamp();
+        volume_signature.imported_vertex_colors_id = volume->imported_vertex_colors_rgba.id();
+        volume_signature.imported_texture_uvs_id = volume->imported_texture_uvs_per_face.id();
+        volume_signature.imported_texture_uv_valid_id = volume->imported_texture_uv_valid.id();
+        volume_signature.imported_texture_rgba_id = volume->imported_texture_rgba.id();
+        volume_signature.imported_texture_raw_id = volume->imported_texture_raw_filament_offsets.id();
+        volume_signature.imported_vertex_colors_size = volume->imported_vertex_colors_rgba.size();
+        volume_signature.imported_texture_uvs_size = volume->imported_texture_uvs_per_face.size();
+        volume_signature.imported_texture_uv_valid_size = volume->imported_texture_uv_valid.size();
+        volume_signature.imported_texture_rgba_size = volume->imported_texture_rgba.size();
+        volume_signature.imported_texture_raw_size = volume->imported_texture_raw_filament_offsets.size();
+        volume_signature.imported_texture_width = volume->imported_texture_width;
+        volume_signature.imported_texture_height = volume->imported_texture_height;
+        volume_signature.imported_texture_raw_channels = volume->imported_texture_raw_channels;
+        volume_signature.uv_map_generator_version = volume->uv_map_generator_version;
+        signature.volumes.emplace_back(volume_signature);
+    }
+    return signature;
+}
+
+static bool image_projection_object_signature_matches(const ModelObject &object, const ImageProjectionObjectSignature &signature)
+{
+    if (object.id() != signature.object_id || image_projection_config_timestamp(object.config) != signature.object_config_timestamp)
+        return false;
+    if (object.volumes.size() != signature.volumes.size())
+        return false;
+    for (size_t idx = 0; idx < object.volumes.size(); ++idx) {
+        const ModelVolume *volume = object.volumes[idx];
+        if (volume == nullptr)
+            return false;
+        const ImageProjectionVolumeSignature &volume_signature = signature.volumes[idx];
+        if (volume->id() != volume_signature.volume_id ||
+            image_projection_config_timestamp(volume->config) != volume_signature.volume_config_timestamp ||
+            volume->mmu_segmentation_facets.timestamp() != volume_signature.mmu_segmentation_timestamp ||
+            volume->texture_mapping_color_facets.timestamp() != volume_signature.texture_mapping_color_timestamp ||
+            volume->imported_vertex_colors_rgba.id() != volume_signature.imported_vertex_colors_id ||
+            volume->imported_texture_uvs_per_face.id() != volume_signature.imported_texture_uvs_id ||
+            volume->imported_texture_uv_valid.id() != volume_signature.imported_texture_uv_valid_id ||
+            volume->imported_texture_rgba.id() != volume_signature.imported_texture_rgba_id ||
+            volume->imported_texture_raw_filament_offsets.id() != volume_signature.imported_texture_raw_id ||
+            volume->imported_vertex_colors_rgba.size() != volume_signature.imported_vertex_colors_size ||
+            volume->imported_texture_uvs_per_face.size() != volume_signature.imported_texture_uvs_size ||
+            volume->imported_texture_uv_valid.size() != volume_signature.imported_texture_uv_valid_size ||
+            volume->imported_texture_rgba.size() != volume_signature.imported_texture_rgba_size ||
+            volume->imported_texture_raw_filament_offsets.size() != volume_signature.imported_texture_raw_size ||
+            volume->imported_texture_width != volume_signature.imported_texture_width ||
+            volume->imported_texture_height != volume_signature.imported_texture_height ||
+            volume->imported_texture_raw_channels != volume_signature.imported_texture_raw_channels ||
+            volume->uv_map_generator_version != volume_signature.uv_map_generator_version)
+            return false;
+    }
+    return true;
+}
+
+static ModelObject *image_projection_model_object_by_id(Model &model, const ObjectID &object_id)
+{
+    for (ModelObject *object : model.objects)
+        if (object != nullptr && object->id() == object_id)
+            return object;
+    return nullptr;
+}
+
+template<typename T>
+static void image_projection_assign_imported_vector(ModelVolumeImportedVector<T> &dst,
+                                                    const ModelVolumeImportedVector<T> &src,
+                                                    bool force_new_id = false)
+{
+    const bool same = dst.size() == src.size() && std::equal(dst.begin(), dst.end(), src.begin());
+    if (same && !force_new_id)
+        return;
+    if (!same)
+        dst.assign(src.begin(), src.end());
+    dst.set_new_unique_id();
+}
+
+static void image_projection_apply_extruder_config(ModelConfigObject &dst, const ModelConfigObject &src)
+{
+    const ConfigOption *src_opt = src.option("extruder");
+    if (src_opt == nullptr)
+        return;
+    const int src_extruder = src_opt->getInt();
+    const ConfigOption *dst_opt = dst.option("extruder");
+    if (dst_opt != nullptr && dst_opt->getInt() == src_extruder)
+        return;
+    dst.set("extruder", src_extruder);
+}
+
+static void image_projection_apply_volume_result(ModelVolume &dst, const ModelVolume &src)
+{
+    const bool texture_metadata_changed =
+        dst.imported_texture_width != src.imported_texture_width ||
+        dst.imported_texture_height != src.imported_texture_height ||
+        dst.uv_map_generator_version != src.uv_map_generator_version;
+    const bool raw_metadata_changed =
+        texture_metadata_changed ||
+        dst.imported_texture_raw_channels != src.imported_texture_raw_channels ||
+        dst.imported_texture_raw_metadata_json != src.imported_texture_raw_metadata_json;
+
+    dst.mmu_segmentation_facets.assign(src.mmu_segmentation_facets);
+    dst.texture_mapping_color_facets.assign(src.texture_mapping_color_facets);
+    image_projection_assign_imported_vector(dst.imported_vertex_colors_rgba, src.imported_vertex_colors_rgba);
+    image_projection_assign_imported_vector(dst.imported_texture_uvs_per_face, src.imported_texture_uvs_per_face, texture_metadata_changed);
+    image_projection_assign_imported_vector(dst.imported_texture_uv_valid, src.imported_texture_uv_valid, texture_metadata_changed);
+    image_projection_assign_imported_vector(dst.imported_texture_rgba, src.imported_texture_rgba, texture_metadata_changed);
+    image_projection_assign_imported_vector(dst.imported_texture_raw_filament_offsets, src.imported_texture_raw_filament_offsets, raw_metadata_changed);
+    dst.imported_texture_width = src.imported_texture_width;
+    dst.imported_texture_height = src.imported_texture_height;
+    dst.imported_texture_raw_channels = src.imported_texture_raw_channels;
+    dst.imported_texture_raw_metadata_json = src.imported_texture_raw_metadata_json;
+    dst.uv_map_generator_version = src.uv_map_generator_version;
 }
 
 static bool model_volume_has_non_region_color_data(const ModelVolume *volume)
@@ -6697,6 +7400,45 @@ static bool image_texture_zone_is_usable(const TextureMappingManager &texture_mg
     return zone != nullptr && zone->enabled && !zone->deleted && zone->is_image_texture();
 }
 
+static std::vector<unsigned int> usable_image_texture_zone_ids()
+{
+    std::vector<unsigned int> ids;
+    if (wxGetApp().preset_bundle == nullptr)
+        return ids;
+
+    const TextureMappingManager &texture_mgr = wxGetApp().preset_bundle->texture_mapping_zones;
+    for (const TextureMappingZone &zone : texture_mgr.zones())
+        if (image_texture_zone_is_usable(texture_mgr, zone.zone_id))
+            ids.emplace_back(zone.zone_id);
+    return ids;
+}
+
+static bool image_texture_zone_id_is_usable(const std::vector<unsigned int> &image_texture_zone_ids,
+                                            unsigned int                     zone_id)
+{
+    return std::find(image_texture_zone_ids.begin(), image_texture_zone_ids.end(), zone_id) != image_texture_zone_ids.end();
+}
+
+static bool model_config_explicit_extruder_is_image_texture_zone(const std::vector<unsigned int> &image_texture_zone_ids,
+                                                                 const ModelConfigObject    &config)
+{
+    const ConfigOption *opt = config.option("extruder");
+    if (opt == nullptr || opt->getInt() <= 0)
+        return false;
+    return image_texture_zone_id_is_usable(image_texture_zone_ids, unsigned(opt->getInt()));
+}
+
+static bool model_config_set_extruder_if_needed(ModelConfigObject &config, unsigned int filament_id)
+{
+    if (filament_id == 0)
+        return false;
+    const ConfigOption *opt = config.option("extruder");
+    if (opt != nullptr && opt->getInt() == int(filament_id))
+        return false;
+    config.set("extruder", int(filament_id));
+    return true;
+}
+
 static bool non_region_color_data_is_assigned_to_image_texture_zone(const ModelObject &object)
 {
     if (wxGetApp().preset_bundle == nullptr)
@@ -6753,6 +7495,46 @@ static bool erase_color_regions_and_assign_texture_mapping_zone(ModelObject &obj
                 volume->config.set("extruder", int(texture_mapping_filament_id));
         changed = true;
     }
+    return changed;
+}
+
+static bool erase_color_regions_and_assign_base_image_texture_zone_if_needed(ModelObject  &object,
+                                                                             unsigned int texture_mapping_filament_id,
+                                                                             const std::vector<unsigned int> &image_texture_zone_ids)
+{
+    bool changed = false;
+    bool object_extruder_is_inherited = false;
+    for (ModelVolume *volume : object.volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+        if (!volume->mmu_segmentation_facets.empty()) {
+            volume->mmu_segmentation_facets.reset();
+            changed = true;
+        }
+        const ConfigOption *volume_opt = volume->config.option("extruder");
+        if (volume_opt == nullptr || volume_opt->getInt() == 0)
+            object_extruder_is_inherited = true;
+    }
+
+    if (texture_mapping_filament_id == 0)
+        return changed;
+
+    if (object_extruder_is_inherited &&
+        !model_config_explicit_extruder_is_image_texture_zone(image_texture_zone_ids, object.config)) {
+        changed |= model_config_set_extruder_if_needed(object.config, texture_mapping_filament_id);
+    }
+
+    for (ModelVolume *volume : object.volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+
+        const ConfigOption *volume_opt = volume->config.option("extruder");
+        if (volume_opt == nullptr || volume_opt->getInt() == 0)
+            continue;
+        if (!model_config_explicit_extruder_is_image_texture_zone(image_texture_zone_ids, volume->config))
+            changed |= model_config_set_extruder_if_needed(volume->config, texture_mapping_filament_id);
+    }
+
     return changed;
 }
 
@@ -6815,6 +7597,15 @@ static unsigned int texture_mapping_zone_id_for_image_projection(ModelObject &ob
         return painted_id;
     if (const unsigned int base_id = base_image_texture_zone_id_for_projection(object); base_id != 0)
         return base_id;
+    return ensure_texture_mapping_zone();
+}
+
+static unsigned int texture_mapping_zone_id_for_erasing_region_projection(ModelObject &object)
+{
+    if (const unsigned int base_id = base_image_texture_zone_id_for_projection(object); base_id != 0)
+        return base_id;
+    if (const unsigned int painted_id = painted_image_texture_zone_id_for_projection(object); painted_id != 0)
+        return painted_id;
     return ensure_texture_mapping_zone();
 }
 
@@ -10340,10 +11131,8 @@ void GLGizmoMmuSegmentation::init_extruders_data(const std::vector<ColorRGBA> &e
             m_selected_extruder_idx = size_t(std::distance(m_display_filament_ids.begin(), selected_it));
     }
 
-    // keep remap table consistent with current extruder count
-    m_extruder_remap.resize(m_display_filament_ids.size());
-    for (size_t i = 0; i < m_extruder_remap.size(); ++i)
-        m_extruder_remap[i] = i;
+    m_remap_source_filament_ids.clear();
+    m_extruder_remap.clear();
 }
 
 void GLGizmoMmuSegmentation::init_extruders_data()
@@ -12278,10 +13067,7 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
     if (m_imgui->button(m_desc.at("perform_remap"))) {
         m_show_filament_remap_ui = !m_show_filament_remap_ui;
         if (m_show_filament_remap_ui) {
-            // reset remap to identity on opening
-            m_extruder_remap.resize(m_display_filament_ids.size());
-            for (size_t i = 0; i < m_extruder_remap.size(); ++i)
-                m_extruder_remap[i] = i;
+            refresh_filament_remap_sources(true);
         }
     }
 
@@ -12381,6 +13167,7 @@ void GLGizmoMmuSegmentation::update_model_object()
         const ModelObjectPtrs &mos = wxGetApp().model().objects;
         size_t obj_idx = std::find(mos.begin(), mos.end(), mo) - mos.begin();
         wxGetApp().obj_list()->update_info_items(obj_idx);
+        wxGetApp().sidebar().update_texture_mapping_panel(false);
         wxGetApp().plater()->get_partplate_list().notify_instance_update(obj_idx, 0);
         m_parent.post_event(SimpleEvent(EVT_GLCANVAS_SCHEDULE_BACKGROUND_PROCESS));
     }
@@ -12556,6 +13343,88 @@ bool GLGizmoMmuSegmentation::selected_object_has_painted_regions() const
             return true;
     }
     return false;
+}
+
+std::vector<unsigned int> GLGizmoMmuSegmentation::selected_object_used_filament_ids() const
+{
+    const ModelObject *object = m_c->selection_info()->model_object();
+    if (object == nullptr || m_extruders_colors.empty())
+        return {};
+
+    std::vector<bool> used_filament_ids(m_extruders_colors.size() + 1, false);
+    auto mark_filament_id = [&used_filament_ids](unsigned int filament_id) {
+        if (filament_id >= 1 && filament_id < used_filament_ids.size() &&
+            filament_id <= unsigned(EnforcerBlockerType::ExtruderMax))
+            used_filament_ids[filament_id] = true;
+    };
+
+    const ConfigOption *object_opt = object->config.option("extruder");
+    const int object_extruder_id = object_opt != nullptr ? object_opt->getInt() : 1;
+    const unsigned int object_base_filament_id = object_extruder_id > 0 ? unsigned(object_extruder_id) : 1u;
+
+    for (const ModelVolume *volume : object->volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+
+        const ConfigOption *volume_opt = volume->config.option("extruder");
+        const bool has_volume_extruder = volume_opt != nullptr && volume_opt->getInt() != 0;
+        const int base_extruder_id = has_volume_extruder ? volume_opt->getInt() : int(object_base_filament_id);
+        mark_filament_id(base_extruder_id > 0 ? unsigned(base_extruder_id) : 1u);
+    }
+
+    if (!m_triangle_selectors.empty()) {
+        for (const auto &selector : m_triangle_selectors) {
+            if (selector == nullptr)
+                continue;
+            const TriangleSelector::TriangleSplittingData data = selector->serialize();
+            for (size_t state_idx = static_cast<size_t>(EnforcerBlockerType::Extruder1); state_idx < data.used_states.size(); ++state_idx)
+                if (data.used_states[state_idx])
+                    mark_filament_id(unsigned(state_idx));
+        }
+    } else {
+        for (const ModelVolume *volume : object->volumes) {
+            if (volume == nullptr || !volume->is_model_part() || volume->mmu_segmentation_facets.empty())
+                continue;
+            const std::vector<bool> &used_states = volume->mmu_segmentation_facets.get_data().used_states;
+            for (size_t state_idx = static_cast<size_t>(EnforcerBlockerType::Extruder1); state_idx < used_states.size(); ++state_idx)
+                if (used_states[state_idx])
+                    mark_filament_id(unsigned(state_idx));
+        }
+    }
+
+    std::vector<unsigned int> result;
+    result.reserve(m_display_filament_ids.size());
+    for (const unsigned int filament_id : m_display_filament_ids)
+        if (filament_id < used_filament_ids.size() && used_filament_ids[filament_id])
+            result.emplace_back(filament_id);
+    return result;
+}
+
+void GLGizmoMmuSegmentation::refresh_filament_remap_sources(bool reset_targets)
+{
+    const std::vector<unsigned int> previous_sources = std::move(m_remap_source_filament_ids);
+    const std::vector<size_t> previous_targets = std::move(m_extruder_remap);
+    m_remap_source_filament_ids = selected_object_used_filament_ids();
+    m_extruder_remap.assign(m_remap_source_filament_ids.size(), 0);
+
+    for (size_t source_idx = 0; source_idx < m_remap_source_filament_ids.size(); ++source_idx) {
+        const unsigned int source_filament_id = m_remap_source_filament_ids[source_idx];
+        const auto display_it = std::find(m_display_filament_ids.begin(), m_display_filament_ids.end(), source_filament_id);
+        const size_t identity_target = display_it == m_display_filament_ids.end() ?
+            0 :
+            size_t(std::distance(m_display_filament_ids.begin(), display_it));
+
+        size_t target = identity_target;
+        if (!reset_targets) {
+            const auto previous_it = std::find(previous_sources.begin(), previous_sources.end(), source_filament_id);
+            if (previous_it != previous_sources.end()) {
+                const size_t previous_idx = size_t(std::distance(previous_sources.begin(), previous_it));
+                if (previous_idx < previous_targets.size() && previous_targets[previous_idx] < m_display_filament_ids.size())
+                    target = previous_targets[previous_idx];
+            }
+        }
+        m_extruder_remap[source_idx] = target;
+    }
 }
 
 bool GLGizmoMmuSegmentation::selected_object_has_color_auto_paint_source() const
@@ -15623,6 +16492,11 @@ void GLGizmoImageProjection::on_load(cereal::BinaryInputArchive& ar)
         m_projection_rotation_deg = 0.f;
         m_projection_panel_expanded = true;
     }
+    try {
+        ar(m_erase_region_painting);
+    } catch (...) {
+        m_erase_region_painting = true;
+    }
 
     m_projection_mode = ProjectionMode(std::clamp(mode, 0, 2));
     m_projection_mode_initialized = false;
@@ -15654,6 +16528,27 @@ void GLGizmoImageProjection::on_load(cereal::BinaryInputArchive& ar)
     m_raw_atlas.expected_line_width_mm = image_map_raw_expected_line_width_from_metadata_json(m_raw_atlas.metadata_json);
     if (!m_raw_atlas.valid())
         m_raw_atlas = {};
+    if (m_raw_atlas.valid()) {
+        if (resize_projection_raw_atlas_to_max_dimension(m_raw_atlas, ProjectionImageRasterMaxDimension)) {
+            std::vector<uint8_t> preview =
+                image_projection_raw_atlas_simulated_preview_rgba(m_raw_atlas, TextureMappingZone::DefaultGenericSolverMixModel);
+            if (!preview.empty()) {
+                m_image_rgba = std::move(preview);
+                m_image_width = m_raw_atlas.width;
+                m_image_height = m_raw_atlas.height;
+            } else {
+                m_raw_atlas = {};
+            }
+        } else {
+            m_raw_atlas = {};
+        }
+    }
+    if (!m_raw_atlas.valid() &&
+        !resize_projection_rgba_to_max_dimension(m_image_rgba, m_image_width, m_image_height, ProjectionImageRasterMaxDimension)) {
+        m_image_rgba.clear();
+        m_image_width = 0;
+        m_image_height = 0;
+    }
     m_overlay_texture.reset();
     m_overlay_texture_dirty = m_text_mode || !m_image_rgba.empty();
 }
@@ -15709,6 +16604,8 @@ void GLGizmoImageProjection::on_save(cereal::BinaryOutputArchive& ar) const
 
     ar(m_projection_rotation_deg,
        m_projection_panel_expanded);
+
+    ar(m_erase_region_painting);
 }
 
 void GLGizmoImageProjection::on_render()
@@ -15737,6 +16634,13 @@ void GLGizmoImageProjection::on_set_state()
             m_text_projection_raw_mode = false;
         }
     } else if (get_state() == Off) {
+        if (m_projection_job_active.load()) {
+            m_state = On;
+            m_projection_panel_expanded = true;
+            m_parent.set_as_dirty();
+            m_parent.request_extra_frame();
+            return;
+        }
         m_parent.enable_picking(true);
         m_parent.toggle_model_objects_visibility(true);
         backup_projected_objects();
@@ -15777,6 +16681,17 @@ bool GLGizmoImageProjection::load_projection_image()
         return false;
 
     wxImage image(dialog.GetPath(), wxBITMAP_TYPE_ANY);
+    if (!image.IsOk()) {
+        m_image_error = _u8L("Unable to load the selected image.");
+        return false;
+    }
+    const bool maybe_raw_atlas = wx_image_looks_like_raw_filament_offset_atlas(image);
+    if (!maybe_raw_atlas &&
+        !resize_wx_projection_image_to_max_dimension(image, ProjectionImageRasterMaxDimension)) {
+        m_image_error = _u8L("Unable to resize the selected image.");
+        return false;
+    }
+
     std::vector<uint8_t> rgba;
     uint32_t width = 0;
     uint32_t height = 0;
@@ -15808,6 +16723,11 @@ bool GLGizmoImageProjection::load_projection_image()
             return false;
         }
 
+        if (!resize_projection_raw_atlas_to_max_dimension(raw_atlas, ProjectionImageRasterMaxDimension)) {
+            m_image_error = _u8L("Unable to resize the selected raw filament offset atlas.");
+            return false;
+        }
+
         std::vector<uint8_t> preview =
             image_projection_raw_atlas_simulated_preview_rgba(raw_atlas,
                                                               generic_solver_mix_model_for_projection_object(selected_model_object()));
@@ -15822,6 +16742,9 @@ bool GLGizmoImageProjection::load_projection_image()
         m_convert_existing_colors_to_raw_offsets = true;
         if (!projection_mode_allowed(m_projection_mode))
             m_projection_mode_initialized = false;
+    } else if (!resize_projection_rgba_to_max_dimension(rgba, width, height, ProjectionImageRasterMaxDimension)) {
+        m_image_error = _u8L("Unable to resize the selected image.");
+        return false;
     }
 
     m_image_path = into_u8(dialog.GetPath());
@@ -16323,6 +17246,11 @@ bool GLGizmoImageProjection::selected_object_has_raw_atlas_texture_data() const
 
 bool GLGizmoImageProjection::render_projection_action_controls()
 {
+    if (m_projection_job_active.load()) {
+        render_projection_progress();
+        return false;
+    }
+
     if (active_projection_empty()) {
         bool overlay = false;
         m_imgui->disabled_begin(true);
@@ -16335,14 +17263,36 @@ bool GLGizmoImageProjection::render_projection_action_controls()
 
     m_imgui->disabled_begin(active_projection_empty() || !projection_mode_allowed(m_projection_mode));
     const wxString project_label = m_text_mode ? _L("Project text onto model") : _L("Project image onto model");
-    const bool projected = m_imgui->button(project_label) && project_image_to_selected_object();
-    if (projected) {
-        m_show_overlay = false;
-        m_parent.set_as_dirty();
-        m_parent.request_extra_frame();
-    }
+    if (m_imgui->button(project_label))
+        start_projection_job();
     m_imgui->disabled_end();
-    return projected;
+    return false;
+}
+
+void GLGizmoImageProjection::render_projection_progress()
+{
+    const int percent = std::clamp(m_projection_job_progress.load(), 0, 100);
+    if (m_projection_job_cancel_requested.load())
+        m_imgui->text(GUI::format(_L("Canceling projection: %1%%%"), percent));
+    else
+        m_imgui->text(GUI::format(_L("Projection in progress: %1%%%"), percent));
+    ImGui::ProgressBar(float(percent) / 100.f, ImVec2(m_imgui->scaled(18.f), 0.f));
+    const bool cancel_requested = m_projection_job_cancel_requested.load();
+    m_imgui->disabled_begin(cancel_requested);
+    m_imgui->push_cancel_button_style();
+    if (m_imgui->button(cancel_requested ? _L("Canceling") : _L("Cancel")))
+        request_projection_job_cancel();
+    m_imgui->pop_cancel_button_style();
+    m_imgui->disabled_end();
+}
+
+void GLGizmoImageProjection::request_projection_job_cancel()
+{
+    if (!m_projection_job_active.load())
+        return;
+    m_projection_job_cancel_requested.store(true);
+    m_parent.set_as_dirty();
+    m_parent.request_extra_frame();
 }
 
 void GLGizmoImageProjection::on_render_input_window(float x, float y, float bottom_limit)
@@ -16360,14 +17310,27 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
                                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar);
     const float max_tooltip_width = ImGui::GetFontSize() * 20.f;
 
-    if (m_imgui->button(m_projection_panel_expanded ? _L("Collapse") : _L("Expand"))) {
-        m_projection_panel_expanded = !m_projection_panel_expanded;
-        m_parent.set_as_dirty();
-        m_parent.request_extra_frame();
+    const bool projection_job_active = m_projection_job_active.load();
+    if (projection_job_active) {
+        m_projection_panel_expanded = true;
+    } else {
+        if (m_imgui->button(m_projection_panel_expanded ? _L("Collapse") : _L("Expand"))) {
+            m_projection_panel_expanded = !m_projection_panel_expanded;
+            m_parent.set_as_dirty();
+            m_parent.request_extra_frame();
+        }
     }
 
     if (!m_projection_panel_expanded) {
         render_projection_action_controls();
+        GizmoImguiEnd();
+        ImGuiWrapper::pop_toolbar_style();
+        render_projection_overlay();
+        return;
+    }
+
+    if (projection_job_active) {
+        render_projection_progress();
         GizmoImguiEnd();
         ImGuiWrapper::pop_toolbar_style();
         render_projection_overlay();
@@ -16525,6 +17488,10 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
         show_projection_overlay();
     if (ImGui::Checkbox("Pass through model", &m_pass_through_model))
         show_projection_overlay();
+    if (ImGui::Checkbox("Erase region painting", &m_erase_region_painting)) {
+        m_parent.set_as_dirty();
+        m_parent.request_extra_frame();
+    }
 
     const bool show_raw_conversion_option =
         active_raw_atlas_valid() &&
@@ -16539,6 +17506,332 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
     ImGuiWrapper::pop_toolbar_style();
 
     render_projection_overlay();
+}
+
+void GLGizmoImageProjection::fill_projection_input(ProjectionInput &input, const ModelObject *object) const
+{
+    input = ProjectionInput();
+    input.mode = m_projection_mode;
+    input.text_mode = m_text_mode;
+    input.pass_through_model = m_pass_through_model;
+    input.raw_atlas_valid = active_raw_atlas_valid();
+    if (input.raw_atlas_valid)
+        input.raw_atlas = active_raw_atlas();
+    input.erase_region_painting = m_erase_region_painting;
+    input.image_texture_zone_ids = usable_image_texture_zone_ids();
+    input.convert_existing_colors_to_raw_offsets = m_convert_existing_colors_to_raw_offsets;
+    input.raw_projection_mix_model = generic_solver_mix_model_for_projection_object(object);
+
+    const Selection &selection = m_parent.get_selection();
+    input.instance_idx = selection.get_instance_idx();
+    const Camera &camera = wxGetApp().plater()->get_camera();
+    const std::array<int, 4> &viewport = camera.get_viewport();
+    const OverlayRect rect = overlay_rect();
+
+    input.image_rgba = active_projection_rgba();
+    input.context.view_projection = camera.get_projection_matrix().matrix() * camera.get_view_matrix().matrix();
+    input.context.camera_forward = camera.get_dir_forward();
+    input.context.camera_position = camera.get_position();
+    input.context.canvas_width = std::max(1, viewport[2]);
+    input.context.canvas_height = std::max(1, viewport[3]);
+    input.context.overlay_left = rect.left;
+    input.context.overlay_top = rect.top;
+    input.context.overlay_width = rect.width;
+    input.context.overlay_height = rect.height;
+    input.context.image_rgba = &input.image_rgba;
+    input.context.image_width = active_projection_width();
+    input.context.image_height = active_projection_height();
+    input.context.image_opacity = m_projection_opacity;
+    input.context.overlay_rotation_deg = m_projection_rotation_deg;
+    input.context.apply_transparency_as_background = effective_apply_transparency_as_background();
+    apply_projection_section_view(input.context, m_c != nullptr ? m_c->object_clipper() : nullptr);
+
+    if (object != nullptr) {
+        input.context.volume_world_matrices.reserve(object->volumes.size());
+        input.volume_base_colors.reserve(object->volumes.size());
+        for (const ModelVolume *volume : object->volumes) {
+            input.context.volume_world_matrices.emplace_back(
+                projection_world_matrix_for_volume(m_parent, object, volume, input.instance_idx));
+            input.volume_base_colors.emplace_back(volume != nullptr ? projection_base_color_for_volume(*volume) :
+                                                                  ColorRGBA(0.15f, 0.65f, 0.6f, 1.f));
+        }
+    }
+}
+
+bool GLGizmoImageProjection::start_projection_job()
+{
+    if (m_projection_job_active.load())
+        return false;
+
+    ModelObject *object = selected_model_object();
+    if (m_text_mode && !ensure_text_projection_image())
+        return false;
+    if (object == nullptr || active_projection_empty())
+        return false;
+
+    RawAtlasProjectionLayout raw_layout;
+    if (active_raw_atlas_valid()) {
+        std::string raw_atlas_error;
+        if (!raw_atlas_projection_layout_for_object(*object, active_raw_atlas(), raw_layout, &raw_atlas_error)) {
+            std::string &projection_error = m_text_mode ? m_text_error : m_image_error;
+            projection_error = raw_atlas_error.empty() ?
+                _u8L("The selected raw filament offset atlas is not compatible with the selected object.") :
+                raw_atlas_error;
+            if (m_text_mode) {
+                m_text_raw_atlas = {};
+                m_text_dirty = true;
+            } else {
+                m_image_path.clear();
+                m_image_rgba.clear();
+                m_image_width = 0;
+                m_image_height = 0;
+                m_raw_atlas = {};
+            }
+            m_overlay_texture.reset();
+            m_overlay_texture_dirty = false;
+            m_show_overlay = false;
+            m_parent.set_as_dirty();
+            return false;
+        }
+    }
+
+    update_default_projection_mode();
+    if (!projection_mode_allowed(m_projection_mode))
+        return false;
+
+    struct ProjectionJobResult
+    {
+        std::unique_ptr<Model> model_copy;
+        ProjectionInput input;
+        ObjectID object_id;
+        ImageProjectionObjectSignature signature;
+        unsigned int texture_mapping_filament_id = 0;
+        bool converting_raw_to_rgba_image = false;
+        bool creating_rgba_data_from_raw = false;
+        bool changed = false;
+        bool prepared = false;
+    };
+
+    auto result = std::make_shared<ProjectionJobResult>();
+    result->object_id = object->id();
+    result->signature = image_projection_object_signature(*object);
+    result->converting_raw_to_rgba_image =
+        !active_raw_atlas_valid() &&
+        m_projection_mode == ProjectionMode::ImageTexture &&
+        selected_object_has_raw_atlas_texture_data() &&
+        !selected_object_has_rgb_data();
+    result->creating_rgba_data_from_raw =
+        !active_raw_atlas_valid() &&
+        m_projection_mode == ProjectionMode::RGBData &&
+        selected_object_has_raw_atlas_texture_data() &&
+        !selected_object_has_rgb_data();
+
+    const bool whole_image_texture_mapped_without_regions = object_is_whole_image_texture_mapped_without_regions(*object);
+    fill_projection_input(result->input, object);
+    if (result->input.erase_region_painting) {
+        result->texture_mapping_filament_id = texture_mapping_zone_id_for_erasing_region_projection(*object);
+        result->input.project_regions = false;
+    } else {
+        result->texture_mapping_filament_id =
+            (!whole_image_texture_mapped_without_regions || active_raw_atlas_valid()) ?
+                texture_mapping_zone_id_for_image_projection(*object) :
+                0;
+        result->input.project_regions =
+            !whole_image_texture_mapped_without_regions && result->texture_mapping_filament_id != 0;
+    }
+
+    m_projection_job_active.store(true);
+    m_projection_job_cancel_requested.store(false);
+    m_projection_job_progress.store(0);
+    m_parent.set_as_dirty();
+    m_parent.request_extra_frame();
+
+    auto process = [this, result](Job::Ctl &ctl) {
+        const std::string status = result->input.text_mode ? _u8L("Projecting text") : _u8L("Projecting image");
+        auto check_cancel = [this, &ctl]() {
+            if (ctl.was_canceled() || m_projection_job_cancel_requested.load()) {
+                m_projection_job_cancel_requested.store(true);
+                throw ImageProjectionCanceledException();
+            }
+        };
+        ctl.update_status(0, status);
+        m_projection_job_progress.store(0);
+        check_cancel();
+
+        ctl.call_on_main_thread([result]() {
+            result->model_copy = std::make_unique<Model>(wxGetApp().model());
+            result->prepared = true;
+        }).wait();
+        check_cancel();
+
+        if (!result->prepared || result->model_copy == nullptr)
+            return;
+
+        ModelObject *copy_object = image_projection_model_object_by_id(*result->model_copy, result->object_id);
+        if (copy_object == nullptr)
+            return;
+
+        auto progress = [this, &ctl, status](int percent) {
+            percent = std::clamp(percent, 0, 100);
+            m_projection_job_progress.store(percent);
+            ctl.update_status(percent, status);
+        };
+        ImageProjectionWorkerResultScope worker_scope(true);
+        result->changed = project_image_to_object(copy_object, result->texture_mapping_filament_id, result->input, progress, check_cancel);
+        check_cancel();
+        progress(100);
+    };
+
+    auto finalize = [this, result](bool canceled, std::exception_ptr &eptr) {
+        auto finish = [this]() {
+            m_projection_job_active.store(false);
+            m_projection_job_cancel_requested.store(false);
+            m_projection_job_progress.store(0);
+            m_parent.set_as_dirty();
+            m_parent.request_extra_frame();
+        };
+
+        try {
+            if (eptr)
+                std::rethrow_exception(eptr);
+        } catch (const ImageProjectionCanceledException &) {
+            eptr = nullptr;
+            finish();
+            return;
+        } catch (const std::exception &e) {
+            if (result->input.text_mode)
+                m_text_error = e.what();
+            else
+                m_image_error = e.what();
+            eptr = nullptr;
+            finish();
+            return;
+        } catch (...) {
+            eptr = nullptr;
+            finish();
+            return;
+        }
+
+        if (canceled || m_projection_job_cancel_requested.load() || !result->changed || result->model_copy == nullptr) {
+            finish();
+            return;
+        }
+
+        ModelObject *object = find_model_object_by_id(result->object_id);
+        ModelObject *copy_object = image_projection_model_object_by_id(*result->model_copy, result->object_id);
+        if (object == nullptr || copy_object == nullptr) {
+            finish();
+            return;
+        }
+
+        if (!image_projection_object_signature_matches(*object, result->signature)) {
+            if (result->input.text_mode)
+                m_text_error = _u8L("Projection was not applied because the selected object changed while projection was running.");
+            else
+                m_image_error = _u8L("Projection was not applied because the selected object changed while projection was running.");
+            finish();
+            return;
+        }
+
+        if (object->volumes.size() != copy_object->volumes.size()) {
+            finish();
+            return;
+        }
+
+        Plater::TakeSnapshot snapshot(wxGetApp().plater(),
+                                      result->input.text_mode ? "Project text onto model" : "Project image onto model",
+                                      UndoRedo::SnapshotType::GizmoAction);
+        if (result->input.erase_region_painting)
+            image_projection_apply_extruder_config(object->config, copy_object->config);
+        for (size_t idx = 0; idx < object->volumes.size(); ++idx) {
+            ModelVolume *dst = object->volumes[idx];
+            const ModelVolume *src = copy_object->volumes[idx];
+            if (dst == nullptr || src == nullptr || dst->id() != src->id()) {
+                finish();
+                return;
+            }
+            if (result->input.erase_region_painting)
+                image_projection_apply_extruder_config(dst->config, src->config);
+            image_projection_apply_volume_result(*dst, *src);
+        }
+
+        refresh_projected_object(object);
+        remember_projected_object(object);
+        m_projection_mode_initialized = true;
+        m_projection_mode_object_id = object->id();
+        if (result->converting_raw_to_rgba_image && !object_has_raw_atlas_texture_data(*object))
+            show_raw_offset_data_converted_to_rgba_image_message();
+        if (result->creating_rgba_data_from_raw && object_has_rgba_data(*object))
+            show_raw_offset_data_converted_to_rgba_message();
+        m_show_overlay = false;
+        finish();
+    };
+
+    if (!queue_job(wxGetApp().plater()->get_ui_job_worker(), std::move(process), std::move(finalize))) {
+        m_projection_job_active.store(false);
+        m_projection_job_cancel_requested.store(false);
+        m_projection_job_progress.store(0);
+        m_parent.set_as_dirty();
+        m_parent.request_extra_frame();
+        return false;
+    }
+    return true;
+}
+
+bool GLGizmoImageProjection::project_image_to_object(ModelObject *object,
+                                                     unsigned int texture_mapping_filament_id,
+                                                     const ProjectionInput &input,
+                                                     const std::function<void(int)> &progress_fn,
+                                                     const std::function<void()> &check_cancel)
+{
+    if (object == nullptr)
+        return false;
+    if (check_cancel)
+        check_cancel();
+
+    auto stage_progress = [&progress_fn](int begin, int end) {
+        return [progress_fn, begin, end](int percent) {
+            if (progress_fn)
+                progress_fn(begin + (end - begin) * std::clamp(percent, 0, 100) / 100);
+        };
+    };
+
+    const int projection_end = input.project_regions && texture_mapping_filament_id != 0 ? 80 : 100;
+    bool changed = input.erase_region_painting ?
+        erase_color_regions_and_assign_base_image_texture_zone_if_needed(*object,
+                                                                         texture_mapping_filament_id,
+                                                                         input.image_texture_zone_ids) :
+        false;
+    switch (input.mode) {
+    case ProjectionMode::VertexColors:
+        changed |= project_to_vertex_colors(object, input, stage_progress(0, projection_end), check_cancel);
+        break;
+    case ProjectionMode::ImageTexture:
+        changed |= project_to_image_texture(object, input, stage_progress(0, projection_end), check_cancel);
+        break;
+    case ProjectionMode::RGBData:
+        changed |= project_to_rgb_data(object, input, stage_progress(0, projection_end), check_cancel);
+        break;
+    }
+
+    if (!changed)
+        return false;
+    if (check_cancel)
+        check_cancel();
+
+    if (input.project_regions && texture_mapping_filament_id != 0)
+        project_texture_mapping_zone_to_regions(*object,
+                                                m_parent,
+                                                input.context,
+                                                input.instance_idx,
+                                                input.pass_through_model,
+                                                texture_mapping_filament_id,
+                                                stage_progress(80, 98),
+                                                check_cancel);
+
+    if (progress_fn)
+        progress_fn(100);
+    return changed;
 }
 
 bool GLGizmoImageProjection::project_image_to_selected_object()
@@ -16590,64 +17883,26 @@ bool GLGizmoImageProjection::project_image_to_selected_object()
         selected_object_has_raw_atlas_texture_data() &&
         !selected_object_has_rgb_data();
 
-    bool changed = false;
+    ProjectionInput input;
+    fill_projection_input(input, object);
+    const bool whole_image_texture_mapped_without_regions = object_is_whole_image_texture_mapped_without_regions(*object);
+    unsigned int texture_mapping_filament_id = 0;
+    if (input.erase_region_painting) {
+        texture_mapping_filament_id = texture_mapping_zone_id_for_erasing_region_projection(*object);
+        input.project_regions = false;
+    } else {
+        texture_mapping_filament_id =
+            (!whole_image_texture_mapped_without_regions || active_raw_atlas_valid()) ?
+                texture_mapping_zone_id_for_image_projection(*object) :
+                0;
+        input.project_regions = !whole_image_texture_mapped_without_regions && texture_mapping_filament_id != 0;
+    }
+
     Plater::TakeSnapshot snapshot(wxGetApp().plater(),
                                   m_text_mode ? "Project text onto model" : "Project image onto model",
                                   UndoRedo::SnapshotType::GizmoAction);
-    switch (m_projection_mode) {
-    case ProjectionMode::VertexColors:
-        changed = project_to_vertex_colors(object);
-        break;
-    case ProjectionMode::ImageTexture:
-        changed = project_to_image_texture(object);
-        break;
-    case ProjectionMode::RGBData:
-        changed = project_to_rgb_data(object);
-        break;
-    }
-
-    if (!changed)
+    if (!project_image_to_object(object, texture_mapping_filament_id, input))
         return false;
-
-    const bool whole_image_texture_mapped_without_regions = object_is_whole_image_texture_mapped_without_regions(*object);
-    const unsigned int texture_mapping_filament_id =
-        (!whole_image_texture_mapped_without_regions || active_raw_atlas_valid()) ?
-            texture_mapping_zone_id_for_image_projection(*object) :
-            0;
-    if (!whole_image_texture_mapped_without_regions) {
-        if (texture_mapping_filament_id != 0) {
-            const Selection &selection = m_parent.get_selection();
-            const int instance_idx = selection.get_instance_idx();
-            const Camera &camera = wxGetApp().plater()->get_camera();
-            const std::array<int, 4> &viewport = camera.get_viewport();
-            const OverlayRect rect = overlay_rect();
-
-            ProjectionContext context;
-            context.view_projection = camera.get_projection_matrix().matrix() * camera.get_view_matrix().matrix();
-            context.camera_forward = camera.get_dir_forward();
-            context.camera_position = camera.get_position();
-            context.canvas_width = std::max(1, viewport[2]);
-            context.canvas_height = std::max(1, viewport[3]);
-            context.overlay_left = rect.left;
-            context.overlay_top = rect.top;
-            context.overlay_width = rect.width;
-            context.overlay_height = rect.height;
-            context.image_rgba = &active_projection_rgba();
-            context.image_width = active_projection_width();
-            context.image_height = active_projection_height();
-            context.image_opacity = m_projection_opacity;
-            context.overlay_rotation_deg = m_projection_rotation_deg;
-            context.apply_transparency_as_background = effective_apply_transparency_as_background();
-            apply_projection_section_view(context, m_c != nullptr ? m_c->object_clipper() : nullptr);
-
-            project_texture_mapping_zone_to_regions(*object,
-                                                    m_parent,
-                                                    context,
-                                                    instance_idx,
-                                                    m_pass_through_model,
-                                                    texture_mapping_filament_id);
-        }
-    }
 
     refresh_projected_object(object);
     remember_projected_object(object);
@@ -16660,35 +17915,22 @@ bool GLGizmoImageProjection::project_image_to_selected_object()
     return true;
 }
 
-bool GLGizmoImageProjection::project_to_vertex_colors(ModelObject *object)
+bool GLGizmoImageProjection::project_to_vertex_colors(ModelObject *object,
+                                                      const ProjectionInput &input,
+                                                      const std::function<void(int)> &progress_fn,
+                                                      const std::function<void()> &check_cancel)
 {
-    const Selection &selection = m_parent.get_selection();
-    const int instance_idx = selection.get_instance_idx();
-    const Camera &camera = wxGetApp().plater()->get_camera();
-    const std::array<int, 4> &viewport = camera.get_viewport();
-    const OverlayRect rect = overlay_rect();
+    const ProjectionContext &context = input.context;
+    const int instance_idx = input.instance_idx;
 
-    ProjectionContext context;
-    context.view_projection = camera.get_projection_matrix().matrix() * camera.get_view_matrix().matrix();
-    context.camera_forward = camera.get_dir_forward();
-    context.camera_position = camera.get_position();
-    context.canvas_width = std::max(1, viewport[2]);
-    context.canvas_height = std::max(1, viewport[3]);
-    context.overlay_left = rect.left;
-    context.overlay_top = rect.top;
-    context.overlay_width = rect.width;
-    context.overlay_height = rect.height;
-    context.image_rgba = &active_projection_rgba();
-    context.image_width = active_projection_width();
-    context.image_height = active_projection_height();
-    context.image_opacity = m_projection_opacity;
-    context.overlay_rotation_deg = m_projection_rotation_deg;
-    context.apply_transparency_as_background = effective_apply_transparency_as_background();
-    apply_projection_section_view(context, m_c != nullptr ? m_c->object_clipper() : nullptr);
-
-    const ProjectionVisibility visibility = m_pass_through_model ?
+    if (check_cancel)
+        check_cancel();
+    const ProjectionVisibility visibility = input.pass_through_model ?
         ProjectionVisibility() :
-        build_projection_visibility(context, m_parent, object, instance_idx);
+        build_projection_visibility(context, m_parent, object, instance_idx, check_cancel);
+    ImageProjectionProgressCounter progress(progress_fn,
+                                            image_projection_model_part_triangle_count(*object) * 2 +
+                                            image_projection_model_part_vertex_count(*object));
 
     bool changed = false;
     for (size_t volume_idx = 0; volume_idx < object->volumes.size(); ++volume_idx) {
@@ -16701,11 +17943,14 @@ bool GLGizmoImageProjection::project_to_vertex_colors(ModelObject *object)
             continue;
 
         const VolumeColorSource source = build_volume_color_source(*volume);
-        const ColorRGBA fallback_color = projection_base_color_for_volume(*volume);
+        const ColorRGBA fallback_color = projection_base_color_for_input_volume(input.volume_base_colors, volume_idx, *volume);
         std::vector<std::array<float, 4>> base_accum(its.vertices.size(), { 0.f, 0.f, 0.f, 0.f });
         std::vector<unsigned int> base_counts(its.vertices.size(), 0);
 
         for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+            if (check_cancel)
+                check_cancel();
+            ImageProjectionProgressStep progress_step(progress);
             const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
             for (int corner = 0; corner < 3; ++corner) {
                 if (tri[corner] < 0 || size_t(tri[corner]) >= its.vertices.size())
@@ -16741,11 +17986,14 @@ bool GLGizmoImageProjection::project_to_vertex_colors(ModelObject *object)
 
         std::vector<std::array<float, 4>> projected_accum(its.vertices.size(), { 0.f, 0.f, 0.f, 0.f });
         std::vector<unsigned int> projected_counts(its.vertices.size(), 0);
-        const Transform3d world_matrix = projection_world_matrix_for_volume(m_parent, object, volume, instance_idx);
+        const Transform3d world_matrix = projection_world_matrix_for_context(context, m_parent, object, volume, volume_idx, instance_idx);
         const Matrix3d world_normal_matrix = world_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
         const std::vector<Vec3d> vertex_normals = projection_smoothed_vertex_normals(its);
 
         for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+            if (check_cancel)
+                check_cancel();
+            ImageProjectionProgressStep progress_step(progress);
             const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
             if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
                 continue;
@@ -16764,7 +18012,7 @@ bool GLGizmoImageProjection::project_to_vertex_colors(ModelObject *object)
                 const size_t vertex_idx = size_t(tri[corner]);
                 Vec3f barycentric = Vec3f::Zero();
                 barycentric[corner] = 1.f;
-                if (!m_pass_through_model &&
+                if (!input.pass_through_model &&
                     !projection_point_allowed_by_camera_facing(context,
                                                                world_matrix,
                                                                world_normal_matrix,
@@ -16773,7 +18021,7 @@ bool GLGizmoImageProjection::project_to_vertex_colors(ModelObject *object)
                                                                vertices[size_t(corner)],
                                                                barycentric))
                     continue;
-                if (!m_pass_through_model &&
+                if (!input.pass_through_model &&
                     !projection_point_is_visible(visibility,
                                                  context,
                                                  world_matrix,
@@ -16796,6 +18044,9 @@ bool GLGizmoImageProjection::project_to_vertex_colors(ModelObject *object)
 
         volume->imported_vertex_colors_rgba.assign(its.vertices.size(), 0xFFFFFFFFu);
         for (size_t idx = 0; idx < its.vertices.size(); ++idx) {
+            if (check_cancel)
+                check_cancel();
+            ImageProjectionProgressStep progress_step(progress);
             ColorRGBA color = base_colors[idx];
             if (projected_counts[idx] > 0) {
                 const float inv = 1.f / float(projected_counts[idx]);
@@ -16806,58 +18057,39 @@ bool GLGizmoImageProjection::project_to_vertex_colors(ModelObject *object)
             }
             volume->imported_vertex_colors_rgba[idx] = pack_vertex_color_rgba(color);
         }
-        volume->imported_vertex_colors_rgba.set_new_unique_id();
+        if (image_projection_should_refresh_ids())
+            volume->imported_vertex_colors_rgba.set_new_unique_id();
         changed = true;
     }
+    progress.finish();
     return changed;
 }
 
-bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
+bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object,
+                                                      const ProjectionInput &input,
+                                                      const std::function<void(int)> &progress_fn,
+                                                      const std::function<void()> &check_cancel)
 {
-    const Selection &selection = m_parent.get_selection();
-    const int instance_idx = selection.get_instance_idx();
-    const Camera &camera = wxGetApp().plater()->get_camera();
-    const std::array<int, 4> &viewport = camera.get_viewport();
-    const OverlayRect rect = overlay_rect();
+    const ProjectionContext &context = input.context;
+    const int instance_idx = input.instance_idx;
 
-    ProjectionContext context;
-    context.view_projection = camera.get_projection_matrix().matrix() * camera.get_view_matrix().matrix();
-    context.camera_forward = camera.get_dir_forward();
-    context.camera_position = camera.get_position();
-    context.canvas_width = std::max(1, viewport[2]);
-    context.canvas_height = std::max(1, viewport[3]);
-    context.overlay_left = rect.left;
-    context.overlay_top = rect.top;
-    context.overlay_width = rect.width;
-    context.overlay_height = rect.height;
-    context.image_rgba = &active_projection_rgba();
-    context.image_width = active_projection_width();
-    context.image_height = active_projection_height();
-    context.image_opacity = m_projection_opacity;
-    context.overlay_rotation_deg = m_projection_rotation_deg;
-    context.apply_transparency_as_background = effective_apply_transparency_as_background();
-    apply_projection_section_view(context, m_c != nullptr ? m_c->object_clipper() : nullptr);
-
-    const ProjectionVisibility visibility = m_pass_through_model ?
+    if (check_cancel)
+        check_cancel();
+    const ProjectionVisibility visibility = input.pass_through_model ?
         ProjectionVisibility() :
-        build_projection_visibility(context, m_parent, object, instance_idx);
-    const bool raw_atlas_projection = active_raw_atlas_valid();
-    const ImageMapRawFilamentOffsetAtlas &raw_projection_atlas = active_raw_atlas();
+        build_projection_visibility(context, m_parent, object, instance_idx, check_cancel);
+    const bool raw_atlas_projection = input.raw_atlas_valid;
+    const ImageMapRawFilamentOffsetAtlas &raw_projection_atlas = input.raw_atlas;
     RawAtlasProjectionLayout raw_layout;
     if (raw_atlas_projection) {
         std::string raw_atlas_error;
-        if (!raw_atlas_projection_layout_for_object(*object, raw_projection_atlas, raw_layout, &raw_atlas_error)) {
-            std::string &projection_error = m_text_mode ? m_text_error : m_image_error;
-            projection_error = raw_atlas_error.empty() ?
-                _u8L("The selected raw filament offset atlas is not compatible with the selected object.") :
-                raw_atlas_error;
+        if (!raw_atlas_projection_layout_for_object(*object, raw_projection_atlas, raw_layout, &raw_atlas_error))
             return false;
-        }
     }
     const std::vector<ColorRGBA> raw_filament_colors =
         raw_atlas_projection ? raw_filament_colors_for_projection_preview(raw_layout.filaments) : std::vector<ColorRGBA>();
     const int raw_projection_mix_model =
-        raw_atlas_projection ? generic_solver_mix_model_for_projection_object(object) : TextureMappingZone::DefaultGenericSolverMixModel;
+        raw_atlas_projection ? input.raw_projection_mix_model : TextureMappingZone::DefaultGenericSolverMixModel;
     const RawOffsetProjectionPreviewSettings raw_projection_preview_settings =
         raw_atlas_projection ?
             raw_offset_projection_preview_settings(raw_filament_colors, raw_projection_mix_model) :
@@ -16872,14 +18104,17 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
         }
     }
     const bool convert_existing_colors_for_raw_projection =
-        m_convert_existing_colors_to_raw_offsets || object_had_raw_atlas_texture;
+        input.convert_existing_colors_to_raw_offsets || object_had_raw_atlas_texture;
     RawOffsetColorConversionSolver raw_conversion_solver =
         raw_atlas_projection && convert_existing_colors_for_raw_projection ?
             build_raw_offset_color_conversion_solver(raw_filament_colors, raw_projection_mix_model) :
             RawOffsetColorConversionSolver();
+    ImageProjectionProgressCounter progress(progress_fn, image_projection_model_part_triangle_count(*object));
 
     bool changed = false;
     for (size_t volume_idx = 0; volume_idx < object->volumes.size(); ++volume_idx) {
+        if (check_cancel)
+            check_cancel();
         ModelVolume *volume = object->volumes[volume_idx];
         if (volume == nullptr || !volume->is_model_part())
             continue;
@@ -16888,8 +18123,8 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
         if (its.vertices.empty() || its.indices.empty())
             continue;
 
-        const ColorRGBA fallback_color = projection_base_color_for_volume(*volume);
-        const Transform3d world_matrix = projection_world_matrix_for_volume(m_parent, object, volume, instance_idx);
+        const ColorRGBA fallback_color = projection_base_color_for_input_volume(input.volume_base_colors, volume_idx, *volume);
+        const Transform3d world_matrix = projection_world_matrix_for_context(context, m_parent, object, volume, volume_idx, instance_idx);
         const Matrix3d world_normal_matrix = world_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
         const std::vector<Vec3d> vertex_normals = projection_smoothed_vertex_normals(its);
         const bool had_raw_atlas_texture = model_volume_has_raw_atlas_texture_data(volume);
@@ -16902,8 +18137,12 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
             discard_existing_texture_for_raw_atlas;
         GeneratedImageTextureAtlas generated_atlas;
         if (generated_texture) {
-            if (!initialize_generated_image_texture(*volume, fallback_color, &generated_atlas, &world_matrix))
+            if (check_cancel)
+                check_cancel();
+            if (!initialize_generated_image_texture(*volume, fallback_color, &generated_atlas, &world_matrix, check_cancel))
                 continue;
+            if (check_cancel)
+                check_cancel();
         }
 
         const VolumeColorSource source = build_volume_color_source(*volume);
@@ -16931,6 +18170,9 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
         }
 
         for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+            if (check_cancel)
+                check_cancel();
+            ImageProjectionProgressStep progress_step(progress);
             const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
             if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
                 continue;
@@ -16990,6 +18232,8 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
 
             if (!uv_raster_too_large) {
                 for (int y_px = min_y; y_px <= max_y; ++y_px) {
+                    if (check_cancel)
+                        check_cancel();
                     for (int x_px = min_x; x_px <= max_x; ++x_px) {
                         const Vec2f pixel(float(x_px) + 0.5f, float(y_px) + 0.5f);
                         Vec3f barycentric = Vec3f::Zero();
@@ -17046,7 +18290,7 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
                                                        vertices[2] * projection_barycentric.z();
                         const bool sample_visible =
                             projection_sample &&
-                            (m_pass_through_model ||
+                            (input.pass_through_model ||
                              (projection_point_allowed_by_camera_facing(context,
                                                                         world_matrix,
                                                                         world_normal_matrix,
@@ -17129,42 +18373,30 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object)
             changed = true;
         }
     }
+    progress.finish();
     return changed;
 }
 
-bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
+bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object,
+                                                 const ProjectionInput &input,
+                                                 const std::function<void(int)> &progress_fn,
+                                                 const std::function<void()> &check_cancel)
 {
-    const Selection &selection = m_parent.get_selection();
-    const int instance_idx = selection.get_instance_idx();
-    const Camera &camera = wxGetApp().plater()->get_camera();
-    const std::array<int, 4> &viewport = camera.get_viewport();
-    const OverlayRect rect = overlay_rect();
+    const ProjectionContext &context = input.context;
+    const int instance_idx = input.instance_idx;
 
-    ProjectionContext context;
-    context.view_projection = camera.get_projection_matrix().matrix() * camera.get_view_matrix().matrix();
-    context.camera_forward = camera.get_dir_forward();
-    context.camera_position = camera.get_position();
-    context.canvas_width = std::max(1, viewport[2]);
-    context.canvas_height = std::max(1, viewport[3]);
-    context.overlay_left = rect.left;
-    context.overlay_top = rect.top;
-    context.overlay_width = rect.width;
-    context.overlay_height = rect.height;
-    context.image_rgba = &active_projection_rgba();
-    context.image_width = active_projection_width();
-    context.image_height = active_projection_height();
-    context.image_opacity = m_projection_opacity;
-    context.overlay_rotation_deg = m_projection_rotation_deg;
-    context.apply_transparency_as_background = effective_apply_transparency_as_background();
-    apply_projection_section_view(context, m_c != nullptr ? m_c->object_clipper() : nullptr);
-
-    const ProjectionVisibility visibility = m_pass_through_model ?
+    if (check_cancel)
+        check_cancel();
+    const ProjectionVisibility visibility = input.pass_through_model ?
         ProjectionVisibility() :
-        build_projection_visibility(context, m_parent, object, instance_idx);
+        build_projection_visibility(context, m_parent, object, instance_idx, check_cancel);
     const ProjectionPaintableImageMask paintable_mask = build_projection_paintable_image_mask(context, true);
+    ImageProjectionProgressCounter progress(progress_fn, image_projection_model_part_triangle_count(*object) * 2);
 
     bool changed = false;
     for (size_t volume_idx = 0; volume_idx < object->volumes.size(); ++volume_idx) {
+        if (check_cancel)
+            check_cancel();
         ModelVolume *volume = object->volumes[volume_idx];
         if (volume == nullptr || !volume->is_model_part())
             continue;
@@ -17174,8 +18406,8 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
             continue;
 
         const VolumeColorSource source = build_volume_color_source(*volume);
-        const ColorRGBA fallback_color = projection_base_color_for_volume(*volume);
-        const Transform3d world_matrix = projection_world_matrix_for_volume(m_parent, object, volume, instance_idx);
+        const ColorRGBA fallback_color = projection_base_color_for_input_volume(input.volume_base_colors, volume_idx, *volume);
+        const Transform3d world_matrix = projection_world_matrix_for_context(context, m_parent, object, volume, volume_idx, instance_idx);
         const Matrix3d world_normal_matrix = world_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
         const std::vector<Vec3d> vertex_normals = projection_smoothed_vertex_normals(its);
         std::vector<bool> projected_triangles(its.indices.size(), false);
@@ -17184,6 +18416,9 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
         size_t projected_triangle_count = 0;
 
         for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+            if (check_cancel)
+                check_cancel();
+            ImageProjectionProgressStep progress_step(progress);
             const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
             if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
                 continue;
@@ -17214,26 +18449,31 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
             }
         }
 
-        if (projected_triangle_count == 0)
+        if (projected_triangle_count == 0) {
+            progress.step(its.indices.size());
             continue;
+        }
 
-        TextureMappingColorSampler sampler = [this,
-                                              volume,
+        TextureMappingColorSampler sampler = [volume,
                                               source,
                                               context,
                                               world_matrix,
                                               world_normal_matrix,
                                               fallback_color,
                                               volume_idx,
+                                              pass_through_model = input.pass_through_model,
                                               &vertex_normals,
                                               &projected_triangles,
-                                              &visibility](size_t tri_idx,
+                                              &visibility,
+                                              &check_cancel](size_t tri_idx,
                                                            const Vec3f &point,
                                                            const Vec3f &barycentric) {
+            if (check_cancel)
+                check_cancel();
             ColorRGBA color = sample_volume_color_source(*volume, source, tri_idx, point, barycentric, true, &fallback_color);
             if (tri_idx < projected_triangles.size() && projected_triangles[tri_idx]) {
                 const stl_triangle_vertex_indices &tri = volume->mesh().its.indices[tri_idx];
-                if (m_pass_through_model ||
+                if (pass_through_model ||
                     (projection_point_allowed_by_camera_facing(context,
                                                                world_matrix,
                                                                world_normal_matrix,
@@ -17269,7 +18509,10 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
              background_safe_max_depth,
              projected_safe_max_depth,
              &projected_triangles,
-             &projected_triangle_depths](size_t tri_idx, const std::array<Vec3f, 3> &vertices) {
+             &projected_triangle_depths,
+             &check_cancel](size_t tri_idx, const std::array<Vec3f, 3> &vertices) {
+            if (check_cancel)
+                check_cancel();
             const bool projected_triangle = tri_idx < projected_triangles.size() && projected_triangles[tri_idx];
             const int triangle_max_depth = projected_triangle ? projected_safe_max_depth : background_safe_max_depth;
             int depth = 0;
@@ -17287,15 +18530,23 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
         };
 
         TextureMappingColorLeafResamplePredicate resample_leaf =
-            [this, context, world_matrix, volume_idx, &visibility, &projected_triangles](size_t tri_idx,
-                                                                                         const std::array<Vec3f, 3> &vertices,
-                                                                                         const std::array<Vec3f, 3> &,
-                                                                                         uint32_t) {
+            [context,
+             world_matrix,
+             volume_idx,
+             pass_through_model = input.pass_through_model,
+             &visibility,
+             &projected_triangles,
+             &check_cancel](size_t tri_idx,
+                                    const std::array<Vec3f, 3> &vertices,
+                                    const std::array<Vec3f, 3> &,
+                                    uint32_t) {
+            if (check_cancel)
+                check_cancel();
             if (tri_idx >= projected_triangles.size() || !projected_triangles[tri_idx])
                 return false;
             if (!projection_triangle_intersects_overlay(context, world_matrix, vertices))
                 return false;
-            if (m_pass_through_model)
+            if (pass_through_model)
                 return true;
 
             return projection_triangle_has_visible_sample(visibility,
@@ -17305,23 +18556,32 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object)
                                                          projection_visibility_triangle_key(volume_idx, tri_idx));
         };
 
+        const size_t sampler_base = progress.completed;
+        TextureMappingColorProgressFn sampler_progress =
+            [&progress, sampler_base](size_t completed, size_t) {
+            progress.set_completed(sampler_base + completed);
+        };
         volume->texture_mapping_color_facets.set_from_triangle_sampler(*volume,
                                                                        sampler,
                                                                        safe_max_depth,
                                                                        split_threshold,
                                                                        subdivision_depths,
                                                                        &projected_triangles,
-                                                                       resample_leaf);
+                                                                       resample_leaf,
+                                                                       sampler_progress);
+        progress.set_completed(sampler_base + its.indices.size());
         if (volume->texture_mapping_color_facets.metadata_json().empty())
             volume->texture_mapping_color_facets.set_metadata_json(rgb_metadata_json(ColorRGBA(1.f, 1.f, 1.f, 1.f)));
         changed = true;
     }
+    progress.finish();
     return changed;
 }
 
 void GLGizmoImageProjection::refresh_projected_object(ModelObject *object)
 {
     m_parent.update_volumes_colors_by_extruder();
+    wxGetApp().sidebar().update_texture_mapping_panel(false);
     m_parent.set_as_dirty();
     m_parent.request_extra_frame();
 
@@ -17424,22 +18684,30 @@ void GLMmSegmentationGizmo3DScene::finalize_triangle_indices()
 
 void GLGizmoMmuSegmentation::render_filament_remap_ui(float window_width, float max_tooltip_width)
 {
-    size_t n_extr = std::min({(size_t)EnforcerBlockerType::ExtruderMax, m_display_filament_ids.size(), m_extruder_remap.size()});
+    refresh_filament_remap_sources();
 
     unsigned int max_label_id = 1;
-    for (size_t idx = 0; idx < n_extr; ++idx)
-        max_label_id = std::max(max_label_id, m_display_filament_ids[idx]);
+    for (const unsigned int filament_id : m_display_filament_ids)
+        max_label_id = std::max(max_label_id, filament_id);
+    for (const unsigned int filament_id : m_remap_source_filament_ids)
+        max_label_id = std::max(max_label_id, filament_id);
     const std::string max_label = std::to_string(max_label_id);
     const ImVec2 max_label_size = ImGui::CalcTextSize(max_label.c_str(), NULL, true);
     const ImVec2 button_size(max_label_size.x + m_imgui->scaled(0.5f), 0.f);
     const int max_items_per_line = 8;
     const float item_width = button_size.x + m_imgui->scaled(1.5f);
     const float start_pos_x = ImGui::GetCursorPosX();
+    const size_t n_sources = std::min(m_remap_source_filament_ids.size(), m_extruder_remap.size());
+    const size_t n_destinations = std::min((size_t)EnforcerBlockerType::ExtruderMax, m_display_filament_ids.size());
+    const unsigned int selected_filament_id =
+        m_selected_extruder_idx < m_display_filament_ids.size() ? m_display_filament_ids[m_selected_extruder_idx] : 0;
 
-    for (int src = 0; src < (int)n_extr; ++src) {
+    for (int src = 0; src < (int)n_sources; ++src) {
+        const unsigned int src_filament_id = m_remap_source_filament_ids[src];
         const unsigned int dst_filament_id =
             m_extruder_remap[src] < m_display_filament_ids.size() ? m_display_filament_ids[m_extruder_remap[src]] : 0;
-        if (dst_filament_id == 0 || dst_filament_id > m_extruders_colors.size())
+        if (src_filament_id == 0 || src_filament_id > m_extruders_colors.size() ||
+            dst_filament_id == 0 || dst_filament_id > m_extruders_colors.size())
             continue;
         const ColorRGBA &dst_col = m_extruders_colors[dst_filament_id - 1];
         ImVec4 col_vec = ImGuiWrapper::to_ImVec4(dst_col);
@@ -17452,7 +18720,7 @@ void GLGizmoMmuSegmentation::render_filament_remap_ui(float window_width, float 
         ImGuiColorEditFlags flags = ImGuiColorEditFlags_NoAlpha | ImGuiColorEditFlags_NoInputs |
                                     ImGuiColorEditFlags_NoLabel  | ImGuiColorEditFlags_NoPicker |
                                     ImGuiColorEditFlags_NoTooltip;
-        if (m_selected_extruder_idx != src) flags |= ImGuiColorEditFlags_NoBorder;
+        if (selected_filament_id != src_filament_id) flags |= ImGuiColorEditFlags_NoBorder;
         
         #ifdef __APPLE__
             ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGuiWrapper::COL_ORCA);
@@ -17486,13 +18754,16 @@ void GLGizmoMmuSegmentation::render_filament_remap_ui(float window_width, float 
                 ImVec2(pos.x + (size.x - txt_sz.x) * 0.5f, pos.y + (size.y - txt_sz.y) * 0.5f),
                 IM_COL32(0,0,0,255), dst_txt.c_str());
 
+        if (ImGui::IsItemHovered())
+            m_imgui->tooltip(wxString::Format(_L("Filament %u -> %u"), src_filament_id, dst_filament_id), max_tooltip_width);
+
         // popup with possible destinations
         std::string pop_id = "popup_" + std::to_string(src);
         if (clicked) {
             // Calculate popup position centered below the current button
             ImVec2 button_pos = ImGui::GetItemRectMin();
-            ImVec2 button_size = ImGui::GetItemRectSize();
-            ImVec2 popup_pos(button_pos.x + button_size.x * 0.5f, button_pos.y + button_size.y);
+            ImVec2 clicked_button_size = ImGui::GetItemRectSize();
+            ImVec2 popup_pos(button_pos.x + clicked_button_size.x * 0.5f, button_pos.y + clicked_button_size.y);
             
             // Set popup styling BEFORE opening popup
             ImGui::SetNextWindowPos(popup_pos, ImGuiCond_Appearing, ImVec2(0.5f, -0.1f));
@@ -17509,7 +18780,7 @@ void GLGizmoMmuSegmentation::render_filament_remap_ui(float window_width, float 
         if (ImGui::BeginPopup(pop_id.c_str())) {
             const float popup_start_pos_x = ImGui::GetCursorPosX();
             
-            for (int dst = 0; dst < (int)n_extr; ++dst) {
+            for (int dst = 0; dst < (int)n_destinations; ++dst) {
                 const unsigned int popup_filament_id = m_display_filament_ids[dst];
                 if (popup_filament_id == 0 || popup_filament_id > m_extruders_colors.size())
                     continue;
@@ -17587,7 +18858,9 @@ void GLGizmoMmuSegmentation::render_filament_remap_ui(float window_width, float 
 
 void GLGizmoMmuSegmentation::remap_filament_assignments()
 {
-    if (m_extruder_remap.empty())
+    refresh_filament_remap_sources();
+
+    if (m_remap_source_filament_ids.empty() || m_extruder_remap.empty())
         return;
 
     constexpr size_t MAX_EBT = (size_t)EnforcerBlockerType::ExtruderMax;
@@ -17597,16 +18870,16 @@ void GLGizmoMmuSegmentation::remap_filament_assignments()
     for (size_t i = 0; i <= MAX_EBT; ++i)
         state_map[i] = static_cast<EnforcerBlockerType>(i);
 
-    size_t n_extr = std::min({m_extruder_remap.size(), m_display_filament_ids.size(), MAX_EBT});
+    size_t n_extr = std::min(m_extruder_remap.size(), m_remap_source_filament_ids.size());
     bool   any_change = false;
     for (size_t src = 0; src < n_extr; ++src) {
         const size_t dst = m_extruder_remap[src];
         if (dst >= m_display_filament_ids.size())
             continue;
 
-        const unsigned int src_state = m_display_filament_ids[src];
+        const unsigned int src_state = m_remap_source_filament_ids[src];
         const unsigned int dst_state = m_display_filament_ids[dst];
-        if (src_state == 0 || dst_state == 0 || src_state == dst_state)
+        if (src_state == 0 || dst_state == 0 || src_state > MAX_EBT || dst_state > MAX_EBT || src_state == dst_state)
             continue;
 
         state_map[src_state] = static_cast<EnforcerBlockerType>(dst_state);
@@ -17618,7 +18891,7 @@ void GLGizmoMmuSegmentation::remap_filament_assignments()
 
     auto remapped_filament_id = [this, n_extr](unsigned int filament_id) {
         for (size_t src = 0; src < n_extr; ++src) {
-            if (m_display_filament_ids[src] != filament_id)
+            if (m_remap_source_filament_ids[src] != filament_id)
                 continue;
             const size_t dst = m_extruder_remap[src];
             return dst < m_display_filament_ids.size() ? m_display_filament_ids[dst] : filament_id;
@@ -17674,6 +18947,7 @@ void GLGizmoMmuSegmentation::remap_filament_assignments()
         wxGetApp().plater()->get_notification_manager()->push_notification(
             _L("Filament remapping finished.").ToStdString());
         update_model_object();
+        wxGetApp().sidebar().update_texture_mapping_panel(false);
         m_parent.set_as_dirty();
     }
 }

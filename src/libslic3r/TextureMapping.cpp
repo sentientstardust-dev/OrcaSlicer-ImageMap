@@ -645,19 +645,43 @@ static int mapping_mode_from_name(const std::string &name)
 
 static std::string modulation_mode_name(int mode)
 {
-    return clamp_int(mode,
-                     int(TextureMappingZone::ModulationLineWidth),
-                     int(TextureMappingZone::ModulationPerimeterPath)) ==
-               int(TextureMappingZone::ModulationPerimeterPath) ?
-        std::string("perimeter_path") :
-        std::string("line_width");
+    switch (clamp_int(mode,
+                      int(TextureMappingZone::ModulationLineWidth),
+                      int(TextureMappingZone::ModulationPerimeterPathV2))) {
+    case int(TextureMappingZone::ModulationPerimeterPath):
+        return std::string("perimeter_path");
+    case int(TextureMappingZone::ModulationPerimeterPathV2):
+        return std::string("perimeter_path_v2");
+    default:
+        return std::string("line_width");
+    }
 }
 
 static int modulation_mode_from_name(const std::string &name)
 {
-    return name == "perimeter_path" ?
-        int(TextureMappingZone::ModulationPerimeterPath) :
-        int(TextureMappingZone::ModulationLineWidth);
+    if (name == "perimeter_path")
+        return int(TextureMappingZone::ModulationPerimeterPath);
+    if (name == "perimeter_path_v2")
+        return int(TextureMappingZone::ModulationPerimeterPathV2);
+    return int(TextureMappingZone::ModulationLineWidth);
+}
+
+static std::string top_surface_image_printing_method_name(int method)
+{
+    if (method == int(TextureMappingZone::TopSurfaceImageContoning))
+        return std::string("contoning");
+    if (method == int(TextureMappingZone::TopSurfaceImageSameLayer45Partition))
+        return std::string("same_layer_45_partition");
+    return std::string("same_angle_45_width");
+}
+
+static int top_surface_image_printing_method_from_name(const std::string &name)
+{
+    if (name == "contoning")
+        return int(TextureMappingZone::TopSurfaceImageContoning);
+    if (name == "same_layer_45_partition")
+        return int(TextureMappingZone::TopSurfaceImageSameLayer45Partition);
+    return int(TextureMappingZone::TopSurfaceImageSameAngle45Width);
 }
 
 static std::string top_visible_recolor_aggressiveness_name(int mode)
@@ -1011,10 +1035,24 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            seam_hiding == rhs.seam_hiding &&
            nonlinear_offset_adjustment == rhs.nonlinear_offset_adjustment &&
            modulation_mode == rhs.modulation_mode &&
+           use_modulated_overhang_geometry_for_support == rhs.use_modulated_overhang_geometry_for_support &&
            modulation_mode_manually_changed == rhs.modulation_mode_manually_changed &&
            recolor_small_perimeter_loops == rhs.recolor_small_perimeter_loops &&
            recolor_top_visible_perimeter_sections == rhs.recolor_top_visible_perimeter_sections &&
            top_visible_perimeter_recolor_aggressiveness == rhs.top_visible_perimeter_recolor_aggressiveness &&
+           top_visible_perimeter_recolor_above_layers == rhs.top_visible_perimeter_recolor_above_layers &&
+           top_visible_perimeter_recolor_point_sampling == rhs.top_visible_perimeter_recolor_point_sampling &&
+           top_surface_image_printing_enabled == rhs.top_surface_image_printing_enabled &&
+           top_surface_image_printing_method == rhs.top_surface_image_printing_method &&
+           std::abs(top_surface_image_min_line_width_mm - rhs.top_surface_image_min_line_width_mm) <= eps &&
+           std::abs(top_surface_image_max_line_width_mm - rhs.top_surface_image_max_line_width_mm) <= eps &&
+           top_surface_image_colored_top_layers == rhs.top_surface_image_colored_top_layers &&
+           top_surface_image_fixed_coloring_filaments == rhs.top_surface_image_fixed_coloring_filaments &&
+           std::abs(top_surface_contoning_angle_threshold_deg - rhs.top_surface_contoning_angle_threshold_deg) <= eps &&
+           top_surface_contoning_stack_layers == rhs.top_surface_contoning_stack_layers &&
+           std::abs(top_surface_contoning_min_feature_mm - rhs.top_surface_contoning_min_feature_mm) <= eps &&
+           top_surface_contoning_color_lower_surfaces == rhs.top_surface_contoning_color_lower_surfaces &&
+           top_surface_contoning_only_color_surface_infill == rhs.top_surface_contoning_only_color_surface_infill &&
            compact_offset_mode == rhs.compact_offset_mode &&
            use_legacy_fixed_color_mode == rhs.use_legacy_fixed_color_mode &&
            high_speed_image_texture_sampling == rhs.high_speed_image_texture_sampling &&
@@ -1176,7 +1214,7 @@ TextureMappingZone *TextureMappingManager::add_zone(size_t num_physical,
     zone.apply_default_modulation_mode();
 
     std::vector<unsigned int> ids;
-    for (size_t i = 1; i <= std::min<size_t>(num_physical, 9); ++i)
+    for (size_t i = 1; i <= std::min<size_t>(num_physical, 4); ++i)
         ids.emplace_back(unsigned(i));
     zone.component_ids = encode_component_ids(ids);
     zone.component_a = ids[0];
@@ -1342,11 +1380,52 @@ std::string TextureMappingManager::serialize_entries()
         texture["hide_seams"] = zone.seam_hiding;
         texture["nonlinear_offset_adjustment"] = zone.nonlinear_offset_adjustment;
         texture["modulation_mode"] = modulation_mode_name(zone.modulation_mode);
+        texture["use_modulated_overhang_geometry_for_support"] = zone.use_modulated_overhang_geometry_for_support;
         texture["modulation_mode_manually_changed"] = zone.modulation_mode_manually_changed;
         texture["recolor_small_perimeter_loops"] = zone.recolor_small_perimeter_loops || zone.recolor_top_visible_perimeter_sections;
         texture["recolor_top_visible_perimeter_sections"] = zone.recolor_top_visible_perimeter_sections;
         texture["top_visible_perimeter_recolor_aggressiveness"] =
             top_visible_recolor_aggressiveness_name(zone.top_visible_perimeter_recolor_aggressiveness);
+        texture["top_visible_perimeter_recolor_above_layers"] =
+            clamp_int(zone.top_visible_perimeter_recolor_above_layers,
+                      TextureMappingZone::MinTopVisiblePerimeterRecolorAboveLayers,
+                      TextureMappingZone::MaxTopVisiblePerimeterRecolorAboveLayers);
+        texture["top_visible_perimeter_recolor_point_sampling"] = zone.top_visible_perimeter_recolor_point_sampling;
+        texture["top_surface_image_printing_enabled"] = zone.top_surface_image_printing_enabled;
+        texture["top_surface_image_printing_method"] =
+            top_surface_image_printing_method_name(zone.top_surface_image_printing_method);
+        const float top_surface_max_width =
+            std::clamp(finite_or(zone.top_surface_image_max_line_width_mm,
+                                 TextureMappingZone::DefaultTopSurfaceImageMaxLineWidthMm),
+                       TextureMappingZone::MinTopSurfaceImageLineWidthMm,
+                       TextureMappingZone::MaxTopSurfaceImageLineWidthMm);
+        texture["top_surface_image_min_line_width_mm"] =
+            std::clamp(finite_or(zone.top_surface_image_min_line_width_mm,
+                                 TextureMappingZone::DefaultTopSurfaceImageMinLineWidthMm),
+                       TextureMappingZone::MinTopSurfaceImageLineWidthMm,
+                       top_surface_max_width);
+        texture["top_surface_image_max_line_width_mm"] = top_surface_max_width;
+        texture["top_surface_image_colored_top_layers"] =
+            clamp_int(zone.top_surface_image_colored_top_layers,
+                      TextureMappingZone::MinTopSurfaceImageColoredTopLayers,
+                      TextureMappingZone::MaxTopSurfaceImageColoredTopLayers);
+        texture["top_surface_image_fixed_coloring_filaments"] = zone.top_surface_image_fixed_coloring_filaments;
+        texture["top_surface_contoning_angle_threshold_deg"] =
+            std::clamp(finite_or(zone.top_surface_contoning_angle_threshold_deg,
+                                 TextureMappingZone::DefaultTopSurfaceContoningAngleThresholdDeg),
+                       TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg,
+                       TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg);
+        texture["top_surface_contoning_stack_layers"] =
+            clamp_int(zone.top_surface_contoning_stack_layers,
+                      TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                      TextureMappingZone::MaxTopSurfaceContoningStackLayers);
+        texture["top_surface_contoning_min_feature_mm"] =
+            std::clamp(finite_or(zone.top_surface_contoning_min_feature_mm,
+                                 TextureMappingZone::DefaultTopSurfaceContoningMinFeatureMm),
+                       TextureMappingZone::MinTopSurfaceContoningMinFeatureMm,
+                       TextureMappingZone::MaxTopSurfaceContoningMinFeatureMm);
+        texture["top_surface_contoning_color_lower_surfaces"] = zone.top_surface_contoning_color_lower_surfaces;
+        texture["top_surface_contoning_only_color_surface_infill"] = zone.top_surface_contoning_only_color_surface_infill;
         texture["compact_offset_mode"] = zone.compact_offset_mode;
         texture["use_legacy_fixed_color_mode"] = zone.use_legacy_fixed_color_mode;
         texture["high_speed_image_texture_sampling"] = true;
@@ -1514,6 +1593,9 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.reduce_outer_surface_texture = false;
         zone.seam_hiding = texture.value("hide_seams", false);
         zone.nonlinear_offset_adjustment = texture.value("nonlinear_offset_adjustment", false);
+        zone.use_modulated_overhang_geometry_for_support =
+            texture.value("use_modulated_overhang_geometry_for_support",
+                          TextureMappingZone::DefaultUseModulatedOverhangGeometryForSupport);
         const auto modulation_mode_it = texture.find("modulation_mode");
         const bool has_modulation_mode =
             modulation_mode_it != texture.end() && modulation_mode_it->is_string();
@@ -1534,6 +1616,64 @@ void TextureMappingManager::load_entries(const std::string &serialized,
             top_visible_recolor_aggressiveness_from_name(
                 texture.value("top_visible_perimeter_recolor_aggressiveness",
                               top_visible_recolor_aggressiveness_name(TextureMappingZone::DefaultTopVisiblePerimeterRecolorAggressiveness)));
+        zone.top_visible_perimeter_recolor_above_layers =
+            clamp_int(texture.value("top_visible_perimeter_recolor_above_layers",
+                                    TextureMappingZone::DefaultTopVisiblePerimeterRecolorAboveLayers),
+                      TextureMappingZone::MinTopVisiblePerimeterRecolorAboveLayers,
+                      TextureMappingZone::MaxTopVisiblePerimeterRecolorAboveLayers);
+        zone.top_visible_perimeter_recolor_point_sampling =
+            texture.value("top_visible_perimeter_recolor_point_sampling",
+                          TextureMappingZone::DefaultTopVisiblePerimeterRecolorPointSampling);
+        zone.top_surface_image_printing_enabled =
+            texture.value("top_surface_image_printing_enabled",
+                          TextureMappingZone::DefaultTopSurfaceImagePrintingEnabled);
+        zone.top_surface_image_printing_method =
+            top_surface_image_printing_method_from_name(
+                texture.value("top_surface_image_printing_method",
+                              top_surface_image_printing_method_name(TextureMappingZone::DefaultTopSurfaceImagePrintingMethod)));
+        zone.top_surface_image_max_line_width_mm =
+            std::clamp(finite_or(texture.value("top_surface_image_max_line_width_mm",
+                                               TextureMappingZone::DefaultTopSurfaceImageMaxLineWidthMm),
+                                 TextureMappingZone::DefaultTopSurfaceImageMaxLineWidthMm),
+                       TextureMappingZone::MinTopSurfaceImageLineWidthMm,
+                       TextureMappingZone::MaxTopSurfaceImageLineWidthMm);
+        zone.top_surface_image_min_line_width_mm =
+            std::clamp(finite_or(texture.value("top_surface_image_min_line_width_mm",
+                                               TextureMappingZone::DefaultTopSurfaceImageMinLineWidthMm),
+                                 TextureMappingZone::DefaultTopSurfaceImageMinLineWidthMm),
+                       TextureMappingZone::MinTopSurfaceImageLineWidthMm,
+                       zone.top_surface_image_max_line_width_mm);
+        zone.top_surface_image_colored_top_layers =
+            clamp_int(texture.value("top_surface_image_colored_top_layers",
+                                    TextureMappingZone::DefaultTopSurfaceImageColoredTopLayers),
+                      TextureMappingZone::MinTopSurfaceImageColoredTopLayers,
+                      TextureMappingZone::MaxTopSurfaceImageColoredTopLayers);
+        zone.top_surface_image_fixed_coloring_filaments =
+            texture.value("top_surface_image_fixed_coloring_filaments",
+                          TextureMappingZone::DefaultTopSurfaceImageFixedColoringFilaments);
+        zone.top_surface_contoning_angle_threshold_deg =
+            std::clamp(finite_or(texture.value("top_surface_contoning_angle_threshold_deg",
+                                               TextureMappingZone::DefaultTopSurfaceContoningAngleThresholdDeg),
+                                 TextureMappingZone::DefaultTopSurfaceContoningAngleThresholdDeg),
+                       TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg,
+                       TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg);
+        zone.top_surface_contoning_stack_layers =
+            clamp_int(texture.value("top_surface_contoning_stack_layers",
+                                    TextureMappingZone::DefaultTopSurfaceContoningStackLayers),
+                      TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                      TextureMappingZone::MaxTopSurfaceContoningStackLayers);
+        zone.top_surface_contoning_min_feature_mm =
+            std::clamp(finite_or(texture.value("top_surface_contoning_min_feature_mm",
+                                               TextureMappingZone::DefaultTopSurfaceContoningMinFeatureMm),
+                                 TextureMappingZone::DefaultTopSurfaceContoningMinFeatureMm),
+                       TextureMappingZone::MinTopSurfaceContoningMinFeatureMm,
+                       TextureMappingZone::MaxTopSurfaceContoningMinFeatureMm);
+        zone.top_surface_contoning_color_lower_surfaces =
+            texture.value("top_surface_contoning_color_lower_surfaces",
+                          TextureMappingZone::DefaultTopSurfaceContoningColorLowerSurfaces);
+        zone.top_surface_contoning_only_color_surface_infill =
+            texture.value("top_surface_contoning_only_color_surface_infill",
+                          TextureMappingZone::DefaultTopSurfaceContoningOnlyColorSurfaceInfill);
         zone.compact_offset_mode = texture.value("compact_offset_mode", TextureMappingZone::DefaultCompactOffsetMode);
         zone.use_legacy_fixed_color_mode =
             texture.value("use_legacy_fixed_color_mode", TextureMappingZone::DefaultUseLegacyFixedColorMode);

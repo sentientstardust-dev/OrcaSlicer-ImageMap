@@ -480,6 +480,8 @@ set(lisbslic3r_sources
     TriangleSetSampling.hpp
     TextureMappingOffset.cpp
     TextureMappingOffset.hpp
+    TextureMappingContoning.cpp
+    TextureMappingContoning.hpp
     TextureMapping.cpp
     TextureMapping.hpp
     TriangulateWall.cpp

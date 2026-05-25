@@ -24,7 +24,10 @@
 #include "AABBTreeLines.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <float.h>
+#include <functional>
 #include <oneapi/tbb/blocked_range.h>
 #include <oneapi/tbb/concurrent_vector.h>
 #include <oneapi/tbb/parallel_for.h>
@@ -500,6 +503,49 @@ void PrintObject::make_perimeters()
     m_print->set_status(15, L("Generating walls"));
     BOOST_LOG_TRIVIAL(info) << "Generating walls..." << log_memory_info();
 
+    const size_t total_wall_layers = m_layers.size();
+    const size_t wall_progress_step = std::max<size_t>(1, total_wall_layers / 100);
+    tbb::spin_mutex wall_status_mutex;
+    auto wall_progress_percent = [](int min_percent, int max_percent, size_t current, size_t total) {
+        if (total == 0)
+            return min_percent;
+        const double progress = std::min(1.0, double(current) / double(total));
+        return min_percent + int(std::floor(double(max_percent - min_percent) * progress));
+    };
+    auto set_wall_status = [&](int percent, const std::string &message) {
+        tbb::spin_mutex::scoped_lock lock(wall_status_mutex);
+        m_print->set_status(percent, message);
+    };
+    auto should_report_wall_layer = [wall_progress_step, total_wall_layers](size_t current) {
+        return current == 1 || current == total_wall_layers || current % wall_progress_step == 0;
+    };
+    auto layer_region_needs_v2_wall_geometry_update = [this](const LayerRegion *layerm) {
+        if (layerm == nullptr)
+            return false;
+        if (layerm->perimeter_path_modulation_v2_applied)
+            return true;
+        const int filament_id = layerm->region().config().wall_filament.value;
+        if (filament_id <= 0)
+            return false;
+        const TextureMappingZone *zone = this->print()->texture_mapping_manager().zone_from_id(unsigned(filament_id));
+        return zone != nullptr &&
+               zone->enabled &&
+               !zone->deleted &&
+               zone->uses_perimeter_path_modulation_v2() &&
+               (zone->is_surface_gradient() || zone->is_image_texture());
+    };
+    bool report_v2_wall_geometry_progress = false;
+    for (const Layer *layer : m_layers) {
+        for (const LayerRegion *layerm : layer->regions()) {
+            if (layer_region_needs_v2_wall_geometry_update(layerm)) {
+                report_v2_wall_geometry_progress = true;
+                break;
+            }
+        }
+        if (report_v2_wall_geometry_progress)
+            break;
+    }
+
     // Revert the typed slices into untyped slices.
     if (m_typed_slices) {
         for (Layer *layer : m_layers) {
@@ -507,6 +553,23 @@ void PrintObject::make_perimeters()
             m_print->throw_if_canceled();
         }
         m_typed_slices = false;
+    }
+
+    size_t prepared_wall_layers = 0;
+    for (auto layer_it = m_layers.rbegin(); layer_it != m_layers.rend(); ++layer_it) {
+        m_print->throw_if_canceled();
+        if (report_v2_wall_geometry_progress && should_report_wall_layer(prepared_wall_layers + 1))
+            set_wall_status(wall_progress_percent(15, 18, prepared_wall_layers, total_wall_layers),
+                            Slic3r::format(L("Generating walls: preparing layer %1%/%2%"),
+                                           prepared_wall_layers + 1,
+                                           total_wall_layers));
+        (*layer_it)->apply_perimeter_path_modulation_v2();
+        ++prepared_wall_layers;
+        if (report_v2_wall_geometry_progress && prepared_wall_layers == total_wall_layers)
+            set_wall_status(18,
+                            Slic3r::format(L("Generating walls: preparing layer %1%/%2%"),
+                                           prepared_wall_layers,
+                                           total_wall_layers));
     }
 
     // compare each layer to the one below, and mark those slices needing
@@ -581,17 +644,46 @@ void PrintObject::make_perimeters()
     }
 
     BOOST_LOG_TRIVIAL(debug) << "Generating perimeters in parallel - start";
+    if (total_wall_layers > 0)
+        set_wall_status(19, Slic3r::format(L("Generating walls: layer %1%/%2%"), 0, total_wall_layers));
+    std::atomic<size_t> completed_wall_layers { 0 };
+    std::atomic<size_t> next_wall_progress_report { wall_progress_step };
     tbb::parallel_for(
         tbb::blocked_range<size_t>(0, m_layers.size()),
-        [this](const tbb::blocked_range<size_t>& range) {
+        [this,
+         total_wall_layers,
+         wall_progress_step,
+         &completed_wall_layers,
+         &next_wall_progress_report,
+         &wall_progress_percent,
+         &set_wall_status](const tbb::blocked_range<size_t>& range) {
             for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
                 m_print->throw_if_canceled();
                 m_layers[layer_idx]->make_perimeters();
+                const size_t completed = ++completed_wall_layers;
+                if (completed == total_wall_layers) {
+                    set_wall_status(24, Slic3r::format(L("Generating walls: layer %1%/%2%"), completed, total_wall_layers));
+                } else {
+                    size_t next_report = next_wall_progress_report.load();
+                    while (completed >= next_report) {
+                        const size_t next_target = std::min(total_wall_layers, completed + wall_progress_step);
+                        if (next_wall_progress_report.compare_exchange_weak(next_report, next_target)) {
+                            set_wall_status(wall_progress_percent(19, 24, completed, total_wall_layers),
+                                            Slic3r::format(L("Generating walls: layer %1%/%2%"), completed, total_wall_layers));
+                            break;
+                        }
+                    }
+                }
             }
         }
     );
     m_print->throw_if_canceled();
     BOOST_LOG_TRIVIAL(debug) << "Generating perimeters in parallel - end";
+
+    for (Layer *layer : m_layers) {
+        m_print->throw_if_canceled();
+        layer->commit_perimeter_path_modulation_v2_fallbacks();
+    }
 
     this->set_done(posPerimeters);
 }
@@ -741,17 +833,28 @@ void PrintObject::infill()
     this->prepare_infill();
 
     if (this->set_started(posInfill)) {
-        m_print->set_status(35, L("Generating infill toolpath"));
+        const size_t total_layers = m_layers.size();
+        std::atomic<size_t> completed_layers { 0 };
+        auto set_infill_progress = [this, total_layers](size_t completed) {
+            if (total_layers == 0)
+                m_print->set_status(35, L("Generating infill toolpath"));
+            else
+                m_print->set_status(35, Slic3r::format(L("Generating infill toolpath (%1%/%2%)"), completed, total_layers));
+        };
+        set_infill_progress(0);
         const auto& adaptive_fill_octree = this->m_adaptive_fill_octrees.first;
         const auto& support_fill_octree = this->m_adaptive_fill_octrees.second;
+        const std::function<void()> throw_if_canceled = [this]() { m_print->throw_if_canceled(); };
 
         BOOST_LOG_TRIVIAL(debug) << "Filling layers in parallel - start";
         tbb::parallel_for(
             tbb::blocked_range<size_t>(0, m_layers.size()),
-            [this, &adaptive_fill_octree = adaptive_fill_octree, &support_fill_octree = support_fill_octree](const tbb::blocked_range<size_t>& range) {
+            [this, &adaptive_fill_octree = adaptive_fill_octree, &support_fill_octree = support_fill_octree, &throw_if_canceled, &completed_layers, &set_infill_progress](const tbb::blocked_range<size_t>& range) {
                 for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
                     m_print->throw_if_canceled();
-                    m_layers[layer_idx]->make_fills(adaptive_fill_octree.get(), support_fill_octree.get(), this->m_lightning_generator.get());
+                    m_layers[layer_idx]->make_fills(adaptive_fill_octree.get(), support_fill_octree.get(), this->m_lightning_generator.get(), throw_if_canceled);
+                    const size_t completed = completed_layers.fetch_add(1, std::memory_order_relaxed) + 1;
+                    set_infill_progress(completed);
                 }
             }
         );
@@ -832,45 +935,169 @@ void PrintObject::generate_support_material()
     if (this->set_started(posSupportMaterial)) {
         this->clear_support_layers();
 
-        if(!has_support() && !m_print->get_no_check_flag()) {
-            // BBS: pop a warning if objects have significant amount of overhangs but support material is not enabled
-            // Note: we also need to pop warning if support is disabled and only raft is enabled
-            m_print->set_status(50, L("Checking support necessity"));
-            typedef std::chrono::high_resolution_clock clock_;
-            typedef std::chrono::duration<double, std::ratio<1> > second_;
-            std::chrono::time_point<clock_> t0{ clock_::now() };
+        struct LayerSupportGeometryBackup {
+            Layer *layer { nullptr };
+            ExPolygons lslices;
+            std::vector<BoundingBox> lslices_bboxes;
+        };
+        struct LayerRegionSupportGeometryBackup {
+            LayerRegion *layerm { nullptr };
+            SurfaceCollection slices;
+            ExPolygons raw_slices;
+            SurfaceCollection fill_surfaces;
+            ExPolygons fill_expolygons;
+            ExPolygons fill_no_overlap_expolygons;
+            bool perimeter_path_modulation_v2_applied { false };
+        };
 
-            SupportNecessaryType sntype = this->is_support_necessary();
+        std::vector<LayerSupportGeometryBackup> layer_backups;
+        std::vector<LayerRegionSupportGeometryBackup> region_backups;
+        const bool typed_slices_backup = m_typed_slices;
+        bool support_geometry_swapped = false;
 
-            double duration{ std::chrono::duration_cast<second_>(clock_::now() - t0).count() };
-            BOOST_LOG_TRIVIAL(info) << std::fixed << std::setprecision(0) << "is_support_necessary takes " << duration << " secs.";
+        auto rebuild_layer_geometry = [](Layer *layer) {
+            layer->make_slices();
+            layer->lslices_bboxes.clear();
+            layer->lslices_bboxes.reserve(layer->lslices.size());
+            for (const ExPolygon &expoly : layer->lslices)
+                layer->lslices_bboxes.emplace_back(get_extents(expoly));
+        };
 
-            if (sntype != NoNeedSupp) {
-                std::map<SupportNecessaryType, std::string> reasons = {
-                    {SharpTail,L("floating regions")},
-                    {Cantilever,L("floating cantilever")},
-                    {LargeOverhang,L("large overhangs")} };
-                std::string warning_message = Slic3r::format(L("It seems object %s has %s. Please re-orient the object or enable support generation."),
-                    this->model_object()->name, reasons[sntype]);
-                this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, warning_message, PrintStateBase::SlicingNeedSupportOn);
+        auto region_uses_unmodulated_support_geometry = [this](const LayerRegion *layerm) {
+            if (layerm == nullptr)
+                return false;
+            const int filament_id = layerm->region().config().wall_filament.value;
+            if (filament_id <= 0)
+                return false;
+            const TextureMappingZone *zone = this->print()->texture_mapping_manager().zone_from_id(unsigned(filament_id));
+            return zone != nullptr &&
+                   zone->enabled &&
+                   !zone->deleted &&
+                   zone->uses_perimeter_path_modulation_v2() &&
+                   !zone->use_modulated_overhang_geometry_for_support &&
+                   (zone->is_surface_gradient() || zone->is_image_texture());
+        };
+
+        auto restore_support_geometry = [&]() {
+            if (!support_geometry_swapped)
+                return;
+            for (LayerRegionSupportGeometryBackup &backup : region_backups) {
+                backup.layerm->slices = std::move(backup.slices);
+                backup.layerm->raw_slices = std::move(backup.raw_slices);
+                backup.layerm->fill_surfaces = std::move(backup.fill_surfaces);
+                backup.layerm->fill_expolygons = std::move(backup.fill_expolygons);
+                backup.layerm->fill_no_overlap_expolygons = std::move(backup.fill_no_overlap_expolygons);
+                backup.layerm->perimeter_path_modulation_v2_applied = backup.perimeter_path_modulation_v2_applied;
             }
+            for (LayerSupportGeometryBackup &backup : layer_backups) {
+                backup.layer->lslices = std::move(backup.lslices);
+                backup.layer->lslices_bboxes = std::move(backup.lslices_bboxes);
+            }
+            m_typed_slices = typed_slices_backup;
+            support_geometry_swapped = false;
+        };
+
+        auto use_unmodulated_support_geometry = [&]() {
+            bool needed = false;
+            for (Layer *layer : m_layers) {
+                for (LayerRegion *layerm : layer->m_regions) {
+                    if (region_uses_unmodulated_support_geometry(layerm)) {
+                        needed = true;
+                        break;
+                    }
+                }
+                if (needed)
+                    break;
+            }
+            if (!needed)
+                return;
+
+            layer_backups.reserve(m_layers.size());
+            for (Layer *layer : m_layers) {
+                layer_backups.push_back({ layer, layer->lslices, layer->lslices_bboxes });
+                for (LayerRegion *layerm : layer->m_regions) {
+                    region_backups.push_back({
+                        layerm,
+                        layerm->slices,
+                        layerm->raw_slices,
+                        layerm->fill_surfaces,
+                        layerm->fill_expolygons,
+                        layerm->fill_no_overlap_expolygons,
+                        layerm->perimeter_path_modulation_v2_applied
+                    });
+                }
+            }
+            support_geometry_swapped = true;
+
+            for (Layer *layer : m_layers) {
+                bool layer_changed = false;
+                for (LayerRegion *layerm : layer->m_regions) {
+                    if (!region_uses_unmodulated_support_geometry(layerm))
+                        continue;
+                    ExPolygons support_slices =
+                        !layerm->unmodulated_raw_slices.empty() ?
+                            layerm->unmodulated_raw_slices :
+                            (!layerm->raw_slices.empty() ?
+                                layerm->raw_slices :
+                                to_expolygons(layerm->slices.surfaces));
+                    layerm->slices.set(support_slices, stInternal);
+                    layerm->raw_slices = std::move(support_slices);
+                    layerm->perimeter_path_modulation_v2_applied = false;
+                    layer_changed = true;
+                }
+                if (layer_changed)
+                    rebuild_layer_geometry(layer);
+            }
+            this->detect_surfaces_type();
+        };
+
+        try {
+            use_unmodulated_support_geometry();
+
+            if(!has_support() && !m_print->get_no_check_flag()) {
+                // BBS: pop a warning if objects have significant amount of overhangs but support material is not enabled
+                // Note: we also need to pop warning if support is disabled and only raft is enabled
+                m_print->set_status(50, L("Checking support necessity"));
+                typedef std::chrono::high_resolution_clock clock_;
+                typedef std::chrono::duration<double, std::ratio<1> > second_;
+                std::chrono::time_point<clock_> t0{ clock_::now() };
+
+                SupportNecessaryType sntype = this->is_support_necessary();
+
+                double duration{ std::chrono::duration_cast<second_>(clock_::now() - t0).count() };
+                BOOST_LOG_TRIVIAL(info) << std::fixed << std::setprecision(0) << "is_support_necessary takes " << duration << " secs.";
+
+                if (sntype != NoNeedSupp) {
+                    std::map<SupportNecessaryType, std::string> reasons = {
+                        {SharpTail,L("floating regions")},
+                        {Cantilever,L("floating cantilever")},
+                        {LargeOverhang,L("large overhangs")} };
+                    std::string warning_message = Slic3r::format(L("It seems object %s has %s. Please re-orient the object or enable support generation."),
+                        this->model_object()->name, reasons[sntype]);
+                    this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, warning_message, PrintStateBase::SlicingNeedSupportOn);
+                }
 
 #if 0
-            // Printing without supports. Empty layer means some objects or object parts are levitating,
-            // therefore they cannot be printed without supports.
-            for (const Layer *layer : m_layers)
-                if (layer->empty())
-                    throw Slic3r::SlicingError("Levitating objects cannot be printed without supports.");
+                // Printing without supports. Empty layer means some objects or object parts are levitating,
+                // therefore they cannot be printed without supports.
+                for (const Layer *layer : m_layers)
+                    if (layer->empty())
+                        throw Slic3r::SlicingError("Levitating objects cannot be printed without supports.");
 #endif
-        }
+            }
 
-        if ((this->has_support() && m_layers.size() > 1) || (this->has_raft() && !m_layers.empty())) {
-            m_print->set_status(50, L("Generating support"));
+            if ((this->has_support() && m_layers.size() > 1) || (this->has_raft() && !m_layers.empty())) {
+                m_print->set_status(50, L("Generating support"));
 
-            this->_generate_support_material();
-            m_print->throw_if_canceled();
+                this->_generate_support_material();
+                m_print->throw_if_canceled();
+            }
+            restore_support_geometry();
+            this->set_done(posSupportMaterial);
+        } catch (...) {
+            restore_support_geometry();
+            throw;
         }
-        this->set_done(posSupportMaterial);
     }
 }
 

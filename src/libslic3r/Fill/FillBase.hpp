@@ -50,6 +50,7 @@ struct FillParams
     bool        full_infill() const { return density > 0.9999f; }
     // Don't connect the fill lines around the inner perimeter.
     bool        dont_connect() const { return anchor_length_max < 0.05f; }
+    void        check_canceled() const { if (throw_if_canceled != nullptr) throw_if_canceled(throw_if_canceled_context); }
 
     // Fill density, fraction in <0, 1>
     float       density 		{ 0.f };
@@ -103,6 +104,8 @@ struct FillParams
     bool            locked_zag{false};
     float           infill_lock_depth{0.0};
     float           skin_infill_depth{0.0};
+    void            (*throw_if_canceled)(void*){ nullptr };
+    void            *throw_if_canceled_context{ nullptr };
 };
 static_assert(IsTriviallyCopyable<FillParams>::value, "FillParams class is not POD (and it should be - see constructor).");
 

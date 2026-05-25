@@ -33,6 +33,7 @@ struct TextureMappingOffsetWeightField {
     std::vector<float> sample_r;
     std::vector<float> sample_g;
     std::vector<float> sample_b;
+    std::vector<float> sample_normal_z;
     std::vector<float> sample_component_weights;
     std::vector<std::vector<uint32_t>> buckets;
     std::vector<float> fallback_weights;
@@ -103,7 +104,10 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     unsigned int             active_component_id_override = 0,
     std::optional<float>     base_outer_width_mm_override = std::nullopt,
     std::optional<float>     layer_height_mm_override = std::nullopt,
-    std::optional<Vec2d>     plate_origin_mm_override = std::nullopt);
+    std::optional<Vec2d>     plate_origin_mm_override = std::nullopt,
+    std::optional<float>     min_outer_width_mm_override = std::nullopt,
+    std::optional<std::array<float, 4>> image_background_rgba_override = std::nullopt,
+    std::optional<float>     sample_z_mm_override = std::nullopt);
 
 std::vector<float> sample_weight_field_components(const TextureMappingOffsetWeightField &weight_field,
                                                   float                                  x_mm,
@@ -114,6 +118,11 @@ std::optional<std::array<float, 3>> sample_weight_field_rgb(const TextureMapping
                                                             float                                  x_mm,
                                                             float                                  y_mm,
                                                             bool                                   high_resolution_texture_sampling);
+
+std::optional<float> sample_weight_field_normal_z(const TextureMappingOffsetWeightField &weight_field,
+                                                  float                                  x_mm,
+                                                  float                                  y_mm,
+                                                  bool                                   high_resolution_texture_sampling);
 
 float texture_mapping_offset_surface_inset_mm(const TextureMappingOffsetContext &context,
                                               const Point                       &point,

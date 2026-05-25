@@ -171,7 +171,8 @@ protected:
     bool                              m_detect_geometry_edge = true;
     
     // Filament remap feature
-    std::vector<size_t>               m_extruder_remap;      // index → target extruder index
+    std::vector<unsigned int>         m_remap_source_filament_ids;
+    std::vector<size_t>               m_extruder_remap;
     bool                              m_show_filament_remap_ui = false;
 
     static const constexpr float      CursorRadiusMin = 0.1f; // cannot be zero
@@ -237,6 +238,8 @@ private:
                                         const std::array<float, 4> &clipping_plane) const override;
     
     // Filament remapping methods
+    std::vector<unsigned int> selected_object_used_filament_ids() const;
+    void refresh_filament_remap_sources(bool reset_targets = false);
     void remap_filament_assignments();
     void render_filament_remap_ui(float window_width, float max_tooltip_width);
     bool selected_object_has_imported_vertex_colors() const;
@@ -532,6 +535,8 @@ private:
         float height = 0.f;
     };
 
+    struct ProjectionInput;
+
     bool load_projection_image();
     void clear_projection_image();
     void ensure_text_font_names();
@@ -560,10 +565,15 @@ private:
     bool selected_object_has_vertex_color_data() const;
     bool selected_object_has_rgb_data() const;
     bool selected_object_has_raw_atlas_texture_data() const;
+    bool start_projection_job();
     bool project_image_to_selected_object();
-    bool project_to_vertex_colors(ModelObject *object);
-    bool project_to_image_texture(ModelObject *object);
-    bool project_to_rgb_data(ModelObject *object);
+    void fill_projection_input(ProjectionInput &input, const ModelObject *object) const;
+    bool project_image_to_object(ModelObject *object, unsigned int texture_mapping_filament_id, const ProjectionInput &input, const std::function<void(int)> &progress_fn = {}, const std::function<void()> &check_cancel = {});
+    bool project_to_vertex_colors(ModelObject *object, const ProjectionInput &input, const std::function<void(int)> &progress_fn = {}, const std::function<void()> &check_cancel = {});
+    bool project_to_image_texture(ModelObject *object, const ProjectionInput &input, const std::function<void(int)> &progress_fn = {}, const std::function<void()> &check_cancel = {});
+    bool project_to_rgb_data(ModelObject *object, const ProjectionInput &input, const std::function<void(int)> &progress_fn = {}, const std::function<void()> &check_cancel = {});
+    void render_projection_progress();
+    void request_projection_job_cancel();
     void refresh_projected_object(ModelObject *object);
     void remember_projected_object(ModelObject *object);
     void backup_projected_objects();
@@ -609,7 +619,11 @@ private:
     bool                 m_projection_panel_expanded = true;
     bool                 m_apply_transparency_as_background = false;
     bool                 m_pass_through_model = false;
+    bool                 m_erase_region_painting = true;
     bool                 m_convert_existing_colors_to_raw_offsets = true;
+    std::atomic_bool     m_projection_job_active { false };
+    std::atomic_bool     m_projection_job_cancel_requested { false };
+    std::atomic_int      m_projection_job_progress { 0 };
     std::vector<ObjectID> m_projected_object_ids;
 };
 

@@ -20,6 +20,12 @@ void filter_by_extrusion_role_in_place(ExtrusionEntitiesPtr &extrusion_entities,
 
 ExtrusionEntityCollection::ExtrusionEntityCollection(const ExtrusionPaths &paths)
     : no_sort(false)
+    , texture_mapping_extruder_override(-1)
+    , texture_mapping_top_surface_image(false)
+    , texture_mapping_top_surface_zone_id(0)
+    , texture_mapping_top_surface_desired_component_id(0)
+    , texture_mapping_top_surface_stack_depth(-1)
+    , texture_mapping_top_surface_fixed_coloring(true)
 {
     this->append(paths);
 }
@@ -32,6 +38,11 @@ ExtrusionEntityCollection& ExtrusionEntityCollection::operator=(const ExtrusionE
         this->entities[i] = this->entities[i]->clone();
     this->no_sort       = other.no_sort;
     this->texture_mapping_extruder_override = other.texture_mapping_extruder_override;
+    this->texture_mapping_top_surface_image = other.texture_mapping_top_surface_image;
+    this->texture_mapping_top_surface_zone_id = other.texture_mapping_top_surface_zone_id;
+    this->texture_mapping_top_surface_desired_component_id = other.texture_mapping_top_surface_desired_component_id;
+    this->texture_mapping_top_surface_stack_depth = other.texture_mapping_top_surface_stack_depth;
+    this->texture_mapping_top_surface_fixed_coloring = other.texture_mapping_top_surface_fixed_coloring;
     return *this;
 }
 
@@ -40,6 +51,11 @@ void ExtrusionEntityCollection::swap(ExtrusionEntityCollection &c)
     std::swap(this->entities, c.entities);
     std::swap(this->no_sort, c.no_sort);
     std::swap(this->texture_mapping_extruder_override, c.texture_mapping_extruder_override);
+    std::swap(this->texture_mapping_top_surface_image, c.texture_mapping_top_surface_image);
+    std::swap(this->texture_mapping_top_surface_zone_id, c.texture_mapping_top_surface_zone_id);
+    std::swap(this->texture_mapping_top_surface_desired_component_id, c.texture_mapping_top_surface_desired_component_id);
+    std::swap(this->texture_mapping_top_surface_stack_depth, c.texture_mapping_top_surface_stack_depth);
+    std::swap(this->texture_mapping_top_surface_fixed_coloring, c.texture_mapping_top_surface_fixed_coloring);
 }
 
 void ExtrusionEntityCollection::clear()
