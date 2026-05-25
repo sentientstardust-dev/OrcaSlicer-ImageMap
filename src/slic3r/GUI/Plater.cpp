@@ -2141,14 +2141,8 @@ public:
 
         auto *modulation_mode_row = new wxBoxSizer(wxHORIZONTAL);
         modulation_mode_row->Add(new wxStaticText(print_settings_page, wxID_ANY, _L("Modulation mode:")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-        wxArrayString modulation_mode_choices;
-        modulation_mode_choices.Add(_L("Line width modulation"));
-        modulation_mode_choices.Add(_L("Perimeter path modulation (legacy v1)"));
-        modulation_mode_choices.Add(_L("Perimeter path modulation (v2)"));
-        m_modulation_mode_choice = new wxChoice(print_settings_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, modulation_mode_choices);
-        m_modulation_mode_choice->SetSelection(std::clamp(modulation_mode,
-                                                          int(TextureMappingZone::ModulationLineWidth),
-                                                          int(TextureMappingZone::ModulationPerimeterPathV2)));
+        m_modulation_mode_choice = new wxChoice(print_settings_page, wxID_ANY);
+        update_modulation_mode_choices(false, modulation_mode);
         modulation_mode_row->Add(m_modulation_mode_choice, 1, wxALIGN_CENTER_VERTICAL);
         print_settings_root->Add(modulation_mode_row, 0, wxEXPAND | wxALL, gap);
         m_modulation_mode_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) {
@@ -2691,11 +2685,12 @@ public:
     }
     int modulation_mode() const
     {
-        return m_modulation_mode_choice ?
-            std::clamp(m_modulation_mode_choice->GetSelection(),
-                       int(TextureMappingZone::ModulationLineWidth),
-                       int(TextureMappingZone::ModulationPerimeterPathV2)) :
-            TextureMappingZone::DefaultModulationMode;
+        if (m_modulation_mode_choice == nullptr)
+            return TextureMappingZone::DefaultModulationMode;
+        const int selection = m_modulation_mode_choice->GetSelection();
+        if (selection < 0 || selection >= int(m_modulation_mode_choice_values.size()))
+            return TextureMappingZone::DefaultModulationMode;
+        return m_modulation_mode_choice_values[size_t(selection)];
     }
     bool modulation_mode_manually_changed() const { return m_modulation_mode_manually_changed; }
     bool compact_offset_mode() const { return dithering_enabled() || (m_compact_offset_mode_checkbox && m_compact_offset_mode_checkbox->GetValue()); }
@@ -3181,6 +3176,36 @@ private:
         }
     }
 
+    void update_modulation_mode_choices(bool force_perimeter_path_v2, int preferred_mode)
+    {
+        if (m_modulation_mode_choice == nullptr)
+            return;
+        const int mode = force_perimeter_path_v2 ?
+            int(TextureMappingZone::ModulationPerimeterPathV2) :
+            std::clamp(preferred_mode,
+                       int(TextureMappingZone::ModulationLineWidth),
+                       int(TextureMappingZone::ModulationPerimeterPathV2));
+        m_modulation_mode_choice->Clear();
+        m_modulation_mode_choice_values.clear();
+        auto append_mode = [this, force_perimeter_path_v2](int value, const wxString &label) {
+            if (force_perimeter_path_v2 && value != int(TextureMappingZone::ModulationPerimeterPathV2))
+                return;
+            m_modulation_mode_choice->Append(label);
+            m_modulation_mode_choice_values.emplace_back(value);
+        };
+        append_mode(int(TextureMappingZone::ModulationLineWidth), _L("Line width modulation"));
+        append_mode(int(TextureMappingZone::ModulationPerimeterPath), _L("Perimeter path modulation (legacy v1)"));
+        append_mode(int(TextureMappingZone::ModulationPerimeterPathV2), _L("Perimeter path modulation (v2)"));
+        int selection = 0;
+        for (size_t i = 0; i < m_modulation_mode_choice_values.size(); ++i) {
+            if (m_modulation_mode_choice_values[i] == mode) {
+                selection = int(i);
+                break;
+            }
+        }
+        m_modulation_mode_choice->SetSelection(selection);
+    }
+
     void update_dithering_options_visibility(bool fit_dialog)
     {
         const bool enabled = m_dithering_enabled_checkbox != nullptr && m_dithering_enabled_checkbox->GetValue();
@@ -3229,8 +3254,11 @@ private:
             m_top_surface_image_method_choice != nullptr &&
             m_top_surface_image_method_choice->GetSelection() == int(TextureMappingZone::TopSurfaceImageContoning);
         const bool contoning = enabled && contoning_selected;
-        if (contoning && m_modulation_mode_choice != nullptr) {
-            m_modulation_mode_choice->SetSelection(int(TextureMappingZone::ModulationPerimeterPathV2));
+        if (m_modulation_mode_choice != nullptr) {
+            const int preferred_mode = modulation_mode();
+            update_modulation_mode_choices(contoning, preferred_mode);
+        }
+        if (contoning) {
             m_modulation_mode_manually_changed = true;
             update_modulation_mode_options_visibility(false);
         }
@@ -3289,6 +3317,7 @@ private:
     wxCheckBox *m_nonlinear_offset_adjustment_checkbox {nullptr};
     wxCheckBox *m_use_modulated_overhang_geometry_for_support_checkbox {nullptr};
     wxChoice *m_modulation_mode_choice {nullptr};
+    std::vector<int> m_modulation_mode_choice_values;
     bool m_modulation_mode_manually_changed {false};
     wxCheckBox *m_recolor_small_perimeter_loops_checkbox {nullptr};
     wxCheckBox *m_recolor_top_visible_perimeter_sections_checkbox {nullptr};
