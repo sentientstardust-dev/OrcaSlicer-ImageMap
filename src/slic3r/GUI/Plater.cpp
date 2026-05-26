@@ -1905,6 +1905,9 @@ public:
                                         float top_surface_contoning_min_feature_mm,
                                         bool top_surface_contoning_color_lower_surfaces,
                                         bool top_surface_contoning_only_color_surface_infill,
+                                        bool top_surface_contoning_replace_top_perimeters_with_infill,
+                                        bool top_surface_contoning_recolor_surrounding_perimeters,
+                                        int top_surface_contoning_perimeter_mode,
                                         const TextureMappingManager &texture_mapping_zones,
                                         const TextureMappingGlobalSettings &global_settings,
                                         const TextureMappingPrimeTowerImage &prime_tower_image,
@@ -2550,7 +2553,67 @@ public:
                                        0,
                                        wxEXPAND | wxTOP | wxBOTTOM,
                                        gap / 2);
+        m_top_surface_contoning_replace_top_perimeters_checkbox =
+            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Replace top perimeters with infill"));
+        m_top_surface_contoning_replace_top_perimeters_checkbox->SetValue(top_surface_contoning_replace_top_perimeters_with_infill);
+        m_top_surface_contoning_replace_top_perimeters_checkbox->SetMinSize(
+            wxSize(-1, std::max(m_top_surface_contoning_replace_top_perimeters_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+        contoning_checkboxes_root->Add(m_top_surface_contoning_replace_top_perimeters_checkbox,
+                                       0,
+                                       wxEXPAND | wxTOP | wxBOTTOM,
+                                       gap / 2);
+        m_top_surface_contoning_recolor_surrounding_perimeters_checkbox =
+            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Recolor surrounding perimeters to match"));
+        m_top_surface_contoning_recolor_surrounding_perimeters_checkbox->SetValue(
+            top_surface_contoning_recolor_surrounding_perimeters && !top_surface_contoning_replace_top_perimeters_with_infill);
+        m_top_surface_contoning_recolor_surrounding_perimeters_checkbox->SetMinSize(
+            wxSize(-1, std::max(m_top_surface_contoning_recolor_surrounding_perimeters_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+        contoning_checkboxes_root->Add(m_top_surface_contoning_recolor_surrounding_perimeters_checkbox,
+                                       0,
+                                       wxEXPAND | wxTOP | wxBOTTOM,
+                                       gap / 2);
+        m_top_surface_contoning_perimeter_mode_panel = new wxPanel(m_top_surface_contoning_checkboxes_panel, wxID_ANY);
+        auto *contoning_perimeter_mode_row = new wxBoxSizer(wxHORIZONTAL);
+        m_top_surface_contoning_perimeter_mode_panel->SetSizer(contoning_perimeter_mode_row);
+        contoning_perimeter_mode_row->Add(new wxStaticText(m_top_surface_contoning_perimeter_mode_panel, wxID_ANY, _L("Perimeter mode")),
+                                          0,
+                                          wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                                          gap);
+        wxArrayString contoning_perimeter_mode_choices;
+        contoning_perimeter_mode_choices.Add(_L("Segment perimeter into blocks"));
+        contoning_perimeter_mode_choices.Add(_L("Divided line"));
+        contoning_perimeter_mode_choices.Add(_L("Segment perimeter into infill"));
+        m_top_surface_contoning_perimeter_mode_choice =
+            new wxChoice(m_top_surface_contoning_perimeter_mode_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, contoning_perimeter_mode_choices);
+        m_top_surface_contoning_perimeter_mode_choice->SetSelection(
+            std::clamp(top_surface_contoning_perimeter_mode,
+                       int(TextureMappingZone::ContoningPerimeterSegmentBlocks),
+                       int(TextureMappingZone::ContoningPerimeterSegmentInfill)));
+        contoning_perimeter_mode_row->Add(m_top_surface_contoning_perimeter_mode_choice, 1, wxEXPAND);
+        contoning_checkboxes_root->Add(m_top_surface_contoning_perimeter_mode_panel,
+                                       0,
+                                       wxEXPAND | wxTOP | wxBOTTOM,
+                                       gap / 2);
         top_surface_box->Add(m_top_surface_contoning_checkboxes_panel, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, gap);
+        m_top_surface_contoning_only_color_surface_infill_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+            update_top_surface_image_options_visibility(true);
+        });
+        m_top_surface_contoning_replace_top_perimeters_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+            if (m_top_surface_contoning_replace_top_perimeters_checkbox != nullptr &&
+                m_top_surface_contoning_replace_top_perimeters_checkbox->GetValue() &&
+                m_top_surface_contoning_recolor_surrounding_perimeters_checkbox != nullptr) {
+                m_top_surface_contoning_recolor_surrounding_perimeters_checkbox->SetValue(false);
+            }
+            update_top_surface_image_options_visibility(true);
+        });
+        m_top_surface_contoning_recolor_surrounding_perimeters_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+            if (m_top_surface_contoning_recolor_surrounding_perimeters_checkbox != nullptr &&
+                m_top_surface_contoning_recolor_surrounding_perimeters_checkbox->GetValue() &&
+                m_top_surface_contoning_replace_top_perimeters_checkbox != nullptr) {
+                m_top_surface_contoning_replace_top_perimeters_checkbox->SetValue(false);
+            }
+            update_top_surface_image_options_visibility(true);
+        });
         m_top_surface_image_printing_enabled_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
             update_top_surface_image_options_visibility(false);
         });
@@ -2903,6 +2966,25 @@ public:
         return m_top_surface_contoning_only_color_surface_infill_checkbox != nullptr ?
             m_top_surface_contoning_only_color_surface_infill_checkbox->GetValue() :
             TextureMappingZone::DefaultTopSurfaceContoningOnlyColorSurfaceInfill;
+    }
+    bool top_surface_contoning_replace_top_perimeters_with_infill() const
+    {
+        return m_top_surface_contoning_replace_top_perimeters_checkbox != nullptr &&
+               m_top_surface_contoning_replace_top_perimeters_checkbox->GetValue();
+    }
+    bool top_surface_contoning_recolor_surrounding_perimeters() const
+    {
+        return m_top_surface_contoning_recolor_surrounding_perimeters_checkbox != nullptr &&
+               m_top_surface_contoning_recolor_surrounding_perimeters_checkbox->GetValue() &&
+               !top_surface_contoning_replace_top_perimeters_with_infill();
+    }
+    int top_surface_contoning_perimeter_mode() const
+    {
+        return m_top_surface_contoning_perimeter_mode_choice != nullptr ?
+            std::clamp(m_top_surface_contoning_perimeter_mode_choice->GetSelection(),
+                       int(TextureMappingZone::ContoningPerimeterSegmentBlocks),
+                       int(TextureMappingZone::ContoningPerimeterSegmentInfill)) :
+            TextureMappingZone::DefaultTopSurfaceContoningPerimeterMode;
     }
     bool minimum_visibility_offset_enabled() const
     {
@@ -3359,6 +3441,22 @@ private:
             m_top_surface_contoning_only_color_surface_infill_checkbox->Show(contoning);
             m_top_surface_contoning_only_color_surface_infill_checkbox->Enable(contoning);
         }
+        if (m_top_surface_contoning_replace_top_perimeters_checkbox != nullptr) {
+            m_top_surface_contoning_replace_top_perimeters_checkbox->Show(contoning);
+            m_top_surface_contoning_replace_top_perimeters_checkbox->Enable(contoning);
+        }
+        if (m_top_surface_contoning_recolor_surrounding_perimeters_checkbox != nullptr) {
+            m_top_surface_contoning_recolor_surrounding_perimeters_checkbox->Show(contoning);
+            m_top_surface_contoning_recolor_surrounding_perimeters_checkbox->Enable(contoning);
+        }
+        const bool show_perimeter_mode =
+            contoning &&
+            m_top_surface_contoning_recolor_surrounding_perimeters_checkbox != nullptr &&
+            m_top_surface_contoning_recolor_surrounding_perimeters_checkbox->GetValue();
+        if (m_top_surface_contoning_perimeter_mode_panel != nullptr)
+            m_top_surface_contoning_perimeter_mode_panel->Show(show_perimeter_mode);
+        if (m_top_surface_contoning_perimeter_mode_choice != nullptr)
+            m_top_surface_contoning_perimeter_mode_choice->Enable(show_perimeter_mode);
         if (m_top_surface_image_fixed_coloring_filaments_checkbox != nullptr) {
             m_top_surface_image_fixed_coloring_filaments_checkbox->Show(!contoning_selected);
             m_top_surface_image_fixed_coloring_filaments_checkbox->Enable(enabled && !contoning_selected);
@@ -3421,6 +3519,10 @@ private:
     wxPanel *m_top_surface_contoning_checkboxes_panel {nullptr};
     wxCheckBox *m_top_surface_contoning_color_lower_surfaces_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_only_color_surface_infill_checkbox {nullptr};
+    wxCheckBox *m_top_surface_contoning_replace_top_perimeters_checkbox {nullptr};
+    wxCheckBox *m_top_surface_contoning_recolor_surrounding_perimeters_checkbox {nullptr};
+    wxPanel *m_top_surface_contoning_perimeter_mode_panel {nullptr};
+    wxChoice *m_top_surface_contoning_perimeter_mode_choice {nullptr};
     wxCheckBox *m_use_legacy_fixed_color_mode_checkbox {nullptr};
     wxCheckBox *m_minimum_visibility_offset_checkbox {nullptr};
     wxSpinCtrl *m_minimum_visibility_offset_spin {nullptr};
@@ -8422,6 +8524,9 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.top_surface_contoning_min_feature_mm,
                                                     updated.top_surface_contoning_color_lower_surfaces,
                                                     updated.top_surface_contoning_only_color_surface_infill,
+                                                    updated.top_surface_contoning_replace_top_perimeters_with_infill,
+                                                    updated.top_surface_contoning_recolor_surrounding_perimeters,
+                                                    updated.top_surface_contoning_perimeter_mode,
                                                     bundle->texture_mapping_zones,
                                                     bundle->texture_mapping_global_settings,
                                                     wxGetApp().model().texture_mapping_prime_tower_image,
@@ -8477,6 +8582,11 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.top_surface_contoning_min_feature_mm = dlg.top_surface_contoning_min_feature_mm();
             updated.top_surface_contoning_color_lower_surfaces = dlg.top_surface_contoning_color_lower_surfaces();
             updated.top_surface_contoning_only_color_surface_infill = dlg.top_surface_contoning_only_color_surface_infill();
+            updated.top_surface_contoning_replace_top_perimeters_with_infill =
+                dlg.top_surface_contoning_replace_top_perimeters_with_infill();
+            updated.top_surface_contoning_recolor_surrounding_perimeters =
+                dlg.top_surface_contoning_recolor_surrounding_perimeters();
+            updated.top_surface_contoning_perimeter_mode = dlg.top_surface_contoning_perimeter_mode();
             if (updated.top_surface_image_printing_enabled &&
                 updated.top_surface_image_printing_method == int(TextureMappingZone::TopSurfaceImageContoning)) {
                 updated.modulation_mode = int(TextureMappingZone::ModulationPerimeterPathV2);

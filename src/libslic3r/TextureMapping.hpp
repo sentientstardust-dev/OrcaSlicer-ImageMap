@@ -72,6 +72,12 @@ struct TextureMappingZone
         TopSurfaceImageContoning = 2
     };
 
+    enum TopSurfaceContoningPerimeterMode : uint8_t {
+        ContoningPerimeterSegmentBlocks = 0,
+        ContoningPerimeterDividedLine = 1,
+        ContoningPerimeterSegmentInfill = 2
+    };
+
     enum FilamentColorMode : uint8_t {
         FilamentColorAny = 0,
         FilamentColorRGB = 1,
@@ -170,6 +176,9 @@ struct TextureMappingZone
     static constexpr float DefaultTopSurfaceContoningMinFeatureMm = 0.f;
     static constexpr bool  DefaultTopSurfaceContoningColorLowerSurfaces = true;
     static constexpr bool  DefaultTopSurfaceContoningOnlyColorSurfaceInfill = true;
+    static constexpr bool  DefaultTopSurfaceContoningReplaceTopPerimetersWithInfill = false;
+    static constexpr bool  DefaultTopSurfaceContoningRecolorSurroundingPerimeters = false;
+    static constexpr int   DefaultTopSurfaceContoningPerimeterMode = int(ContoningPerimeterDividedLine);
     static constexpr bool  DefaultCompactOffsetMode = true;
     static constexpr bool  DefaultUseLegacyFixedColorMode = false;
     static constexpr bool  DefaultHighSpeedImageTextureSampling = true;
@@ -270,6 +279,9 @@ struct TextureMappingZone
     float       top_surface_contoning_min_feature_mm = DefaultTopSurfaceContoningMinFeatureMm;
     bool        top_surface_contoning_color_lower_surfaces = DefaultTopSurfaceContoningColorLowerSurfaces;
     bool        top_surface_contoning_only_color_surface_infill = DefaultTopSurfaceContoningOnlyColorSurfaceInfill;
+    bool        top_surface_contoning_replace_top_perimeters_with_infill = DefaultTopSurfaceContoningReplaceTopPerimetersWithInfill;
+    bool        top_surface_contoning_recolor_surrounding_perimeters = DefaultTopSurfaceContoningRecolorSurroundingPerimeters;
+    int         top_surface_contoning_perimeter_mode = DefaultTopSurfaceContoningPerimeterMode;
     bool        compact_offset_mode = DefaultCompactOffsetMode;
     bool        use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
     bool        high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;
@@ -332,7 +344,10 @@ struct TextureMappingZone
     }
     bool top_surface_contoning_perimeters_active() const
     {
-        return top_surface_contoning_active() && !top_surface_contoning_only_color_surface_infill;
+        return top_surface_contoning_active() &&
+               !top_surface_contoning_only_color_surface_infill &&
+               !top_surface_contoning_replace_top_perimeters_with_infill &&
+               !top_surface_contoning_recolor_surrounding_perimeters;
     }
 
     void apply_default_modulation_mode()
@@ -383,6 +398,9 @@ struct TextureMappingZone
         top_surface_contoning_min_feature_mm = DefaultTopSurfaceContoningMinFeatureMm;
         top_surface_contoning_color_lower_surfaces = DefaultTopSurfaceContoningColorLowerSurfaces;
         top_surface_contoning_only_color_surface_infill = DefaultTopSurfaceContoningOnlyColorSurfaceInfill;
+        top_surface_contoning_replace_top_perimeters_with_infill = DefaultTopSurfaceContoningReplaceTopPerimetersWithInfill;
+        top_surface_contoning_recolor_surrounding_perimeters = DefaultTopSurfaceContoningRecolorSurroundingPerimeters;
+        top_surface_contoning_perimeter_mode = DefaultTopSurfaceContoningPerimeterMode;
         compact_offset_mode = DefaultCompactOffsetMode;
         use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
         high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;
