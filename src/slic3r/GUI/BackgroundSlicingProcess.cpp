@@ -355,6 +355,12 @@ void BackgroundSlicingProcess::thread_proc()
 		else {
 			//BBS: internal cancel
 			m_internal_cancelled = true;
+			if (m_internal_cancel_event_requested) {
+				m_internal_cancel_event_requested = false;
+				SlicingProcessCompletedEvent evt(m_event_finished_id, 0, SlicingProcessCompletedEvent::Cancelled, exception);
+				BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": send internal SlicingProcessCompletedEvent to main, status %1%")%evt.status();
+				wxQueueEvent(GUI::wxGetApp().mainframe->m_plater, evt.Clone());
+			}
 		}
 		m_print->restart();
 		lck.unlock();
@@ -556,6 +562,7 @@ bool BackgroundSlicingProcess::stop()
 	if (m_state == STATE_STARTED || m_state == STATE_RUNNING) {
 		// Cancel any task planned by the background thread on UI thread.
 		cancel_ui_task(m_ui_task);
+		m_internal_cancel_event_requested = false;
 		m_print->cancel();
 		// Wait until the background processing stops by being canceled.
 		m_condition.wait(lck, [this](){ return m_state == STATE_CANCELED; });
@@ -584,6 +591,19 @@ bool BackgroundSlicingProcess::cancel()
 		return true;
 	}
 	return m_state == STATE_FINISHED || m_state == STATE_CANCELED;
+}
+
+bool BackgroundSlicingProcess::cancel_internal()
+{
+	BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< ", enter"<<std::endl;
+	std::unique_lock<std::mutex> lck(m_mutex);
+	if (m_state == STATE_STARTED || m_state == STATE_RUNNING) {
+		cancel_ui_task(m_ui_task);
+		m_internal_cancel_event_requested = true;
+		m_print->cancel_internal();
+		return true;
+	}
+	return false;
 }
 
 bool BackgroundSlicingProcess::reset()

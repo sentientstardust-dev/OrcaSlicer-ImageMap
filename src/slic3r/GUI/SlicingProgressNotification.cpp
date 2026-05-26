@@ -146,6 +146,12 @@ void NotificationManager::SlicingProgressNotification::set_status_text(const std
 	}
 }
 
+void NotificationManager::SlicingProgressNotification::set_cancel_requested_text(const std::string& text)
+{
+	m_cancel_requested = true;
+	set_status_text(text);
+}
+
 void NotificationManager::SlicingProgressNotification::set_print_info(const std::string& info)
 {
 	if (m_sp_state != SlicingProgressState::SP_COMPLETED) {
@@ -169,8 +175,7 @@ void NotificationManager::SlicingProgressNotification::on_cancel_button()
 		if (!m_cancel_callback()) {
 			set_progress_state(SlicingProgressState::SP_NO_SLICING);
 		} else {
-			m_cancel_requested = true;
-			set_status_text(_u8L("Cancelling..."));
+			set_cancel_requested_text(_u8L("Cancelling..."));
 		}
 	}
 }

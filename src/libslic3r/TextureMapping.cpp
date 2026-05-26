@@ -684,6 +684,45 @@ static int top_surface_image_printing_method_from_name(const std::string &name)
     return int(TextureMappingZone::TopSurfaceImageSameAngle45Width);
 }
 
+static std::string top_surface_contoning_flat_surface_infill_mode_name(int mode)
+{
+    switch (clamp_int(mode,
+                      int(TextureMappingZone::ContoningFlatSurfaceInfillDefault),
+                      int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinHybrid))) {
+    case int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinear):
+        return "rectilinear";
+    case int(TextureMappingZone::ContoningFlatSurfaceInfillConcentric):
+        return "concentric";
+    case int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinFixed):
+        return "boundary_skin_fixed";
+    case int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariable):
+        return "boundary_skin_variable";
+    case int(TextureMappingZone::ContoningFlatSurfaceInfillSpiral):
+        return "spiral";
+    case int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinHybrid):
+        return "boundary_skin_hybrid";
+    default:
+        return "default";
+    }
+}
+
+static int top_surface_contoning_flat_surface_infill_mode_from_name(const std::string &name)
+{
+    if (name == "rectilinear")
+        return int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinear);
+    if (name == "concentric")
+        return int(TextureMappingZone::ContoningFlatSurfaceInfillConcentric);
+    if (name == "boundary_skin" || name == "boundary_skin_variable")
+        return int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariable);
+    if (name == "boundary_skin_fixed")
+        return int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinFixed);
+    if (name == "spiral")
+        return int(TextureMappingZone::ContoningFlatSurfaceInfillSpiral);
+    if (name == "boundary_skin_hybrid")
+        return int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinHybrid);
+    return int(TextureMappingZone::ContoningFlatSurfaceInfillDefault);
+}
+
 static std::string top_visible_recolor_aggressiveness_name(int mode)
 {
     switch (clamp_int(mode,
@@ -1057,6 +1096,7 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            top_surface_contoning_replace_top_perimeters_with_infill == rhs.top_surface_contoning_replace_top_perimeters_with_infill &&
            top_surface_contoning_recolor_surrounding_perimeters == rhs.top_surface_contoning_recolor_surrounding_perimeters &&
            top_surface_contoning_perimeter_mode == rhs.top_surface_contoning_perimeter_mode &&
+           top_surface_contoning_flat_surface_infill_mode == rhs.top_surface_contoning_flat_surface_infill_mode &&
            top_surface_contoning_layer_phase_enabled == rhs.top_surface_contoning_layer_phase_enabled &&
            top_surface_contoning_varied_infill_angles_enabled == rhs.top_surface_contoning_varied_infill_angles_enabled &&
            top_surface_contoning_blue_noise_error_diffusion_enabled == rhs.top_surface_contoning_blue_noise_error_diffusion_enabled &&
@@ -1448,6 +1488,8 @@ std::string TextureMappingManager::serialize_entries()
             clamp_int(zone.top_surface_contoning_perimeter_mode,
                       int(TextureMappingZone::ContoningPerimeterSegmentBlocks),
                       int(TextureMappingZone::ContoningPerimeterSegmentInfill));
+        texture["top_surface_contoning_flat_surface_infill_mode"] =
+            top_surface_contoning_flat_surface_infill_mode_name(zone.top_surface_contoning_flat_surface_infill_mode);
         texture["top_surface_contoning_layer_phase_enabled"] = zone.top_surface_contoning_layer_phase_enabled;
         texture["top_surface_contoning_varied_infill_angles_enabled"] =
             zone.top_surface_contoning_varied_infill_angles_enabled;
@@ -1721,6 +1763,15 @@ void TextureMappingManager::load_entries(const std::string &serialized,
                                     TextureMappingZone::DefaultTopSurfaceContoningPerimeterMode),
                       int(TextureMappingZone::ContoningPerimeterSegmentBlocks),
                       int(TextureMappingZone::ContoningPerimeterSegmentInfill));
+        auto flat_surface_infill_mode_it = texture.find("top_surface_contoning_flat_surface_infill_mode");
+        zone.top_surface_contoning_flat_surface_infill_mode =
+            flat_surface_infill_mode_it != texture.end() && flat_surface_infill_mode_it->is_string() ?
+                top_surface_contoning_flat_surface_infill_mode_from_name(flat_surface_infill_mode_it->get<std::string>()) :
+                clamp_int(flat_surface_infill_mode_it != texture.end() && flat_surface_infill_mode_it->is_number_integer() ?
+                              flat_surface_infill_mode_it->get<int>() :
+                          TextureMappingZone::DefaultTopSurfaceContoningFlatSurfaceInfillMode,
+                          int(TextureMappingZone::ContoningFlatSurfaceInfillDefault),
+                          int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinHybrid));
         if (zone.top_surface_contoning_replace_top_perimeters_with_infill)
             zone.top_surface_contoning_recolor_surrounding_perimeters = false;
         zone.top_surface_contoning_layer_phase_enabled =

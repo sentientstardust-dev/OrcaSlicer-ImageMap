@@ -2402,6 +2402,18 @@ void NotificationManager::set_slicing_progress_percentage(const std::string& tex
 	// Slicing progress notification was not found - init it thru plater so correct cancel callback function is appended
 	wxGetApp().plater()->init_notification_manager();
 }
+void NotificationManager::set_slicing_progress_canceling(const std::string& text)
+{
+	for (std::unique_ptr<PopNotification>& notification : m_pop_notifications) {
+		if (notification->get_type() == NotificationType::SlicingProgress) {
+			SlicingProgressNotification* spn = dynamic_cast<SlicingProgressNotification*>(notification.get());
+			spn->set_cancel_requested_text(text);
+			wxGetApp().plater()->get_current_canvas3D()->schedule_extra_frame(0);
+			return;
+		}
+	}
+	wxGetApp().plater()->init_notification_manager();
+}
 void NotificationManager::set_slicing_progress_canceled(const std::string& text)
 {
 	for (std::unique_ptr<PopNotification>& notification : m_pop_notifications) {

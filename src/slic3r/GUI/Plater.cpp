@@ -1908,6 +1908,7 @@ public:
                                         bool top_surface_contoning_replace_top_perimeters_with_infill,
                                         bool top_surface_contoning_recolor_surrounding_perimeters,
                                         int top_surface_contoning_perimeter_mode,
+                                        int top_surface_contoning_flat_surface_infill_mode,
                                         bool top_surface_contoning_layer_phase_enabled,
                                         bool top_surface_contoning_varied_infill_angles_enabled,
                                         bool top_surface_contoning_blue_noise_error_diffusion_enabled,
@@ -2532,6 +2533,27 @@ public:
         contoning_feature_row->Add(m_top_surface_contoning_min_feature_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
         contoning_feature_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("mm")), 0, wxALIGN_CENTER_VERTICAL);
         top_surface_contoning_root->Add(contoning_feature_row, 0, wxEXPAND);
+        auto *contoning_flat_infill_row = new wxBoxSizer(wxHORIZONTAL);
+        contoning_flat_infill_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Flat surface infill mode")),
+                                       0,
+                                       wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                                       gap);
+        wxArrayString contoning_flat_infill_choices;
+        contoning_flat_infill_choices.Add(_L("Default (Rectilinear)"));
+        contoning_flat_infill_choices.Add(_L("Rectilinear"));
+        contoning_flat_infill_choices.Add(_L("Concentric"));
+        contoning_flat_infill_choices.Add(_L("Boundary Skin (fixed width)"));
+        contoning_flat_infill_choices.Add(_L("Boundary Skin (variable width)"));
+        contoning_flat_infill_choices.Add(_L("Spiral"));
+        contoning_flat_infill_choices.Add(_L("Boundary Skin Hybrid"));
+        m_top_surface_contoning_flat_surface_infill_choice =
+            new wxChoice(m_top_surface_contoning_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, contoning_flat_infill_choices);
+        m_top_surface_contoning_flat_surface_infill_choice->SetSelection(
+            std::clamp(top_surface_contoning_flat_surface_infill_mode,
+                       int(TextureMappingZone::ContoningFlatSurfaceInfillDefault),
+                       int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinHybrid)));
+        contoning_flat_infill_row->Add(m_top_surface_contoning_flat_surface_infill_choice, 1, wxEXPAND);
+        top_surface_contoning_root->Add(contoning_flat_infill_row, 0, wxEXPAND | wxTOP, gap);
         top_surface_box->Add(m_top_surface_contoning_panel, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
         m_top_surface_image_fixed_coloring_filaments_checkbox =
             new wxCheckBox(top_surface_page, wxID_ANY, _L("Fixed top-surface coloring filaments"));
@@ -3036,6 +3058,14 @@ public:
                        int(TextureMappingZone::ContoningPerimeterSegmentInfill)) :
             TextureMappingZone::DefaultTopSurfaceContoningPerimeterMode;
     }
+    int top_surface_contoning_flat_surface_infill_mode() const
+    {
+        return m_top_surface_contoning_flat_surface_infill_choice != nullptr ?
+            std::clamp(m_top_surface_contoning_flat_surface_infill_choice->GetSelection(),
+                       int(TextureMappingZone::ContoningFlatSurfaceInfillDefault),
+                       int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinHybrid)) :
+            TextureMappingZone::DefaultTopSurfaceContoningFlatSurfaceInfillMode;
+    }
     bool top_surface_contoning_layer_phase_enabled() const
     {
         return m_top_surface_contoning_layer_phase_checkbox != nullptr &&
@@ -3507,6 +3537,8 @@ private:
             m_top_surface_contoning_pattern_filaments_spin->Enable(contoning);
         if (m_top_surface_contoning_min_feature_spin != nullptr)
             m_top_surface_contoning_min_feature_spin->Enable(contoning);
+        if (m_top_surface_contoning_flat_surface_infill_choice != nullptr)
+            m_top_surface_contoning_flat_surface_infill_choice->Enable(contoning);
         if (m_top_surface_contoning_checkboxes_panel != nullptr)
             m_top_surface_contoning_checkboxes_panel->Show(contoning);
         if (m_top_surface_contoning_color_lower_surfaces_checkbox != nullptr) {
@@ -3612,6 +3644,7 @@ private:
     wxSpinCtrl *m_top_surface_contoning_stack_layers_spin {nullptr};
     wxSpinCtrl *m_top_surface_contoning_pattern_filaments_spin {nullptr};
     wxSpinCtrlDouble *m_top_surface_contoning_min_feature_spin {nullptr};
+    wxChoice *m_top_surface_contoning_flat_surface_infill_choice {nullptr};
     wxPanel *m_top_surface_contoning_checkboxes_panel {nullptr};
     wxCheckBox *m_top_surface_contoning_color_lower_surfaces_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_only_color_surface_infill_checkbox {nullptr};
@@ -8628,6 +8661,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.top_surface_contoning_replace_top_perimeters_with_infill,
                                                     updated.top_surface_contoning_recolor_surrounding_perimeters,
                                                     updated.top_surface_contoning_perimeter_mode,
+                                                    updated.top_surface_contoning_flat_surface_infill_mode,
                                                     updated.top_surface_contoning_layer_phase_enabled,
                                                     updated.top_surface_contoning_varied_infill_angles_enabled,
                                                     updated.top_surface_contoning_blue_noise_error_diffusion_enabled,
@@ -8693,6 +8727,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.top_surface_contoning_recolor_surrounding_perimeters =
                 dlg.top_surface_contoning_recolor_surrounding_perimeters();
             updated.top_surface_contoning_perimeter_mode = dlg.top_surface_contoning_perimeter_mode();
+            updated.top_surface_contoning_flat_surface_infill_mode =
+                dlg.top_surface_contoning_flat_surface_infill_mode();
             updated.top_surface_contoning_layer_phase_enabled = dlg.top_surface_contoning_layer_phase_enabled();
             updated.top_surface_contoning_varied_infill_angles_enabled =
                 dlg.top_surface_contoning_varied_infill_angles_enabled();
@@ -9525,6 +9561,7 @@ struct Plater::priv
     bool m_is_slicing {false};
     bool auto_reslice_pending {false};
     bool auto_reslice_after_cancel {false};
+    bool background_process_update_after_cancel {false};
     bool m_is_publishing {false};
     int m_is_RightClickInLeftUI{-1};
     int m_cur_slice_plate;
@@ -12918,7 +12955,8 @@ void Plater::priv::schedule_auto_reslice_if_needed()
     if (background_process.running() || m_is_slicing) {
         // Remember to restart once the current slice stops and cancel it now.
         auto_reslice_after_cancel = true;
-        background_process.stop();
+        if (background_process.cancel_internal())
+            notification_manager->set_slicing_progress_canceling(_u8L("Cancelling..."));
         return;
     }
 
@@ -13391,6 +13429,13 @@ void Plater::priv::export_gcode(fs::path output_path, bool output_path_on_remova
 }
 unsigned int Plater::priv::update_restart_background_process(bool force_update_scene, bool force_update_preview)
 {
+    if (this->background_process.running()) {
+        if (this->background_process.cancel_internal())
+            notification_manager->set_slicing_progress_canceling(_u8L("Cancelling..."));
+        background_process_update_after_cancel = true;
+        return 0;
+    }
+
     bool switch_print = true;
     //BBS: judge whether can switch print or not
     if ((partplate_list.get_plate_count() > 1) && !this->background_process.can_switch_print())
@@ -15000,6 +15045,7 @@ void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
             m_slice_all_only_has_gcode = false;
     }
 
+    const bool internal_cancelled = this->background_process.is_internal_cancelled();
     // Stop the background task, wait until the thread goes into the "Idle" state.
     // At this point of time the thread should be either finished or canceled,
     // so the following call just confirms, that the produced data were consumed.
@@ -15045,7 +15091,10 @@ void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
     }
     if (evt.cancelled()) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", cancel event, status: %1%") % evt.status();
-        this->notification_manager->set_slicing_progress_canceled(_u8L("Slicing Canceled"));
+        if (internal_cancelled)
+            this->notification_manager->set_slicing_progress_hidden();
+        else
+            this->notification_manager->set_slicing_progress_canceled(_u8L("Slicing Canceled"));
         is_finished = true;
     }
 
@@ -15187,6 +15236,10 @@ void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
     if (auto_reslice_after_cancel) {
         auto_reslice_after_cancel = false;
         schedule_auto_reslice_if_needed();
+    }
+    if (background_process_update_after_cancel) {
+        background_process_update_after_cancel = false;
+        schedule_background_process();
     }
 
     BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(", exit.");

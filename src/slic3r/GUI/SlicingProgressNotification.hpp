@@ -32,6 +32,7 @@ public:
     SlicingProgressState get_progress_state() { return m_sp_state; }
     // sets text of notification - call after setting progress state
     void				set_status_text(const std::string& text);
+    void                set_cancel_requested_text(const std::string& text);
     // sets cancel button callback
     void			    set_cancel_callback(std::function<bool()> callback) { m_cancel_callback = callback; }
     bool                has_cancel_callback() const { return m_cancel_callback != nullptr; }

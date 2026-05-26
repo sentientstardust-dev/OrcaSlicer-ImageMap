@@ -78,6 +78,16 @@ struct TextureMappingZone
         ContoningPerimeterSegmentInfill = 2
     };
 
+    enum TopSurfaceContoningFlatSurfaceInfillMode : uint8_t {
+        ContoningFlatSurfaceInfillDefault = 0,
+        ContoningFlatSurfaceInfillRectilinear = 1,
+        ContoningFlatSurfaceInfillConcentric = 2,
+        ContoningFlatSurfaceInfillBoundarySkinFixed = 3,
+        ContoningFlatSurfaceInfillBoundarySkinVariable = 4,
+        ContoningFlatSurfaceInfillSpiral = 5,
+        ContoningFlatSurfaceInfillBoundarySkinHybrid = 6
+    };
+
     enum FilamentColorMode : uint8_t {
         FilamentColorAny = 0,
         FilamentColorRGB = 1,
@@ -179,6 +189,8 @@ struct TextureMappingZone
     static constexpr bool  DefaultTopSurfaceContoningReplaceTopPerimetersWithInfill = false;
     static constexpr bool  DefaultTopSurfaceContoningRecolorSurroundingPerimeters = false;
     static constexpr int   DefaultTopSurfaceContoningPerimeterMode = int(ContoningPerimeterDividedLine);
+    static constexpr int   DefaultTopSurfaceContoningFlatSurfaceInfillMode = int(ContoningFlatSurfaceInfillDefault);
+    static constexpr int   SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode = int(ContoningFlatSurfaceInfillRectilinear);
     static constexpr bool  DefaultTopSurfaceContoningLayerPhaseEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningVariedInfillAnglesEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled = false;
@@ -215,6 +227,13 @@ struct TextureMappingZone
         case int(LinearGradient):  return DefaultLinearGradientModulationMode;
         default:                   return DefaultImageTextureModulationMode;
         }
+    }
+
+    static constexpr int effective_top_surface_contoning_flat_surface_infill_mode(int mode)
+    {
+        return mode == int(ContoningFlatSurfaceInfillDefault) ?
+            SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode :
+            mode;
     }
 
     struct LinearGradientAnchor {
@@ -287,6 +306,7 @@ struct TextureMappingZone
     bool        top_surface_contoning_replace_top_perimeters_with_infill = DefaultTopSurfaceContoningReplaceTopPerimetersWithInfill;
     bool        top_surface_contoning_recolor_surrounding_perimeters = DefaultTopSurfaceContoningRecolorSurroundingPerimeters;
     int         top_surface_contoning_perimeter_mode = DefaultTopSurfaceContoningPerimeterMode;
+    int         top_surface_contoning_flat_surface_infill_mode = DefaultTopSurfaceContoningFlatSurfaceInfillMode;
     bool        top_surface_contoning_layer_phase_enabled = DefaultTopSurfaceContoningLayerPhaseEnabled;
     bool        top_surface_contoning_varied_infill_angles_enabled = DefaultTopSurfaceContoningVariedInfillAnglesEnabled;
     bool        top_surface_contoning_blue_noise_error_diffusion_enabled = DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled;
@@ -411,6 +431,7 @@ struct TextureMappingZone
         top_surface_contoning_replace_top_perimeters_with_infill = DefaultTopSurfaceContoningReplaceTopPerimetersWithInfill;
         top_surface_contoning_recolor_surrounding_perimeters = DefaultTopSurfaceContoningRecolorSurroundingPerimeters;
         top_surface_contoning_perimeter_mode = DefaultTopSurfaceContoningPerimeterMode;
+        top_surface_contoning_flat_surface_infill_mode = DefaultTopSurfaceContoningFlatSurfaceInfillMode;
         top_surface_contoning_layer_phase_enabled = DefaultTopSurfaceContoningLayerPhaseEnabled;
         top_surface_contoning_varied_infill_angles_enabled = DefaultTopSurfaceContoningVariedInfillAnglesEnabled;
         top_surface_contoning_blue_noise_error_diffusion_enabled = DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled;

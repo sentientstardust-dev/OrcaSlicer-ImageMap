@@ -132,6 +132,7 @@ public:
 	// A stopped background processing may be restarted with start().
 	bool stop();
 	bool cancel();
+	bool cancel_internal();
 	// Cancel the background processing and reset the print. Returns false if the background processing was not running.
 	// Useful when the Model or configuration is being changed drastically.
 	bool reset();
@@ -278,6 +279,7 @@ private:
 	GUI::PartPlate* m_current_plate;
 	PrinterTechnology m_printer_tech = ptUnknown;
 	bool m_internal_cancelled = false;
+	bool m_internal_cancel_event_requested = false;
 
     PrintState<BackgroundSlicingProcessStep, bspsCount>   	m_step_state;
 	bool                set_step_started(BackgroundSlicingProcessStep step);
