@@ -2483,7 +2483,7 @@ public:
         contoning_layers_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("layers")), 0, wxALIGN_CENTER_VERTICAL);
         top_surface_contoning_root->Add(contoning_layers_row, 0, wxEXPAND | wxBOTTOM, gap);
         auto *contoning_pattern_row = new wxBoxSizer(wxHORIZONTAL);
-        contoning_pattern_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Surface infill blend layer count")),
+        contoning_pattern_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Surface infill color pattern length")),
                                    0,
                                    wxALIGN_CENTER_VERTICAL | wxRIGHT,
                                    gap);
@@ -2529,14 +2529,28 @@ public:
             new wxCheckBox(top_surface_page, wxID_ANY, _L("Fixed top-surface coloring filaments"));
         m_top_surface_image_fixed_coloring_filaments_checkbox->SetValue(top_surface_image_fixed_coloring_filaments);
         top_surface_box->Add(m_top_surface_image_fixed_coloring_filaments_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+        m_top_surface_contoning_checkboxes_panel = new wxPanel(top_surface_page, wxID_ANY);
+        auto *contoning_checkboxes_root = new wxBoxSizer(wxVERTICAL);
+        m_top_surface_contoning_checkboxes_panel->SetSizer(contoning_checkboxes_root);
         m_top_surface_contoning_color_lower_surfaces_checkbox =
-            new wxCheckBox(top_surface_page, wxID_ANY, _L("Also color lower surfaces"));
+            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Also color lower surfaces"));
         m_top_surface_contoning_color_lower_surfaces_checkbox->SetValue(top_surface_contoning_color_lower_surfaces);
-        top_surface_box->Add(m_top_surface_contoning_color_lower_surfaces_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+        m_top_surface_contoning_color_lower_surfaces_checkbox->SetMinSize(
+            wxSize(-1, std::max(m_top_surface_contoning_color_lower_surfaces_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+        contoning_checkboxes_root->Add(m_top_surface_contoning_color_lower_surfaces_checkbox,
+                                       0,
+                                       wxEXPAND | wxTOP | wxBOTTOM,
+                                       gap / 2);
         m_top_surface_contoning_only_color_surface_infill_checkbox =
-            new wxCheckBox(top_surface_page, wxID_ANY, _L("Only color surface infill"));
+            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Only color surface infill"));
         m_top_surface_contoning_only_color_surface_infill_checkbox->SetValue(top_surface_contoning_only_color_surface_infill);
-        top_surface_box->Add(m_top_surface_contoning_only_color_surface_infill_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, gap);
+        m_top_surface_contoning_only_color_surface_infill_checkbox->SetMinSize(
+            wxSize(-1, std::max(m_top_surface_contoning_only_color_surface_infill_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+        contoning_checkboxes_root->Add(m_top_surface_contoning_only_color_surface_infill_checkbox,
+                                       0,
+                                       wxEXPAND | wxTOP | wxBOTTOM,
+                                       gap / 2);
+        top_surface_box->Add(m_top_surface_contoning_checkboxes_panel, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, gap);
         m_top_surface_image_printing_enabled_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
             update_top_surface_image_options_visibility(false);
         });
@@ -3335,6 +3349,8 @@ private:
             m_top_surface_contoning_pattern_filaments_spin->Enable(contoning);
         if (m_top_surface_contoning_min_feature_spin != nullptr)
             m_top_surface_contoning_min_feature_spin->Enable(contoning);
+        if (m_top_surface_contoning_checkboxes_panel != nullptr)
+            m_top_surface_contoning_checkboxes_panel->Show(contoning);
         if (m_top_surface_contoning_color_lower_surfaces_checkbox != nullptr) {
             m_top_surface_contoning_color_lower_surfaces_checkbox->Show(contoning);
             m_top_surface_contoning_color_lower_surfaces_checkbox->Enable(contoning);
@@ -3402,6 +3418,7 @@ private:
     wxSpinCtrl *m_top_surface_contoning_stack_layers_spin {nullptr};
     wxSpinCtrl *m_top_surface_contoning_pattern_filaments_spin {nullptr};
     wxSpinCtrlDouble *m_top_surface_contoning_min_feature_spin {nullptr};
+    wxPanel *m_top_surface_contoning_checkboxes_panel {nullptr};
     wxCheckBox *m_top_surface_contoning_color_lower_surfaces_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_only_color_surface_infill_checkbox {nullptr};
     wxCheckBox *m_use_legacy_fixed_color_mode_checkbox {nullptr};

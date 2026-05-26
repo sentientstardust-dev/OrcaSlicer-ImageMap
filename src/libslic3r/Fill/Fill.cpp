@@ -732,6 +732,95 @@ static void top_surface_image_contoning_sort_stack_for_top_color(std::vector<uns
     });
 }
 
+static bool top_surface_image_contoning_can_finish_without_repeat(const std::vector<unsigned int> &ids,
+                                                                  const std::vector<int>          &counts,
+                                                                  unsigned int                     previous_id,
+                                                                  int                              remaining)
+{
+    for (size_t idx = 0; idx < ids.size() && idx < counts.size(); ++idx) {
+        const int limit = ids[idx] == previous_id ? remaining / 2 : (remaining + 1) / 2;
+        if (counts[idx] > limit)
+            return false;
+    }
+    return true;
+}
+
+static void top_surface_image_contoning_spread_stack_repeats(std::vector<unsigned int> &bottom_to_top)
+{
+    if (bottom_to_top.size() < 3)
+        return;
+
+    std::vector<unsigned int> ids;
+    std::vector<int> counts;
+    std::vector<int> ranks;
+    for (size_t pos = 0; pos < bottom_to_top.size(); ++pos) {
+        const unsigned int id = bottom_to_top[pos];
+        auto it = std::find(ids.begin(), ids.end(), id);
+        if (it == ids.end()) {
+            ids.emplace_back(id);
+            counts.emplace_back(1);
+            ranks.emplace_back(int(pos));
+        } else {
+            const size_t idx = size_t(it - ids.begin());
+            ++counts[idx];
+            ranks[idx] = int(pos);
+        }
+    }
+    if (ids.size() < 2)
+        return;
+
+    std::vector<unsigned int> top_to_bottom;
+    top_to_bottom.reserve(bottom_to_top.size());
+    unsigned int previous_id = 0;
+    int remaining = int(bottom_to_top.size());
+
+    auto better_candidate = [&counts, &ranks, &ids](int lhs, int rhs) {
+        if (rhs < 0)
+            return true;
+        if (ranks[size_t(lhs)] != ranks[size_t(rhs)])
+            return ranks[size_t(lhs)] > ranks[size_t(rhs)];
+        if (counts[size_t(lhs)] != counts[size_t(rhs)])
+            return counts[size_t(lhs)] > counts[size_t(rhs)];
+        return ids[size_t(lhs)] < ids[size_t(rhs)];
+    };
+
+    auto select_candidate = [&](bool require_feasible, bool allow_repeat) {
+        int best = -1;
+        for (size_t idx = 0; idx < ids.size(); ++idx) {
+            if (counts[idx] <= 0 || (!allow_repeat && ids[idx] == previous_id))
+                continue;
+            --counts[idx];
+            const bool feasible =
+                top_surface_image_contoning_can_finish_without_repeat(ids, counts, ids[idx], remaining - 1);
+            ++counts[idx];
+            if (require_feasible && !feasible)
+                continue;
+            if (better_candidate(int(idx), best))
+                best = int(idx);
+        }
+        return best;
+    };
+
+    while (remaining > 0) {
+        int selected = select_candidate(true, false);
+        if (selected < 0)
+            selected = select_candidate(false, false);
+        if (selected < 0)
+            selected = select_candidate(false, true);
+        if (selected < 0)
+            break;
+        top_to_bottom.emplace_back(ids[size_t(selected)]);
+        --counts[size_t(selected)];
+        previous_id = ids[size_t(selected)];
+        --remaining;
+    }
+
+    if (top_to_bottom.size() != bottom_to_top.size())
+        return;
+    std::reverse(top_to_bottom.begin(), top_to_bottom.end());
+    bottom_to_top = std::move(top_to_bottom);
+}
+
 static float top_surface_image_contoning_sample_pitch_mm(const TopSurfaceImageRegionPlan &plan,
                                                          const BoundingBox               &bbox)
 {
@@ -1037,6 +1126,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
             if (!stack_rgb)
                 continue;
             top_surface_image_contoning_sort_stack_for_top_color(stack.bottom_to_top, *stack_rgb, print_config);
+            top_surface_image_contoning_spread_stack_repeats(stack.bottom_to_top);
             auto label_it = label_by_stack.find(stack.bottom_to_top);
             int label = -1;
             if (label_it == label_by_stack.end()) {
