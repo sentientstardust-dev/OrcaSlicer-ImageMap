@@ -131,6 +131,7 @@ public:
 	// Cancel the background processing. Returns false if the background processing was not running.
 	// A stopped background processing may be restarted with start().
 	bool stop();
+	bool cancel();
 	// Cancel the background processing and reset the print. Returns false if the background processing was not running.
 	// Useful when the Model or configuration is being changed drastically.
 	bool reset();

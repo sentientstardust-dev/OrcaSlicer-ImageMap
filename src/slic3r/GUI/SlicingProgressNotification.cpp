@@ -70,6 +70,7 @@ bool NotificationManager::SlicingProgressNotification::set_progress_state(Notifi
         set_percentage(-1);
         m_has_print_info = false;
         set_export_possible(false);
+        m_cancel_requested = false;
         m_sp_state             = state;
         return true;
 	case Slic3r::GUI::NotificationManager::SlicingProgressNotification::SlicingProgressState::SP_BEGAN:
@@ -77,6 +78,7 @@ bool NotificationManager::SlicingProgressNotification::set_progress_state(Notifi
 		set_percentage(-1);
 		m_has_print_info = false;
 		set_export_possible(false);
+		m_cancel_requested = false;
 		m_sp_state = state;
         m_current_fade_opacity = 1;
 		return true;
@@ -91,6 +93,7 @@ bool NotificationManager::SlicingProgressNotification::set_progress_state(Notifi
 		set_percentage(-1);
 		m_has_print_info = false;
 		set_export_possible(false);
+		m_cancel_requested = false;
 		m_sp_state = state;
 		return true;
 	case Slic3r::GUI::NotificationManager::SlicingProgressNotification::SlicingProgressState::SP_COMPLETED:
@@ -100,6 +103,7 @@ bool NotificationManager::SlicingProgressNotification::set_progress_state(Notifi
 		m_has_print_info = false;
 		// m_export_possible is important only for SP_PROGRESS state, thus we can reset it here
 		set_export_possible(false);
+		m_cancel_requested = false;
 		m_sp_state = state;
 		return true;
 	default:
@@ -117,7 +121,8 @@ void NotificationManager::SlicingProgressNotification::set_status_text(const std
 		break;
 	case Slic3r::GUI::NotificationManager::SlicingProgressNotification::SlicingProgressState::SP_PROGRESS:
 	{
-		NotificationData data{ NotificationType::SlicingProgress, NotificationLevel::ProgressBarNotificationLevel, 0, text + "." };
+		NotificationData data{ NotificationType::SlicingProgress, NotificationLevel::ProgressBarNotificationLevel, 0,
+			m_cancel_requested ? _u8L("Cancelling...") : text + "." };
 		update(data);
 		m_state = EState::NotFading;
 	}
@@ -163,6 +168,9 @@ void NotificationManager::SlicingProgressNotification::on_cancel_button()
 	if (m_cancel_callback){
 		if (!m_cancel_callback()) {
 			set_progress_state(SlicingProgressState::SP_NO_SLICING);
+		} else {
+			m_cancel_requested = true;
+			set_status_text(_u8L("Cancelling..."));
 		}
 	}
 }

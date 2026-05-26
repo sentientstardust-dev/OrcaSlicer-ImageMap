@@ -8,6 +8,7 @@
 #include "ExtrusionEntityCollection.hpp"
 #include "BoundingBox.hpp"
 #include <functional>
+#include <memory>
 namespace Slic3r {
 
 class ExPolygon;
@@ -18,6 +19,9 @@ class LayerRegion;
 using LayerRegionPtrs = std::vector<LayerRegion*>;
 class PrintRegion;
 class PrintObject;
+class TopSurfaceImageContoningStackPlanCache;
+
+std::shared_ptr<TopSurfaceImageContoningStackPlanCache> make_top_surface_image_contoning_stack_plan_cache();
 
 namespace FillAdaptive {
     struct Octree;
@@ -197,7 +201,8 @@ public:
     void                    make_fills(FillAdaptive::Octree* adaptive_fill_octree,
                                        FillAdaptive::Octree* support_fill_octree,
                                        FillLightning::Generator* lightning_generator = nullptr,
-                                       std::function<void()> throw_if_canceled = {});
+                                       std::function<void()> throw_if_canceled = {},
+                                       TopSurfaceImageContoningStackPlanCache *contoning_stack_plan_cache = nullptr);
     Polylines               generate_sparse_infill_polylines_for_anchoring(FillAdaptive::Octree *adaptive_fill_octree,
                                                                            FillAdaptive::Octree *support_fill_octree,
                                                                            FillLightning::Generator* lightning_generator) const;

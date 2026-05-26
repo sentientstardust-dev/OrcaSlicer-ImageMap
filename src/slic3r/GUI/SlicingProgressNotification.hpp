@@ -71,6 +71,7 @@ protected:
     // if returns false, process was already canceled
     std::function<bool()>	m_cancel_callback;
     SlicingProgressState	m_sp_state{ SlicingProgressState::SP_PROGRESS };
+    bool                    m_cancel_requested{ false };
     bool                    m_sidebar_collapsed{ false };
     // if true, it is possible show export hyperlink in state SP_PROGRESS
     bool                    m_export_possible{ false };

@@ -572,6 +572,20 @@ bool BackgroundSlicingProcess::stop()
 	return true;
 }
 
+bool BackgroundSlicingProcess::cancel()
+{
+	BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< ", enter"<<std::endl;
+	std::unique_lock<std::mutex> lck(m_mutex);
+	if (m_state == STATE_INITIAL || m_state == STATE_IDLE)
+		return false;
+	if (m_state == STATE_STARTED || m_state == STATE_RUNNING) {
+		cancel_ui_task(m_ui_task);
+		m_print->cancel();
+		return true;
+	}
+	return m_state == STATE_FINISHED || m_state == STATE_CANCELED;
+}
+
 bool BackgroundSlicingProcess::reset()
 {
 	bool stopped = this->stop();

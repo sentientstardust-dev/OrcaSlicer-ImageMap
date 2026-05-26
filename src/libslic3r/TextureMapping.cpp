@@ -1061,6 +1061,7 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            top_surface_contoning_varied_infill_angles_enabled == rhs.top_surface_contoning_varied_infill_angles_enabled &&
            top_surface_contoning_blue_noise_error_diffusion_enabled == rhs.top_surface_contoning_blue_noise_error_diffusion_enabled &&
            top_surface_contoning_supersampled_cells_enabled == rhs.top_surface_contoning_supersampled_cells_enabled &&
+           top_surface_contoning_surface_anchored_stacks_enabled == rhs.top_surface_contoning_surface_anchored_stacks_enabled &&
            compact_offset_mode == rhs.compact_offset_mode &&
            use_legacy_fixed_color_mode == rhs.use_legacy_fixed_color_mode &&
            high_speed_image_texture_sampling == rhs.high_speed_image_texture_sampling &&
@@ -1454,6 +1455,8 @@ std::string TextureMappingManager::serialize_entries()
             zone.top_surface_contoning_blue_noise_error_diffusion_enabled;
         texture["top_surface_contoning_supersampled_cells_enabled"] =
             zone.top_surface_contoning_supersampled_cells_enabled;
+        texture["top_surface_contoning_surface_anchored_stacks_enabled"] =
+            zone.top_surface_contoning_surface_anchored_stacks_enabled;
         texture["compact_offset_mode"] = zone.compact_offset_mode;
         texture["use_legacy_fixed_color_mode"] = zone.use_legacy_fixed_color_mode;
         texture["high_speed_image_texture_sampling"] = true;
@@ -1732,6 +1735,9 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.top_surface_contoning_supersampled_cells_enabled =
             texture.value("top_surface_contoning_supersampled_cells_enabled",
                           TextureMappingZone::DefaultTopSurfaceContoningSupersampledCellsEnabled);
+        zone.top_surface_contoning_surface_anchored_stacks_enabled =
+            texture.value("top_surface_contoning_surface_anchored_stacks_enabled",
+                          TextureMappingZone::DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled);
         zone.compact_offset_mode = texture.value("compact_offset_mode", TextureMappingZone::DefaultCompactOffsetMode);
         zone.use_legacy_fixed_color_mode =
             texture.value("use_legacy_fixed_color_mode", TextureMappingZone::DefaultUseLegacyFixedColorMode);

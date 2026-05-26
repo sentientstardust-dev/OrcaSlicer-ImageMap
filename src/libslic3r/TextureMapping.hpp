@@ -183,6 +183,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultTopSurfaceContoningVariedInfillAnglesEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningSupersampledCellsEnabled = false;
+    static constexpr bool  DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled = false;
     static constexpr bool  DefaultCompactOffsetMode = true;
     static constexpr bool  DefaultUseLegacyFixedColorMode = false;
     static constexpr bool  DefaultHighSpeedImageTextureSampling = true;
@@ -290,6 +291,7 @@ struct TextureMappingZone
     bool        top_surface_contoning_varied_infill_angles_enabled = DefaultTopSurfaceContoningVariedInfillAnglesEnabled;
     bool        top_surface_contoning_blue_noise_error_diffusion_enabled = DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled;
     bool        top_surface_contoning_supersampled_cells_enabled = DefaultTopSurfaceContoningSupersampledCellsEnabled;
+    bool        top_surface_contoning_surface_anchored_stacks_enabled = DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled;
     bool        compact_offset_mode = DefaultCompactOffsetMode;
     bool        use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
     bool        high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;
@@ -413,6 +415,7 @@ struct TextureMappingZone
         top_surface_contoning_varied_infill_angles_enabled = DefaultTopSurfaceContoningVariedInfillAnglesEnabled;
         top_surface_contoning_blue_noise_error_diffusion_enabled = DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled;
         top_surface_contoning_supersampled_cells_enabled = DefaultTopSurfaceContoningSupersampledCellsEnabled;
+        top_surface_contoning_surface_anchored_stacks_enabled = DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled;
         compact_offset_mode = DefaultCompactOffsetMode;
         use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
         high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;

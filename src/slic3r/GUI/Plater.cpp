@@ -1912,6 +1912,7 @@ public:
                                         bool top_surface_contoning_varied_infill_angles_enabled,
                                         bool top_surface_contoning_blue_noise_error_diffusion_enabled,
                                         bool top_surface_contoning_supersampled_cells_enabled,
+                                        bool top_surface_contoning_surface_anchored_stacks_enabled,
                                         const TextureMappingManager &texture_mapping_zones,
                                         const TextureMappingGlobalSettings &global_settings,
                                         const TextureMappingPrimeTowerImage &prime_tower_image,
@@ -2634,6 +2635,15 @@ public:
                                        0,
                                        wxEXPAND | wxTOP | wxBOTTOM,
                                        gap / 2);
+        m_top_surface_contoning_surface_anchored_stacks_checkbox =
+            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Surface-anchored stacks"));
+        m_top_surface_contoning_surface_anchored_stacks_checkbox->SetValue(top_surface_contoning_surface_anchored_stacks_enabled);
+        m_top_surface_contoning_surface_anchored_stacks_checkbox->SetMinSize(
+            wxSize(-1, std::max(m_top_surface_contoning_surface_anchored_stacks_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+        contoning_checkboxes_root->Add(m_top_surface_contoning_surface_anchored_stacks_checkbox,
+                                       0,
+                                       wxEXPAND | wxTOP | wxBOTTOM,
+                                       gap / 2);
         top_surface_box->Add(m_top_surface_contoning_checkboxes_panel, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, gap);
         m_top_surface_contoning_only_color_surface_infill_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
             update_top_surface_image_options_visibility(true);
@@ -3045,6 +3055,12 @@ public:
     {
         return m_top_surface_contoning_supersampled_cells_checkbox != nullptr &&
                m_top_surface_contoning_supersampled_cells_checkbox->GetValue();
+    }
+    bool top_surface_contoning_surface_anchored_stacks_enabled() const
+    {
+        return m_top_surface_contoning_surface_anchored_stacks_checkbox == nullptr ?
+            TextureMappingZone::DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled :
+            m_top_surface_contoning_surface_anchored_stacks_checkbox->GetValue();
     }
     bool minimum_visibility_offset_enabled() const
     {
@@ -3533,6 +3549,10 @@ private:
             m_top_surface_contoning_supersampled_cells_checkbox->Show(contoning);
             m_top_surface_contoning_supersampled_cells_checkbox->Enable(contoning);
         }
+        if (m_top_surface_contoning_surface_anchored_stacks_checkbox != nullptr) {
+            m_top_surface_contoning_surface_anchored_stacks_checkbox->Show(contoning);
+            m_top_surface_contoning_surface_anchored_stacks_checkbox->Enable(contoning);
+        }
         if (m_top_surface_image_fixed_coloring_filaments_checkbox != nullptr) {
             m_top_surface_image_fixed_coloring_filaments_checkbox->Show(!contoning_selected);
             m_top_surface_image_fixed_coloring_filaments_checkbox->Enable(enabled && !contoning_selected);
@@ -3603,6 +3623,7 @@ private:
     wxCheckBox *m_top_surface_contoning_varied_infill_angles_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_blue_noise_error_diffusion_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_supersampled_cells_checkbox {nullptr};
+    wxCheckBox *m_top_surface_contoning_surface_anchored_stacks_checkbox {nullptr};
     wxCheckBox *m_use_legacy_fixed_color_mode_checkbox {nullptr};
     wxCheckBox *m_minimum_visibility_offset_checkbox {nullptr};
     wxSpinCtrl *m_minimum_visibility_offset_spin {nullptr};
@@ -8611,6 +8632,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.top_surface_contoning_varied_infill_angles_enabled,
                                                     updated.top_surface_contoning_blue_noise_error_diffusion_enabled,
                                                     updated.top_surface_contoning_supersampled_cells_enabled,
+                                                    updated.top_surface_contoning_surface_anchored_stacks_enabled,
                                                     bundle->texture_mapping_zones,
                                                     bundle->texture_mapping_global_settings,
                                                     wxGetApp().model().texture_mapping_prime_tower_image,
@@ -8678,6 +8700,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 dlg.top_surface_contoning_blue_noise_error_diffusion_enabled();
             updated.top_surface_contoning_supersampled_cells_enabled =
                 dlg.top_surface_contoning_supersampled_cells_enabled();
+            updated.top_surface_contoning_surface_anchored_stacks_enabled =
+                dlg.top_surface_contoning_surface_anchored_stacks_enabled();
             if (updated.top_surface_image_printing_enabled &&
                 updated.top_surface_image_printing_method == int(TextureMappingZone::TopSurfaceImageContoning)) {
                 updated.modulation_mode = int(TextureMappingZone::ModulationPerimeterPathV2);
@@ -15944,8 +15968,7 @@ void Plater::priv::init_notification_manager()
     auto cancel_callback = [this]() {
         if (this->background_process.idle())
             return false;
-        this->background_process.stop();
-        return true;
+        return this->background_process.cancel();
     };
     notification_manager->init_slicing_progress_notification(cancel_callback);
     notification_manager->set_fff(printer_technology == ptFFF);
