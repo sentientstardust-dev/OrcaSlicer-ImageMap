@@ -1908,6 +1908,10 @@ public:
                                         bool top_surface_contoning_replace_top_perimeters_with_infill,
                                         bool top_surface_contoning_recolor_surrounding_perimeters,
                                         int top_surface_contoning_perimeter_mode,
+                                        bool top_surface_contoning_layer_phase_enabled,
+                                        bool top_surface_contoning_varied_infill_angles_enabled,
+                                        bool top_surface_contoning_blue_noise_error_diffusion_enabled,
+                                        bool top_surface_contoning_supersampled_cells_enabled,
                                         const TextureMappingManager &texture_mapping_zones,
                                         const TextureMappingGlobalSettings &global_settings,
                                         const TextureMappingPrimeTowerImage &prime_tower_image,
@@ -2594,6 +2598,42 @@ public:
                                        0,
                                        wxEXPAND | wxTOP | wxBOTTOM,
                                        gap / 2);
+        m_top_surface_contoning_layer_phase_checkbox =
+            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Layer phase detail"));
+        m_top_surface_contoning_layer_phase_checkbox->SetValue(top_surface_contoning_layer_phase_enabled);
+        m_top_surface_contoning_layer_phase_checkbox->SetMinSize(
+            wxSize(-1, std::max(m_top_surface_contoning_layer_phase_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+        contoning_checkboxes_root->Add(m_top_surface_contoning_layer_phase_checkbox,
+                                       0,
+                                       wxEXPAND | wxTOP | wxBOTTOM,
+                                       gap / 2);
+        m_top_surface_contoning_varied_infill_angles_checkbox =
+            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Varied infill angles"));
+        m_top_surface_contoning_varied_infill_angles_checkbox->SetValue(top_surface_contoning_varied_infill_angles_enabled);
+        m_top_surface_contoning_varied_infill_angles_checkbox->SetMinSize(
+            wxSize(-1, std::max(m_top_surface_contoning_varied_infill_angles_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+        contoning_checkboxes_root->Add(m_top_surface_contoning_varied_infill_angles_checkbox,
+                                       0,
+                                       wxEXPAND | wxTOP | wxBOTTOM,
+                                       gap / 2);
+        m_top_surface_contoning_blue_noise_error_diffusion_checkbox =
+            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Blue-noise error diffusion"));
+        m_top_surface_contoning_blue_noise_error_diffusion_checkbox->SetValue(top_surface_contoning_blue_noise_error_diffusion_enabled);
+        m_top_surface_contoning_blue_noise_error_diffusion_checkbox->SetMinSize(
+            wxSize(-1, std::max(m_top_surface_contoning_blue_noise_error_diffusion_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+        contoning_checkboxes_root->Add(m_top_surface_contoning_blue_noise_error_diffusion_checkbox,
+                                       0,
+                                       wxEXPAND | wxTOP | wxBOTTOM,
+                                       gap / 2);
+        m_top_surface_contoning_supersampled_cells_checkbox =
+            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Supersampled cell colors"));
+        m_top_surface_contoning_supersampled_cells_checkbox->SetValue(top_surface_contoning_supersampled_cells_enabled);
+        m_top_surface_contoning_supersampled_cells_checkbox->SetMinSize(
+            wxSize(-1, std::max(m_top_surface_contoning_supersampled_cells_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+        contoning_checkboxes_root->Add(m_top_surface_contoning_supersampled_cells_checkbox,
+                                       0,
+                                       wxEXPAND | wxTOP | wxBOTTOM,
+                                       gap / 2);
         top_surface_box->Add(m_top_surface_contoning_checkboxes_panel, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, gap);
         m_top_surface_contoning_only_color_surface_infill_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
             update_top_surface_image_options_visibility(true);
@@ -2985,6 +3025,26 @@ public:
                        int(TextureMappingZone::ContoningPerimeterSegmentBlocks),
                        int(TextureMappingZone::ContoningPerimeterSegmentInfill)) :
             TextureMappingZone::DefaultTopSurfaceContoningPerimeterMode;
+    }
+    bool top_surface_contoning_layer_phase_enabled() const
+    {
+        return m_top_surface_contoning_layer_phase_checkbox != nullptr &&
+               m_top_surface_contoning_layer_phase_checkbox->GetValue();
+    }
+    bool top_surface_contoning_varied_infill_angles_enabled() const
+    {
+        return m_top_surface_contoning_varied_infill_angles_checkbox != nullptr &&
+               m_top_surface_contoning_varied_infill_angles_checkbox->GetValue();
+    }
+    bool top_surface_contoning_blue_noise_error_diffusion_enabled() const
+    {
+        return m_top_surface_contoning_blue_noise_error_diffusion_checkbox != nullptr &&
+               m_top_surface_contoning_blue_noise_error_diffusion_checkbox->GetValue();
+    }
+    bool top_surface_contoning_supersampled_cells_enabled() const
+    {
+        return m_top_surface_contoning_supersampled_cells_checkbox != nullptr &&
+               m_top_surface_contoning_supersampled_cells_checkbox->GetValue();
     }
     bool minimum_visibility_offset_enabled() const
     {
@@ -3457,6 +3517,22 @@ private:
             m_top_surface_contoning_perimeter_mode_panel->Show(show_perimeter_mode);
         if (m_top_surface_contoning_perimeter_mode_choice != nullptr)
             m_top_surface_contoning_perimeter_mode_choice->Enable(show_perimeter_mode);
+        if (m_top_surface_contoning_layer_phase_checkbox != nullptr) {
+            m_top_surface_contoning_layer_phase_checkbox->Show(contoning);
+            m_top_surface_contoning_layer_phase_checkbox->Enable(contoning);
+        }
+        if (m_top_surface_contoning_varied_infill_angles_checkbox != nullptr) {
+            m_top_surface_contoning_varied_infill_angles_checkbox->Show(contoning);
+            m_top_surface_contoning_varied_infill_angles_checkbox->Enable(contoning);
+        }
+        if (m_top_surface_contoning_blue_noise_error_diffusion_checkbox != nullptr) {
+            m_top_surface_contoning_blue_noise_error_diffusion_checkbox->Show(contoning);
+            m_top_surface_contoning_blue_noise_error_diffusion_checkbox->Enable(contoning);
+        }
+        if (m_top_surface_contoning_supersampled_cells_checkbox != nullptr) {
+            m_top_surface_contoning_supersampled_cells_checkbox->Show(contoning);
+            m_top_surface_contoning_supersampled_cells_checkbox->Enable(contoning);
+        }
         if (m_top_surface_image_fixed_coloring_filaments_checkbox != nullptr) {
             m_top_surface_image_fixed_coloring_filaments_checkbox->Show(!contoning_selected);
             m_top_surface_image_fixed_coloring_filaments_checkbox->Enable(enabled && !contoning_selected);
@@ -3523,6 +3599,10 @@ private:
     wxCheckBox *m_top_surface_contoning_recolor_surrounding_perimeters_checkbox {nullptr};
     wxPanel *m_top_surface_contoning_perimeter_mode_panel {nullptr};
     wxChoice *m_top_surface_contoning_perimeter_mode_choice {nullptr};
+    wxCheckBox *m_top_surface_contoning_layer_phase_checkbox {nullptr};
+    wxCheckBox *m_top_surface_contoning_varied_infill_angles_checkbox {nullptr};
+    wxCheckBox *m_top_surface_contoning_blue_noise_error_diffusion_checkbox {nullptr};
+    wxCheckBox *m_top_surface_contoning_supersampled_cells_checkbox {nullptr};
     wxCheckBox *m_use_legacy_fixed_color_mode_checkbox {nullptr};
     wxCheckBox *m_minimum_visibility_offset_checkbox {nullptr};
     wxSpinCtrl *m_minimum_visibility_offset_spin {nullptr};
@@ -8527,6 +8607,10 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.top_surface_contoning_replace_top_perimeters_with_infill,
                                                     updated.top_surface_contoning_recolor_surrounding_perimeters,
                                                     updated.top_surface_contoning_perimeter_mode,
+                                                    updated.top_surface_contoning_layer_phase_enabled,
+                                                    updated.top_surface_contoning_varied_infill_angles_enabled,
+                                                    updated.top_surface_contoning_blue_noise_error_diffusion_enabled,
+                                                    updated.top_surface_contoning_supersampled_cells_enabled,
                                                     bundle->texture_mapping_zones,
                                                     bundle->texture_mapping_global_settings,
                                                     wxGetApp().model().texture_mapping_prime_tower_image,
@@ -8587,6 +8671,13 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.top_surface_contoning_recolor_surrounding_perimeters =
                 dlg.top_surface_contoning_recolor_surrounding_perimeters();
             updated.top_surface_contoning_perimeter_mode = dlg.top_surface_contoning_perimeter_mode();
+            updated.top_surface_contoning_layer_phase_enabled = dlg.top_surface_contoning_layer_phase_enabled();
+            updated.top_surface_contoning_varied_infill_angles_enabled =
+                dlg.top_surface_contoning_varied_infill_angles_enabled();
+            updated.top_surface_contoning_blue_noise_error_diffusion_enabled =
+                dlg.top_surface_contoning_blue_noise_error_diffusion_enabled();
+            updated.top_surface_contoning_supersampled_cells_enabled =
+                dlg.top_surface_contoning_supersampled_cells_enabled();
             if (updated.top_surface_image_printing_enabled &&
                 updated.top_surface_image_printing_method == int(TextureMappingZone::TopSurfaceImageContoning)) {
                 updated.modulation_mode = int(TextureMappingZone::ModulationPerimeterPathV2);

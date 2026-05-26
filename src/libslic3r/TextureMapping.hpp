@@ -179,6 +179,10 @@ struct TextureMappingZone
     static constexpr bool  DefaultTopSurfaceContoningReplaceTopPerimetersWithInfill = false;
     static constexpr bool  DefaultTopSurfaceContoningRecolorSurroundingPerimeters = false;
     static constexpr int   DefaultTopSurfaceContoningPerimeterMode = int(ContoningPerimeterDividedLine);
+    static constexpr bool  DefaultTopSurfaceContoningLayerPhaseEnabled = false;
+    static constexpr bool  DefaultTopSurfaceContoningVariedInfillAnglesEnabled = false;
+    static constexpr bool  DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled = false;
+    static constexpr bool  DefaultTopSurfaceContoningSupersampledCellsEnabled = false;
     static constexpr bool  DefaultCompactOffsetMode = true;
     static constexpr bool  DefaultUseLegacyFixedColorMode = false;
     static constexpr bool  DefaultHighSpeedImageTextureSampling = true;
@@ -282,6 +286,10 @@ struct TextureMappingZone
     bool        top_surface_contoning_replace_top_perimeters_with_infill = DefaultTopSurfaceContoningReplaceTopPerimetersWithInfill;
     bool        top_surface_contoning_recolor_surrounding_perimeters = DefaultTopSurfaceContoningRecolorSurroundingPerimeters;
     int         top_surface_contoning_perimeter_mode = DefaultTopSurfaceContoningPerimeterMode;
+    bool        top_surface_contoning_layer_phase_enabled = DefaultTopSurfaceContoningLayerPhaseEnabled;
+    bool        top_surface_contoning_varied_infill_angles_enabled = DefaultTopSurfaceContoningVariedInfillAnglesEnabled;
+    bool        top_surface_contoning_blue_noise_error_diffusion_enabled = DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled;
+    bool        top_surface_contoning_supersampled_cells_enabled = DefaultTopSurfaceContoningSupersampledCellsEnabled;
     bool        compact_offset_mode = DefaultCompactOffsetMode;
     bool        use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
     bool        high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;
@@ -401,6 +409,10 @@ struct TextureMappingZone
         top_surface_contoning_replace_top_perimeters_with_infill = DefaultTopSurfaceContoningReplaceTopPerimetersWithInfill;
         top_surface_contoning_recolor_surrounding_perimeters = DefaultTopSurfaceContoningRecolorSurroundingPerimeters;
         top_surface_contoning_perimeter_mode = DefaultTopSurfaceContoningPerimeterMode;
+        top_surface_contoning_layer_phase_enabled = DefaultTopSurfaceContoningLayerPhaseEnabled;
+        top_surface_contoning_varied_infill_angles_enabled = DefaultTopSurfaceContoningVariedInfillAnglesEnabled;
+        top_surface_contoning_blue_noise_error_diffusion_enabled = DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled;
+        top_surface_contoning_supersampled_cells_enabled = DefaultTopSurfaceContoningSupersampledCellsEnabled;
         compact_offset_mode = DefaultCompactOffsetMode;
         use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
         high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;
