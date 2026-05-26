@@ -29,6 +29,12 @@
 
 
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <exception>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 #include <unordered_map>
 #include <functional>
@@ -207,6 +213,216 @@ static bool mesh_boolean_texture_result_has_output(const SimplifyTextureDataResu
         break;
     }
     return result.region_painting_valid;
+}
+
+static bool smooth_mesh_color_snapshot_is_valid(const SimplifyTextureDataSnapshot &snapshot)
+{
+    return snapshot.source != SimplifyColorSource::None;
+}
+
+static bool smooth_mesh_texture_result_preserved_color(const SimplifyTextureDataSnapshot &snapshot, const SimplifyTextureDataResult &result)
+{
+    switch (snapshot.source) {
+    case SimplifyColorSource::RgbaData:
+        return result.source == SimplifyColorSource::RgbaData && result.rgba_data != nullptr;
+    case SimplifyColorSource::ImageTexture:
+        return result.source == SimplifyColorSource::ImageTexture ||
+               (result.source == SimplifyColorSource::RgbaData && result.rgba_data != nullptr);
+    case SimplifyColorSource::VertexColors:
+        return result.source == SimplifyColorSource::VertexColors && !result.vertex_colors_rgba.empty();
+    case SimplifyColorSource::None:
+        break;
+    }
+    return true;
+}
+
+struct SmoothMeshJob
+{
+    int obj_idx = -1;
+    int vol_idx = -1;
+    std::string name;
+    TriangleMesh mesh;
+    SimplifyTextureDataSnapshot texture_snapshot;
+};
+
+struct SmoothMeshResult
+{
+    int obj_idx = -1;
+    int vol_idx = -1;
+    std::string name;
+    bool ok = false;
+    TriangleMesh mesh;
+    SimplifyTextureDataResult texture_result;
+};
+
+struct SmoothMeshWorkerState
+{
+    std::atomic<bool> cancel_requested { false };
+    std::atomic<bool> done { false };
+    std::mutex mutex;
+    int progress = 0;
+    bool canceled = false;
+    bool failed = false;
+    std::string failure_message;
+    std::vector<SmoothMeshResult> results;
+    ModelRepairColorRemapStats color_remap_stats;
+};
+
+class SmoothMeshCanceledException : public std::exception
+{
+public:
+    const char *what() const noexcept override { return "Subdivision mesh has been canceled"; }
+};
+
+static void smooth_mesh_update_color_remap_stats(const SimplifyTextureDataSnapshot &snapshot,
+                                                 const SimplifyTextureDataResult   &result,
+                                                 bool                               remap_region_painting,
+                                                 ModelRepairColorRemapStats        &stats)
+{
+    const bool has_color = smooth_mesh_color_snapshot_is_valid(snapshot);
+    stats.had_color_data |= has_color;
+    stats.remap_requested |= has_color;
+    stats.used_fallback_rgba |= result.used_fallback_rgba;
+    stats.remap_failed |= result.remap_failed && !result.used_fallback_rgba;
+    stats.had_region_painting |= snapshot.region_painting_present;
+    stats.region_remap_requested |= snapshot.region_painting_transfer_needed && remap_region_painting;
+    stats.region_remap_skipped |= snapshot.region_painting_transfer_needed && !remap_region_painting;
+    stats.region_remap_failed |= result.region_painting_remap_failed && remap_region_painting;
+
+    if (has_color) {
+        if (smooth_mesh_texture_result_preserved_color(snapshot, result))
+            ++stats.volumes_remapped;
+        else
+            ++stats.volumes_cleared;
+    }
+    if (snapshot.region_painting_present) {
+        if (result.region_painting_touched && result.region_painting_valid)
+            ++stats.region_volumes_remapped;
+        else
+            ++stats.region_volumes_cleared;
+    }
+}
+
+static void smooth_mesh_apply_result(ModelVolume &volume,
+                                     TriangleMesh &&result_mesh,
+                                     SimplifyTextureDataResult &&texture_result)
+{
+    volume.set_mesh(std::move(result_mesh));
+    volume.reset_extra_facets();
+    apply_simplify_texture_data_result(volume, std::move(texture_result));
+    volume.calculate_convex_hull();
+    volume.invalidate_convex_hull_2d();
+    volume.set_new_unique_id();
+}
+
+static void smooth_mesh_set_worker_progress(SmoothMeshWorkerState &state, int progress)
+{
+    std::lock_guard lk(state.mutex);
+    state.progress = std::clamp(progress, 0, 100);
+}
+
+static void smooth_mesh_throw_on_cancel(const SmoothMeshWorkerState &state)
+{
+    if (state.cancel_requested.load())
+        throw SmoothMeshCanceledException();
+}
+
+static void smooth_mesh_run_worker(std::shared_ptr<SmoothMeshWorkerState> state,
+                                   std::vector<SmoothMeshJob>             jobs,
+                                   bool                                   remap_region_painting)
+{
+    try {
+        std::vector<SmoothMeshResult> results;
+        results.reserve(jobs.size());
+        ModelRepairColorRemapStats color_remap_stats;
+
+        for (size_t job_idx = 0; job_idx < jobs.size(); ++job_idx) {
+            smooth_mesh_throw_on_cancel(*state);
+            const int base_progress = jobs.empty() ? 100 : int((uint64_t(job_idx) * 100u) / uint64_t(jobs.size()));
+            const int after_mesh_progress = jobs.empty() ? 100 : int((uint64_t(job_idx) * 100u + 70u) / uint64_t(jobs.size()));
+            smooth_mesh_set_worker_progress(*state, base_progress);
+
+            SmoothMeshResult result;
+            result.obj_idx = jobs[job_idx].obj_idx;
+            result.vol_idx = jobs[job_idx].vol_idx;
+            result.name = jobs[job_idx].name;
+
+            bool ok = false;
+            TriangleMesh result_mesh = TriangleMeshDeal::smooth_triangle_mesh(jobs[job_idx].mesh, ok);
+            smooth_mesh_throw_on_cancel(*state);
+            if (ok) {
+                result.ok = true;
+                smooth_mesh_set_worker_progress(*state, after_mesh_progress);
+                SimplifyTextureDataRemapOptions remap_options;
+                remap_options.remap_region_painting = remap_region_painting;
+                auto progress_fn = [state, job_idx, jobs_count = jobs.size()](int percent) {
+                    const int clamped = std::clamp(percent, 0, 100);
+                    const int progress = jobs_count == 0 ?
+                        100 :
+                        int((uint64_t(job_idx) * 100u + 70u + uint64_t(clamped) * 30u / 100u) / uint64_t(jobs_count));
+                    smooth_mesh_set_worker_progress(*state, progress);
+                };
+                result.texture_result = remap_simplify_texture_data(
+                    jobs[job_idx].texture_snapshot,
+                    result_mesh.its,
+                    [state]() { smooth_mesh_throw_on_cancel(*state); },
+                    progress_fn,
+                    remap_options);
+                smooth_mesh_update_color_remap_stats(jobs[job_idx].texture_snapshot,
+                                                     result.texture_result,
+                                                     remap_region_painting,
+                                                     color_remap_stats);
+                result.mesh = std::move(result_mesh);
+            }
+            results.emplace_back(std::move(result));
+        }
+
+        {
+            std::lock_guard lk(state->mutex);
+            state->results = std::move(results);
+            state->color_remap_stats = color_remap_stats;
+            state->progress = 100;
+        }
+    } catch (const SmoothMeshCanceledException &) {
+        std::lock_guard lk(state->mutex);
+        state->canceled = true;
+    } catch (const std::exception &ex) {
+        std::lock_guard lk(state->mutex);
+        state->failed = true;
+        state->failure_message = ex.what();
+    } catch (...) {
+        std::lock_guard lk(state->mutex);
+        state->failed = true;
+    }
+    state->done = true;
+}
+
+static void smooth_mesh_notify_color_remap_result(const ModelRepairColorRemapStats &stats)
+{
+    Plater *plater = wxGetApp().plater();
+    if (plater == nullptr)
+        return;
+
+    if (stats.used_fallback_rgba)
+        plater->get_notification_manager()->push_notification(
+            NotificationType::CustomNotification,
+            NotificationManager::NotificationLevel::PrintInfoNotificationLevel,
+            _u8L("Some image texture UVs could not be regenerated after subdivision; texture colors were preserved as RGBA data."));
+    if (stats.remap_failed && stats.volumes_cleared > 0)
+        plater->get_notification_manager()->push_notification(
+            NotificationType::CustomNotification,
+            NotificationManager::NotificationLevel::PrintInfoNotificationLevel,
+            _u8L("Some color data could not be remapped after subdivision and was cleared."));
+    if (stats.region_remap_failed && stats.region_volumes_cleared > 0)
+        plater->get_notification_manager()->push_notification(
+            NotificationType::CustomNotification,
+            NotificationManager::NotificationLevel::PrintInfoNotificationLevel,
+            _u8L("Some region painting could not be remapped after subdivision and was cleared."));
+    if (stats.region_remap_skipped && stats.region_volumes_cleared > 0)
+        plater->get_notification_manager()->push_notification(
+            NotificationType::CustomNotification,
+            NotificationManager::NotificationLevel::PrintInfoNotificationLevel,
+            _u8L("Region painting remapping was skipped; stale region painting was cleared from subdivided parts."));
 }
 
 static void mesh_boolean_transform_snapshot(SimplifyTextureDataSnapshot &snapshot, const Transform3d &transform, bool fix_left_handed)
@@ -6532,14 +6748,11 @@ void ObjectList::simplify()
 
 void GUI::ObjectList::smooth_mesh()
 {
-    wxBusyCursor cursor;
     auto plater = wxGetApp().plater();
     if (!plater) { return; }
-    plater->take_snapshot("smooth_mesh");
     std::vector<int> obj_idxs, vol_idxs;
     get_selection_indexes(obj_idxs, vol_idxs);
     auto object_idx = obj_idxs.front();
-    ModelObject *obj{nullptr};
     auto show_warning_dlg = [this](int cur_face_count,std::string name,bool is_part) {
         int limit_face_count = 1000000;
         if (cur_face_count > limit_face_count) {
@@ -6559,61 +6772,125 @@ void GUI::ObjectList::smooth_mesh()
         WarningDialog dlg(static_cast<wxWindow *>(wxGetApp().mainframe), content, wxEmptyString, wxOK);
         dlg.ShowModal();
     };
-    bool has_show_smooth_mesh_error_dlg = false;
+    std::vector<SmoothMeshJob> jobs;
+    bool has_remappable_region_painting = false;
+    auto add_smooth_mesh_job = [&jobs, &has_remappable_region_painting](int obj_idx, int vol_idx, ModelVolume *mv) {
+        if (mv == nullptr)
+            return;
+        SmoothMeshJob job;
+        job.obj_idx = obj_idx;
+        job.vol_idx = vol_idx;
+        job.name = mv->name;
+        job.mesh = mv->mesh();
+        job.texture_snapshot = snapshot_simplify_texture_data(*mv);
+        has_remappable_region_painting |= job.texture_snapshot.region_painting_transfer_needed;
+        jobs.emplace_back(std::move(job));
+    };
     if (vol_idxs.empty()) {
-        obj        = object(object_idx);
+        ModelObject *obj = object(object_idx);
         auto             future_face_count = static_cast<int>(obj->facets_count()) * 4;
         if (show_warning_dlg(future_face_count, obj->name,false)) {
             return;
         }
-        for (auto mv : obj->volumes) {
-            bool ok;
-            auto result_mesh = TriangleMeshDeal::smooth_triangle_mesh(mv->mesh(), ok);
-            if (ok) {
-                mv->set_mesh(result_mesh);
-                mv->reset_extra_facets(); // reset paint color
-                mv->calculate_convex_hull();
-                mv->invalidate_convex_hull_2d();
-                mv->set_new_unique_id();
-            } else {
-                if (!has_show_smooth_mesh_error_dlg) {
-                    show_smooth_mesh_error_dlg(mv->name);
-                    has_show_smooth_mesh_error_dlg = true;
-                }
-            }
-        }
-        obj->invalidate_bounding_box();
-        obj->ensure_on_bed();
-        plater->changed_mesh(object_idx);
+        for (size_t vol_idx = 0; vol_idx < obj->volumes.size(); ++vol_idx)
+            add_smooth_mesh_job(object_idx, int(vol_idx), obj->volumes[vol_idx]);
     } else {
-        obj = object(obj_idxs.front());
+        ModelObject *obj = object(obj_idxs.front());
         for (int vol_idx : vol_idxs) {
             auto mv = obj->volumes[vol_idx];
             auto future_face_count = static_cast<int>(mv->mesh().facets_count()) * 4;
             if (show_warning_dlg(future_face_count, mv->name,true)) {
                 return;
             }
-            bool ok;
-            auto result_mesh = TriangleMeshDeal::smooth_triangle_mesh(mv->mesh(),ok);
-            if (ok) {
-                mv->set_mesh(result_mesh);
-                mv->reset_extra_facets(); // reset paint color
-                mv->calculate_convex_hull();
-                mv->invalidate_convex_hull_2d();
-                mv->set_new_unique_id();
-            } else {
-                if (!has_show_smooth_mesh_error_dlg) {
-                    show_smooth_mesh_error_dlg(mv->name);
-                    has_show_smooth_mesh_error_dlg = true;
-                }
-            }
+            add_smooth_mesh_job(obj_idxs.front(), vol_idx, mv);
         }
     }
-    if (obj) {
-        obj->invalidate_bounding_box();
-        obj->ensure_on_bed();
-        plater->changed_mesh(object_idx);
+
+    if (jobs.empty())
+        return;
+
+    bool remap_region_painting = true;
+    if (has_remappable_region_painting) {
+        RichMessageDialog dlg(static_cast<wxWindow *>(wxGetApp().mainframe),
+                              _L("Choose options to use when subdividing mesh:"),
+                              _L("Subdivision options"),
+                              wxOK | wxCANCEL);
+        dlg.ShowCheckBox(_L("Remap filament region painting to subdivided mesh"), true);
+        if (dlg.ShowModal() != wxID_OK)
+            return;
+        remap_region_painting = dlg.IsCheckBoxChecked();
     }
+
+    auto worker_state = std::make_shared<SmoothMeshWorkerState>();
+    ProgressDialog progress_dlg(_L("Subdivision mesh"), _L("Subdividing mesh"), 100, find_toplevel_parent(plater),
+                                wxPD_AUTO_HIDE | wxPD_APP_MODAL | wxPD_CAN_ABORT, true);
+    progress_dlg.Update(0, _L("Subdividing mesh"));
+    std::thread worker(smooth_mesh_run_worker, worker_state, std::move(jobs), remap_region_painting);
+    while (!worker_state->done.load()) {
+        int progress = 0;
+        {
+            std::lock_guard lk(worker_state->mutex);
+            progress = worker_state->progress;
+        }
+        if (!progress_dlg.Update(progress, worker_state->cancel_requested.load() ? _L("Canceling subdivision") : _L("Subdividing mesh")))
+            worker_state->cancel_requested = true;
+        wxMilliSleep(50);
+    }
+    if (worker.joinable())
+        worker.join();
+
+    if (worker_state->canceled)
+        return;
+    progress_dlg.Update(100, _L("Subdivision finished"));
+    if (worker_state->failed) {
+        wxString msg = _L("Subdivision failed.");
+        if (!worker_state->failure_message.empty())
+            msg += "\n" + from_u8(worker_state->failure_message);
+        WarningDialog dlg(static_cast<wxWindow *>(wxGetApp().mainframe), msg, wxEmptyString, wxOK);
+        dlg.ShowModal();
+        return;
+    }
+
+    bool applied = false;
+    bool has_show_smooth_mesh_error_dlg = false;
+    std::vector<int> changed_objects;
+    for (SmoothMeshResult &result : worker_state->results) {
+        if (!result.ok) {
+            if (!has_show_smooth_mesh_error_dlg) {
+                show_smooth_mesh_error_dlg(result.name);
+                has_show_smooth_mesh_error_dlg = true;
+            }
+            continue;
+        }
+
+        if (result.obj_idx < 0 || size_t(result.obj_idx) >= m_objects->size())
+            continue;
+        ModelObject *target_obj = object(result.obj_idx);
+        if (target_obj == nullptr || result.vol_idx < 0 || size_t(result.vol_idx) >= target_obj->volumes.size())
+            continue;
+
+        if (!applied) {
+            plater->take_snapshot("smooth_mesh");
+            applied = true;
+        }
+
+        ModelVolume *mv = target_obj->volumes[size_t(result.vol_idx)];
+        smooth_mesh_apply_result(*mv, std::move(result.mesh), std::move(result.texture_result));
+        update_item_error_icon(result.obj_idx, result.vol_idx);
+        if (std::find(changed_objects.begin(), changed_objects.end(), result.obj_idx) == changed_objects.end())
+            changed_objects.emplace_back(result.obj_idx);
+    }
+
+    for (int changed_obj_idx : changed_objects) {
+        ModelObject *changed_obj = object(changed_obj_idx);
+        if (changed_obj == nullptr)
+            continue;
+        changed_obj->invalidate_bounding_box();
+        changed_obj->ensure_on_bed();
+        plater->changed_mesh(changed_obj_idx);
+    }
+    if (applied)
+        smooth_mesh_notify_color_remap_result(worker_state->color_remap_stats);
 }
 
 void ObjectList::update_item_error_icon(const int obj_idx, const int vol_idx) const

@@ -4084,6 +4084,15 @@ static bool project_point_to_screen(const ProjectionContext &context, const Vec3
     return true;
 }
 
+static float projection_camera_depth(const ProjectionContext &context, const Vec3d &world_point)
+{
+    Vec3d forward = context.camera_forward;
+    if (forward.squaredNorm() <= EPSILON)
+        return 0.f;
+    forward.normalize();
+    return float((world_point - context.camera_position).dot(forward));
+}
+
 static bool project_point_to_depth_clipped_screen(const ProjectionContext &context,
                                                   const Vec3d             &world_point,
                                                   Vec2f                   &screen,
@@ -5616,6 +5625,8 @@ struct ProjectionVisibility
     float              scale = 1.f;
     std::vector<float> depth;
     std::vector<float> local_depth_tolerance;
+    std::vector<float> camera_depth;
+    float              camera_depth_tolerance = 0.05f;
     std::vector<uint64_t> triangle_keys;
 };
 
@@ -5623,6 +5634,9 @@ static constexpr float PROJECTION_VISIBILITY_DEPTH_TOLERANCE = 2e-4f;
 static constexpr float PROJECTION_VISIBILITY_SAME_TRIANGLE_DEPTH_TOLERANCE = 2e-3f;
 static constexpr float PROJECTION_VISIBILITY_PROJECTED_TRIANGLE_DEPTH_TOLERANCE = 5e-3f;
 static constexpr float PROJECTION_VISIBILITY_MAX_LOCAL_DEPTH_TOLERANCE = 2e-2f;
+static constexpr float PROJECTION_VISIBILITY_CAMERA_DEPTH_TOLERANCE_MIN = 0.005f;
+static constexpr float PROJECTION_VISIBILITY_CAMERA_DEPTH_TOLERANCE_MAX = 0.05f;
+static constexpr float PROJECTION_VISIBILITY_CAMERA_DEPTH_TOLERANCE_RATIO = 0.0005f;
 static constexpr uint64_t PROJECTION_VISIBILITY_INVALID_TRIANGLE_KEY = std::numeric_limits<uint64_t>::max();
 
 static uint64_t projection_visibility_triangle_key(size_t volume_idx, size_t tri_idx)
@@ -5636,7 +5650,25 @@ static bool projection_visibility_valid(const ProjectionVisibility &visibility)
            visibility.height > 0 &&
            visibility.depth.size() == size_t(visibility.width) * size_t(visibility.height) &&
            visibility.local_depth_tolerance.size() == visibility.depth.size() &&
+           visibility.camera_depth.size() == visibility.depth.size() &&
            visibility.triangle_keys.size() == visibility.depth.size();
+}
+
+static void projection_visibility_prepare_camera_depth_tolerance(ProjectionVisibility &visibility)
+{
+    float min_depth = std::numeric_limits<float>::max();
+    float max_depth = std::numeric_limits<float>::lowest();
+    for (float depth : visibility.camera_depth) {
+        if (!std::isfinite(depth))
+            continue;
+        min_depth = std::min(min_depth, depth);
+        max_depth = std::max(max_depth, depth);
+    }
+    if (min_depth <= max_depth) {
+        visibility.camera_depth_tolerance = std::clamp((max_depth - min_depth) * PROJECTION_VISIBILITY_CAMERA_DEPTH_TOLERANCE_RATIO,
+                                                       PROJECTION_VISIBILITY_CAMERA_DEPTH_TOLERANCE_MIN,
+                                                       PROJECTION_VISIBILITY_CAMERA_DEPTH_TOLERANCE_MAX);
+    }
 }
 
 static void projection_visibility_prepare_local_depth_tolerances(ProjectionVisibility &visibility)
@@ -5681,10 +5713,22 @@ static float projection_visibility_local_depth_tolerance(const ProjectionVisibil
     return visibility.local_depth_tolerance[idx];
 }
 
+static bool projection_visibility_camera_depth_matches_sample(const ProjectionVisibility &visibility,
+                                                              size_t                      idx,
+                                                              float                       camera_depth)
+{
+    if (idx >= visibility.camera_depth.size() || !std::isfinite(camera_depth))
+        return true;
+    const float nearest_camera_depth = visibility.camera_depth[idx];
+    return !std::isfinite(nearest_camera_depth) ||
+           camera_depth <= nearest_camera_depth + visibility.camera_depth_tolerance;
+}
+
 static bool projection_visibility_depth_matches_sample(const ProjectionVisibility &visibility,
                                                        int                         x,
                                                        int                         y,
                                                        float                       depth,
+                                                       float                       camera_depth,
                                                        uint64_t                    triangle_key)
 {
     if (x < 0 || y < 0 || x >= visibility.width || y >= visibility.height)
@@ -5703,7 +5747,9 @@ static bool projection_visibility_depth_matches_sample(const ProjectionVisibilit
     } else if (has_triangle_key) {
         center_tolerance = std::max(PROJECTION_VISIBILITY_PROJECTED_TRIANGLE_DEPTH_TOLERANCE, local_tolerance);
     }
-    if (std::isfinite(center_nearest) && depth <= center_nearest + center_tolerance)
+    if (std::isfinite(center_nearest) &&
+        depth <= center_nearest + center_tolerance &&
+        (center_same_triangle || !has_triangle_key || projection_visibility_camera_depth_matches_sample(visibility, center_idx, camera_depth)))
         return true;
 
     if (!has_triangle_key)
@@ -5742,7 +5788,9 @@ static bool projection_visibility_depth_matches_sample(const ProjectionVisibilit
             const float nearby_tolerance =
                 std::max(PROJECTION_VISIBILITY_PROJECTED_TRIANGLE_DEPTH_TOLERANCE,
                          projection_visibility_local_depth_tolerance(visibility, sample_x, sample_y));
-            if (std::isfinite(nearest) && depth <= nearest + nearby_tolerance)
+            if (std::isfinite(nearest) &&
+                depth <= nearest + nearby_tolerance &&
+                projection_visibility_camera_depth_matches_sample(visibility, idx, camera_depth))
                 return true;
         }
     }
@@ -5772,10 +5820,14 @@ static ProjectionVisibility build_projection_visibility(const ProjectionContext 
     visibility.height = std::max(1, int(std::ceil(bounds_height * visibility.scale)));
     visibility.left = bounds.left;
     visibility.top = bounds.top;
-    visibility.depth.assign(size_t(visibility.width) * size_t(visibility.height), std::numeric_limits<float>::max());
+    visibility.depth.assign(size_t(visibility.width) * size_t(visibility.height), std::numeric_limits<float>::infinity());
+    visibility.camera_depth.assign(visibility.depth.size(), std::numeric_limits<float>::infinity());
     visibility.triangle_keys.assign(visibility.depth.size(), PROJECTION_VISIBILITY_INVALID_TRIANGLE_KEY);
 
-    auto rasterize_triangle = [&visibility, &check_cancel](const std::array<Vec2f, 3> &screen, const std::array<float, 3> &depths, uint64_t triangle_key) {
+    auto rasterize_triangle = [&visibility, &check_cancel](const std::array<Vec2f, 3> &screen,
+                                                           const std::array<float, 3> &depths,
+                                                           const std::array<float, 3> &camera_depths,
+                                                           uint64_t triangle_key) {
         const float min_screen_x = std::min({ screen[0].x(), screen[1].x(), screen[2].x() });
         const float max_screen_x = std::max({ screen[0].x(), screen[1].x(), screen[2].x() });
         const float min_screen_y = std::min({ screen[0].y(), screen[1].y(), screen[2].y() });
@@ -5804,6 +5856,8 @@ static ProjectionVisibility build_projection_visibility(const ProjectionContext 
                 const size_t idx = size_t(y) * size_t(visibility.width) + size_t(x);
                 if (depth < visibility.depth[idx]) {
                     visibility.depth[idx] = depth;
+                    visibility.camera_depth[idx] =
+                        camera_depths[0] * weights.x() + camera_depths[1] * weights.y() + camera_depths[2] * weights.z();
                     visibility.triangle_keys[idx] = triangle_key;
                 }
             }
@@ -5844,19 +5898,22 @@ static ProjectionVisibility build_projection_visibility(const ProjectionContext 
                 const std::array<Vec3d, 3> fan = { polygon[0], polygon[polygon_idx], polygon[polygon_idx + 1] };
                 std::array<Vec2f, 3> screen;
                 std::array<float, 3> depths;
+                std::array<float, 3> camera_depths;
                 bool projected = true;
                 for (size_t idx = 0; idx < fan.size(); ++idx) {
                     if (!project_point_to_depth_clipped_screen(context, fan[idx], screen[idx], &depths[idx])) {
                         projected = false;
                         break;
                     }
+                    camera_depths[idx] = projection_camera_depth(context, fan[idx]);
                 }
                 if (projected)
-                    rasterize_triangle(screen, depths, projection_visibility_triangle_key(volume_idx, tri_idx));
+                    rasterize_triangle(screen, depths, camera_depths, projection_visibility_triangle_key(volume_idx, tri_idx));
             }
         }
     }
 
+    projection_visibility_prepare_camera_depth_tolerance(visibility);
     projection_visibility_prepare_local_depth_tolerances(visibility);
     return visibility;
 }
@@ -5878,18 +5935,20 @@ static bool projection_point_is_visible(const ProjectionVisibility &visibility,
     float depth = 0.f;
     if (!project_point_to_screen(context, world_point, screen, &depth))
         return false;
+    const float camera_depth = projection_camera_depth(context, world_point);
 
     const int x = int(std::floor((screen.x() - visibility.left) * visibility.scale));
     const int y = int(std::floor((screen.y() - visibility.top) * visibility.scale));
     if (x < 0 || y < 0 || x >= visibility.width || y >= visibility.height)
         return false;
 
-    return projection_visibility_depth_matches_sample(visibility, x, y, depth, triangle_key);
+    return projection_visibility_depth_matches_sample(visibility, x, y, depth, camera_depth, triangle_key);
 }
 
 static bool projection_screen_triangle_has_visible_sample(const ProjectionVisibility   &visibility,
                                                           const std::array<Vec2f, 3>  &screen,
                                                           const std::array<float, 3>  &depths,
+                                                          const std::array<float, 3>  &camera_depths,
                                                           uint64_t                     triangle_key)
 {
     if (!projection_visibility_valid(visibility))
@@ -5918,7 +5977,9 @@ static bool projection_screen_triangle_has_visible_sample(const ProjectionVisibi
                 continue;
 
             const float depth = depths[0] * weights.x() + depths[1] * weights.y() + depths[2] * weights.z();
-            if (projection_visibility_depth_matches_sample(visibility, x, y, depth, triangle_key))
+            const float camera_depth =
+                camera_depths[0] * weights.x() + camera_depths[1] * weights.y() + camera_depths[2] * weights.z();
+            if (projection_visibility_depth_matches_sample(visibility, x, y, depth, camera_depth, triangle_key))
                 return true;
         }
     }
@@ -6154,14 +6215,16 @@ static bool projection_triangle_has_visible_sample(const ProjectionVisibility &v
         const std::array<Vec3d, 3> fan = { polygon[0], polygon[polygon_idx], polygon[polygon_idx + 1] };
         std::array<Vec2f, 3> screen;
         std::array<float, 3> depths;
+        std::array<float, 3> camera_depths;
         bool projected = true;
         for (size_t idx = 0; idx < fan.size(); ++idx) {
             if (!project_point_to_depth_clipped_screen(context, fan[idx], screen[idx], &depths[idx])) {
                 projected = false;
                 break;
             }
+            camera_depths[idx] = projection_camera_depth(context, fan[idx]);
         }
-        if (projected && projection_screen_triangle_has_visible_sample(visibility, screen, depths, triangle_key))
+        if (projected && projection_screen_triangle_has_visible_sample(visibility, screen, depths, camera_depths, triangle_key))
             return true;
     }
 
@@ -6171,6 +6234,7 @@ static bool projection_triangle_has_visible_sample(const ProjectionVisibility &v
 static bool projection_screen_triangle_is_fully_visible(const ProjectionVisibility   &visibility,
                                                         const std::array<Vec2f, 3>  &screen,
                                                         const std::array<float, 3>  &depths,
+                                                        const std::array<float, 3>  &camera_depths,
                                                         uint64_t                     triangle_key)
 {
     if (!projection_visibility_valid(visibility))
@@ -6204,7 +6268,9 @@ static bool projection_screen_triangle_is_fully_visible(const ProjectionVisibili
 
             covered = true;
             const float depth = depths[0] * weights.x() + depths[1] * weights.y() + depths[2] * weights.z();
-            if (!projection_visibility_depth_matches_sample(visibility, x, y, depth, triangle_key))
+            const float camera_depth =
+                camera_depths[0] * weights.x() + camera_depths[1] * weights.y() + camera_depths[2] * weights.z();
+            if (!projection_visibility_depth_matches_sample(visibility, x, y, depth, camera_depth, triangle_key))
                 return false;
         }
     }
@@ -6227,12 +6293,14 @@ static bool projection_triangle_is_fully_visible(const ProjectionVisibility &vis
 
     std::array<Vec2f, 3> screen;
     std::array<float, 3> depths;
+    std::array<float, 3> camera_depths;
     for (size_t idx = 0; idx < polygon.size(); ++idx) {
         if (!project_point_to_depth_clipped_screen(context, polygon[idx], screen[idx], &depths[idx]))
             return false;
+        camera_depths[idx] = projection_camera_depth(context, polygon[idx]);
     }
 
-    return projection_screen_triangle_is_fully_visible(visibility, screen, depths, triangle_key);
+    return projection_screen_triangle_is_fully_visible(visibility, screen, depths, camera_depths, triangle_key);
 }
 
 static bool projection_triangle_should_project(const ProjectionContext            &context,

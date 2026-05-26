@@ -1901,6 +1901,7 @@ public:
                                         bool top_surface_image_fixed_coloring_filaments,
                                         float top_surface_contoning_angle_threshold_deg,
                                         int top_surface_contoning_stack_layers,
+                                        int top_surface_contoning_pattern_filaments,
                                         float top_surface_contoning_min_feature_mm,
                                         bool top_surface_contoning_color_lower_surfaces,
                                         bool top_surface_contoning_only_color_surface_infill,
@@ -2462,7 +2463,7 @@ public:
         contoning_angle_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("deg")), 0, wxALIGN_CENTER_VERTICAL);
         top_surface_contoning_root->Add(contoning_angle_row, 0, wxEXPAND | wxBOTTOM, gap);
         auto *contoning_layers_row = new wxBoxSizer(wxHORIZONTAL);
-        contoning_layers_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Stack layers")),
+        contoning_layers_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Max infill/perimeter layer depth")),
                                   0,
                                   wxALIGN_CENTER_VERTICAL | wxRIGHT,
                                   gap);
@@ -2481,6 +2482,26 @@ public:
         contoning_layers_row->Add(m_top_surface_contoning_stack_layers_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
         contoning_layers_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("layers")), 0, wxALIGN_CENTER_VERTICAL);
         top_surface_contoning_root->Add(contoning_layers_row, 0, wxEXPAND | wxBOTTOM, gap);
+        auto *contoning_pattern_row = new wxBoxSizer(wxHORIZONTAL);
+        contoning_pattern_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Surface infill blend layer count")),
+                                   0,
+                                   wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                                   gap);
+        m_top_surface_contoning_pattern_filaments_spin =
+            new wxSpinCtrl(m_top_surface_contoning_panel,
+                           wxID_ANY,
+                           wxEmptyString,
+                           wxDefaultPosition,
+                           wxSize(FromDIP(70), -1),
+                           wxSP_ARROW_KEYS | wxALIGN_RIGHT,
+                           TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
+                           TextureMappingZone::MaxTopSurfaceContoningPatternFilaments,
+                           std::clamp(top_surface_contoning_pattern_filaments,
+                                      TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
+                                      TextureMappingZone::MaxTopSurfaceContoningPatternFilaments));
+        contoning_pattern_row->Add(m_top_surface_contoning_pattern_filaments_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+        contoning_pattern_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("layers")), 0, wxALIGN_CENTER_VERTICAL);
+        top_surface_contoning_root->Add(contoning_pattern_row, 0, wxEXPAND | wxBOTTOM, gap);
         auto *contoning_feature_row = new wxBoxSizer(wxHORIZONTAL);
         contoning_feature_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Minimum feature")),
                                    0,
@@ -2841,6 +2862,14 @@ public:
                        TextureMappingZone::MinTopSurfaceContoningStackLayers,
                        TextureMappingZone::MaxTopSurfaceContoningStackLayers) :
             TextureMappingZone::DefaultTopSurfaceContoningStackLayers;
+    }
+    int top_surface_contoning_pattern_filaments() const
+    {
+        return m_top_surface_contoning_pattern_filaments_spin ?
+            std::clamp(m_top_surface_contoning_pattern_filaments_spin->GetValue(),
+                       TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
+                       TextureMappingZone::MaxTopSurfaceContoningPatternFilaments) :
+            TextureMappingZone::DefaultTopSurfaceContoningPatternFilaments;
     }
     float top_surface_contoning_min_feature_mm() const
     {
@@ -3302,6 +3331,8 @@ private:
             m_top_surface_contoning_angle_threshold_spin->Enable(contoning);
         if (m_top_surface_contoning_stack_layers_spin != nullptr)
             m_top_surface_contoning_stack_layers_spin->Enable(contoning);
+        if (m_top_surface_contoning_pattern_filaments_spin != nullptr)
+            m_top_surface_contoning_pattern_filaments_spin->Enable(contoning);
         if (m_top_surface_contoning_min_feature_spin != nullptr)
             m_top_surface_contoning_min_feature_spin->Enable(contoning);
         if (m_top_surface_contoning_color_lower_surfaces_checkbox != nullptr) {
@@ -3369,6 +3400,7 @@ private:
     wxPanel *m_top_surface_contoning_panel {nullptr};
     wxSpinCtrlDouble *m_top_surface_contoning_angle_threshold_spin {nullptr};
     wxSpinCtrl *m_top_surface_contoning_stack_layers_spin {nullptr};
+    wxSpinCtrl *m_top_surface_contoning_pattern_filaments_spin {nullptr};
     wxSpinCtrlDouble *m_top_surface_contoning_min_feature_spin {nullptr};
     wxCheckBox *m_top_surface_contoning_color_lower_surfaces_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_only_color_surface_infill_checkbox {nullptr};
@@ -8294,16 +8326,16 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             apply_zone(std::move(updated));
             CallAfter([this]() { update_texture_mapping_panel(false); });
         });
-        advanced_btn->Bind(wxEVT_BUTTON, [this,
-                                          zone_index,
-                                          mgr_ptr,
-                                          palette,
-                                          physical_colors,
-                                          apply_zone,
-                                          bundle,
-                                          set_config_string,
-                                          notify_change,
-                                          refresh_texture_mapping_preview](wxCommandEvent &) {
+        auto open_advanced_options = [this,
+                                      zone_index,
+                                      mgr_ptr,
+                                      palette,
+                                      physical_colors,
+                                      apply_zone,
+                                      bundle,
+                                      set_config_string,
+                                      notify_change,
+                                      refresh_texture_mapping_preview]() {
             if (mgr_ptr == nullptr || zone_index >= mgr_ptr->zones().size())
                 return;
             TextureMappingZone updated = mgr_ptr->zones()[zone_index];
@@ -8369,6 +8401,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.top_surface_image_fixed_coloring_filaments,
                                                     updated.top_surface_contoning_angle_threshold_deg,
                                                     updated.top_surface_contoning_stack_layers,
+                                                    updated.top_surface_contoning_pattern_filaments,
                                                     updated.top_surface_contoning_min_feature_mm,
                                                     updated.top_surface_contoning_color_lower_surfaces,
                                                     updated.top_surface_contoning_only_color_surface_infill,
@@ -8423,6 +8456,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.top_surface_image_fixed_coloring_filaments = dlg.top_surface_image_fixed_coloring_filaments();
             updated.top_surface_contoning_angle_threshold_deg = dlg.top_surface_contoning_angle_threshold_deg();
             updated.top_surface_contoning_stack_layers = dlg.top_surface_contoning_stack_layers();
+            updated.top_surface_contoning_pattern_filaments = dlg.top_surface_contoning_pattern_filaments();
             updated.top_surface_contoning_min_feature_mm = dlg.top_surface_contoning_min_feature_mm();
             updated.top_surface_contoning_color_lower_surfaces = dlg.top_surface_contoning_color_lower_surfaces();
             updated.top_surface_contoning_only_color_surface_infill = dlg.top_surface_contoning_only_color_surface_infill();
@@ -8485,6 +8519,9 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             if (affects_scene || prime_tower_preview_changed)
                 refresh_texture_mapping_preview();
             CallAfter([this]() { update_texture_mapping_panel(false); });
+        };
+        advanced_btn->Bind(wxEVT_BUTTON, [open_advanced_options](wxCommandEvent &) {
+            open_advanced_options();
         });
 
         auto toggle_editor = [this, zone_index, editor, row, update_texture_mapping_area_height]() {
@@ -8521,12 +8558,14 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             evt.Skip();
         });
         menu_btn->Bind(wxEVT_BUTTON, [this, zone_index, num_physical, physical_colors, mgr_ptr, persist_rows, menu_btn, bundle, set_config_string,
+                                      open_advanced_options,
                                       texture_mapping_zone_affects_scene, selected_texture_mapping_object_idxs, refresh_texture_mapping_preview](wxCommandEvent &) {
             if (menu_btn == nullptr)
                 return;
             wxMenu menu;
             const int assign_selected_objects_id = wxWindow::NewControlId();
             const int assign_selected_objects_erase_id = wxWindow::NewControlId();
+            const int advanced_options_id = wxWindow::NewControlId();
             const int duplicate_id = wxWindow::NewControlId();
             const int delete_id = wxWindow::NewControlId();
             const int delete_all_id = wxWindow::NewControlId();
@@ -8537,11 +8576,13 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             wxMenuItem *assign_selected_objects_erase_item = menu.Append(assign_selected_objects_erase_id, _L("Assign to selected objects (erase region painting)"));
             if (assign_selected_objects_erase_item != nullptr)
                 assign_selected_objects_erase_item->Enable(has_selected_objects);
+            menu.Append(advanced_options_id, _L("Advanced Options"));
             menu.Append(duplicate_id, _L("Duplicate"));
             menu.Append(delete_id, _L("Delete"));
             menu.Append(delete_all_id, _L("Delete All Texture Mapping Zones"));
             menu.Bind(wxEVT_COMMAND_MENU_SELECTED, [this, zone_index, num_physical, physical_colors, mgr_ptr, persist_rows, assign_selected_objects_id,
-                                                     assign_selected_objects_erase_id, duplicate_id, delete_id, delete_all_id, bundle, set_config_string,
+                                                     assign_selected_objects_erase_id, advanced_options_id, duplicate_id, delete_id, delete_all_id,
+                                                     bundle, set_config_string, open_advanced_options,
                                                      texture_mapping_zone_affects_scene, selected_texture_mapping_object_idxs,
                                                      refresh_texture_mapping_preview, menu_btn](wxCommandEvent &evt) {
                 if (mgr_ptr == nullptr)
@@ -8562,6 +8603,10 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                         refresh_texture_mapping_preview();
                         CallAfter([this]() { update_texture_mapping_panel(false); });
                     }
+                    return;
+                }
+                if (evt.GetId() == advanced_options_id) {
+                    open_advanced_options();
                     return;
                 }
                 if (evt.GetId() == duplicate_id) {

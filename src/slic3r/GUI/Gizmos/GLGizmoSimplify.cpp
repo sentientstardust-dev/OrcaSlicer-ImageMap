@@ -677,6 +677,14 @@ void GLGizmoSimplify::on_set_state()
         m_parent.toggle_model_objects_visibility(true);
 
         stop_worker_thread_request();
+        {
+            std::lock_guard lk(m_state_mutex);
+            m_state.result.reset();
+            m_state.mv = nullptr;
+            m_state.skip_color_conversion_requested = false;
+            m_state.color_conversion_in_progress = false;
+            m_state.progress = 0.f;
+        }
         m_volume = nullptr; // invalidate selected model
         m_glmodel.reset();
     } else if (GLGizmoBase::m_state == GLGizmoBase::On) {

@@ -426,6 +426,7 @@ struct TopSurfaceImageRegionPlan {
     bool color_lower_surfaces = true;
     int colored_top_layers = TextureMappingZone::DefaultTopSurfaceImageColoredTopLayers;
     int contoning_stack_layers = TextureMappingZone::DefaultTopSurfaceContoningStackLayers;
+    int contoning_pattern_filaments = TextureMappingZone::DefaultTopSurfaceContoningPatternFilaments;
     float contoning_min_feature_mm = 2.f;
     float contoning_external_width_mm = 0.4f;
 };
@@ -921,6 +922,19 @@ static ExPolygons top_surface_image_contoning_area_from_grid_label(const std::ve
     return top_surface_image_contoning_clean_area(std::move(cells), clip_area, blocked_area, min_feature_mm, throw_if_canceled);
 }
 
+static int top_surface_image_contoning_pattern_filaments(int stack_layers, int configured_pattern_filaments)
+{
+    const int clamped_stack_layers =
+        std::clamp(stack_layers,
+                   TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                   TextureMappingZone::MaxTopSurfaceContoningStackLayers);
+    const int clamped_pattern_filaments =
+        std::clamp(configured_pattern_filaments,
+                   TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
+                   TextureMappingZone::MaxTopSurfaceContoningPatternFilaments);
+    return std::max(1, std::min(clamped_stack_layers, clamped_pattern_filaments));
+}
+
 static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_contoning_vector_regions(
     const TopSurfaceImageRegionPlan      &plan,
     const Layer                          &source_layer,
@@ -979,6 +993,8 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
     const int stack_layers = std::clamp(plan.contoning_stack_layers,
                                         TextureMappingZone::MinTopSurfaceContoningStackLayers,
                                         TextureMappingZone::MaxTopSurfaceContoningStackLayers);
+    const int pattern_filaments =
+        top_surface_image_contoning_pattern_filaments(stack_layers, plan.contoning_pattern_filaments);
     const std::vector<ExPolygons> source_stack_areas =
         top_surface_image_contoning_stack_areas(source_layer, plan.zone_id, stack_layers, source_surface, throw_if_canceled);
 
@@ -999,7 +1015,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                 top_surface_image_contoning_local_stack_layers_at_point(sample_point, source_stack_areas, stack_layers);
             if (depth >= local_stack_layers)
                 continue;
-            const int solve_layers = std::min({ local_stack_layers, stack_layers, 4 });
+            const int solve_layers = std::min({ local_stack_layers, stack_layers, pattern_filaments });
             if (solve_layers <= 0)
                 continue;
             const float sample_x_mm = unscale<float>(sample_point.x());
@@ -1117,6 +1133,8 @@ static void top_surface_image_append_contoning_slices(TopSurfaceImageRegionPlan 
     if (area.empty() || !solver.valid())
         return;
     check_canceled(throw_if_canceled);
+    const int pattern_filaments =
+        top_surface_image_contoning_pattern_filaments(plan.contoning_stack_layers, plan.contoning_pattern_filaments);
 
     std::vector<ExPolygons> by_component(print_config.filament_colour.values.size() + 1);
     const std::vector<TopSurfaceImageContoningVectorRegion> stack_regions =
@@ -1156,8 +1174,8 @@ static void top_surface_image_append_contoning_slices(TopSurfaceImageRegionPlan 
         TopSurfaceImageStackSlice slice;
         slice.component_id = component_id;
         slice.depth = depth;
-        slice.component_index = size_t(depth % std::max(1, std::min(plan.contoning_stack_layers, 4)));
-        slice.component_count = size_t(std::min(plan.contoning_stack_layers, 4));
+        slice.component_index = size_t(depth % pattern_filaments);
+        slice.component_count = size_t(pattern_filaments);
         slice.contoning = true;
         slice.lower_surface = source_surface == TopSurfaceImageSourceSurface::Bottom;
         slice.angle_rad = (depth & 1) ? float(-PI / 4.0) : float(PI / 4.0);
@@ -1239,6 +1257,9 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(con
         plan.contoning_stack_layers = std::clamp(zone->top_surface_contoning_stack_layers,
                                                  TextureMappingZone::MinTopSurfaceContoningStackLayers,
                                                  TextureMappingZone::MaxTopSurfaceContoningStackLayers);
+        plan.contoning_pattern_filaments = std::clamp(zone->top_surface_contoning_pattern_filaments,
+                                                      TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
+                                                      TextureMappingZone::MaxTopSurfaceContoningPatternFilaments);
         plan.contoning_external_width_mm = float(layerm->flow(frExternalPerimeter).width());
         plan.contoning_min_feature_mm =
             texture_mapping_contoning_min_feature_mm(*zone, print_config, components, plan.contoning_external_width_mm);

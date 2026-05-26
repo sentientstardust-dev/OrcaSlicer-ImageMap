@@ -459,10 +459,28 @@ struct PerimeterTextureRecolorSampler {
     std::vector<std::array<float, 3>> image_component_colors;
     TextureMappingContoningSolver contoning_solver;
     int contoning_stack_layers { TextureMappingZone::DefaultTopSurfaceContoningStackLayers };
+    int contoning_pattern_filaments { TextureMappingZone::DefaultTopSurfaceContoningPatternFilaments };
     float contoning_angle_threshold_deg { TextureMappingZone::DefaultTopSurfaceContoningAngleThresholdDeg };
     std::vector<unsigned int> component_ids;
     std::vector<TextureMappingOffsetContext> gradient_contexts;
 };
+
+static int perimeter_texture_available_contoning_shell_slots(const ExtrusionEntityCollection &perimeters,
+                                                             int                              fallback_wall_loops,
+                                                             int                              configured_stack_layers);
+
+static int perimeter_texture_contoning_pattern_layers(int stack_layers, int configured_pattern_filaments)
+{
+    const int clamped_stack_layers =
+        std::clamp(stack_layers,
+                   TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                   TextureMappingZone::MaxTopSurfaceContoningStackLayers);
+    const int clamped_pattern_filaments =
+        std::clamp(configured_pattern_filaments,
+                   TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
+                   TextureMappingZone::MaxTopSurfaceContoningPatternFilaments);
+    return std::max(1, std::min(clamped_stack_layers, clamped_pattern_filaments));
+}
 
 static std::optional<PerimeterTextureRecolorSampler> perimeter_texture_make_recolor_sampler(
     const LayerRegion        &layer_region,
@@ -515,6 +533,10 @@ static std::optional<PerimeterTextureRecolorSampler> perimeter_texture_make_reco
                 std::clamp(zone.top_surface_contoning_stack_layers,
                            TextureMappingZone::MinTopSurfaceContoningStackLayers,
                            TextureMappingZone::MaxTopSurfaceContoningStackLayers);
+            sampler.contoning_pattern_filaments =
+                std::clamp(zone.top_surface_contoning_pattern_filaments,
+                           TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
+                           TextureMappingZone::MaxTopSurfaceContoningPatternFilaments);
             sampler.contoning_angle_threshold_deg =
                 std::clamp(zone.top_surface_contoning_angle_threshold_deg,
                            TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg,
@@ -547,7 +569,8 @@ static std::optional<PerimeterTextureRecolorSampler> perimeter_texture_make_reco
 static std::optional<unsigned int> perimeter_texture_choose_recolor_component_with_sampler(
     const ExPolygons                       &visible,
     const ExtrusionEntity                  *fallback_entity,
-    const PerimeterTextureRecolorSampler   &sampler)
+    const PerimeterTextureRecolorSampler   &sampler,
+    int                                     contoning_stack_layers = 0)
 {
     if (sampler.image_texture) {
         if (!sampler.image_context)
@@ -572,8 +595,15 @@ static std::optional<unsigned int> perimeter_texture_choose_recolor_component_wi
             }
             if (!rgb)
                 return std::nullopt;
+            const int stack_layers = perimeter_texture_contoning_pattern_layers(
+                contoning_stack_layers > 0 ?
+                    std::clamp(contoning_stack_layers,
+                               TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                               sampler.contoning_stack_layers) :
+                    sampler.contoning_stack_layers,
+                sampler.contoning_pattern_filaments);
             const unsigned int component_id =
-                sampler.contoning_solver.component_for_depth(*rgb, sampler.contoning_stack_layers, 0);
+                sampler.contoning_solver.component_for_depth(*rgb, stack_layers, 0);
             if (component_id >= 1 && component_id <= sampler.num_physical)
                 return component_id;
             return std::nullopt;
@@ -621,7 +651,8 @@ static std::optional<unsigned int> perimeter_texture_choose_recolor_component_fo
     const ExtrusionEntity    *fallback_entity,
     const TextureMappingZone &zone,
     unsigned int             texture_zone_id,
-    float                    base_outer_width_mm)
+    float                    base_outer_width_mm,
+    int                      contoning_stack_layers = 0)
 {
     const Layer *layer = layer_region.layer();
     if (layer == nullptr || layer->object() == nullptr || layer->object()->print() == nullptr)
@@ -632,7 +663,7 @@ static std::optional<unsigned int> perimeter_texture_choose_recolor_component_fo
     if (!sampler)
         return std::nullopt;
 
-    return perimeter_texture_choose_recolor_component_with_sampler(visible, fallback_entity, *sampler);
+    return perimeter_texture_choose_recolor_component_with_sampler(visible, fallback_entity, *sampler, contoning_stack_layers);
 }
 
 static std::optional<unsigned int> perimeter_texture_choose_recolor_component(const LayerRegion        &layer_region,
@@ -642,12 +673,30 @@ static std::optional<unsigned int> perimeter_texture_choose_recolor_component(co
                                                                               float                    base_outer_width_mm)
 {
     const ExPolygons visible = perimeter_texture_external_visible_footprint(layer_region, entity);
+    int contoning_stack_layers = 0;
+    if (zone.top_surface_contoning_perimeters_active()) {
+        const int fallback_wall_loops = std::max(1, layer_region.region().config().wall_loops.value);
+        if (const ExtrusionEntityCollection *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
+            contoning_stack_layers =
+                perimeter_texture_available_contoning_shell_slots(*collection,
+                                                                  fallback_wall_loops,
+                                                                  zone.top_surface_contoning_stack_layers);
+        } else {
+            contoning_stack_layers =
+                std::clamp(fallback_wall_loops,
+                           TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                           std::clamp(zone.top_surface_contoning_stack_layers,
+                                      TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                                      TextureMappingZone::MaxTopSurfaceContoningStackLayers));
+        }
+    }
     return perimeter_texture_choose_recolor_component_for_visible(layer_region,
                                                                   visible,
                                                                   &entity,
                                                                   zone,
                                                                   texture_zone_id,
-                                                                  base_outer_width_mm);
+                                                                  base_outer_width_mm,
+                                                                  contoning_stack_layers);
 }
 
 static bool perimeter_texture_apply_recolor_small_perimeter_loops(LayerRegion              &layer_region,
@@ -1014,8 +1063,11 @@ static std::optional<unsigned int> perimeter_texture_choose_recolor_component_fr
                            TextureMappingZone::MinTopSurfaceContoningStackLayers,
                            sampler.contoning_stack_layers) :
                 sampler.contoning_stack_layers;
+            const int pattern_layers =
+                perimeter_texture_contoning_pattern_layers(stack_layers, sampler.contoning_pattern_filaments);
+            const int pattern_depth = depth_from_top >= 0 ? depth_from_top % pattern_layers : 0;
             const unsigned int component_id =
-                sampler.contoning_solver.component_for_depth(rgb, stack_layers, depth_from_top);
+                sampler.contoning_solver.component_for_depth(rgb, pattern_layers, pattern_depth);
             if (component_id >= 1 && component_id <= sampler.num_physical)
                 return component_id;
             return std::nullopt;

@@ -161,7 +161,10 @@ struct TextureMappingZone
     static constexpr float DefaultTopSurfaceContoningAngleThresholdDeg = 20.f;
     static constexpr int   MinTopSurfaceContoningStackLayers = 1;
     static constexpr int   MaxTopSurfaceContoningStackLayers = 20;
-    static constexpr int   DefaultTopSurfaceContoningStackLayers = 6;
+    static constexpr int   DefaultTopSurfaceContoningStackLayers = 15;
+    static constexpr int   MinTopSurfaceContoningPatternFilaments = 1;
+    static constexpr int   MaxTopSurfaceContoningPatternFilaments = 20;
+    static constexpr int   DefaultTopSurfaceContoningPatternFilaments = 4;
     static constexpr float MinTopSurfaceContoningMinFeatureMm = 0.f;
     static constexpr float MaxTopSurfaceContoningMinFeatureMm = 20.f;
     static constexpr float DefaultTopSurfaceContoningMinFeatureMm = 0.f;
@@ -263,6 +266,7 @@ struct TextureMappingZone
     bool        top_surface_image_fixed_coloring_filaments = DefaultTopSurfaceImageFixedColoringFilaments;
     float       top_surface_contoning_angle_threshold_deg = DefaultTopSurfaceContoningAngleThresholdDeg;
     int         top_surface_contoning_stack_layers = DefaultTopSurfaceContoningStackLayers;
+    int         top_surface_contoning_pattern_filaments = DefaultTopSurfaceContoningPatternFilaments;
     float       top_surface_contoning_min_feature_mm = DefaultTopSurfaceContoningMinFeatureMm;
     bool        top_surface_contoning_color_lower_surfaces = DefaultTopSurfaceContoningColorLowerSurfaces;
     bool        top_surface_contoning_only_color_surface_infill = DefaultTopSurfaceContoningOnlyColorSurfaceInfill;
@@ -375,6 +379,7 @@ struct TextureMappingZone
         top_surface_image_fixed_coloring_filaments = DefaultTopSurfaceImageFixedColoringFilaments;
         top_surface_contoning_angle_threshold_deg = DefaultTopSurfaceContoningAngleThresholdDeg;
         top_surface_contoning_stack_layers = DefaultTopSurfaceContoningStackLayers;
+        top_surface_contoning_pattern_filaments = DefaultTopSurfaceContoningPatternFilaments;
         top_surface_contoning_min_feature_mm = DefaultTopSurfaceContoningMinFeatureMm;
         top_surface_contoning_color_lower_surfaces = DefaultTopSurfaceContoningColorLowerSurfaces;
         top_surface_contoning_only_color_surface_infill = DefaultTopSurfaceContoningOnlyColorSurfaceInfill;
