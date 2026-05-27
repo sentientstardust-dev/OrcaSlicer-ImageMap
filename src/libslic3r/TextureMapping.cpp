@@ -916,7 +916,8 @@ static std::string normalized_prime_tower_color_mode_name(std::string name)
 std::string TextureMappingGlobalSettings::serialize() const
 {
     const std::string normalized_mode = normalize_color_mode_name(prime_tower_color_mode);
-    if (!enabled &&
+    const bool prime_tower_defaults =
+        !enabled &&
         std::abs((std::isfinite(angle_offset_deg) ? angle_offset_deg : 0.f)) <= 1e-6f &&
         !preserve_aspect_ratio &&
         normalized_mode == "auto" &&
@@ -928,26 +929,44 @@ std::string TextureMappingGlobalSettings::serialize() const
         image_file_back.empty() &&
         image_name_back.empty() &&
         image_width_back == 0 &&
-        image_height_back == 0)
+        image_height_back == 0;
+    const bool preview_defaults =
+        std::abs((std::isfinite(preview_opacity_pct) ? preview_opacity_pct : TextureMappingZone::DefaultPreviewOpacityPct) -
+                 TextureMappingZone::DefaultPreviewOpacityPct) <= 1e-6f &&
+        preview_simulate_colors == TextureMappingZone::DefaultPreviewSimulateColors &&
+        preview_limit_resolution == TextureMappingZone::DefaultPreviewLimitResolution &&
+        preview_simulate_top_surface_lod == TextureMappingZone::DefaultPreviewSimulateTopSurfaceLod;
+    if (prime_tower_defaults && preview_defaults)
         return {};
 
     nlohmann::json root;
     root["schema"] = 1;
-    nlohmann::json prime_tower_texture_mapping;
-    prime_tower_texture_mapping["enabled"] = enabled;
-    prime_tower_texture_mapping["angle_offset_deg"] = std::clamp(std::isfinite(angle_offset_deg) ? angle_offset_deg : 0.f, 0.f, 360.f);
-    prime_tower_texture_mapping["preserve_aspect_ratio"] = preserve_aspect_ratio;
-    prime_tower_texture_mapping["prime_tower_color_mode"] = normalized_mode;
-    prime_tower_texture_mapping["settings_zone_uid"] = prime_tower_settings_zone_uid;
-    prime_tower_texture_mapping["image_file"] = image_file;
-    prime_tower_texture_mapping["image_name"] = image_name;
-    prime_tower_texture_mapping["image_width"] = image_width;
-    prime_tower_texture_mapping["image_height"] = image_height;
-    prime_tower_texture_mapping["image_file_back"] = image_file_back;
-    prime_tower_texture_mapping["image_name_back"] = image_name_back;
-    prime_tower_texture_mapping["image_width_back"] = image_width_back;
-    prime_tower_texture_mapping["image_height_back"] = image_height_back;
-    root["prime_tower_texture_mapping"] = std::move(prime_tower_texture_mapping);
+    if (!preview_defaults || !prime_tower_defaults) {
+        nlohmann::json preview_options;
+        preview_options["preview_opacity_pct"] =
+            std::clamp(std::isfinite(preview_opacity_pct) ? preview_opacity_pct : TextureMappingZone::DefaultPreviewOpacityPct, 0.f, 100.f);
+        preview_options["simulate_preview_colors"] = preview_simulate_colors;
+        preview_options["limit_preview_resolution"] = preview_limit_resolution;
+        preview_options["simulate_top_surface_lod"] = preview_simulate_top_surface_lod;
+        root["preview_options"] = std::move(preview_options);
+    }
+    if (!prime_tower_defaults) {
+        nlohmann::json prime_tower_texture_mapping;
+        prime_tower_texture_mapping["enabled"] = enabled;
+        prime_tower_texture_mapping["angle_offset_deg"] = std::clamp(std::isfinite(angle_offset_deg) ? angle_offset_deg : 0.f, 0.f, 360.f);
+        prime_tower_texture_mapping["preserve_aspect_ratio"] = preserve_aspect_ratio;
+        prime_tower_texture_mapping["prime_tower_color_mode"] = normalized_mode;
+        prime_tower_texture_mapping["settings_zone_uid"] = prime_tower_settings_zone_uid;
+        prime_tower_texture_mapping["image_file"] = image_file;
+        prime_tower_texture_mapping["image_name"] = image_name;
+        prime_tower_texture_mapping["image_width"] = image_width;
+        prime_tower_texture_mapping["image_height"] = image_height;
+        prime_tower_texture_mapping["image_file_back"] = image_file_back;
+        prime_tower_texture_mapping["image_name_back"] = image_name_back;
+        prime_tower_texture_mapping["image_width_back"] = image_width_back;
+        prime_tower_texture_mapping["image_height_back"] = image_height_back;
+        root["prime_tower_texture_mapping"] = std::move(prime_tower_texture_mapping);
+    }
     return root.dump();
 }
 
@@ -966,6 +985,25 @@ void TextureMappingGlobalSettings::load(const std::string &serialized)
     }
     if (!root.is_object())
         return;
+
+    const auto preview_options_it = root.find("preview_options");
+    if (preview_options_it != root.end() && preview_options_it->is_object()) {
+        const auto opacity_it = preview_options_it->find("preview_opacity_pct");
+        if (opacity_it != preview_options_it->end() && opacity_it->is_number())
+            preview_opacity_pct = std::clamp(opacity_it->get<float>(), 0.f, 100.f);
+        const auto simulate_it = preview_options_it->find("simulate_preview_colors");
+        if (simulate_it != preview_options_it->end() && simulate_it->is_boolean())
+            preview_simulate_colors = simulate_it->get<bool>();
+        const auto limit_it = preview_options_it->find("limit_preview_resolution");
+        if (limit_it != preview_options_it->end() && limit_it->is_boolean())
+            preview_limit_resolution = limit_it->get<bool>();
+        const auto top_surface_lod_it = preview_options_it->find("simulate_top_surface_lod");
+        if (top_surface_lod_it != preview_options_it->end() && top_surface_lod_it->is_boolean())
+            preview_simulate_top_surface_lod = top_surface_lod_it->get<bool>();
+    }
+    const auto root_simulate_it = root.find("simulate_preview_colors");
+    if (root_simulate_it != root.end() && root_simulate_it->is_boolean())
+        preview_simulate_colors = root_simulate_it->get<bool>();
 
     const auto prime_tower_texture_mapping_it = root.find("prime_tower_texture_mapping");
     if (prime_tower_texture_mapping_it == root.end() || !prime_tower_texture_mapping_it->is_object())
@@ -1122,9 +1160,6 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            high_resolution_sampling == rhs.high_resolution_sampling &&
            std::abs(tone_gamma - rhs.tone_gamma) <= eps &&
            transmission_distance_calibration_mode == rhs.transmission_distance_calibration_mode &&
-           std::abs(preview_opacity_pct - rhs.preview_opacity_pct) <= eps &&
-           preview_simulate_colors == rhs.preview_simulate_colors &&
-           preview_limit_resolution == rhs.preview_limit_resolution &&
            auto_adjust_filament_selection == rhs.auto_adjust_filament_selection &&
            floats_equal(filament_strengths_pct, rhs.filament_strengths_pct) &&
            floats_equal(filament_minimum_offsets_pct, rhs.filament_minimum_offsets_pct) &&
@@ -1527,10 +1562,6 @@ std::string TextureMappingManager::serialize_entries()
         texture["tone_gamma"] = normalize_tone_gamma(zone.tone_gamma);
         texture["transmission_distance_calibration"] =
             transmission_distance_calibration_mode_name(zone.transmission_distance_calibration_mode);
-        texture["preview_opacity_pct"] =
-            std::clamp(finite_or(zone.preview_opacity_pct, TextureMappingZone::DefaultPreviewOpacityPct), 0.f, 100.f);
-        texture["simulate_preview_colors"] = zone.preview_simulate_colors;
-        texture["limit_preview_resolution"] = zone.preview_limit_resolution;
         texture["auto_adjust_filaments"] = zone.auto_adjust_filament_selection;
         texture["strength_pct"] = floats_to_json(normalized_strengths);
         texture["minimum_offset_pct"] = floats_to_json(normalized_min_offsets);
@@ -1832,10 +1863,6 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.high_resolution_sampling = true;
         zone.tone_gamma = normalize_tone_gamma(texture.value("tone_gamma", 1.f));
         zone.transmission_distance_calibration_mode = transmission_distance_calibration_mode_from_json(texture);
-        zone.preview_opacity_pct =
-            std::clamp(texture.value("preview_opacity_pct", TextureMappingZone::DefaultPreviewOpacityPct), 0.f, 100.f);
-        zone.preview_simulate_colors = texture.value("simulate_preview_colors", TextureMappingZone::DefaultPreviewSimulateColors);
-        zone.preview_limit_resolution = texture.value("limit_preview_resolution", true);
         zone.auto_adjust_filament_selection = texture.value("auto_adjust_filaments", true);
         zone.filament_strengths_pct = normalize_strengths(floats_from_json(texture.value("strength_pct", nlohmann::json::array())));
         zone.filament_minimum_offsets_pct =

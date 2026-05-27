@@ -3760,6 +3760,7 @@ void PresetBundle::load_config_file_config(const std::string &name_or_path, bool
         this->project_config.apply_only(config, s_project_options);
         if (const auto *color_opt = this->project_config.option<ConfigOptionStrings>("filament_colour", false); color_opt != nullptr)
             this->texture_mapping_zones.load_entries(this->project_config.opt_string("texture_mapping_definitions"), color_opt->values);
+        this->texture_mapping_global_settings.load(this->project_config.opt_string("texture_mapping_global_settings"));
 
         break;
     }

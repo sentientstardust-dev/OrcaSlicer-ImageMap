@@ -3,6 +3,7 @@
 const vec3 ZERO = vec3(0.0, 0.0, 0.0);
 const float UV_EDGE_EPSILON = 0.000001;
 const float INVALID_TEXTURE_CHECKER_SCALE = 0.2;
+const float CONTONING_FLAT_SURFACE_NORMAL_Z = 0.999;
 
 struct PrintVolumeDetection
 {
@@ -13,8 +14,11 @@ struct PrintVolumeDetection
 
 uniform vec4 uniform_color;
 uniform sampler2D uniform_texture;
+uniform sampler2D contoning_flat_surface_texture;
 uniform float texture_preview_mix;
 uniform bool invalid_texture_mapping;
+uniform bool contoning_flat_surface_texture_enabled;
+uniform bool contoning_flat_surface_include_bottom;
 uniform bool color_match_preview_active;
 uniform vec3 color_match_target_oklab;
 uniform float color_match_tolerance_sq;
@@ -80,6 +84,12 @@ void main()
 
     vec4 color = uniform_color;
     vec4 texture_color = texture(uniform_texture, texture_preview_coord(tex_coord));
+    if (contoning_flat_surface_texture_enabled) {
+        float normal_z = normalize(world_normal).z;
+        if (normal_z >= CONTONING_FLAT_SURFACE_NORMAL_Z ||
+            (contoning_flat_surface_include_bottom && normal_z <= -CONTONING_FLAT_SURFACE_NORMAL_Z))
+            texture_color = texture(contoning_flat_surface_texture, texture_preview_coord(tex_coord));
+    }
     float mix_factor = clamp(texture_preview_mix, 0.0, 1.0);
     if (color_match_preview_active) {
         float source_alpha = clamp(texture_color.a, 0.0, 1.0);

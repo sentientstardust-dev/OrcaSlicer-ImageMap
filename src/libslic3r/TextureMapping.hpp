@@ -219,6 +219,7 @@ struct TextureMappingZone
     static constexpr int   DefaultTransmissionDistanceCalibrationMode = int(TDCalibrationAbsolute);
     static constexpr bool  DefaultPreviewSimulateColors = false;
     static constexpr bool  DefaultPreviewLimitResolution = true;
+    static constexpr bool  DefaultPreviewSimulateTopSurfaceLod = true;
     static constexpr bool  DefaultAutoAdjustFilamentSelection = true;
 
     static constexpr int default_modulation_mode_for_surface_pattern(int surface_pattern)
@@ -329,9 +330,6 @@ struct TextureMappingZone
     bool        high_resolution_sampling = DefaultHighResolutionSampling;
     float       tone_gamma = DefaultToneGamma;
     int         transmission_distance_calibration_mode = DefaultTransmissionDistanceCalibrationMode;
-    float       preview_opacity_pct = DefaultPreviewOpacityPct;
-    bool        preview_simulate_colors = DefaultPreviewSimulateColors;
-    bool        preview_limit_resolution = DefaultPreviewLimitResolution;
     bool        auto_adjust_filament_selection = DefaultAutoAdjustFilamentSelection;
     std::vector<float> filament_strengths_pct;
     std::vector<float> filament_minimum_offsets_pct;
@@ -454,9 +452,6 @@ struct TextureMappingZone
         high_resolution_sampling = DefaultHighResolutionSampling;
         tone_gamma = DefaultToneGamma;
         transmission_distance_calibration_mode = DefaultTransmissionDistanceCalibrationMode;
-        preview_opacity_pct = DefaultPreviewOpacityPct;
-        preview_simulate_colors = DefaultPreviewSimulateColors;
-        preview_limit_resolution = DefaultPreviewLimitResolution;
         auto_adjust_filament_selection = DefaultAutoAdjustFilamentSelection;
         linear_gradient_mode = DefaultLinearGradientMode;
         linear_gradient_radius_mm = DefaultLinearGradientRadiusMm;
@@ -519,6 +514,10 @@ struct TextureMappingGlobalSettings
     bool enabled = false;
     float angle_offset_deg = 0.f;
     bool preserve_aspect_ratio = false;
+    float preview_opacity_pct = TextureMappingZone::DefaultPreviewOpacityPct;
+    bool preview_simulate_colors = TextureMappingZone::DefaultPreviewSimulateColors;
+    bool preview_limit_resolution = TextureMappingZone::DefaultPreviewLimitResolution;
+    bool preview_simulate_top_surface_lod = TextureMappingZone::DefaultPreviewSimulateTopSurfaceLod;
     std::string prime_tower_color_mode = "auto";
     uint64_t prime_tower_settings_zone_uid = 0;
     std::string image_file;

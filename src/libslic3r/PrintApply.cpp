@@ -262,6 +262,7 @@ static void remove_texture_mapping_preview_options(nlohmann::json &root)
         texture_it->erase("preview_opacity_pct");
         texture_it->erase("simulate_preview_colors");
         texture_it->erase("limit_preview_resolution");
+        texture_it->erase("simulate_top_surface_lod");
     }
 }
 
@@ -286,15 +287,66 @@ static bool texture_mapping_definitions_equal_for_gcode(const ConfigOption *lhs,
     return lhs_json == rhs_json;
 }
 
+static bool texture_mapping_global_settings_json_for_gcode(const ConfigOption *opt, nlohmann::json &out)
+{
+    out = nlohmann::json::object();
+    if (opt == nullptr)
+        return true;
+    if (opt->type() != coString)
+        return false;
+    const std::string &value = static_cast<const ConfigOptionString *>(opt)->value;
+    if (value.empty())
+        return true;
+    try {
+        out = nlohmann::json::parse(value);
+    } catch (const nlohmann::json::exception &) {
+        return false;
+    }
+    if (!out.is_object())
+        return false;
+    out.erase("schema");
+    auto preview_it = out.find("preview_options");
+    if (preview_it != out.end()) {
+        if (preview_it->is_object()) {
+            preview_it->erase("preview_opacity_pct");
+            preview_it->erase("simulate_preview_colors");
+            preview_it->erase("limit_preview_resolution");
+            preview_it->erase("simulate_top_surface_lod");
+            if (preview_it->empty())
+                out.erase(preview_it);
+        }
+    }
+    out.erase("preview_opacity_pct");
+    out.erase("simulate_preview_colors");
+    out.erase("limit_preview_resolution");
+    out.erase("simulate_top_surface_lod");
+    return true;
+}
+
+static bool texture_mapping_global_settings_equal_for_gcode(const ConfigOption *lhs, const ConfigOption *rhs)
+{
+    if (config_options_equal(lhs, rhs))
+        return true;
+    nlohmann::json lhs_json;
+    nlohmann::json rhs_json;
+    return texture_mapping_global_settings_json_for_gcode(lhs, lhs_json) &&
+           texture_mapping_global_settings_json_for_gcode(rhs, rhs_json) &&
+           lhs_json == rhs_json;
+}
+
 static void remove_texture_mapping_preview_only_diff(t_config_option_keys     &diff,
                                                      const ConfigBase         &current_config,
                                                      const DynamicPrintConfig &new_full_config)
 {
     auto it = std::find(diff.begin(), diff.end(), "texture_mapping_definitions");
-    if (it == diff.end())
-        return;
-    if (texture_mapping_definitions_equal_for_gcode(current_config.option("texture_mapping_definitions"),
+    if (it != diff.end() &&
+        texture_mapping_definitions_equal_for_gcode(current_config.option("texture_mapping_definitions"),
                                                    new_full_config.option("texture_mapping_definitions")))
+        diff.erase(it);
+    it = std::find(diff.begin(), diff.end(), "texture_mapping_global_settings");
+    if (it != diff.end() &&
+        texture_mapping_global_settings_equal_for_gcode(current_config.option("texture_mapping_global_settings"),
+                                                       new_full_config.option("texture_mapping_global_settings")))
         diff.erase(it);
 }
 
@@ -324,6 +376,8 @@ static t_config_option_keys print_config_diffs(
             compute_filament_override_value(opt_key, opt_old, opt_new, opt_new_filament, new_full_config, print_diff, filament_overrides, filament_maps);
         } else if (*opt_new != *opt_old) {
             if (opt_key == "texture_mapping_definitions" && texture_mapping_definitions_equal_for_gcode(opt_old, opt_new))
+                continue;
+            if (opt_key == "texture_mapping_global_settings" && texture_mapping_global_settings_equal_for_gcode(opt_old, opt_new))
                 continue;
             //BBS: add plate_index logic for wipe_tower_x/wipe_tower_y
             if (!opt_key.compare("wipe_tower_x") || !opt_key.compare("wipe_tower_y")) {
@@ -357,6 +411,8 @@ static t_config_option_keys full_print_config_diffs(const DynamicPrintConfig &cu
         const ConfigOption *opt_new = new_full_config.option(opt_key);
         if (opt_old == nullptr || *opt_new != *opt_old) {
             if (opt_key == "texture_mapping_definitions" && texture_mapping_definitions_equal_for_gcode(opt_old, opt_new))
+                continue;
+            if (opt_key == "texture_mapping_global_settings" && texture_mapping_global_settings_equal_for_gcode(opt_old, opt_new))
                 continue;
             //BBS: add plate_index logic for wipe_tower_x/wipe_tower_y
             if (opt_old && (!opt_key.compare("wipe_tower_x") || !opt_key.compare("wipe_tower_y"))) {

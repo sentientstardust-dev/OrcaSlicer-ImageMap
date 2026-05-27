@@ -621,7 +621,9 @@ static bool assign_imported_texture_mapping_zone(Model &model)
         return false;
 
     project_config.option<ConfigOptionString>("texture_mapping_definitions", true);
+    project_config.option<ConfigOptionString>("texture_mapping_global_settings", true);
     bundle->texture_mapping_zones.load_entries(project_config.opt_string("texture_mapping_definitions"), color_opt->values);
+    bundle->texture_mapping_global_settings.load(project_config.opt_string("texture_mapping_global_settings"));
     const unsigned int zone_id = bundle->texture_mapping_zones.ensure_image_texture_zone(color_opt->values.size(), color_opt->values);
     if (zone_id == 0)
         return false;
@@ -636,6 +638,15 @@ static bool assign_imported_texture_mapping_zone(Model &model)
         opt->value = serialized;
     else
         print_config.set_key_value("texture_mapping_definitions", new ConfigOptionString(serialized));
+    const std::string global_serialized = bundle->texture_mapping_global_settings.serialize();
+    if (ConfigOptionString *opt = project_config.option<ConfigOptionString>("texture_mapping_global_settings"))
+        opt->value = global_serialized;
+    else
+        project_config.set_key_value("texture_mapping_global_settings", new ConfigOptionString(global_serialized));
+    if (ConfigOptionString *opt = print_config.option<ConfigOptionString>("texture_mapping_global_settings"))
+        opt->value = global_serialized;
+    else
+        print_config.set_key_value("texture_mapping_global_settings", new ConfigOptionString(global_serialized));
 
     for (ModelObject *object : model.objects) {
         if (!model_object_has_imported_texture_mapping_data(object))
@@ -760,6 +771,7 @@ static void load_texture_mapping_definitions(PresetBundle &bundle, const std::st
     set_texture_mapping_definitions(bundle, serialized);
     const ConfigOptionStrings *color_opt = bundle.project_config.option<ConfigOptionStrings>("filament_colour", false);
     bundle.texture_mapping_zones.load_entries(serialized, color_opt != nullptr ? color_opt->values : std::vector<std::string>());
+    set_texture_mapping_definitions(bundle, bundle.texture_mapping_zones.serialize_entries());
 }
 
 static void sync_model_texture_mapping_definitions(Model &model, const std::string &serialized)
@@ -1867,10 +1879,8 @@ public:
                                         const std::vector<float> &component_transmission_distances_mm,
                                         int transmission_distance_calibration_mode,
                                         float tone_gamma,
-                                        float preview_opacity_pct,
                                         bool force_sequential_filaments,
                                         bool auto_adjust_filament_selection,
-                                        bool preview_limit_resolution,
                                         bool reduce_outer_surface_texture,
                                         bool seam_hiding,
                                         bool nonlinear_offset_adjustment,
@@ -2125,13 +2135,28 @@ public:
         m_force_sequential_filaments_checkbox->SetValue(force_sequential_filaments);
         filament_root->Add(m_force_sequential_filaments_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
 
+        filament_root->AddStretchSpacer(1);
+        auto *filament_calibration_note =
+            new wxStaticText(filament_page,
+                             wxID_ANY,
+                             _L("NOTE: Filament/TD calibration is not currently used in top-surface coloring"),
+                             wxDefaultPosition,
+                             wxSize(FromDIP(390), -1));
+        filament_calibration_note->Wrap(FromDIP(390));
+        filament_root->Add(filament_calibration_note, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        filament_page->Bind(wxEVT_SIZE, [this, filament_page, filament_calibration_note, gap](wxSizeEvent &evt) {
+            const int wrap_width = std::max(FromDIP(120), filament_page->GetClientSize().GetWidth() - gap * 2);
+            filament_calibration_note->Wrap(wrap_width);
+            evt.Skip();
+        });
+
         auto *preview_box = new wxStaticBoxSizer(wxVERTICAL, preview_page, _L("3D Preview"));
         auto *preview_opacity_row = new wxBoxSizer(wxHORIZONTAL);
         preview_opacity_row->Add(new wxStaticText(preview_page, wxID_ANY, _L("Texture opacity")),
                                  0,
                                  wxALIGN_CENTER_VERTICAL | wxRIGHT,
                                  gap);
-        const int opacity = std::clamp(int(std::lround(preview_opacity_pct)), 0, 100);
+        const int opacity = std::clamp(int(std::lround(m_global_settings.preview_opacity_pct)), 0, 100);
         m_preview_opacity_slider = new wxSlider(preview_page, wxID_ANY, opacity, 0, 100, wxDefaultPosition, wxSize(FromDIP(180), -1), wxSL_HORIZONTAL | wxSL_AUTOTICKS);
         m_preview_opacity_spin = new wxSpinCtrl(preview_page, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(70), -1),
                                                 wxSP_ARROW_KEYS | wxALIGN_RIGHT, 0, 100, opacity);
@@ -2151,8 +2176,11 @@ public:
         m_auto_adjust_filament_selection_checkbox->SetValue(auto_adjust_filament_selection);
         preview_box->Add(m_auto_adjust_filament_selection_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
         m_preview_limit_resolution_checkbox = new wxCheckBox(preview_page, wxID_ANY, _L("Limit color simulation texture resolution"));
-        m_preview_limit_resolution_checkbox->SetValue(preview_limit_resolution);
+        m_preview_limit_resolution_checkbox->SetValue(m_global_settings.preview_limit_resolution);
         preview_box->Add(m_preview_limit_resolution_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+        m_preview_top_surface_lod_checkbox = new wxCheckBox(preview_page, wxID_ANY, _L("Simulate level of detail for top-surface coloring"));
+        m_preview_top_surface_lod_checkbox->SetValue(m_global_settings.preview_simulate_top_surface_lod);
+        preview_box->Add(m_preview_top_surface_lod_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
         auto *minimum_visibility_offset_row = new wxBoxSizer(wxHORIZONTAL);
         m_minimum_visibility_offset_checkbox = new wxCheckBox(preview_page, wxID_ANY, _L("Minimum visibility offset"));
         m_minimum_visibility_offset_checkbox->SetValue(minimum_visibility_offset_enabled);
@@ -2872,6 +2900,7 @@ public:
     bool force_sequential_filaments() const { return m_force_sequential_filaments_checkbox && m_force_sequential_filaments_checkbox->GetValue(); }
     bool auto_adjust_filament_selection() const { return m_auto_adjust_filament_selection_checkbox == nullptr || m_auto_adjust_filament_selection_checkbox->GetValue(); }
     bool preview_limit_resolution() const { return m_preview_limit_resolution_checkbox == nullptr || m_preview_limit_resolution_checkbox->GetValue(); }
+    bool preview_simulate_top_surface_lod() const { return m_preview_top_surface_lod_checkbox != nullptr && m_preview_top_surface_lod_checkbox->GetValue(); }
     bool reduce_outer_surface_texture() const { return false; }
     bool seam_hiding() const { return m_seam_hiding_checkbox && m_seam_hiding_checkbox->GetValue(); }
     bool nonlinear_offset_adjustment() const { return m_nonlinear_offset_adjustment_checkbox && m_nonlinear_offset_adjustment_checkbox->GetValue(); }
@@ -3131,6 +3160,9 @@ public:
     TextureMappingGlobalSettings global_settings() const
     {
         TextureMappingGlobalSettings settings = m_global_settings;
+        settings.preview_opacity_pct = preview_opacity_pct();
+        settings.preview_limit_resolution = preview_limit_resolution();
+        settings.preview_simulate_top_surface_lod = preview_simulate_top_surface_lod();
         settings.enabled = m_prime_tower_mapping_enabled_checkbox != nullptr && m_prime_tower_mapping_enabled_checkbox->GetValue();
         settings.preserve_aspect_ratio =
             m_prime_tower_preserve_aspect_ratio_checkbox != nullptr && m_prime_tower_preserve_aspect_ratio_checkbox->GetValue();
@@ -3612,6 +3644,7 @@ private:
     wxCheckBox *m_force_sequential_filaments_checkbox {nullptr};
     wxCheckBox *m_auto_adjust_filament_selection_checkbox {nullptr};
     wxCheckBox *m_preview_limit_resolution_checkbox {nullptr};
+    wxCheckBox *m_preview_top_surface_lod_checkbox {nullptr};
     wxCheckBox *m_reduce_outer_surface_texture_checkbox {nullptr};
     wxCheckBox *m_seam_hiding_checkbox {nullptr};
     wxCheckBox *m_nonlinear_offset_adjustment_checkbox {nullptr};
@@ -5633,6 +5666,15 @@ Sidebar::Sidebar(Plater *parent)
             opt->value = serialized;
         else
             bundle->project_config.set_key_value("texture_mapping_definitions", new ConfigOptionString(serialized));
+        const std::string global_serialized = bundle->texture_mapping_global_settings.serialize();
+        if (ConfigOptionString *opt = print_cfg->option<ConfigOptionString>("texture_mapping_global_settings"))
+            opt->value = global_serialized;
+        else
+            print_cfg->set_key_value("texture_mapping_global_settings", new ConfigOptionString(global_serialized));
+        if (ConfigOptionString *opt = bundle->project_config.option<ConfigOptionString>("texture_mapping_global_settings"))
+            opt->value = global_serialized;
+        else
+            bundle->project_config.set_key_value("texture_mapping_global_settings", new ConfigOptionString(global_serialized));
         if (auto *print_tab = wxGetApp().get_tab(Preset::TYPE_PRINT))
             print_tab->update_dirty();
         if (wxGetApp().plater() != nullptr)
@@ -5654,6 +5696,7 @@ Sidebar::Sidebar(Plater *parent)
             bundle->project_config.opt_string("texture_mapping_definitions") :
             std::string();
         bundle->texture_mapping_zones.load_entries(serialized, colors);
+        bundle->texture_mapping_global_settings.load(bundle->project_config.opt_string("texture_mapping_global_settings"));
         bundle->texture_mapping_zones.add_zone(colors.size(),
                                                colors,
                                                colors.size() < 2 ? int(TextureMappingZone::LinearGradient) : int(TextureMappingZone::ImageTexture));
@@ -7549,13 +7592,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
     auto is_preview_only_texture_row_change = [](const TextureMappingZone &before, const TextureMappingZone &after) {
         TextureMappingZone before_gcode = before;
         TextureMappingZone after_gcode = after;
-        before_gcode.preview_opacity_pct = TextureMappingZone::DefaultPreviewOpacityPct;
-        before_gcode.preview_simulate_colors = TextureMappingZone::DefaultPreviewSimulateColors;
-        before_gcode.preview_limit_resolution = TextureMappingZone::DefaultPreviewLimitResolution;
         before_gcode.show_linear_gradient_direction_arrow = false;
-        after_gcode.preview_opacity_pct = TextureMappingZone::DefaultPreviewOpacityPct;
-        after_gcode.preview_simulate_colors = TextureMappingZone::DefaultPreviewSimulateColors;
-        after_gcode.preview_limit_resolution = TextureMappingZone::DefaultPreviewLimitResolution;
         after_gcode.show_linear_gradient_direction_arrow = false;
         return before != after && before_gcode == after_gcode;
     };
@@ -7632,6 +7669,19 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
     auto persist_rows = [mgr_ptr, set_config_string, notify_change](bool affects_scene) {
         set_config_string("texture_mapping_definitions", serialize_texture_mapping_manager(mgr_ptr));
         notify_change(affects_scene);
+    };
+
+    auto persist_preview_simulate_colors = [this, bundle, set_config_string, notify_change, refresh_texture_mapping_preview](bool value) {
+        if (bundle == nullptr)
+            return;
+        const bool changed = bundle->texture_mapping_global_settings.preview_simulate_colors != value;
+        bundle->texture_mapping_global_settings.preview_simulate_colors = value;
+        set_config_string("texture_mapping_global_settings", bundle->texture_mapping_global_settings.serialize());
+        if (changed) {
+            notify_change(false);
+            refresh_texture_mapping_preview();
+            CallAfter([this]() { update_texture_mapping_panel(false); });
+        }
     };
 
     for (const size_t zone_index : visible_zone_indices) {
@@ -7994,7 +8044,10 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         editor_sizer->Add(contrast_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
 
         ::CheckBox *preview_colors_chk = nullptr;
-        auto *preview_colors_row = make_sidebar_checkbox_row(editor, preview_colors_chk, _L("Preview Result Colors"), entry.preview_simulate_colors);
+        auto *preview_colors_row = make_sidebar_checkbox_row(editor,
+                                                             preview_colors_chk,
+                                                             _L("Preview Result Colors"),
+                                                             bundle->texture_mapping_global_settings.preview_simulate_colors);
         editor_sizer->Add(preview_colors_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
 
         auto *button_row = new wxBoxSizer(wxHORIZONTAL);
@@ -8008,7 +8061,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         auto apply_controls = [zone_index, mgr_ptr, num_physical, filament_checks, surface_choice,
                                linear_gradient_stops_bar, linear_gradient_mode_choice, linear_gradient_radius_spin,
                                linear_gradient_radius_percent_chk,
-                               surface_pattern_from_selection, linear_gradient_mode_from_selection, mode_choice, preview_colors_chk,
+                               surface_pattern_from_selection, linear_gradient_mode_from_selection, mode_choice,
                                show_direction_arrow_chk, contrast_spin, apply_zone]() {
             if (mgr_ptr == nullptr)
                 return;
@@ -8058,8 +8111,6 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.filament_color_mode = mode_choice != nullptr ?
                 texture_mapping_color_mode_from_selection(mode_choice->GetSelection(), updated.filament_color_mode) :
                 updated.filament_color_mode;
-            updated.preview_simulate_colors =
-                updated.is_image_texture() && preview_colors_chk != nullptr && preview_colors_chk->GetValue();
             updated.show_linear_gradient_direction_arrow = show_direction_arrow_chk != nullptr && show_direction_arrow_chk->GetValue();
             updated.contrast_pct = contrast_spin != nullptr ? std::clamp(float(contrast_spin->GetValue()), 25.f, 300.f) : updated.contrast_pct;
             updated.high_resolution_sampling = true;
@@ -8174,7 +8225,6 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                linear_gradient_mode_from_selection,
                                mode_choice,
                                surface_choice,
-                               preview_colors_chk,
                                contrast_spin,
                                set_sidebar_checkbox_value,
                                surface_pattern_from_selection,
@@ -8235,8 +8285,6 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.filament_color_mode = mode_choice != nullptr ?
                 texture_mapping_color_mode_from_selection(mode_choice->GetSelection(), updated.filament_color_mode) :
                 updated.filament_color_mode;
-            updated.preview_simulate_colors =
-                updated.is_image_texture() && preview_colors_chk != nullptr && preview_colors_chk->GetValue();
             updated.contrast_pct = contrast_spin != nullptr ? std::clamp(float(contrast_spin->GetValue()), 25.f, 300.f) : updated.contrast_pct;
             updated.high_resolution_sampling = true;
 
@@ -8264,8 +8312,9 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             apply_zone(std::move(updated));
         };
         mode_choice->Bind(wxEVT_COMBOBOX, on_mode_choice);
-        preview_colors_chk->Bind(wxEVT_TOGGLEBUTTON, [apply_controls](wxCommandEvent &evt) {
-            apply_controls();
+        preview_colors_chk->Bind(wxEVT_TOGGLEBUTTON, [preview_colors_chk, persist_preview_simulate_colors](wxCommandEvent &evt) {
+            if (preview_colors_chk != nullptr)
+                persist_preview_simulate_colors(preview_colors_chk->GetValue());
             evt.Skip();
         });
         if (show_direction_arrow_chk != nullptr)
@@ -8621,10 +8670,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     transmission_distances,
                                                     updated.transmission_distance_calibration_mode,
                                                     updated.tone_gamma,
-                                                    updated.preview_opacity_pct,
                                                     updated.force_sequential_filaments,
                                                     updated.auto_adjust_filament_selection,
-                                                    updated.preview_limit_resolution,
                                                     updated.reduce_outer_surface_texture,
                                                     updated.seam_hiding,
                                                     updated.nonlinear_offset_adjustment,
@@ -8682,7 +8729,6 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.texture_mapping_mode = dlg.texture_mapping_mode();
             updated.tone_gamma = dlg.tone_gamma();
             updated.transmission_distance_calibration_mode = dlg.transmission_distance_calibration_mode();
-            updated.preview_opacity_pct = dlg.preview_opacity_pct();
             updated.force_sequential_filaments = dlg.force_sequential_filaments();
             if (updated.force_sequential_filaments && ids.size() >= 2) {
                 updated.component_ids = encode_texture_mapping_component_ids(ids);
@@ -8690,7 +8736,6 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 updated.component_b = ids[1];
             }
             updated.auto_adjust_filament_selection = dlg.auto_adjust_filament_selection();
-            updated.preview_limit_resolution = dlg.preview_limit_resolution();
             updated.reduce_outer_surface_texture = dlg.reduce_outer_surface_texture();
             updated.seam_hiding = dlg.seam_hiding();
             updated.nonlinear_offset_adjustment = dlg.nonlinear_offset_adjustment();
@@ -8752,8 +8797,18 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.generic_solver_mode = dlg.generic_solver_mode();
             updated.generic_solver_mix_model = dlg.generic_solver_mix_model();
             const TextureMappingGlobalSettings dlg_global_settings = dlg.global_settings();
+            auto prime_tower_only_settings = [](TextureMappingGlobalSettings settings) {
+                settings.preview_opacity_pct = TextureMappingZone::DefaultPreviewOpacityPct;
+                settings.preview_simulate_colors = TextureMappingZone::DefaultPreviewSimulateColors;
+                settings.preview_limit_resolution = TextureMappingZone::DefaultPreviewLimitResolution;
+                settings.preview_simulate_top_surface_lod = TextureMappingZone::DefaultPreviewSimulateTopSurfaceLod;
+                return settings.serialize();
+            };
             const bool global_settings_changed =
                 dlg_global_settings.serialize() != bundle->texture_mapping_global_settings.serialize();
+            const bool prime_tower_settings_changed =
+                prime_tower_only_settings(dlg_global_settings) !=
+                prime_tower_only_settings(bundle->texture_mapping_global_settings);
             if (global_settings_changed)
                 bundle->texture_mapping_global_settings = dlg_global_settings;
             Model &model = wxGetApp().model();
@@ -8792,10 +8847,10 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                    std::abs(updated.filament_transmission_distances_mm.back()) <= 1e-6f)
                 updated.filament_transmission_distances_mm.pop_back();
             const bool affects_scene = apply_zone(std::move(updated));
-            const bool prime_tower_preview_changed = global_settings_changed || prime_tower_images_changed;
-            if (prime_tower_preview_changed)
-                notify_change(true);
-            if (affects_scene || prime_tower_preview_changed)
+            const bool prime_tower_preview_changed = prime_tower_settings_changed || prime_tower_images_changed;
+            if (global_settings_changed || prime_tower_images_changed)
+                notify_change(prime_tower_preview_changed);
+            if (affects_scene || global_settings_changed || prime_tower_images_changed)
                 refresh_texture_mapping_preview();
             CallAfter([this]() { update_texture_mapping_panel(false); });
         };
