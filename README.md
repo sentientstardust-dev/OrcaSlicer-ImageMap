@@ -165,6 +165,8 @@ Currently builds are not available for linux, you must build this yourself
     - Avoid using filament with higher TD values with line width modulation mode, such as filaments labelled 'translucent' or 'transparent', as they are likely to lead to washed out/pale colors (this technique works by overhanging filament sagging and blocking the layer below, so if you use filament that is too translucent the color below will still be visible).
     - On the other hand, filament that is very opaque can cause horizontal lines to be too visible, so I recommend filaments with middle ground TD values
     - If you don’t have a TD measurement device you can look up community sourced filament TD values on filamentcolors.xyz or 3dfilamentprofiles.com
+- If you're using translucent filament I recommend using perimeter path modulation mode v2 (you can set it in the options panel for each texture zone, in the modulation mode tab)
+    - To use top-surface texturing (still WIP), translucent filaments will likely be required otherwise color depth will be reduced
 ### Overhang amount
 - The range between the minimum and maximum outer wall line width in Multimaterial settings determines the maximum overhang amount, which will affect the strength of your colors (essentially, larger range -> stronger colors). 
     - The default min/max values are 0.32-0.95 for a 0.4mm nozzle, if you use a different size nozzle you should change these values accordingly.
