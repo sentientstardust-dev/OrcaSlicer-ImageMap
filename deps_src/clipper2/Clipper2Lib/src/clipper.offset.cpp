@@ -1,6 +1,6 @@
 /*******************************************************************************
 * Author    :  Angus Johnson                                                   *
-* Date      :  22 January 2025                                                 *
+* Date      :  11 October 2025                                                 *
 * Website   :  https://www.angusj.com                                          *
 * Copyright :  Angus Johnson 2010-2025                                         *
 * Purpose   :  Path Offset (Inflate/Shrink)                                    *
@@ -37,22 +37,28 @@ const double arc_const = 0.002; // <-- 1/500
 // Miscellaneous methods
 //------------------------------------------------------------------------------
 
-std::optional<size_t> GetLowestClosedPathIdx(const Paths64& paths)
+void GetLowestClosedPathInfo(const Paths64& paths, std::optional<size_t>& idx, bool& is_neg_area)
 {
-    std::optional<size_t> result;
+	idx.reset();
 	Point64 botPt = Point64(INT64_MAX, INT64_MIN);
 	for (size_t i = 0; i < paths.size(); ++i)
 	{
+		double a = MAX_DBL;
 		for (const Point64& pt : paths[i])
 		{
 			if ((pt.y < botPt.y) ||
 				((pt.y == botPt.y) && (pt.x >= botPt.x))) continue;
-            result = i;
+			if (a == MAX_DBL)
+			{
+				a = Area(paths[i]);
+				if (a == 0) break; // invalid closed path, so break from inner loop
+				is_neg_area = a < 0;
+			}
+      idx = i;
 			botPt.x = pt.x;
 			botPt.y = pt.y;
 		}
 	}
-	return result;
 }
 
 inline double Hypot(double x, double y)
@@ -145,15 +151,16 @@ ClipperOffset::Group::Group(const Paths64& _paths, JoinType _join_type, EndType 
 
 	if (end_type == EndType::Polygon)
 	{
-		lowest_path_idx = GetLowestClosedPathIdx(paths_in);
+		bool is_neg_area;
+		GetLowestClosedPathInfo(paths_in, lowest_path_idx, is_neg_area);
 		// the lowermost path must be an outer path, so if its orientation is negative,
 		// then flag the whole group is 'reversed' (will negate delta etc.)
 		// as this is much more efficient than reversing every path.
-    is_reversed = (lowest_path_idx.has_value()) && Area(paths_in[lowest_path_idx.value()]) < 0;
+    is_reversed = lowest_path_idx.has_value() && is_neg_area;
 	}
 	else
 	{
-    lowest_path_idx = std::nullopt;
+    lowest_path_idx.reset();
 		is_reversed = false;
 	}
 }
@@ -236,7 +243,7 @@ void ClipperOffset::DoSquare(const Path64& path, size_t j, size_t k)
 	{
 		PointD pt4 = PointD(pt3.x + vec.x * group_delta_, pt3.y + vec.y * group_delta_);
 		PointD pt = ptQ;
-		GetSegmentIntersectPt(pt1, pt2, pt3, pt4, pt);
+		GetLineIntersectPt(pt1, pt2, pt3, pt4, pt);
 		//get the second intersect point through reflecion
         path_out.emplace_back(ReflectPoint(pt, ptQ));
         path_out.emplace_back(pt);
@@ -245,7 +252,7 @@ void ClipperOffset::DoSquare(const Path64& path, size_t j, size_t k)
 	{
 		PointD pt4 = GetPerpendicD(path[j], norms[k], group_delta_);
 		PointD pt = ptQ;
-		GetSegmentIntersectPt(pt1, pt2, pt3, pt4, pt);
+		GetLineIntersectPt(pt1, pt2, pt3, pt4, pt);
         path_out.emplace_back(pt);
 		//get the second intersect point through reflecion
         path_out.emplace_back(ReflectPoint(pt, ptQ));
@@ -601,10 +608,10 @@ void ClipperOffset::ExecuteInternal(double delta)
 
 	if (!solution->size()) return;
 
-		bool paths_reversed = CheckReverseOrientation();
+	bool paths_reversed = CheckReverseOrientation();
 	//clean up self-intersections ...
 	Clipper64 c;
-	c.PreserveCollinear(false);
+	c.PreserveCollinear(preserve_collinear_);
 	//the solution should retain the orientation of the input
 	c.ReverseSolution(reverse_solution_ != paths_reversed);
 #ifdef USINGZ

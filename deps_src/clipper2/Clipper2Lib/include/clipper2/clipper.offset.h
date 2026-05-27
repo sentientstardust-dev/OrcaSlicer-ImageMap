@@ -39,7 +39,7 @@ private:
 	class Group {
 	public:
 		Paths64 paths_in;
-        std::optional<size_t> lowest_path_idx{};
+    std::optional<size_t> lowest_path_idx{};
 		bool is_reversed = false;
 		JoinType join_type;
 		EndType end_type;
@@ -92,14 +92,14 @@ public:
 		bool reverse_solution = false) :
 		miter_limit_(miter_limit), arc_tolerance_(arc_tolerance),
 		preserve_collinear_(preserve_collinear),
-		reverse_solution_(reverse_solution) { };
+		reverse_solution_(reverse_solution) { }
 
-	~ClipperOffset() { Clear(); };
+	~ClipperOffset() { Clear(); }
 
-	int ErrorCode() const { return error_code_; };
+	int ErrorCode() const { return error_code_; }
 	void AddPath(const Path64& path, JoinType jt_, EndType et_);
 	void AddPaths(const Paths64& paths, JoinType jt_, EndType et_);
-	void Clear() { groups_.clear(); norms.clear(); };
+	void Clear() { groups_.clear(); norms.clear(); }
 
 	void Execute(double delta, Paths64& sols_64);
 	void Execute(double delta, PolyTree64& polytree);
