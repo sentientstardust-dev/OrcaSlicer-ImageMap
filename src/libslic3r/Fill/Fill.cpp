@@ -2648,7 +2648,7 @@ static std::shared_ptr<const TopSurfaceImageContoningDepthRegionPlan> top_surfac
             return;
 
         ExPolygons area = perimeter_area;
-        if (!plan.contoning_replace_top_perimeters_with_infill) {
+        if (!plan.contoning_replace_top_perimeters_with_infill && include_perimeter_regions) {
             Polygons current_layer_perimeters =
                 top_surface_image_layer_perimeter_polygons(*target_layer, throw_if_canceled);
             if (!current_layer_perimeters.empty())
@@ -3120,7 +3120,7 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
             std::clamp(TextureMappingZone::effective_top_surface_contoning_flat_surface_infill_mode(
                        zone->top_surface_contoning_flat_surface_infill_mode),
                        int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinear),
-                       int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinHybrid));
+                       int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithBoundary));
         plan.contoning_layer_phase_enabled = zone->top_surface_contoning_layer_phase_enabled;
         plan.contoning_varied_infill_angles_enabled = zone->top_surface_contoning_varied_infill_angles_enabled;
         plan.contoning_blue_noise_error_diffusion_enabled = zone->top_surface_contoning_blue_noise_error_diffusion_enabled;
@@ -3142,8 +3142,11 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
         }
         if (plan.contoning) {
             auto append_contoning_surface = [&](TopSurfaceImageSourceSurface source_surface) {
+                const bool target_surface_limited =
+                    plan.contoning_replace_top_perimeters_with_infill ||
+                    !plan.contoning_recolor_surrounding_perimeters;
                 const ExPolygons current_target_surface_area =
-                    plan.contoning_replace_top_perimeters_with_infill ?
+                    target_surface_limited ?
                     top_surface_image_current_layer_surface_mask(*layerm, source_surface) :
                     ExPolygons();
                 std::vector<const Layer *> contoning_depth_layers(size_t(stack_depth), nullptr);
@@ -3160,7 +3163,7 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
                             source_layer->lower_layer;
                     if (source_layer == nullptr)
                         break;
-                    if (plan.contoning_replace_top_perimeters_with_infill &&
+                    if (target_surface_limited &&
                         !top_surface_image_contoning_depth_within_shell(layer,
                                                                          *source_layer,
                                                                          layerm->region().config(),
@@ -3174,12 +3177,14 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
                     ExPolygons fill_area = source_area;
                     ExPolygons vector_area = source_area;
                     ExPolygons perimeter_clip_area = source_area;
-                    if (plan.contoning_replace_top_perimeters_with_infill) {
+                    if (target_surface_limited) {
                         if (current_target_surface_area.empty())
                             continue;
                         fill_area = top_surface_clip_intersection_ex(fill_area, current_target_surface_area, ApplySafetyOffset::Yes);
                         if (fill_area.empty())
                             continue;
+                    }
+                    if (plan.contoning_replace_top_perimeters_with_infill) {
                         vector_area = fill_area;
                         perimeter_clip_area = current_region_wall_area;
                         if (!perimeter_clip_area.empty()) {
@@ -3188,8 +3193,6 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
                         }
                     }
                     if (!plan.contoning_replace_top_perimeters_with_infill) {
-                        if (!current_layer_perimeters.empty())
-                            fill_area = top_surface_clip_diff_ex(fill_area, current_layer_perimeters, ApplySafetyOffset::Yes);
                         if (!plan.contoning_recolor_surrounding_perimeters)
                             vector_area = fill_area;
                     }
@@ -3721,6 +3724,449 @@ static void top_surface_image_append_colored_block_loops(LayerRegion &layerm,
         delete collection;
     else
         layerm.perimeters.entities.emplace_back(collection);
+}
+
+static bool top_surface_image_contoning_rectilinear_with_boundary_mode(int mode)
+{
+    return mode == int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithBoundary);
+}
+
+struct TopSurfaceImageRectilinearBoundaryKey {
+    size_t region_id = size_t(-1);
+    unsigned int zone_id = 0;
+    int depth = 0;
+    SurfaceType surface_type = stInternal;
+    ExtrusionRole extrusion_role = erMixed;
+    float flow_width = 0.f;
+    float flow_height = 0.f;
+    float flow_nozzle = 0.f;
+    float flow_spacing = 0.f;
+
+    bool operator<(const TopSurfaceImageRectilinearBoundaryKey &rhs) const
+    {
+        return std::tie(region_id,
+                        zone_id,
+                        depth,
+                        surface_type,
+                        extrusion_role,
+                        flow_width,
+                        flow_height,
+                        flow_nozzle,
+                        flow_spacing) <
+               std::tie(rhs.region_id,
+                        rhs.zone_id,
+                        rhs.depth,
+                        rhs.surface_type,
+                        rhs.extrusion_role,
+                        rhs.flow_width,
+                        rhs.flow_height,
+                        rhs.flow_nozzle,
+                        rhs.flow_spacing);
+    }
+};
+
+struct TopSurfaceImageRectilinearBoundaryGroup {
+    SurfaceFillParams params;
+    ExPolygons area;
+    std::map<unsigned int, ExPolygons> component_areas;
+};
+
+static void top_surface_image_apply_rectilinear_boundary_metadata(ExtrusionEntityCollection &collection,
+                                                                  const SurfaceFillParams &params)
+{
+    collection.texture_mapping_top_surface_image = true;
+    collection.texture_mapping_top_surface_zone_id = params.texture_mapping_top_surface_zone_id;
+    collection.texture_mapping_top_surface_stack_depth = params.texture_mapping_top_surface_stack_depth;
+    collection.texture_mapping_top_surface_fixed_coloring = params.texture_mapping_top_surface_fixed_coloring;
+    collection.texture_mapping_top_surface_desired_component_id =
+        collection.texture_mapping_extruder_override >= 0 ?
+        unsigned(collection.texture_mapping_extruder_override + 1) :
+        params.texture_mapping_top_surface_component_id;
+    for (ExtrusionEntity *entity : collection.entities)
+        if (ExtrusionEntityCollection *child = dynamic_cast<ExtrusionEntityCollection *>(entity))
+            top_surface_image_apply_rectilinear_boundary_metadata(*child, params);
+}
+
+static int top_surface_image_rectilinear_boundary_override_at_point(const Point &point,
+                                                                    const std::vector<TopSurfaceImagePerimeterMask> &masks,
+                                                                    int fallback_override)
+{
+    const int override = top_surface_image_perimeter_override_at_point(point, masks);
+    return override >= 0 ? override : fallback_override;
+}
+
+static void top_surface_image_append_rectilinear_boundary_polyline(ExtrusionEntitiesPtr &collections,
+                                                                   const ExtrusionPath &source,
+                                                                   const Polyline &polyline,
+                                                                   const std::vector<TopSurfaceImagePerimeterMask> &masks,
+                                                                   float sample_step_mm,
+                                                                   int fallback_override)
+{
+    if (polyline.points.size() < 2 || fallback_override < 0)
+        return;
+    const double sample_step = std::max(0.02, double(sample_step_mm));
+    Points current_points;
+    int current_override = -2;
+    auto flush = [&]() {
+        if (current_points.empty())
+            return;
+        top_surface_image_append_perimeter_path_piece(collections, source, std::move(current_points), current_override);
+        current_points.clear();
+        current_override = -2;
+    };
+    for (size_t point_idx = 1; point_idx < polyline.points.size(); ++point_idx) {
+        const Point &p0 = polyline.points[point_idx - 1];
+        const Point &p1 = polyline.points[point_idx];
+        const double len_mm = unscale<double>(p0.distance_to(p1));
+        if (!std::isfinite(len_mm) || len_mm <= EPSILON)
+            continue;
+        const int steps = std::max(1, int(std::ceil(len_mm / sample_step)));
+        for (int step = 0; step < steps; ++step) {
+            const double t0 = double(step) / double(steps);
+            const double t1 = double(step + 1) / double(steps);
+            const Point q0 = lerp(p0, p1, t0);
+            const Point q1 = lerp(p0, p1, t1);
+            if (q0 == q1)
+                continue;
+            const Point qm = lerp(p0, p1, 0.5 * (t0 + t1));
+            const int override = top_surface_image_rectilinear_boundary_override_at_point(qm,
+                                                                                          masks,
+                                                                                          current_override >= 0 ?
+                                                                                          current_override :
+                                                                                          fallback_override);
+            if (current_points.empty()) {
+                current_override = override;
+                current_points.emplace_back(q0);
+                current_points.emplace_back(q1);
+            } else if (current_override == override && current_points.back() == q0) {
+                current_points.emplace_back(q1);
+            } else {
+                flush();
+                current_override = override;
+                current_points.emplace_back(q0);
+                current_points.emplace_back(q1);
+            }
+        }
+    }
+    flush();
+}
+
+static ExtrusionEntitiesPtr top_surface_image_rectilinear_boundary_collections(
+    const TopSurfaceImageRectilinearBoundaryGroup &group,
+    const ThrowIfCanceled *throw_if_canceled)
+{
+    check_canceled(throw_if_canceled);
+    if (group.area.empty() || group.component_areas.empty())
+        return {};
+
+    ExPolygons boundary_area = top_surface_clip_union_ex(group.area);
+    if (boundary_area.empty())
+        return {};
+
+    std::vector<TopSurfaceImagePerimeterMask> masks;
+    masks.reserve(group.component_areas.size());
+    const float sample_tolerance_mm =
+        std::clamp(group.params.flow.width() * 0.20f, 0.02f, 0.08f);
+    int fallback_override = -1;
+    for (const auto &component_area : group.component_areas) {
+        check_canceled(throw_if_canceled);
+        if (component_area.first == 0 || component_area.second.empty())
+            continue;
+        ExPolygons area = top_surface_clip_union_ex(component_area.second);
+        ExPolygons sample_area = top_surface_clip_offset_ex(area, float(scale_(sample_tolerance_mm)));
+        if (sample_area.empty())
+            sample_area = std::move(area);
+        TopSurfaceImagePerimeterMask mask;
+        mask.component_id = component_area.first;
+        mask.zone_id = group.params.texture_mapping_top_surface_zone_id;
+        mask.depth = group.params.texture_mapping_top_surface_stack_depth;
+        mask.area = std::move(sample_area);
+        masks.emplace_back(std::move(mask));
+        if (fallback_override < 0)
+            fallback_override = int(component_area.first) - 1;
+    }
+    if (masks.empty() || fallback_override < 0)
+        return {};
+
+    Polygons loops = to_polygons(boundary_area);
+    if (loops.empty())
+        return {};
+
+    ExtrusionEntitiesPtr collections;
+    ExtrusionPath source(group.params.extrusion_role,
+                         group.params.flow.mm3_per_mm(),
+                         group.params.flow.width(),
+                         group.params.flow.height());
+    const float sample_step_mm =
+        std::clamp(group.params.flow.width() * 0.50f, 0.05f, 0.25f);
+    for (const Polygon &loop : loops) {
+        check_canceled(throw_if_canceled);
+        if (loop.points.size() < 3)
+            continue;
+        Polyline polyline;
+        polyline.points.reserve(loop.points.size() + 1);
+        polyline.points.insert(polyline.points.end(), loop.points.begin(), loop.points.end());
+        polyline.points.emplace_back(loop.points.front());
+        remove_same_neighbor(polyline);
+        if (!polyline.is_valid())
+            continue;
+        top_surface_image_append_rectilinear_boundary_polyline(collections,
+                                                               source,
+                                                               polyline,
+                                                               masks,
+                                                               sample_step_mm,
+                                                               fallback_override);
+    }
+    for (ExtrusionEntity *entity : collections)
+        if (ExtrusionEntityCollection *collection = dynamic_cast<ExtrusionEntityCollection *>(entity))
+            top_surface_image_apply_rectilinear_boundary_metadata(*collection, group.params);
+    return collections;
+}
+
+static std::map<TopSurfaceImageRectilinearBoundaryKey, TopSurfaceImageRectilinearBoundaryGroup>
+top_surface_image_rectilinear_boundary_groups(const Layer &layer,
+                                              const std::vector<SurfaceFill> &surface_fills,
+                                              const ThrowIfCanceled *throw_if_canceled)
+{
+    std::map<TopSurfaceImageRectilinearBoundaryKey, TopSurfaceImageRectilinearBoundaryGroup> groups;
+    for (const SurfaceFill &fill : surface_fills) {
+        check_canceled(throw_if_canceled);
+        if (fill.expolygons.empty() ||
+            fill.region_id >= layer.regions().size() ||
+            !fill.params.texture_mapping_top_surface_image ||
+            !fill.params.texture_mapping_top_surface_contoning ||
+            !top_surface_image_contoning_rectilinear_with_boundary_mode(
+                fill.params.texture_mapping_top_surface_contoning_flat_surface_infill_mode) ||
+            fill.params.texture_mapping_top_surface_component_id == 0)
+            continue;
+        TopSurfaceImageRectilinearBoundaryKey key;
+        key.region_id = fill.region_id;
+        key.zone_id = fill.params.texture_mapping_top_surface_zone_id;
+        key.depth = fill.params.texture_mapping_top_surface_stack_depth;
+        key.surface_type = fill.surface.surface_type;
+        key.extrusion_role = fill.params.extrusion_role;
+        key.flow_width = fill.params.flow.width();
+        key.flow_height = fill.params.flow.height();
+        key.flow_nozzle = fill.params.flow.nozzle_diameter();
+        key.flow_spacing = fill.params.spacing;
+        TopSurfaceImageRectilinearBoundaryGroup &group = groups[key];
+        if (group.component_areas.empty()) {
+            group.params = fill.params;
+            group.params.texture_mapping_top_surface_component_id = 0;
+        }
+        append(group.area, fill.expolygons);
+        append(group.component_areas[fill.params.texture_mapping_top_surface_component_id], fill.expolygons);
+    }
+    return groups;
+}
+
+static void top_surface_image_append_rectilinear_boundary_collections(Layer &layer,
+                                                                      const std::map<TopSurfaceImageRectilinearBoundaryKey,
+                                                                                     TopSurfaceImageRectilinearBoundaryGroup> &groups,
+                                                                      const ThrowIfCanceled *throw_if_canceled)
+{
+    for (const auto &entry : groups) {
+        check_canceled(throw_if_canceled);
+        if (entry.first.region_id >= layer.regions().size() || layer.regions()[entry.first.region_id] == nullptr)
+            continue;
+        ExtrusionEntitiesPtr collections =
+            top_surface_image_rectilinear_boundary_collections(entry.second, throw_if_canceled);
+        for (ExtrusionEntity *entity : collections)
+            layer.regions()[entry.first.region_id]->fills.entities.emplace_back(entity);
+        collections.clear();
+    }
+}
+
+static void top_surface_image_append_rectilinear_repair_loops(ExtrusionEntityCollection &collection,
+                                                              const ExPolygon &expolygon,
+                                                              const SurfaceFillParams &params)
+{
+    Polygons loops = to_polygons(ExPolygons { expolygon });
+    if (loops.empty())
+        return;
+    extrusion_entities_append_loops(collection.entities,
+                                    std::move(loops),
+                                    params.extrusion_role,
+                                    float(params.flow.mm3_per_mm()),
+                                    float(params.flow.width()),
+                                    float(params.flow.height()));
+}
+
+static void top_surface_image_append_rectilinear_repair_lines(ExtrusionEntityCollection &collection,
+                                                              const ExPolygon &expolygon,
+                                                              const SurfaceFillParams &params,
+                                                              const ThrowIfCanceled *throw_if_canceled)
+{
+    const BoundingBox bbox = get_extents(expolygon);
+    if (!bbox.defined)
+        return;
+    const double theta = params.angle;
+    const double cos_t = std::cos(theta);
+    const double sin_t = std::sin(theta);
+    double min_u = std::numeric_limits<double>::max();
+    double min_v = std::numeric_limits<double>::max();
+    double max_u = -std::numeric_limits<double>::max();
+    double max_v = -std::numeric_limits<double>::max();
+    for (size_t i = 0; i < 4; ++i) {
+        const Point corner = bbox[i];
+        const double x = unscale<double>(corner.x());
+        const double y = unscale<double>(corner.y());
+        const double u = x * cos_t + y * sin_t;
+        const double v = -x * sin_t + y * cos_t;
+        min_u = std::min(min_u, u);
+        max_u = std::max(max_u, u);
+        min_v = std::min(min_v, v);
+        max_v = std::max(max_v, v);
+    }
+    if (max_u < min_u || max_v < min_v)
+        return;
+    const double spacing = std::max(0.05, double(params.flow.spacing()) * 0.75);
+    const double v_span = std::max(0.0, max_v - min_v);
+    const int line_count = std::max(1, int(std::ceil(v_span / spacing)));
+    const double margin = std::max(double(params.flow.spacing()), double(params.flow.width())) * 2.0;
+    const ExPolygons clip { expolygon };
+    for (int line_idx = 0; line_idx < line_count; ++line_idx) {
+        check_canceled(throw_if_canceled);
+        const double v = line_count == 1 ?
+            0.5 * (min_v + max_v) :
+            min_v + (double(line_idx) + 0.5) * v_span / double(line_count);
+        const double u0 = min_u - margin;
+        const double u1 = max_u + margin;
+        Polyline polyline;
+        polyline.points.emplace_back(Point::new_scale(u0 * cos_t - v * sin_t, u0 * sin_t + v * cos_t));
+        polyline.points.emplace_back(Point::new_scale(u1 * cos_t - v * sin_t, u1 * sin_t + v * cos_t));
+        if (!polyline.is_valid())
+            continue;
+        ExtrusionPath path(params.extrusion_role,
+                           params.flow.mm3_per_mm(),
+                           params.flow.width(),
+                           params.flow.height());
+        path.polyline = std::move(polyline);
+        path.intersect_expolygons(clip, &collection);
+    }
+}
+
+static ExPolygons top_surface_image_rectilinear_repair_leftover(
+    const Layer &layer,
+    const TopSurfaceImageRectilinearBoundaryKey &key,
+    const TopSurfaceImageRectilinearBoundaryGroup &group,
+    const ThrowIfCanceled *throw_if_canceled)
+{
+    if (key.region_id >= layer.regions().size() || layer.regions()[key.region_id] == nullptr || group.area.empty())
+        return {};
+    ExPolygons intended = top_surface_clip_union_ex(group.area);
+    if (intended.empty())
+        return {};
+    Polygons covered_polygons;
+    const LayerRegion *layerm = layer.regions()[key.region_id];
+    for (const ExtrusionEntity *entity : layerm->fills.entities) {
+        check_canceled(throw_if_canceled);
+        const ExtrusionEntityCollection *collection = dynamic_cast<const ExtrusionEntityCollection *>(entity);
+        if (collection == nullptr ||
+            !collection->texture_mapping_top_surface_image ||
+            collection->texture_mapping_top_surface_zone_id != key.zone_id ||
+            collection->texture_mapping_top_surface_stack_depth != key.depth)
+            continue;
+        const ExtrusionRole role = collection->role();
+        if (key.extrusion_role != erMixed && role != key.extrusion_role)
+            continue;
+        collection->polygons_covered_by_spacing(covered_polygons, float(scale_(0.02)));
+    }
+    if (covered_polygons.empty())
+        return intended;
+    ExPolygons covered =
+        top_surface_clip_intersection_ex(top_surface_clip_union_ex(covered_polygons), intended, ApplySafetyOffset::Yes);
+    return covered.empty() ? intended : top_surface_clip_diff_ex(intended, covered, ApplySafetyOffset::Yes);
+}
+
+static ExtrusionEntitiesPtr top_surface_image_rectilinear_repair_collections(
+    const TopSurfaceImageRectilinearBoundaryGroup &group,
+    const ExPolygons &leftover,
+    const ThrowIfCanceled *throw_if_canceled)
+{
+    ExtrusionEntitiesPtr out;
+    if (leftover.empty() || group.component_areas.empty())
+        return out;
+    const float sample_tolerance_mm =
+        std::clamp(group.params.flow.width() * 0.20f, 0.02f, 0.08f);
+    ExPolygons taken;
+    for (const auto &component_area : group.component_areas) {
+        check_canceled(throw_if_canceled);
+        if (component_area.first == 0 || component_area.second.empty())
+            continue;
+        ExPolygons sample_area = top_surface_clip_union_ex(component_area.second);
+        sample_area = top_surface_clip_offset_ex(sample_area, float(scale_(sample_tolerance_mm)));
+        if (sample_area.empty())
+            sample_area = top_surface_clip_union_ex(component_area.second);
+        ExPolygons area = top_surface_clip_intersection_ex(leftover, sample_area, ApplySafetyOffset::Yes);
+        if (!taken.empty())
+            area = top_surface_clip_diff_ex(area, taken, ApplySafetyOffset::Yes);
+        if (!area.empty())
+            area = top_surface_clip_union_ex(area);
+        if (area.empty())
+            continue;
+        append(taken, area);
+        SurfaceFillParams params = group.params;
+        params.texture_mapping_top_surface_component_id = component_area.first;
+        ExtrusionEntityCollection *collection = new ExtrusionEntityCollection();
+        collection->no_sort = true;
+        collection->texture_mapping_extruder_override = int(component_area.first) - 1;
+        for (const ExPolygon &expolygon : area) {
+            check_canceled(throw_if_canceled);
+            top_surface_image_append_rectilinear_repair_lines(*collection, expolygon, params, throw_if_canceled);
+        }
+        Polygons line_covered_polygons;
+        collection->polygons_covered_by_spacing(line_covered_polygons, float(scale_(0.02)));
+        ExPolygons loop_area = area;
+        if (!line_covered_polygons.empty()) {
+            ExPolygons line_covered =
+                top_surface_clip_intersection_ex(top_surface_clip_union_ex(line_covered_polygons), area, ApplySafetyOffset::Yes);
+            if (!line_covered.empty())
+                loop_area = top_surface_clip_diff_ex(area, line_covered, ApplySafetyOffset::Yes);
+        }
+        for (const ExPolygon &expolygon : loop_area) {
+            check_canceled(throw_if_canceled);
+            top_surface_image_append_rectilinear_repair_loops(*collection, expolygon, params);
+        }
+        if (collection->empty()) {
+            delete collection;
+        } else {
+            top_surface_image_apply_rectilinear_boundary_metadata(*collection, params);
+            out.emplace_back(collection);
+        }
+    }
+    return out;
+}
+
+static void top_surface_image_append_rectilinear_repair_collections(Layer &layer,
+                                                                    const std::map<TopSurfaceImageRectilinearBoundaryKey,
+                                                                                   TopSurfaceImageRectilinearBoundaryGroup> &groups,
+                                                                    const ThrowIfCanceled *throw_if_canceled)
+{
+    std::vector<std::pair<size_t, ExtrusionEntitiesPtr>> repairs;
+    for (const auto &entry : groups) {
+        check_canceled(throw_if_canceled);
+        ExPolygons leftover = top_surface_image_rectilinear_repair_leftover(layer,
+                                                                            entry.first,
+                                                                            entry.second,
+                                                                            throw_if_canceled);
+        if (leftover.empty())
+            continue;
+        ExtrusionEntitiesPtr collections =
+            top_surface_image_rectilinear_repair_collections(entry.second, leftover, throw_if_canceled);
+        if (!collections.empty())
+            repairs.emplace_back(entry.first.region_id, std::move(collections));
+    }
+    for (auto &repair : repairs) {
+        check_canceled(throw_if_canceled);
+        if (repair.first >= layer.regions().size() || layer.regions()[repair.first] == nullptr) {
+            top_surface_image_delete_entities(repair.second);
+            continue;
+        }
+        for (ExtrusionEntity *entity : repair.second)
+            layer.regions()[repair.first]->fills.entities.emplace_back(entity);
+        repair.second.clear();
+    }
 }
 
 static double top_surface_image_perimeter_infill_adjacency_score(const SurfaceFill &fill,
@@ -5737,6 +6183,10 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree,
 	}
 #endif /* SLIC3R_DEBUG_SLICE_PROCESSING */
 
+    const std::map<TopSurfaceImageRectilinearBoundaryKey, TopSurfaceImageRectilinearBoundaryGroup> rectilinear_boundary_groups =
+        top_surface_image_rectilinear_boundary_groups(*this, surface_fills, throw_if_canceled_ptr);
+    top_surface_image_append_rectilinear_boundary_collections(*this, rectilinear_boundary_groups, throw_if_canceled_ptr);
+
     for (SurfaceFill &surface_fill : surface_fills) {
         check_canceled(throw_if_canceled_ptr);
         if (surface_fill.expolygons.empty() ||
@@ -6030,8 +6480,10 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree,
                             apply_top_surface_image_collection_metadata(*collection, surface_fill.params, top_surface_image_context, throw_if_canceled_ptr);
                 }
             }
-		}
-    }
+			}
+	    }
+
+    top_surface_image_append_rectilinear_repair_collections(*this, rectilinear_boundary_groups, throw_if_canceled_ptr);
 
     // add thin fill regions
     // Unpacks the collection, creates multiple collections per path.

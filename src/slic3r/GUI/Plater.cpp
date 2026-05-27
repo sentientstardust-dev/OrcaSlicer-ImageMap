@@ -2546,12 +2546,13 @@ public:
         contoning_flat_infill_choices.Add(_L("Boundary Skin (variable width)"));
         contoning_flat_infill_choices.Add(_L("Spiral"));
         contoning_flat_infill_choices.Add(_L("Boundary Skin Hybrid"));
+        contoning_flat_infill_choices.Add(_L("Rectilinear with Boundary"));
         m_top_surface_contoning_flat_surface_infill_choice =
             new wxChoice(m_top_surface_contoning_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, contoning_flat_infill_choices);
         m_top_surface_contoning_flat_surface_infill_choice->SetSelection(
             std::clamp(top_surface_contoning_flat_surface_infill_mode,
                        int(TextureMappingZone::ContoningFlatSurfaceInfillDefault),
-                       int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinHybrid)));
+                       int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithBoundary)));
         contoning_flat_infill_row->Add(m_top_surface_contoning_flat_surface_infill_choice, 1, wxEXPAND);
         top_surface_contoning_root->Add(contoning_flat_infill_row, 0, wxEXPAND | wxTOP, gap);
         top_surface_box->Add(m_top_surface_contoning_panel, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
@@ -3063,7 +3064,7 @@ public:
         return m_top_surface_contoning_flat_surface_infill_choice != nullptr ?
             std::clamp(m_top_surface_contoning_flat_surface_infill_choice->GetSelection(),
                        int(TextureMappingZone::ContoningFlatSurfaceInfillDefault),
-                       int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinHybrid)) :
+                       int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithBoundary)) :
             TextureMappingZone::DefaultTopSurfaceContoningFlatSurfaceInfillMode;
     }
     bool top_surface_contoning_layer_phase_enabled() const

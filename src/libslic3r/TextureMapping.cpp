@@ -688,9 +688,11 @@ static std::string top_surface_contoning_flat_surface_infill_mode_name(int mode)
 {
     switch (clamp_int(mode,
                       int(TextureMappingZone::ContoningFlatSurfaceInfillDefault),
-                      int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinHybrid))) {
+                      int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithBoundary))) {
     case int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinear):
         return "rectilinear";
+    case int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithBoundary):
+        return "rectilinear_with_boundary";
     case int(TextureMappingZone::ContoningFlatSurfaceInfillConcentric):
         return "concentric";
     case int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinFixed):
@@ -710,6 +712,8 @@ static int top_surface_contoning_flat_surface_infill_mode_from_name(const std::s
 {
     if (name == "rectilinear")
         return int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinear);
+    if (name == "rectilinear_with_boundary" || name == "rectilinear_boundary")
+        return int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithBoundary);
     if (name == "concentric")
         return int(TextureMappingZone::ContoningFlatSurfaceInfillConcentric);
     if (name == "boundary_skin" || name == "boundary_skin_variable")
@@ -1769,9 +1773,9 @@ void TextureMappingManager::load_entries(const std::string &serialized,
                 top_surface_contoning_flat_surface_infill_mode_from_name(flat_surface_infill_mode_it->get<std::string>()) :
                 clamp_int(flat_surface_infill_mode_it != texture.end() && flat_surface_infill_mode_it->is_number_integer() ?
                               flat_surface_infill_mode_it->get<int>() :
-                          TextureMappingZone::DefaultTopSurfaceContoningFlatSurfaceInfillMode,
+                              TextureMappingZone::DefaultTopSurfaceContoningFlatSurfaceInfillMode,
                           int(TextureMappingZone::ContoningFlatSurfaceInfillDefault),
-                          int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinHybrid));
+                          int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithBoundary));
         if (zone.top_surface_contoning_replace_top_perimeters_with_infill)
             zone.top_surface_contoning_recolor_surrounding_perimeters = false;
         zone.top_surface_contoning_layer_phase_enabled =

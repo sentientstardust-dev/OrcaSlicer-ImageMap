@@ -837,26 +837,27 @@ void PrintObject::infill()
         const auto objects = m_print->objects();
         const auto object_it = std::find(objects.begin(), objects.end(), this);
         const size_t object_index = object_it == objects.end() ? 0 : size_t(object_it - objects.begin());
+        Print *print = m_print;
         std::atomic<size_t> completed_layers { 0 };
-        auto set_infill_progress = [this, total_layers, object_index](size_t completed) {
+        auto set_infill_progress = [print, total_layers, object_index](size_t completed) {
             const std::string message_prefix = Slic3r::format("%1% %2%", L("Generating infill toolpath"), object_index + 1);
             if (total_layers == 0)
-                m_print->set_status(35, message_prefix);
+                print->set_status(35, message_prefix);
             else
-                m_print->set_status(35, Slic3r::format("%1% (%2%/%3%)", message_prefix, completed, total_layers));
+                print->set_status(35, Slic3r::format("%1% (%2%/%3%)", message_prefix, completed, total_layers));
         };
         set_infill_progress(0);
         const auto& adaptive_fill_octree = this->m_adaptive_fill_octrees.first;
         const auto& support_fill_octree = this->m_adaptive_fill_octrees.second;
-        const std::function<void()> throw_if_canceled = [this]() { m_print->throw_if_canceled(); };
+        const std::function<void()> throw_if_canceled = [print]() { print->throw_if_canceled(); };
         auto contoning_stack_plan_cache = make_top_surface_image_contoning_stack_plan_cache();
 
         BOOST_LOG_TRIVIAL(debug) << "Filling layers in parallel - start";
         tbb::parallel_for(
             tbb::blocked_range<size_t>(0, m_layers.size()),
-            [this, &adaptive_fill_octree = adaptive_fill_octree, &support_fill_octree = support_fill_octree, &throw_if_canceled, &completed_layers, &set_infill_progress, contoning_stack_plan_cache](const tbb::blocked_range<size_t>& range) {
+            [this, print, &adaptive_fill_octree = adaptive_fill_octree, &support_fill_octree = support_fill_octree, &throw_if_canceled, &completed_layers, &set_infill_progress, contoning_stack_plan_cache](const tbb::blocked_range<size_t>& range) {
                 for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
-                    m_print->throw_if_canceled();
+                    print->throw_if_canceled();
                     m_layers[layer_idx]->make_fills(adaptive_fill_octree.get(), support_fill_octree.get(), this->m_lightning_generator.get(), throw_if_canceled, contoning_stack_plan_cache.get());
                     const size_t completed = completed_layers.fetch_add(1, std::memory_order_relaxed) + 1;
                     set_infill_progress(completed);

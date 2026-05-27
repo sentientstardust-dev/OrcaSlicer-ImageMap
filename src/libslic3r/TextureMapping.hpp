@@ -85,7 +85,8 @@ struct TextureMappingZone
         ContoningFlatSurfaceInfillBoundarySkinFixed = 3,
         ContoningFlatSurfaceInfillBoundarySkinVariable = 4,
         ContoningFlatSurfaceInfillSpiral = 5,
-        ContoningFlatSurfaceInfillBoundarySkinHybrid = 6
+        ContoningFlatSurfaceInfillBoundarySkinHybrid = 6,
+        ContoningFlatSurfaceInfillRectilinearWithBoundary = 7
     };
 
     enum FilamentColorMode : uint8_t {
