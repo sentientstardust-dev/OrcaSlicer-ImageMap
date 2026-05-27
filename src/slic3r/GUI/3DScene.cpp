@@ -2791,7 +2791,7 @@ int GLVolumeCollection::load_wipe_tower_preview(
     std::vector<ColorRGBA> extruder_colors = GUI::wxGetApp().plater()->get_extruders_colors();
     std::vector<ColorRGBA> colors;
     GUI::PartPlateList& ppl = GUI::wxGetApp().plater()->get_partplate_list();
-    std::vector<int> plate_extruders = ppl.get_plate(plate_idx)->get_extruders(true);
+    std::vector<int> plate_extruders = ppl.get_plate(plate_idx)->get_wipe_tower_extruders(true);
     TriangleMesh wipe_tower_shell = make_cube(width, depth, height);
     for (int extruder_id : plate_extruders) {
         if (extruder_id > 0 && extruder_id <= extruder_colors.size())
@@ -2866,7 +2866,7 @@ int GLVolumeCollection::load_real_wipe_tower_preview(int                 obj_idx
 
     std::vector<Slic3r::ColorRGBA> extruder_colors = GUI::wxGetApp().plater()->get_extruders_colors();
     GUI::PartPlateList               &ppl              = GUI::wxGetApp().plater()->get_partplate_list();
-    std::vector<int>                  plate_extruders  = ppl.get_plate(plate_idx)->get_extruders(true);
+    std::vector<int>                  plate_extruders  = ppl.get_plate(plate_idx)->get_wipe_tower_extruders(true);
     std::vector<Slic3r::ColorRGBA>    colors;
     if (!plate_extruders.empty()) {
         if (plate_extruders.front() <= extruder_colors.size())

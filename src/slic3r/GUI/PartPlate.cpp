@@ -188,9 +188,58 @@ size_t estimate_wipe_tower_filaments_count_for_texture_mapping(const std::vector
              std::string());
     texture_mgr.load_entries(texture_mapping_definitions, filament_colours);
 
+    struct TextureEstimatePattern {
+        std::vector<unsigned int> component_ids;
+        std::string component_weights;
+
+        bool operator==(const TextureEstimatePattern &rhs) const
+        {
+            return component_ids == rhs.component_ids && component_weights == rhs.component_weights;
+        }
+    };
+
+    auto append_physical_id = [num_physical](std::vector<unsigned int> &ids, unsigned int id) {
+        if (id >= 1 && id <= num_physical)
+            ids.emplace_back(id);
+    };
+
+    auto append_physical_ids = [&append_physical_id](std::vector<unsigned int> &ids, const std::vector<unsigned int> &to_add) {
+        for (const unsigned int id : to_add)
+            append_physical_id(ids, id);
+    };
+
+    auto sort_unique = [](std::vector<unsigned int> &ids) {
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    };
+
+    auto contains_id = [](const std::vector<unsigned int> &ids, unsigned int id) {
+        return std::find(ids.begin(), ids.end(), id) != ids.end();
+    };
+
+    auto zone_component_ids = [&texture_mgr, num_physical, &filament_colours, &contains_id](const TextureMappingZone &zone,
+                                                                                            unsigned int             filament_id) {
+        std::vector<unsigned int> component_ids = zone.is_image_texture() ?
+            TextureMappingManager::effective_texture_component_ids(zone, num_physical, filament_colours) :
+            TextureMappingManager::selected_component_ids(zone, num_physical);
+        std::vector<unsigned int> filtered_component_ids;
+        filtered_component_ids.reserve(component_ids.size());
+        for (const unsigned int id : component_ids)
+            if (id >= 1 && id <= num_physical && !contains_id(filtered_component_ids, id))
+                filtered_component_ids.emplace_back(id);
+        component_ids = std::move(filtered_component_ids);
+        if (component_ids.empty()) {
+            const unsigned int resolved = texture_mgr.resolve_zone_component(filament_id, num_physical, 0);
+            if (resolved >= 1 && resolved <= num_physical)
+                component_ids.emplace_back(resolved);
+        }
+        return component_ids;
+    };
+
     std::vector<unsigned int> physical_ids;
-    size_t                    texture_slots                      = 0;
-    bool                      texture_changes_physical_component = false;
+    std::vector<unsigned int> all_texture_component_ids;
+    std::vector<unsigned int> every_layer_texture_ids;
+    std::vector<std::pair<TextureEstimatePattern, std::vector<unsigned int>>> sequential_texture_patterns;
 
     for (const int extruder : extruders) {
         if (extruder <= 0)
@@ -206,32 +255,60 @@ size_t estimate_wipe_tower_filaments_count_for_texture_mapping(const std::vector
         if (zone == nullptr || !zone->enabled || zone->deleted)
             continue;
 
-        std::vector<unsigned int> component_ids = zone->is_image_texture() ?
-            TextureMappingManager::effective_texture_component_ids(*zone, num_physical, filament_colours) :
-            TextureMappingManager::selected_component_ids(*zone, num_physical);
-        component_ids.erase(std::remove_if(component_ids.begin(),
-                                           component_ids.end(),
-                                           [num_physical](unsigned int id) { return id == 0 || id > num_physical; }),
-                            component_ids.end());
-        std::sort(component_ids.begin(), component_ids.end());
-        component_ids.erase(std::unique(component_ids.begin(), component_ids.end()), component_ids.end());
+        const std::vector<unsigned int> component_ids = zone_component_ids(*zone, filament_id);
         if (component_ids.empty())
             continue;
 
-        if (component_ids.size() == 1) {
-            physical_ids.emplace_back(component_ids.front());
+        append_physical_ids(all_texture_component_ids, component_ids);
+        const bool same_layer_components =
+            zone->top_surface_image_printing_enabled ||
+            zone->recolor_small_perimeter_loops ||
+            zone->recolor_top_visible_perimeter_sections;
+
+        if (same_layer_components || component_ids.size() == 1) {
+            append_physical_ids(every_layer_texture_ids, component_ids);
         } else {
-            ++texture_slots;
-            texture_changes_physical_component = true;
+            sequential_texture_patterns.emplace_back(TextureEstimatePattern{component_ids, zone->component_weights}, component_ids);
         }
     }
 
-    std::sort(physical_ids.begin(), physical_ids.end());
-    physical_ids.erase(std::unique(physical_ids.begin(), physical_ids.end()), physical_ids.end());
+    sort_unique(physical_ids);
+    sort_unique(all_texture_component_ids);
+    sort_unique(every_layer_texture_ids);
 
-    size_t count = physical_ids.size() + texture_slots;
-    if (count < 2 && texture_changes_physical_component)
-        count = 2;
+    bool have_sequential_texture_slot = false;
+    if (!sequential_texture_patterns.empty()) {
+        std::vector<TextureEstimatePattern> patterns;
+        std::vector<unsigned int> sequential_component_ids;
+        for (const auto &entry : sequential_texture_patterns) {
+            if (std::find(patterns.begin(), patterns.end(), entry.first) == patterns.end())
+                patterns.emplace_back(entry.first);
+            append_physical_ids(sequential_component_ids, entry.second);
+        }
+
+        if (patterns.size() == 1) {
+            have_sequential_texture_slot = true;
+        } else {
+            append_physical_ids(every_layer_texture_ids, sequential_component_ids);
+            sort_unique(every_layer_texture_ids);
+        }
+    }
+
+    std::vector<unsigned int> all_used_ids = physical_ids;
+    append_physical_ids(all_used_ids, all_texture_component_ids);
+    sort_unique(all_used_ids);
+
+    size_t count = every_layer_texture_ids.size();
+    for (const unsigned int physical_id : physical_ids)
+        if (!contains_id(every_layer_texture_ids, physical_id))
+            ++count;
+
+    if (have_sequential_texture_slot)
+        count += 2;
+
+    if (!all_used_ids.empty())
+        count = std::min(count, all_used_ids.size());
+
     return count;
 }
 
