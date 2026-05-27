@@ -89,6 +89,7 @@ struct TexturePreviewSimulationSettings
     int generic_solver_mode = int(TextureMappingZone::GenericSolverV2);
     int generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
     bool contoning_flat_surface_quantization = false;
+    bool contoning_flat_surface_pattern_blend = false;
     int contoning_flat_surface_pattern_filaments = TextureMappingZone::DefaultTopSurfaceContoningPatternFilaments;
     bool simulate_top_surface_lod = false;
     float top_surface_lod_pitch_mm = 0.f;
@@ -782,6 +783,9 @@ std::array<unsigned int, 2> simulated_texture_preview_size(unsigned int width,
             size[1] = std::min(size[1], lod_height);
         }
     }
+
+    if (settings.contoning_flat_surface_pattern_blend)
+        size = { 1u, 1u };
 
     return size;
 }
@@ -2540,7 +2544,7 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
                                               int(TextureMappingZone::GenericSolverLegacy),
                                               int(TextureMappingZone::GenericSolverV2));
     settings.generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
-    if (zone->top_surface_contoning_active()) {
+    if (zone->top_surface_image_printing_enabled) {
         const int stack_layers =
             std::clamp(zone->top_surface_contoning_stack_layers,
                        TextureMappingZone::MinTopSurfaceContoningStackLayers,
@@ -2563,7 +2567,7 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
         return std::nullopt;
     settings.simulate_top_surface_lod =
         texture_preview_simulate_top_surface_lod() &&
-        zone->top_surface_contoning_active();
+        zone->top_surface_image_printing_enabled;
 
     const bool raw_values_mode = settings.mapping_mode == int(TextureMappingZone::TextureMappingRawValues);
     settings.component_colors.reserve(settings.component_ids.size());
@@ -2627,6 +2631,7 @@ size_t texture_preview_simulation_signature(const ModelVolume &model_volume,
     mix(std::hash<int>{}(settings.generic_solver_mode));
     mix(std::hash<int>{}(settings.generic_solver_mix_model));
     mix(std::hash<int>{}(settings.contoning_flat_surface_quantization ? 1 : 0));
+    mix(std::hash<int>{}(settings.contoning_flat_surface_pattern_blend ? 1 : 0));
     if (settings.contoning_flat_surface_quantization) {
         mix(std::hash<int>{}(settings.contoning_flat_surface_pattern_filaments));
         mix(std::hash<int>{}(settings.simulate_top_surface_lod ? 1 : 0));
@@ -2676,6 +2681,23 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
     result.rgba.resize(size_t(result.width) * size_t(result.height) * 4, 0);
     if (result.width == 0 || result.height == 0)
         return result;
+
+    const bool use_contoning_flat_surface_pattern_blend =
+        settings.contoning_flat_surface_pattern_blend &&
+        settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
+        !settings.component_colors.empty();
+    if (use_contoning_flat_surface_pattern_blend) {
+        std::vector<float> weights(settings.component_colors.size(), 1.f / float(settings.component_colors.size()));
+        const std::array<float, 3> rgb =
+            mix_color_solver_components(settings.component_colors, weights, ColorSolverMixModel::PigmentPainter);
+        for (size_t idx = 0; idx + 3 < result.rgba.size(); idx += 4) {
+            result.rgba[idx + 0] = to_u8(rgb[0]);
+            result.rgba[idx + 1] = to_u8(rgb[1]);
+            result.rgba[idx + 2] = to_u8(rgb[2]);
+            result.rgba[idx + 3] = 255;
+        }
+        return result;
+    }
 
     prepare_texture_preview_simulation_settings(settings);
     const int contoning_flat_surface_pattern_filaments =
@@ -3351,21 +3373,26 @@ const GUI::GLTexture *simulated_texture_preview_texture_for_filament(const Model
                                                                     size_t source_texture_signature,
                                                                     const GUI::GLTexture &fallback_texture,
                                                                     bool contoning_flat_surface_quantization = false,
+                                                                    bool contoning_flat_surface_pattern_blend = false,
                                                                     bool *simulated_ready = nullptr)
 {
     if (simulated_ready != nullptr)
         *simulated_ready = false;
     const TextureMappingZone *zone = zone_for_filament(filament_id, num_physical, texture_mgr);
-    if (contoning_flat_surface_quantization &&
-        (zone == nullptr || !is_image_zone(*zone) || !texture_preview_simulate_colors() || !zone->top_surface_contoning_active()))
+    if ((contoning_flat_surface_quantization || contoning_flat_surface_pattern_blend) &&
+        (zone == nullptr ||
+         !is_image_zone(*zone) ||
+         !texture_preview_simulate_colors() ||
+         zone->texture_mapping_mode == int(TextureMappingZone::TextureMappingRawValues)))
         return nullptr;
 
     const std::vector<std::string> physical_colors = physical_filament_colors_for_texture_preview(num_physical);
     std::optional<TexturePreviewSimulationSettings> settings =
         texture_preview_simulation_settings_for_filament(filament_id, num_physical, texture_mgr, physical_colors);
     if (!settings.has_value())
-        return contoning_flat_surface_quantization ? nullptr : &fallback_texture;
+        return (contoning_flat_surface_quantization || contoning_flat_surface_pattern_blend) ? nullptr : &fallback_texture;
     settings->contoning_flat_surface_quantization = contoning_flat_surface_quantization;
+    settings->contoning_flat_surface_pattern_blend = contoning_flat_surface_pattern_blend;
     settings->texture_preview_mm_per_pixel = estimated_texture_preview_mm_per_pixel(model_volume, &world_matrix);
     if (settings->contoning_flat_surface_quantization && settings->simulate_top_surface_lod)
         settings->top_surface_lod_pitch_mm =
@@ -3376,7 +3403,8 @@ const GUI::GLTexture *simulated_texture_preview_texture_for_filament(const Model
     auto &cache = texture_preview_simulation_cache();
     const size_t cache_key = texture_preview_simulation_cache_key(model_volume,
                                                                   filament_id,
-                                                                  contoning_flat_surface_quantization ? 1u : 0u,
+                                                                  contoning_flat_surface_quantization ? 1u :
+                                                                      contoning_flat_surface_pattern_blend ? 2u : 0u,
                                                                   settings->texture_preview_mm_per_pixel);
     std::shared_ptr<TexturePreviewSimulationCacheEntry> &entry_ref = cache[cache_key];
     if (entry_ref == nullptr)
@@ -3477,7 +3505,7 @@ const GUI::GLTexture *simulated_texture_preview_texture_for_filament(const Model
         return entry.texture.get();
     }
 
-    return contoning_flat_surface_quantization ? nullptr : &fallback_texture;
+    return (contoning_flat_surface_quantization || contoning_flat_surface_pattern_blend) ? nullptr : &fallback_texture;
 }
 
 } // namespace
@@ -5552,26 +5580,41 @@ static bool texture_preview_zone_uses_halftone_model(const TextureMappingZone &z
            is_halftone_dithering_method_for_texture_preview(method);
 }
 
-static bool texture_preview_zone_uses_contoning_flat_surface_texture(const TextureMappingZone &zone)
+static bool texture_preview_zone_uses_flat_surface_texture(const TextureMappingZone &zone)
 {
     return zone.enabled &&
            !zone.deleted &&
            zone.is_image_texture() &&
            texture_preview_simulate_colors() &&
-           zone.texture_mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
-           zone.top_surface_contoning_active();
+           zone.texture_mapping_mode != int(TextureMappingZone::TextureMappingRawValues);
 }
 
-static bool texture_preview_contoning_flat_surface_texture_for_filament(unsigned int filament_id,
-                                                                        size_t num_physical,
-                                                                        const TextureMappingManager *texture_mgr,
-                                                                        bool &include_bottom)
+static bool texture_preview_flat_surface_texture_for_filament(unsigned int filament_id,
+                                                              size_t num_physical,
+                                                              const TextureMappingManager *texture_mgr,
+                                                              bool &top_quantization,
+                                                              bool &top_pattern_blend,
+                                                              bool &bottom_quantization,
+                                                              bool &bottom_pattern_blend)
 {
-    include_bottom = false;
+    top_quantization = false;
+    top_pattern_blend = false;
+    bottom_quantization = false;
+    bottom_pattern_blend = false;
     const TextureMappingZone *zone = zone_for_filament(filament_id, num_physical, texture_mgr);
-    if (zone == nullptr || !texture_preview_zone_uses_contoning_flat_surface_texture(*zone))
+    if (zone == nullptr || !texture_preview_zone_uses_flat_surface_texture(*zone))
         return false;
-    include_bottom = zone->top_surface_contoning_color_lower_surfaces;
+
+    if (zone->top_surface_image_printing_enabled) {
+        top_quantization = true;
+        if (zone->top_surface_contoning_active() && zone->top_surface_contoning_color_lower_surfaces)
+            bottom_quantization = true;
+        else
+            bottom_pattern_blend = true;
+    } else {
+        top_pattern_blend = true;
+        bottom_pattern_blend = true;
+    }
     return true;
 }
 
@@ -5782,12 +5825,14 @@ void render_model_texture_preview_models(
     glsafe(::glActiveTexture(GL_TEXTURE0));
     shader->set_uniform("uniform_texture", 0);
     shader->set_uniform("contoning_flat_surface_texture", 1);
+    shader->set_uniform("contoning_flat_surface_bottom_texture", 2);
     shader->set_uniform("contoning_flat_surface_texture_enabled", false);
-    shader->set_uniform("contoning_flat_surface_include_bottom", false);
+    shader->set_uniform("contoning_flat_surface_bottom_texture_enabled", false);
 
     const size_t texture_signature = model_volume_texture_preview_signature(model_volume);
     GLuint bound_texture_id = 0;
     GLuint bound_contoning_flat_texture_id = 0;
+    GLuint bound_contoning_flat_bottom_texture_id = 0;
     const bool color_match_active = color_match != nullptr && color_match->active;
     for (size_t idx = 0; idx < models.size(); ++idx) {
         if (color_match_active && !color_match_preview_allows_filament(color_match, filament_ids[idx]))
@@ -5822,15 +5867,22 @@ void render_model_texture_preview_models(
             bound_texture_id = preview_texture->get_id();
         }
 
-        bool include_contoning_bottom = false;
-        bool contoning_flat_ready = false;
+        bool contoning_flat_top_ready = false;
+        bool contoning_flat_bottom_ready = false;
+        bool contoning_flat_top_quantization = false;
+        bool contoning_flat_top_pattern_blend = false;
+        bool contoning_flat_bottom_quantization = false;
+        bool contoning_flat_bottom_pattern_blend = false;
         const bool use_contoning_flat_texture =
             !color_match_active &&
             !force_original_texture &&
-            texture_preview_contoning_flat_surface_texture_for_filament(filament_ids[idx],
-                                                                        num_physical,
-                                                                        texture_mgr,
-                                                                        include_contoning_bottom);
+            texture_preview_flat_surface_texture_for_filament(filament_ids[idx],
+                                                              num_physical,
+                                                              texture_mgr,
+                                                              contoning_flat_top_quantization,
+                                                              contoning_flat_top_pattern_blend,
+                                                              contoning_flat_bottom_quantization,
+                                                              contoning_flat_bottom_pattern_blend);
         const GUI::GLTexture *contoning_flat_texture = use_contoning_flat_texture ?
             simulated_texture_preview_texture_for_filament(model_volume,
                                                            model_matrix,
@@ -5839,25 +5891,56 @@ void render_model_texture_preview_models(
                                                            texture_mgr,
                                                            texture_signature,
                                                            texture,
-                                                           true,
-                                                           &contoning_flat_ready) :
+                                                           contoning_flat_top_quantization,
+                                                           contoning_flat_top_pattern_blend,
+                                                           &contoning_flat_top_ready) :
             nullptr;
+        bool reuse_top_for_bottom =
+            use_contoning_flat_texture &&
+            contoning_flat_bottom_quantization == contoning_flat_top_quantization &&
+            contoning_flat_bottom_pattern_blend == contoning_flat_top_pattern_blend;
+        const GUI::GLTexture *contoning_flat_bottom_texture = reuse_top_for_bottom ?
+            contoning_flat_texture :
+            use_contoning_flat_texture ?
+                simulated_texture_preview_texture_for_filament(model_volume,
+                                                               model_matrix,
+                                                               filament_ids[idx],
+                                                               num_physical,
+                                                               texture_mgr,
+                                                               texture_signature,
+                                                               texture,
+                                                               contoning_flat_bottom_quantization,
+                                                               contoning_flat_bottom_pattern_blend,
+                                                               &contoning_flat_bottom_ready) :
+                nullptr;
+        if (reuse_top_for_bottom)
+            contoning_flat_bottom_ready = contoning_flat_top_ready;
         const bool contoning_flat_enabled =
-            contoning_flat_ready && contoning_flat_texture != nullptr && contoning_flat_texture->get_id() != 0;
+            contoning_flat_top_ready && contoning_flat_texture != nullptr && contoning_flat_texture->get_id() != 0;
+        const bool contoning_flat_bottom_enabled =
+            contoning_flat_bottom_ready && contoning_flat_bottom_texture != nullptr && contoning_flat_bottom_texture->get_id() != 0;
         if (contoning_flat_enabled && contoning_flat_texture->get_id() != bound_contoning_flat_texture_id) {
             glsafe(::glActiveTexture(GL_TEXTURE1));
             glsafe(::glBindTexture(GL_TEXTURE_2D, contoning_flat_texture->get_id()));
             bound_contoning_flat_texture_id = contoning_flat_texture->get_id();
             glsafe(::glActiveTexture(GL_TEXTURE0));
         }
+        if (contoning_flat_bottom_enabled && contoning_flat_bottom_texture->get_id() != bound_contoning_flat_bottom_texture_id) {
+            glsafe(::glActiveTexture(GL_TEXTURE2));
+            glsafe(::glBindTexture(GL_TEXTURE_2D, contoning_flat_bottom_texture->get_id()));
+            bound_contoning_flat_bottom_texture_id = contoning_flat_bottom_texture->get_id();
+            glsafe(::glActiveTexture(GL_TEXTURE0));
+        }
         shader->set_uniform("contoning_flat_surface_texture_enabled", contoning_flat_enabled);
-        shader->set_uniform("contoning_flat_surface_include_bottom", contoning_flat_enabled && include_contoning_bottom);
+        shader->set_uniform("contoning_flat_surface_bottom_texture_enabled", contoning_flat_bottom_enabled);
         shader->set_uniform("texture_preview_mix", color_match_active ? 1.f : mix);
         shader->set_uniform("invalid_texture_mapping", invalid);
         models[idx].set_color(colors[idx]);
         models[idx].render();
     }
 
+    glsafe(::glActiveTexture(GL_TEXTURE2));
+    glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
     glsafe(::glActiveTexture(GL_TEXTURE1));
     glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
     glsafe(::glActiveTexture(GL_TEXTURE0));
@@ -5933,15 +6016,23 @@ void render_model_texture_preview_model(
     glsafe(::glBindTexture(GL_TEXTURE_2D, preview_texture->get_id()));
     shader->set_uniform("uniform_texture", 0);
     shader->set_uniform("contoning_flat_surface_texture", 1);
-    bool include_contoning_bottom = false;
-    bool contoning_flat_ready = false;
+    shader->set_uniform("contoning_flat_surface_bottom_texture", 2);
+    bool contoning_flat_top_ready = false;
+    bool contoning_flat_bottom_ready = false;
+    bool contoning_flat_top_quantization = false;
+    bool contoning_flat_top_pattern_blend = false;
+    bool contoning_flat_bottom_quantization = false;
+    bool contoning_flat_bottom_pattern_blend = false;
     const bool use_contoning_flat_texture =
         !color_match_active &&
         !force_original_texture &&
-        texture_preview_contoning_flat_surface_texture_for_filament(filament_id,
-                                                                    num_physical,
-                                                                    texture_mgr,
-                                                                    include_contoning_bottom);
+        texture_preview_flat_surface_texture_for_filament(filament_id,
+                                                          num_physical,
+                                                          texture_mgr,
+                                                          contoning_flat_top_quantization,
+                                                          contoning_flat_top_pattern_blend,
+                                                          contoning_flat_bottom_quantization,
+                                                          contoning_flat_bottom_pattern_blend);
     const GUI::GLTexture *contoning_flat_texture = use_contoning_flat_texture ?
         simulated_texture_preview_texture_for_filament(model_volume,
                                                        model_matrix,
@@ -5950,18 +6041,46 @@ void render_model_texture_preview_model(
                                                        texture_mgr,
                                                        texture_signature,
                                                        texture,
-                                                       true,
-                                                       &contoning_flat_ready) :
+                                                       contoning_flat_top_quantization,
+                                                       contoning_flat_top_pattern_blend,
+                                                       &contoning_flat_top_ready) :
         nullptr;
+    bool reuse_top_for_bottom =
+        use_contoning_flat_texture &&
+        contoning_flat_bottom_quantization == contoning_flat_top_quantization &&
+        contoning_flat_bottom_pattern_blend == contoning_flat_top_pattern_blend;
+    const GUI::GLTexture *contoning_flat_bottom_texture = reuse_top_for_bottom ?
+        contoning_flat_texture :
+        use_contoning_flat_texture ?
+            simulated_texture_preview_texture_for_filament(model_volume,
+                                                           model_matrix,
+                                                           filament_id,
+                                                           num_physical,
+                                                           texture_mgr,
+                                                           texture_signature,
+                                                           texture,
+                                                           contoning_flat_bottom_quantization,
+                                                           contoning_flat_bottom_pattern_blend,
+                                                           &contoning_flat_bottom_ready) :
+            nullptr;
+    if (reuse_top_for_bottom)
+        contoning_flat_bottom_ready = contoning_flat_top_ready;
     const bool contoning_flat_enabled =
-        contoning_flat_ready && contoning_flat_texture != nullptr && contoning_flat_texture->get_id() != 0;
+        contoning_flat_top_ready && contoning_flat_texture != nullptr && contoning_flat_texture->get_id() != 0;
+    const bool contoning_flat_bottom_enabled =
+        contoning_flat_bottom_ready && contoning_flat_bottom_texture != nullptr && contoning_flat_bottom_texture->get_id() != 0;
     if (contoning_flat_enabled) {
         glsafe(::glActiveTexture(GL_TEXTURE1));
         glsafe(::glBindTexture(GL_TEXTURE_2D, contoning_flat_texture->get_id()));
         glsafe(::glActiveTexture(GL_TEXTURE0));
     }
+    if (contoning_flat_bottom_enabled) {
+        glsafe(::glActiveTexture(GL_TEXTURE2));
+        glsafe(::glBindTexture(GL_TEXTURE_2D, contoning_flat_bottom_texture->get_id()));
+        glsafe(::glActiveTexture(GL_TEXTURE0));
+    }
     shader->set_uniform("contoning_flat_surface_texture_enabled", contoning_flat_enabled);
-    shader->set_uniform("contoning_flat_surface_include_bottom", contoning_flat_enabled && include_contoning_bottom);
+    shader->set_uniform("contoning_flat_surface_bottom_texture_enabled", contoning_flat_bottom_enabled);
     shader->set_uniform("texture_preview_mix", color_match_active ? 1.f : mix);
     shader->set_uniform("invalid_texture_mapping", invalid);
     model.set_color(color);
@@ -5970,6 +6089,8 @@ void render_model_texture_preview_model(
     else
         model.render(render_range);
 
+    glsafe(::glActiveTexture(GL_TEXTURE2));
+    glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
     glsafe(::glActiveTexture(GL_TEXTURE1));
     glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
     glsafe(::glActiveTexture(GL_TEXTURE0));

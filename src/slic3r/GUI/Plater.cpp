@@ -2716,7 +2716,7 @@ public:
             update_top_surface_image_options_visibility(true);
         });
         m_top_surface_image_printing_enabled_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
-            update_top_surface_image_options_visibility(false);
+            update_top_surface_image_options_visibility(true);
         });
         m_top_surface_image_method_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) {
             update_top_surface_image_options_visibility(true);
