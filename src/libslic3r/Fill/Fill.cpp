@@ -3093,7 +3093,7 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
         plan.min_width_mm = std::clamp(zone->top_surface_image_min_line_width_mm,
                                        TextureMappingZone::MinTopSurfaceImageLineWidthMm,
                                        plan.max_width_mm);
-        plan.fixed_coloring = zone->top_surface_image_fixed_coloring_filaments;
+        plan.fixed_coloring = zone->top_surface_image_fixed_coloring_filaments_active();
         plan.color_lower_surfaces = zone->top_surface_contoning_color_lower_surfaces;
         plan.colored_top_layers = std::clamp(zone->top_surface_image_colored_top_layers,
                                              TextureMappingZone::MinTopSurfaceImageColoredTopLayers,
@@ -3108,24 +3108,23 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
         plan.contoning_min_feature_mm =
             texture_mapping_contoning_min_feature_mm(*zone, print_config, components, plan.contoning_external_width_mm);
         plan.contoning_replace_top_perimeters_with_infill =
-            zone->top_surface_contoning_replace_top_perimeters_with_infill;
+            zone->effective_top_surface_contoning_replace_top_perimeters_with_infill();
         plan.contoning_recolor_surrounding_perimeters =
-            zone->top_surface_contoning_recolor_surrounding_perimeters &&
-            !plan.contoning_replace_top_perimeters_with_infill;
+            zone->effective_top_surface_contoning_recolor_surrounding_perimeters();
         plan.contoning_perimeter_mode =
-            std::clamp(zone->top_surface_contoning_perimeter_mode,
+            std::clamp(zone->stored_top_surface_contoning_perimeter_mode(),
                        int(TextureMappingZone::ContoningPerimeterSegmentBlocks),
                        int(TextureMappingZone::ContoningPerimeterSegmentInfill));
         plan.contoning_flat_surface_infill_mode =
-            std::clamp(TextureMappingZone::effective_top_surface_contoning_flat_surface_infill_mode(
-                       zone->top_surface_contoning_flat_surface_infill_mode),
+            std::clamp(zone->effective_top_surface_contoning_flat_surface_infill_mode(),
                        int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinear),
                        int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithBoundary));
         plan.contoning_layer_phase_enabled = zone->top_surface_contoning_layer_phase_enabled;
         plan.contoning_varied_infill_angles_enabled = zone->top_surface_contoning_varied_infill_angles_enabled;
         plan.contoning_blue_noise_error_diffusion_enabled = zone->top_surface_contoning_blue_noise_error_diffusion_enabled;
         plan.contoning_supersampled_cells_enabled = zone->top_surface_contoning_supersampled_cells_enabled;
-        plan.contoning_surface_anchored_stacks_enabled = zone->top_surface_contoning_surface_anchored_stacks_enabled;
+        plan.contoning_surface_anchored_stacks_enabled =
+            zone->effective_top_surface_contoning_surface_anchored_stacks_enabled();
         const TextureMappingContoningSolver contoning_solver(*zone, print_config, components);
 
         const int stack_depth = plan.contoning ?

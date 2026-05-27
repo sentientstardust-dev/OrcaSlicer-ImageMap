@@ -1128,22 +1128,22 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            std::abs(top_surface_image_min_line_width_mm - rhs.top_surface_image_min_line_width_mm) <= eps &&
            std::abs(top_surface_image_max_line_width_mm - rhs.top_surface_image_max_line_width_mm) <= eps &&
            top_surface_image_colored_top_layers == rhs.top_surface_image_colored_top_layers &&
-           top_surface_image_fixed_coloring_filaments == rhs.top_surface_image_fixed_coloring_filaments &&
+           top_surface_image_fixed_coloring_filaments_active() == rhs.top_surface_image_fixed_coloring_filaments_active() &&
            std::abs(top_surface_contoning_angle_threshold_deg - rhs.top_surface_contoning_angle_threshold_deg) <= eps &&
            top_surface_contoning_stack_layers == rhs.top_surface_contoning_stack_layers &&
            top_surface_contoning_pattern_filaments == rhs.top_surface_contoning_pattern_filaments &&
            std::abs(top_surface_contoning_min_feature_mm - rhs.top_surface_contoning_min_feature_mm) <= eps &&
            top_surface_contoning_color_lower_surfaces == rhs.top_surface_contoning_color_lower_surfaces &&
-           top_surface_contoning_only_color_surface_infill == rhs.top_surface_contoning_only_color_surface_infill &&
-           top_surface_contoning_replace_top_perimeters_with_infill == rhs.top_surface_contoning_replace_top_perimeters_with_infill &&
-           top_surface_contoning_recolor_surrounding_perimeters == rhs.top_surface_contoning_recolor_surrounding_perimeters &&
-           top_surface_contoning_perimeter_mode == rhs.top_surface_contoning_perimeter_mode &&
-           top_surface_contoning_flat_surface_infill_mode == rhs.top_surface_contoning_flat_surface_infill_mode &&
+           effective_top_surface_contoning_only_color_surface_infill() == rhs.effective_top_surface_contoning_only_color_surface_infill() &&
+           effective_top_surface_contoning_replace_top_perimeters_with_infill() == rhs.effective_top_surface_contoning_replace_top_perimeters_with_infill() &&
+           effective_top_surface_contoning_recolor_surrounding_perimeters() == rhs.effective_top_surface_contoning_recolor_surrounding_perimeters() &&
+           stored_top_surface_contoning_perimeter_mode() == rhs.stored_top_surface_contoning_perimeter_mode() &&
+           stored_top_surface_contoning_flat_surface_infill_mode() == rhs.stored_top_surface_contoning_flat_surface_infill_mode() &&
            top_surface_contoning_layer_phase_enabled == rhs.top_surface_contoning_layer_phase_enabled &&
            top_surface_contoning_varied_infill_angles_enabled == rhs.top_surface_contoning_varied_infill_angles_enabled &&
            top_surface_contoning_blue_noise_error_diffusion_enabled == rhs.top_surface_contoning_blue_noise_error_diffusion_enabled &&
            top_surface_contoning_supersampled_cells_enabled == rhs.top_surface_contoning_supersampled_cells_enabled &&
-           top_surface_contoning_surface_anchored_stacks_enabled == rhs.top_surface_contoning_surface_anchored_stacks_enabled &&
+           effective_top_surface_contoning_surface_anchored_stacks_enabled() == rhs.effective_top_surface_contoning_surface_anchored_stacks_enabled() &&
            compact_offset_mode == rhs.compact_offset_mode &&
            use_legacy_fixed_color_mode == rhs.use_legacy_fixed_color_mode &&
            high_speed_image_texture_sampling == rhs.high_speed_image_texture_sampling &&
@@ -1497,7 +1497,7 @@ std::string TextureMappingManager::serialize_entries()
             clamp_int(zone.top_surface_image_colored_top_layers,
                       TextureMappingZone::MinTopSurfaceImageColoredTopLayers,
                       TextureMappingZone::MaxTopSurfaceImageColoredTopLayers);
-        texture["top_surface_image_fixed_coloring_filaments"] = zone.top_surface_image_fixed_coloring_filaments;
+        texture["top_surface_image_fixed_coloring_filaments"] = zone.top_surface_image_fixed_coloring_filaments_active();
         texture["top_surface_contoning_angle_threshold_deg"] =
             std::clamp(finite_or(zone.top_surface_contoning_angle_threshold_deg,
                                  TextureMappingZone::DefaultTopSurfaceContoningAngleThresholdDeg),
@@ -1517,18 +1517,18 @@ std::string TextureMappingManager::serialize_entries()
                        TextureMappingZone::MinTopSurfaceContoningMinFeatureMm,
                        TextureMappingZone::MaxTopSurfaceContoningMinFeatureMm);
         texture["top_surface_contoning_color_lower_surfaces"] = zone.top_surface_contoning_color_lower_surfaces;
-        texture["top_surface_contoning_only_color_surface_infill"] = zone.top_surface_contoning_only_color_surface_infill;
+        texture["top_surface_contoning_only_color_surface_infill"] =
+            zone.effective_top_surface_contoning_only_color_surface_infill();
         texture["top_surface_contoning_replace_top_perimeters_with_infill"] =
-            zone.top_surface_contoning_replace_top_perimeters_with_infill;
+            zone.effective_top_surface_contoning_replace_top_perimeters_with_infill();
         texture["top_surface_contoning_recolor_surrounding_perimeters"] =
-            zone.top_surface_contoning_recolor_surrounding_perimeters &&
-            !zone.top_surface_contoning_replace_top_perimeters_with_infill;
+            zone.effective_top_surface_contoning_recolor_surrounding_perimeters();
         texture["top_surface_contoning_perimeter_mode"] =
-            clamp_int(zone.top_surface_contoning_perimeter_mode,
+            clamp_int(zone.stored_top_surface_contoning_perimeter_mode(),
                       int(TextureMappingZone::ContoningPerimeterSegmentBlocks),
                       int(TextureMappingZone::ContoningPerimeterSegmentInfill));
         texture["top_surface_contoning_flat_surface_infill_mode"] =
-            top_surface_contoning_flat_surface_infill_mode_name(zone.top_surface_contoning_flat_surface_infill_mode);
+            top_surface_contoning_flat_surface_infill_mode_name(zone.stored_top_surface_contoning_flat_surface_infill_mode());
         texture["top_surface_contoning_layer_phase_enabled"] = zone.top_surface_contoning_layer_phase_enabled;
         texture["top_surface_contoning_varied_infill_angles_enabled"] =
             zone.top_surface_contoning_varied_infill_angles_enabled;
@@ -1537,7 +1537,7 @@ std::string TextureMappingManager::serialize_entries()
         texture["top_surface_contoning_supersampled_cells_enabled"] =
             zone.top_surface_contoning_supersampled_cells_enabled;
         texture["top_surface_contoning_surface_anchored_stacks_enabled"] =
-            zone.top_surface_contoning_surface_anchored_stacks_enabled;
+            zone.effective_top_surface_contoning_surface_anchored_stacks_enabled();
         texture["compact_offset_mode"] = zone.compact_offset_mode;
         texture["use_legacy_fixed_color_mode"] = zone.use_legacy_fixed_color_mode;
         texture["high_speed_image_texture_sampling"] = true;
@@ -1807,8 +1807,6 @@ void TextureMappingManager::load_entries(const std::string &serialized,
                               TextureMappingZone::DefaultTopSurfaceContoningFlatSurfaceInfillMode,
                           int(TextureMappingZone::ContoningFlatSurfaceInfillDefault),
                           int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithBoundary));
-        if (zone.top_surface_contoning_replace_top_perimeters_with_infill)
-            zone.top_surface_contoning_recolor_surrounding_perimeters = false;
         zone.top_surface_contoning_layer_phase_enabled =
             texture.value("top_surface_contoning_layer_phase_enabled",
                           TextureMappingZone::DefaultTopSurfaceContoningLayerPhaseEnabled);
@@ -1824,6 +1822,7 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.top_surface_contoning_surface_anchored_stacks_enabled =
             texture.value("top_surface_contoning_surface_anchored_stacks_enabled",
                           TextureMappingZone::DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled);
+        zone.apply_top_surface_contoning_experimental_defaults();
         zone.compact_offset_mode = texture.value("compact_offset_mode", TextureMappingZone::DefaultCompactOffsetMode);
         zone.use_legacy_fixed_color_mode =
             texture.value("use_legacy_fixed_color_mode", TextureMappingZone::DefaultUseLegacyFixedColorMode);
