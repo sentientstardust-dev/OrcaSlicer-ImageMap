@@ -185,13 +185,13 @@ struct TextureMappingZone
     static constexpr int   DefaultTopSurfaceContoningStackLayers = 15;
     static constexpr int   MinTopSurfaceContoningPatternFilaments = 1;
     static constexpr int   MaxTopSurfaceContoningPatternFilaments = 20;
-    static constexpr int   DefaultTopSurfaceContoningPatternFilaments = 4;
+    static constexpr int   DefaultTopSurfaceContoningPatternFilaments = 5;
     static constexpr float MinTopSurfaceContoningMinFeatureMm = 0.f;
     static constexpr float MaxTopSurfaceContoningMinFeatureMm = 20.f;
     static constexpr float DefaultTopSurfaceContoningMinFeatureMm = 0.f;
     static constexpr bool  DefaultTopSurfaceContoningColorLowerSurfaces = true;
     static constexpr bool  DefaultTopSurfaceContoningOnlyColorSurfaceInfill = true;
-    static constexpr bool  DefaultTopSurfaceContoningOnlyOnePerimeterAroundShellInfill = false;
+    static constexpr bool  DefaultTopSurfaceContoningOnlyOnePerimeterAroundShellInfill = true;
     static constexpr bool  DefaultTopSurfaceContoningReplaceTopPerimetersWithInfill = false;
     static constexpr bool  DefaultTopSurfaceContoningRecolorSurroundingPerimeters = false;
     static constexpr int   DefaultTopSurfaceContoningPerimeterMode = int(ContoningPerimeterDividedLine);
@@ -201,8 +201,8 @@ struct TextureMappingZone
     static constexpr bool  DefaultTopSurfaceContoningVariedInfillAnglesEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningSupersampledCellsEnabled = false;
-    static constexpr bool  DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled = false;
-    static constexpr int   DefaultTopSurfaceContoningPolygonizeResolution = 2;
+    static constexpr bool  DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled = true;
+    static constexpr int   DefaultTopSurfaceContoningPolygonizeResolution = 4;
     static constexpr bool  DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled = false;
     static constexpr bool  DefaultCompactOffsetMode = true;
     static constexpr bool  DefaultUseLegacyFixedColorMode = false;

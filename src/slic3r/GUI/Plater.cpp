@@ -3181,8 +3181,9 @@ public:
     }
     bool top_surface_contoning_only_one_perimeter_around_shell_infill() const
     {
-        return m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox != nullptr &&
-               m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox->GetValue();
+        return m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox != nullptr ?
+            m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox->GetValue() :
+            TextureMappingZone::DefaultTopSurfaceContoningOnlyOnePerimeterAroundShellInfill;
     }
     bool top_surface_contoning_only_color_surface_infill() const
     {
@@ -3247,8 +3248,9 @@ public:
     }
     bool top_surface_contoning_polygonize_color_regions_enabled() const
     {
-        return m_top_surface_contoning_polygonize_color_regions_checkbox != nullptr &&
-               m_top_surface_contoning_polygonize_color_regions_checkbox->GetValue();
+        return m_top_surface_contoning_polygonize_color_regions_checkbox != nullptr ?
+            m_top_surface_contoning_polygonize_color_regions_checkbox->GetValue() :
+            TextureMappingZone::DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled;
     }
     int top_surface_contoning_polygonize_resolution() const
     {
