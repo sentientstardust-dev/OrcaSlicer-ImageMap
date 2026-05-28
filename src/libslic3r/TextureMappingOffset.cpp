@@ -2823,6 +2823,133 @@ std::optional<float> sample_weight_field_normal_z(const TextureMappingOffsetWeig
     return std::nullopt;
 }
 
+static float texture_mapping_offset_context_sample_z_mm(const TextureMappingOffsetContext &context, float z_mm)
+{
+    if (std::isfinite(z_mm))
+        return z_mm;
+    if (std::isfinite(context.sample_z_mm))
+        return context.sample_z_mm;
+    if (context.layer != nullptr && std::isfinite(float(context.layer->print_z)))
+        return float(context.layer->print_z);
+    return 0.f;
+}
+
+static float texture_mapping_offset_linear_gradient_t_at_point(const TextureMappingOffsetContext &context,
+                                                               float                              x_mm,
+                                                               float                              y_mm,
+                                                               float                              z_mm)
+{
+    const Vec3f sample(x_mm, y_mm, texture_mapping_offset_context_sample_z_mm(context, z_mm));
+    if (context.linear_gradient_radial_mode) {
+        const float radius = std::max(0.01f, context.linear_gradient_radius_mm);
+        return clamp01f((sample - context.linear_gradient_start_mm).norm() / radius);
+    }
+
+    const Vec3f gradient_vec = context.linear_gradient_end_mm - context.linear_gradient_start_mm;
+    const float denom = gradient_vec.squaredNorm();
+    return denom > 1e-8f ? clamp01f((sample - context.linear_gradient_start_mm).dot(gradient_vec) / denom) : 0.f;
+}
+
+static std::vector<float> texture_mapping_offset_gradient_component_weights_at_point(const TextureMappingOffsetContext &context,
+                                                                                    float                              x_mm,
+                                                                                    float                              y_mm,
+                                                                                    float                              z_mm,
+                                                                                    double                             direction_x,
+                                                                                    double                             direction_y)
+{
+    std::vector<float> weights(context.component_ids.size(), 0.f);
+    if (weights.empty())
+        return weights;
+
+    if (context.linear_gradient_mode) {
+        const float t = texture_mapping_offset_linear_gradient_t_at_point(context, x_mm, y_mm, z_mm);
+        return TextureMappingManager::linear_gradient_compact_weights(t, context.linear_gradient_stops, context.component_ids);
+    }
+
+    if (context.object_center_mode || !std::isfinite(direction_x) || !std::isfinite(direction_y)) {
+        direction_x = double(x_mm) - unscale<double>(context.object_center.x());
+        direction_y = double(y_mm) - unscale<double>(context.object_center.y());
+    }
+    const double direction_len = std::hypot(direction_x, direction_y);
+    if (!std::isfinite(direction_len) || direction_len <= EPSILON) {
+        direction_x = 1.0;
+        direction_y = 0.0;
+    } else {
+        direction_x /= direction_len;
+        direction_y /= direction_len;
+    }
+
+    const float theta_deg =
+        normalize_texture_mapping_offset_angle_deg(float(Geometry::rad2deg(std::atan2(direction_y, direction_x))));
+    const float sample_theta_deg = context.signed_fade_factor < 0.f ?
+        normalize_texture_mapping_offset_angle_deg(theta_deg + 180.f) :
+        theta_deg;
+
+    for (size_t i = 0; i < weights.size(); ++i) {
+        weights[i] = component_angular_influence(context.component_ids[i],
+                                                 sample_theta_deg,
+                                                 context.component_ids,
+                                                 context.rotated_angles);
+    }
+    return weights;
+}
+
+std::vector<float> texture_mapping_offset_component_weights_at_point(const TextureMappingOffsetContext &context,
+                                                                     float                              x_mm,
+                                                                     float                              y_mm,
+                                                                     float                              z_mm)
+{
+    if (context.vertex_color_match_mode)
+        return sample_weight_field_components(context.weight_field,
+                                              x_mm,
+                                              y_mm,
+                                              context.high_resolution_texture_sampling);
+
+    std::vector<float> weights =
+        texture_mapping_offset_gradient_component_weights_at_point(context,
+                                                                   x_mm,
+                                                                   y_mm,
+                                                                   z_mm,
+                                                                   std::numeric_limits<double>::quiet_NaN(),
+                                                                   std::numeric_limits<double>::quiet_NaN());
+    if (!context.linear_gradient_mode && context.fade_factor < 1.f - EPSILON)
+        for (float &weight : weights)
+            weight = clamp01f(1.f + (weight - 1.f) * context.fade_factor);
+    return weights;
+}
+
+std::optional<std::array<float, 3>> texture_mapping_offset_target_rgb_at_point(const TextureMappingOffsetContext &context,
+                                                                               float                              x_mm,
+                                                                               float                              y_mm,
+                                                                               float                              z_mm)
+{
+    if (context.vertex_color_match_mode)
+        return sample_weight_field_rgb(context.weight_field,
+                                       x_mm,
+                                       y_mm,
+                                       context.high_resolution_texture_sampling);
+
+    if (context.component_colors.empty() || context.component_colors.size() != context.component_ids.size())
+        return std::nullopt;
+
+    std::vector<float> weights = texture_mapping_offset_component_weights_at_point(context, x_mm, y_mm, z_mm);
+    if (weights.empty())
+        return std::nullopt;
+    bool has_weight = false;
+    for (const float weight : weights) {
+        if (std::isfinite(weight) && weight > EPSILON) {
+            has_weight = true;
+            break;
+        }
+    }
+    if (!has_weight)
+        weights.assign(context.component_colors.size(), 1.f);
+
+    const std::array<float, 3> rgb =
+        mix_color_solver_components(context.component_colors, weights, ColorSolverMixModel::PigmentPainter);
+    return std::array<float, 3>{ clamp01f(rgb[0]), clamp01f(rgb[1]), clamp01f(rgb[2]) };
+}
+
 std::vector<unsigned int> decode_texture_mapping_offset_component_ids(const TextureMappingZone &zone, size_t num_physical)
 {
     if (zone.is_linear_gradient())
@@ -3203,6 +3330,7 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     context.active_component_id = active_component_id;
     context.active_component_idx = active_component_idx;
     context.component_ids = std::move(component_ids);
+    context.component_colors = std::move(component_colors);
     if (linear_gradient_mode)
         context.linear_gradient_stops = TextureMappingManager::normalized_linear_gradient_stops(zone, num_physical);
     context.component_distances_mm = std::move(distances_mm);
@@ -3226,6 +3354,7 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
         transmission_distance_width_factor(td_calibration_context, active_component_idx, previous_component_idx);
     context.base_outer_width_mm = base_outer_width_mm;
     context.layer_height_mm = layer_height_mm;
+    context.sample_z_mm = sample_z_mm;
     context.layer = &layer;
     return context;
 }
@@ -3295,61 +3424,31 @@ float texture_mapping_offset_surface_inset_mm(const TextureMappingOffsetContext 
         }
         inset_strength = std::clamp(1.f - desired_strength, 0.f, 1.f);
     } else if (context.linear_gradient_mode) {
-        float t = 0.f;
-        float z_mm = context.layer != nullptr ? float(context.layer->print_z) : 0.f;
-        if (std::isfinite(surface_v_mm))
-            z_mm = surface_v_mm;
-        if (!std::isfinite(z_mm))
-            z_mm = 0.f;
-        const Vec3f sample(unscale<float>(point.x()), unscale<float>(point.y()), z_mm);
-        if (context.linear_gradient_radial_mode) {
-            const float radius = std::max(0.01f, context.linear_gradient_radius_mm);
-            t = clamp01f((sample - context.linear_gradient_start_mm).norm() / radius);
-        } else {
-            const Vec3f gradient_vec = context.linear_gradient_end_mm - context.linear_gradient_start_mm;
-            const float denom = gradient_vec.squaredNorm();
-            if (denom > 1e-8f)
-                t = clamp01f((sample - context.linear_gradient_start_mm).dot(gradient_vec) / denom);
-        }
-        if (context.linear_gradient_radial_mode || (context.linear_gradient_end_mm - context.linear_gradient_start_mm).squaredNorm() > 1e-8f) {
-            const std::vector<float> weights =
-                TextureMappingManager::linear_gradient_compact_weights(t, context.linear_gradient_stops, context.component_ids);
-            const float desired_strength = context.active_component_idx < weights.size() ?
-                clamp01f(weights[context.active_component_idx]) :
-                0.f;
-            inset_strength = std::clamp(1.f - desired_strength, 0.f, 1.f);
-        } else {
-            inset_strength = 0.f;
-        }
+        const std::vector<float> weights =
+            texture_mapping_offset_gradient_component_weights_at_point(context,
+                                                                       unscale<float>(point.x()),
+                                                                       unscale<float>(point.y()),
+                                                                       surface_v_mm,
+                                                                       outward_x,
+                                                                       outward_y);
+        const float desired_strength = context.active_component_idx < weights.size() ?
+            clamp01f(weights[context.active_component_idx]) :
+            0.f;
+        inset_strength = std::clamp(1.f - desired_strength, 0.f, 1.f);
     } else {
-        double theta_direction_x = outward_x;
-        double theta_direction_y = outward_y;
-        if (context.object_center_mode) {
-            const double radial_x = double(point.x()) - double(context.object_center.x());
-            const double radial_y = double(point.y()) - double(context.object_center.y());
-            const double radial_len = std::hypot(radial_x, radial_y);
-            if (radial_len > EPSILON) {
-                theta_direction_x = radial_x / radial_len;
-                theta_direction_y = radial_y / radial_len;
-            }
-        }
-
-        const float theta_deg =
-            normalize_texture_mapping_offset_angle_deg(float(Geometry::rad2deg(std::atan2(theta_direction_y, theta_direction_x))));
-        const float sample_theta_deg = context.signed_fade_factor < 0.f ?
-            normalize_texture_mapping_offset_angle_deg(theta_deg + 180.f) :
-            theta_deg;
+        const std::vector<float> weights =
+            texture_mapping_offset_gradient_component_weights_at_point(context,
+                                                                       unscale<float>(point.x()),
+                                                                       unscale<float>(point.y()),
+                                                                       surface_v_mm,
+                                                                       outward_x,
+                                                                       outward_y);
         float raw_inset_mm = 0.f;
-        const size_t component_count = std::min(context.component_ids.size(), context.component_distances_mm.size());
+        const size_t component_count = std::min(weights.size(), context.component_distances_mm.size());
         for (size_t i = 0; i < component_count; ++i) {
             if (i == context.active_component_idx)
                 continue;
-            const float influence =
-                component_angular_influence(context.component_ids[i],
-                                            sample_theta_deg,
-                                            context.component_ids,
-                                            context.rotated_angles);
-            raw_inset_mm += context.component_distances_mm[i] * influence;
+            raw_inset_mm += context.component_distances_mm[i] * weights[i];
         }
         inset_strength = std::clamp(raw_inset_mm / std::max(context.inset_strength_reference_mm, float(EPSILON)), 0.f, 1.f);
     }

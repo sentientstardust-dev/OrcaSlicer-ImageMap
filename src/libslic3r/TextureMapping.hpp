@@ -395,7 +395,7 @@ struct TextureMappingZone
     bool top_surface_image_printing_active() const
     {
         return top_surface_image_printing_enabled &&
-               is_image_texture() &&
+               (is_image_texture() || is_surface_gradient()) &&
                (top_surface_image_printing_method == int(TopSurfaceImageSameAngle45Width) ||
                 top_surface_image_printing_method == int(TopSurfaceImageSameLayer45Partition) ||
                 (top_surface_image_printing_method == int(TopSurfaceImageContoning) &&
@@ -404,7 +404,7 @@ struct TextureMappingZone
     bool top_surface_contoning_active() const
     {
         return top_surface_image_printing_enabled &&
-               is_image_texture() &&
+               (is_image_texture() || is_surface_gradient()) &&
                top_surface_image_printing_method == int(TopSurfaceImageContoning) &&
                uses_perimeter_path_modulation_v2();
     }
@@ -416,7 +416,8 @@ struct TextureMappingZone
     }
     bool top_surface_contoning_perimeters_active() const
     {
-        return top_surface_contoning_active() &&
+        return is_image_texture() &&
+               top_surface_contoning_active() &&
                !effective_top_surface_contoning_only_color_surface_infill() &&
                !effective_top_surface_contoning_replace_top_perimeters_with_infill() &&
                !effective_top_surface_contoning_recolor_surrounding_perimeters();

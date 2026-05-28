@@ -1939,10 +1939,10 @@ static std::optional<TopSurfaceImageContoningCellSample> top_surface_image_conto
                 return;
         }
         const std::optional<std::array<float, 3>> rgb =
-            sample_weight_field_rgb(context.weight_field,
-                                    sample_x_mm,
-                                    sample_y_mm,
-                                    context.high_resolution_texture_sampling);
+            texture_mapping_offset_target_rgb_at_point(context,
+                                                       sample_x_mm,
+                                                       sample_y_mm,
+                                                       std::numeric_limits<float>::quiet_NaN());
         if (!rgb)
             return;
         out.rgb[0] += (*rgb)[0];
@@ -3064,7 +3064,9 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
         std::vector<std::string> filament_colours = print_config.filament_colour.values;
         filament_colours.resize(num_physical, "#FFFFFF");
         std::vector<unsigned int> components =
-            TextureMappingManager::effective_texture_component_ids(*zone, num_physical, filament_colours);
+            zone->is_image_texture() ?
+                TextureMappingManager::effective_texture_component_ids(*zone, num_physical, filament_colours) :
+                TextureMappingManager::selected_component_ids(*zone, num_physical);
         components.erase(std::remove_if(components.begin(), components.end(), [num_physical](unsigned int id) {
             return id == 0 || id > num_physical;
         }), components.end());
@@ -4497,10 +4499,10 @@ static ExtrusionPaths top_surface_image_split_path(const ExtrusionPath &path,
                 continue;
             const Point qm = lerp(p0, p1, 0.5 * (t0 + t1));
             const std::vector<float> weights =
-                sample_weight_field_components(context.weight_field,
-                                               unscale<float>(qm.x()),
-                                               unscale<float>(qm.y()),
-                                               context.high_resolution_texture_sampling);
+                texture_mapping_offset_component_weights_at_point(context,
+                                                                  unscale<float>(qm.x()),
+                                                                  unscale<float>(qm.y()),
+                                                                  std::numeric_limits<float>::quiet_NaN());
             const float coverage = context.active_component_idx < weights.size() ?
                 std::clamp(weights[context.active_component_idx], 0.f, 1.f) :
                 0.f;
@@ -4582,10 +4584,10 @@ static std::vector<float> top_surface_image_same_layer_fractions(const std::opti
     if (!context)
         return fractions;
     std::vector<float> weights =
-        sample_weight_field_components(context->weight_field,
-                                       x_mm,
-                                       y_mm,
-                                       context->high_resolution_texture_sampling);
+        texture_mapping_offset_component_weights_at_point(*context,
+                                                          x_mm,
+                                                          y_mm,
+                                                          std::numeric_limits<float>::quiet_NaN());
     if (weights.size() != size_t(component_count))
         return fractions;
     fractions.assign(size_t(component_count), 0.f);
@@ -6298,9 +6300,11 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree,
                 std::vector<std::string> filament_colours = print_config.filament_colour.values;
                 filament_colours.resize(print_config.filament_colour.values.size(), "#FFFFFF");
                 std::vector<unsigned int> components =
-                    TextureMappingManager::effective_texture_component_ids(*zone,
-                                                                           print_config.filament_colour.values.size(),
-                                                                           filament_colours);
+                    zone->is_image_texture() ?
+                        TextureMappingManager::effective_texture_component_ids(*zone,
+                                                                               print_config.filament_colour.values.size(),
+                                                                               filament_colours) :
+                        TextureMappingManager::selected_component_ids(*zone, print_config.filament_colour.values.size());
                 const std::optional<std::array<float, 4>> background =
                     top_surface_image_equal_blend_background(print_config, components);
                 top_surface_image_context =

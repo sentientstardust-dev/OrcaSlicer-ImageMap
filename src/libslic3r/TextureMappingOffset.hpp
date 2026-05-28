@@ -72,6 +72,7 @@ struct TextureMappingOffsetContext {
     unsigned int                    active_component_id { 0 };
     size_t                          active_component_idx { size_t(-1) };
     std::vector<unsigned int>       component_ids;
+    std::vector<std::array<float, 3>> component_colors;
     std::vector<float>              component_distances_mm;
     std::vector<float>              rotated_angles;
     TextureMappingOffsetWeightField weight_field;
@@ -87,6 +88,7 @@ struct TextureMappingOffsetContext {
     float                           active_component_td_width_factor { 1.f };
     float                           base_outer_width_mm { 0.f };
     float                           layer_height_mm { 0.f };
+    float                           sample_z_mm { std::numeric_limits<float>::quiet_NaN() };
     const Layer                    *layer { nullptr };
 };
 
@@ -123,6 +125,16 @@ std::optional<float> sample_weight_field_normal_z(const TextureMappingOffsetWeig
                                                   float                                  x_mm,
                                                   float                                  y_mm,
                                                   bool                                   high_resolution_texture_sampling);
+
+std::vector<float> texture_mapping_offset_component_weights_at_point(const TextureMappingOffsetContext &context,
+                                                                     float                              x_mm,
+                                                                     float                              y_mm,
+                                                                     float                              z_mm);
+
+std::optional<std::array<float, 3>> texture_mapping_offset_target_rgb_at_point(const TextureMappingOffsetContext &context,
+                                                                               float                              x_mm,
+                                                                               float                              y_mm,
+                                                                               float                              z_mm);
 
 float texture_mapping_offset_surface_inset_mm(const TextureMappingOffsetContext &context,
                                               const Point                       &point,
