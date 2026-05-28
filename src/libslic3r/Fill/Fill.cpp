@@ -502,6 +502,7 @@ struct TopSurfaceImageRegionPlan {
     bool contoning_blue_noise_error_diffusion_enabled = false;
     bool contoning_supersampled_cells_enabled = false;
     bool contoning_polygonize_color_regions_enabled = false;
+    bool contoning_polygonize_high_resolution_enabled = TextureMappingZone::DefaultTopSurfaceContoningPolygonizeHighResolutionEnabled;
     bool contoning_surface_anchored_stacks_enabled = false;
     int contoning_flat_surface_infill_mode = TextureMappingZone::SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode;
 };
@@ -1164,6 +1165,7 @@ struct TopSurfaceImageContoningStackPlanKey {
     bool supersampled { false };
     bool blue_noise { false };
     bool polygonize { false };
+    bool polygonize_high_resolution { false };
 
     bool operator<(const TopSurfaceImageContoningStackPlanKey &rhs) const
     {
@@ -1189,7 +1191,8 @@ struct TopSurfaceImageContoningStackPlanKey {
                         recolor_surrounding_perimeters,
                         supersampled,
                         blue_noise,
-                        polygonize) <
+                        polygonize,
+                        polygonize_high_resolution) <
                std::tie(rhs.source_layer,
                         rhs.source_layer_id,
                         rhs.target_layer,
@@ -1212,7 +1215,8 @@ struct TopSurfaceImageContoningStackPlanKey {
                         rhs.recolor_surrounding_perimeters,
                         rhs.supersampled,
                         rhs.blue_noise,
-                        rhs.polygonize);
+                        rhs.polygonize,
+                        rhs.polygonize_high_resolution);
     }
 };
 
@@ -1468,15 +1472,21 @@ static float top_surface_image_contoning_sample_pitch_mm(const TopSurfaceImageRe
     float pitch = std::clamp(plan.contoning_external_width_mm,
                              0.25f,
                              std::max(0.25f, plan.contoning_min_feature_mm * 0.5f));
+    const bool high_resolution =
+        plan.contoning_polygonize_color_regions_enabled &&
+        plan.contoning_polygonize_high_resolution_enabled;
+    const float min_pitch = high_resolution ? 0.125f : 0.25f;
+    if (high_resolution)
+        pitch = std::max(min_pitch, pitch * 0.5f);
     const double width_mm = unscale<double>(bbox.max.x() - bbox.min.x());
     const double height_mm = unscale<double>(bbox.max.y() - bbox.min.y());
-    const double max_samples = 350000.0;
+    const double max_samples = high_resolution ? 2600000.0 : 650000.0;
     if (width_mm > 0.0 && height_mm > 0.0) {
         const double estimated = std::ceil(width_mm / double(pitch)) * std::ceil(height_mm / double(pitch));
         if (estimated > max_samples)
             pitch = float(std::sqrt(width_mm * height_mm / max_samples));
     }
-    return std::clamp(pitch, 0.25f, std::max(0.25f, plan.contoning_min_feature_mm));
+    return std::clamp(pitch, min_pitch, std::max(min_pitch, plan.contoning_min_feature_mm));
 }
 
 static float top_surface_image_contoning_angle_rad(int depth, bool varied_angles)
@@ -2582,6 +2592,9 @@ static TopSurfaceImageContoningStackPlanKey top_surface_image_contoning_stack_pl
     key.supersampled = plan.contoning_supersampled_cells_enabled;
     key.blue_noise = use_blue_noise_error_diffusion;
     key.polygonize = plan.contoning_polygonize_color_regions_enabled;
+    key.polygonize_high_resolution =
+        plan.contoning_polygonize_color_regions_enabled &&
+        plan.contoning_polygonize_high_resolution_enabled;
     return key;
 }
 
@@ -3230,6 +3243,8 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
         plan.contoning_blue_noise_error_diffusion_enabled = zone->top_surface_contoning_blue_noise_error_diffusion_enabled;
         plan.contoning_supersampled_cells_enabled = zone->top_surface_contoning_supersampled_cells_enabled;
         plan.contoning_polygonize_color_regions_enabled = zone->top_surface_contoning_polygonize_color_regions_enabled;
+        plan.contoning_polygonize_high_resolution_enabled =
+            zone->top_surface_contoning_polygonize_high_resolution_enabled;
         plan.contoning_surface_anchored_stacks_enabled =
             zone->effective_top_surface_contoning_surface_anchored_stacks_enabled();
         const TextureMappingContoningSolver contoning_solver(*zone, print_config, components);

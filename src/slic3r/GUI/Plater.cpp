@@ -1982,6 +1982,7 @@ public:
                                         bool top_surface_contoning_blue_noise_error_diffusion_enabled,
                                         bool top_surface_contoning_supersampled_cells_enabled,
                                         bool top_surface_contoning_polygonize_color_regions_enabled,
+                                        bool top_surface_contoning_polygonize_high_resolution_enabled,
                                         bool top_surface_contoning_surface_anchored_stacks_enabled,
                                         const TextureMappingManager &texture_mapping_zones,
                                         const TextureMappingGlobalSettings &global_settings,
@@ -2768,6 +2769,15 @@ public:
                                        0,
                                        wxEXPAND | wxTOP | wxBOTTOM,
                                        gap / 2);
+        m_top_surface_contoning_polygonize_high_resolution_checkbox =
+            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("High-resolution polygon tracing"));
+        m_top_surface_contoning_polygonize_high_resolution_checkbox->SetValue(top_surface_contoning_polygonize_high_resolution_enabled);
+        m_top_surface_contoning_polygonize_high_resolution_checkbox->SetMinSize(
+            wxSize(-1, std::max(m_top_surface_contoning_polygonize_high_resolution_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+        contoning_checkboxes_root->Add(m_top_surface_contoning_polygonize_high_resolution_checkbox,
+                                       0,
+                                       wxEXPAND | wxTOP | wxBOTTOM,
+                                       gap / 2);
         if (TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions) {
             m_top_surface_contoning_surface_anchored_stacks_checkbox =
                 new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Surface-anchored stacks"));
@@ -2802,6 +2812,11 @@ public:
                     m_top_surface_contoning_replace_top_perimeters_checkbox != nullptr) {
                     m_top_surface_contoning_replace_top_perimeters_checkbox->SetValue(false);
                 }
+                update_top_surface_image_options_visibility(true);
+            });
+        }
+        if (m_top_surface_contoning_polygonize_color_regions_checkbox != nullptr) {
+            m_top_surface_contoning_polygonize_color_regions_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
                 update_top_surface_image_options_visibility(true);
             });
         }
@@ -3223,6 +3238,12 @@ public:
     {
         return m_top_surface_contoning_polygonize_color_regions_checkbox != nullptr &&
                m_top_surface_contoning_polygonize_color_regions_checkbox->GetValue();
+    }
+    bool top_surface_contoning_polygonize_high_resolution_enabled() const
+    {
+        return m_top_surface_contoning_polygonize_high_resolution_checkbox == nullptr ?
+            TextureMappingZone::DefaultTopSurfaceContoningPolygonizeHighResolutionEnabled :
+            m_top_surface_contoning_polygonize_high_resolution_checkbox->GetValue();
     }
     bool top_surface_contoning_surface_anchored_stacks_enabled() const
     {
@@ -3732,6 +3753,14 @@ private:
             m_top_surface_contoning_polygonize_color_regions_checkbox->Show(contoning);
             m_top_surface_contoning_polygonize_color_regions_checkbox->Enable(contoning);
         }
+        const bool polygonize_color_regions =
+            contoning &&
+            m_top_surface_contoning_polygonize_color_regions_checkbox != nullptr &&
+            m_top_surface_contoning_polygonize_color_regions_checkbox->GetValue();
+        if (m_top_surface_contoning_polygonize_high_resolution_checkbox != nullptr) {
+            m_top_surface_contoning_polygonize_high_resolution_checkbox->Show(polygonize_color_regions);
+            m_top_surface_contoning_polygonize_high_resolution_checkbox->Enable(polygonize_color_regions);
+        }
         if (m_top_surface_contoning_surface_anchored_stacks_checkbox != nullptr) {
             m_top_surface_contoning_surface_anchored_stacks_checkbox->Show(contoning);
             m_top_surface_contoning_surface_anchored_stacks_checkbox->Enable(contoning);
@@ -3810,6 +3839,7 @@ private:
     wxCheckBox *m_top_surface_contoning_blue_noise_error_diffusion_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_supersampled_cells_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_polygonize_color_regions_checkbox {nullptr};
+    wxCheckBox *m_top_surface_contoning_polygonize_high_resolution_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_surface_anchored_stacks_checkbox {nullptr};
     wxCheckBox *m_use_legacy_fixed_color_mode_checkbox {nullptr};
     wxCheckBox *m_minimum_visibility_offset_checkbox {nullptr};
@@ -8833,6 +8863,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.top_surface_contoning_blue_noise_error_diffusion_enabled,
                                                     updated.top_surface_contoning_supersampled_cells_enabled,
                                                     updated.top_surface_contoning_polygonize_color_regions_enabled,
+                                                    updated.top_surface_contoning_polygonize_high_resolution_enabled,
                                                     updated.top_surface_contoning_surface_anchored_stacks_enabled,
                                                     bundle->texture_mapping_zones,
                                                     bundle->texture_mapping_global_settings,
@@ -8905,6 +8936,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 dlg.top_surface_contoning_supersampled_cells_enabled();
             updated.top_surface_contoning_polygonize_color_regions_enabled =
                 dlg.top_surface_contoning_polygonize_color_regions_enabled();
+            updated.top_surface_contoning_polygonize_high_resolution_enabled =
+                dlg.top_surface_contoning_polygonize_high_resolution_enabled();
             updated.top_surface_contoning_surface_anchored_stacks_enabled =
                 dlg.top_surface_contoning_surface_anchored_stacks_enabled();
             if (updated.top_surface_image_printing_enabled &&

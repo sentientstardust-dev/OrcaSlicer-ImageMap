@@ -202,6 +202,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningSupersampledCellsEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled = false;
+    static constexpr bool  DefaultTopSurfaceContoningPolygonizeHighResolutionEnabled = true;
     static constexpr bool  DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled = false;
     static constexpr bool  DefaultCompactOffsetMode = true;
     static constexpr bool  DefaultUseLegacyFixedColorMode = false;
@@ -354,6 +355,7 @@ struct TextureMappingZone
     bool        top_surface_contoning_blue_noise_error_diffusion_enabled = DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled;
     bool        top_surface_contoning_supersampled_cells_enabled = DefaultTopSurfaceContoningSupersampledCellsEnabled;
     bool        top_surface_contoning_polygonize_color_regions_enabled = DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled;
+    bool        top_surface_contoning_polygonize_high_resolution_enabled = DefaultTopSurfaceContoningPolygonizeHighResolutionEnabled;
     bool        top_surface_contoning_surface_anchored_stacks_enabled = DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled;
     bool        compact_offset_mode = DefaultCompactOffsetMode;
     bool        use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
@@ -544,6 +546,7 @@ struct TextureMappingZone
         top_surface_contoning_blue_noise_error_diffusion_enabled = DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled;
         top_surface_contoning_supersampled_cells_enabled = DefaultTopSurfaceContoningSupersampledCellsEnabled;
         top_surface_contoning_polygonize_color_regions_enabled = DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled;
+        top_surface_contoning_polygonize_high_resolution_enabled = DefaultTopSurfaceContoningPolygonizeHighResolutionEnabled;
         top_surface_contoning_surface_anchored_stacks_enabled = DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled;
         compact_offset_mode = DefaultCompactOffsetMode;
         use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
