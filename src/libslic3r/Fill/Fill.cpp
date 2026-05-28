@@ -5099,7 +5099,7 @@ static ExtrusionPath *top_surface_image_last_extrusion_path(ExtrusionEntitiesPtr
     return nullptr;
 }
 
-static double top_surface_image_boundary_skin_start_distance_sq(const Polyline &polyline, const Point &near)
+static double top_surface_image_boundary_skin_start_distance_sq(const Polyline &polyline, const Point &anchor)
 {
     if (!polyline.is_valid())
         return std::numeric_limits<double>::max();
@@ -5107,14 +5107,14 @@ static double top_surface_image_boundary_skin_start_distance_sq(const Polyline &
         double best = std::numeric_limits<double>::max();
         const size_t point_count = polyline.points.size() > 1 ? polyline.points.size() - 1 : polyline.points.size();
         for (size_t i = 0; i < point_count; ++i)
-            best = std::min(best, (polyline.points[i] - near).cast<double>().squaredNorm());
+            best = std::min(best, (polyline.points[i] - anchor).cast<double>().squaredNorm());
         return best;
     }
-    return std::min((polyline.first_point() - near).cast<double>().squaredNorm(),
-                    (polyline.last_point() - near).cast<double>().squaredNorm());
+    return std::min((polyline.first_point() - anchor).cast<double>().squaredNorm(),
+                    (polyline.last_point() - anchor).cast<double>().squaredNorm());
 }
 
-static void top_surface_image_boundary_skin_orient_near(Polyline &polyline, const Point &near)
+static void top_surface_image_boundary_skin_orient_near(Polyline &polyline, const Point &anchor)
 {
     if (!polyline.is_valid())
         return;
@@ -5123,19 +5123,19 @@ static void top_surface_image_boundary_skin_orient_near(Polyline &polyline, cons
         points.pop_back();
         if (points.empty())
             return;
-        const int nearest_idx = near.nearest_point_index(points);
+        const int nearest_idx = anchor.nearest_point_index(points);
         std::rotate(points.begin(), points.begin() + nearest_idx, points.end());
         points.emplace_back(points.front());
         polyline.points = std::move(points);
-    } else if ((polyline.last_point() - near).cast<double>().squaredNorm() <
-               (polyline.first_point() - near).cast<double>().squaredNorm()) {
+    } else if ((polyline.last_point() - anchor).cast<double>().squaredNorm() <
+               (polyline.first_point() - anchor).cast<double>().squaredNorm()) {
         polyline.reverse();
     }
 }
 
 static std::unique_ptr<ExtrusionPath> top_surface_image_take_nearest_boundary_skin_path(
     ExtrusionEntityCollection &collection,
-    const Point &near)
+    const Point &anchor)
 {
     size_t best_idx = collection.entities.size();
     double best_dist = std::numeric_limits<double>::max();
@@ -5143,7 +5143,7 @@ static std::unique_ptr<ExtrusionPath> top_surface_image_take_nearest_boundary_sk
         const ExtrusionPath *path = dynamic_cast<const ExtrusionPath *>(collection.entities[i]);
         if (path == nullptr || !path->polyline.is_valid())
             continue;
-        const double dist = top_surface_image_boundary_skin_start_distance_sq(path->polyline, near);
+        const double dist = top_surface_image_boundary_skin_start_distance_sq(path->polyline, anchor);
         if (dist < best_dist) {
             best_dist = dist;
             best_idx = i;
@@ -5153,7 +5153,7 @@ static std::unique_ptr<ExtrusionPath> top_surface_image_take_nearest_boundary_sk
         return nullptr;
     ExtrusionPath *path = static_cast<ExtrusionPath *>(collection.entities[best_idx]);
     collection.entities.erase(collection.entities.begin() + best_idx);
-    top_surface_image_boundary_skin_orient_near(path->polyline, near);
+    top_surface_image_boundary_skin_orient_near(path->polyline, anchor);
     return std::unique_ptr<ExtrusionPath>(path);
 }
 
