@@ -502,7 +502,7 @@ struct TopSurfaceImageRegionPlan {
     bool contoning_blue_noise_error_diffusion_enabled = false;
     bool contoning_supersampled_cells_enabled = false;
     bool contoning_polygonize_color_regions_enabled = false;
-    bool contoning_polygonize_high_resolution_enabled = TextureMappingZone::DefaultTopSurfaceContoningPolygonizeHighResolutionEnabled;
+    int contoning_polygonize_resolution = TextureMappingZone::DefaultTopSurfaceContoningPolygonizeResolution;
     bool contoning_surface_anchored_stacks_enabled = false;
     int contoning_flat_surface_infill_mode = TextureMappingZone::SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode;
 };
@@ -1165,7 +1165,7 @@ struct TopSurfaceImageContoningStackPlanKey {
     bool supersampled { false };
     bool blue_noise { false };
     bool polygonize { false };
-    bool polygonize_high_resolution { false };
+    int polygonize_resolution { 1 };
 
     bool operator<(const TopSurfaceImageContoningStackPlanKey &rhs) const
     {
@@ -1192,7 +1192,7 @@ struct TopSurfaceImageContoningStackPlanKey {
                         supersampled,
                         blue_noise,
                         polygonize,
-                        polygonize_high_resolution) <
+                        polygonize_resolution) <
                std::tie(rhs.source_layer,
                         rhs.source_layer_id,
                         rhs.target_layer,
@@ -1216,7 +1216,7 @@ struct TopSurfaceImageContoningStackPlanKey {
                         rhs.supersampled,
                         rhs.blue_noise,
                         rhs.polygonize,
-                        rhs.polygonize_high_resolution);
+                        rhs.polygonize_resolution);
     }
 };
 
@@ -1343,144 +1343,21 @@ static std::optional<std::array<float, 3>> top_surface_image_contoning_stack_rgb
     return mix_color_solver_components(colors, weights, ColorSolverMixModel::PigmentPainter);
 }
 
-static std::optional<std::array<float, 3>> top_surface_image_contoning_component_rgb(
-    unsigned int       component_id,
-    const PrintConfig &print_config)
-{
-    if (component_id == 0 || component_id > print_config.filament_colour.values.size())
-        return std::nullopt;
-    ColorRGB color;
-    if (!decode_color(print_config.filament_colour.get_at(size_t(component_id - 1)), color))
-        return std::nullopt;
-    return std::array<float, 3>{ color.r(), color.g(), color.b() };
-}
-
-static void top_surface_image_contoning_sort_stack_for_top_color(std::vector<unsigned int> &bottom_to_top,
-                                                                 const std::array<float, 3> &mix_rgb,
-                                                                 const PrintConfig &print_config)
-{
-    if (bottom_to_top.size() < 2)
-        return;
-    const std::array<float, 3> mix_oklab = color_solver_oklab_from_srgb(mix_rgb);
-    std::stable_sort(bottom_to_top.begin(), bottom_to_top.end(), [&mix_oklab, &print_config](unsigned int lhs, unsigned int rhs) {
-        const std::optional<std::array<float, 3>> lhs_rgb =
-            top_surface_image_contoning_component_rgb(lhs, print_config);
-        const std::optional<std::array<float, 3>> rhs_rgb =
-            top_surface_image_contoning_component_rgb(rhs, print_config);
-        const float lhs_error = lhs_rgb ?
-            top_surface_image_contoning_oklab_error(color_solver_oklab_from_srgb(*lhs_rgb), mix_oklab) :
-            std::numeric_limits<float>::max();
-        const float rhs_error = rhs_rgb ?
-            top_surface_image_contoning_oklab_error(color_solver_oklab_from_srgb(*rhs_rgb), mix_oklab) :
-            std::numeric_limits<float>::max();
-        return lhs_error > rhs_error;
-    });
-}
-
-static bool top_surface_image_contoning_can_finish_without_repeat(const std::vector<unsigned int> &ids,
-                                                                  const std::vector<int>          &counts,
-                                                                  unsigned int                     previous_id,
-                                                                  int                              remaining)
-{
-    for (size_t idx = 0; idx < ids.size() && idx < counts.size(); ++idx) {
-        const int limit = ids[idx] == previous_id ? remaining / 2 : (remaining + 1) / 2;
-        if (counts[idx] > limit)
-            return false;
-    }
-    return true;
-}
-
-static void top_surface_image_contoning_spread_stack_repeats(std::vector<unsigned int> &bottom_to_top)
-{
-    if (bottom_to_top.size() < 3)
-        return;
-
-    std::vector<unsigned int> ids;
-    std::vector<int> counts;
-    std::vector<int> ranks;
-    for (size_t pos = 0; pos < bottom_to_top.size(); ++pos) {
-        const unsigned int id = bottom_to_top[pos];
-        auto it = std::find(ids.begin(), ids.end(), id);
-        if (it == ids.end()) {
-            ids.emplace_back(id);
-            counts.emplace_back(1);
-            ranks.emplace_back(int(pos));
-        } else {
-            const size_t idx = size_t(it - ids.begin());
-            ++counts[idx];
-            ranks[idx] = int(pos);
-        }
-    }
-    if (ids.size() < 2)
-        return;
-
-    std::vector<unsigned int> top_to_bottom;
-    top_to_bottom.reserve(bottom_to_top.size());
-    unsigned int previous_id = 0;
-    int remaining = int(bottom_to_top.size());
-
-    auto better_candidate = [&counts, &ranks, &ids](int lhs, int rhs) {
-        if (rhs < 0)
-            return true;
-        if (ranks[size_t(lhs)] != ranks[size_t(rhs)])
-            return ranks[size_t(lhs)] > ranks[size_t(rhs)];
-        if (counts[size_t(lhs)] != counts[size_t(rhs)])
-            return counts[size_t(lhs)] > counts[size_t(rhs)];
-        return ids[size_t(lhs)] < ids[size_t(rhs)];
-    };
-
-    auto select_candidate = [&](bool require_feasible, bool allow_repeat) {
-        int best = -1;
-        for (size_t idx = 0; idx < ids.size(); ++idx) {
-            if (counts[idx] <= 0 || (!allow_repeat && ids[idx] == previous_id))
-                continue;
-            --counts[idx];
-            const bool feasible =
-                top_surface_image_contoning_can_finish_without_repeat(ids, counts, ids[idx], remaining - 1);
-            ++counts[idx];
-            if (require_feasible && !feasible)
-                continue;
-            if (better_candidate(int(idx), best))
-                best = int(idx);
-        }
-        return best;
-    };
-
-    while (remaining > 0) {
-        int selected = select_candidate(true, false);
-        if (selected < 0)
-            selected = select_candidate(false, false);
-        if (selected < 0)
-            selected = select_candidate(false, true);
-        if (selected < 0)
-            break;
-        top_to_bottom.emplace_back(ids[size_t(selected)]);
-        --counts[size_t(selected)];
-        previous_id = ids[size_t(selected)];
-        --remaining;
-    }
-
-    if (top_to_bottom.size() != bottom_to_top.size())
-        return;
-    std::reverse(top_to_bottom.begin(), top_to_bottom.end());
-    bottom_to_top = std::move(top_to_bottom);
-}
-
 static float top_surface_image_contoning_sample_pitch_mm(const TopSurfaceImageRegionPlan &plan,
                                                          const BoundingBox               &bbox)
 {
     float pitch = std::clamp(plan.contoning_external_width_mm,
                              0.25f,
                              std::max(0.25f, plan.contoning_min_feature_mm * 0.5f));
-    const bool high_resolution =
-        plan.contoning_polygonize_color_regions_enabled &&
-        plan.contoning_polygonize_high_resolution_enabled;
-    const float min_pitch = high_resolution ? 0.125f : 0.25f;
-    if (high_resolution)
-        pitch = std::max(min_pitch, pitch * 0.5f);
+    const int polygonize_resolution = plan.contoning_polygonize_color_regions_enabled ?
+        TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(plan.contoning_polygonize_resolution) :
+        1;
+    const float min_pitch = 0.25f / float(polygonize_resolution);
+    if (polygonize_resolution > 1)
+        pitch = std::max(min_pitch, pitch / float(polygonize_resolution));
     const double width_mm = unscale<double>(bbox.max.x() - bbox.min.x());
     const double height_mm = unscale<double>(bbox.max.y() - bbox.min.y());
-    const double max_samples = high_resolution ? 2600000.0 : 650000.0;
+    const double max_samples = 650000.0 * double(polygonize_resolution) * double(polygonize_resolution);
     if (width_mm > 0.0 && height_mm > 0.0) {
         const double estimated = std::ceil(width_mm / double(pitch)) * std::ceil(height_mm / double(pitch));
         if (estimated > max_samples)
@@ -2103,8 +1980,6 @@ static std::optional<TopSurfaceImageContoningSolvedLabel> top_surface_image_cont
         top_surface_image_contoning_stack_rgb(stack.bottom_to_top, print_config);
     if (!stack_rgb)
         return std::nullopt;
-    top_surface_image_contoning_sort_stack_for_top_color(stack.bottom_to_top, *stack_rgb, print_config);
-    top_surface_image_contoning_spread_stack_repeats(stack.bottom_to_top);
     auto label_it = label_by_stack.find(stack.bottom_to_top);
     int label = -1;
     if (label_it == label_by_stack.end()) {
@@ -2592,9 +2467,9 @@ static TopSurfaceImageContoningStackPlanKey top_surface_image_contoning_stack_pl
     key.supersampled = plan.contoning_supersampled_cells_enabled;
     key.blue_noise = use_blue_noise_error_diffusion;
     key.polygonize = plan.contoning_polygonize_color_regions_enabled;
-    key.polygonize_high_resolution =
-        plan.contoning_polygonize_color_regions_enabled &&
-        plan.contoning_polygonize_high_resolution_enabled;
+    key.polygonize_resolution = plan.contoning_polygonize_color_regions_enabled ?
+        TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(plan.contoning_polygonize_resolution) :
+        1;
     return key;
 }
 
@@ -3243,8 +3118,8 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
         plan.contoning_blue_noise_error_diffusion_enabled = zone->top_surface_contoning_blue_noise_error_diffusion_enabled;
         plan.contoning_supersampled_cells_enabled = zone->top_surface_contoning_supersampled_cells_enabled;
         plan.contoning_polygonize_color_regions_enabled = zone->top_surface_contoning_polygonize_color_regions_enabled;
-        plan.contoning_polygonize_high_resolution_enabled =
-            zone->top_surface_contoning_polygonize_high_resolution_enabled;
+        plan.contoning_polygonize_resolution =
+            TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(zone->top_surface_contoning_polygonize_resolution);
         plan.contoning_surface_anchored_stacks_enabled =
             zone->effective_top_surface_contoning_surface_anchored_stacks_enabled();
         const TextureMappingContoningSolver contoning_solver(*zone, print_config, components);

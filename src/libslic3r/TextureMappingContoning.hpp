@@ -42,11 +42,14 @@ private:
     };
 
     const std::vector<Candidate>& candidates_for_depth(int stack_layers) const;
+    void arrange_stack_for_light_path(std::vector<unsigned int> &bottom_to_top,
+                                      const std::array<float, 3> &target_rgb) const;
 
     std::vector<unsigned int> m_component_ids;
     std::vector<unsigned int> m_components_bottom_to_top;
     std::vector<std::array<float, 3>> m_component_colors;
     std::vector<float> m_component_luminance;
+    std::vector<float> m_effective_transmission_distances_mm;
     mutable std::map<int, std::vector<Candidate>> m_candidates_by_depth;
 };
 

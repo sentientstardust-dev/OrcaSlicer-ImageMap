@@ -1145,7 +1145,8 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            top_surface_contoning_blue_noise_error_diffusion_enabled == rhs.top_surface_contoning_blue_noise_error_diffusion_enabled &&
            top_surface_contoning_supersampled_cells_enabled == rhs.top_surface_contoning_supersampled_cells_enabled &&
            top_surface_contoning_polygonize_color_regions_enabled == rhs.top_surface_contoning_polygonize_color_regions_enabled &&
-           top_surface_contoning_polygonize_high_resolution_enabled == rhs.top_surface_contoning_polygonize_high_resolution_enabled &&
+           TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(top_surface_contoning_polygonize_resolution) ==
+               TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(rhs.top_surface_contoning_polygonize_resolution) &&
            effective_top_surface_contoning_surface_anchored_stacks_enabled() == rhs.effective_top_surface_contoning_surface_anchored_stacks_enabled() &&
            compact_offset_mode == rhs.compact_offset_mode &&
            use_legacy_fixed_color_mode == rhs.use_legacy_fixed_color_mode &&
@@ -1543,8 +1544,8 @@ std::string TextureMappingManager::serialize_entries()
             zone.top_surface_contoning_supersampled_cells_enabled;
         texture["top_surface_contoning_polygonize_color_regions_enabled"] =
             zone.top_surface_contoning_polygonize_color_regions_enabled;
-        texture["top_surface_contoning_polygonize_high_resolution_enabled"] =
-            zone.top_surface_contoning_polygonize_high_resolution_enabled;
+        texture["top_surface_contoning_polygonize_resolution"] =
+            TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(zone.top_surface_contoning_polygonize_resolution);
         texture["top_surface_contoning_surface_anchored_stacks_enabled"] =
             zone.effective_top_surface_contoning_surface_anchored_stacks_enabled();
         texture["compact_offset_mode"] = zone.compact_offset_mode;
@@ -1834,9 +1835,12 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.top_surface_contoning_polygonize_color_regions_enabled =
             texture.value("top_surface_contoning_polygonize_color_regions_enabled",
                           TextureMappingZone::DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled);
-        zone.top_surface_contoning_polygonize_high_resolution_enabled =
-            texture.value("top_surface_contoning_polygonize_high_resolution_enabled",
-                          TextureMappingZone::DefaultTopSurfaceContoningPolygonizeHighResolutionEnabled);
+        auto polygonize_resolution_it = texture.find("top_surface_contoning_polygonize_resolution");
+        zone.top_surface_contoning_polygonize_resolution =
+            TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(
+                polygonize_resolution_it != texture.end() && polygonize_resolution_it->is_number_integer() ?
+                    polygonize_resolution_it->get<int>() :
+                    TextureMappingZone::DefaultTopSurfaceContoningPolygonizeResolution);
         zone.top_surface_contoning_surface_anchored_stacks_enabled =
             texture.value("top_surface_contoning_surface_anchored_stacks_enabled",
                           TextureMappingZone::DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled);

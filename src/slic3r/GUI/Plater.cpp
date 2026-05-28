@@ -1982,7 +1982,7 @@ public:
                                         bool top_surface_contoning_blue_noise_error_diffusion_enabled,
                                         bool top_surface_contoning_supersampled_cells_enabled,
                                         bool top_surface_contoning_polygonize_color_regions_enabled,
-                                        bool top_surface_contoning_polygonize_high_resolution_enabled,
+                                        int top_surface_contoning_polygonize_resolution,
                                         bool top_surface_contoning_surface_anchored_stacks_enabled,
                                         const TextureMappingManager &texture_mapping_zones,
                                         const TextureMappingGlobalSettings &global_settings,
@@ -2769,12 +2769,23 @@ public:
                                        0,
                                        wxEXPAND | wxTOP | wxBOTTOM,
                                        gap / 2);
-        m_top_surface_contoning_polygonize_high_resolution_checkbox =
-            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("High-resolution polygon tracing"));
-        m_top_surface_contoning_polygonize_high_resolution_checkbox->SetValue(top_surface_contoning_polygonize_high_resolution_enabled);
-        m_top_surface_contoning_polygonize_high_resolution_checkbox->SetMinSize(
-            wxSize(-1, std::max(m_top_surface_contoning_polygonize_high_resolution_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
-        contoning_checkboxes_root->Add(m_top_surface_contoning_polygonize_high_resolution_checkbox,
+        m_top_surface_contoning_polygonize_resolution_panel = new wxPanel(m_top_surface_contoning_checkboxes_panel, wxID_ANY);
+        auto *contoning_polygonize_resolution_row = new wxBoxSizer(wxHORIZONTAL);
+        m_top_surface_contoning_polygonize_resolution_panel->SetSizer(contoning_polygonize_resolution_row);
+        contoning_polygonize_resolution_row->Add(new wxStaticText(m_top_surface_contoning_polygonize_resolution_panel, wxID_ANY, _L("Polygon tracing resolution")),
+                                                 0,
+                                                 wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                                                 gap);
+        wxArrayString contoning_polygonize_resolution_choices;
+        contoning_polygonize_resolution_choices.Add(_L("1x"));
+        contoning_polygonize_resolution_choices.Add(_L("2x"));
+        contoning_polygonize_resolution_choices.Add(_L("4x (slow)"));
+        m_top_surface_contoning_polygonize_resolution_choice =
+            new wxChoice(m_top_surface_contoning_polygonize_resolution_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, contoning_polygonize_resolution_choices);
+        const int polygonize_resolution = TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(top_surface_contoning_polygonize_resolution);
+        m_top_surface_contoning_polygonize_resolution_choice->SetSelection(polygonize_resolution == 1 ? 0 : (polygonize_resolution == 4 ? 2 : 1));
+        contoning_polygonize_resolution_row->Add(m_top_surface_contoning_polygonize_resolution_choice, 1, wxEXPAND);
+        contoning_checkboxes_root->Add(m_top_surface_contoning_polygonize_resolution_panel,
                                        0,
                                        wxEXPAND | wxTOP | wxBOTTOM,
                                        gap / 2);
@@ -3239,11 +3250,12 @@ public:
         return m_top_surface_contoning_polygonize_color_regions_checkbox != nullptr &&
                m_top_surface_contoning_polygonize_color_regions_checkbox->GetValue();
     }
-    bool top_surface_contoning_polygonize_high_resolution_enabled() const
+    int top_surface_contoning_polygonize_resolution() const
     {
-        return m_top_surface_contoning_polygonize_high_resolution_checkbox == nullptr ?
-            TextureMappingZone::DefaultTopSurfaceContoningPolygonizeHighResolutionEnabled :
-            m_top_surface_contoning_polygonize_high_resolution_checkbox->GetValue();
+        if (m_top_surface_contoning_polygonize_resolution_choice == nullptr)
+            return TextureMappingZone::DefaultTopSurfaceContoningPolygonizeResolution;
+        const int selection = m_top_surface_contoning_polygonize_resolution_choice->GetSelection();
+        return selection == 0 ? 1 : (selection == 2 ? 4 : 2);
     }
     bool top_surface_contoning_surface_anchored_stacks_enabled() const
     {
@@ -3757,10 +3769,10 @@ private:
             contoning &&
             m_top_surface_contoning_polygonize_color_regions_checkbox != nullptr &&
             m_top_surface_contoning_polygonize_color_regions_checkbox->GetValue();
-        if (m_top_surface_contoning_polygonize_high_resolution_checkbox != nullptr) {
-            m_top_surface_contoning_polygonize_high_resolution_checkbox->Show(polygonize_color_regions);
-            m_top_surface_contoning_polygonize_high_resolution_checkbox->Enable(polygonize_color_regions);
-        }
+        if (m_top_surface_contoning_polygonize_resolution_panel != nullptr)
+            m_top_surface_contoning_polygonize_resolution_panel->Show(polygonize_color_regions);
+        if (m_top_surface_contoning_polygonize_resolution_choice != nullptr)
+            m_top_surface_contoning_polygonize_resolution_choice->Enable(polygonize_color_regions);
         if (m_top_surface_contoning_surface_anchored_stacks_checkbox != nullptr) {
             m_top_surface_contoning_surface_anchored_stacks_checkbox->Show(contoning);
             m_top_surface_contoning_surface_anchored_stacks_checkbox->Enable(contoning);
@@ -3839,7 +3851,8 @@ private:
     wxCheckBox *m_top_surface_contoning_blue_noise_error_diffusion_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_supersampled_cells_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_polygonize_color_regions_checkbox {nullptr};
-    wxCheckBox *m_top_surface_contoning_polygonize_high_resolution_checkbox {nullptr};
+    wxPanel *m_top_surface_contoning_polygonize_resolution_panel {nullptr};
+    wxChoice *m_top_surface_contoning_polygonize_resolution_choice {nullptr};
     wxCheckBox *m_top_surface_contoning_surface_anchored_stacks_checkbox {nullptr};
     wxCheckBox *m_use_legacy_fixed_color_mode_checkbox {nullptr};
     wxCheckBox *m_minimum_visibility_offset_checkbox {nullptr};
@@ -8863,7 +8876,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.top_surface_contoning_blue_noise_error_diffusion_enabled,
                                                     updated.top_surface_contoning_supersampled_cells_enabled,
                                                     updated.top_surface_contoning_polygonize_color_regions_enabled,
-                                                    updated.top_surface_contoning_polygonize_high_resolution_enabled,
+                                                    updated.top_surface_contoning_polygonize_resolution,
                                                     updated.top_surface_contoning_surface_anchored_stacks_enabled,
                                                     bundle->texture_mapping_zones,
                                                     bundle->texture_mapping_global_settings,
@@ -8936,8 +8949,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 dlg.top_surface_contoning_supersampled_cells_enabled();
             updated.top_surface_contoning_polygonize_color_regions_enabled =
                 dlg.top_surface_contoning_polygonize_color_regions_enabled();
-            updated.top_surface_contoning_polygonize_high_resolution_enabled =
-                dlg.top_surface_contoning_polygonize_high_resolution_enabled();
+            updated.top_surface_contoning_polygonize_resolution =
+                dlg.top_surface_contoning_polygonize_resolution();
             updated.top_surface_contoning_surface_anchored_stacks_enabled =
                 dlg.top_surface_contoning_surface_anchored_stacks_enabled();
             if (updated.top_surface_image_printing_enabled &&
