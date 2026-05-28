@@ -235,9 +235,13 @@ OrcaSlicer-ImageMap is a fork of OrcaSlicer made by sentientstardust, to add ima
 The OrcaSlicer logo was designed by community member Justin Levine (@freejstnalxndr).
 
 ## Acknowledgements
-Use of filament overhang to create the appearance of continuous imagery based on [Kuipers, et. al 2018](https://arxiv.org/pdf/1805.01375)
+Use of filament overhang to create the appearance of continuous side-surface imagery based on [Kuipers, et. al 2018](https://arxiv.org/pdf/1805.01375)
 
-Thanks to neotko for giving me some helpful suggestions on overhang implementation when I was working on  2D gradient functionality
+Top surface color blending inspired by [V. Babaei et. al, 2017](https://cdfg.mit.edu/assets/files/Color3DP_compressed.pdf)
+
+Thanks to neotko for suggesting I experiment with variable line width
+
+Thanks to everyone who has beta tested and given feedback
 
 # License
 - **OrcaSlicer-ImageMap** is licensed under the GNU Affero General Public License, version 3. OrcaSlicer-ImageMap is forked from OrcaSlicer.
@@ -246,3 +250,4 @@ Thanks to neotko for giving me some helpful suggestions on overhang implementati
 - OrcaSlicer includes a **pressure advance calibration pattern test** adapted from Andrew Ellis' generator, which is licensed under GNU General Public License, version 3. Ellis' generator is itself adapted from a generator developed by Sineos for Marlin, which is licensed under GNU General Public License, version 3.
 - The **Bambu networking plugin** is based on non-free libraries from BambuLab. It is optional to the OrcaSlicer and provides extended functionalities for Bambulab printer users.
 - This repository uses Pigment Painter in order to predict how filament colors will mix. Pigment Painter is licensed under the GNU General Public License, version 3.
+- ColorSolver is used for fast RGB -> filament ratio conversion. ColorSolver is licensed under the GNU Affero General Public License, version 3
