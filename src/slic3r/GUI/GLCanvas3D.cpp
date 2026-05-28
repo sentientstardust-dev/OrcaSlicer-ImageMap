@@ -2411,6 +2411,8 @@ void GLCanvas3D::mirror_selection(Axis axis)
 // 3) SLA support meshes for their respective ModelObjects / ModelInstances
 // 4) Wipe tower preview
 // 5) Out of bed collision status & message overlay (texture)
+static bool should_persist_wipe_tower_position_for_plate(int plate_id, bool user_initiated);
+
 void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_refresh)
 {
     if (m_canvas == nullptr || m_config == nullptr || m_model == nullptr)
@@ -2852,6 +2854,7 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
 
                 const Print* print = m_process->fff_print();
                 const Print* current_print = part_plate->fff_print();
+                const bool persist_wipe_tower_position = should_persist_wipe_tower_position_for_plate(plate_id, false);
                 const size_t texture_mapping_filaments_count =
                     part_plate->estimate_wipe_tower_filaments_count(&wxGetApp().preset_bundle->project_config);
                 const size_t wipe_tower_filaments_count = need_wipe_tower ?
@@ -2899,13 +2902,19 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
                     x = clamp_wipe_tower_axis(x, plate_bbox_x_min_local_coord, plate_bbox_x_max_local_coord, wipe_tower_size(0), margin);
                     y = clamp_wipe_tower_axis(y, plate_bbox_y_min_local_coord, plate_bbox_y_max_local_coord, wipe_tower_size(1), margin);
 
-                    if (std::abs(x - old_x) > EPSILON) {
+                    if (persist_wipe_tower_position && std::abs(x - old_x) > EPSILON) {
                         ConfigOptionFloat x_opt(x);
                         dynamic_cast<ConfigOptionFloats*>(proj_cfg.option("wipe_tower_x"))->set_at(&x_opt, plate_id, 0);
                     }
-                    if (std::abs(y - old_y) > EPSILON) {
+                    if (persist_wipe_tower_position && std::abs(y - old_y) > EPSILON) {
                         ConfigOptionFloat y_opt(y);
                         dynamic_cast<ConfigOptionFloats*>(proj_cfg.option("wipe_tower_y"))->set_at(&y_opt, plate_id, 0);
+                    }
+                    if (!persist_wipe_tower_position &&
+                        (std::abs(x - old_x) > EPSILON || std::abs(y - old_y) > EPSILON)) {
+                        BOOST_LOG_TRIVIAL(info) << "reload_scene: skipped persisting clamped wipe tower position during or after slice, plate=" << plate_id
+                                                << ", old_x=" << old_x << ", new_x=" << x
+                                                << ", old_y=" << old_y << ", new_y=" << y;
                     }
 
                     if (!current_print->is_step_done(psWipeTower) || !current_print->wipe_tower_data().wipe_tower_mesh_data) {
@@ -4899,6 +4908,25 @@ void GLCanvas3D::set_tooltip(const std::string& tooltip)
         m_tooltip.set_text(tooltip);
 }
 
+static bool should_persist_wipe_tower_position_for_plate(int plate_id, bool user_initiated)
+{
+    if (user_initiated)
+        return true;
+
+    Plater *plater = wxGetApp().plater();
+    if (plater == nullptr)
+        return true;
+    if (plater->is_background_process_slicing())
+        return false;
+
+    PartPlate *plate = plater->get_partplate_list().get_plate(plate_id);
+    if (plate == nullptr)
+        return true;
+
+    Print *print = plate->fff_print();
+    return !plate->is_slice_result_valid() || print == nullptr || !print->finished();
+}
+
 void GLCanvas3D::do_move(const std::string& snapshot_type)
 {
     if (m_model == nullptr)
@@ -5006,8 +5034,16 @@ void GLCanvas3D::do_move(const std::string& snapshot_type)
 
         ConfigOptionFloats* wipe_tower_x_opt = proj_cfg.option<ConfigOptionFloats>("wipe_tower_x", true);
         ConfigOptionFloats* wipe_tower_y_opt = proj_cfg.option<ConfigOptionFloats>("wipe_tower_y", true);
-        wipe_tower_x_opt->set_at(&wipe_tower_x, plate_id, 0);
-        wipe_tower_y_opt->set_at(&wipe_tower_y, plate_id, 0);
+        const float old_x = wipe_tower_x_opt->get_at(plate_id);
+        const float old_y = wipe_tower_y_opt->get_at(plate_id);
+        if (should_persist_wipe_tower_position_for_plate(plate_id, !snapshot_type.empty())) {
+            wipe_tower_x_opt->set_at(&wipe_tower_x, plate_id, 0);
+            wipe_tower_y_opt->set_at(&wipe_tower_y, plate_id, 0);
+        } else if (std::abs(old_x - wipe_tower_x.value) > EPSILON || std::abs(old_y - wipe_tower_y.value) > EPSILON) {
+            BOOST_LOG_TRIVIAL(info) << "do_move: skipped persisting wipe tower position during or after slice, plate=" << plate_id
+                                    << ", old_x=" << old_x << ", new_x=" << wipe_tower_x.value
+                                    << ", old_y=" << old_y << ", new_y=" << wipe_tower_y.value;
+        }
     }
 
     reset_sequential_print_clearance();

@@ -2778,7 +2778,7 @@ void LayerRegion::slices_to_fill_surfaces_clipped()
     }
 }
 
-void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRegionPtrs &compatible_regions, SurfaceCollection* fill_surfaces, ExPolygons* fill_no_overlap)
+void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRegionPtrs &compatible_regions, SurfaceCollection* fill_surfaces, ExPolygons* fill_no_overlap, const ExPolygons *contoning_one_wall_shell_infill)
 {
     this->perimeters.clear();
     this->thin_fills.clear();
@@ -2931,6 +2931,7 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
             g.ext_perimeter_flow = texture_external_flow(*texture_external_width_mm);
         g.overhang_flow         = this->bridging_flow(frPerimeter, object_config.thick_bridges);
         g.solid_infill_flow     = this->flow(frSolidInfill);
+        g.contoning_one_wall_shell_infill = contoning_one_wall_shell_infill;
 
         if (this->layer()->object()->config().wall_generator.value == PerimeterGeneratorType::Arachne && !spiral_mode &&
             !force_classic_wall_generator)

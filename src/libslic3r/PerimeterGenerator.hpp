@@ -77,6 +77,7 @@ public:
     const PrintRegionConfig     *config;
     const PrintObjectConfig     *object_config;
     const PrintConfig           *print_config;
+    const ExPolygons            *contoning_one_wall_shell_infill;
     // Outputs:
     ExtrusionEntityCollection   *loops;
     ExtrusionEntityCollection   *gap_fill;
@@ -117,7 +118,7 @@ public:
         : slices(slices), compatible_regions(compatible_regions), upper_slices(nullptr), lower_slices(nullptr), layer_height(layer_height),
             slice_z(slice_z), layer_id(-1), perimeter_flow(flow), ext_perimeter_flow(flow),
             overhang_flow(flow), solid_infill_flow(flow),
-            config(config), object_config(object_config), print_config(print_config),
+            config(config), object_config(object_config), print_config(print_config), contoning_one_wall_shell_infill(nullptr),
             m_spiral_vase(spiral_mode),
             m_scaled_resolution(scaled<double>(print_config->resolution.value > EPSILON ? print_config->resolution.value : EPSILON)),
             loops(loops), gap_fill(gap_fill), fill_surfaces(fill_surfaces), fill_no_overlap(fill_no_overlap),
@@ -139,6 +140,7 @@ public:
 private:
     std::vector<Polygons>     generate_lower_polygons_series(float width);
     void split_top_surfaces(const ExPolygons &orig_polygons, ExPolygons &top_fills, ExPolygons &non_top_polygons, ExPolygons &fill_clip) const;
+    void split_one_wall_shell_infill_surfaces(const ExPolygons &orig_polygons, ExPolygons &one_wall_fills, ExPolygons &multi_wall_polygons, ExPolygons &fill_clip) const;
     void apply_extra_perimeters(ExPolygons& infill_area);
     void process_no_bridge(Surfaces& all_surfaces, coord_t perimeter_spacing, coord_t ext_perimeter_width);
 

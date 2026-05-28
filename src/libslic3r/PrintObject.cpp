@@ -28,10 +28,12 @@
 #include <cmath>
 #include <float.h>
 #include <functional>
+#include <map>
 #include <oneapi/tbb/blocked_range.h>
 #include <oneapi/tbb/concurrent_vector.h>
 #include <oneapi/tbb/parallel_for.h>
 #include <string_view>
+#include <tuple>
 #include <utility>
 
 #include <boost/log/trivial.hpp>
@@ -489,6 +491,142 @@ std::vector<std::set<int>> PrintObject::detect_extruder_geometric_unprintables()
     return geometric_unprintables;
 }
 
+static const TextureMappingZone* contoning_one_wall_shell_infill_zone(const Print &print, const PrintRegionConfig &config)
+{
+    const int raw_zone_id = config.solid_infill_filament.value;
+    if (raw_zone_id <= 0)
+        return nullptr;
+    const TextureMappingZone *zone = print.texture_mapping_manager().zone_from_id(unsigned(raw_zone_id));
+    if (zone == nullptr || !zone->enabled || zone->deleted ||
+        !zone->top_surface_contoning_active() ||
+        !zone->top_surface_contoning_only_one_perimeter_around_shell_infill ||
+        zone->effective_top_surface_contoning_replace_top_perimeters_with_infill())
+        return nullptr;
+    return zone;
+}
+
+static ExPolygons contoning_one_wall_visible_surface_mask(const Layer &layer,
+                                                          unsigned int zone_id,
+                                                          bool top_surface)
+{
+    ExPolygons area;
+    for (const LayerRegion *layerm : layer.regions()) {
+        if (layerm == nullptr ||
+            unsigned(std::max(0, layerm->region().config().solid_infill_filament.value)) != zone_id)
+            continue;
+        append(area, to_expolygons(layerm->slices.surfaces));
+    }
+    if (area.empty())
+        return {};
+    area = union_ex(area);
+    const Layer *cover_layer = top_surface ? layer.upper_layer : layer.lower_layer;
+    if (cover_layer != nullptr && !cover_layer->lslices.empty())
+        area = diff_ex(area, cover_layer->lslices, ApplySafetyOffset::Yes);
+    return area.empty() ? ExPolygons() : union_ex(area);
+}
+
+static bool contoning_one_wall_depth_within_shell(const Layer             &target_layer,
+                                                  const Layer             &source_layer,
+                                                  const PrintRegionConfig &region_config,
+                                                  bool                     top_surface,
+                                                  int                      depth)
+{
+    if (depth < 0)
+        return false;
+    if (top_surface) {
+        const int shell_layers = region_config.top_shell_layers.value;
+        if (shell_layers <= 0)
+            return false;
+        if (depth < shell_layers)
+            return true;
+        const double shell_thickness = region_config.top_shell_thickness.value;
+        return shell_thickness > EPSILON &&
+               source_layer.print_z - target_layer.print_z < shell_thickness - EPSILON;
+    }
+    const int shell_layers = region_config.bottom_shell_layers.value;
+    if (shell_layers <= 0)
+        return false;
+    if (depth < shell_layers)
+        return true;
+    const double shell_thickness = region_config.bottom_shell_thickness.value;
+    return shell_thickness > EPSILON &&
+           target_layer.bottom_z() - source_layer.bottom_z() < shell_thickness - EPSILON;
+}
+
+void PrintObject::prepare_contoning_one_wall_shell_infill_masks()
+{
+    for (Layer *layer : m_layers)
+        for (LayerRegion *layerm : layer->m_regions)
+            layerm->contoning_one_wall_shell_infill_expolygons.clear();
+
+    const Print *print = this->print();
+    if (print == nullptr)
+        return;
+
+    std::map<std::tuple<size_t, unsigned int, bool>, ExPolygons> visible_surface_cache;
+    for (size_t target_layer_idx = 0; target_layer_idx < m_layers.size(); ++target_layer_idx) {
+        Layer *target_layer = m_layers[target_layer_idx];
+        if (target_layer == nullptr)
+            continue;
+        for (size_t region_id = 0; region_id < target_layer->m_regions.size(); ++region_id) {
+            LayerRegion *target_layerm = target_layer->m_regions[region_id];
+            if (target_layerm == nullptr || target_layerm->slices.empty())
+                continue;
+            const PrintRegionConfig &region_config = target_layerm->region().config();
+            const TextureMappingZone *zone = contoning_one_wall_shell_infill_zone(*print, region_config);
+            if (zone == nullptr)
+                continue;
+            const unsigned int zone_id = unsigned(region_config.solid_infill_filament.value);
+            const int stack_layers =
+                std::clamp(zone->top_surface_contoning_stack_layers,
+                           TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                           TextureMappingZone::MaxTopSurfaceContoningStackLayers);
+            const ExPolygons target_area = to_expolygons(target_layerm->slices.surfaces);
+            if (target_area.empty())
+                continue;
+
+            auto append_source_surface = [&](bool top_surface) {
+                if (!top_surface && !zone->top_surface_contoning_color_lower_surfaces)
+                    return;
+                for (int depth = 0; depth < stack_layers; ++depth) {
+                    const int source_layer_idx = top_surface ?
+                        int(target_layer_idx) + depth :
+                        int(target_layer_idx) - depth;
+                    if (source_layer_idx < 0 || source_layer_idx >= int(m_layers.size()))
+                        break;
+                    const Layer *source_layer = m_layers[size_t(source_layer_idx)];
+                    if (source_layer == nullptr ||
+                        !contoning_one_wall_depth_within_shell(*target_layer,
+                                                               *source_layer,
+                                                               region_config,
+                                                               top_surface,
+                                                               depth))
+                        break;
+                    const auto cache_key = std::make_tuple(size_t(source_layer_idx), zone_id, top_surface);
+                    auto cache_it = visible_surface_cache.find(cache_key);
+                    if (cache_it == visible_surface_cache.end()) {
+                        cache_it = visible_surface_cache.emplace(
+                            cache_key,
+                            contoning_one_wall_visible_surface_mask(*source_layer, zone_id, top_surface)).first;
+                    }
+                    if (cache_it->second.empty())
+                        continue;
+                    ExPolygons contribution =
+                        intersection_ex(target_area, cache_it->second, ApplySafetyOffset::Yes);
+                    if (!contribution.empty())
+                        append(target_layerm->contoning_one_wall_shell_infill_expolygons, std::move(contribution));
+                }
+            };
+
+            append_source_surface(true);
+            append_source_surface(false);
+            if (!target_layerm->contoning_one_wall_shell_infill_expolygons.empty())
+                target_layerm->contoning_one_wall_shell_infill_expolygons =
+                    union_ex(target_layerm->contoning_one_wall_shell_infill_expolygons);
+        }
+    }
+}
+
 // 1) Merges typed region slices into stInternal type.
 // 2) Increases an "extra perimeters" counter at region slices where needed.
 // 3) Generates perimeters, gap fills and fill regions (fill regions of type stInternal).
@@ -571,6 +709,9 @@ void PrintObject::make_perimeters()
                                            prepared_wall_layers,
                                            total_wall_layers));
     }
+
+    this->prepare_contoning_one_wall_shell_infill_masks();
+    m_print->throw_if_canceled();
 
     // compare each layer to the one below, and mark those slices needing
     // one additional inner perimeter, like the top of domed objects-

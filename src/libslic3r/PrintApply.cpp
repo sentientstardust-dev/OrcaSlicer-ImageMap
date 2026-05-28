@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cfloat>
+#include <cmath>
 
 namespace Slic3r {
 
@@ -334,6 +335,15 @@ static bool texture_mapping_global_settings_equal_for_gcode(const ConfigOption *
            lhs_json == rhs_json;
 }
 
+static void log_apply_diff_keys(const char *label, const t_config_option_keys &keys)
+{
+    const size_t max_keys = 32;
+    for (size_t i = 0; i < keys.size() && i < max_keys; ++i)
+        BOOST_LOG_TRIVIAL(info) << "Print::apply " << label << "[" << i << "]=" << keys[i];
+    if (keys.size() > max_keys)
+        BOOST_LOG_TRIVIAL(info) << "Print::apply " << label << " remaining=" << (keys.size() - max_keys);
+}
+
 static void remove_texture_mapping_preview_only_diff(t_config_option_keys     &diff,
                                                      const ConfigBase         &current_config,
                                                      const DynamicPrintConfig &new_full_config)
@@ -348,6 +358,39 @@ static void remove_texture_mapping_preview_only_diff(t_config_option_keys     &d
         texture_mapping_global_settings_equal_for_gcode(current_config.option("texture_mapping_global_settings"),
                                                        new_full_config.option("texture_mapping_global_settings")))
         diff.erase(it);
+}
+
+static bool is_wipe_tower_position_key(const t_config_option_key &opt_key)
+{
+    return opt_key == "wipe_tower_x" || opt_key == "wipe_tower_y";
+}
+
+static bool wipe_tower_position_differs_for_plate(const t_config_option_key &opt_key,
+                                                  const ConfigOption        *opt_old,
+                                                  const ConfigOption        *opt_new,
+                                                  int                        plate_index)
+{
+    static constexpr double wipe_tower_position_epsilon = 1e-3;
+
+    const ConfigOptionFloats *option_new = dynamic_cast<const ConfigOptionFloats *>(opt_new);
+    const ConfigOptionFloats *option_old = dynamic_cast<const ConfigOptionFloats *>(opt_old);
+    if (option_new == nullptr || option_old == nullptr)
+        return true;
+    if (plate_index < 0)
+        return *opt_new != *opt_old;
+
+    const size_t plate = size_t(plate_index);
+    if (plate < option_new->values.size() && plate < option_old->values.size()) {
+        const double value_new = option_new->values[plate];
+        const double value_old = option_old->values[plate];
+        const bool changed = std::abs(value_old - value_new) > wipe_tower_position_epsilon;
+        if (changed)
+            BOOST_LOG_TRIVIAL(info) << "Print::apply " << opt_key << " changed, plate=" << plate_index
+                                    << ", old=" << value_old << ", new=" << value_new;
+        return changed;
+    }
+
+    return plate < option_new->values.size() || plate < option_old->values.size();
 }
 
 // Collect changes to print config, account for overrides of extruder retract values by filament presets.
@@ -380,17 +423,8 @@ static t_config_option_keys print_config_diffs(
             if (opt_key == "texture_mapping_global_settings" && texture_mapping_global_settings_equal_for_gcode(opt_old, opt_new))
                 continue;
             //BBS: add plate_index logic for wipe_tower_x/wipe_tower_y
-            if (!opt_key.compare("wipe_tower_x") || !opt_key.compare("wipe_tower_y")) {
-                const ConfigOptionFloats* option_new = dynamic_cast<const ConfigOptionFloats*>(opt_new);
-                const ConfigOptionFloats* option_old = dynamic_cast<const ConfigOptionFloats*>(opt_old);
-                if ((plate_index < option_new->values.size())&&(plate_index < option_old->values.size()))
-                {
-                    float value_new = option_new->values[plate_index];
-                    float value_old = option_old->values[plate_index];
-                    if (value_old != value_new)
-                        print_diff.emplace_back(opt_key);
-                }
-                else if ((plate_index < option_new->values.size())||(plate_index < option_old->values.size()))
+            if (is_wipe_tower_position_key(opt_key)) {
+                if (wipe_tower_position_differs_for_plate(opt_key, opt_old, opt_new, plate_index))
                     print_diff.emplace_back(opt_key);
             }
             else
@@ -415,17 +449,8 @@ static t_config_option_keys full_print_config_diffs(const DynamicPrintConfig &cu
             if (opt_key == "texture_mapping_global_settings" && texture_mapping_global_settings_equal_for_gcode(opt_old, opt_new))
                 continue;
             //BBS: add plate_index logic for wipe_tower_x/wipe_tower_y
-            if (opt_old && (!opt_key.compare("wipe_tower_x") || !opt_key.compare("wipe_tower_y"))) {
-                const ConfigOptionFloats* option_new = dynamic_cast<const ConfigOptionFloats*>(opt_new);
-                const ConfigOptionFloats* option_old = dynamic_cast<const ConfigOptionFloats*>(opt_old);
-                if ((plate_index < option_new->values.size())&&(plate_index < option_old->values.size()))
-                {
-                    float value_new = option_new->values[plate_index];
-                    float value_old = option_old->values[plate_index];
-                    if (value_old != value_new)
-                        full_config_diff.emplace_back(opt_key);
-                }
-                else if ((plate_index < option_new->values.size())||(plate_index < option_old->values.size()))
+            if (opt_old && is_wipe_tower_position_key(opt_key)) {
+                if (wipe_tower_position_differs_for_plate(opt_key, opt_old, opt_new, plate_index))
                     full_config_diff.emplace_back(opt_key);
             }
             else
@@ -1473,6 +1498,11 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
         if (print_diff_set.size() != print_diff.size())
             print_diff.assign(print_diff_set.begin(), print_diff_set.end());
     }
+
+    log_apply_diff_keys("print_diff", print_diff);
+    log_apply_diff_keys("full_config_diff", full_config_diff);
+    log_apply_diff_keys("object_diff", object_diff);
+    log_apply_diff_keys("region_diff", region_diff);
 
     // Do not use the ApplyStatus as we will use the max function when updating apply_status.
     unsigned int apply_status = APPLY_STATUS_UNCHANGED;

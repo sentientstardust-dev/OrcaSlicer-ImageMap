@@ -2767,13 +2767,21 @@ bool FillRectilinear::fill_surface_by_lines(const Surface *surface, const FillPa
 
     assert(params.density > 0.0001f && params.density <= 1.f);
     coord_t line_spacing = coord_t(scale_(this->spacing) / params.density);
+    const coordf_t edge_width = std::max<coordf_t>(this->spacing, coordf_t(params.flow.width()));
+    const coordf_t edge_overlap_width = 0.075 * edge_width;
+    const coordf_t outer_clearance = params.no_edge_overlap ?
+        std::max<coordf_t>(0.5 * edge_width - edge_overlap_width, coordf_t(0.0)) :
+        (0.5f - INFILL_OVERLAP_OVER_SPACING) * this->spacing;
+    const coordf_t inner_clearance = params.no_edge_overlap ?
+        outer_clearance + std::max<coordf_t>(coordf_t(0.001), 0.02 * this->spacing) :
+        0.5f * this->spacing;
 
     // On the polygons of poly_with_offset, the infill lines will be connected.
     ExPolygonWithOffset poly_with_offset(
         surface->expolygon, 
         - rotate_vector.first, 
-        float(scale_(this->overlap - (0.5 - INFILL_OVERLAP_OVER_SPACING) * this->spacing)),
-        float(scale_(this->overlap - 0.5f * this->spacing)));
+        float(scale_(this->overlap - outer_clearance)),
+        float(scale_(this->overlap - inner_clearance)));
     if (poly_with_offset.n_contours_inner == 0) {
         // Not a single infill line fits.
         //FIXME maybe one shall trigger the gap fill here?

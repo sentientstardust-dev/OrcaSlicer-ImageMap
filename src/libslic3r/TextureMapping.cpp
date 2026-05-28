@@ -1135,6 +1135,7 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            std::abs(top_surface_contoning_min_feature_mm - rhs.top_surface_contoning_min_feature_mm) <= eps &&
            top_surface_contoning_color_lower_surfaces == rhs.top_surface_contoning_color_lower_surfaces &&
            effective_top_surface_contoning_only_color_surface_infill() == rhs.effective_top_surface_contoning_only_color_surface_infill() &&
+           top_surface_contoning_only_one_perimeter_around_shell_infill == rhs.top_surface_contoning_only_one_perimeter_around_shell_infill &&
            effective_top_surface_contoning_replace_top_perimeters_with_infill() == rhs.effective_top_surface_contoning_replace_top_perimeters_with_infill() &&
            effective_top_surface_contoning_recolor_surrounding_perimeters() == rhs.effective_top_surface_contoning_recolor_surrounding_perimeters() &&
            stored_top_surface_contoning_perimeter_mode() == rhs.stored_top_surface_contoning_perimeter_mode() &&
@@ -1143,6 +1144,7 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            top_surface_contoning_varied_infill_angles_enabled == rhs.top_surface_contoning_varied_infill_angles_enabled &&
            top_surface_contoning_blue_noise_error_diffusion_enabled == rhs.top_surface_contoning_blue_noise_error_diffusion_enabled &&
            top_surface_contoning_supersampled_cells_enabled == rhs.top_surface_contoning_supersampled_cells_enabled &&
+           top_surface_contoning_polygonize_color_regions_enabled == rhs.top_surface_contoning_polygonize_color_regions_enabled &&
            effective_top_surface_contoning_surface_anchored_stacks_enabled() == rhs.effective_top_surface_contoning_surface_anchored_stacks_enabled() &&
            compact_offset_mode == rhs.compact_offset_mode &&
            use_legacy_fixed_color_mode == rhs.use_legacy_fixed_color_mode &&
@@ -1519,6 +1521,8 @@ std::string TextureMappingManager::serialize_entries()
         texture["top_surface_contoning_color_lower_surfaces"] = zone.top_surface_contoning_color_lower_surfaces;
         texture["top_surface_contoning_only_color_surface_infill"] =
             zone.effective_top_surface_contoning_only_color_surface_infill();
+        texture["top_surface_contoning_only_one_perimeter_around_shell_infill"] =
+            zone.top_surface_contoning_only_one_perimeter_around_shell_infill;
         texture["top_surface_contoning_replace_top_perimeters_with_infill"] =
             zone.effective_top_surface_contoning_replace_top_perimeters_with_infill();
         texture["top_surface_contoning_recolor_surrounding_perimeters"] =
@@ -1536,6 +1540,8 @@ std::string TextureMappingManager::serialize_entries()
             zone.top_surface_contoning_blue_noise_error_diffusion_enabled;
         texture["top_surface_contoning_supersampled_cells_enabled"] =
             zone.top_surface_contoning_supersampled_cells_enabled;
+        texture["top_surface_contoning_polygonize_color_regions_enabled"] =
+            zone.top_surface_contoning_polygonize_color_regions_enabled;
         texture["top_surface_contoning_surface_anchored_stacks_enabled"] =
             zone.effective_top_surface_contoning_surface_anchored_stacks_enabled();
         texture["compact_offset_mode"] = zone.compact_offset_mode;
@@ -1787,6 +1793,9 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.top_surface_contoning_only_color_surface_infill =
             texture.value("top_surface_contoning_only_color_surface_infill",
                           TextureMappingZone::DefaultTopSurfaceContoningOnlyColorSurfaceInfill);
+        zone.top_surface_contoning_only_one_perimeter_around_shell_infill =
+            texture.value("top_surface_contoning_only_one_perimeter_around_shell_infill",
+                          TextureMappingZone::DefaultTopSurfaceContoningOnlyOnePerimeterAroundShellInfill);
         zone.top_surface_contoning_replace_top_perimeters_with_infill =
             texture.value("top_surface_contoning_replace_top_perimeters_with_infill",
                           TextureMappingZone::DefaultTopSurfaceContoningReplaceTopPerimetersWithInfill);
@@ -1819,6 +1828,9 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.top_surface_contoning_supersampled_cells_enabled =
             texture.value("top_surface_contoning_supersampled_cells_enabled",
                           TextureMappingZone::DefaultTopSurfaceContoningSupersampledCellsEnabled);
+        zone.top_surface_contoning_polygonize_color_regions_enabled =
+            texture.value("top_surface_contoning_polygonize_color_regions_enabled",
+                          TextureMappingZone::DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled);
         zone.top_surface_contoning_surface_anchored_stacks_enabled =
             texture.value("top_surface_contoning_surface_anchored_stacks_enabled",
                           TextureMappingZone::DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled);

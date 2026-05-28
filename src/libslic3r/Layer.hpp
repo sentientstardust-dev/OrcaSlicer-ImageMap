@@ -65,6 +65,7 @@ public:
     SurfaceCollection           fill_surfaces;
     // BBS: Unspecified fill polygons, used for interecting when we don't want the infill/perimeter overlap
     ExPolygons                  fill_no_overlap_expolygons;
+    ExPolygons                  contoning_one_wall_shell_infill_expolygons;
 
     // collection of expolygons representing the bridged areas (thus not
     // needing support material)
@@ -88,7 +89,7 @@ public:
     void    slices_to_fill_surfaces_clipped();
     void    prepare_fill_surfaces();
     //BBS
-    void    make_perimeters(const SurfaceCollection &slices, const LayerRegionPtrs &compatible_regions, SurfaceCollection* fill_surfaces, ExPolygons* fill_no_overlap);
+    void    make_perimeters(const SurfaceCollection &slices, const LayerRegionPtrs &compatible_regions, SurfaceCollection* fill_surfaces, ExPolygons* fill_no_overlap, const ExPolygons *contoning_one_wall_shell_infill);
     void    process_external_surfaces(const Layer *lower_layer, const Polygons *lower_layer_covered);
     double  infill_area_threshold() const;
     // Trim surfaces by trimming polygons. Used by the elephant foot compensation at the 1st layer.

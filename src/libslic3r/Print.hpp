@@ -518,6 +518,7 @@ private:
     // BBS
     void detect_overhangs_for_lift();
     void clear_overhangs_for_lift();
+    void prepare_contoning_one_wall_shell_infill_masks();
 
    void _transform_hole_to_polyholes();
 

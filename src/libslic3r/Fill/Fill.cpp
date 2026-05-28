@@ -18,6 +18,7 @@
 #include "../ColorSolver.hpp"
 #include "../Geometry.hpp"
 #include "../Layer.hpp"
+#include "../MarchingSquares.hpp"
 #include "../Print.hpp"
 #include "../PrintConfig.hpp"
 #include "../SVG.hpp"
@@ -41,6 +42,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -53,9 +55,38 @@
 #include <system_error>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
+
+struct TopSurfaceImageContoningLabelRaster
+{
+    using ValueType = uint8_t;
+    const std::vector<int> *grid { nullptr };
+    int cols { 0 };
+    int rows { 0 };
+    int label { -1 };
+};
+
+namespace marchsq {
+
+template<> struct _RasterTraits<TopSurfaceImageContoningLabelRaster>
+{
+    using ValueType = TopSurfaceImageContoningLabelRaster::ValueType;
+
+    static ValueType get(const TopSurfaceImageContoningLabelRaster &raster, size_t row, size_t col)
+    {
+        if (raster.grid == nullptr || row >= size_t(raster.rows) || col >= size_t(raster.cols))
+            return ValueType(0);
+        return (*raster.grid)[row * size_t(raster.cols) + col] == raster.label ? ValueType(255) : ValueType(0);
+    }
+
+    static size_t rows(const TopSurfaceImageContoningLabelRaster &raster) { return size_t(std::max(0, raster.rows)); }
+    static size_t cols(const TopSurfaceImageContoningLabelRaster &raster) { return size_t(std::max(0, raster.cols)); }
+};
+
+}
 
 namespace Slic3r {
 
@@ -328,6 +359,7 @@ struct SurfaceFillParams
     int texture_mapping_top_surface_component_index = 0;
     int texture_mapping_top_surface_component_count = 0;
     int texture_mapping_top_surface_contoning_flat_surface_infill_mode = TextureMappingZone::SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode;
+    bool texture_mapping_top_surface_contoning_no_edge_overlap = false;
 
 	bool operator<(const SurfaceFillParams &rhs) const {
 #define RETURN_COMPARE_NON_EQUAL(KEY) if (this->KEY < rhs.KEY) return true; if (this->KEY > rhs.KEY) return false;
@@ -373,6 +405,7 @@ struct SurfaceFillParams
         RETURN_COMPARE_NON_EQUAL(texture_mapping_top_surface_component_index);
         RETURN_COMPARE_NON_EQUAL(texture_mapping_top_surface_component_count);
         RETURN_COMPARE_NON_EQUAL(texture_mapping_top_surface_contoning_flat_surface_infill_mode);
+        RETURN_COMPARE_NON_EQUAL(texture_mapping_top_surface_contoning_no_edge_overlap);
 
 		return false;
 	}
@@ -412,7 +445,8 @@ struct SurfaceFillParams
                 this->texture_mapping_top_surface_contoning == rhs.texture_mapping_top_surface_contoning &&
                 this->texture_mapping_top_surface_component_index == rhs.texture_mapping_top_surface_component_index &&
                 this->texture_mapping_top_surface_component_count == rhs.texture_mapping_top_surface_component_count &&
-                this->texture_mapping_top_surface_contoning_flat_surface_infill_mode == rhs.texture_mapping_top_surface_contoning_flat_surface_infill_mode;
+                this->texture_mapping_top_surface_contoning_flat_surface_infill_mode == rhs.texture_mapping_top_surface_contoning_flat_surface_infill_mode &&
+                this->texture_mapping_top_surface_contoning_no_edge_overlap == rhs.texture_mapping_top_surface_contoning_no_edge_overlap;
 	}
 };
 
@@ -459,6 +493,7 @@ struct TopSurfaceImageRegionPlan {
     int contoning_pattern_filaments = TextureMappingZone::DefaultTopSurfaceContoningPatternFilaments;
     float contoning_min_feature_mm = 2.f;
     float contoning_external_width_mm = 0.4f;
+    bool contoning_only_one_perimeter_around_shell_infill = false;
     bool contoning_replace_top_perimeters_with_infill = false;
     bool contoning_recolor_surrounding_perimeters = false;
     int contoning_perimeter_mode = TextureMappingZone::DefaultTopSurfaceContoningPerimeterMode;
@@ -466,6 +501,7 @@ struct TopSurfaceImageRegionPlan {
     bool contoning_varied_infill_angles_enabled = false;
     bool contoning_blue_noise_error_diffusion_enabled = false;
     bool contoning_supersampled_cells_enabled = false;
+    bool contoning_polygonize_color_regions_enabled = false;
     bool contoning_surface_anchored_stacks_enabled = false;
     int contoning_flat_surface_infill_mode = TextureMappingZone::SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode;
 };
@@ -1127,6 +1163,7 @@ struct TopSurfaceImageContoningStackPlanKey {
     bool recolor_surrounding_perimeters { false };
     bool supersampled { false };
     bool blue_noise { false };
+    bool polygonize { false };
 
     bool operator<(const TopSurfaceImageContoningStackPlanKey &rhs) const
     {
@@ -1151,7 +1188,8 @@ struct TopSurfaceImageContoningStackPlanKey {
                         replace_top_perimeters,
                         recolor_surrounding_perimeters,
                         supersampled,
-                        blue_noise) <
+                        blue_noise,
+                        polygonize) <
                std::tie(rhs.source_layer,
                         rhs.source_layer_id,
                         rhs.target_layer,
@@ -1173,7 +1211,8 @@ struct TopSurfaceImageContoningStackPlanKey {
                         rhs.replace_top_perimeters,
                         rhs.recolor_surrounding_perimeters,
                         rhs.supersampled,
-                        rhs.blue_noise);
+                        rhs.blue_noise,
+                        rhs.polygonize);
     }
 };
 
@@ -1720,6 +1759,51 @@ static ExPolygons top_surface_image_contoning_area_from_grid_label(const std::ve
     return top_surface_image_contoning_clean_area(std::move(cells), clip_area, blocked_area, min_feature_mm, throw_if_canceled);
 }
 
+static ExPolygons top_surface_image_contoning_polygonized_area_from_grid_label(const std::vector<int> &grid,
+                                                                              int                     cols,
+                                                                              int                     rows,
+                                                                              int                     label,
+                                                                              coord_t                 min_x,
+                                                                              coord_t                 min_y,
+                                                                              coord_t                 step,
+                                                                              const BoundingBox      &bbox,
+                                                                              const ExPolygons       &clip_area,
+                                                                              const ExPolygons       &blocked_area,
+                                                                              float                   min_feature_mm,
+                                                                              const ThrowIfCanceled  *throw_if_canceled)
+{
+    if (grid.empty() || cols <= 0 || rows <= 0 || grid.size() != size_t(cols) * size_t(rows))
+        return {};
+
+    const TopSurfaceImageContoningLabelRaster raster{ &grid, cols, rows, label };
+    std::vector<marchsq::Ring> rings =
+        marchsq::execute(raster, TopSurfaceImageContoningLabelRaster::ValueType(128), marchsq::Coord(1, 1));
+    if (rings.empty())
+        return {};
+
+    ExPolygons cells;
+    cells.reserve(rings.size());
+    for (const marchsq::Ring &ring : rings) {
+        check_canceled(throw_if_canceled);
+        if (ring.size() < 3)
+            continue;
+        Polygon polygon;
+        polygon.points.reserve(ring.size());
+        for (const marchsq::Coord &coord : ring) {
+            const coord_t x = std::min<coord_t>(min_x + coord_t(coord.c) * step, bbox.max.x());
+            const coord_t y = std::min<coord_t>(min_y + coord_t(coord.r) * step, bbox.max.y());
+            if (polygon.points.empty() || polygon.points.back() != Point(x, y))
+                polygon.points.emplace_back(x, y);
+        }
+        if (polygon.points.size() >= 3 && polygon.points.front() == polygon.points.back())
+            polygon.points.pop_back();
+        if (polygon.points.size() >= 3)
+            cells.emplace_back(std::move(polygon));
+    }
+
+    return top_surface_image_contoning_clean_area(std::move(cells), clip_area, blocked_area, min_feature_mm, throw_if_canceled);
+}
+
 static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_contoning_component_regions_from_grid(
     const std::vector<int>                                      &label_grid,
     int                                                          cols,
@@ -1732,6 +1816,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
     const BoundingBox                                           &bbox,
     const ExPolygons                                            &area,
     float                                                        min_feature_mm,
+    bool                                                         polygonize_color_regions,
     const ThrowIfCanceled                                       *throw_if_canceled)
 {
     std::vector<TopSurfaceImageContoningVectorRegion> regions;
@@ -1780,18 +1865,31 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
     for (int component_id : component_order) {
         check_canceled(throw_if_canceled);
         ExPolygons component_area =
-            top_surface_image_contoning_area_from_grid_label(component_grid,
-                                                             cols,
-                                                             rows,
-                                                             component_id,
-                                                             min_x,
-                                                             min_y,
-                                                             step,
-                                                             bbox,
-                                                             area,
-                                                             taken,
-                                                             min_feature_mm,
-                                                             throw_if_canceled);
+            polygonize_color_regions ?
+                top_surface_image_contoning_polygonized_area_from_grid_label(component_grid,
+                                                                             cols,
+                                                                             rows,
+                                                                             component_id,
+                                                                             min_x,
+                                                                             min_y,
+                                                                             step,
+                                                                             bbox,
+                                                                             area,
+                                                                             taken,
+                                                                             min_feature_mm,
+                                                                             throw_if_canceled) :
+                top_surface_image_contoning_area_from_grid_label(component_grid,
+                                                                 cols,
+                                                                 rows,
+                                                                 component_id,
+                                                                 min_x,
+                                                                 min_y,
+                                                                 step,
+                                                                 bbox,
+                                                                 area,
+                                                                 taken,
+                                                                 min_feature_mm,
+                                                                 throw_if_canceled);
         if (component_area.empty())
             continue;
         append(taken, component_area);
@@ -2263,6 +2361,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                                   bbox,
                                                                   area,
                                                                   plan.contoning_min_feature_mm,
+                                                                  plan.contoning_polygonize_color_regions_enabled,
                                                                   throw_if_canceled);
 }
 
@@ -2482,6 +2581,7 @@ static TopSurfaceImageContoningStackPlanKey top_surface_image_contoning_stack_pl
     key.recolor_surrounding_perimeters = plan.contoning_recolor_surrounding_perimeters;
     key.supersampled = plan.contoning_supersampled_cells_enabled;
     key.blue_noise = use_blue_noise_error_diffusion;
+    key.polygonize = plan.contoning_polygonize_color_regions_enabled;
     return key;
 }
 
@@ -2561,6 +2661,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                                   stack_plan.bbox,
                                                                   area,
                                                                   plan.contoning_min_feature_mm,
+                                                                  plan.contoning_polygonize_color_regions_enabled,
                                                                   throw_if_canceled);
 }
 
@@ -3111,6 +3212,9 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
             texture_mapping_contoning_min_feature_mm(*zone, print_config, components, plan.contoning_external_width_mm);
         plan.contoning_replace_top_perimeters_with_infill =
             zone->effective_top_surface_contoning_replace_top_perimeters_with_infill();
+        plan.contoning_only_one_perimeter_around_shell_infill =
+            zone->top_surface_contoning_only_one_perimeter_around_shell_infill &&
+            !plan.contoning_replace_top_perimeters_with_infill;
         plan.contoning_recolor_surrounding_perimeters =
             zone->effective_top_surface_contoning_recolor_surrounding_perimeters();
         plan.contoning_perimeter_mode =
@@ -3125,6 +3229,7 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
         plan.contoning_varied_infill_angles_enabled = zone->top_surface_contoning_varied_infill_angles_enabled;
         plan.contoning_blue_noise_error_diffusion_enabled = zone->top_surface_contoning_blue_noise_error_diffusion_enabled;
         plan.contoning_supersampled_cells_enabled = zone->top_surface_contoning_supersampled_cells_enabled;
+        plan.contoning_polygonize_color_regions_enabled = zone->top_surface_contoning_polygonize_color_regions_enabled;
         plan.contoning_surface_anchored_stacks_enabled =
             zone->effective_top_surface_contoning_surface_anchored_stacks_enabled();
         const TextureMappingContoningSolver contoning_solver(*zone, print_config, components);
@@ -4465,6 +4570,8 @@ static SurfaceFillParams top_surface_image_params_for_slice(const Layer &layer,
     params.texture_mapping_top_surface_component_index = int(slice.component_index);
     params.texture_mapping_top_surface_component_count = int(slice.component_count);
     params.texture_mapping_top_surface_contoning_flat_surface_infill_mode = plan.contoning_flat_surface_infill_mode;
+    params.texture_mapping_top_surface_contoning_no_edge_overlap =
+        slice.contoning && plan.contoning_polygonize_color_regions_enabled;
     return params;
 }
 
@@ -5921,8 +6028,16 @@ std::vector<SurfaceFill> group_fills(const Layer &layer,
                                         top_surface_clip_intersection_ex(remaining, plan.slices[same_idx].area, ApplySafetyOffset::Yes);
                                     if (!component_expolygons.empty()) {
                                         append(depth_clip, component_expolygons);
-                                        SurfaceFill &image_fill = surface_fill_for_params(surface_fills, image_params);
-                                        append_surface_fill_expolygons(image_fill, region_id, surface, std::move(component_expolygons), layerm);
+                                        if (plan.slices[same_idx].contoning &&
+                                            plan.contoning_only_one_perimeter_around_shell_infill &&
+                                            !layerm.fill_no_overlap_expolygons.empty())
+                                            component_expolygons = top_surface_clip_intersection_ex(component_expolygons,
+                                                                                                    layerm.fill_no_overlap_expolygons,
+                                                                                                    ApplySafetyOffset::Yes);
+                                        if (!component_expolygons.empty()) {
+                                            SurfaceFill &image_fill = surface_fill_for_params(surface_fills, image_params);
+                                            append_surface_fill_expolygons(image_fill, region_id, surface, std::move(component_expolygons), layerm);
+                                        }
                                     }
                                 }
                                 if (!depth_clip.empty())
@@ -6260,7 +6375,8 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree,
 		params.flow = surface_fill.params.flow;
 		params.extrusion_role = surface_fill.params.extrusion_role;
 		params.using_internal_flow = using_internal_flow;
-		params.no_extrusion_overlap = surface_fill.params.overlap;
+        params.no_extrusion_overlap = surface_fill.params.overlap;
+        params.no_edge_overlap = surface_fill.params.texture_mapping_top_surface_contoning_no_edge_overlap;
         auto &region_config = layerm->region().config();
         params.config               = &region_config;
         params.pattern              = surface_fill.params.pattern;

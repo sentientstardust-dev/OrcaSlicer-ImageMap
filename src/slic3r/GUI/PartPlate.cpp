@@ -1,5 +1,6 @@
 #include <cstddef>
 #include <algorithm>
+#include <cmath>
 #include <numeric>
 #include <vector>
 #include <string>
@@ -4393,6 +4394,8 @@ void PartPlateList::set_default_wipe_tower_pos_for_plate(int plate_idx, bool ini
     ConfigOptionFloats *wipe_tower_y = proj_cfg.opt<ConfigOptionFloats>("wipe_tower_y");
     wipe_tower_x->values.resize(m_plate_list.size(), wipe_tower_x->values.front());
     wipe_tower_y->values.resize(m_plate_list.size(), wipe_tower_y->values.front());
+    const float old_x = wipe_tower_x->get_at(plate_idx);
+    const float old_y = wipe_tower_y->get_at(plate_idx);
 
     auto printer_structure_opt = wxGetApp().preset_bundle->printers.get_edited_preset().config.option<ConfigOptionEnum<PrinterStructure>>("printer_structure");
     // set the default position, the same with print config(left top)
@@ -4459,8 +4462,20 @@ void PartPlateList::set_default_wipe_tower_pos_for_plate(int plate_idx, bool ini
 
     ConfigOptionFloat wt_x_opt(x);
     ConfigOptionFloat wt_y_opt(y);
-    dynamic_cast<ConfigOptionFloats *>(proj_cfg.option("wipe_tower_x"))->set_at(&wt_x_opt, plate_idx, 0);
-    dynamic_cast<ConfigOptionFloats *>(proj_cfg.option("wipe_tower_y"))->set_at(&wt_y_opt, plate_idx, 0);
+    const bool changed = std::abs(old_x - wt_x_opt.value) > EPSILON || std::abs(old_y - wt_y_opt.value) > EPSILON;
+    Print *print = part_plate->fff_print();
+    Plater *plater = wxGetApp().plater();
+    const bool slice_active = plater != nullptr && plater->is_background_process_slicing();
+    const bool completed_slice = part_plate->is_slice_result_valid() && print != nullptr && print->finished();
+    const bool persist = init_pos || (!slice_active && !completed_slice);
+    if (persist) {
+        dynamic_cast<ConfigOptionFloats *>(proj_cfg.option("wipe_tower_x"))->set_at(&wt_x_opt, plate_idx, 0);
+        dynamic_cast<ConfigOptionFloats *>(proj_cfg.option("wipe_tower_y"))->set_at(&wt_y_opt, plate_idx, 0);
+    } else if (changed) {
+        BOOST_LOG_TRIVIAL(info) << "set_default_wipe_tower_pos_for_plate: skipped persisting wipe tower position during or after slice, plate="
+                                << plate_idx << ", old_x=" << old_x << ", new_x=" << wt_x_opt.value
+                                << ", old_y=" << old_y << ", new_y=" << wt_y_opt.value;
+    }
 }
 
 //this may be happened after machine changed

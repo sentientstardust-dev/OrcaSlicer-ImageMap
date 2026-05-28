@@ -191,6 +191,7 @@ struct TextureMappingZone
     static constexpr float DefaultTopSurfaceContoningMinFeatureMm = 0.f;
     static constexpr bool  DefaultTopSurfaceContoningColorLowerSurfaces = true;
     static constexpr bool  DefaultTopSurfaceContoningOnlyColorSurfaceInfill = true;
+    static constexpr bool  DefaultTopSurfaceContoningOnlyOnePerimeterAroundShellInfill = false;
     static constexpr bool  DefaultTopSurfaceContoningReplaceTopPerimetersWithInfill = false;
     static constexpr bool  DefaultTopSurfaceContoningRecolorSurroundingPerimeters = false;
     static constexpr int   DefaultTopSurfaceContoningPerimeterMode = int(ContoningPerimeterDividedLine);
@@ -200,6 +201,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultTopSurfaceContoningVariedInfillAnglesEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningSupersampledCellsEnabled = false;
+    static constexpr bool  DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled = false;
     static constexpr bool  DefaultCompactOffsetMode = true;
     static constexpr bool  DefaultUseLegacyFixedColorMode = false;
@@ -342,6 +344,7 @@ struct TextureMappingZone
     float       top_surface_contoning_min_feature_mm = DefaultTopSurfaceContoningMinFeatureMm;
     bool        top_surface_contoning_color_lower_surfaces = DefaultTopSurfaceContoningColorLowerSurfaces;
     bool        top_surface_contoning_only_color_surface_infill = DefaultTopSurfaceContoningOnlyColorSurfaceInfill;
+    bool        top_surface_contoning_only_one_perimeter_around_shell_infill = DefaultTopSurfaceContoningOnlyOnePerimeterAroundShellInfill;
     bool        top_surface_contoning_replace_top_perimeters_with_infill = DefaultTopSurfaceContoningReplaceTopPerimetersWithInfill;
     bool        top_surface_contoning_recolor_surrounding_perimeters = DefaultTopSurfaceContoningRecolorSurroundingPerimeters;
     int         top_surface_contoning_perimeter_mode = DefaultTopSurfaceContoningPerimeterMode;
@@ -350,6 +353,7 @@ struct TextureMappingZone
     bool        top_surface_contoning_varied_infill_angles_enabled = DefaultTopSurfaceContoningVariedInfillAnglesEnabled;
     bool        top_surface_contoning_blue_noise_error_diffusion_enabled = DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled;
     bool        top_surface_contoning_supersampled_cells_enabled = DefaultTopSurfaceContoningSupersampledCellsEnabled;
+    bool        top_surface_contoning_polygonize_color_regions_enabled = DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled;
     bool        top_surface_contoning_surface_anchored_stacks_enabled = DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled;
     bool        compact_offset_mode = DefaultCompactOffsetMode;
     bool        use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
@@ -530,6 +534,7 @@ struct TextureMappingZone
         top_surface_contoning_min_feature_mm = DefaultTopSurfaceContoningMinFeatureMm;
         top_surface_contoning_color_lower_surfaces = DefaultTopSurfaceContoningColorLowerSurfaces;
         top_surface_contoning_only_color_surface_infill = DefaultTopSurfaceContoningOnlyColorSurfaceInfill;
+        top_surface_contoning_only_one_perimeter_around_shell_infill = DefaultTopSurfaceContoningOnlyOnePerimeterAroundShellInfill;
         top_surface_contoning_replace_top_perimeters_with_infill = DefaultTopSurfaceContoningReplaceTopPerimetersWithInfill;
         top_surface_contoning_recolor_surrounding_perimeters = DefaultTopSurfaceContoningRecolorSurroundingPerimeters;
         top_surface_contoning_perimeter_mode = DefaultTopSurfaceContoningPerimeterMode;
@@ -538,6 +543,7 @@ struct TextureMappingZone
         top_surface_contoning_varied_infill_angles_enabled = DefaultTopSurfaceContoningVariedInfillAnglesEnabled;
         top_surface_contoning_blue_noise_error_diffusion_enabled = DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled;
         top_surface_contoning_supersampled_cells_enabled = DefaultTopSurfaceContoningSupersampledCellsEnabled;
+        top_surface_contoning_polygonize_color_regions_enabled = DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled;
         top_surface_contoning_surface_anchored_stacks_enabled = DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled;
         compact_offset_mode = DefaultCompactOffsetMode;
         use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;

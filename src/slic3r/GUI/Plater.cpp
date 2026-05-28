@@ -791,6 +791,63 @@ static std::string serialize_texture_mapping_manager(TextureMappingManager *mana
     return manager != nullptr ? manager->serialize_entries() : std::string();
 }
 
+static std::string texture_mapping_config_string(const DynamicPrintConfig &project_config,
+                                                 const DynamicPrintConfig *print_config,
+                                                 const std::string        &key)
+{
+    if (project_config.has(key)) {
+        const std::string value = project_config.opt_string(key);
+        if (!value.empty())
+            return value;
+    }
+    if (print_config != nullptr && print_config->has(key))
+        return print_config->opt_string(key);
+    return std::string();
+}
+
+static bool set_texture_mapping_config_string(DynamicPrintConfig &config,
+                                              const std::string  &key,
+                                              const std::string  &value)
+{
+    if (ConfigOptionString *opt = config.option<ConfigOptionString>(key)) {
+        if (opt->value == value)
+            return false;
+        opt->value = value;
+        return true;
+    }
+    if (value.empty())
+        return false;
+    config.set_key_value(key, new ConfigOptionString(value));
+    return true;
+}
+
+static bool canonicalize_texture_mapping_config(PresetBundle &bundle, bool sync_model)
+{
+    DynamicPrintConfig &project_config = bundle.project_config;
+    DynamicPrintConfig &print_config = bundle.prints.get_edited_preset().config;
+    const ConfigOptionStrings *color_opt = project_config.option<ConfigOptionStrings>("filament_colour", false);
+    if (color_opt == nullptr)
+        return false;
+
+    bool changed = false;
+
+    const std::string serialized = texture_mapping_config_string(project_config, &print_config, "texture_mapping_definitions");
+    bundle.texture_mapping_zones.load_entries(serialized, color_opt->values);
+    const std::string canonical = bundle.texture_mapping_zones.serialize_entries();
+    changed |= set_texture_mapping_config_string(project_config, "texture_mapping_definitions", canonical);
+    changed |= set_texture_mapping_config_string(print_config, "texture_mapping_definitions", canonical);
+    if (sync_model)
+        sync_current_model_texture_mapping_definitions(canonical);
+
+    const std::string global_serialized = texture_mapping_config_string(project_config, &print_config, "texture_mapping_global_settings");
+    bundle.texture_mapping_global_settings.load(global_serialized);
+    const std::string global_canonical = bundle.texture_mapping_global_settings.serialize();
+    changed |= set_texture_mapping_config_string(project_config, "texture_mapping_global_settings", global_canonical);
+    changed |= set_texture_mapping_config_string(print_config, "texture_mapping_global_settings", global_canonical);
+
+    return changed;
+}
+
 static unsigned int ensure_texture_mapping_import_target_zone(PresetBundle &bundle, bool &changed)
 {
     DynamicPrintConfig &project_config = bundle.project_config;
@@ -1914,6 +1971,7 @@ public:
                                         int top_surface_contoning_pattern_filaments,
                                         float top_surface_contoning_min_feature_mm,
                                         bool top_surface_contoning_color_lower_surfaces,
+                                        bool top_surface_contoning_only_one_perimeter_around_shell_infill,
                                         bool top_surface_contoning_only_color_surface_infill,
                                         bool top_surface_contoning_replace_top_perimeters_with_infill,
                                         bool top_surface_contoning_recolor_surrounding_perimeters,
@@ -1923,6 +1981,7 @@ public:
                                         bool top_surface_contoning_varied_infill_angles_enabled,
                                         bool top_surface_contoning_blue_noise_error_diffusion_enabled,
                                         bool top_surface_contoning_supersampled_cells_enabled,
+                                        bool top_surface_contoning_polygonize_color_regions_enabled,
                                         bool top_surface_contoning_surface_anchored_stacks_enabled,
                                         const TextureMappingManager &texture_mapping_zones,
                                         const TextureMappingGlobalSettings &global_settings,
@@ -2602,6 +2661,16 @@ public:
                                        0,
                                        wxEXPAND | wxTOP | wxBOTTOM,
                                        gap / 2);
+        m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox =
+            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Only one perimeter around shell infill"));
+        m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox->SetValue(
+            top_surface_contoning_only_one_perimeter_around_shell_infill);
+        m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox->SetMinSize(
+            wxSize(-1, std::max(m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+        contoning_checkboxes_root->Add(m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox,
+                                       0,
+                                       wxEXPAND | wxTOP | wxBOTTOM,
+                                       gap / 2);
         if (TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions) {
             m_top_surface_contoning_only_color_surface_infill_checkbox =
                 new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Only color surface infill"));
@@ -2687,6 +2756,15 @@ public:
         m_top_surface_contoning_supersampled_cells_checkbox->SetMinSize(
             wxSize(-1, std::max(m_top_surface_contoning_supersampled_cells_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
         contoning_checkboxes_root->Add(m_top_surface_contoning_supersampled_cells_checkbox,
+                                       0,
+                                       wxEXPAND | wxTOP | wxBOTTOM,
+                                       gap / 2);
+        m_top_surface_contoning_polygonize_color_regions_checkbox =
+            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Polygonize color regions"));
+        m_top_surface_contoning_polygonize_color_regions_checkbox->SetValue(top_surface_contoning_polygonize_color_regions_enabled);
+        m_top_surface_contoning_polygonize_color_regions_checkbox->SetMinSize(
+            wxSize(-1, std::max(m_top_surface_contoning_polygonize_color_regions_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+        contoning_checkboxes_root->Add(m_top_surface_contoning_polygonize_color_regions_checkbox,
                                        0,
                                        wxEXPAND | wxTOP | wxBOTTOM,
                                        gap / 2);
@@ -3075,6 +3153,11 @@ public:
         return m_top_surface_contoning_color_lower_surfaces_checkbox == nullptr ||
                m_top_surface_contoning_color_lower_surfaces_checkbox->GetValue();
     }
+    bool top_surface_contoning_only_one_perimeter_around_shell_infill() const
+    {
+        return m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox != nullptr &&
+               m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox->GetValue();
+    }
     bool top_surface_contoning_only_color_surface_infill() const
     {
         if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
@@ -3135,6 +3218,11 @@ public:
     {
         return m_top_surface_contoning_supersampled_cells_checkbox != nullptr &&
                m_top_surface_contoning_supersampled_cells_checkbox->GetValue();
+    }
+    bool top_surface_contoning_polygonize_color_regions_enabled() const
+    {
+        return m_top_surface_contoning_polygonize_color_regions_checkbox != nullptr &&
+               m_top_surface_contoning_polygonize_color_regions_checkbox->GetValue();
     }
     bool top_surface_contoning_surface_anchored_stacks_enabled() const
     {
@@ -3600,6 +3688,10 @@ private:
             m_top_surface_contoning_color_lower_surfaces_checkbox->Show(contoning);
             m_top_surface_contoning_color_lower_surfaces_checkbox->Enable(contoning);
         }
+        if (m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox != nullptr) {
+            m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox->Show(contoning);
+            m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox->Enable(contoning);
+        }
         if (m_top_surface_contoning_only_color_surface_infill_checkbox != nullptr) {
             m_top_surface_contoning_only_color_surface_infill_checkbox->Show(contoning);
             m_top_surface_contoning_only_color_surface_infill_checkbox->Enable(contoning);
@@ -3635,6 +3727,10 @@ private:
         if (m_top_surface_contoning_supersampled_cells_checkbox != nullptr) {
             m_top_surface_contoning_supersampled_cells_checkbox->Show(contoning);
             m_top_surface_contoning_supersampled_cells_checkbox->Enable(contoning);
+        }
+        if (m_top_surface_contoning_polygonize_color_regions_checkbox != nullptr) {
+            m_top_surface_contoning_polygonize_color_regions_checkbox->Show(contoning);
+            m_top_surface_contoning_polygonize_color_regions_checkbox->Enable(contoning);
         }
         if (m_top_surface_contoning_surface_anchored_stacks_checkbox != nullptr) {
             m_top_surface_contoning_surface_anchored_stacks_checkbox->Show(contoning);
@@ -3703,6 +3799,7 @@ private:
     wxChoice *m_top_surface_contoning_flat_surface_infill_choice {nullptr};
     wxPanel *m_top_surface_contoning_checkboxes_panel {nullptr};
     wxCheckBox *m_top_surface_contoning_color_lower_surfaces_checkbox {nullptr};
+    wxCheckBox *m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_only_color_surface_infill_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_replace_top_perimeters_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_recolor_surrounding_perimeters_checkbox {nullptr};
@@ -3712,6 +3809,7 @@ private:
     wxCheckBox *m_top_surface_contoning_varied_infill_angles_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_blue_noise_error_diffusion_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_supersampled_cells_checkbox {nullptr};
+    wxCheckBox *m_top_surface_contoning_polygonize_color_regions_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_surface_anchored_stacks_checkbox {nullptr};
     wxCheckBox *m_use_legacy_fixed_color_mode_checkbox {nullptr};
     wxCheckBox *m_minimum_visibility_offset_checkbox {nullptr};
@@ -7447,9 +7545,6 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         if (!zone.deleted)
             zone.enabled = true;
     mgr.normalize_zone_ids(num_physical);
-    set_config_string("texture_mapping_definitions", mgr.serialize_entries());
-    set_config_string("texture_mapping_global_settings", bundle->texture_mapping_global_settings.serialize());
-    sync_current_model_texture_mapping_definitions(mgr.serialize_entries());
 
     wxSizer *content_sizer = p->m_panel_texture_mapping_content->GetSizer();
     if (content_sizer == nullptr)
@@ -8727,6 +8822,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.top_surface_contoning_pattern_filaments,
                                                     updated.top_surface_contoning_min_feature_mm,
                                                     updated.top_surface_contoning_color_lower_surfaces,
+                                                    updated.top_surface_contoning_only_one_perimeter_around_shell_infill,
                                                     updated.top_surface_contoning_only_color_surface_infill,
                                                     updated.top_surface_contoning_replace_top_perimeters_with_infill,
                                                     updated.top_surface_contoning_recolor_surrounding_perimeters,
@@ -8736,6 +8832,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.top_surface_contoning_varied_infill_angles_enabled,
                                                     updated.top_surface_contoning_blue_noise_error_diffusion_enabled,
                                                     updated.top_surface_contoning_supersampled_cells_enabled,
+                                                    updated.top_surface_contoning_polygonize_color_regions_enabled,
                                                     updated.top_surface_contoning_surface_anchored_stacks_enabled,
                                                     bundle->texture_mapping_zones,
                                                     bundle->texture_mapping_global_settings,
@@ -8789,6 +8886,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.top_surface_contoning_pattern_filaments = dlg.top_surface_contoning_pattern_filaments();
             updated.top_surface_contoning_min_feature_mm = dlg.top_surface_contoning_min_feature_mm();
             updated.top_surface_contoning_color_lower_surfaces = dlg.top_surface_contoning_color_lower_surfaces();
+            updated.top_surface_contoning_only_one_perimeter_around_shell_infill =
+                dlg.top_surface_contoning_only_one_perimeter_around_shell_infill();
             updated.top_surface_contoning_only_color_surface_infill = dlg.top_surface_contoning_only_color_surface_infill();
             updated.top_surface_contoning_replace_top_perimeters_with_infill =
                 dlg.top_surface_contoning_replace_top_perimeters_with_infill();
@@ -8804,6 +8903,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 dlg.top_surface_contoning_blue_noise_error_diffusion_enabled();
             updated.top_surface_contoning_supersampled_cells_enabled =
                 dlg.top_surface_contoning_supersampled_cells_enabled();
+            updated.top_surface_contoning_polygonize_color_regions_enabled =
+                dlg.top_surface_contoning_polygonize_color_regions_enabled();
             updated.top_surface_contoning_surface_anchored_stacks_enabled =
                 dlg.top_surface_contoning_surface_anchored_stacks_enabled();
             if (updated.top_surface_image_printing_enabled &&
@@ -13206,6 +13307,9 @@ unsigned int Plater::priv::update_background_process(bool force_validation, bool
         this->partplate_list.update_slice_context_to_current_plate(background_process);
         this->preview->update_gcode_result(partplate_list.get_current_slice_result());
     }
+
+    if (PresetBundle *preset_bundle = wxGetApp().preset_bundle; preset_bundle != nullptr)
+        canonicalize_texture_mapping_config(*preset_bundle, true);
 
     background_process.fff_print()->set_check_multi_filaments_compatibility(wxGetApp().app_config->get("enable_high_low_temp_mixed_printing") == "false");
 
@@ -23402,7 +23506,7 @@ void Plater::set_bed_position(Vec2d& pos)
 //BBS: is the background process slicing currently
 bool Plater::is_background_process_slicing() const
 {
-    return p->m_is_slicing;
+    return p->m_is_slicing || p->background_process.running();
 }
 
 //BBS: update slicing context
