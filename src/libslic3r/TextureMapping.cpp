@@ -1129,7 +1129,8 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            std::abs(top_surface_image_max_line_width_mm - rhs.top_surface_image_max_line_width_mm) <= eps &&
            top_surface_image_colored_top_layers == rhs.top_surface_image_colored_top_layers &&
            top_surface_image_fixed_coloring_filaments_active() == rhs.top_surface_image_fixed_coloring_filaments_active() &&
-           std::abs(top_surface_contoning_angle_threshold_deg - rhs.top_surface_contoning_angle_threshold_deg) <= eps &&
+           std::abs(effective_top_surface_contoning_angle_threshold_deg() -
+                    rhs.effective_top_surface_contoning_angle_threshold_deg()) <= eps &&
            top_surface_contoning_stack_layers == rhs.top_surface_contoning_stack_layers &&
            top_surface_contoning_pattern_filaments == rhs.top_surface_contoning_pattern_filaments &&
            std::abs(top_surface_contoning_min_feature_mm - rhs.top_surface_contoning_min_feature_mm) <= eps &&
@@ -1140,10 +1141,12 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            effective_top_surface_contoning_recolor_surrounding_perimeters() == rhs.effective_top_surface_contoning_recolor_surrounding_perimeters() &&
            stored_top_surface_contoning_perimeter_mode() == rhs.stored_top_surface_contoning_perimeter_mode() &&
            stored_top_surface_contoning_flat_surface_infill_mode() == rhs.stored_top_surface_contoning_flat_surface_infill_mode() &&
-           top_surface_contoning_layer_phase_enabled == rhs.top_surface_contoning_layer_phase_enabled &&
+           effective_top_surface_contoning_layer_phase_enabled() == rhs.effective_top_surface_contoning_layer_phase_enabled() &&
            top_surface_contoning_varied_infill_angles_enabled == rhs.top_surface_contoning_varied_infill_angles_enabled &&
-           top_surface_contoning_blue_noise_error_diffusion_enabled == rhs.top_surface_contoning_blue_noise_error_diffusion_enabled &&
-           top_surface_contoning_supersampled_cells_enabled == rhs.top_surface_contoning_supersampled_cells_enabled &&
+           effective_top_surface_contoning_blue_noise_error_diffusion_enabled() ==
+               rhs.effective_top_surface_contoning_blue_noise_error_diffusion_enabled() &&
+           effective_top_surface_contoning_supersampled_cells_enabled() ==
+               rhs.effective_top_surface_contoning_supersampled_cells_enabled() &&
            top_surface_contoning_polygonize_color_regions_enabled == rhs.top_surface_contoning_polygonize_color_regions_enabled &&
            TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(top_surface_contoning_polygonize_resolution) ==
                TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(rhs.top_surface_contoning_polygonize_resolution) &&
@@ -1504,7 +1507,7 @@ std::string TextureMappingManager::serialize_entries()
                       TextureMappingZone::MaxTopSurfaceImageColoredTopLayers);
         texture["top_surface_image_fixed_coloring_filaments"] = zone.top_surface_image_fixed_coloring_filaments_active();
         texture["top_surface_contoning_angle_threshold_deg"] =
-            std::clamp(finite_or(zone.top_surface_contoning_angle_threshold_deg,
+            std::clamp(finite_or(zone.effective_top_surface_contoning_angle_threshold_deg(),
                                  TextureMappingZone::DefaultTopSurfaceContoningAngleThresholdDeg),
                        TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg,
                        TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg);
@@ -1538,13 +1541,13 @@ std::string TextureMappingManager::serialize_entries()
                       int(TextureMappingZone::ContoningPerimeterSegmentInfill));
         texture["top_surface_contoning_flat_surface_infill_mode"] =
             top_surface_contoning_flat_surface_infill_mode_name(zone.stored_top_surface_contoning_flat_surface_infill_mode());
-        texture["top_surface_contoning_layer_phase_enabled"] = zone.top_surface_contoning_layer_phase_enabled;
+        texture["top_surface_contoning_layer_phase_enabled"] = zone.effective_top_surface_contoning_layer_phase_enabled();
         texture["top_surface_contoning_varied_infill_angles_enabled"] =
             zone.top_surface_contoning_varied_infill_angles_enabled;
         texture["top_surface_contoning_blue_noise_error_diffusion_enabled"] =
-            zone.top_surface_contoning_blue_noise_error_diffusion_enabled;
+            zone.effective_top_surface_contoning_blue_noise_error_diffusion_enabled();
         texture["top_surface_contoning_supersampled_cells_enabled"] =
-            zone.top_surface_contoning_supersampled_cells_enabled;
+            zone.effective_top_surface_contoning_supersampled_cells_enabled();
         texture["top_surface_contoning_polygonize_color_regions_enabled"] =
             zone.top_surface_contoning_polygonize_color_regions_enabled;
         texture["top_surface_contoning_polygonize_resolution"] =

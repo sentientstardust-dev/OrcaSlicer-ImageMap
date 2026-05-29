@@ -2145,7 +2145,7 @@ static std::optional<TopSurfaceImageContoningSourceContext> top_surface_image_co
     TopSurfaceImageContoningSourceContext out;
     out.offset_context = std::move(*offset_context);
     out.threshold_deg =
-        std::clamp(zone.top_surface_contoning_angle_threshold_deg,
+        std::clamp(zone.effective_top_surface_contoning_angle_threshold_deg(),
                    TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg,
                    TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg);
     out.stack_layers = std::clamp(plan.contoning_stack_layers,
@@ -2610,7 +2610,8 @@ static TopSurfaceImageContoningStackPlanKey top_surface_image_contoning_stack_pl
     key.min_width_mm = top_surface_image_contoning_float_key(plan.min_width_mm);
     key.max_width_mm = top_surface_image_contoning_float_key(plan.max_width_mm);
     key.external_width_mm = top_surface_image_contoning_float_key(plan.contoning_external_width_mm);
-    key.angle_threshold_deg = top_surface_image_contoning_float_key(zone.top_surface_contoning_angle_threshold_deg);
+    key.angle_threshold_deg =
+        top_surface_image_contoning_float_key(zone.effective_top_surface_contoning_angle_threshold_deg());
     key.layer_phase = plan.contoning_layer_phase_enabled;
     key.replace_top_perimeters = plan.contoning_replace_top_perimeters_with_infill;
     key.recolor_surrounding_perimeters = plan.contoning_recolor_surrounding_perimeters;
@@ -3272,10 +3273,12 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
             std::clamp(zone->effective_top_surface_contoning_flat_surface_infill_mode(),
                        int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinear),
                        int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithBoundary));
-        plan.contoning_layer_phase_enabled = zone->top_surface_contoning_layer_phase_enabled;
+        plan.contoning_layer_phase_enabled = zone->effective_top_surface_contoning_layer_phase_enabled();
         plan.contoning_varied_infill_angles_enabled = zone->top_surface_contoning_varied_infill_angles_enabled;
-        plan.contoning_blue_noise_error_diffusion_enabled = zone->top_surface_contoning_blue_noise_error_diffusion_enabled;
-        plan.contoning_supersampled_cells_enabled = zone->top_surface_contoning_supersampled_cells_enabled;
+        plan.contoning_blue_noise_error_diffusion_enabled =
+            zone->effective_top_surface_contoning_blue_noise_error_diffusion_enabled();
+        plan.contoning_supersampled_cells_enabled =
+            zone->effective_top_surface_contoning_supersampled_cells_enabled();
         plan.contoning_polygonize_color_regions_enabled = zone->top_surface_contoning_polygonize_color_regions_enabled;
         plan.contoning_polygonize_resolution =
             TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(zone->top_surface_contoning_polygonize_resolution);

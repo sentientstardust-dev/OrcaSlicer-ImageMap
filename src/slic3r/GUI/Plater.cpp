@@ -2108,6 +2108,7 @@ public:
     {
         (void) generic_solver_mix_model;
         (void) reduce_outer_surface_texture;
+        (void) top_surface_contoning_min_feature_mm;
         m_modulation_mode_manually_changed = modulation_mode_manually_changed;
         m_strength_offsets_expanded = initial_strength_offsets_expanded;
         m_top_surface_contoning_shell_usage = top_surface_contoning_shell_usage;
@@ -2649,28 +2650,30 @@ public:
         m_top_surface_contoning_panel = new wxPanel(top_surface_page, wxID_ANY);
         auto *top_surface_contoning_root = new wxBoxSizer(wxVERTICAL);
         m_top_surface_contoning_panel->SetSizer(top_surface_contoning_root);
-        auto *contoning_angle_row = new wxBoxSizer(wxHORIZONTAL);
-        contoning_angle_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Surface angle threshold")),
-                                 0,
-                                 wxALIGN_CENTER_VERTICAL | wxRIGHT,
-                                 gap);
-        m_top_surface_contoning_angle_threshold_spin =
-            new wxSpinCtrlDouble(m_top_surface_contoning_panel,
-                                 wxID_ANY,
-                                 wxEmptyString,
-                                 wxDefaultPosition,
-                                 wxSize(FromDIP(84), -1),
-                                 wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER,
-                                 double(TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg),
-                                 double(TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg),
-                                 std::clamp(double(top_surface_contoning_angle_threshold_deg),
-                                            double(TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg),
-                                            double(TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg)),
-                                 1.0);
-        m_top_surface_contoning_angle_threshold_spin->SetDigits(0);
-        contoning_angle_row->Add(m_top_surface_contoning_angle_threshold_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
-        contoning_angle_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("deg")), 0, wxALIGN_CENTER_VERTICAL);
-        top_surface_contoning_root->Add(contoning_angle_row, 0, wxEXPAND | wxBOTTOM, gap);
+        if (TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions) {
+            auto *contoning_angle_row = new wxBoxSizer(wxHORIZONTAL);
+            contoning_angle_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Surface angle threshold")),
+                                     0,
+                                     wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                                     gap);
+            m_top_surface_contoning_angle_threshold_spin =
+                new wxSpinCtrlDouble(m_top_surface_contoning_panel,
+                                     wxID_ANY,
+                                     wxEmptyString,
+                                     wxDefaultPosition,
+                                     wxSize(FromDIP(84), -1),
+                                     wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER,
+                                     double(TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg),
+                                     double(TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg),
+                                     std::clamp(double(top_surface_contoning_angle_threshold_deg),
+                                                double(TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg),
+                                                double(TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg)),
+                                     1.0);
+            m_top_surface_contoning_angle_threshold_spin->SetDigits(0);
+            contoning_angle_row->Add(m_top_surface_contoning_angle_threshold_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+            contoning_angle_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("deg")), 0, wxALIGN_CENTER_VERTICAL);
+            top_surface_contoning_root->Add(contoning_angle_row, 0, wxEXPAND | wxBOTTOM, gap);
+        }
         const int clamped_contoning_pattern_filaments =
             std::clamp(top_surface_contoning_pattern_filaments,
                        TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
@@ -2728,28 +2731,6 @@ public:
             evt.Skip();
             queue_top_surface_contoning_message_resize_wrap();
         });
-        auto *contoning_feature_row = new wxBoxSizer(wxHORIZONTAL);
-        contoning_feature_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Minimum feature")),
-                                   0,
-                                   wxALIGN_CENTER_VERTICAL | wxRIGHT,
-                                   gap);
-        m_top_surface_contoning_min_feature_spin =
-            new wxSpinCtrlDouble(m_top_surface_contoning_panel,
-                                 wxID_ANY,
-                                 wxEmptyString,
-                                 wxDefaultPosition,
-                                 wxSize(FromDIP(84), -1),
-                                 wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER,
-                                 double(TextureMappingZone::MinTopSurfaceContoningMinFeatureMm),
-                                 double(TextureMappingZone::MaxTopSurfaceContoningMinFeatureMm),
-                                 std::clamp(double(top_surface_contoning_min_feature_mm),
-                                            double(TextureMappingZone::MinTopSurfaceContoningMinFeatureMm),
-                                            double(TextureMappingZone::MaxTopSurfaceContoningMinFeatureMm)),
-                                 0.1);
-        m_top_surface_contoning_min_feature_spin->SetDigits(1);
-        contoning_feature_row->Add(m_top_surface_contoning_min_feature_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
-        contoning_feature_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("mm")), 0, wxALIGN_CENTER_VERTICAL);
-        top_surface_contoning_root->Add(contoning_feature_row, 0, wxEXPAND);
         if (TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions) {
             auto *contoning_flat_infill_row = new wxBoxSizer(wxHORIZONTAL);
             contoning_flat_infill_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Flat surface infill mode")),
@@ -2862,15 +2843,17 @@ public:
                                            wxEXPAND | wxTOP | wxBOTTOM,
                                            gap / 2);
         }
-        m_top_surface_contoning_layer_phase_checkbox =
-            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Layer phase detail"));
-        m_top_surface_contoning_layer_phase_checkbox->SetValue(top_surface_contoning_layer_phase_enabled);
-        m_top_surface_contoning_layer_phase_checkbox->SetMinSize(
-            wxSize(-1, std::max(m_top_surface_contoning_layer_phase_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
-        contoning_checkboxes_root->Add(m_top_surface_contoning_layer_phase_checkbox,
-                                       0,
-                                       wxEXPAND | wxTOP | wxBOTTOM,
-                                       gap / 2);
+        if (TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions) {
+            m_top_surface_contoning_layer_phase_checkbox =
+                new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Layer phase detail"));
+            m_top_surface_contoning_layer_phase_checkbox->SetValue(top_surface_contoning_layer_phase_enabled);
+            m_top_surface_contoning_layer_phase_checkbox->SetMinSize(
+                wxSize(-1, std::max(m_top_surface_contoning_layer_phase_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+            contoning_checkboxes_root->Add(m_top_surface_contoning_layer_phase_checkbox,
+                                           0,
+                                           wxEXPAND | wxTOP | wxBOTTOM,
+                                           gap / 2);
+        }
         m_top_surface_contoning_varied_infill_angles_checkbox =
             new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Varied infill angles"));
         m_top_surface_contoning_varied_infill_angles_checkbox->SetValue(top_surface_contoning_varied_infill_angles_enabled);
@@ -2880,24 +2863,26 @@ public:
                                        0,
                                        wxEXPAND | wxTOP | wxBOTTOM,
                                        gap / 2);
-        m_top_surface_contoning_blue_noise_error_diffusion_checkbox =
-            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Blue-noise error diffusion"));
-        m_top_surface_contoning_blue_noise_error_diffusion_checkbox->SetValue(top_surface_contoning_blue_noise_error_diffusion_enabled);
-        m_top_surface_contoning_blue_noise_error_diffusion_checkbox->SetMinSize(
-            wxSize(-1, std::max(m_top_surface_contoning_blue_noise_error_diffusion_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
-        contoning_checkboxes_root->Add(m_top_surface_contoning_blue_noise_error_diffusion_checkbox,
-                                       0,
-                                       wxEXPAND | wxTOP | wxBOTTOM,
-                                       gap / 2);
-        m_top_surface_contoning_supersampled_cells_checkbox =
-            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Supersampled cell colors"));
-        m_top_surface_contoning_supersampled_cells_checkbox->SetValue(top_surface_contoning_supersampled_cells_enabled);
-        m_top_surface_contoning_supersampled_cells_checkbox->SetMinSize(
-            wxSize(-1, std::max(m_top_surface_contoning_supersampled_cells_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
-        contoning_checkboxes_root->Add(m_top_surface_contoning_supersampled_cells_checkbox,
-                                       0,
-                                       wxEXPAND | wxTOP | wxBOTTOM,
-                                       gap / 2);
+        if (TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions) {
+            m_top_surface_contoning_blue_noise_error_diffusion_checkbox =
+                new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Blue-noise error diffusion"));
+            m_top_surface_contoning_blue_noise_error_diffusion_checkbox->SetValue(top_surface_contoning_blue_noise_error_diffusion_enabled);
+            m_top_surface_contoning_blue_noise_error_diffusion_checkbox->SetMinSize(
+                wxSize(-1, std::max(m_top_surface_contoning_blue_noise_error_diffusion_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+            contoning_checkboxes_root->Add(m_top_surface_contoning_blue_noise_error_diffusion_checkbox,
+                                           0,
+                                           wxEXPAND | wxTOP | wxBOTTOM,
+                                           gap / 2);
+            m_top_surface_contoning_supersampled_cells_checkbox =
+                new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Supersampled cell colors"));
+            m_top_surface_contoning_supersampled_cells_checkbox->SetValue(top_surface_contoning_supersampled_cells_enabled);
+            m_top_surface_contoning_supersampled_cells_checkbox->SetMinSize(
+                wxSize(-1, std::max(m_top_surface_contoning_supersampled_cells_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+            contoning_checkboxes_root->Add(m_top_surface_contoning_supersampled_cells_checkbox,
+                                           0,
+                                           wxEXPAND | wxTOP | wxBOTTOM,
+                                           gap / 2);
+        }
         m_top_surface_contoning_polygonize_color_regions_checkbox =
             new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Polygonize color regions"));
         m_top_surface_contoning_polygonize_color_regions_checkbox->SetValue(top_surface_contoning_polygonize_color_regions_enabled);
@@ -3326,6 +3311,8 @@ public:
     }
     float top_surface_contoning_angle_threshold_deg() const
     {
+        if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
+            return TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg;
         return float(std::clamp(m_top_surface_contoning_angle_threshold_spin != nullptr ?
                                     m_top_surface_contoning_angle_threshold_spin->GetValue() :
                                     double(TextureMappingZone::DefaultTopSurfaceContoningAngleThresholdDeg),
@@ -3351,11 +3338,7 @@ public:
     }
     float top_surface_contoning_min_feature_mm() const
     {
-        return float(std::clamp(m_top_surface_contoning_min_feature_spin != nullptr ?
-                                    m_top_surface_contoning_min_feature_spin->GetValue() :
-                                    double(TextureMappingZone::DefaultTopSurfaceContoningMinFeatureMm),
-                                double(TextureMappingZone::MinTopSurfaceContoningMinFeatureMm),
-                                double(TextureMappingZone::MaxTopSurfaceContoningMinFeatureMm)));
+        return TextureMappingZone::DefaultTopSurfaceContoningMinFeatureMm;
     }
     bool top_surface_contoning_color_lower_surfaces() const
     {
@@ -3411,6 +3394,8 @@ public:
     }
     bool top_surface_contoning_layer_phase_enabled() const
     {
+        if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
+            return false;
         return m_top_surface_contoning_layer_phase_checkbox != nullptr &&
                m_top_surface_contoning_layer_phase_checkbox->GetValue();
     }
@@ -3421,11 +3406,15 @@ public:
     }
     bool top_surface_contoning_blue_noise_error_diffusion_enabled() const
     {
+        if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
+            return false;
         return m_top_surface_contoning_blue_noise_error_diffusion_checkbox != nullptr &&
                m_top_surface_contoning_blue_noise_error_diffusion_checkbox->GetValue();
     }
     bool top_surface_contoning_supersampled_cells_enabled() const
     {
+        if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
+            return false;
         return m_top_surface_contoning_supersampled_cells_checkbox != nullptr &&
                m_top_surface_contoning_supersampled_cells_checkbox->GetValue();
     }
@@ -3820,10 +3809,8 @@ private:
             return _L("Recommendation based on TD: 1-3 layers.");
         upper = std::max(upper, lower);
         strong = std::max(strong, upper);
-        return wxString::Format(_L("Recommendation based on highest TD: %d-%d layers (%d+ to show highest TD at strong saturation)."),
-                                lower,
-                                upper,
-                                strong);
+        return wxString::Format(_L("Recommendation based on highest TD: %d+ layers"),
+                                lower);
     }
 
     wxString top_surface_contoning_shell_warning_text() const
@@ -4227,8 +4214,6 @@ private:
             m_top_surface_contoning_stack_layers_spin->Enable(contoning);
         if (m_top_surface_contoning_pattern_filaments_spin != nullptr)
             m_top_surface_contoning_pattern_filaments_spin->Enable(contoning);
-        if (m_top_surface_contoning_min_feature_spin != nullptr)
-            m_top_surface_contoning_min_feature_spin->Enable(contoning);
         if (m_top_surface_contoning_flat_surface_infill_choice != nullptr)
             m_top_surface_contoning_flat_surface_infill_choice->Enable(contoning);
         if (m_top_surface_contoning_checkboxes_panel != nullptr)
@@ -4369,7 +4354,6 @@ private:
     wxSpinCtrl *m_top_surface_contoning_pattern_filaments_spin {nullptr};
     wxStaticText *m_top_surface_contoning_pattern_recommendation_text {nullptr};
     wxStaticText *m_top_surface_contoning_shell_warning_text {nullptr};
-    wxSpinCtrlDouble *m_top_surface_contoning_min_feature_spin {nullptr};
     wxChoice *m_top_surface_contoning_flat_surface_infill_choice {nullptr};
     wxPanel *m_top_surface_contoning_checkboxes_panel {nullptr};
     wxCheckBox *m_top_surface_contoning_color_lower_surfaces_checkbox {nullptr};

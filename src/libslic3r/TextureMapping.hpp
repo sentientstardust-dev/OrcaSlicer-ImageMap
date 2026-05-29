@@ -259,6 +259,11 @@ struct TextureMappingZone
         return ShowExperimentalTopSurfaceContoningOptions ? mode : DefaultTopSurfaceContoningPerimeterMode;
     }
 
+    static constexpr float effective_top_surface_contoning_angle_threshold_deg(float value)
+    {
+        return ShowExperimentalTopSurfaceContoningOptions ? value : MaxTopSurfaceContoningAngleThresholdDeg;
+    }
+
     static constexpr bool effective_top_surface_contoning_only_color_surface_infill(bool value)
     {
         return ShowExperimentalTopSurfaceContoningOptions ? value : true;
@@ -275,6 +280,21 @@ struct TextureMappingZone
     }
 
     static constexpr bool effective_top_surface_contoning_surface_anchored_stacks_enabled(bool value)
+    {
+        return ShowExperimentalTopSurfaceContoningOptions && value;
+    }
+
+    static constexpr bool effective_top_surface_contoning_layer_phase_enabled(bool value)
+    {
+        return ShowExperimentalTopSurfaceContoningOptions && value;
+    }
+
+    static constexpr bool effective_top_surface_contoning_blue_noise_error_diffusion_enabled(bool value)
+    {
+        return ShowExperimentalTopSurfaceContoningOptions && value;
+    }
+
+    static constexpr bool effective_top_surface_contoning_supersampled_cells_enabled(bool value)
     {
         return ShowExperimentalTopSurfaceContoningOptions && value;
     }
@@ -436,6 +456,12 @@ struct TextureMappingZone
                !effective_top_surface_contoning_recolor_surrounding_perimeters();
     }
 
+    float effective_top_surface_contoning_angle_threshold_deg() const
+    {
+        return TextureMappingZone::effective_top_surface_contoning_angle_threshold_deg(
+            top_surface_contoning_angle_threshold_deg);
+    }
+
     bool effective_top_surface_contoning_only_color_surface_infill() const
     {
         return effective_top_surface_contoning_only_color_surface_infill(top_surface_contoning_only_color_surface_infill);
@@ -475,6 +501,24 @@ struct TextureMappingZone
             top_surface_contoning_surface_anchored_stacks_enabled);
     }
 
+    bool effective_top_surface_contoning_layer_phase_enabled() const
+    {
+        return TextureMappingZone::effective_top_surface_contoning_layer_phase_enabled(
+            top_surface_contoning_layer_phase_enabled);
+    }
+
+    bool effective_top_surface_contoning_blue_noise_error_diffusion_enabled() const
+    {
+        return TextureMappingZone::effective_top_surface_contoning_blue_noise_error_diffusion_enabled(
+            top_surface_contoning_blue_noise_error_diffusion_enabled);
+    }
+
+    bool effective_top_surface_contoning_supersampled_cells_enabled() const
+    {
+        return TextureMappingZone::effective_top_surface_contoning_supersampled_cells_enabled(
+            top_surface_contoning_supersampled_cells_enabled);
+    }
+
     void apply_top_surface_contoning_experimental_defaults()
     {
         if (top_surface_image_printing_enabled &&
@@ -484,12 +528,16 @@ struct TextureMappingZone
             top_surface_image_fixed_coloring_filaments = true;
         }
         if (!ShowExperimentalTopSurfaceContoningOptions) {
+            top_surface_contoning_angle_threshold_deg = MaxTopSurfaceContoningAngleThresholdDeg;
             top_surface_contoning_only_color_surface_infill = true;
             top_surface_contoning_replace_top_perimeters_with_infill = false;
             top_surface_contoning_recolor_surrounding_perimeters = false;
             top_surface_contoning_perimeter_mode = DefaultTopSurfaceContoningPerimeterMode;
             top_surface_contoning_flat_surface_infill_mode = DefaultTopSurfaceContoningFlatSurfaceInfillMode;
             top_surface_contoning_surface_anchored_stacks_enabled = false;
+            top_surface_contoning_layer_phase_enabled = false;
+            top_surface_contoning_blue_noise_error_diffusion_enabled = false;
+            top_surface_contoning_supersampled_cells_enabled = false;
         } else if (top_surface_contoning_replace_top_perimeters_with_infill) {
             top_surface_contoning_recolor_surrounding_perimeters = false;
         }
