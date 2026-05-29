@@ -1508,14 +1508,16 @@ std::string TextureMappingManager::serialize_entries()
                                  TextureMappingZone::DefaultTopSurfaceContoningAngleThresholdDeg),
                        TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg,
                        TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg);
-        texture["top_surface_contoning_stack_layers"] =
-            clamp_int(zone.top_surface_contoning_stack_layers,
-                      TextureMappingZone::MinTopSurfaceContoningStackLayers,
-                      TextureMappingZone::MaxTopSurfaceContoningStackLayers);
-        texture["top_surface_contoning_pattern_filaments"] =
+        const int top_surface_contoning_pattern_filaments =
             clamp_int(zone.top_surface_contoning_pattern_filaments,
                       TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
                       TextureMappingZone::MaxTopSurfaceContoningPatternFilaments);
+        texture["top_surface_contoning_stack_layers"] =
+            std::max(top_surface_contoning_pattern_filaments,
+                     clamp_int(zone.top_surface_contoning_stack_layers,
+                               TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                               TextureMappingZone::MaxTopSurfaceContoningStackLayers));
+        texture["top_surface_contoning_pattern_filaments"] = top_surface_contoning_pattern_filaments;
         texture["top_surface_contoning_min_feature_mm"] =
             std::clamp(finite_or(zone.top_surface_contoning_min_feature_mm,
                                  TextureMappingZone::DefaultTopSurfaceContoningMinFeatureMm),
@@ -1788,6 +1790,9 @@ void TextureMappingManager::load_entries(const std::string &serialized,
                                     TextureMappingZone::DefaultTopSurfaceContoningPatternFilaments),
                       TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
                       TextureMappingZone::MaxTopSurfaceContoningPatternFilaments);
+        zone.top_surface_contoning_stack_layers =
+            std::max(zone.top_surface_contoning_stack_layers,
+                     zone.top_surface_contoning_pattern_filaments);
         zone.top_surface_contoning_min_feature_mm =
             std::clamp(finite_or(texture.value("top_surface_contoning_min_feature_mm",
                                                TextureMappingZone::DefaultTopSurfaceContoningMinFeatureMm),

@@ -111,6 +111,7 @@ std::array<float, 3> mix_color_solver_ordered_stack(const std::vector<std::array
                                                     const std::array<float, 3>              &background_rgb,
                                                     ColorSolverMixModel                       mix_model);
 std::array<float, 3> color_solver_oklab_from_srgb(const std::array<float, 3> &rgb);
+std::array<float, 3> color_solver_srgb_from_oklab(const std::array<float, 3> &oklab);
 
 std::string color_solver_candidate_cache_key(const std::vector<std::array<float, 3>> &component_colors,
                                              ColorSolverMixModel                       mix_model,

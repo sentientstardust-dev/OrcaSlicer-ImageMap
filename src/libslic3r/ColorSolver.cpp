@@ -46,6 +46,12 @@ float srgb_to_linear_component(float value)
     return x <= 0.04045f ? x / 12.92f : std::pow((x + 0.055f) / 1.055f, 2.4f);
 }
 
+float linear_to_srgb_component(float value)
+{
+    const float x = clamp01(value);
+    return x <= 0.0031308f ? 12.92f * x : 1.055f * std::pow(x, 1.f / 2.4f) - 0.055f;
+}
+
 std::array<float, 3> oklab_from_srgb(const std::array<float, 3> &rgb)
 {
     const float r = srgb_to_linear_component(rgb[0]);
@@ -60,6 +66,27 @@ std::array<float, 3> oklab_from_srgb(const std::array<float, 3> &rgb)
         0.2104542553f * l + 0.7936177850f * m - 0.0040720468f * s,
         1.9779984951f * l - 2.4285922050f * m + 0.4505937099f * s,
         0.0259040371f * l + 0.7827717662f * m - 0.8086757660f * s
+    };
+}
+
+std::array<float, 3> srgb_from_oklab(const std::array<float, 3> &oklab)
+{
+    const float l_ = oklab[0] + 0.3963377774f * oklab[1] + 0.2158037573f * oklab[2];
+    const float m_ = oklab[0] - 0.1055613458f * oklab[1] - 0.0638541728f * oklab[2];
+    const float s_ = oklab[0] - 0.0894841775f * oklab[1] - 1.2914855480f * oklab[2];
+
+    const float l = l_ * l_ * l_;
+    const float m = m_ * m_ * m_;
+    const float s = s_ * s_ * s_;
+
+    const float r = 4.0767416621f * l - 3.3077115913f * m + 0.2309699292f * s;
+    const float g = -1.2684380046f * l + 2.6097574011f * m - 0.3413193965f * s;
+    const float b = -0.0041960863f * l - 0.7034186147f * m + 1.7076147010f * s;
+
+    return {
+        linear_to_srgb_component(r),
+        linear_to_srgb_component(g),
+        linear_to_srgb_component(b)
     };
 }
 
@@ -603,6 +630,11 @@ std::array<float, 3> mix_color_solver_ordered_stack(const std::vector<std::array
 std::array<float, 3> color_solver_oklab_from_srgb(const std::array<float, 3> &rgb)
 {
     return oklab_from_srgb(rgb);
+}
+
+std::array<float, 3> color_solver_srgb_from_oklab(const std::array<float, 3> &oklab)
+{
+    return srgb_from_oklab(oklab);
 }
 
 std::string color_solver_candidate_cache_key(const std::vector<std::array<float, 3>> &component_colors,

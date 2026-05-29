@@ -1098,6 +1098,7 @@ struct TopSurfaceImageContoningCellSample {
     std::array<float, 3> rgb { { 0.f, 0.f, 0.f } };
     int solve_layers { 0 };
     int available_depth { 0 };
+    int sample_count { 0 };
 };
 
 struct TopSurfaceImageContoningSolvedLabel {
@@ -1946,6 +1947,7 @@ static std::optional<TopSurfaceImageContoningCellSample> top_surface_image_conto
     out.rgb[2] = std::clamp(out.rgb[2] / float(sample_count), 0.f, 1.f);
     if (out.solve_layers <= 0 || out.available_depth <= 0)
         return std::nullopt;
+    out.sample_count = sample_count;
     return out;
 }
 
@@ -1983,6 +1985,128 @@ static std::optional<TopSurfaceImageContoningSolvedLabel> top_surface_image_cont
     out.label = label;
     out.rgb = *stack_rgb;
     return out;
+}
+
+static void top_surface_image_contoning_resolve_merged_grid_regions(
+    std::vector<int>                                                  &grid,
+    int                                                                cols,
+    int                                                                rows,
+    std::vector<TopSurfaceImageContoningVectorLabel>                  &labels,
+    const std::vector<std::optional<TopSurfaceImageContoningCellSample>> &cell_samples,
+    const TextureMappingContoningSolver                               &solver,
+    int                                                                stack_layers,
+    int                                                                pattern_filaments,
+    bool                                                               lower_surface,
+    const ThrowIfCanceled                                             *throw_if_canceled)
+{
+    if (grid.empty() || labels.empty() || cols <= 0 || rows <= 0 ||
+        grid.size() != size_t(cols) * size_t(rows) ||
+        cell_samples.size() != grid.size() ||
+        stack_layers <= 0 || pattern_filaments <= 0 || !solver.valid())
+        return;
+
+    std::vector<int> resolved_grid(grid.size(), -1);
+    std::vector<TopSurfaceImageContoningVectorLabel> resolved_labels;
+    std::map<std::pair<std::vector<unsigned int>, int>, int> label_by_stack;
+    std::vector<unsigned char> visited(grid.size(), 0);
+
+    auto append_fallback_label = [&](int source_label) {
+        if (source_label < 0 || source_label >= int(labels.size()))
+            return -1;
+        const int label = int(resolved_labels.size());
+        resolved_labels.emplace_back(labels[size_t(source_label)]);
+        return label;
+    };
+
+    for (int row = 0; row < rows; ++row) {
+        if ((row & 15) == 0)
+            check_canceled(throw_if_canceled);
+        for (int col = 0; col < cols; ++col) {
+            const int start_idx = row * cols + col;
+            const int source_label = grid[size_t(start_idx)];
+            if (source_label < 0 || visited[size_t(start_idx)])
+                continue;
+
+            std::vector<int> queue;
+            std::vector<int> cells;
+            queue.push_back(start_idx);
+            visited[size_t(start_idx)] = 1;
+            std::array<double, 3> oklab_sum { { 0., 0., 0. } };
+            double sample_weight = 0.;
+            int visible_layers = std::numeric_limits<int>::max();
+
+            for (size_t queue_idx = 0; queue_idx < queue.size(); ++queue_idx) {
+                if ((queue_idx & 255) == 0)
+                    check_canceled(throw_if_canceled);
+                const int idx = queue[queue_idx];
+                cells.push_back(idx);
+                if (cell_samples[size_t(idx)]) {
+                    const TopSurfaceImageContoningCellSample &sample = *cell_samples[size_t(idx)];
+                    const std::array<float, 3> sample_oklab = color_solver_oklab_from_srgb(sample.rgb);
+                    const double weight = double(std::max(1, sample.sample_count));
+                    oklab_sum[0] += double(sample_oklab[0]) * weight;
+                    oklab_sum[1] += double(sample_oklab[1]) * weight;
+                    oklab_sum[2] += double(sample_oklab[2]) * weight;
+                    visible_layers = std::min(visible_layers, sample.available_depth);
+                    sample_weight += weight;
+                }
+
+                const int r = idx / cols;
+                const int c = idx - r * cols;
+                const std::array<std::pair<int, int>, 4> neighbors{
+                    std::pair<int, int>{ c - 1, r },
+                    std::pair<int, int>{ c + 1, r },
+                    std::pair<int, int>{ c, r - 1 },
+                    std::pair<int, int>{ c, r + 1 }
+                };
+                for (const std::pair<int, int> &neighbor : neighbors) {
+                    const int nc = neighbor.first;
+                    const int nr = neighbor.second;
+                    if (nc < 0 || nc >= cols || nr < 0 || nr >= rows)
+                        continue;
+                    const int nidx = nr * cols + nc;
+                    if (visited[size_t(nidx)] || grid[size_t(nidx)] != source_label)
+                        continue;
+                    visited[size_t(nidx)] = 1;
+                    queue.push_back(nidx);
+                }
+            }
+
+            int resolved_label = -1;
+            if (sample_weight > 0. && visible_layers > 0 && visible_layers != std::numeric_limits<int>::max()) {
+                const std::array<float, 3> average_oklab {
+                    float(oklab_sum[0] / sample_weight),
+                    float(oklab_sum[1] / sample_weight),
+                    float(oklab_sum[2] / sample_weight)
+                };
+                const std::array<float, 3> average_rgb = color_solver_srgb_from_oklab(average_oklab);
+                const int solve_layers = std::min({ visible_layers, stack_layers, pattern_filaments });
+                if (solve_layers > 0) {
+                    std::optional<TopSurfaceImageContoningSolvedLabel> solved =
+                        top_surface_image_contoning_solve_label(average_rgb,
+                                                                solve_layers,
+                                                                visible_layers,
+                                                                solver,
+                                                                lower_surface,
+                                                                resolved_labels,
+                                                                label_by_stack);
+                    if (solved)
+                        resolved_label = solved->label;
+                }
+            }
+            if (resolved_label < 0)
+                resolved_label = append_fallback_label(source_label);
+            if (resolved_label < 0)
+                continue;
+            for (int idx : cells)
+                resolved_grid[size_t(idx)] = resolved_label;
+        }
+    }
+
+    if (!resolved_labels.empty()) {
+        grid = std::move(resolved_grid);
+        labels = std::move(resolved_labels);
+    }
 }
 
 static std::optional<TopSurfaceImageContoningSourceContext> top_surface_image_contoning_source_context(
@@ -2226,6 +2350,18 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                          plan.contoning_min_feature_mm,
                                                          plan.contoning_external_width_mm,
                                                          throw_if_canceled);
+    if (plan.contoning_td_adjustment_enabled) {
+        top_surface_image_contoning_resolve_merged_grid_regions(grid,
+                                                                cols,
+                                                                rows,
+                                                                labels,
+                                                                cell_samples,
+                                                                solver,
+                                                                source->stack_layers,
+                                                                source->pattern_filaments,
+                                                                source_surface == TopSurfaceImageSourceSurface::Bottom,
+                                                                throw_if_canceled);
+    }
     check_canceled(throw_if_canceled);
 
     return top_surface_image_contoning_component_regions_from_grid(grid,
@@ -2422,6 +2558,18 @@ static std::shared_ptr<const TopSurfaceImageContoningStackPlan> top_surface_imag
                                                          plan.contoning_min_feature_mm,
                                                          plan.contoning_external_width_mm,
                                                          throw_if_canceled);
+    if (plan.contoning_td_adjustment_enabled) {
+        top_surface_image_contoning_resolve_merged_grid_regions(grid,
+                                                                cols,
+                                                                rows,
+                                                                out->labels,
+                                                                cell_samples,
+                                                                solver,
+                                                                source_context->stack_layers,
+                                                                source_context->pattern_filaments,
+                                                                source_surface == TopSurfaceImageSourceSurface::Bottom,
+                                                                throw_if_canceled);
+    }
     for (size_t idx = 0; idx < out->cells.size(); ++idx)
         out->cells[idx].label = grid[idx];
     return out;
