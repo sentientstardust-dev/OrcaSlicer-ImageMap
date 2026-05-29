@@ -69,6 +69,28 @@ struct ColorSolverCandidateSet {
 
 using ColorSolverCandidateCache = std::map<std::string, ColorSolverCandidateSet>;
 
+struct ColorSolverOrderedStackCandidateSet {
+    using KdNode = ColorSolverCandidateSet::KdNode;
+
+    size_t component_count { 0 };
+    int stack_depth { 0 };
+    std::vector<float> rgbs;
+    std::vector<float> perceptual_coords;
+    std::vector<uint16_t> stacks;
+    std::vector<KdNode> kd_nodes;
+    std::vector<KdNode> perceptual_kd_nodes;
+    int kd_root { -1 };
+    int perceptual_kd_root { -1 };
+
+    bool empty() const
+    {
+        return component_count == 0 || stack_depth <= 0 || rgbs.empty() || rgbs.size() % 3 != 0 ||
+               stacks.size() != (rgbs.size() / 3) * size_t(stack_depth);
+    }
+};
+
+using ColorSolverOrderedStackCandidateCache = std::map<std::string, ColorSolverOrderedStackCandidateSet>;
+
 ColorSolverMixModel color_solver_mix_model_from_index(int model);
 ColorSolverLookupMode color_solver_lookup_mode_from_index(int mode);
 ColorSolverMode color_solver_mode_from_index(int mode);
@@ -82,6 +104,11 @@ std::array<float, 3> mix_color_solver_components(const std::vector<std::array<fl
 std::array<float, 3> mix_color_solver_components(const std::vector<std::array<float, 3>> &component_colors,
                                                  const std::vector<float>                &weights,
                                                  ColorSolverMixModel                       mix_model);
+std::array<float, 3> mix_color_solver_ordered_stack(const std::vector<std::array<float, 3>> &component_colors,
+                                                    const std::vector<uint16_t>             &surface_to_deep,
+                                                    const std::vector<float>                &layer_opacities,
+                                                    const std::array<float, 3>              &background_rgb,
+                                                    ColorSolverMixModel                       mix_model);
 std::array<float, 3> color_solver_oklab_from_srgb(const std::array<float, 3> &rgb);
 
 std::string color_solver_candidate_cache_key(const std::vector<std::array<float, 3>> &component_colors,
@@ -98,6 +125,31 @@ std::vector<float> solve_color_solver_weights_for_target(const ColorSolverCandid
                                                          const std::array<float, 3>     &target_rgb,
                                                          ColorSolverLookupMode           lookup_mode,
                                                          ColorSolverMode                 solver_mode);
+std::string color_solver_ordered_stack_candidate_cache_key(const std::vector<std::array<float, 3>> &component_colors,
+                                                           const std::vector<float>                &layer_opacities,
+                                                           const std::array<float, 3>              &background_rgb,
+                                                           ColorSolverMixModel                       mix_model,
+                                                           int                                       stack_depth,
+                                                           size_t                                    candidate_limit = 0);
+ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
+    const std::vector<std::array<float, 3>> &component_colors,
+    const std::vector<float>                &layer_opacities,
+    const std::array<float, 3>              &background_rgb,
+    ColorSolverMixModel                       mix_model,
+    int                                       stack_depth,
+    size_t                                    candidate_limit = 0);
+const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates(
+    ColorSolverOrderedStackCandidateCache        &cache,
+    const std::vector<std::array<float, 3>>      &component_colors,
+    const std::vector<float>                     &layer_opacities,
+    const std::array<float, 3>                   &background_rgb,
+    ColorSolverMixModel                            mix_model,
+    int                                            stack_depth,
+    size_t                                         candidate_limit = 0);
+std::vector<uint16_t> solve_color_solver_ordered_stack_for_target(
+    const ColorSolverOrderedStackCandidateSet &candidates,
+    const std::array<float, 3>                &target_rgb,
+    ColorSolverMode                            solver_mode);
 
 } // namespace Slic3r
 

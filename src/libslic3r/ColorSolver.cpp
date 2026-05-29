@@ -124,7 +124,8 @@ int build_color_solver_kd_tree(const std::vector<float>                    &coor
     return build_color_solver_kd_tree(coords, nodes, indices, 0, candidate_count, uint8_t(0));
 }
 
-void build_color_solver_kd_trees(ColorSolverCandidateSet &candidates)
+template <class CandidateSet>
+void build_color_solver_kd_trees(CandidateSet &candidates)
 {
     candidates.kd_root = build_color_solver_kd_tree(candidates.rgbs, candidates.kd_nodes);
     if (candidates.perceptual_coords.size() == candidates.rgbs.size()) {
@@ -159,7 +160,8 @@ void update_color_solver_nearest_result(ColorSolverNearestResult &result, size_t
     }
 }
 
-float color_solver_candidate_error(const ColorSolverCandidateSet &candidates,
+template <class CandidateSet>
+float color_solver_candidate_error(const CandidateSet             &candidates,
                                    size_t                         candidate_idx,
                                    const std::array<float, 3>    &target_rgb)
 {
@@ -170,7 +172,8 @@ float color_solver_candidate_error(const ColorSolverCandidateSet &candidates,
     return dr * dr + dg * dg + db * db;
 }
 
-ColorSolverNearestResult nearest_color_solver_candidates_linear(const ColorSolverCandidateSet &candidates,
+template <class CandidateSet>
+ColorSolverNearestResult nearest_color_solver_candidates_linear(const CandidateSet             &candidates,
                                                                 const std::array<float, 3>    &target_rgb)
 {
     ColorSolverNearestResult result;
@@ -184,7 +187,8 @@ ColorSolverNearestResult nearest_color_solver_candidates_linear(const ColorSolve
     return result;
 }
 
-void query_color_solver_kd_tree(const ColorSolverCandidateSet &candidates,
+template <class CandidateSet>
+void query_color_solver_kd_tree(const CandidateSet             &candidates,
                                 const std::array<float, 3>    &target_rgb,
                                 int                            node_idx,
                                 ColorSolverNearestResult      &result)
@@ -216,7 +220,8 @@ void query_color_solver_kd_tree(const ColorSolverCandidateSet &candidates,
         query_color_solver_kd_tree(candidates, target_rgb, far_node, result);
 }
 
-ColorSolverNearestResult nearest_color_solver_candidates(const ColorSolverCandidateSet &candidates,
+template <class CandidateSet>
+ColorSolverNearestResult nearest_color_solver_candidates(const CandidateSet             &candidates,
                                                          const std::array<float, 3>    &target_rgb)
 {
     ColorSolverNearestResult result;
@@ -228,7 +233,8 @@ ColorSolverNearestResult nearest_color_solver_candidates(const ColorSolverCandid
     return result;
 }
 
-float color_solver_candidate_perceptual_error(const ColorSolverCandidateSet &candidates,
+template <class CandidateSet>
+float color_solver_candidate_perceptual_error(const CandidateSet             &candidates,
                                               size_t                         candidate_idx,
                                               const std::array<float, 3>    &target_oklab,
                                               const std::array<float, 3>    &axis_weights)
@@ -240,7 +246,8 @@ float color_solver_candidate_perceptual_error(const ColorSolverCandidateSet &can
     return axis_weights[0] * dl * dl + axis_weights[1] * da * da + axis_weights[2] * db * db;
 }
 
-ColorSolverNearestResult nearest_color_solver_candidates_perceptual_linear(const ColorSolverCandidateSet &candidates,
+template <class CandidateSet>
+ColorSolverNearestResult nearest_color_solver_candidates_perceptual_linear(const CandidateSet             &candidates,
                                                                            const std::array<float, 3>    &target_oklab,
                                                                            const std::array<float, 3>    &axis_weights)
 {
@@ -254,7 +261,8 @@ ColorSolverNearestResult nearest_color_solver_candidates_perceptual_linear(const
     return result;
 }
 
-void query_color_solver_perceptual_kd_tree(const ColorSolverCandidateSet &candidates,
+template <class CandidateSet>
+void query_color_solver_perceptual_kd_tree(const CandidateSet             &candidates,
                                            const std::array<float, 3>    &target_oklab,
                                            const std::array<float, 3>    &axis_weights,
                                            int                            node_idx,
@@ -287,7 +295,8 @@ void query_color_solver_perceptual_kd_tree(const ColorSolverCandidateSet &candid
         query_color_solver_perceptual_kd_tree(candidates, target_oklab, axis_weights, far_node, result);
 }
 
-ColorSolverNearestResult nearest_color_solver_candidates_perceptual(const ColorSolverCandidateSet &candidates,
+template <class CandidateSet>
+ColorSolverNearestResult nearest_color_solver_candidates_perceptual(const CandidateSet             &candidates,
                                                                     const std::array<float, 3>    &target_rgb)
 {
     ColorSolverNearestResult result;
@@ -302,6 +311,48 @@ ColorSolverNearestResult nearest_color_solver_candidates_perceptual(const ColorS
     if (result.best_idx >= candidate_count)
         result = nearest_color_solver_candidates_perceptual_linear(candidates, target_oklab, axis_weights);
     return result;
+}
+
+std::array<float, 3> mix_ordered_stack_with_buffers(const std::vector<std::array<float, 3>> &colors_with_background,
+                                                    std::vector<float>                      &weights,
+                                                    const std::vector<uint16_t>             &surface_to_deep,
+                                                    const std::vector<float>                &layer_opacities)
+{
+    if (colors_with_background.empty() || surface_to_deep.empty())
+        return colors_with_background.empty() ? std::array<float, 3>{ { 0.f, 0.f, 0.f } } : colors_with_background.back();
+
+    const size_t component_count = colors_with_background.size() - 1;
+    weights.assign(colors_with_background.size(), 0.f);
+    float transmission = 1.f;
+    for (uint16_t component_idx : surface_to_deep) {
+        if (size_t(component_idx) >= component_count)
+            continue;
+        const float opacity =
+            size_t(component_idx) < layer_opacities.size() && std::isfinite(layer_opacities[size_t(component_idx)]) ?
+                std::clamp(layer_opacities[size_t(component_idx)], 1e-4f, 0.9999f) :
+                0.5f;
+        weights[size_t(component_idx)] += transmission * opacity;
+        transmission *= 1.f - opacity;
+        if (transmission <= 1e-5f)
+            break;
+    }
+    weights.back() = std::max(0.f, transmission);
+    return pigment_painter::mix_srgb(colors_with_background, weights);
+}
+
+size_t ordered_stack_candidate_count(size_t component_count, int stack_depth, size_t candidate_limit)
+{
+    if (component_count == 0 || stack_depth <= 0)
+        return 0;
+    size_t count = 1;
+    for (int idx = 0; idx < stack_depth; ++idx) {
+        if (candidate_limit > 0 && count > candidate_limit / component_count)
+            return 0;
+        if (count > std::numeric_limits<size_t>::max() / component_count)
+            return 0;
+        count *= component_count;
+    }
+    return candidate_limit > 0 && count > candidate_limit ? 0 : count;
 }
 
 } // namespace
@@ -360,6 +411,22 @@ std::array<float, 3> mix_color_solver_components(const std::vector<std::array<fl
     for (const float weight : weights)
         safe_weights.emplace_back(std::isfinite(weight) ? std::clamp(weight, 0.f, 1.f) : 0.f);
     return pigment_painter::mix_srgb(component_colors, safe_weights);
+}
+
+std::array<float, 3> mix_color_solver_ordered_stack(const std::vector<std::array<float, 3>> &component_colors,
+                                                    const std::vector<uint16_t>             &surface_to_deep,
+                                                    const std::vector<float>                &layer_opacities,
+                                                    const std::array<float, 3>              &background_rgb,
+                                                    ColorSolverMixModel                       mix_model)
+{
+    (void) mix_model;
+    if (component_colors.empty() || surface_to_deep.empty())
+        return background_rgb;
+
+    std::vector<std::array<float, 3>> colors = component_colors;
+    colors.emplace_back(background_rgb);
+    std::vector<float> weights;
+    return mix_ordered_stack_with_buffers(colors, weights, surface_to_deep, layer_opacities);
 }
 
 std::array<float, 3> color_solver_oklab_from_srgb(const std::array<float, 3> &rgb)
@@ -478,6 +545,147 @@ std::vector<float> solve_color_solver_weights_for_target(const ColorSolverCandid
         weights[idx] = clamp01((candidates.weights[best_weight_idx + idx] * best_inv +
                                 candidates.weights[second_weight_idx + idx] * second_inv) / inv_sum);
     return weights;
+}
+
+std::string color_solver_ordered_stack_candidate_cache_key(const std::vector<std::array<float, 3>> &component_colors,
+                                                           const std::vector<float>                &layer_opacities,
+                                                           const std::array<float, 3>              &background_rgb,
+                                                           ColorSolverMixModel                       mix_model,
+                                                           int                                       stack_depth,
+                                                           size_t                                    candidate_limit)
+{
+    std::ostringstream key;
+    key << component_colors.size();
+    key << "|mx" << mix_model_index(mix_model);
+    key << "|sd" << stack_depth;
+    key << "|lim" << candidate_limit;
+    key << "|bg"
+        << int(std::lround(clamp01(background_rgb[0]) * 65535.f)) << ','
+        << int(std::lround(clamp01(background_rgb[1]) * 65535.f)) << ','
+        << int(std::lround(clamp01(background_rgb[2]) * 65535.f));
+    for (const std::array<float, 3> &color : component_colors) {
+        key << '|'
+            << int(std::lround(clamp01(color[0]) * 65535.f)) << ','
+            << int(std::lround(clamp01(color[1]) * 65535.f)) << ','
+            << int(std::lround(clamp01(color[2]) * 65535.f));
+    }
+    key << "|op";
+    for (size_t idx = 0; idx < component_colors.size(); ++idx) {
+        const float opacity =
+            idx < layer_opacities.size() && std::isfinite(layer_opacities[idx]) ?
+                std::clamp(layer_opacities[idx], 1e-4f, 0.9999f) :
+                0.5f;
+        key << ',' << int(std::lround(opacity * 1000000.f));
+    }
+    return key.str();
+}
+
+ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
+    const std::vector<std::array<float, 3>> &component_colors,
+    const std::vector<float>                &layer_opacities,
+    const std::array<float, 3>              &background_rgb,
+    ColorSolverMixModel                       mix_model,
+    int                                       stack_depth,
+    size_t                                    candidate_limit)
+{
+    (void) mix_model;
+    ColorSolverOrderedStackCandidateSet candidates;
+    if (component_colors.empty() || stack_depth <= 0 || component_colors.size() > size_t(std::numeric_limits<uint16_t>::max()))
+        return candidates;
+
+    const size_t component_count = component_colors.size();
+    const size_t candidate_count = ordered_stack_candidate_count(component_count, stack_depth, candidate_limit);
+    if (candidate_count == 0)
+        return candidates;
+
+    candidates.component_count = component_count;
+    candidates.stack_depth = stack_depth;
+    candidates.rgbs.reserve(candidate_count * 3);
+    candidates.perceptual_coords.reserve(candidate_count * 3);
+    candidates.stacks.reserve(candidate_count * size_t(stack_depth));
+
+    std::vector<std::array<float, 3>> colors_with_background = component_colors;
+    colors_with_background.emplace_back(background_rgb);
+    std::vector<float> weights(colors_with_background.size(), 0.f);
+    std::vector<uint16_t> surface_to_deep(size_t(stack_depth), 0);
+
+    std::function<void(int)> recurse = [&](int depth_idx) {
+        if (depth_idx == stack_depth) {
+            const std::array<float, 3> mixed =
+                mix_ordered_stack_with_buffers(colors_with_background, weights, surface_to_deep, layer_opacities);
+            const std::array<float, 3> perceptual = oklab_from_srgb(mixed);
+            candidates.rgbs.emplace_back(mixed[0]);
+            candidates.rgbs.emplace_back(mixed[1]);
+            candidates.rgbs.emplace_back(mixed[2]);
+            candidates.perceptual_coords.emplace_back(perceptual[0]);
+            candidates.perceptual_coords.emplace_back(perceptual[1]);
+            candidates.perceptual_coords.emplace_back(perceptual[2]);
+            candidates.stacks.insert(candidates.stacks.end(), surface_to_deep.begin(), surface_to_deep.end());
+            return;
+        }
+
+        for (size_t component_idx = 0; component_idx < component_count; ++component_idx) {
+            surface_to_deep[size_t(depth_idx)] = uint16_t(component_idx);
+            recurse(depth_idx + 1);
+        }
+    };
+    recurse(0);
+    build_color_solver_kd_trees(candidates);
+    return candidates;
+}
+
+const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates(
+    ColorSolverOrderedStackCandidateCache        &cache,
+    const std::vector<std::array<float, 3>>      &component_colors,
+    const std::vector<float>                     &layer_opacities,
+    const std::array<float, 3>                   &background_rgb,
+    ColorSolverMixModel                            mix_model,
+    int                                            stack_depth,
+    size_t                                         candidate_limit)
+{
+    const std::string key =
+        color_solver_ordered_stack_candidate_cache_key(component_colors,
+                                                       layer_opacities,
+                                                       background_rgb,
+                                                       mix_model,
+                                                       stack_depth,
+                                                       candidate_limit);
+    auto it = cache.find(key);
+    if (it != cache.end())
+        return it->second;
+    return cache.emplace(
+        key,
+        build_color_solver_ordered_stack_candidates(component_colors,
+                                                   layer_opacities,
+                                                   background_rgb,
+                                                   mix_model,
+                                                   stack_depth,
+                                                   candidate_limit)).first->second;
+}
+
+std::vector<uint16_t> solve_color_solver_ordered_stack_for_target(
+    const ColorSolverOrderedStackCandidateSet &candidates,
+    const std::array<float, 3>                &target_rgb,
+    ColorSolverMode                            solver_mode)
+{
+    if (candidates.empty())
+        return {};
+
+    const size_t candidate_count = candidates.rgbs.size() / 3;
+    ColorSolverNearestResult nearest =
+        solver_mode == ColorSolverMode::V2 ?
+            nearest_color_solver_candidates_perceptual(candidates, target_rgb) :
+            nearest_color_solver_candidates(candidates, target_rgb);
+    if (nearest.best_idx >= candidate_count && solver_mode == ColorSolverMode::V2)
+        nearest = nearest_color_solver_candidates(candidates, target_rgb);
+    if (nearest.best_idx >= candidate_count)
+        return {};
+
+    const size_t stack_begin = nearest.best_idx * size_t(candidates.stack_depth);
+    if (stack_begin + size_t(candidates.stack_depth) > candidates.stacks.size())
+        return {};
+    return std::vector<uint16_t>(candidates.stacks.begin() + stack_begin,
+                                 candidates.stacks.begin() + stack_begin + candidates.stack_depth);
 }
 
 } // namespace Slic3r

@@ -45,8 +45,10 @@ constexpr size_t k_temporary_simulated_texture_preview_min_source_pixels = k_tem
 constexpr size_t k_surface_gradient_preview_max_components = 10;
 constexpr size_t k_surface_gradient_preview_lut_size = 33;
 constexpr size_t k_contoning_flat_surface_preview_max_candidates = 250000;
+constexpr size_t k_contoning_flat_surface_preview_max_ordered_candidates = 2500000;
 constexpr double k_contoning_top_surface_preview_lod_max_samples = 350000.0;
 constexpr const char *TEXTURE_MAPPING_BACKGROUND_COLOR_CONFIG_KEY = "texture_mapping_background_color";
+constexpr float k_contoning_preview_inferred_black_td_mm = 0.1f;
 
 struct TexturePreviewMixCandidate
 {
@@ -90,9 +92,13 @@ struct TexturePreviewSimulationSettings
     int generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
     bool contoning_flat_surface_quantization = false;
     bool contoning_flat_surface_pattern_blend = false;
+    bool contoning_flat_surface_td_adjustment = false;
     int contoning_flat_surface_pattern_filaments = TextureMappingZone::DefaultTopSurfaceContoningPatternFilaments;
     bool simulate_top_surface_lod = false;
     float top_surface_lod_pitch_mm = 0.f;
+    float contoning_flat_surface_layer_height_mm = 0.2f;
+    std::array<float, 3> contoning_flat_surface_background_rgb { { 0.f, 0.f, 0.f } };
+    std::vector<float> contoning_flat_surface_layer_opacities;
     float minimum_visibility_offset_factor = 0.f;
     std::vector<unsigned int> component_ids;
     std::vector<std::array<float, 3>> component_colors;
@@ -519,6 +525,82 @@ float contoning_flat_surface_lod_pitch_for_texture_preview(const TextureMappingZ
                              0.25f,
                              std::max(0.25f, min_feature * 0.5f));
     return std::clamp(pitch, 0.25f, std::max(0.25f, min_feature));
+}
+
+float texture_preview_layer_height_mm()
+{
+    return std::clamp(texture_preview_config_float("layer_height", 0.2f), 0.01f, 2.f);
+}
+
+float texture_preview_filament_luminance(const std::array<float, 3> &color)
+{
+    return 0.2126f * clamp01(color[0]) + 0.7152f * clamp01(color[1]) + 0.0722f * clamp01(color[2]);
+}
+
+bool texture_preview_black_role_component(int filament_color_mode, size_t component_idx, size_t component_count)
+{
+    switch (std::clamp(filament_color_mode,
+                       int(TextureMappingZone::FilamentColorAny),
+                       int(TextureMappingZone::FilamentColorRGBKW))) {
+    case int(TextureMappingZone::FilamentColorCMYK):
+    case int(TextureMappingZone::FilamentColorRGBK):
+        return component_count == 4 && component_idx == 3;
+    case int(TextureMappingZone::FilamentColorBW):
+        return component_count == 2 && component_idx == 0;
+    case int(TextureMappingZone::FilamentColorCMYKW):
+    case int(TextureMappingZone::FilamentColorRGBKW):
+        return component_count == 5 && component_idx == 3;
+    default:
+        return false;
+    }
+}
+
+bool texture_preview_black_color_filament(const std::array<float, 3> &color)
+{
+    const float r = clamp01(color[0]);
+    const float g = clamp01(color[1]);
+    const float b = clamp01(color[2]);
+    const float max_channel = std::max({ r, g, b });
+    const float min_channel = std::min({ r, g, b });
+    const float luminance = texture_preview_filament_luminance(color);
+    return max_channel <= 0.20f && luminance <= 0.12f && max_channel - min_channel <= 0.08f;
+}
+
+float texture_preview_estimated_transmission_distance_mm(const std::array<float, 3> &color)
+{
+    return std::clamp(0.1f + 2.9f * std::pow(texture_preview_filament_luminance(color), 1.35f), 0.12f, 3.f);
+}
+
+float texture_preview_layer_opacity_from_td(float td_mm, float layer_height_mm)
+{
+    const float safe_td = std::clamp(td_mm, 0.01f, 50.f);
+    const float safe_layer_height = std::clamp(layer_height_mm, 0.01f, 2.f);
+    return std::clamp(1.f - std::pow(0.05f, safe_layer_height / safe_td), 1e-4f, 0.9999f);
+}
+
+std::vector<float> contoning_flat_surface_preview_layer_opacities(
+    const TextureMappingZone                 &zone,
+    const TexturePreviewSimulationSettings   &settings)
+{
+    std::vector<float> out;
+    out.reserve(settings.component_ids.size());
+    for (size_t idx = 0; idx < settings.component_ids.size() && idx < settings.component_colors.size(); ++idx) {
+        const unsigned int component_id = settings.component_ids[idx];
+        float td_mm = 0.f;
+        if (component_id > 0 && size_t(component_id - 1) < zone.filament_transmission_distances_mm.size()) {
+            const float explicit_td = zone.filament_transmission_distances_mm[size_t(component_id - 1)];
+            if (std::isfinite(explicit_td) && explicit_td > 0.f)
+                td_mm = explicit_td;
+        }
+        if (td_mm <= 0.f &&
+            (texture_preview_black_role_component(zone.filament_color_mode, idx, settings.component_ids.size()) ||
+             texture_preview_black_color_filament(settings.component_colors[idx])))
+            td_mm = k_contoning_preview_inferred_black_td_mm;
+        if (td_mm <= 0.f)
+            td_mm = texture_preview_estimated_transmission_distance_mm(settings.component_colors[idx]);
+        out.emplace_back(texture_preview_layer_opacity_from_td(td_mm, settings.contoning_flat_surface_layer_height_mm));
+    }
+    return out;
 }
 
 std::array<float, 2> raw_offset_visibility_factors_for_texture_preview(const TextureMappingZone &zone)
@@ -2401,12 +2483,23 @@ std::array<float, 3> fallback_contoning_flat_surface_rgb_for_texture_preview(
 std::array<float, 3> contoning_flat_surface_rgb_for_texture_preview(
     const TexturePreviewSimulationSettings                  &settings,
     const std::array<float, 4>                              &sample_rgba,
+    const ColorSolverOrderedStackCandidateSet               &ordered_candidates,
     const std::vector<TexturePreviewMixCandidate>           &candidates,
     const std::vector<TexturePreviewMixCandidateKdNode>     &nodes,
     int                                                      root,
     int                                                      total_units)
 {
     const std::array<float, 3> target_rgb = texture_preview_target_rgb(settings, sample_rgba);
+    if (settings.contoning_flat_surface_td_adjustment && !ordered_candidates.empty()) {
+        const std::vector<uint16_t> surface_to_deep =
+            solve_color_solver_ordered_stack_for_target(ordered_candidates, target_rgb, ColorSolverMode::V2);
+        if (!surface_to_deep.empty())
+            return mix_color_solver_ordered_stack(settings.component_colors,
+                                                 surface_to_deep,
+                                                 settings.contoning_flat_surface_layer_opacities,
+                                                 settings.contoning_flat_surface_background_rgb,
+                                                 ColorSolverMixModel::PigmentPainter);
+    }
     if (!candidates.empty()) {
         const TexturePreviewMixNearestResult nearest =
             nearest_contoning_flat_surface_mix_candidate(candidates, nodes, root, target_rgb);
@@ -2544,6 +2637,7 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
                                               int(TextureMappingZone::GenericSolverLegacy),
                                               int(TextureMappingZone::GenericSolverV2));
     settings.generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
+    settings.contoning_flat_surface_layer_height_mm = texture_preview_layer_height_mm();
     if (zone->top_surface_image_printing_enabled) {
         const int stack_layers =
             std::clamp(zone->top_surface_contoning_stack_layers,
@@ -2554,6 +2648,8 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
                        TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
                        TextureMappingZone::MaxTopSurfaceContoningPatternFilaments);
         settings.contoning_flat_surface_pattern_filaments = std::max(1, std::min(stack_layers, pattern_filaments));
+        settings.contoning_flat_surface_td_adjustment =
+            zone->top_surface_contoning_active() && zone->top_surface_contoning_td_adjustment_enabled;
     }
     settings.minimum_visibility_offset_factor = zone->minimum_visibility_offset_enabled ?
         std::clamp((std::isfinite(zone->minimum_visibility_offset_pct) ?
@@ -2597,6 +2693,16 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
         settings.component_minimum_offset_factors.emplace_back(std::clamp(safe_minimum_offset_pct / 100.f, 0.f, 1.f));
     }
 
+    if (settings.contoning_flat_surface_td_adjustment && !settings.component_colors.empty()) {
+        std::vector<float> background_weights(settings.component_colors.size(), 1.f / float(settings.component_colors.size()));
+        settings.contoning_flat_surface_background_rgb =
+            mix_color_solver_components(settings.component_colors, background_weights, ColorSolverMixModel::PigmentPainter);
+        settings.contoning_flat_surface_layer_opacities =
+            contoning_flat_surface_preview_layer_opacities(*zone, settings);
+        if (settings.contoning_flat_surface_layer_opacities.size() != settings.component_colors.size())
+            settings.contoning_flat_surface_td_adjustment = false;
+    }
+
     const std::array<float, 2> raw_offset_visibility_factors = raw_offset_visibility_factors_for_texture_preview(*zone);
     settings.raw_offset_base_visibility_factor = raw_offset_visibility_factors[0];
     settings.raw_offset_visibility_range_factor = raw_offset_visibility_factors[1];
@@ -2632,11 +2738,17 @@ size_t texture_preview_simulation_signature(const ModelVolume &model_volume,
     mix(std::hash<int>{}(settings.generic_solver_mix_model));
     mix(std::hash<int>{}(settings.contoning_flat_surface_quantization ? 1 : 0));
     mix(std::hash<int>{}(settings.contoning_flat_surface_pattern_blend ? 1 : 0));
+    mix(std::hash<int>{}(settings.contoning_flat_surface_td_adjustment ? 1 : 0));
     if (settings.contoning_flat_surface_quantization) {
         mix(std::hash<int>{}(settings.contoning_flat_surface_pattern_filaments));
         mix(std::hash<int>{}(settings.simulate_top_surface_lod ? 1 : 0));
         if (settings.simulate_top_surface_lod)
             mix(std::hash<int>{}(int(std::lround(settings.top_surface_lod_pitch_mm * 100000.f))));
+    }
+    if (settings.contoning_flat_surface_td_adjustment) {
+        mix(std::hash<int>{}(int(std::lround(settings.contoning_flat_surface_layer_height_mm * 100000.f))));
+        for (const float opacity : settings.contoning_flat_surface_layer_opacities)
+            mix(std::hash<int>{}(int(std::lround(opacity * 1000000.f))));
     }
     mix(std::hash<int>{}(int(std::lround(settings.contrast_pct * 100.f))));
     mix(std::hash<int>{}(int(std::lround(settings.tone_gamma * 1000.f))));
@@ -2709,8 +2821,21 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
         settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
         !settings.component_colors.empty() &&
         contoning_flat_surface_pattern_filaments > 0;
+    const bool use_contoning_flat_surface_ordered_quantization =
+        use_contoning_flat_surface_quantization &&
+        settings.contoning_flat_surface_td_adjustment &&
+        settings.contoning_flat_surface_layer_opacities.size() == settings.component_colors.size();
+    const ColorSolverOrderedStackCandidateSet contoning_flat_surface_ordered_candidates =
+        use_contoning_flat_surface_ordered_quantization ?
+            build_color_solver_ordered_stack_candidates(settings.component_colors,
+                                                       settings.contoning_flat_surface_layer_opacities,
+                                                       settings.contoning_flat_surface_background_rgb,
+                                                       ColorSolverMixModel::PigmentPainter,
+                                                       contoning_flat_surface_pattern_filaments,
+                                                       k_contoning_flat_surface_preview_max_ordered_candidates) :
+            ColorSolverOrderedStackCandidateSet{};
     const std::vector<TexturePreviewMixCandidate> contoning_flat_surface_candidates =
-        use_contoning_flat_surface_quantization ?
+        use_contoning_flat_surface_quantization && contoning_flat_surface_ordered_candidates.empty() ?
             build_contoning_flat_surface_mix_candidates(settings.component_colors, contoning_flat_surface_pattern_filaments) :
             std::vector<TexturePreviewMixCandidate>{};
     std::vector<TexturePreviewMixCandidateKdNode> contoning_flat_surface_nodes;
@@ -2928,6 +3053,7 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                     forced_simulated_rgb =
                         contoning_flat_surface_rgb_for_texture_preview(settings,
                                                                        sample_rgba,
+                                                                       contoning_flat_surface_ordered_candidates,
                                                                        contoning_flat_surface_candidates,
                                                                        contoning_flat_surface_nodes,
                                                                        contoning_flat_surface_root,
@@ -5513,6 +5639,7 @@ static size_t texture_preview_settings_signature_impl(size_t num_physical,
         signature_mix(std::hash<int>{}(zone.top_surface_contoning_stack_layers));
         signature_mix(std::hash<int>{}(zone.top_surface_contoning_pattern_filaments));
         signature_mix(std::hash<int>{}(zone.top_surface_contoning_color_lower_surfaces ? 1 : 0));
+        signature_mix(std::hash<int>{}(zone.top_surface_contoning_td_adjustment_enabled ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.nonlinear_offset_adjustment ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.compact_offset_mode ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.use_legacy_fixed_color_mode ? 1 : 0));
@@ -5533,6 +5660,8 @@ static size_t texture_preview_settings_signature_impl(size_t num_physical,
             signature_mix_float(strength_pct, 100.f);
         for (const float minimum_offset_pct : zone.filament_minimum_offsets_pct)
             signature_mix_float(minimum_offset_pct, 100.f);
+        for (const float td_mm : zone.filament_transmission_distances_mm)
+            signature_mix_float(td_mm, 1000.f);
     }
     return signature;
 }
@@ -5663,6 +5792,7 @@ static void texture_preview_mix_zone_baked_model_settings(size_t &signature,
     signature_mix(std::hash<int>{}(zone.top_surface_contoning_stack_layers));
     signature_mix(std::hash<int>{}(zone.top_surface_contoning_pattern_filaments));
     signature_mix(std::hash<int>{}(zone.top_surface_contoning_color_lower_surfaces ? 1 : 0));
+    signature_mix(std::hash<int>{}(zone.top_surface_contoning_td_adjustment_enabled ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.nonlinear_offset_adjustment ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.compact_offset_mode ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.use_legacy_fixed_color_mode ? 1 : 0));
@@ -5687,6 +5817,8 @@ static void texture_preview_mix_zone_baked_model_settings(size_t &signature,
         signature_mix_float(strength_pct, 100.f);
     for (const float minimum_offset_pct : zone.filament_minimum_offsets_pct)
         signature_mix_float(minimum_offset_pct, 100.f);
+    for (const float td_mm : zone.filament_transmission_distances_mm)
+        signature_mix_float(td_mm, 1000.f);
 
     if (zone.is_surface_gradient()) {
         signature_mix_float(texture_preview_config_float("texture_mapping_outer_wall_gradient_global_strength", 100.f), 100.f);

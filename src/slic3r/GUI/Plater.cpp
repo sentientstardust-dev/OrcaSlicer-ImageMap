@@ -1984,6 +1984,7 @@ public:
                                         bool top_surface_contoning_polygonize_color_regions_enabled,
                                         int top_surface_contoning_polygonize_resolution,
                                         bool top_surface_contoning_surface_anchored_stacks_enabled,
+                                        bool top_surface_contoning_td_adjustment_enabled,
                                         const TextureMappingManager &texture_mapping_zones,
                                         const TextureMappingGlobalSettings &global_settings,
                                         const TextureMappingPrimeTowerImage &prime_tower_image,
@@ -2199,7 +2200,7 @@ public:
         auto *filament_calibration_note =
             new wxStaticText(filament_page,
                              wxID_ANY,
-                             _L("NOTE: Filament/TD calibration is not currently used in top-surface coloring"),
+                             _L("NOTE: TD calibration is used by overhang modulation and Contoning TD adjustment"),
                              wxDefaultPosition,
                              wxSize(FromDIP(390), -1));
         filament_calibration_note->Wrap(FromDIP(390));
@@ -2659,6 +2660,15 @@ public:
         m_top_surface_contoning_color_lower_surfaces_checkbox->SetMinSize(
             wxSize(-1, std::max(m_top_surface_contoning_color_lower_surfaces_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
         contoning_checkboxes_root->Add(m_top_surface_contoning_color_lower_surfaces_checkbox,
+                                       0,
+                                       wxEXPAND | wxTOP | wxBOTTOM,
+                                       gap / 2);
+        m_top_surface_contoning_td_adjustment_checkbox =
+            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("TD adjustment"));
+        m_top_surface_contoning_td_adjustment_checkbox->SetValue(top_surface_contoning_td_adjustment_enabled);
+        m_top_surface_contoning_td_adjustment_checkbox->SetMinSize(
+            wxSize(-1, std::max(m_top_surface_contoning_td_adjustment_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+        contoning_checkboxes_root->Add(m_top_surface_contoning_td_adjustment_checkbox,
                                        0,
                                        wxEXPAND | wxTOP | wxBOTTOM,
                                        gap / 2);
@@ -3267,6 +3277,12 @@ public:
             TextureMappingZone::DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled :
             m_top_surface_contoning_surface_anchored_stacks_checkbox->GetValue();
     }
+    bool top_surface_contoning_td_adjustment_enabled() const
+    {
+        return m_top_surface_contoning_td_adjustment_checkbox == nullptr ?
+            TextureMappingZone::DefaultTopSurfaceContoningTdAdjustmentEnabled :
+            m_top_surface_contoning_td_adjustment_checkbox->GetValue();
+    }
     bool minimum_visibility_offset_enabled() const
     {
         return m_minimum_visibility_offset_checkbox && m_minimum_visibility_offset_checkbox->GetValue();
@@ -3723,6 +3739,10 @@ private:
             m_top_surface_contoning_color_lower_surfaces_checkbox->Show(contoning);
             m_top_surface_contoning_color_lower_surfaces_checkbox->Enable(contoning);
         }
+        if (m_top_surface_contoning_td_adjustment_checkbox != nullptr) {
+            m_top_surface_contoning_td_adjustment_checkbox->Show(contoning);
+            m_top_surface_contoning_td_adjustment_checkbox->Enable(contoning);
+        }
         if (m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox != nullptr) {
             m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox->Show(contoning);
             m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox->Enable(contoning);
@@ -3856,6 +3876,7 @@ private:
     wxPanel *m_top_surface_contoning_polygonize_resolution_panel {nullptr};
     wxChoice *m_top_surface_contoning_polygonize_resolution_choice {nullptr};
     wxCheckBox *m_top_surface_contoning_surface_anchored_stacks_checkbox {nullptr};
+    wxCheckBox *m_top_surface_contoning_td_adjustment_checkbox {nullptr};
     wxCheckBox *m_use_legacy_fixed_color_mode_checkbox {nullptr};
     wxCheckBox *m_minimum_visibility_offset_checkbox {nullptr};
     wxSpinCtrl *m_minimum_visibility_offset_spin {nullptr};
@@ -8880,6 +8901,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.top_surface_contoning_polygonize_color_regions_enabled,
                                                     updated.top_surface_contoning_polygonize_resolution,
                                                     updated.top_surface_contoning_surface_anchored_stacks_enabled,
+                                                    updated.top_surface_contoning_td_adjustment_enabled,
                                                     bundle->texture_mapping_zones,
                                                     bundle->texture_mapping_global_settings,
                                                     wxGetApp().model().texture_mapping_prime_tower_image,
@@ -8955,6 +8977,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 dlg.top_surface_contoning_polygonize_resolution();
             updated.top_surface_contoning_surface_anchored_stacks_enabled =
                 dlg.top_surface_contoning_surface_anchored_stacks_enabled();
+            updated.top_surface_contoning_td_adjustment_enabled =
+                dlg.top_surface_contoning_td_adjustment_enabled();
             if (updated.top_surface_image_printing_enabled &&
                 updated.top_surface_image_printing_method == int(TextureMappingZone::TopSurfaceImageContoning)) {
                 updated.modulation_mode = int(TextureMappingZone::ModulationPerimeterPathV2);

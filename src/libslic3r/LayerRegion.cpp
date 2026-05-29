@@ -528,7 +528,10 @@ static std::optional<PerimeterTextureRecolorSampler> perimeter_texture_make_reco
         if (zone.top_surface_contoning_perimeters_active()) {
             sampler.contoning = true;
             sampler.contoning_solver =
-                TextureMappingContoningSolver(zone, print_config, sampler.image_context->component_ids);
+                TextureMappingContoningSolver(zone,
+                                              print_config,
+                                              sampler.image_context->component_ids,
+                                              layer != nullptr ? float(layer->height) : 0.f);
             sampler.contoning_stack_layers =
                 std::clamp(zone.top_surface_contoning_stack_layers,
                            TextureMappingZone::MinTopSurfaceContoningStackLayers,

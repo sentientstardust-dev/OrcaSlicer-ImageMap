@@ -504,6 +504,7 @@ struct TopSurfaceImageRegionPlan {
     bool contoning_polygonize_color_regions_enabled = false;
     int contoning_polygonize_resolution = TextureMappingZone::DefaultTopSurfaceContoningPolygonizeResolution;
     bool contoning_surface_anchored_stacks_enabled = false;
+    bool contoning_td_adjustment_enabled = TextureMappingZone::DefaultTopSurfaceContoningTdAdjustmentEnabled;
     int contoning_flat_surface_infill_mode = TextureMappingZone::SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode;
 };
 
@@ -1166,6 +1167,7 @@ struct TopSurfaceImageContoningStackPlanKey {
     bool blue_noise { false };
     bool polygonize { false };
     int polygonize_resolution { 1 };
+    bool td_adjustment { false };
 
     bool operator<(const TopSurfaceImageContoningStackPlanKey &rhs) const
     {
@@ -1192,7 +1194,8 @@ struct TopSurfaceImageContoningStackPlanKey {
                         supersampled,
                         blue_noise,
                         polygonize,
-                        polygonize_resolution) <
+                        polygonize_resolution,
+                        td_adjustment) <
                std::tie(rhs.source_layer,
                         rhs.source_layer_id,
                         rhs.target_layer,
@@ -1216,7 +1219,8 @@ struct TopSurfaceImageContoningStackPlanKey {
                         rhs.supersampled,
                         rhs.blue_noise,
                         rhs.polygonize,
-                        rhs.polygonize_resolution);
+                        rhs.polygonize_resolution,
+                        rhs.td_adjustment);
     }
 };
 
@@ -1318,29 +1322,6 @@ static float top_surface_image_contoning_oklab_error(const std::array<float, 3> 
     const float da = lhs[1] - rhs[1];
     const float db = lhs[2] - rhs[2];
     return dl * dl + 4.f * da * da + 4.f * db * db;
-}
-
-static std::optional<std::array<float, 3>> top_surface_image_contoning_stack_rgb(
-    const std::vector<unsigned int> &bottom_to_top,
-    const PrintConfig               &print_config)
-{
-    if (bottom_to_top.empty())
-        return std::nullopt;
-    std::vector<std::array<float, 3>> colors;
-    std::vector<float> weights;
-    colors.reserve(bottom_to_top.size());
-    weights.reserve(bottom_to_top.size());
-    const float weight = 1.f / float(bottom_to_top.size());
-    for (unsigned int component_id : bottom_to_top) {
-        if (component_id == 0 || component_id > print_config.filament_colour.values.size())
-            return std::nullopt;
-        ColorRGB color;
-        if (!decode_color(print_config.filament_colour.get_at(size_t(component_id - 1)), color))
-            return std::nullopt;
-        colors.push_back({ color.r(), color.g(), color.b() });
-        weights.emplace_back(weight);
-    }
-    return mix_color_solver_components(colors, weights, ColorSolverMixModel::PigmentPainter);
 }
 
 static float top_surface_image_contoning_sample_pitch_mm(const TopSurfaceImageRegionPlan &plan,
@@ -1704,6 +1685,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
     const ExPolygons                                            &area,
     float                                                        min_feature_mm,
     bool                                                         polygonize_color_regions,
+    bool                                                         lower_surface,
     const ThrowIfCanceled                                       *throw_if_canceled)
 {
     std::vector<TopSurfaceImageContoningVectorRegion> regions;
@@ -1729,7 +1711,9 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
             continue;
         const int pattern_depth = depth % int(bottom_to_top.size());
         const unsigned int component_id =
-            bottom_to_top[size_t(int(bottom_to_top.size()) - 1 - pattern_depth)];
+            lower_surface ?
+                bottom_to_top[size_t(pattern_depth)] :
+                bottom_to_top[size_t(int(bottom_to_top.size()) - 1 - pattern_depth)];
         if (component_id == 0 || component_id > max_component_id)
             continue;
         component_grid[idx] = int(component_id);
@@ -1969,15 +1953,15 @@ static std::optional<TopSurfaceImageContoningSolvedLabel> top_surface_image_cont
     const std::array<float, 3>                         &rgb,
     int                                                 solve_layers,
     const TextureMappingContoningSolver                &solver,
-    const PrintConfig                                  &print_config,
+    bool                                                lower_surface,
     std::vector<TopSurfaceImageContoningVectorLabel>   &labels,
     std::map<std::vector<unsigned int>, int>           &label_by_stack)
 {
-    TextureMappingContoningStack stack = solver.solve(rgb, solve_layers);
+    TextureMappingContoningStack stack = solver.solve(rgb, solve_layers, lower_surface);
     if (stack.bottom_to_top.empty())
         return std::nullopt;
     std::optional<std::array<float, 3>> stack_rgb =
-        top_surface_image_contoning_stack_rgb(stack.bottom_to_top, print_config);
+        solver.stack_rgb(stack.bottom_to_top, lower_surface);
     if (!stack_rgb)
         return std::nullopt;
     auto label_it = label_by_stack.find(stack.bottom_to_top);
@@ -2124,7 +2108,13 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
 
     auto solve_cell = [&](int row, int col, const std::array<float, 3> &target_rgb, int solve_layers) {
         std::optional<TopSurfaceImageContoningSolvedLabel> solved =
-            top_surface_image_contoning_solve_label(target_rgb, solve_layers, solver, print_config, labels, label_by_stack);
+            top_surface_image_contoning_solve_label(target_rgb,
+                                                    solve_layers,
+                                                    solver,
+                                                    source_surface == TopSurfaceImageSourceSurface::Bottom &&
+                                                        plan.contoning_td_adjustment_enabled,
+                                                    labels,
+                                                    label_by_stack);
         if (!solved)
             return std::optional<TopSurfaceImageContoningSolvedLabel>();
         grid[size_t(row * cols + col)] = solved->label;
@@ -2247,6 +2237,8 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                                   area,
                                                                   plan.contoning_min_feature_mm,
                                                                   plan.contoning_polygonize_color_regions_enabled,
+                                                                  source_surface == TopSurfaceImageSourceSurface::Bottom &&
+                                                                      plan.contoning_td_adjustment_enabled,
                                                                   throw_if_canceled);
 }
 
@@ -2306,7 +2298,13 @@ static std::shared_ptr<const TopSurfaceImageContoningStackPlan> top_surface_imag
 
     auto solve_cell = [&](int row, int col, const std::array<float, 3> &target_rgb, int solve_layers, int available_depth) {
         std::optional<TopSurfaceImageContoningSolvedLabel> solved =
-            top_surface_image_contoning_solve_label(target_rgb, solve_layers, solver, print_config, out->labels, label_by_stack);
+            top_surface_image_contoning_solve_label(target_rgb,
+                                                    solve_layers,
+                                                    solver,
+                                                    source_surface == TopSurfaceImageSourceSurface::Bottom &&
+                                                        plan.contoning_td_adjustment_enabled,
+                                                    out->labels,
+                                                    label_by_stack);
         if (!solved)
             return std::optional<TopSurfaceImageContoningSolvedLabel>();
         TopSurfaceImageContoningStackPlanCell &cell = out->cells[size_t(row * cols + col)];
@@ -2470,6 +2468,7 @@ static TopSurfaceImageContoningStackPlanKey top_surface_image_contoning_stack_pl
     key.polygonize_resolution = plan.contoning_polygonize_color_regions_enabled ?
         TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(plan.contoning_polygonize_resolution) :
         1;
+    key.td_adjustment = plan.contoning_td_adjustment_enabled;
     return key;
 }
 
@@ -2511,6 +2510,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
     const TopSurfaceImageContoningStackPlan  &stack_plan,
     const ExPolygons                         &area,
     int                                       depth,
+    TopSurfaceImageSourceSurface              source_surface,
     const ThrowIfCanceled                    *throw_if_canceled)
 {
     std::vector<TopSurfaceImageContoningVectorRegion> regions;
@@ -2550,6 +2550,8 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                                   area,
                                                                   plan.contoning_min_feature_mm,
                                                                   plan.contoning_polygonize_color_regions_enabled,
+                                                                  source_surface == TopSurfaceImageSourceSurface::Bottom &&
+                                                                      plan.contoning_td_adjustment_enabled,
                                                                   throw_if_canceled);
 }
 
@@ -2889,7 +2891,12 @@ static void top_surface_image_append_contoning_slices(TopSurfaceImageRegionPlan 
                                                        stack_area_extensions_ptr,
                                                        throw_if_canceled);
             const std::vector<TopSurfaceImageContoningVectorRegion> stack_regions =
-                top_surface_image_contoning_vector_regions_from_stack_plan(plan, *stack_plan, vector_area, depth, throw_if_canceled);
+                top_surface_image_contoning_vector_regions_from_stack_plan(plan,
+                                                                           *stack_plan,
+                                                                           vector_area,
+                                                                           depth,
+                                                                           source_surface,
+                                                                           throw_if_canceled);
             append_regions(stack_regions, true, include_perimeter_regions);
         }
     } else if (plan.contoning_blue_noise_error_diffusion_enabled) {
@@ -3122,7 +3129,8 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
             TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(zone->top_surface_contoning_polygonize_resolution);
         plan.contoning_surface_anchored_stacks_enabled =
             zone->effective_top_surface_contoning_surface_anchored_stacks_enabled();
-        const TextureMappingContoningSolver contoning_solver(*zone, print_config, components);
+        plan.contoning_td_adjustment_enabled = zone->top_surface_contoning_td_adjustment_enabled;
+        const TextureMappingContoningSolver contoning_solver(*zone, print_config, components, float(layer.height));
 
         const int stack_depth = plan.contoning ?
             plan.contoning_stack_layers :

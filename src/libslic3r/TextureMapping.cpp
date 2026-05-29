@@ -1148,6 +1148,7 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(top_surface_contoning_polygonize_resolution) ==
                TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(rhs.top_surface_contoning_polygonize_resolution) &&
            effective_top_surface_contoning_surface_anchored_stacks_enabled() == rhs.effective_top_surface_contoning_surface_anchored_stacks_enabled() &&
+           top_surface_contoning_td_adjustment_enabled == rhs.top_surface_contoning_td_adjustment_enabled &&
            compact_offset_mode == rhs.compact_offset_mode &&
            use_legacy_fixed_color_mode == rhs.use_legacy_fixed_color_mode &&
            high_speed_image_texture_sampling == rhs.high_speed_image_texture_sampling &&
@@ -1548,6 +1549,8 @@ std::string TextureMappingManager::serialize_entries()
             TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(zone.top_surface_contoning_polygonize_resolution);
         texture["top_surface_contoning_surface_anchored_stacks_enabled"] =
             zone.effective_top_surface_contoning_surface_anchored_stacks_enabled();
+        texture["top_surface_contoning_td_adjustment_enabled"] =
+            zone.top_surface_contoning_td_adjustment_enabled;
         texture["compact_offset_mode"] = zone.compact_offset_mode;
         texture["use_legacy_fixed_color_mode"] = zone.use_legacy_fixed_color_mode;
         texture["high_speed_image_texture_sampling"] = true;
@@ -1844,6 +1847,9 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.top_surface_contoning_surface_anchored_stacks_enabled =
             texture.value("top_surface_contoning_surface_anchored_stacks_enabled",
                           TextureMappingZone::DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled);
+        zone.top_surface_contoning_td_adjustment_enabled =
+            texture.value("top_surface_contoning_td_adjustment_enabled",
+                          TextureMappingZone::DefaultTopSurfaceContoningTdAdjustmentEnabled);
         zone.apply_top_surface_contoning_experimental_defaults();
         zone.compact_offset_mode = texture.value("compact_offset_mode", TextureMappingZone::DefaultCompactOffsetMode);
         zone.use_legacy_fixed_color_mode =

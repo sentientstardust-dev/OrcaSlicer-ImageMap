@@ -204,6 +204,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled = true;
     static constexpr int   DefaultTopSurfaceContoningPolygonizeResolution = 4;
     static constexpr bool  DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled = false;
+    static constexpr bool  DefaultTopSurfaceContoningTdAdjustmentEnabled = true;
     static constexpr bool  DefaultCompactOffsetMode = true;
     static constexpr bool  DefaultUseLegacyFixedColorMode = false;
     static constexpr bool  DefaultHighSpeedImageTextureSampling = true;
@@ -362,6 +363,7 @@ struct TextureMappingZone
     bool        top_surface_contoning_polygonize_color_regions_enabled = DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled;
     int         top_surface_contoning_polygonize_resolution = DefaultTopSurfaceContoningPolygonizeResolution;
     bool        top_surface_contoning_surface_anchored_stacks_enabled = DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled;
+    bool        top_surface_contoning_td_adjustment_enabled = DefaultTopSurfaceContoningTdAdjustmentEnabled;
     bool        compact_offset_mode = DefaultCompactOffsetMode;
     bool        use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
     bool        high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;
@@ -553,6 +555,7 @@ struct TextureMappingZone
         top_surface_contoning_polygonize_color_regions_enabled = DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled;
         top_surface_contoning_polygonize_resolution = DefaultTopSurfaceContoningPolygonizeResolution;
         top_surface_contoning_surface_anchored_stacks_enabled = DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled;
+        top_surface_contoning_td_adjustment_enabled = DefaultTopSurfaceContoningTdAdjustmentEnabled;
         compact_offset_mode = DefaultCompactOffsetMode;
         use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
         high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;
