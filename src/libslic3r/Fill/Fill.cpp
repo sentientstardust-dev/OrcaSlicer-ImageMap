@@ -505,6 +505,8 @@ struct TopSurfaceImageRegionPlan {
     int contoning_polygonize_resolution = TextureMappingZone::DefaultTopSurfaceContoningPolygonizeResolution;
     bool contoning_surface_anchored_stacks_enabled = false;
     bool contoning_td_adjustment_enabled = TextureMappingZone::DefaultTopSurfaceContoningTdAdjustmentEnabled;
+    bool contoning_surface_scatter_enabled = TextureMappingZone::DefaultTopSurfaceContoningSurfaceScatterEnabled;
+    bool contoning_beer_lambert_rgb_correction_enabled = TextureMappingZone::DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled;
     int contoning_flat_surface_infill_mode = TextureMappingZone::SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode;
 };
 
@@ -1169,6 +1171,8 @@ struct TopSurfaceImageContoningStackPlanKey {
     bool polygonize { false };
     int polygonize_resolution { 1 };
     bool td_adjustment { false };
+    bool surface_scatter { false };
+    bool beer_lambert_rgb_correction { false };
 
     bool operator<(const TopSurfaceImageContoningStackPlanKey &rhs) const
     {
@@ -1196,7 +1200,9 @@ struct TopSurfaceImageContoningStackPlanKey {
                         blue_noise,
                         polygonize,
                         polygonize_resolution,
-                        td_adjustment) <
+                        td_adjustment,
+                        surface_scatter,
+                        beer_lambert_rgb_correction) <
                std::tie(rhs.source_layer,
                         rhs.source_layer_id,
                         rhs.target_layer,
@@ -1221,7 +1227,9 @@ struct TopSurfaceImageContoningStackPlanKey {
                         rhs.blue_noise,
                         rhs.polygonize,
                         rhs.polygonize_resolution,
-                        rhs.td_adjustment);
+                        rhs.td_adjustment,
+                        rhs.surface_scatter,
+                        rhs.beer_lambert_rgb_correction);
     }
 };
 
@@ -2622,6 +2630,8 @@ static TopSurfaceImageContoningStackPlanKey top_surface_image_contoning_stack_pl
         TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(plan.contoning_polygonize_resolution) :
         1;
     key.td_adjustment = plan.contoning_td_adjustment_enabled;
+    key.surface_scatter = plan.contoning_surface_scatter_enabled;
+    key.beer_lambert_rgb_correction = plan.contoning_beer_lambert_rgb_correction_enabled;
     return key;
 }
 
@@ -3285,6 +3295,10 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
         plan.contoning_surface_anchored_stacks_enabled =
             zone->effective_top_surface_contoning_surface_anchored_stacks_enabled();
         plan.contoning_td_adjustment_enabled = zone->top_surface_contoning_td_adjustment_enabled;
+        plan.contoning_surface_scatter_enabled =
+            plan.contoning_td_adjustment_enabled && zone->top_surface_contoning_surface_scatter_enabled;
+        plan.contoning_beer_lambert_rgb_correction_enabled =
+            plan.contoning_td_adjustment_enabled && zone->top_surface_contoning_beer_lambert_rgb_correction_enabled;
         const TextureMappingContoningSolver contoning_solver(*zone, print_config, components, float(layer.height));
 
         const int stack_depth = plan.contoning ?

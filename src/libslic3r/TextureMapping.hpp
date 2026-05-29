@@ -185,7 +185,7 @@ struct TextureMappingZone
     static constexpr int   DefaultTopSurfaceContoningStackLayers = 100;
     static constexpr int   MinTopSurfaceContoningPatternFilaments = 1;
     static constexpr int   MaxTopSurfaceContoningPatternFilaments = 100;
-    static constexpr int   DefaultTopSurfaceContoningPatternFilaments = 5;
+    static constexpr int   DefaultTopSurfaceContoningPatternFilaments = 8;
     static constexpr float MinTopSurfaceContoningMinFeatureMm = 0.f;
     static constexpr float MaxTopSurfaceContoningMinFeatureMm = 20.f;
     static constexpr float DefaultTopSurfaceContoningMinFeatureMm = 0.f;
@@ -205,6 +205,8 @@ struct TextureMappingZone
     static constexpr int   DefaultTopSurfaceContoningPolygonizeResolution = 4;
     static constexpr bool  DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningTdAdjustmentEnabled = true;
+    static constexpr bool  DefaultTopSurfaceContoningSurfaceScatterEnabled = true;
+    static constexpr bool  DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled = false;
     static constexpr bool  DefaultCompactOffsetMode = true;
     static constexpr bool  DefaultUseLegacyFixedColorMode = false;
     static constexpr bool  DefaultHighSpeedImageTextureSampling = true;
@@ -384,6 +386,8 @@ struct TextureMappingZone
     int         top_surface_contoning_polygonize_resolution = DefaultTopSurfaceContoningPolygonizeResolution;
     bool        top_surface_contoning_surface_anchored_stacks_enabled = DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled;
     bool        top_surface_contoning_td_adjustment_enabled = DefaultTopSurfaceContoningTdAdjustmentEnabled;
+    bool        top_surface_contoning_surface_scatter_enabled = DefaultTopSurfaceContoningSurfaceScatterEnabled;
+    bool        top_surface_contoning_beer_lambert_rgb_correction_enabled = DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled;
     bool        compact_offset_mode = DefaultCompactOffsetMode;
     bool        use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
     bool        high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;
@@ -604,6 +608,8 @@ struct TextureMappingZone
         top_surface_contoning_polygonize_resolution = DefaultTopSurfaceContoningPolygonizeResolution;
         top_surface_contoning_surface_anchored_stacks_enabled = DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled;
         top_surface_contoning_td_adjustment_enabled = DefaultTopSurfaceContoningTdAdjustmentEnabled;
+        top_surface_contoning_surface_scatter_enabled = DefaultTopSurfaceContoningSurfaceScatterEnabled;
+        top_surface_contoning_beer_lambert_rgb_correction_enabled = DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled;
         compact_offset_mode = DefaultCompactOffsetMode;
         use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
         high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;

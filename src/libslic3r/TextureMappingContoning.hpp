@@ -67,6 +67,7 @@ private:
     float m_layer_height_mm { 0.2f };
     float m_surface_scatter { 0.f };
     bool m_td_adjustment_enabled { false };
+    bool m_beer_lambert_rgb_correction_enabled { false };
     mutable std::map<int, std::vector<Candidate>> m_candidates_by_depth;
     mutable std::shared_ptr<ColorSolverOrderedStackCandidateCache> m_ordered_candidate_cache { std::make_shared<ColorSolverOrderedStackCandidateCache>() };
     mutable std::shared_ptr<std::mutex> m_ordered_candidate_cache_mutex { std::make_shared<std::mutex>() };

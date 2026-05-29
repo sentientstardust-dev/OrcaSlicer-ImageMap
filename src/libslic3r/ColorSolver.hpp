@@ -110,7 +110,8 @@ std::array<float, 3> mix_color_solver_ordered_stack(const std::vector<std::array
                                                     const std::vector<float>                &layer_opacities,
                                                     const std::array<float, 3>              &background_rgb,
                                                     ColorSolverMixModel                       mix_model,
-                                                    float                                     surface_scatter = 0.f);
+                                                    float                                     surface_scatter = 0.f,
+                                                    bool                                      beer_lambert_rgb_correction = false);
 std::array<float, 3> color_solver_oklab_from_srgb(const std::array<float, 3> &rgb);
 std::array<float, 3> color_solver_srgb_from_oklab(const std::array<float, 3> &oklab);
 
@@ -136,7 +137,8 @@ std::string color_solver_ordered_stack_candidate_cache_key(const std::vector<std
                                                            int                                       simulated_stack_depth = 0,
                                                            size_t                                    candidate_limit = 0,
                                                            size_t                                    stack_item_limit = 0,
-                                                           float                                     surface_scatter = 0.f);
+                                                           float                                     surface_scatter = 0.f,
+                                                           bool                                      beer_lambert_rgb_correction = false);
 ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
     const std::vector<std::array<float, 3>> &component_colors,
     const std::vector<float>                &layer_opacities,
@@ -146,7 +148,8 @@ ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
     int                                       simulated_stack_depth = 0,
     size_t                                    candidate_limit = 0,
     size_t                                    stack_item_limit = 0,
-    float                                     surface_scatter = 0.f);
+    float                                     surface_scatter = 0.f,
+    bool                                      beer_lambert_rgb_correction = false);
 const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates(
     ColorSolverOrderedStackCandidateCache        &cache,
     const std::vector<std::array<float, 3>>      &component_colors,
@@ -157,7 +160,8 @@ const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates
     int                                            simulated_stack_depth = 0,
     size_t                                         candidate_limit = 0,
     size_t                                         stack_item_limit = 0,
-    float                                          surface_scatter = 0.f);
+    float                                          surface_scatter = 0.f,
+    bool                                           beer_lambert_rgb_correction = false);
 std::vector<uint16_t> solve_color_solver_ordered_stack_for_target(
     const ColorSolverOrderedStackCandidateSet &candidates,
     const std::array<float, 3>                &target_rgb,

@@ -2094,6 +2094,8 @@ public:
                                         int top_surface_contoning_polygonize_resolution,
                                         bool top_surface_contoning_surface_anchored_stacks_enabled,
                                         bool top_surface_contoning_td_adjustment_enabled,
+                                        bool top_surface_contoning_surface_scatter_enabled,
+                                        bool top_surface_contoning_beer_lambert_rgb_correction_enabled,
                                         const TextureMappingZoneShellUsageSummary &top_surface_contoning_shell_usage,
                                         const TextureMappingManager &texture_mapping_zones,
                                         const TextureMappingGlobalSettings &global_settings,
@@ -2781,6 +2783,24 @@ public:
                                        0,
                                        wxEXPAND | wxTOP | wxBOTTOM,
                                        gap / 2);
+        m_top_surface_contoning_surface_scatter_checkbox =
+            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Surface scatter correction"));
+        m_top_surface_contoning_surface_scatter_checkbox->SetValue(top_surface_contoning_surface_scatter_enabled);
+        m_top_surface_contoning_surface_scatter_checkbox->SetMinSize(
+            wxSize(-1, std::max(m_top_surface_contoning_surface_scatter_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+        contoning_checkboxes_root->Add(m_top_surface_contoning_surface_scatter_checkbox,
+                                       0,
+                                       wxEXPAND | wxTOP | wxBOTTOM,
+                                       gap / 2);
+        m_top_surface_contoning_beer_lambert_rgb_correction_checkbox =
+            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("RGB Beer-Lambert correction"));
+        m_top_surface_contoning_beer_lambert_rgb_correction_checkbox->SetValue(top_surface_contoning_beer_lambert_rgb_correction_enabled);
+        m_top_surface_contoning_beer_lambert_rgb_correction_checkbox->SetMinSize(
+            wxSize(-1, std::max(m_top_surface_contoning_beer_lambert_rgb_correction_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+        contoning_checkboxes_root->Add(m_top_surface_contoning_beer_lambert_rgb_correction_checkbox,
+                                       0,
+                                       wxEXPAND | wxTOP | wxBOTTOM,
+                                       gap / 2);
         m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox =
             new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Only one perimeter around shell infill"));
         m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox->SetValue(
@@ -2956,6 +2976,17 @@ public:
         }
         if (m_top_surface_contoning_td_adjustment_checkbox != nullptr) {
             m_top_surface_contoning_td_adjustment_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+                update_top_surface_image_options_visibility(false);
+                queue_top_surface_contoning_message_update(true);
+            });
+        }
+        if (m_top_surface_contoning_surface_scatter_checkbox != nullptr) {
+            m_top_surface_contoning_surface_scatter_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+                queue_top_surface_contoning_message_update(true);
+            });
+        }
+        if (m_top_surface_contoning_beer_lambert_rgb_correction_checkbox != nullptr) {
+            m_top_surface_contoning_beer_lambert_rgb_correction_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
                 queue_top_surface_contoning_message_update(true);
             });
         }
@@ -3445,6 +3476,19 @@ public:
             TextureMappingZone::DefaultTopSurfaceContoningTdAdjustmentEnabled :
             m_top_surface_contoning_td_adjustment_checkbox->GetValue();
     }
+    bool top_surface_contoning_surface_scatter_enabled() const
+    {
+        return m_top_surface_contoning_surface_scatter_checkbox == nullptr ?
+            TextureMappingZone::DefaultTopSurfaceContoningSurfaceScatterEnabled :
+            m_top_surface_contoning_surface_scatter_checkbox->GetValue();
+    }
+    bool top_surface_contoning_beer_lambert_rgb_correction_enabled() const
+    {
+        return top_surface_contoning_td_adjustment_enabled() &&
+            (m_top_surface_contoning_beer_lambert_rgb_correction_checkbox == nullptr ?
+                 TextureMappingZone::DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled :
+                 m_top_surface_contoning_beer_lambert_rgb_correction_checkbox->GetValue());
+    }
     bool minimum_visibility_offset_enabled() const
     {
         return m_minimum_visibility_offset_checkbox && m_minimum_visibility_offset_checkbox->GetValue();
@@ -3779,7 +3823,7 @@ private:
             return 0;
         const float layer_height = top_surface_contoning_layer_height_mm();
         const float safe_strength = std::clamp(strength, 0.01f, 0.99f);
-        constexpr float surface_scatter = 0.12f;
+        const float surface_scatter = top_surface_contoning_surface_scatter_enabled() ? 0.12f : 0.f;
         if (safe_strength <= surface_scatter)
             return 1;
         const float remaining = std::clamp((1.f - safe_strength) / (1.f - surface_scatter), 1e-6f, 0.999999f);
@@ -4230,6 +4274,22 @@ private:
             m_top_surface_contoning_td_adjustment_checkbox->Show(contoning);
             m_top_surface_contoning_td_adjustment_checkbox->Enable(contoning);
         }
+        if (m_top_surface_contoning_surface_scatter_checkbox != nullptr) {
+            const bool td_adjustment =
+                contoning &&
+                m_top_surface_contoning_td_adjustment_checkbox != nullptr &&
+                m_top_surface_contoning_td_adjustment_checkbox->GetValue();
+            m_top_surface_contoning_surface_scatter_checkbox->Show(contoning);
+            m_top_surface_contoning_surface_scatter_checkbox->Enable(td_adjustment);
+        }
+        if (m_top_surface_contoning_beer_lambert_rgb_correction_checkbox != nullptr) {
+            const bool td_adjustment =
+                contoning &&
+                m_top_surface_contoning_td_adjustment_checkbox != nullptr &&
+                m_top_surface_contoning_td_adjustment_checkbox->GetValue();
+            m_top_surface_contoning_beer_lambert_rgb_correction_checkbox->Show(contoning);
+            m_top_surface_contoning_beer_lambert_rgb_correction_checkbox->Enable(td_adjustment);
+        }
         if (m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox != nullptr) {
             m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox->Show(contoning);
             m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox->Enable(contoning);
@@ -4376,6 +4436,8 @@ private:
     wxChoice *m_top_surface_contoning_polygonize_resolution_choice {nullptr};
     wxCheckBox *m_top_surface_contoning_surface_anchored_stacks_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_td_adjustment_checkbox {nullptr};
+    wxCheckBox *m_top_surface_contoning_surface_scatter_checkbox {nullptr};
+    wxCheckBox *m_top_surface_contoning_beer_lambert_rgb_correction_checkbox {nullptr};
     wxCheckBox *m_use_legacy_fixed_color_mode_checkbox {nullptr};
     wxCheckBox *m_minimum_visibility_offset_checkbox {nullptr};
     wxSpinCtrl *m_minimum_visibility_offset_spin {nullptr};
@@ -9404,6 +9466,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.top_surface_contoning_polygonize_resolution,
                                                     updated.top_surface_contoning_surface_anchored_stacks_enabled,
                                                     updated.top_surface_contoning_td_adjustment_enabled,
+                                                    updated.top_surface_contoning_surface_scatter_enabled,
+                                                    updated.top_surface_contoning_beer_lambert_rgb_correction_enabled,
                                                     shell_usage,
                                                     bundle->texture_mapping_zones,
                                                     bundle->texture_mapping_global_settings,
@@ -9482,6 +9546,10 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 dlg.top_surface_contoning_surface_anchored_stacks_enabled();
             updated.top_surface_contoning_td_adjustment_enabled =
                 dlg.top_surface_contoning_td_adjustment_enabled();
+            updated.top_surface_contoning_surface_scatter_enabled =
+                dlg.top_surface_contoning_surface_scatter_enabled();
+            updated.top_surface_contoning_beer_lambert_rgb_correction_enabled =
+                dlg.top_surface_contoning_beer_lambert_rgb_correction_enabled();
             if (updated.top_surface_image_printing_enabled &&
                 updated.top_surface_image_printing_method == int(TextureMappingZone::TopSurfaceImageContoning)) {
                 updated.modulation_mode = int(TextureMappingZone::ModulationPerimeterPathV2);
