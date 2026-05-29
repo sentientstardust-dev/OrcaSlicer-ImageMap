@@ -23,6 +23,7 @@
 #include "libslic3r/TextureMapping.hpp"
 #include "libslic3r/ColorSolver.hpp"
 #include "libslic3r/Geometry.hpp"
+#include "libslic3r/AABBMesh.hpp"
 #include "slic3r/Utils/UndoRedo.hpp"
 #include "GLGizmosCommon.hpp"
 #include "GLGizmoUtils.hpp"
@@ -42,12 +43,15 @@
 #include <exception>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
 #include <cereal/types/string.hpp>
 #include <cereal/types/vector.hpp>
 #include <boost/log/trivial.hpp>
@@ -3048,6 +3052,7 @@ struct ProjectionContext
     float                        image_opacity = 1.f;
     float                        overlay_rotation_deg = 0.f;
     bool                         apply_transparency_as_background = false;
+    bool                         camera_perspective = true;
     ClippingPlane                section_clipping_plane;
     std::vector<Transform3d>     volume_world_matrices;
 };
@@ -3067,6 +3072,7 @@ struct GLGizmoImageProjection::ProjectionInput
     bool                         project_regions = false;
     bool                         erase_region_painting = true;
     bool                         text_mode = false;
+    bool                         improve_projection_accuracy = false;
     int                          raw_projection_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
 };
 
@@ -5616,6 +5622,14 @@ static bool projection_point_allowed_by_camera_facing(const ProjectionContext   
     return projection_sample_allowed_by_camera_facing(context, world_point, world_normal);
 }
 
+struct ProjectionExactVisibilityVolume
+{
+    size_t                    volume_idx = 0;
+    Transform3d               world_matrix = Transform3d::Identity();
+    Transform3d               inverse_world_matrix = Transform3d::Identity();
+    std::unique_ptr<AABBMesh> aabb;
+};
+
 struct ProjectionVisibility
 {
     int                width = 0;
@@ -5628,6 +5642,11 @@ struct ProjectionVisibility
     std::vector<float> camera_depth;
     float              camera_depth_tolerance = 0.05f;
     std::vector<uint64_t> triangle_keys;
+    bool               exact = false;
+    bool               exact_perspective = true;
+    double             exact_ray_length = 1.0;
+    double             exact_world_tolerance = 1e-4;
+    std::vector<ProjectionExactVisibilityVolume> exact_volumes;
 };
 
 static constexpr float PROJECTION_VISIBILITY_DEPTH_TOLERANCE = 2e-4f;
@@ -5652,6 +5671,11 @@ static bool projection_visibility_valid(const ProjectionVisibility &visibility)
            visibility.local_depth_tolerance.size() == visibility.depth.size() &&
            visibility.camera_depth.size() == visibility.depth.size() &&
            visibility.triangle_keys.size() == visibility.depth.size();
+}
+
+static bool projection_visibility_exact(const ProjectionVisibility &visibility)
+{
+    return visibility.exact && !visibility.exact_volumes.empty();
 }
 
 static void projection_visibility_prepare_camera_depth_tolerance(ProjectionVisibility &visibility)
@@ -5798,12 +5822,151 @@ static bool projection_visibility_depth_matches_sample(const ProjectionVisibilit
     return false;
 }
 
+static ProjectionVisibility build_projection_exact_visibility(const ProjectionContext &context,
+                                                              const GLCanvas3D       &parent,
+                                                              const ModelObject      *object,
+                                                              int                     instance_idx,
+                                                              const ImageProjectionCancelCheckFn &check_cancel = {})
+{
+    ProjectionVisibility visibility;
+    visibility.exact = true;
+    visibility.exact_perspective = context.camera_perspective;
+    if (object == nullptr || context.overlay_width <= 0.f || context.overlay_height <= 0.f)
+        return visibility;
+
+    double min_depth = std::numeric_limits<double>::max();
+    double max_depth = std::numeric_limits<double>::lowest();
+    Vec3d min_point = Vec3d::Constant(std::numeric_limits<double>::max());
+    Vec3d max_point = Vec3d::Constant(std::numeric_limits<double>::lowest());
+
+    for (size_t volume_idx = 0; volume_idx < object->volumes.size(); ++volume_idx) {
+        if (check_cancel)
+            check_cancel();
+        const ModelVolume *volume = object->volumes[volume_idx];
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+
+        const indexed_triangle_set &its = volume->mesh().its;
+        if (its.vertices.empty() || its.indices.empty())
+            continue;
+
+        ProjectionExactVisibilityVolume exact_volume;
+        exact_volume.volume_idx = volume_idx;
+        exact_volume.world_matrix = projection_world_matrix_for_context(context, parent, object, volume, volume_idx, instance_idx);
+        exact_volume.inverse_world_matrix = exact_volume.world_matrix.inverse();
+        exact_volume.aabb = std::make_unique<AABBMesh>(its, true);
+        visibility.exact_volumes.emplace_back(std::move(exact_volume));
+
+        const Transform3d &world_matrix = visibility.exact_volumes.back().world_matrix;
+        for (const Vec3f &vertex : its.vertices) {
+            const Vec3d world_point = world_matrix * vertex.cast<double>();
+            const double depth = double(projection_camera_depth(context, world_point));
+            if (std::isfinite(depth)) {
+                min_depth = std::min(min_depth, depth);
+                max_depth = std::max(max_depth, depth);
+            }
+            for (int axis = 0; axis < 3; ++axis) {
+                min_point[axis] = std::min(min_point[axis], world_point[axis]);
+                max_point[axis] = std::max(max_point[axis], world_point[axis]);
+            }
+        }
+    }
+
+    if (min_depth <= max_depth) {
+        const double depth_span = std::max(max_depth - min_depth, 1.0);
+        visibility.exact_ray_length = depth_span + std::max(1.0, depth_span * 0.05);
+    }
+    if ((min_point.array() <= max_point.array()).all()) {
+        const double span = (max_point - min_point).norm();
+        visibility.exact_world_tolerance = std::clamp(span * 1e-5, 1e-4, 0.05);
+    }
+    return visibility;
+}
+
+static bool projection_exact_point_is_visible(const ProjectionVisibility &visibility,
+                                              const ProjectionContext    &context,
+                                              const Vec3d               &world_point,
+                                              uint64_t                   triangle_key)
+{
+    if (!projection_visibility_exact(visibility))
+        return true;
+
+    Vec3d world_dir = context.camera_forward;
+    Vec3d source = context.camera_position;
+    double max_world_distance = 0.0;
+    if (visibility.exact_perspective) {
+        world_dir = world_point - source;
+        max_world_distance = world_dir.norm();
+        if (max_world_distance <= EPSILON)
+            return true;
+        world_dir /= max_world_distance;
+    } else {
+        if (world_dir.squaredNorm() <= EPSILON)
+            return true;
+        world_dir.normalize();
+        max_world_distance = visibility.exact_ray_length;
+        source = world_point - world_dir * max_world_distance;
+    }
+
+    const double tolerance = visibility.exact_world_tolerance;
+    double best_distance = std::numeric_limits<double>::infinity();
+    uint64_t best_triangle_key = PROJECTION_VISIBILITY_INVALID_TRIANGLE_KEY;
+
+    for (const ProjectionExactVisibilityVolume &volume : visibility.exact_volumes) {
+        if (!volume.aabb)
+            continue;
+
+        const Vec3d local_source = volume.inverse_world_matrix * source;
+        const Vec3d local_target = volume.inverse_world_matrix * world_point;
+        Vec3d local_dir = local_target - local_source;
+        const double local_distance = local_dir.norm();
+        if (local_distance <= EPSILON)
+            continue;
+        local_dir /= local_distance;
+
+        auto add_hit = [&](const AABBMesh::hit_result &hit) {
+            if (!hit.is_hit())
+                return;
+            const Vec3d hit_world = volume.world_matrix * hit.position();
+            if (!projection_world_point_visible_in_section(context, hit_world))
+                return;
+            const double distance = (hit_world - source).dot(world_dir);
+            if (distance < -tolerance || distance > max_world_distance + tolerance)
+                return;
+            if (distance < best_distance) {
+                best_distance = distance;
+                best_triangle_key = projection_visibility_triangle_key(volume.volume_idx, size_t(hit.face()));
+            }
+        };
+
+        if (projection_section_view_active(context)) {
+            const std::vector<AABBMesh::hit_result> hits = volume.aabb->query_ray_hits(local_source, local_dir);
+            for (const AABBMesh::hit_result &hit : hits)
+                add_hit(hit);
+        } else {
+            add_hit(volume.aabb->query_ray_hit(local_source, local_dir));
+        }
+    }
+
+    if (!std::isfinite(best_distance))
+        return true;
+    if (best_distance < max_world_distance - tolerance)
+        return false;
+    if (triangle_key != PROJECTION_VISIBILITY_INVALID_TRIANGLE_KEY && best_triangle_key == triangle_key)
+        return true;
+    return std::abs(best_distance - max_world_distance) <= tolerance || best_distance >= max_world_distance - tolerance;
+}
+
 static ProjectionVisibility build_projection_visibility(const ProjectionContext &context,
                                                         const GLCanvas3D       &parent,
                                                         const ModelObject      *object,
                                                         int                     instance_idx,
-                                                        const ImageProjectionCancelCheckFn &check_cancel = {})
+                                                        const ImageProjectionCancelCheckFn &check_cancel = {},
+                                                        bool                    improve_projection_accuracy = false)
 {
+    if (improve_projection_accuracy)
+        return build_projection_exact_visibility(context, parent, object, instance_idx, check_cancel);
+
     ProjectionVisibility visibility;
     if (object == nullptr || context.overlay_width <= 0.f || context.overlay_height <= 0.f)
         return visibility;
@@ -5928,13 +6091,16 @@ static bool projection_point_is_visible(const ProjectionVisibility &visibility,
     if (!projection_world_point_visible_in_section(context, world_point))
         return false;
 
-    if (!projection_visibility_valid(visibility))
-        return true;
-
     Vec2f screen = Vec2f::Zero();
     float depth = 0.f;
     if (!project_point_to_screen(context, world_point, screen, &depth))
         return false;
+
+    if (projection_visibility_exact(visibility))
+        return projection_exact_point_is_visible(visibility, context, world_point, triangle_key);
+
+    if (!projection_visibility_valid(visibility))
+        return true;
     const float camera_depth = projection_camera_depth(context, world_point);
 
     const int x = int(std::floor((screen.x() - visibility.left) * visibility.scale));
@@ -6197,7 +6363,10 @@ static bool projection_triangle_has_visible_sample(const ProjectionVisibility &v
     if (polygon.size() < 3)
         return false;
 
-    if (!projection_visibility_valid(visibility))
+    if (projection_visibility_exact(visibility))
+        return true;
+
+    if (!projection_visibility_valid(visibility) && !projection_visibility_exact(visibility))
         return true;
 
     if (projection_point_is_visible(visibility, context, world_matrix, (vertices[0] + vertices[1] + vertices[2]) / 3.f, triangle_key))
@@ -6284,12 +6453,24 @@ static bool projection_triangle_is_fully_visible(const ProjectionVisibility &vis
                                                  const std::array<Vec3f, 3> &vertices,
                                                  uint64_t                   triangle_key)
 {
-    if (!projection_visibility_valid(visibility))
+    if (!projection_visibility_valid(visibility) && !projection_visibility_exact(visibility))
         return true;
 
     const std::vector<Vec3d> polygon = projection_visible_world_polygon(context, world_matrix, vertices);
     if (polygon.size() != 3)
         return false;
+
+    if (projection_visibility_exact(visibility)) {
+        if (!projection_point_is_visible(visibility, context, world_matrix, (vertices[0] + vertices[1] + vertices[2]) / 3.f, triangle_key))
+            return false;
+        for (const Vec3f &vertex : vertices)
+            if (!projection_point_is_visible(visibility, context, world_matrix, vertex, triangle_key))
+                return false;
+        for (size_t idx = 0; idx < 3; ++idx)
+            if (!projection_point_is_visible(visibility, context, world_matrix, (vertices[idx] + vertices[(idx + 1) % 3]) * 0.5f, triangle_key))
+                return false;
+        return true;
+    }
 
     std::array<Vec2f, 3> screen;
     std::array<float, 3> depths;
@@ -6713,16 +6894,17 @@ static bool project_texture_mapping_zone_to_regions(ModelObject             &obj
                                                     bool                     pass_through_model,
                                                     unsigned int             texture_mapping_filament_id,
                                                     const ImageProjectionProgressFn &progress_fn = {},
-                                                    const ImageProjectionCancelCheckFn &check_cancel = {})
+                                                    const ImageProjectionCancelCheckFn &check_cancel = {},
+                                                    bool                     improve_projection_accuracy = false)
 {
     if (texture_mapping_filament_id == 0)
         return false;
 
     if (check_cancel)
         check_cancel();
-    const ProjectionVisibility visibility = pass_through_model ?
-        ProjectionVisibility() :
-        build_projection_visibility(context, parent, &object, instance_idx, check_cancel);
+    ProjectionVisibility visibility;
+    if (!pass_through_model)
+        visibility = build_projection_visibility(context, parent, &object, instance_idx, check_cancel, improve_projection_accuracy);
     const ProjectionPaintableImageMask paintable_mask = build_projection_paintable_image_mask(context);
     const float projection_target_span = image_projection_rgb_target_triangle_pixel_span(context);
     bool changed = false;
@@ -16565,6 +16747,11 @@ void GLGizmoImageProjection::on_load(cereal::BinaryInputArchive& ar)
     } catch (...) {
         m_erase_region_painting = true;
     }
+    try {
+        ar(m_improve_projection_accuracy);
+    } catch (...) {
+        m_improve_projection_accuracy = false;
+    }
 
     m_projection_mode = ProjectionMode(std::clamp(mode, 0, 2));
     m_projection_mode_initialized = false;
@@ -16674,6 +16861,7 @@ void GLGizmoImageProjection::on_save(cereal::BinaryOutputArchive& ar) const
        m_projection_panel_expanded);
 
     ar(m_erase_region_painting);
+    ar(m_improve_projection_accuracy);
 }
 
 void GLGizmoImageProjection::on_render()
@@ -17556,6 +17744,10 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
         show_projection_overlay();
     if (ImGui::Checkbox("Pass through model", &m_pass_through_model))
         show_projection_overlay();
+    m_imgui->disabled_begin(m_pass_through_model);
+    if (ImGui::Checkbox("Improve Projection Accuracy", &m_improve_projection_accuracy))
+        show_projection_overlay();
+    m_imgui->disabled_end();
     if (ImGui::Checkbox("Erase region painting", &m_erase_region_painting)) {
         m_parent.set_as_dirty();
         m_parent.request_extra_frame();
@@ -17582,6 +17774,7 @@ void GLGizmoImageProjection::fill_projection_input(ProjectionInput &input, const
     input.mode = m_projection_mode;
     input.text_mode = m_text_mode;
     input.pass_through_model = m_pass_through_model;
+    input.improve_projection_accuracy = m_improve_projection_accuracy;
     input.raw_atlas_valid = active_raw_atlas_valid();
     if (input.raw_atlas_valid)
         input.raw_atlas = active_raw_atlas();
@@ -17600,6 +17793,7 @@ void GLGizmoImageProjection::fill_projection_input(ProjectionInput &input, const
     input.context.view_projection = camera.get_projection_matrix().matrix() * camera.get_view_matrix().matrix();
     input.context.camera_forward = camera.get_dir_forward();
     input.context.camera_position = camera.get_position();
+    input.context.camera_perspective = camera.get_type() == Camera::EType::Perspective;
     input.context.canvas_width = std::max(1, viewport[2]);
     input.context.canvas_height = std::max(1, viewport[3]);
     input.context.overlay_left = rect.left;
@@ -17895,7 +18089,8 @@ bool GLGizmoImageProjection::project_image_to_object(ModelObject *object,
                                                 input.pass_through_model,
                                                 texture_mapping_filament_id,
                                                 stage_progress(80, 98),
-                                                check_cancel);
+                                                check_cancel,
+                                                input.improve_projection_accuracy);
 
     if (progress_fn)
         progress_fn(100);
@@ -17993,9 +18188,9 @@ bool GLGizmoImageProjection::project_to_vertex_colors(ModelObject *object,
 
     if (check_cancel)
         check_cancel();
-    const ProjectionVisibility visibility = input.pass_through_model ?
-        ProjectionVisibility() :
-        build_projection_visibility(context, m_parent, object, instance_idx, check_cancel);
+    ProjectionVisibility visibility;
+    if (!input.pass_through_model)
+        visibility = build_projection_visibility(context, m_parent, object, instance_idx, check_cancel, input.improve_projection_accuracy);
     ImageProjectionProgressCounter progress(progress_fn,
                                             image_projection_model_part_triangle_count(*object) * 2 +
                                             image_projection_model_part_vertex_count(*object));
@@ -18143,9 +18338,9 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object,
 
     if (check_cancel)
         check_cancel();
-    const ProjectionVisibility visibility = input.pass_through_model ?
-        ProjectionVisibility() :
-        build_projection_visibility(context, m_parent, object, instance_idx, check_cancel);
+    ProjectionVisibility visibility;
+    if (!input.pass_through_model)
+        visibility = build_projection_visibility(context, m_parent, object, instance_idx, check_cancel, input.improve_projection_accuracy);
     const bool raw_atlas_projection = input.raw_atlas_valid;
     const ImageMapRawFilamentOffsetAtlas &raw_projection_atlas = input.raw_atlas;
     RawAtlasProjectionLayout raw_layout;
@@ -18235,6 +18430,39 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object,
         } else if (model_volume_has_raw_atlas_texture_data(volume)) {
             clear_imported_texture_raw_atlas(*volume);
             volume_changed = true;
+        }
+
+        std::vector<uint8_t> exact_projected_triangles;
+        if (projection_visibility_exact(visibility)) {
+            exact_projected_triangles.assign(its.indices.size(), 0);
+            const ProjectionPaintableImageMask paintable_mask =
+                build_projection_paintable_image_mask(context, context.apply_transparency_as_background);
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, its.indices.size(), 512),
+                              [&](const tbb::blocked_range<size_t> &range) {
+                for (size_t tri_idx = range.begin(); tri_idx < range.end(); ++tri_idx) {
+                    if ((tri_idx & 255u) == 0u && check_cancel)
+                        check_cancel();
+                    const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
+                    if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
+                        continue;
+                    if (size_t(tri[0]) >= its.vertices.size() ||
+                        size_t(tri[1]) >= its.vertices.size() ||
+                        size_t(tri[2]) >= its.vertices.size())
+                        continue;
+                    const std::array<Vec3f, 3> vertices = {
+                        its.vertices[size_t(tri[0])].cast<float>(),
+                        its.vertices[size_t(tri[1])].cast<float>(),
+                        its.vertices[size_t(tri[2])].cast<float>()
+                    };
+                    if (projection_triangle_should_project(context,
+                                                           visibility,
+                                                           paintable_mask,
+                                                           world_matrix,
+                                                           vertices,
+                                                           projection_visibility_triangle_key(volume_idx, tri_idx)))
+                        exact_projected_triangles[tri_idx] = 1;
+                }
+            });
         }
 
         for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
@@ -18356,8 +18584,11 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object,
                         const Vec3f projection_point = vertices[0] * projection_barycentric.x() +
                                                        vertices[1] * projection_barycentric.y() +
                                                        vertices[2] * projection_barycentric.z();
+                        const bool exact_triangle_projected =
+                            exact_projected_triangles.empty() || exact_projected_triangles[tri_idx] != 0;
                         const bool sample_visible =
                             projection_sample &&
+                            exact_triangle_projected &&
                             (input.pass_through_model ||
                              (projection_point_allowed_by_camera_facing(context,
                                                                         world_matrix,
@@ -18455,9 +18686,9 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object,
 
     if (check_cancel)
         check_cancel();
-    const ProjectionVisibility visibility = input.pass_through_model ?
-        ProjectionVisibility() :
-        build_projection_visibility(context, m_parent, object, instance_idx, check_cancel);
+    ProjectionVisibility visibility;
+    if (!input.pass_through_model)
+        visibility = build_projection_visibility(context, m_parent, object, instance_idx, check_cancel, input.improve_projection_accuracy);
     const ProjectionPaintableImageMask paintable_mask = build_projection_paintable_image_mask(context, true);
     ImageProjectionProgressCounter progress(progress_fn, image_projection_model_part_triangle_count(*object) * 2);
 
