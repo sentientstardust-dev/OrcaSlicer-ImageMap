@@ -50,6 +50,7 @@ constexpr size_t k_contoning_flat_surface_preview_max_ordered_stack_items = 2000
 constexpr double k_contoning_top_surface_preview_lod_max_samples = 350000.0;
 constexpr const char *TEXTURE_MAPPING_BACKGROUND_COLOR_CONFIG_KEY = "texture_mapping_background_color";
 constexpr float k_contoning_preview_inferred_black_td_mm = 0.1f;
+constexpr float k_contoning_preview_surface_scatter = 0.12f;
 
 struct TexturePreviewMixCandidate
 {
@@ -98,6 +99,7 @@ struct TexturePreviewSimulationSettings
     bool simulate_top_surface_lod = false;
     float top_surface_lod_pitch_mm = 0.f;
     float contoning_flat_surface_layer_height_mm = 0.2f;
+    float contoning_flat_surface_surface_scatter = k_contoning_preview_surface_scatter;
     std::array<float, 3> contoning_flat_surface_background_rgb { { 0.f, 0.f, 0.f } };
     std::vector<float> contoning_flat_surface_layer_opacities;
     float minimum_visibility_offset_factor = 0.f;
@@ -576,7 +578,7 @@ float texture_preview_layer_opacity_from_td(float td_mm, float layer_height_mm)
 {
     const float safe_td = std::clamp(td_mm, 0.01f, 50.f);
     const float safe_layer_height = std::clamp(layer_height_mm, 0.01f, 2.f);
-    return std::clamp(1.f - std::pow(0.05f, safe_layer_height / safe_td), 1e-4f, 0.9999f);
+    return std::clamp(1.f - std::pow(0.05f, 2.f * safe_layer_height / safe_td), 1e-4f, 0.9999f);
 }
 
 std::vector<float> contoning_flat_surface_preview_layer_opacities(
@@ -2507,7 +2509,8 @@ std::array<float, 3> contoning_flat_surface_rgb_for_texture_preview(
                                                  simulated_surface_to_deep,
                                                  settings.contoning_flat_surface_layer_opacities,
                                                  settings.contoning_flat_surface_background_rgb,
-                                                 ColorSolverMixModel::PigmentPainter);
+                                                 ColorSolverMixModel::PigmentPainter,
+                                                 settings.contoning_flat_surface_surface_scatter);
         }
     }
     if (!candidates.empty()) {
@@ -2757,6 +2760,7 @@ size_t texture_preview_simulation_signature(const ModelVolume &model_volume,
     }
     if (settings.contoning_flat_surface_td_adjustment) {
         mix(std::hash<int>{}(int(std::lround(settings.contoning_flat_surface_layer_height_mm * 100000.f))));
+        mix(std::hash<int>{}(int(std::lround(settings.contoning_flat_surface_surface_scatter * 1000000.f))));
         for (const float opacity : settings.contoning_flat_surface_layer_opacities)
             mix(std::hash<int>{}(int(std::lround(opacity * 1000000.f))));
     }
@@ -2844,7 +2848,8 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                                                        contoning_flat_surface_pattern_filaments,
                                                        contoning_flat_surface_pattern_filaments,
                                                        k_contoning_flat_surface_preview_max_ordered_candidates,
-                                                       k_contoning_flat_surface_preview_max_ordered_stack_items) :
+                                                       k_contoning_flat_surface_preview_max_ordered_stack_items,
+                                                       settings.contoning_flat_surface_surface_scatter) :
             ColorSolverOrderedStackCandidateSet{};
     const std::vector<TexturePreviewMixCandidate> contoning_flat_surface_candidates =
         use_contoning_flat_surface_quantization && contoning_flat_surface_ordered_candidates.empty() ?

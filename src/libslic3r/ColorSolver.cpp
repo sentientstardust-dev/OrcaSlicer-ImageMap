@@ -344,7 +344,8 @@ ColorSolverNearestResult nearest_color_solver_candidates_perceptual(const Candid
 std::array<float, 3> mix_ordered_stack_with_buffers(const std::vector<std::array<float, 3>> &colors_with_background,
                                                     std::vector<float>                      &weights,
                                                     const std::vector<uint16_t>             &surface_to_deep,
-                                                    const std::vector<float>                &layer_opacities)
+                                                    const std::vector<float>                &layer_opacities,
+                                                    float                                    surface_scatter)
 {
     if (colors_with_background.empty() || surface_to_deep.empty())
         return colors_with_background.empty() ? std::array<float, 3>{ { 0.f, 0.f, 0.f } } : colors_with_background.back();
@@ -352,13 +353,20 @@ std::array<float, 3> mix_ordered_stack_with_buffers(const std::vector<std::array
     const size_t component_count = colors_with_background.size() - 1;
     weights.assign(colors_with_background.size(), 0.f);
     float transmission = 1.f;
+    bool surface_layer = true;
+    const float safe_surface_scatter =
+        std::clamp(std::isfinite(surface_scatter) ? surface_scatter : 0.f, 0.f, 0.5f);
     for (uint16_t component_idx : surface_to_deep) {
         if (size_t(component_idx) >= component_count)
             continue;
-        const float opacity =
+        float opacity =
             size_t(component_idx) < layer_opacities.size() && std::isfinite(layer_opacities[size_t(component_idx)]) ?
                 std::clamp(layer_opacities[size_t(component_idx)], 1e-4f, 0.9999f) :
                 0.5f;
+        if (surface_layer) {
+            opacity = std::clamp(safe_surface_scatter + (1.f - safe_surface_scatter) * opacity, 1e-4f, 0.9999f);
+            surface_layer = false;
+        }
         weights[size_t(component_idx)] += transmission * opacity;
         transmission *= 1.f - opacity;
         if (transmission <= 1e-5f)
@@ -533,7 +541,8 @@ void append_ordered_stack_candidate(ColorSolverOrderedStackCandidateSet       &c
                                     std::vector<float>                       &weights,
                                     const std::vector<uint16_t>              &surface_to_deep,
                                     const std::vector<float>                 &layer_opacities,
-                                    int                                       simulated_stack_depth)
+                                    int                                       simulated_stack_depth,
+                                    float                                     surface_scatter)
 {
     std::vector<uint16_t> simulated_surface_to_deep;
     const std::vector<uint16_t> *mix_stack = &surface_to_deep;
@@ -542,7 +551,7 @@ void append_ordered_stack_candidate(ColorSolverOrderedStackCandidateSet       &c
         mix_stack = &simulated_surface_to_deep;
     }
     const std::array<float, 3> mixed =
-        mix_ordered_stack_with_buffers(colors_with_background, weights, *mix_stack, layer_opacities);
+        mix_ordered_stack_with_buffers(colors_with_background, weights, *mix_stack, layer_opacities, surface_scatter);
     const std::array<float, 3> perceptual = oklab_from_srgb(mixed);
     candidates.rgbs.emplace_back(mixed[0]);
     candidates.rgbs.emplace_back(mixed[1]);
@@ -615,7 +624,8 @@ std::array<float, 3> mix_color_solver_ordered_stack(const std::vector<std::array
                                                     const std::vector<uint16_t>             &surface_to_deep,
                                                     const std::vector<float>                &layer_opacities,
                                                     const std::array<float, 3>              &background_rgb,
-                                                    ColorSolverMixModel                       mix_model)
+                                                    ColorSolverMixModel                       mix_model,
+                                                    float                                     surface_scatter)
 {
     (void) mix_model;
     if (component_colors.empty() || surface_to_deep.empty())
@@ -624,7 +634,7 @@ std::array<float, 3> mix_color_solver_ordered_stack(const std::vector<std::array
     std::vector<std::array<float, 3>> colors = component_colors;
     colors.emplace_back(background_rgb);
     std::vector<float> weights;
-    return mix_ordered_stack_with_buffers(colors, weights, surface_to_deep, layer_opacities);
+    return mix_ordered_stack_with_buffers(colors, weights, surface_to_deep, layer_opacities, surface_scatter);
 }
 
 std::array<float, 3> color_solver_oklab_from_srgb(const std::array<float, 3> &rgb)
@@ -757,7 +767,8 @@ std::string color_solver_ordered_stack_candidate_cache_key(const std::vector<std
                                                            int                                       stack_depth,
                                                            int                                       simulated_stack_depth,
                                                            size_t                                    candidate_limit,
-                                                           size_t                                    stack_item_limit)
+                                                           size_t                                    stack_item_limit,
+                                                           float                                     surface_scatter)
 {
     std::ostringstream key;
     key << component_colors.size();
@@ -766,6 +777,9 @@ std::string color_solver_ordered_stack_candidate_cache_key(const std::vector<std
     key << "|vd" << simulated_stack_depth;
     key << "|lim" << candidate_limit;
     key << "|item" << stack_item_limit;
+    const float safe_surface_scatter =
+        std::clamp(std::isfinite(surface_scatter) ? surface_scatter : 0.f, 0.f, 0.5f);
+    key << "|ss" << int(std::lround(safe_surface_scatter * 1000000.f));
     key << "|bg"
         << int(std::lround(clamp01(background_rgb[0]) * 65535.f)) << ','
         << int(std::lround(clamp01(background_rgb[1]) * 65535.f)) << ','
@@ -795,7 +809,8 @@ ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
     int                                       stack_depth,
     int                                       simulated_stack_depth,
     size_t                                    candidate_limit,
-    size_t                                    stack_item_limit)
+    size_t                                    stack_item_limit,
+    float                                     surface_scatter)
 {
     (void) mix_model;
     ColorSolverOrderedStackCandidateSet candidates;
@@ -832,7 +847,8 @@ ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
                                                weights,
                                                surface_to_deep,
                                                layer_opacities,
-                                               simulated_depth);
+                                               simulated_depth,
+                                               surface_scatter);
                 return;
             }
 
@@ -878,7 +894,8 @@ ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
                                                weights,
                                                surface_to_deep,
                                                layer_opacities,
-                                               simulated_depth);
+                                               simulated_depth,
+                                               surface_scatter);
             }
             return;
         }
@@ -904,7 +921,8 @@ const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates
     int                                            stack_depth,
     int                                            simulated_stack_depth,
     size_t                                         candidate_limit,
-    size_t                                         stack_item_limit)
+    size_t                                         stack_item_limit,
+    float                                          surface_scatter)
 {
     const std::string key =
         color_solver_ordered_stack_candidate_cache_key(component_colors,
@@ -914,7 +932,8 @@ const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates
                                                        stack_depth,
                                                        simulated_stack_depth,
                                                        candidate_limit,
-                                                       stack_item_limit);
+                                                       stack_item_limit,
+                                                       surface_scatter);
     auto it = cache.find(key);
     if (it != cache.end())
         return it->second;
@@ -927,7 +946,8 @@ const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates
                                                    stack_depth,
                                                    simulated_stack_depth,
                                                    candidate_limit,
-                                                   stack_item_limit)).first->second;
+                                                   stack_item_limit,
+                                                   surface_scatter)).first->second;
 }
 
 std::vector<uint16_t> solve_color_solver_ordered_stack_for_target(

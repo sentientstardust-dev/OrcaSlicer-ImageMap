@@ -65,6 +65,7 @@ private:
     std::vector<float> m_effective_transmission_distances_mm;
     std::vector<float> m_component_layer_opacity;
     float m_layer_height_mm { 0.2f };
+    float m_surface_scatter { 0.f };
     bool m_td_adjustment_enabled { false };
     mutable std::map<int, std::vector<Candidate>> m_candidates_by_depth;
     mutable std::shared_ptr<ColorSolverOrderedStackCandidateCache> m_ordered_candidate_cache { std::make_shared<ColorSolverOrderedStackCandidateCache>() };

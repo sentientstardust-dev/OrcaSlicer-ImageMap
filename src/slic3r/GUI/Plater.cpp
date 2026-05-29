@@ -2309,19 +2309,19 @@ public:
         filament_root->Add(m_force_sequential_filaments_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
 
         filament_root->AddStretchSpacer(1);
-        auto *filament_calibration_note =
-            new wxStaticText(filament_page,
-                             wxID_ANY,
-                             _L("NOTE: TD calibration is used by overhang modulation and Contoning TD adjustment"),
-                             wxDefaultPosition,
-                             wxSize(FromDIP(390), -1));
-        filament_calibration_note->Wrap(FromDIP(390));
-        filament_root->Add(filament_calibration_note, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
-        filament_page->Bind(wxEVT_SIZE, [this, filament_page, filament_calibration_note, gap](wxSizeEvent &evt) {
-            const int wrap_width = std::max(FromDIP(120), filament_page->GetClientSize().GetWidth() - gap * 2);
-            filament_calibration_note->Wrap(wrap_width);
-            evt.Skip();
-        });
+        // auto *filament_calibration_note =
+        //     new wxStaticText(filament_page,
+        //                      wxID_ANY,
+        //                      _L("NOTE: TD calibration is used by overhang modulation and Contoning TD adjustment"),
+        //                      wxDefaultPosition,
+        //                      wxSize(FromDIP(390), -1));
+        // filament_calibration_note->Wrap(FromDIP(390));
+        // filament_root->Add(filament_calibration_note, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        // filament_page->Bind(wxEVT_SIZE, [this, filament_page, filament_calibration_note, gap](wxSizeEvent &evt) {
+        //     const int wrap_width = std::max(FromDIP(120), filament_page->GetClientSize().GetWidth() - gap * 2);
+        //     filament_calibration_note->Wrap(wrap_width);
+        //     evt.Skip();
+        // });
 
         auto *preview_box = new wxStaticBoxSizer(wxVERTICAL, preview_page, _L("3D Preview"));
         auto *preview_opacity_row = new wxBoxSizer(wxHORIZONTAL);
@@ -3779,7 +3779,11 @@ private:
             return 0;
         const float layer_height = top_surface_contoning_layer_height_mm();
         const float safe_strength = std::clamp(strength, 0.01f, 0.99f);
-        const float layers = (td_mm / layer_height) * (std::log(1.f - safe_strength) / std::log(0.05f));
+        constexpr float surface_scatter = 0.12f;
+        if (safe_strength <= surface_scatter)
+            return 1;
+        const float remaining = std::clamp((1.f - safe_strength) / (1.f - surface_scatter), 1e-6f, 0.999999f);
+        const float layers = (td_mm / (2.f * layer_height)) * (std::log(remaining) / std::log(0.05f));
         return std::max(1, int(std::ceil(layers)));
     }
 

@@ -18,6 +18,7 @@ namespace {
 
 constexpr float OPAQUE_CONTONING_TD_THRESHOLD_MM = 0.5f;
 constexpr float INFERRED_BLACK_TD_MM = 0.1f;
+constexpr float CONTONING_SURFACE_SCATTER = 0.12f;
 constexpr size_t MAX_TD_ORDERED_CONTONING_CANDIDATES = 2500000;
 constexpr size_t MAX_TD_ORDERED_CONTONING_STACK_ITEMS = 20000000;
 
@@ -114,7 +115,7 @@ float layer_opacity_from_td(float td_mm, float layer_height_mm)
 {
     const float safe_td = std::clamp(td_mm, 0.01f, 50.f);
     const float safe_layer_height = std::clamp(layer_height_mm, 0.01f, 2.f);
-    return std::clamp(1.f - std::pow(0.05f, safe_layer_height / safe_td), 1e-4f, 0.9999f);
+    return std::clamp(1.f - std::pow(0.05f, 2.f * safe_layer_height / safe_td), 1e-4f, 0.9999f);
 }
 
 float effective_transmission_distance_for_component(const std::vector<unsigned int> &component_ids,
@@ -354,6 +355,7 @@ TextureMappingContoningSolver::TextureMappingContoningSolver(const TextureMappin
     m_layer_height_mm = std::isfinite(layer_height_mm) && layer_height_mm > 0.f ? layer_height_mm : 0.2f;
     if (!std::isfinite(m_layer_height_mm) || m_layer_height_mm <= 0.f)
         m_layer_height_mm = 0.2f;
+    m_surface_scatter = CONTONING_SURFACE_SCATTER;
 
     component_ids.erase(std::remove_if(component_ids.begin(), component_ids.end(), [&config](unsigned int id) {
         return id == 0 || id > config.filament_colour.values.size();
@@ -480,7 +482,8 @@ std::optional<std::array<float, 3>> TextureMappingContoningSolver::stack_rgb(
                                           surface_to_deep,
                                           m_component_layer_opacity,
                                           m_background_rgb,
-                                          ColorSolverMixModel::PigmentPainter);
+                                          ColorSolverMixModel::PigmentPainter,
+                                          m_surface_scatter);
 }
 
 void TextureMappingContoningSolver::arrange_stack_for_light_path(std::vector<unsigned int> &bottom_to_top,
@@ -579,7 +582,8 @@ TextureMappingContoningStack TextureMappingContoningSolver::solve(const std::arr
                                                        depth,
                                                        visible_depth,
                                                        MAX_TD_ORDERED_CONTONING_CANDIDATES,
-                                                       MAX_TD_ORDERED_CONTONING_STACK_ITEMS);
+                                                       MAX_TD_ORDERED_CONTONING_STACK_ITEMS,
+                                                       m_surface_scatter);
         }
         const std::vector<uint16_t> surface_to_deep =
             solve_color_solver_ordered_stack_for_target(*ordered_candidates, target_rgb, ColorSolverMode::V2);
