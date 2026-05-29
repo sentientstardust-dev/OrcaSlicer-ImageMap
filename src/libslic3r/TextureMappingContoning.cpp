@@ -19,6 +19,7 @@ namespace {
 constexpr float OPAQUE_CONTONING_TD_THRESHOLD_MM = 0.5f;
 constexpr float INFERRED_BLACK_TD_MM = 0.1f;
 constexpr size_t MAX_TD_ORDERED_CONTONING_CANDIDATES = 2500000;
+constexpr size_t MAX_TD_ORDERED_CONTONING_STACK_ITEMS = 20000000;
 
 float clamp01(float value)
 {
@@ -422,7 +423,8 @@ std::optional<size_t> TextureMappingContoningSolver::component_index(unsigned in
 
 std::optional<std::array<float, 3>> TextureMappingContoningSolver::stack_rgb(
     const std::vector<unsigned int> &bottom_to_top,
-    bool lower_surface) const
+    bool lower_surface,
+    int visible_stack_layers) const
 {
     if (bottom_to_top.empty() || !valid())
         return std::nullopt;
@@ -443,8 +445,13 @@ std::optional<std::array<float, 3>> TextureMappingContoningSolver::stack_rgb(
         return mix_color_solver_components(colors, weights, ColorSolverMixModel::PigmentPainter);
     }
 
+    const int visible_depth = visible_stack_layers > 0 ?
+        std::clamp(visible_stack_layers,
+                   TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                   TextureMappingZone::MaxTopSurfaceContoningStackLayers) :
+        int(bottom_to_top.size());
     std::vector<uint16_t> surface_to_deep;
-    surface_to_deep.reserve(bottom_to_top.size());
+    surface_to_deep.reserve(size_t(visible_depth));
     auto append_component = [this, &surface_to_deep](unsigned int component_id) {
         const std::optional<size_t> idx = component_index(component_id);
         if (!idx || *idx > size_t(std::numeric_limits<uint16_t>::max()))
@@ -460,6 +467,13 @@ std::optional<std::array<float, 3>> TextureMappingContoningSolver::stack_rgb(
         for (auto it = bottom_to_top.rbegin(); it != bottom_to_top.rend(); ++it)
             if (!append_component(*it))
                 return std::nullopt;
+    }
+    if (visible_depth > 0 && int(surface_to_deep.size()) != visible_depth) {
+        std::vector<uint16_t> repeated;
+        repeated.reserve(size_t(visible_depth));
+        for (int idx = 0; idx < visible_depth; ++idx)
+            repeated.emplace_back(surface_to_deep[size_t(idx) % surface_to_deep.size()]);
+        surface_to_deep = std::move(repeated);
     }
 
     return mix_color_solver_ordered_stack(m_component_colors,
@@ -536,15 +550,22 @@ void TextureMappingContoningSolver::arrange_stack_for_light_path(std::vector<uns
 
 TextureMappingContoningStack TextureMappingContoningSolver::solve(const std::array<float, 3> &target_rgb,
                                                                   int stack_layers,
-                                                                  bool lower_surface) const
+                                                                  bool lower_surface,
+                                                                  int visible_stack_layers) const
 {
     TextureMappingContoningStack out;
     if (!valid())
         return out;
 
-    const int depth = std::clamp(stack_layers,
-                                 TextureMappingZone::MinTopSurfaceContoningStackLayers,
-                                 TextureMappingZone::MaxTopSurfaceContoningStackLayers);
+    const int requested_depth = std::clamp(stack_layers,
+                                           TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                                           TextureMappingZone::MaxTopSurfaceContoningStackLayers);
+    const int visible_depth = visible_stack_layers > 0 ?
+        std::clamp(visible_stack_layers,
+                   TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                   TextureMappingZone::MaxTopSurfaceContoningStackLayers) :
+        requested_depth;
+    const int depth = std::min(requested_depth, visible_depth);
     if (m_td_adjustment_enabled) {
         const ColorSolverOrderedStackCandidateSet *ordered_candidates = nullptr;
         {
@@ -556,7 +577,9 @@ TextureMappingContoningStack TextureMappingContoningSolver::solve(const std::arr
                                                        m_background_rgb,
                                                        ColorSolverMixModel::PigmentPainter,
                                                        depth,
-                                                       MAX_TD_ORDERED_CONTONING_CANDIDATES);
+                                                       visible_depth,
+                                                       MAX_TD_ORDERED_CONTONING_CANDIDATES,
+                                                       MAX_TD_ORDERED_CONTONING_STACK_ITEMS);
         }
         const std::vector<uint16_t> surface_to_deep =
             solve_color_solver_ordered_stack_for_target(*ordered_candidates, target_rgb, ColorSolverMode::V2);

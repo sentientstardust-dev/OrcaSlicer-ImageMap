@@ -23,6 +23,7 @@
 #include <functional>
 #include <limits>
 #include <sstream>
+#include <utility>
 
 namespace Slic3r {
 namespace {
@@ -355,6 +356,176 @@ size_t ordered_stack_candidate_count(size_t component_count, int stack_depth, si
     return candidate_limit > 0 && count > candidate_limit ? 0 : count;
 }
 
+size_t ordered_stack_candidate_storage_limit(int stack_depth, size_t candidate_limit, size_t stack_item_limit)
+{
+    size_t limit = candidate_limit > 0 ? candidate_limit : std::numeric_limits<size_t>::max();
+    if (stack_item_limit > 0 && stack_depth > 0)
+        limit = std::min(limit, stack_item_limit / size_t(stack_depth));
+    return limit;
+}
+
+int ordered_stack_control_depth(size_t component_count, int stack_depth, size_t candidate_limit)
+{
+    if (component_count == 0 || stack_depth <= 0 || candidate_limit == 0)
+        return 0;
+    size_t count = 1;
+    int depth = 0;
+    for (int idx = 0; idx < stack_depth; ++idx) {
+        if (count > candidate_limit / component_count)
+            break;
+        count *= component_count;
+        ++depth;
+    }
+    return depth > 0 ? depth : 1;
+}
+
+std::vector<uint16_t> repeat_ordered_stack_to_depth(const std::vector<uint16_t> &surface_to_deep, int depth)
+{
+    std::vector<uint16_t> out;
+    if (surface_to_deep.empty() || depth <= 0)
+        return out;
+    out.reserve(size_t(depth));
+    for (int idx = 0; idx < depth; ++idx)
+        out.emplace_back(surface_to_deep[size_t(idx) % surface_to_deep.size()]);
+    return out;
+}
+
+void append_unique_ordered_stack_variant(std::vector<std::vector<uint16_t>> &variants, std::vector<uint16_t> candidate)
+{
+    if (candidate.empty())
+        return;
+    if (std::find(variants.begin(), variants.end(), candidate) == variants.end())
+        variants.emplace_back(std::move(candidate));
+}
+
+std::vector<uint16_t> stretch_ordered_stack_tiled(const std::vector<uint16_t> &control, int stack_depth)
+{
+    return repeat_ordered_stack_to_depth(control, stack_depth);
+}
+
+std::vector<uint16_t> stretch_ordered_stack_proportional(const std::vector<uint16_t> &control, int stack_depth)
+{
+    std::vector<uint16_t> out;
+    if (control.empty() || stack_depth <= 0)
+        return out;
+    out.reserve(size_t(stack_depth));
+    const size_t control_depth = control.size();
+    for (int idx = 0; idx < stack_depth; ++idx) {
+        const size_t source_idx = std::min(control_depth - 1, size_t(idx) * control_depth / size_t(stack_depth));
+        out.emplace_back(control[source_idx]);
+    }
+    return out;
+}
+
+std::vector<uint16_t> stretch_ordered_stack_by_scores(const std::vector<uint16_t> &control,
+                                                      const std::vector<float>    &scores,
+                                                      int                          stack_depth)
+{
+    std::vector<uint16_t> out;
+    if (control.empty() || stack_depth <= 0)
+        return out;
+    if (int(control.size()) >= stack_depth) {
+        out.assign(control.begin(), control.begin() + std::min(control.size(), size_t(stack_depth)));
+        return out;
+    }
+
+    std::vector<int> duplicates(control.size(), 0);
+    const int extra = stack_depth - int(control.size());
+    for (int idx = 0; idx < extra; ++idx) {
+        size_t best_idx = 0;
+        float best_score = -std::numeric_limits<float>::max();
+        for (size_t score_idx = 0; score_idx < control.size(); ++score_idx) {
+            const float base_score =
+                score_idx < scores.size() && std::isfinite(scores[score_idx]) ?
+                    std::max(scores[score_idx], 0.f) :
+                    0.f;
+            const float score = base_score / float(duplicates[score_idx] + 1);
+            if (score > best_score) {
+                best_score = score;
+                best_idx = score_idx;
+            }
+        }
+        ++duplicates[best_idx];
+    }
+
+    out.reserve(size_t(stack_depth));
+    for (size_t idx = 0; idx < control.size(); ++idx) {
+        out.emplace_back(control[idx]);
+        for (int duplicate_idx = 0; duplicate_idx < duplicates[idx]; ++duplicate_idx)
+            out.emplace_back(control[idx]);
+    }
+    return out;
+}
+
+std::vector<std::vector<uint16_t>> stretched_ordered_stack_variants(const std::vector<uint16_t> &control,
+                                                                    const std::vector<float>    &layer_opacities,
+                                                                    int                          stack_depth)
+{
+    std::vector<std::vector<uint16_t>> variants;
+    if (control.empty() || stack_depth <= 0)
+        return variants;
+    if (int(control.size()) >= stack_depth) {
+        std::vector<uint16_t> variant(control.begin(), control.begin() + std::min(control.size(), size_t(stack_depth)));
+        append_unique_ordered_stack_variant(variants, std::move(variant));
+        return variants;
+    }
+
+    append_unique_ordered_stack_variant(variants, stretch_ordered_stack_tiled(control, stack_depth));
+    append_unique_ordered_stack_variant(variants, stretch_ordered_stack_proportional(control, stack_depth));
+
+    std::vector<float> even(control.size(), 1.f);
+    std::vector<float> opacity(control.size(), 1.f);
+    std::vector<float> surface(control.size(), 1.f);
+    std::vector<float> deep(control.size(), 1.f);
+    for (size_t idx = 0; idx < control.size(); ++idx) {
+        const size_t component_idx = size_t(control[idx]);
+        const float layer_opacity =
+            component_idx < layer_opacities.size() && std::isfinite(layer_opacities[component_idx]) ?
+                std::clamp(layer_opacities[component_idx], 1e-4f, 0.9999f) :
+                0.5f;
+        opacity[idx] = 1.f - layer_opacity;
+        surface[idx] = float(control.size() - idx);
+        deep[idx] = float(idx + 1);
+    }
+
+    append_unique_ordered_stack_variant(variants, stretch_ordered_stack_by_scores(control, even, stack_depth));
+    append_unique_ordered_stack_variant(variants, stretch_ordered_stack_by_scores(control, opacity, stack_depth));
+    append_unique_ordered_stack_variant(variants, stretch_ordered_stack_by_scores(control, surface, stack_depth));
+    append_unique_ordered_stack_variant(variants, stretch_ordered_stack_by_scores(control, deep, stack_depth));
+    for (size_t idx = 0; idx < control.size(); ++idx) {
+        surface[idx] *= opacity[idx];
+        deep[idx] *= opacity[idx];
+    }
+    append_unique_ordered_stack_variant(variants, stretch_ordered_stack_by_scores(control, surface, stack_depth));
+    append_unique_ordered_stack_variant(variants, stretch_ordered_stack_by_scores(control, deep, stack_depth));
+    return variants;
+}
+
+void append_ordered_stack_candidate(ColorSolverOrderedStackCandidateSet       &candidates,
+                                    const std::vector<std::array<float, 3>>  &colors_with_background,
+                                    std::vector<float>                       &weights,
+                                    const std::vector<uint16_t>              &surface_to_deep,
+                                    const std::vector<float>                 &layer_opacities,
+                                    int                                       simulated_stack_depth)
+{
+    std::vector<uint16_t> simulated_surface_to_deep;
+    const std::vector<uint16_t> *mix_stack = &surface_to_deep;
+    if (simulated_stack_depth > 0 && simulated_stack_depth != int(surface_to_deep.size())) {
+        simulated_surface_to_deep = repeat_ordered_stack_to_depth(surface_to_deep, simulated_stack_depth);
+        mix_stack = &simulated_surface_to_deep;
+    }
+    const std::array<float, 3> mixed =
+        mix_ordered_stack_with_buffers(colors_with_background, weights, *mix_stack, layer_opacities);
+    const std::array<float, 3> perceptual = oklab_from_srgb(mixed);
+    candidates.rgbs.emplace_back(mixed[0]);
+    candidates.rgbs.emplace_back(mixed[1]);
+    candidates.rgbs.emplace_back(mixed[2]);
+    candidates.perceptual_coords.emplace_back(perceptual[0]);
+    candidates.perceptual_coords.emplace_back(perceptual[1]);
+    candidates.perceptual_coords.emplace_back(perceptual[2]);
+    candidates.stacks.insert(candidates.stacks.end(), surface_to_deep.begin(), surface_to_deep.end());
+}
+
 } // namespace
 
 ColorSolverMixModel color_solver_mix_model_from_index(int model)
@@ -552,13 +723,17 @@ std::string color_solver_ordered_stack_candidate_cache_key(const std::vector<std
                                                            const std::array<float, 3>              &background_rgb,
                                                            ColorSolverMixModel                       mix_model,
                                                            int                                       stack_depth,
-                                                           size_t                                    candidate_limit)
+                                                           int                                       simulated_stack_depth,
+                                                           size_t                                    candidate_limit,
+                                                           size_t                                    stack_item_limit)
 {
     std::ostringstream key;
     key << component_colors.size();
     key << "|mx" << mix_model_index(mix_model);
     key << "|sd" << stack_depth;
+    key << "|vd" << simulated_stack_depth;
     key << "|lim" << candidate_limit;
+    key << "|item" << stack_item_limit;
     key << "|bg"
         << int(std::lround(clamp01(background_rgb[0]) * 65535.f)) << ','
         << int(std::lround(clamp01(background_rgb[1]) * 65535.f)) << ','
@@ -586,47 +761,101 @@ ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
     const std::array<float, 3>              &background_rgb,
     ColorSolverMixModel                       mix_model,
     int                                       stack_depth,
-    size_t                                    candidate_limit)
+    int                                       simulated_stack_depth,
+    size_t                                    candidate_limit,
+    size_t                                    stack_item_limit)
 {
     (void) mix_model;
     ColorSolverOrderedStackCandidateSet candidates;
-    if (component_colors.empty() || stack_depth <= 0 || component_colors.size() > size_t(std::numeric_limits<uint16_t>::max()))
+    int simulated_depth = simulated_stack_depth > 0 ? simulated_stack_depth : stack_depth;
+    if (component_colors.empty() || stack_depth <= 0 || simulated_depth <= 0 ||
+        component_colors.size() > size_t(std::numeric_limits<uint16_t>::max()))
         return candidates;
 
     const size_t component_count = component_colors.size();
-    const size_t candidate_count = ordered_stack_candidate_count(component_count, stack_depth, candidate_limit);
-    if (candidate_count == 0)
+    stack_depth = std::min(stack_depth, simulated_depth);
+    const size_t max_candidate_count = ordered_stack_candidate_storage_limit(stack_depth, candidate_limit, stack_item_limit);
+    if (max_candidate_count == 0)
         return candidates;
 
     candidates.component_count = component_count;
     candidates.stack_depth = stack_depth;
-    candidates.rgbs.reserve(candidate_count * 3);
-    candidates.perceptual_coords.reserve(candidate_count * 3);
-    candidates.stacks.reserve(candidate_count * size_t(stack_depth));
+    candidates.simulated_stack_depth = simulated_depth;
 
     std::vector<std::array<float, 3>> colors_with_background = component_colors;
     colors_with_background.emplace_back(background_rgb);
     std::vector<float> weights(colors_with_background.size(), 0.f);
-    std::vector<uint16_t> surface_to_deep(size_t(stack_depth), 0);
 
+    const size_t exact_candidate_count = ordered_stack_candidate_count(component_count, stack_depth, candidate_limit);
+    if (exact_candidate_count > 0 && exact_candidate_count <= max_candidate_count) {
+        candidates.rgbs.reserve(exact_candidate_count * 3);
+        candidates.perceptual_coords.reserve(exact_candidate_count * 3);
+        candidates.stacks.reserve(exact_candidate_count * size_t(stack_depth));
+
+        std::vector<uint16_t> surface_to_deep(size_t(stack_depth), 0);
+        std::function<void(int)> recurse = [&](int depth_idx) {
+            if (depth_idx == stack_depth) {
+                append_ordered_stack_candidate(candidates,
+                                               colors_with_background,
+                                               weights,
+                                               surface_to_deep,
+                                               layer_opacities,
+                                               simulated_depth);
+                return;
+            }
+
+            for (size_t component_idx = 0; component_idx < component_count; ++component_idx) {
+                surface_to_deep[size_t(depth_idx)] = uint16_t(component_idx);
+                recurse(depth_idx + 1);
+            }
+        };
+        recurse(0);
+        build_color_solver_kd_trees(candidates);
+        return candidates;
+    }
+    if (candidate_limit == 0 && stack_item_limit == 0)
+        return candidates;
+
+    const size_t variant_budget = 8;
+    const size_t max_control_candidates = std::max<size_t>(1, max_candidate_count / variant_budget);
+    const int control_depth = std::min(stack_depth, ordered_stack_control_depth(component_count, stack_depth, max_control_candidates));
+    if (control_depth <= 0)
+        return candidates;
+
+    const size_t control_candidate_count = ordered_stack_candidate_count(component_count, control_depth, 0);
+    const size_t reserve_count = std::min(max_candidate_count, control_candidate_count * variant_budget);
+    candidates.rgbs.reserve(reserve_count * 3);
+    candidates.perceptual_coords.reserve(reserve_count * 3);
+    candidates.stacks.reserve(reserve_count * size_t(stack_depth));
+
+    bool limit_reached = false;
+    std::vector<uint16_t> control(size_t(control_depth), 0);
     std::function<void(int)> recurse = [&](int depth_idx) {
-        if (depth_idx == stack_depth) {
-            const std::array<float, 3> mixed =
-                mix_ordered_stack_with_buffers(colors_with_background, weights, surface_to_deep, layer_opacities);
-            const std::array<float, 3> perceptual = oklab_from_srgb(mixed);
-            candidates.rgbs.emplace_back(mixed[0]);
-            candidates.rgbs.emplace_back(mixed[1]);
-            candidates.rgbs.emplace_back(mixed[2]);
-            candidates.perceptual_coords.emplace_back(perceptual[0]);
-            candidates.perceptual_coords.emplace_back(perceptual[1]);
-            candidates.perceptual_coords.emplace_back(perceptual[2]);
-            candidates.stacks.insert(candidates.stacks.end(), surface_to_deep.begin(), surface_to_deep.end());
+        if (limit_reached)
+            return;
+        if (depth_idx == control_depth) {
+            std::vector<std::vector<uint16_t>> variants =
+                stretched_ordered_stack_variants(control, layer_opacities, stack_depth);
+            for (const std::vector<uint16_t> &surface_to_deep : variants) {
+                if (candidates.rgbs.size() / 3 >= max_candidate_count) {
+                    limit_reached = true;
+                    return;
+                }
+                append_ordered_stack_candidate(candidates,
+                                               colors_with_background,
+                                               weights,
+                                               surface_to_deep,
+                                               layer_opacities,
+                                               simulated_depth);
+            }
             return;
         }
 
         for (size_t component_idx = 0; component_idx < component_count; ++component_idx) {
-            surface_to_deep[size_t(depth_idx)] = uint16_t(component_idx);
+            control[size_t(depth_idx)] = uint16_t(component_idx);
             recurse(depth_idx + 1);
+            if (limit_reached)
+                return;
         }
     };
     recurse(0);
@@ -641,7 +870,9 @@ const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates
     const std::array<float, 3>                   &background_rgb,
     ColorSolverMixModel                            mix_model,
     int                                            stack_depth,
-    size_t                                         candidate_limit)
+    int                                            simulated_stack_depth,
+    size_t                                         candidate_limit,
+    size_t                                         stack_item_limit)
 {
     const std::string key =
         color_solver_ordered_stack_candidate_cache_key(component_colors,
@@ -649,7 +880,9 @@ const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates
                                                        background_rgb,
                                                        mix_model,
                                                        stack_depth,
-                                                       candidate_limit);
+                                                       simulated_stack_depth,
+                                                       candidate_limit,
+                                                       stack_item_limit);
     auto it = cache.find(key);
     if (it != cache.end())
         return it->second;
@@ -660,7 +893,9 @@ const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates
                                                    background_rgb,
                                                    mix_model,
                                                    stack_depth,
-                                                   candidate_limit)).first->second;
+                                                   simulated_stack_depth,
+                                                   candidate_limit,
+                                                   stack_item_limit)).first->second;
 }
 
 std::vector<uint16_t> solve_color_solver_ordered_stack_for_target(

@@ -35,9 +35,14 @@ public:
     const std::vector<unsigned int>& component_ids() const { return m_component_ids; }
     const std::vector<unsigned int>& components_bottom_to_top() const { return m_components_bottom_to_top; }
 
-    TextureMappingContoningStack solve(const std::array<float, 3> &target_rgb, int stack_layers, bool lower_surface = false) const;
+    TextureMappingContoningStack solve(const std::array<float, 3> &target_rgb,
+                                       int                         stack_layers,
+                                       bool                        lower_surface = false,
+                                       int                         visible_stack_layers = 0) const;
     unsigned int component_for_depth(const std::array<float, 3> &target_rgb, int stack_layers, int depth_from_top, bool lower_surface = false) const;
-    std::optional<std::array<float, 3>> stack_rgb(const std::vector<unsigned int> &bottom_to_top, bool lower_surface = false) const;
+    std::optional<std::array<float, 3>> stack_rgb(const std::vector<unsigned int> &bottom_to_top,
+                                                 bool                             lower_surface = false,
+                                                 int                              visible_stack_layers = 0) const;
 
 private:
     struct Candidate {

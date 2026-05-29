@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <iomanip>
 #include <numeric>
 #include <limits>
@@ -20,6 +21,7 @@
 #include <future>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <boost/algorithm/string.hpp>
 #include <boost/iterator/counting_iterator.hpp>
 #include <boost/optional.hpp>
@@ -2561,7 +2563,7 @@ public:
         contoning_angle_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("deg")), 0, wxALIGN_CENTER_VERTICAL);
         top_surface_contoning_root->Add(contoning_angle_row, 0, wxEXPAND | wxBOTTOM, gap);
         auto *contoning_layers_row = new wxBoxSizer(wxHORIZONTAL);
-        contoning_layers_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Max infill/perimeter layer depth")),
+        contoning_layers_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Max infill layer depth")),
                                   0,
                                   wxALIGN_CENTER_VERTICAL | wxRIGHT,
                                   gap);
@@ -2599,7 +2601,11 @@ public:
                                       TextureMappingZone::MaxTopSurfaceContoningPatternFilaments));
         contoning_pattern_row->Add(m_top_surface_contoning_pattern_filaments_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
         contoning_pattern_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("layers")), 0, wxALIGN_CENTER_VERTICAL);
-        top_surface_contoning_root->Add(contoning_pattern_row, 0, wxEXPAND | wxBOTTOM, gap);
+        top_surface_contoning_root->Add(contoning_pattern_row, 0, wxEXPAND);
+        m_top_surface_contoning_pattern_recommendation_text =
+            new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, wxEmptyString);
+        m_top_surface_contoning_pattern_recommendation_text->Wrap(FromDIP(520));
+        top_surface_contoning_root->Add(m_top_surface_contoning_pattern_recommendation_text, 0, wxEXPAND | wxTOP | wxBOTTOM, gap / 2);
         auto *contoning_feature_row = new wxBoxSizer(wxHORIZONTAL);
         contoning_feature_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Minimum feature")),
                                    0,
@@ -2839,6 +2845,21 @@ public:
         if (m_top_surface_contoning_polygonize_color_regions_checkbox != nullptr) {
             m_top_surface_contoning_polygonize_color_regions_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
                 update_top_surface_image_options_visibility(true);
+            });
+        }
+        if (m_top_surface_contoning_td_adjustment_checkbox != nullptr) {
+            m_top_surface_contoning_td_adjustment_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+                update_top_surface_contoning_td_recommendation(true);
+            });
+        }
+        for (wxSpinCtrlDouble *spin : m_transmission_distance_spins) {
+            if (spin == nullptr)
+                continue;
+            spin->Bind(wxEVT_SPINCTRLDOUBLE, [this](wxSpinDoubleEvent &) {
+                update_top_surface_contoning_td_recommendation(true);
+            });
+            spin->Bind(wxEVT_TEXT, [this](wxCommandEvent &) {
+                update_top_surface_contoning_td_recommendation(false);
             });
         }
         m_top_surface_image_printing_enabled_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
@@ -3588,6 +3609,93 @@ private:
         }
     }
 
+    float top_surface_contoning_layer_height_mm() const
+    {
+        auto read_layer_height = [](const DynamicPrintConfig &config, float &value) {
+            if (!config.has("layer_height"))
+                return false;
+            const ConfigOptionFloat *opt = config.option<ConfigOptionFloat>("layer_height");
+            if (opt == nullptr || !std::isfinite(opt->value) || opt->value <= 0.0)
+                return false;
+            value = float(opt->value);
+            return true;
+        };
+
+        float value = 0.2f;
+        PresetBundle *bundle = wxGetApp().preset_bundle;
+        if (bundle != nullptr) {
+            if (read_layer_height(bundle->project_config, value))
+                return std::clamp(value, 0.01f, 2.f);
+            if (read_layer_height(bundle->prints.get_edited_preset().config, value))
+                return std::clamp(value, 0.01f, 2.f);
+        }
+        return value;
+    }
+
+    int top_surface_contoning_layers_for_strength(float td_mm, float strength) const
+    {
+        if (!std::isfinite(td_mm) || td_mm <= 0.f)
+            return 0;
+        const float layer_height = top_surface_contoning_layer_height_mm();
+        const float safe_strength = std::clamp(strength, 0.01f, 0.99f);
+        const float layers = (td_mm / layer_height) * (std::log(1.f - safe_strength) / std::log(0.05f));
+        return std::max(1, int(std::ceil(layers)));
+    }
+
+    wxString top_surface_contoning_td_recommendation_text() const
+    {
+        if (!top_surface_contoning_td_adjustment_enabled() || m_transmission_distance_spins.empty())
+            return wxEmptyString;
+
+        int lower = 0;
+        int upper = 0;
+        int strong = 0;
+        bool has_translucent = false;
+        for (wxSpinCtrlDouble *spin : m_transmission_distance_spins) {
+            const double td_value = spin != nullptr ? spin->GetValue() : 0.0;
+            if (!std::isfinite(td_value) || td_value <= 0.0)
+                return wxEmptyString;
+            const float td_mm = float(std::clamp(td_value, 0.01, 50.0));
+            if (top_surface_contoning_layers_for_strength(td_mm, 0.95f) <= 3)
+                continue;
+            has_translucent = true;
+            lower = std::max(lower, top_surface_contoning_layers_for_strength(td_mm, 0.30f));
+            upper = std::max(upper, top_surface_contoning_layers_for_strength(td_mm, 0.50f));
+            strong = std::max(strong, top_surface_contoning_layers_for_strength(td_mm, 0.75f));
+        }
+
+        if (!has_translucent)
+            return _L("TD recommendation: 1-3 layers.");
+        upper = std::max(upper, lower);
+        strong = std::max(strong, upper);
+        return wxString::Format(_L("TD recommendation: %d-%d layers. %d+ layers for stronger saturation."),
+                                lower,
+                                upper,
+                                strong);
+    }
+
+    void update_top_surface_contoning_td_recommendation(bool fit_dialog)
+    {
+        if (m_top_surface_contoning_pattern_recommendation_text == nullptr)
+            return;
+        const bool contoning =
+            m_top_surface_image_printing_enabled_checkbox != nullptr &&
+            m_top_surface_image_printing_enabled_checkbox->GetValue() &&
+            m_top_surface_image_method_choice != nullptr &&
+            m_top_surface_image_method_choice->GetSelection() == int(TextureMappingZone::TopSurfaceImageContoning);
+        const wxString text = contoning ? top_surface_contoning_td_recommendation_text() : wxString();
+        m_top_surface_contoning_pattern_recommendation_text->SetLabel(text);
+        m_top_surface_contoning_pattern_recommendation_text->Show(!text.empty());
+        if (!fit_dialog)
+            return;
+        layout_current_options_page();
+        update_options_book_min_size();
+        if (GetSizer() != nullptr) {
+            Layout();
+            Fit();
+        }
+    }
+
     void update_modulation_mode_options_visibility(bool fit_dialog)
     {
         const bool perimeter_path_mode = modulation_mode() == int(TextureMappingZone::ModulationPerimeterPath) ||
@@ -3803,6 +3911,7 @@ private:
             m_top_surface_image_fixed_coloring_filaments_checkbox->Show(!contoning_selected);
             m_top_surface_image_fixed_coloring_filaments_checkbox->Enable(enabled && !contoning_selected);
         }
+        update_top_surface_contoning_td_recommendation(false);
         layout_current_options_page();
         if (!fit_dialog)
             return;
@@ -3858,6 +3967,7 @@ private:
     wxSpinCtrlDouble *m_top_surface_contoning_angle_threshold_spin {nullptr};
     wxSpinCtrl *m_top_surface_contoning_stack_layers_spin {nullptr};
     wxSpinCtrl *m_top_surface_contoning_pattern_filaments_spin {nullptr};
+    wxStaticText *m_top_surface_contoning_pattern_recommendation_text {nullptr};
     wxSpinCtrlDouble *m_top_surface_contoning_min_feature_spin {nullptr};
     wxChoice *m_top_surface_contoning_flat_surface_infill_choice {nullptr};
     wxPanel *m_top_surface_contoning_checkboxes_panel {nullptr};

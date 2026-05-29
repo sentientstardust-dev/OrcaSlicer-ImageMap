@@ -1952,19 +1952,21 @@ static std::optional<TopSurfaceImageContoningCellSample> top_surface_image_conto
 static std::optional<TopSurfaceImageContoningSolvedLabel> top_surface_image_contoning_solve_label(
     const std::array<float, 3>                         &rgb,
     int                                                 solve_layers,
+    int                                                 visible_layers,
     const TextureMappingContoningSolver                &solver,
     bool                                                lower_surface,
     std::vector<TopSurfaceImageContoningVectorLabel>   &labels,
-    std::map<std::vector<unsigned int>, int>           &label_by_stack)
+    std::map<std::pair<std::vector<unsigned int>, int>, int> &label_by_stack)
 {
-    TextureMappingContoningStack stack = solver.solve(rgb, solve_layers, lower_surface);
+    TextureMappingContoningStack stack = solver.solve(rgb, solve_layers, lower_surface, visible_layers);
     if (stack.bottom_to_top.empty())
         return std::nullopt;
     std::optional<std::array<float, 3>> stack_rgb =
-        solver.stack_rgb(stack.bottom_to_top, lower_surface);
+        solver.stack_rgb(stack.bottom_to_top, lower_surface, visible_layers);
     if (!stack_rgb)
         return std::nullopt;
-    auto label_it = label_by_stack.find(stack.bottom_to_top);
+    const auto label_key = std::make_pair(stack.bottom_to_top, std::max(0, visible_layers));
+    auto label_it = label_by_stack.find(label_key);
     int label = -1;
     if (label_it == label_by_stack.end()) {
         TopSurfaceImageContoningVectorLabel label_data;
@@ -1973,7 +1975,7 @@ static std::optional<TopSurfaceImageContoningSolvedLabel> top_surface_image_cont
         label_data.oklab = color_solver_oklab_from_srgb(*stack_rgb);
         label = int(labels.size());
         labels.emplace_back(std::move(label_data));
-        label_by_stack.emplace(labels.back().bottom_to_top, label);
+        label_by_stack.emplace(label_key, label);
     } else {
         label = label_it->second;
     }
@@ -2104,12 +2106,13 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
 
     std::vector<int> grid(size_t(cols) * size_t(rows), -1);
     std::vector<TopSurfaceImageContoningVectorLabel> labels;
-    std::map<std::vector<unsigned int>, int> label_by_stack;
+    std::map<std::pair<std::vector<unsigned int>, int>, int> label_by_stack;
 
-    auto solve_cell = [&](int row, int col, const std::array<float, 3> &target_rgb, int solve_layers) {
+    auto solve_cell = [&](int row, int col, const std::array<float, 3> &target_rgb, int solve_layers, int available_depth) {
         std::optional<TopSurfaceImageContoningSolvedLabel> solved =
             top_surface_image_contoning_solve_label(target_rgb,
                                                     solve_layers,
+                                                    available_depth,
                                                     solver,
                                                     source_surface == TopSurfaceImageSourceSurface::Bottom &&
                                                         plan.contoning_td_adjustment_enabled,
@@ -2178,7 +2181,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                     std::clamp(sample->rgb[2] + errors[grid_idx][2] + top_surface_image_contoning_jitter(col, row, depth, 2), 0.f, 1.f)
                 };
                 const std::optional<TopSurfaceImageContoningSolvedLabel> solved =
-                    solve_cell(row, col, target_rgb, sample->solve_layers);
+                    solve_cell(row, col, target_rgb, sample->solve_layers, sample->available_depth);
                 if (!solved)
                     continue;
                 const std::array<float, 3> error {
@@ -2207,7 +2210,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                 const std::optional<TopSurfaceImageContoningCellSample> &sample = cell_samples[size_t(row * cols + col)];
                 if (!sample)
                     continue;
-                solve_cell(row, col, sample->rgb, sample->solve_layers);
+                solve_cell(row, col, sample->rgb, sample->solve_layers, sample->available_depth);
             }
         }
     }
@@ -2294,12 +2297,13 @@ static std::shared_ptr<const TopSurfaceImageContoningStackPlan> top_surface_imag
     out->rows = rows;
     out->cells.assign(size_t(cols) * size_t(rows), TopSurfaceImageContoningStackPlanCell());
 
-    std::map<std::vector<unsigned int>, int> label_by_stack;
+    std::map<std::pair<std::vector<unsigned int>, int>, int> label_by_stack;
 
     auto solve_cell = [&](int row, int col, const std::array<float, 3> &target_rgb, int solve_layers, int available_depth) {
         std::optional<TopSurfaceImageContoningSolvedLabel> solved =
             top_surface_image_contoning_solve_label(target_rgb,
                                                     solve_layers,
+                                                    available_depth,
                                                     solver,
                                                     source_surface == TopSurfaceImageSourceSurface::Bottom &&
                                                         plan.contoning_td_adjustment_enabled,

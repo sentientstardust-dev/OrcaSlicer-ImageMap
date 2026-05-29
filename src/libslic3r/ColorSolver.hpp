@@ -74,6 +74,7 @@ struct ColorSolverOrderedStackCandidateSet {
 
     size_t component_count { 0 };
     int stack_depth { 0 };
+    int simulated_stack_depth { 0 };
     std::vector<float> rgbs;
     std::vector<float> perceptual_coords;
     std::vector<uint16_t> stacks;
@@ -130,14 +131,18 @@ std::string color_solver_ordered_stack_candidate_cache_key(const std::vector<std
                                                            const std::array<float, 3>              &background_rgb,
                                                            ColorSolverMixModel                       mix_model,
                                                            int                                       stack_depth,
-                                                           size_t                                    candidate_limit = 0);
+                                                           int                                       simulated_stack_depth = 0,
+                                                           size_t                                    candidate_limit = 0,
+                                                           size_t                                    stack_item_limit = 0);
 ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
     const std::vector<std::array<float, 3>> &component_colors,
     const std::vector<float>                &layer_opacities,
     const std::array<float, 3>              &background_rgb,
     ColorSolverMixModel                       mix_model,
     int                                       stack_depth,
-    size_t                                    candidate_limit = 0);
+    int                                       simulated_stack_depth = 0,
+    size_t                                    candidate_limit = 0,
+    size_t                                    stack_item_limit = 0);
 const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates(
     ColorSolverOrderedStackCandidateCache        &cache,
     const std::vector<std::array<float, 3>>      &component_colors,
@@ -145,7 +150,9 @@ const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates
     const std::array<float, 3>                   &background_rgb,
     ColorSolverMixModel                            mix_model,
     int                                            stack_depth,
-    size_t                                         candidate_limit = 0);
+    int                                            simulated_stack_depth = 0,
+    size_t                                         candidate_limit = 0,
+    size_t                                         stack_item_limit = 0);
 std::vector<uint16_t> solve_color_solver_ordered_stack_for_target(
     const ColorSolverOrderedStackCandidateSet &candidates,
     const std::array<float, 3>                &target_rgb,

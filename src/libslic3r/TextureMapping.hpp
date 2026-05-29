@@ -181,10 +181,10 @@ struct TextureMappingZone
     static constexpr float MaxTopSurfaceContoningAngleThresholdDeg = 180.f;
     static constexpr float DefaultTopSurfaceContoningAngleThresholdDeg = 20.f;
     static constexpr int   MinTopSurfaceContoningStackLayers = 1;
-    static constexpr int   MaxTopSurfaceContoningStackLayers = 20;
-    static constexpr int   DefaultTopSurfaceContoningStackLayers = 15;
+    static constexpr int   MaxTopSurfaceContoningStackLayers = 100;
+    static constexpr int   DefaultTopSurfaceContoningStackLayers = 100;
     static constexpr int   MinTopSurfaceContoningPatternFilaments = 1;
-    static constexpr int   MaxTopSurfaceContoningPatternFilaments = 20;
+    static constexpr int   MaxTopSurfaceContoningPatternFilaments = 100;
     static constexpr int   DefaultTopSurfaceContoningPatternFilaments = 5;
     static constexpr float MinTopSurfaceContoningMinFeatureMm = 0.f;
     static constexpr float MaxTopSurfaceContoningMinFeatureMm = 20.f;

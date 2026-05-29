@@ -46,6 +46,7 @@ constexpr size_t k_surface_gradient_preview_max_components = 10;
 constexpr size_t k_surface_gradient_preview_lut_size = 33;
 constexpr size_t k_contoning_flat_surface_preview_max_candidates = 250000;
 constexpr size_t k_contoning_flat_surface_preview_max_ordered_candidates = 2500000;
+constexpr size_t k_contoning_flat_surface_preview_max_ordered_stack_items = 20000000;
 constexpr double k_contoning_top_surface_preview_lod_max_samples = 350000.0;
 constexpr const char *TEXTURE_MAPPING_BACKGROUND_COLOR_CONFIG_KEY = "texture_mapping_background_color";
 constexpr float k_contoning_preview_inferred_black_td_mm = 0.1f;
@@ -2493,12 +2494,21 @@ std::array<float, 3> contoning_flat_surface_rgb_for_texture_preview(
     if (settings.contoning_flat_surface_td_adjustment && !ordered_candidates.empty()) {
         const std::vector<uint16_t> surface_to_deep =
             solve_color_solver_ordered_stack_for_target(ordered_candidates, target_rgb, ColorSolverMode::V2);
-        if (!surface_to_deep.empty())
+        if (!surface_to_deep.empty()) {
+            std::vector<uint16_t> simulated_surface_to_deep = surface_to_deep;
+            if (ordered_candidates.simulated_stack_depth > 0 &&
+                ordered_candidates.simulated_stack_depth != int(surface_to_deep.size())) {
+                simulated_surface_to_deep.clear();
+                simulated_surface_to_deep.reserve(size_t(ordered_candidates.simulated_stack_depth));
+                for (int idx = 0; idx < ordered_candidates.simulated_stack_depth; ++idx)
+                    simulated_surface_to_deep.emplace_back(surface_to_deep[size_t(idx) % surface_to_deep.size()]);
+            }
             return mix_color_solver_ordered_stack(settings.component_colors,
-                                                 surface_to_deep,
+                                                 simulated_surface_to_deep,
                                                  settings.contoning_flat_surface_layer_opacities,
                                                  settings.contoning_flat_surface_background_rgb,
                                                  ColorSolverMixModel::PigmentPainter);
+        }
     }
     if (!candidates.empty()) {
         const TexturePreviewMixNearestResult nearest =
@@ -2832,7 +2842,9 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                                                        settings.contoning_flat_surface_background_rgb,
                                                        ColorSolverMixModel::PigmentPainter,
                                                        contoning_flat_surface_pattern_filaments,
-                                                       k_contoning_flat_surface_preview_max_ordered_candidates) :
+                                                       contoning_flat_surface_pattern_filaments,
+                                                       k_contoning_flat_surface_preview_max_ordered_candidates,
+                                                       k_contoning_flat_surface_preview_max_ordered_stack_items) :
             ColorSolverOrderedStackCandidateSet{};
     const std::vector<TexturePreviewMixCandidate> contoning_flat_surface_candidates =
         use_contoning_flat_surface_quantization && contoning_flat_surface_ordered_candidates.empty() ?
