@@ -405,7 +405,7 @@ private:
         return solve_color_solver_weights_for_target(candidates,
                                                      target,
                                                      color_solver_lookup_mode_from_index(generic_solver_lookup_mode),
-                                                     color_solver_mode_from_index(generic_solver_mode));
+                                                     color_solver_mode_from_index(TextureMappingZone::effective_generic_solver_mode(generic_solver_mode)));
     }
 
     std::vector<size_t> generic_solver_tool_candidates(const std::vector<size_t> *preferred_tools = nullptr) const

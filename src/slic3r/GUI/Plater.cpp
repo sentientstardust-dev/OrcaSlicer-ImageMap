@@ -2045,6 +2045,55 @@ static bool texture_mapping_prime_tower_images_equal(const TextureMappingPrimeTo
            lhs.rgba == rhs.rgba;
 }
 
+static wxString texture_mapping_generic_solver_mode_label(int mode)
+{
+    switch (TextureMappingZone::effective_generic_solver_mode(mode)) {
+    case int(TextureMappingZone::GenericSolverRGB):
+        return _L("RGB");
+    case int(TextureMappingZone::GenericSolverOklab):
+        return _L("Oklab");
+    default:
+        return _L("Oklab soft cap dark correction");
+    }
+}
+
+static wxString texture_mapping_generic_solver_default_label()
+{
+    wxString label = _L("Default");
+    label += " (";
+    label += texture_mapping_generic_solver_mode_label(TextureMappingZone::SlicerDefaultGenericSolverMode);
+    label += ")";
+    return label;
+}
+
+static int texture_mapping_generic_solver_mode_choice_selection(int mode)
+{
+    if (mode == int(TextureMappingZone::GenericSolverDefault))
+        return 0;
+    switch (TextureMappingZone::effective_generic_solver_mode(mode)) {
+    case int(TextureMappingZone::GenericSolverRGB):
+        return 1;
+    case int(TextureMappingZone::GenericSolverOklab):
+        return 2;
+    default:
+        return 3;
+    }
+}
+
+static int texture_mapping_generic_solver_mode_from_choice_selection(int selection)
+{
+    switch (selection) {
+    case 1:
+        return int(TextureMappingZone::GenericSolverRGB);
+    case 2:
+        return int(TextureMappingZone::GenericSolverOklab);
+    case 3:
+        return int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4);
+    default:
+        return TextureMappingZone::DefaultGenericSolverMode;
+    }
+}
+
 class TextureMappingAdvancedOptionsDialog : public wxDialog
 {
 public:
@@ -2538,13 +2587,12 @@ public:
         auto *generic_solver_mode_row = new wxBoxSizer(wxHORIZONTAL);
         generic_solver_mode_row->Add(new wxStaticText(experimental_page, wxID_ANY, _L("Generic solver")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         wxArrayString generic_solver_mode_choices;
-        generic_solver_mode_choices.Add(_L("RGB"));
-        generic_solver_mode_choices.Add(_L("Oklab"));
-        generic_solver_mode_choices.Add(_L("Oklab soft cap dark correction"));
+        generic_solver_mode_choices.Add(texture_mapping_generic_solver_default_label());
+        generic_solver_mode_choices.Add(texture_mapping_generic_solver_mode_label(int(TextureMappingZone::GenericSolverRGB)));
+        generic_solver_mode_choices.Add(texture_mapping_generic_solver_mode_label(int(TextureMappingZone::GenericSolverOklab)));
+        generic_solver_mode_choices.Add(texture_mapping_generic_solver_mode_label(int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4)));
         m_generic_solver_mode_choice = new wxChoice(experimental_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, generic_solver_mode_choices);
-        m_generic_solver_mode_choice->SetSelection(std::clamp(generic_solver_mode,
-                                                              int(TextureMappingZone::GenericSolverRGB),
-                                                              int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4)));
+        m_generic_solver_mode_choice->SetSelection(texture_mapping_generic_solver_mode_choice_selection(generic_solver_mode));
         generic_solver_mode_row->Add(m_generic_solver_mode_choice, 1, wxALIGN_CENTER_VERTICAL);
         experimental_box->Add(generic_solver_mode_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
 
@@ -3535,7 +3583,7 @@ public:
     bool top_surface_contoning_surface_anchored_stacks_enabled() const
     {
         if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
-            return false;
+            return true;
         return m_top_surface_contoning_surface_anchored_stacks_checkbox == nullptr ?
             TextureMappingZone::DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled :
             m_top_surface_contoning_surface_anchored_stacks_checkbox->GetValue();
@@ -3607,9 +3655,7 @@ public:
     int generic_solver_mode() const
     {
         return m_generic_solver_mode_choice ?
-            std::clamp(m_generic_solver_mode_choice->GetSelection(),
-                       int(TextureMappingZone::GenericSolverRGB),
-                       int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4)) :
+            texture_mapping_generic_solver_mode_from_choice_selection(m_generic_solver_mode_choice->GetSelection()) :
             TextureMappingZone::DefaultGenericSolverMode;
     }
 

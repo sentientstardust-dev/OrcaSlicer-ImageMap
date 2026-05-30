@@ -677,8 +677,9 @@ float generic_solver_oklab_chroma_factor(const std::array<float, 3> &target_okla
 std::array<float, 3> generic_solver_perceptual_axis_weights(const std::array<float, 3> &target_oklab,
                                                             int                         generic_solver_mode)
 {
+    const int effective_solver_mode = TextureMappingZone::effective_generic_solver_mode(generic_solver_mode);
     std::array<float, 3> weights = generic_solver_oklab_axis_weights(target_oklab);
-    if (generic_solver_mode == int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4)) {
+    if (effective_solver_mode == int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4)) {
         weights[0] = std::max(weights[0], 1.f);
         weights[1] = std::min(weights[1], 4.f);
         weights[2] = std::min(weights[2], 4.f);
@@ -688,7 +689,7 @@ std::array<float, 3> generic_solver_perceptual_axis_weights(const std::array<flo
 
 bool generic_solver_mode_is_perceptual(int generic_solver_mode)
 {
-    return generic_solver_mode != int(TextureMappingZone::GenericSolverRGB);
+    return TextureMappingZone::effective_generic_solver_mode(generic_solver_mode) != int(TextureMappingZone::GenericSolverRGB);
 }
 
 unsigned char to_u8(float value)
@@ -1657,7 +1658,7 @@ float texture_preview_mix_candidate_perceptual_error(const TexturePreviewMixCand
     const float da = candidate.perceptual[1] - target_oklab[1];
     const float db = candidate.perceptual[2] - target_oklab[2];
     float error = axis_weights[0] * dl * dl + axis_weights[1] * da * da + axis_weights[2] * db * db;
-    if (generic_solver_mode == int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4)) {
+    if (TextureMappingZone::effective_generic_solver_mode(generic_solver_mode) == int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4)) {
         const float under_l = std::max(0.f, target_oklab[0] - candidate.perceptual[0] - 0.04f);
         error += 4.f * generic_solver_oklab_chroma_factor(target_oklab) * under_l * under_l;
     }
@@ -1744,9 +1745,7 @@ std::vector<float> best_component_mix_weights_for_target(const std::vector<Textu
     if (candidates.empty())
         return {};
 
-    const int clamped_solver_mode = std::clamp(generic_solver_mode,
-                                               int(TextureMappingZone::GenericSolverRGB),
-                                               int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4));
+    const int clamped_solver_mode = TextureMappingZone::effective_generic_solver_mode(generic_solver_mode);
     TexturePreviewMixNearestResult nearest =
         generic_solver_mode_is_perceptual(clamped_solver_mode) ?
             nearest_texture_preview_mix_candidates_perceptual(candidates, perceptual_nodes, perceptual_root, target_rgb, clamped_solver_mode) :
@@ -1904,6 +1903,41 @@ struct TexturePreviewBinaryDitherCandidate
     std::array<float, 3> oklab { { 1.f, 0.f, 0.f } };
 };
 
+const std::array<float, 3> &binary_dither_candidate_color_for_texture_preview(
+    const TexturePreviewBinaryDitherCandidate &candidate,
+    int                                        generic_solver_mode)
+{
+    return TextureMappingZone::effective_generic_solver_mode(generic_solver_mode) == int(TextureMappingZone::GenericSolverRGB) ?
+        candidate.rgb :
+        candidate.oklab;
+}
+
+std::array<float, 3> binary_dither_axis_weights_for_texture_preview(const std::array<float, 3> &target_color,
+                                                                    int                         generic_solver_mode)
+{
+    return TextureMappingZone::effective_generic_solver_mode(generic_solver_mode) == int(TextureMappingZone::GenericSolverRGB) ?
+        std::array<float, 3>{ { 1.f, 1.f, 1.f } } :
+        generic_solver_perceptual_axis_weights(target_color, generic_solver_mode);
+}
+
+float binary_dither_candidate_error_for_texture_preview(const TexturePreviewBinaryDitherCandidate &candidate,
+                                                        const std::array<float, 3>               &target_color,
+                                                        const std::array<float, 3>               &axis_weights,
+                                                        int                                       generic_solver_mode)
+{
+    const std::array<float, 3> &candidate_color =
+        binary_dither_candidate_color_for_texture_preview(candidate, generic_solver_mode);
+    const float d0 = candidate_color[0] - target_color[0];
+    const float d1 = candidate_color[1] - target_color[1];
+    const float d2 = candidate_color[2] - target_color[2];
+    float error = axis_weights[0] * d0 * d0 + axis_weights[1] * d1 * d1 + axis_weights[2] * d2 * d2;
+    if (TextureMappingZone::effective_generic_solver_mode(generic_solver_mode) == int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4)) {
+        const float under_l = std::max(0.f, target_color[0] - candidate_color[0] - 0.04f);
+        error += 4.f * generic_solver_oklab_chroma_factor(target_color) * under_l * under_l;
+    }
+    return error;
+}
+
 std::vector<float> binary_component_visibility_weights_for_texture_preview(const TexturePreviewSimulationSettings &settings,
                                                                            uint32_t                                mask)
 {
@@ -2003,10 +2037,13 @@ std::array<float, 3> texture_preview_target_rgb(const TexturePreviewSimulationSe
     return apply_texture_contrast_to_rgb(target, std::clamp(settings.contrast_pct, 25.f, 300.f) / 100.f);
 }
 
-std::array<float, 3> texture_preview_target_oklab(const TexturePreviewSimulationSettings &settings,
+std::array<float, 3> texture_preview_target_color(const TexturePreviewSimulationSettings &settings,
                                                   const std::array<float, 4>            &sample_rgba)
 {
-    return oklab_from_srgb(texture_preview_target_rgb(settings, sample_rgba));
+    const std::array<float, 3> target_rgb = texture_preview_target_rgb(settings, sample_rgba);
+    return TextureMappingZone::effective_generic_solver_mode(settings.generic_solver_mode) == int(TextureMappingZone::GenericSolverRGB) ?
+        target_rgb :
+        oklab_from_srgb(target_rgb);
 }
 
 struct TexturePreviewBinaryDitherNearestResult {
@@ -2018,16 +2055,18 @@ struct TexturePreviewBinaryDitherNearestResult {
 
 TexturePreviewBinaryDitherNearestResult nearest_binary_dither_candidates_for_texture_preview(
     const std::vector<TexturePreviewBinaryDitherCandidate> &candidates,
-    const std::array<float, 3>                             &target_oklab)
+    const std::array<float, 3>                             &target_color,
+    int                                                     generic_solver_mode)
 {
     TexturePreviewBinaryDitherNearestResult result;
-    const std::array<float, 3> axis_weights = generic_solver_oklab_axis_weights(target_oklab);
+    const int clamped_solver_mode = TextureMappingZone::effective_generic_solver_mode(generic_solver_mode);
+    const std::array<float, 3> axis_weights =
+        binary_dither_axis_weights_for_texture_preview(target_color, clamped_solver_mode);
     for (size_t idx = 0; idx < candidates.size(); ++idx) {
-        const std::array<float, 3> &candidate = candidates[idx].oklab;
-        const float dl = candidate[0] - target_oklab[0];
-        const float da = candidate[1] - target_oklab[1];
-        const float db = candidate[2] - target_oklab[2];
-        const float error = axis_weights[0] * dl * dl + axis_weights[1] * da * da + axis_weights[2] * db * db;
+        const float error = binary_dither_candidate_error_for_texture_preview(candidates[idx],
+                                                                              target_color,
+                                                                              axis_weights,
+                                                                              clamped_solver_mode);
         if (error < result.best_error) {
             result.second_error = result.best_error;
             result.second_idx = result.best_idx;
@@ -2042,27 +2081,33 @@ TexturePreviewBinaryDitherNearestResult nearest_binary_dither_candidates_for_tex
 }
 
 size_t nearest_binary_dither_candidate_for_texture_preview(const std::vector<TexturePreviewBinaryDitherCandidate> &candidates,
-                                                           const std::array<float, 3>                             &target_oklab)
+                                                           const std::array<float, 3>                             &target_color,
+                                                           int                                                     generic_solver_mode)
 {
-    return nearest_binary_dither_candidates_for_texture_preview(candidates, target_oklab).best_idx;
+    return nearest_binary_dither_candidates_for_texture_preview(candidates, target_color, generic_solver_mode).best_idx;
 }
 
 float binary_dither_alternate_fraction_for_texture_preview(const std::vector<TexturePreviewBinaryDitherCandidate> &candidates,
-                                                          const std::array<float, 3>                             &target_oklab,
+                                                          const std::array<float, 3>                             &target_color,
                                                           size_t                                                  base_idx,
-                                                          size_t                                                  alternate_idx)
+                                                          size_t                                                  alternate_idx,
+                                                          int                                                     generic_solver_mode)
 {
     if (base_idx >= candidates.size() || alternate_idx >= candidates.size() || base_idx == alternate_idx)
         return 0.f;
 
-    const std::array<float, 3> axis_weights = generic_solver_oklab_axis_weights(target_oklab);
-    const std::array<float, 3> &base = candidates[base_idx].oklab;
-    const std::array<float, 3> &alternate = candidates[alternate_idx].oklab;
+    const int clamped_solver_mode = TextureMappingZone::effective_generic_solver_mode(generic_solver_mode);
+    const std::array<float, 3> axis_weights =
+        binary_dither_axis_weights_for_texture_preview(target_color, clamped_solver_mode);
+    const std::array<float, 3> &base =
+        binary_dither_candidate_color_for_texture_preview(candidates[base_idx], clamped_solver_mode);
+    const std::array<float, 3> &alternate =
+        binary_dither_candidate_color_for_texture_preview(candidates[alternate_idx], clamped_solver_mode);
     float numerator = 0.f;
     float denominator = 0.f;
     for (size_t axis = 0; axis < 3; ++axis) {
         const float delta = alternate[axis] - base[axis];
-        numerator += axis_weights[axis] * (target_oklab[axis] - base[axis]) * delta;
+        numerator += axis_weights[axis] * (target_color[axis] - base[axis]) * delta;
         denominator += axis_weights[axis] * delta * delta;
     }
     if (!std::isfinite(numerator) || !std::isfinite(denominator) || denominator <= 1e-12f)
@@ -2071,18 +2116,20 @@ float binary_dither_alternate_fraction_for_texture_preview(const std::vector<Tex
 }
 
 size_t thresholded_binary_dither_candidate_for_texture_preview(const std::vector<TexturePreviewBinaryDitherCandidate> &candidates,
-                                                               const std::array<float, 3>                             &target_oklab,
-                                                               float                                                   threshold)
+                                                               const std::array<float, 3>                             &target_color,
+                                                               float                                                   threshold,
+                                                               int                                                     generic_solver_mode)
 {
     const TexturePreviewBinaryDitherNearestResult nearest =
-        nearest_binary_dither_candidates_for_texture_preview(candidates, target_oklab);
+        nearest_binary_dither_candidates_for_texture_preview(candidates, target_color, generic_solver_mode);
     if (nearest.best_idx >= candidates.size())
         return size_t(-1);
     if (nearest.second_idx >= candidates.size())
         return nearest.best_idx;
 
     const float alternate_fraction =
-        binary_dither_alternate_fraction_for_texture_preview(candidates, target_oklab, nearest.best_idx, nearest.second_idx);
+        binary_dither_alternate_fraction_for_texture_preview(
+            candidates, target_color, nearest.best_idx, nearest.second_idx, generic_solver_mode);
     return std::clamp(threshold, 0.f, 1.f) < alternate_fraction ? nearest.second_idx : nearest.best_idx;
 }
 
@@ -2385,8 +2432,9 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
         settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
         !is_halftone_dithering_method_for_texture_preview(settings.dithering_method)) {
         const std::vector<TexturePreviewBinaryDitherCandidate> candidates = binary_dither_candidates_for_texture_preview(settings);
-        const std::array<float, 3> target_oklab = texture_preview_target_oklab(settings, sample_rgba);
-        const size_t candidate_idx = nearest_binary_dither_candidate_for_texture_preview(candidates, target_oklab);
+        const std::array<float, 3> target_color = texture_preview_target_color(settings, sample_rgba);
+        const size_t candidate_idx =
+            nearest_binary_dither_candidate_for_texture_preview(candidates, target_color, settings.generic_solver_mode);
         if (candidate_idx < candidates.size())
             return binary_component_visibility_weights_for_texture_preview(settings, candidates[candidate_idx].mask);
     }
@@ -2428,7 +2476,7 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
                     settings.generic_mix_candidate_cache->candidates,
                     target,
                     color_solver_lookup_mode_from_index(settings.generic_solver_lookup_mode),
-                    color_solver_mode_from_index(settings.generic_solver_mode)) :
+                    color_solver_mode_from_index(TextureMappingZone::effective_generic_solver_mode(settings.generic_solver_mode))) :
                 std::vector<float>{};
             if (best.size() == component_count)
                 desired = std::move(best);
@@ -2698,9 +2746,7 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
     settings.generic_solver_lookup_mode = std::clamp(zone->generic_solver_lookup_mode,
                                                      int(TextureMappingZone::GenericSolverClosestMix),
                                                      int(TextureMappingZone::GenericSolverBlendClosestTwo));
-    settings.generic_solver_mode = std::clamp(zone->generic_solver_mode,
-                                              int(TextureMappingZone::GenericSolverRGB),
-                                              int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4));
+    settings.generic_solver_mode = TextureMappingZone::effective_generic_solver_mode(zone->generic_solver_mode);
     settings.generic_solver_mix_model = std::clamp(zone->generic_solver_mix_model,
                                                    int(TextureMappingZone::GenericSolverPigmentPainter),
                                                    int(TextureMappingZone::GenericSolverPrusaFdmMixer));
@@ -3186,13 +3232,13 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                     }
                     component_weights = halftone_component_visibility_weights_for_texture_preview(settings, mask);
                 } else if (use_binary_dithering && !binary_dither_candidates.empty()) {
-                    std::array<float, 3> target_oklab = texture_preview_target_oklab(settings, sample_rgba);
+                    std::array<float, 3> target_color = texture_preview_target_color(settings, sample_rgba);
                     const int clamped_method = std::clamp(settings.dithering_method,
                                                           int(TextureMappingZone::DitheringClosest),
                                                           int(TextureMappingZone::DitheringHalftoneV2));
                     if (clamped_method == int(TextureMappingZone::DitheringFloydSteinberg)) {
                         for (size_t axis = 0; axis < 3; ++axis)
-                            target_oklab[axis] += floyd_error_current[x][axis];
+                            target_color[axis] += floyd_error_current[x][axis];
                     }
 
                     bool thresholded_dither = false;
@@ -3204,16 +3250,20 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
 
                     const size_t candidate_idx =
                         thresholded_dither ?
-                            thresholded_binary_dither_candidate_for_texture_preview(binary_dither_candidates, target_oklab, threshold) :
-                            nearest_binary_dither_candidate_for_texture_preview(binary_dither_candidates, target_oklab);
+                            thresholded_binary_dither_candidate_for_texture_preview(
+                                binary_dither_candidates, target_color, threshold, settings.generic_solver_mode) :
+                            nearest_binary_dither_candidate_for_texture_preview(
+                                binary_dither_candidates, target_color, settings.generic_solver_mode);
                     if (candidate_idx < binary_dither_candidates.size()) {
                         const TexturePreviewBinaryDitherCandidate &candidate = binary_dither_candidates[candidate_idx];
                         component_weights = binary_component_visibility_weights_for_texture_preview(settings, candidate.mask);
                         if (clamped_method == int(TextureMappingZone::DitheringFloydSteinberg)) {
+                            const std::array<float, 3> &candidate_color =
+                                binary_dither_candidate_color_for_texture_preview(candidate, settings.generic_solver_mode);
                             const std::array<float, 3> error = {
-                                target_oklab[0] - candidate.oklab[0],
-                                target_oklab[1] - candidate.oklab[1],
-                                target_oklab[2] - candidate.oklab[2]
+                                target_color[0] - candidate_color[0],
+                                target_color[1] - candidate_color[1],
+                                target_color[2] - candidate_color[2]
                             };
                             auto add_error = [&error](std::array<float, 3> &dst, float factor) {
                                 for (size_t axis = 0; axis < 3; ++axis)

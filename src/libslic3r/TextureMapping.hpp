@@ -110,7 +110,8 @@ struct TextureMappingZone
     enum GenericSolverMode : uint8_t {
         GenericSolverRGB = 0,
         GenericSolverOklab = 1,
-        GenericSolverOklabSoftCap4Dark4 = 2
+        GenericSolverOklabSoftCap4Dark4 = 2,
+        GenericSolverDefault = 255
     };
 
     enum GenericSolverMixModel : uint8_t {
@@ -201,7 +202,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultTopSurfaceContoningSupersampledCellsEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled = true;
     static constexpr int   DefaultTopSurfaceContoningPolygonizeResolution = 4;
-    static constexpr bool  DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled = false;
+    static constexpr bool  DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled = true;
     static constexpr bool  DefaultTopSurfaceContoningSurfaceAnchoredStackOptimizationsEnabled = true;
     static constexpr bool  DefaultTopSurfaceContoningTdAdjustmentEnabled = true;
     static constexpr bool  DefaultTopSurfaceContoningSurfaceScatterEnabled = false;
@@ -214,7 +215,8 @@ struct TextureMappingZone
     static constexpr bool  DefaultMinimumVisibilityOffsetEnabled = true;
     static constexpr float DefaultMinimumVisibilityOffsetPct = 30.f;
     static constexpr int   DefaultGenericSolverLookupMode = int(GenericSolverClosestMix);
-    static constexpr int   DefaultGenericSolverMode = int(GenericSolverOklabSoftCap4Dark4);
+    static constexpr int   SlicerDefaultGenericSolverMode = int(GenericSolverOklabSoftCap4Dark4);
+    static constexpr int   DefaultGenericSolverMode = int(GenericSolverDefault);
     static constexpr int   DefaultGenericSolverMixModel = int(GenericSolverPigmentPainter);
     static constexpr bool  DefaultDitheringEnabled = false;
     static constexpr int   DefaultDitheringMethod = int(DitheringHalftoneV2);
@@ -241,6 +243,13 @@ struct TextureMappingZone
         case int(LinearGradient):  return DefaultLinearGradientModulationMode;
         default:                   return DefaultImageTextureModulationMode;
         }
+    }
+
+    static int effective_generic_solver_mode(int mode)
+    {
+        if (mode == int(GenericSolverDefault))
+            return SlicerDefaultGenericSolverMode;
+        return std::clamp(mode, int(GenericSolverRGB), int(GenericSolverOklabSoftCap4Dark4));
     }
 
     static int effective_top_surface_contoning_flat_surface_infill_mode(int mode)
@@ -284,7 +293,7 @@ struct TextureMappingZone
 
     static bool effective_top_surface_contoning_surface_anchored_stacks_enabled(bool value)
     {
-        return ShowExperimentalTopSurfaceContoningOptions && value;
+        return ShowExperimentalTopSurfaceContoningOptions ? value : true;
     }
 
     static bool effective_top_surface_contoning_surface_anchored_stack_optimizations_enabled(bool value)
@@ -578,7 +587,7 @@ struct TextureMappingZone
             top_surface_contoning_recolor_surrounding_perimeters = false;
             top_surface_contoning_perimeter_mode = DefaultTopSurfaceContoningPerimeterMode;
             top_surface_contoning_flat_surface_infill_mode = DefaultTopSurfaceContoningFlatSurfaceInfillMode;
-            top_surface_contoning_surface_anchored_stacks_enabled = false;
+            top_surface_contoning_surface_anchored_stacks_enabled = true;
             top_surface_contoning_surface_anchored_stack_optimizations_enabled = true;
             top_surface_contoning_beam_search_stack_expansion_enabled = true;
             top_surface_contoning_layer_phase_enabled = false;

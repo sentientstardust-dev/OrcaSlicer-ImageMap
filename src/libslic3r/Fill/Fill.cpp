@@ -44,6 +44,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -552,7 +553,7 @@ static void top_surface_image_contoning_report_anchored_progress(const PrintObje
                                      std::clamp(current_depth, 0, total_depth),
                                      total_depth,
                                      source_layer.id() + 1,
-                                     source_surface == TopSurfaceImageSourceSurface::Bottom ? L(", lower") : L(", upper")));
+                                     source_surface == TopSurfaceImageSourceSurface::Bottom ? L("- lower") : L("- upper")));
 }
 
 static ExPolygons top_surface_clip_union_ex(const Polygons &subject)
@@ -1400,6 +1401,139 @@ struct TopSurfaceImageContoningAnchoredSurfacePlan {
     std::vector<TopSurfaceImageContoningAnchoredSurfaceRegion> regions;
 };
 
+class TopSurfaceImageContoningAnchoredDepthWork
+{
+public:
+    using BuildFn = std::function<std::vector<TopSurfaceImageContoningVectorRegion>(int)>;
+    using StoreFn = std::function<void(int, std::vector<TopSurfaceImageContoningVectorRegion>&&)>;
+    using ProgressFn = std::function<void(int)>;
+
+    TopSurfaceImageContoningAnchoredDepthWork(std::vector<int> depths,
+                                              BuildFn          build,
+                                              StoreFn          store,
+                                              ProgressFn       progress)
+        : m_depths(std::move(depths))
+        , m_build(std::move(build))
+        , m_store(std::move(store))
+        , m_progress(std::move(progress))
+    {}
+
+    bool run_one()
+    {
+        int depth = -1;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_error || m_next >= m_depths.size())
+                return false;
+            depth = m_depths[m_next++];
+            ++m_active;
+        }
+
+        std::vector<TopSurfaceImageContoningVectorRegion> regions;
+        std::exception_ptr error;
+        try {
+            regions = m_build(depth);
+            m_store(depth, std::move(regions));
+        } catch (...) {
+            error = std::current_exception();
+        }
+
+        int completed = 0;
+        bool done = false;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (error && !m_error)
+                m_error = error;
+            --m_active;
+            completed = ++m_completed;
+            done = (m_error || m_next >= m_depths.size()) && m_active == 0;
+            m_done = m_done || done;
+        }
+        if (done)
+            m_cv.notify_all();
+        if (!error && m_progress)
+            m_progress(completed);
+        return true;
+    }
+
+    void wait()
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_cv.wait(lock, [this]() { return m_done; });
+        if (m_error)
+            std::rethrow_exception(m_error);
+    }
+
+private:
+    std::mutex m_mutex;
+    std::condition_variable m_cv;
+    std::vector<int> m_depths;
+    BuildFn m_build;
+    StoreFn m_store;
+    ProgressFn m_progress;
+    size_t m_next { 0 };
+    int m_active { 0 };
+    int m_completed { 0 };
+    bool m_done { false };
+    std::exception_ptr m_error;
+};
+
+class TopSurfaceImageContoningAnchoredSurfaceBuildState
+{
+public:
+    void set_depth_work(std::shared_ptr<TopSurfaceImageContoningAnchoredDepthWork> work)
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_finished)
+                m_depth_work = std::move(work);
+        }
+        m_cv.notify_all();
+    }
+
+    void clear_depth_work(const std::shared_ptr<TopSurfaceImageContoningAnchoredDepthWork> &work)
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_depth_work == work)
+                m_depth_work.reset();
+        }
+        m_cv.notify_all();
+    }
+
+    bool help_one()
+    {
+        std::shared_ptr<TopSurfaceImageContoningAnchoredDepthWork> work;
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            if (!m_finished && !m_depth_work)
+                m_cv.wait_for(lock, std::chrono::milliseconds(2), [this]() {
+                    return m_finished || m_depth_work != nullptr;
+                });
+            if (m_finished || !m_depth_work)
+                return false;
+            work = m_depth_work;
+        }
+        return work->run_one();
+    }
+
+    void finish()
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_finished = true;
+            m_depth_work.reset();
+        }
+        m_cv.notify_all();
+    }
+
+private:
+    std::mutex m_mutex;
+    std::condition_variable m_cv;
+    std::shared_ptr<TopSurfaceImageContoningAnchoredDepthWork> m_depth_work;
+    bool m_finished { false };
+};
+
 struct TopSurfaceImageContoningSourceContext {
     TextureMappingOffsetContext offset_context;
     std::vector<ExPolygons> stack_areas;
@@ -1540,7 +1674,7 @@ public:
         const TopSurfaceImageContoningStackPlanKey &key,
         Builder &&builder)
     {
-        return get_or_build_impl(m_anchored_surface_plans, key, std::forward<Builder>(builder));
+        return get_or_build_anchored_surface_impl(key, std::forward<Builder>(builder));
     }
 
 private:
@@ -1551,6 +1685,7 @@ private:
         std::shared_ptr<const Plan> plan;
         std::exception_ptr error;
         bool ready { false };
+        std::shared_ptr<TopSurfaceImageContoningAnchoredSurfaceBuildState> anchored_build_state;
     };
 
     template <class Plan, class Builder>
@@ -1603,6 +1738,79 @@ private:
         if (entry->error)
             std::rethrow_exception(entry->error);
         return entry->plan;
+    }
+
+    template <class Builder>
+    std::shared_ptr<const TopSurfaceImageContoningAnchoredSurfacePlan> get_or_build_anchored_surface_impl(
+        const TopSurfaceImageContoningStackPlanKey &key,
+        Builder &&builder)
+    {
+        using Plan = TopSurfaceImageContoningAnchoredSurfacePlan;
+
+        std::shared_ptr<Entry<Plan>> entry;
+        bool build = false;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto found = m_anchored_surface_plans.find(key);
+            if (found == m_anchored_surface_plans.end()) {
+                entry = std::make_shared<Entry<Plan>>();
+                entry->anchored_build_state = std::make_shared<TopSurfaceImageContoningAnchoredSurfaceBuildState>();
+                m_anchored_surface_plans.emplace(key, entry);
+                build = true;
+            } else {
+                entry = found->second;
+            }
+        }
+
+        if (build) {
+            std::shared_ptr<const Plan> plan;
+            std::exception_ptr error;
+            try {
+                plan = builder(entry->anchored_build_state.get());
+            } catch (...) {
+                error = std::current_exception();
+            }
+            {
+                std::lock_guard<std::mutex> lock(entry->mutex);
+                entry->plan = plan;
+                entry->error = error;
+                entry->ready = true;
+            }
+            if (entry->anchored_build_state)
+                entry->anchored_build_state->finish();
+            entry->cv.notify_all();
+            if (error) {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                auto found = m_anchored_surface_plans.find(key);
+                if (found != m_anchored_surface_plans.end() && found->second == entry)
+                    m_anchored_surface_plans.erase(found);
+                std::rethrow_exception(error);
+            }
+            return plan;
+        }
+
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> lock(entry->mutex);
+                if (entry->ready) {
+                    if (entry->error)
+                        std::rethrow_exception(entry->error);
+                    return entry->plan;
+                }
+            }
+
+            if (entry->anchored_build_state && entry->anchored_build_state->help_one())
+                continue;
+
+            std::unique_lock<std::mutex> lock(entry->mutex);
+            if (!entry->ready)
+                entry->cv.wait_for(lock, std::chrono::milliseconds(1));
+            if (entry->ready) {
+                if (entry->error)
+                    std::rethrow_exception(entry->error);
+                return entry->plan;
+            }
+        }
     }
 
     std::mutex m_mutex;
@@ -2799,6 +3007,7 @@ static void top_surface_image_contoning_solve_anchored_region(
     const TopSurfaceImageContoningSourceContext   &source_context,
     const TextureMappingContoningSolver           &solver,
     TopSurfaceImageSourceSurface                   source_surface,
+    TopSurfaceImageContoningAnchoredSurfaceBuildState *build_state,
     const ThrowIfCanceled                         *throw_if_canceled)
 {
     if (anchored_region.union_area.empty() ||
@@ -2985,6 +3194,37 @@ static void top_surface_image_contoning_solve_anchored_region(
     if (active_depths.size() <= 1) {
         const int depth = active_depths.front();
         anchored_region.depth_regions[size_t(depth)] = build_depth_regions(depth);
+    } else if (build_state != nullptr) {
+        auto store_depth_regions = [&](int depth, std::vector<TopSurfaceImageContoningVectorRegion> &&regions) {
+            anchored_region.depth_regions[size_t(depth)] = std::move(regions);
+        };
+        auto report_progress = [&](int completed) {
+            if (completed == int(active_depths.size()) || (completed & 3) == 0)
+                top_surface_image_contoning_report_anchored_progress(object,
+                                                                     source_layer,
+                                                                     source_surface,
+                                                                     L("processing"),
+                                                                     completed,
+                                                                     int(active_depths.size()));
+        };
+        std::shared_ptr<TopSurfaceImageContoningAnchoredDepthWork> depth_work =
+            std::make_shared<TopSurfaceImageContoningAnchoredDepthWork>(active_depths,
+                                                                        build_depth_regions,
+                                                                        store_depth_regions,
+                                                                        report_progress);
+        build_state->set_depth_work(depth_work);
+        try {
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, active_depths.size(), 1),
+                [&](const tbb::blocked_range<size_t> &range) {
+                    for (size_t idx = range.begin(); idx != range.end(); ++idx)
+                        depth_work->run_one();
+                });
+            depth_work->wait();
+        } catch (...) {
+            build_state->clear_depth_work(depth_work);
+            throw;
+        }
+        build_state->clear_depth_work(depth_work);
     } else {
         std::atomic<int> completed_depths { 0 };
         tbb::parallel_for(tbb::blocked_range<size_t>(0, active_depths.size(), 1),
@@ -3019,6 +3259,7 @@ static std::shared_ptr<TopSurfaceImageContoningAnchoredSurfacePlan> top_surface_
     const PrintConfig                    &print_config,
     const TextureMappingContoningSolver  &solver,
     TopSurfaceImageSourceSurface          source_surface,
+    TopSurfaceImageContoningAnchoredSurfaceBuildState *build_state,
     const ThrowIfCanceled                *throw_if_canceled)
 {
     std::shared_ptr<TopSurfaceImageContoningAnchoredSurfacePlan> out =
@@ -3135,6 +3376,7 @@ static std::shared_ptr<TopSurfaceImageContoningAnchoredSurfacePlan> top_surface_
                                                               *source_context,
                                                               solver,
                                                               source_surface,
+                                                              build_state,
                                                               throw_if_canceled);
             const bool has_depth_regions =
                 std::any_of(anchored_region.depth_regions.begin(),
@@ -3209,7 +3451,7 @@ static std::shared_ptr<const TopSurfaceImageContoningAnchoredSurfacePlan> top_su
 {
     const TopSurfaceImageContoningStackPlanKey key =
         top_surface_image_contoning_anchored_surface_plan_key(plan, source_layer, zone, solver, source_surface);
-    auto builder = [&]() {
+    auto builder = [&](TopSurfaceImageContoningAnchoredSurfaceBuildState *build_state) {
         return top_surface_image_contoning_build_anchored_surface_plan(plan,
                                                                        source_layer,
                                                                        object,
@@ -3217,9 +3459,10 @@ static std::shared_ptr<const TopSurfaceImageContoningAnchoredSurfacePlan> top_su
                                                                        print_config,
                                                                        solver,
                                                                        source_surface,
+                                                                       build_state,
                                                                        throw_if_canceled);
     };
-    return cache != nullptr ? cache->get_or_build_anchored_surface(key, builder) : builder();
+    return cache != nullptr ? cache->get_or_build_anchored_surface(key, builder) : builder(nullptr);
 }
 
 static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_contoning_vector_regions_from_anchored_surface_plan(
