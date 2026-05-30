@@ -44,6 +44,16 @@ enum class ColorSolverMode : int
     V2 = 1
 };
 
+enum class ColorSolverStackComponentRole : uint8_t
+{
+    Generic = 0,
+    Cyan = 1,
+    Magenta = 2,
+    Yellow = 3,
+    Black = 4,
+    White = 5
+};
+
 struct ColorSolverCandidateSet {
     struct KdNode {
         uint32_t candidate_idx { 0 };
@@ -112,7 +122,9 @@ std::array<float, 3> mix_color_solver_ordered_stack(const std::vector<std::array
                                                     const std::array<float, 3>              &background_rgb,
                                                     ColorSolverMixModel                       mix_model,
                                                     float                                     surface_scatter = 0.f,
-                                                    bool                                      beer_lambert_rgb_correction = false);
+                                                    bool                                      beer_lambert_rgb_correction = false,
+                                                    bool                                      td_effective_alpha_correction = false,
+                                                    const std::vector<ColorSolverStackComponentRole> &component_roles = {});
 std::array<float, 3> color_solver_oklab_from_srgb(const std::array<float, 3> &rgb);
 std::array<float, 3> color_solver_srgb_from_oklab(const std::array<float, 3> &oklab);
 
@@ -139,7 +151,9 @@ std::string color_solver_ordered_stack_candidate_cache_key(const std::vector<std
                                                            size_t                                    candidate_limit = 0,
                                                            size_t                                    stack_item_limit = 0,
                                                            float                                     surface_scatter = 0.f,
-                                                           bool                                      beer_lambert_rgb_correction = false);
+                                                           bool                                      beer_lambert_rgb_correction = false,
+                                                           bool                                      td_effective_alpha_correction = false,
+                                                           const std::vector<ColorSolverStackComponentRole> &component_roles = {});
 ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
     const std::vector<std::array<float, 3>> &component_colors,
     const std::vector<float>                &layer_opacities,
@@ -150,7 +164,9 @@ ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
     size_t                                    candidate_limit = 0,
     size_t                                    stack_item_limit = 0,
     float                                     surface_scatter = 0.f,
-    bool                                      beer_lambert_rgb_correction = false);
+    bool                                      beer_lambert_rgb_correction = false,
+    bool                                      td_effective_alpha_correction = false,
+    const std::vector<ColorSolverStackComponentRole> &component_roles = {});
 const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates(
     ColorSolverOrderedStackCandidateCache        &cache,
     const std::vector<std::array<float, 3>>      &component_colors,
@@ -162,7 +178,9 @@ const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates
     size_t                                         candidate_limit = 0,
     size_t                                         stack_item_limit = 0,
     float                                          surface_scatter = 0.f,
-    bool                                           beer_lambert_rgb_correction = false);
+    bool                                           beer_lambert_rgb_correction = false,
+    bool                                           td_effective_alpha_correction = false,
+    const std::vector<ColorSolverStackComponentRole> &component_roles = {});
 std::vector<uint16_t> solve_color_solver_ordered_stack_for_target(
     const ColorSolverOrderedStackCandidateSet &candidates,
     const std::array<float, 3>                &target_rgb,

@@ -2108,6 +2108,7 @@ public:
                                         bool top_surface_contoning_td_adjustment_enabled,
                                         bool top_surface_contoning_surface_scatter_enabled,
                                         bool top_surface_contoning_beer_lambert_rgb_correction_enabled,
+                                        bool top_surface_contoning_td_effective_alpha_correction_enabled,
                                         const TextureMappingZoneShellUsageSummary &top_surface_contoning_shell_usage,
                                         const TextureMappingManager &texture_mapping_zones,
                                         const TextureMappingGlobalSettings &global_settings,
@@ -2806,6 +2807,15 @@ public:
                                        0,
                                        wxEXPAND | wxTOP | wxBOTTOM,
                                        gap / 2);
+        m_top_surface_contoning_td_effective_alpha_correction_checkbox =
+            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("TD Effective Alpha correction"));
+        m_top_surface_contoning_td_effective_alpha_correction_checkbox->SetValue(top_surface_contoning_td_effective_alpha_correction_enabled);
+        m_top_surface_contoning_td_effective_alpha_correction_checkbox->SetMinSize(
+            wxSize(-1, std::max(m_top_surface_contoning_td_effective_alpha_correction_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+        contoning_checkboxes_root->Add(m_top_surface_contoning_td_effective_alpha_correction_checkbox,
+                                       0,
+                                       wxEXPAND | wxTOP | wxBOTTOM,
+                                       gap / 2);
         m_top_surface_contoning_beer_lambert_rgb_correction_checkbox =
             new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("RGB Beer-Lambert correction"));
         m_top_surface_contoning_beer_lambert_rgb_correction_checkbox->SetValue(top_surface_contoning_beer_lambert_rgb_correction_enabled);
@@ -2999,6 +3009,12 @@ public:
         }
         if (m_top_surface_contoning_surface_scatter_checkbox != nullptr) {
             m_top_surface_contoning_surface_scatter_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+                queue_top_surface_contoning_message_update(true);
+            });
+        }
+        if (m_top_surface_contoning_td_effective_alpha_correction_checkbox != nullptr) {
+            m_top_surface_contoning_td_effective_alpha_correction_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+                update_top_surface_image_options_visibility(false);
                 queue_top_surface_contoning_message_update(true);
             });
         }
@@ -3508,9 +3524,17 @@ public:
     bool top_surface_contoning_beer_lambert_rgb_correction_enabled() const
     {
         return top_surface_contoning_td_adjustment_enabled() &&
+            !top_surface_contoning_td_effective_alpha_correction_enabled() &&
             (m_top_surface_contoning_beer_lambert_rgb_correction_checkbox == nullptr ?
                  TextureMappingZone::DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled :
                  m_top_surface_contoning_beer_lambert_rgb_correction_checkbox->GetValue());
+    }
+    bool top_surface_contoning_td_effective_alpha_correction_enabled() const
+    {
+        return top_surface_contoning_td_adjustment_enabled() &&
+            (m_top_surface_contoning_td_effective_alpha_correction_checkbox == nullptr ?
+                 TextureMappingZone::DefaultTopSurfaceContoningTdEffectiveAlphaCorrectionEnabled :
+                 m_top_surface_contoning_td_effective_alpha_correction_checkbox->GetValue());
     }
     bool minimum_visibility_offset_enabled() const
     {
@@ -3854,7 +3878,8 @@ private:
         if (safe_strength <= surface_scatter)
             return 1;
         const float remaining = std::clamp((1.f - safe_strength) / (1.f - surface_scatter), 1e-6f, 0.999999f);
-        const float layers = (td_mm / (2.f * layer_height)) * (std::log(remaining) / std::log(0.05f));
+        const float density_scale = top_surface_contoning_td_effective_alpha_correction_enabled() ? 0.6761904762f : 1.f;
+        const float layers = (td_mm / (2.f * layer_height * density_scale)) * (std::log(remaining) / std::log(0.05f));
         return std::max(1, int(std::ceil(layers)));
     }
 
@@ -4314,8 +4339,20 @@ private:
                 contoning &&
                 m_top_surface_contoning_td_adjustment_checkbox != nullptr &&
                 m_top_surface_contoning_td_adjustment_checkbox->GetValue();
+            const bool td_effective_alpha =
+                td_adjustment &&
+                m_top_surface_contoning_td_effective_alpha_correction_checkbox != nullptr &&
+                m_top_surface_contoning_td_effective_alpha_correction_checkbox->GetValue();
             m_top_surface_contoning_beer_lambert_rgb_correction_checkbox->Show(contoning);
-            m_top_surface_contoning_beer_lambert_rgb_correction_checkbox->Enable(td_adjustment);
+            m_top_surface_contoning_beer_lambert_rgb_correction_checkbox->Enable(td_adjustment && !td_effective_alpha);
+        }
+        if (m_top_surface_contoning_td_effective_alpha_correction_checkbox != nullptr) {
+            const bool td_adjustment =
+                contoning &&
+                m_top_surface_contoning_td_adjustment_checkbox != nullptr &&
+                m_top_surface_contoning_td_adjustment_checkbox->GetValue();
+            m_top_surface_contoning_td_effective_alpha_correction_checkbox->Show(contoning);
+            m_top_surface_contoning_td_effective_alpha_correction_checkbox->Enable(td_adjustment);
         }
         if (m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox != nullptr) {
             m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox->Show(contoning);
@@ -4465,6 +4502,7 @@ private:
     wxCheckBox *m_top_surface_contoning_td_adjustment_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_surface_scatter_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_beer_lambert_rgb_correction_checkbox {nullptr};
+    wxCheckBox *m_top_surface_contoning_td_effective_alpha_correction_checkbox {nullptr};
     wxCheckBox *m_use_legacy_fixed_color_mode_checkbox {nullptr};
     wxCheckBox *m_minimum_visibility_offset_checkbox {nullptr};
     wxSpinCtrl *m_minimum_visibility_offset_spin {nullptr};
@@ -9497,6 +9535,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.top_surface_contoning_td_adjustment_enabled,
                                                     updated.top_surface_contoning_surface_scatter_enabled,
                                                     updated.top_surface_contoning_beer_lambert_rgb_correction_enabled,
+                                                    updated.top_surface_contoning_td_effective_alpha_correction_enabled,
                                                     shell_usage,
                                                     bundle->texture_mapping_zones,
                                                     bundle->texture_mapping_global_settings,
@@ -9579,6 +9618,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 dlg.top_surface_contoning_surface_scatter_enabled();
             updated.top_surface_contoning_beer_lambert_rgb_correction_enabled =
                 dlg.top_surface_contoning_beer_lambert_rgb_correction_enabled();
+            updated.top_surface_contoning_td_effective_alpha_correction_enabled =
+                dlg.top_surface_contoning_td_effective_alpha_correction_enabled();
             if (updated.top_surface_image_printing_enabled &&
                 updated.top_surface_image_printing_method == int(TextureMappingZone::TopSurfaceImageContoning)) {
                 updated.modulation_mode = int(TextureMappingZone::ModulationPerimeterPathV2);

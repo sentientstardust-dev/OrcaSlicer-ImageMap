@@ -507,6 +507,7 @@ struct TopSurfaceImageRegionPlan {
     bool contoning_td_adjustment_enabled = TextureMappingZone::DefaultTopSurfaceContoningTdAdjustmentEnabled;
     bool contoning_surface_scatter_enabled = TextureMappingZone::DefaultTopSurfaceContoningSurfaceScatterEnabled;
     bool contoning_beer_lambert_rgb_correction_enabled = TextureMappingZone::DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled;
+    bool contoning_td_effective_alpha_correction_enabled = TextureMappingZone::DefaultTopSurfaceContoningTdEffectiveAlphaCorrectionEnabled;
     int contoning_generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
     int contoning_flat_surface_infill_mode = TextureMappingZone::SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode;
 };
@@ -1176,6 +1177,7 @@ struct TopSurfaceImageContoningStackPlanKey {
     bool td_adjustment { false };
     bool surface_scatter { false };
     bool beer_lambert_rgb_correction { false };
+    bool td_effective_alpha_correction { false };
     int mix_model { TextureMappingZone::DefaultGenericSolverMixModel };
 
     bool operator<(const TopSurfaceImageContoningStackPlanKey &rhs) const
@@ -1207,6 +1209,7 @@ struct TopSurfaceImageContoningStackPlanKey {
                         td_adjustment,
                         surface_scatter,
                         beer_lambert_rgb_correction,
+                        td_effective_alpha_correction,
                         mix_model) <
                std::tie(rhs.source_layer,
                         rhs.source_layer_id,
@@ -1235,6 +1238,7 @@ struct TopSurfaceImageContoningStackPlanKey {
                         rhs.td_adjustment,
                         rhs.surface_scatter,
                         rhs.beer_lambert_rgb_correction,
+                        rhs.td_effective_alpha_correction,
                         rhs.mix_model);
     }
 };
@@ -2640,6 +2644,7 @@ static TopSurfaceImageContoningStackPlanKey top_surface_image_contoning_stack_pl
     key.td_adjustment = plan.contoning_td_adjustment_enabled;
     key.surface_scatter = plan.contoning_surface_scatter_enabled;
     key.beer_lambert_rgb_correction = plan.contoning_beer_lambert_rgb_correction_enabled;
+    key.td_effective_alpha_correction = plan.contoning_td_effective_alpha_correction_enabled;
     key.mix_model = plan.contoning_generic_solver_mix_model;
     return key;
 }
@@ -3306,8 +3311,12 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
         plan.contoning_td_adjustment_enabled = zone->top_surface_contoning_td_adjustment_enabled;
         plan.contoning_surface_scatter_enabled =
             plan.contoning_td_adjustment_enabled && zone->top_surface_contoning_surface_scatter_enabled;
+        plan.contoning_td_effective_alpha_correction_enabled =
+            plan.contoning_td_adjustment_enabled && zone->top_surface_contoning_td_effective_alpha_correction_enabled;
         plan.contoning_beer_lambert_rgb_correction_enabled =
-            plan.contoning_td_adjustment_enabled && zone->top_surface_contoning_beer_lambert_rgb_correction_enabled;
+            plan.contoning_td_adjustment_enabled &&
+            !plan.contoning_td_effective_alpha_correction_enabled &&
+            zone->top_surface_contoning_beer_lambert_rgb_correction_enabled;
         plan.contoning_generic_solver_mix_model =
             std::clamp(zone->generic_solver_mix_model,
                        int(TextureMappingZone::GenericSolverPigmentPainter),

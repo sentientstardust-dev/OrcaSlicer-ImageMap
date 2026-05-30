@@ -13,6 +13,7 @@
 #include "libslic3r/Model.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/TextureMapping.hpp"
+#include "libslic3r/TextureMappingContoning.hpp"
 #include "libslic3r/ColorSolver.hpp"
 
 #include <algorithm>
@@ -96,6 +97,7 @@ struct TexturePreviewSimulationSettings
     bool contoning_flat_surface_pattern_blend = false;
     bool contoning_flat_surface_td_adjustment = false;
     bool contoning_flat_surface_beer_lambert_rgb_correction = false;
+    bool contoning_flat_surface_td_effective_alpha_correction = false;
     int contoning_flat_surface_pattern_filaments = TextureMappingZone::DefaultTopSurfaceContoningPatternFilaments;
     bool simulate_top_surface_lod = false;
     float top_surface_lod_pitch_mm = 0.f;
@@ -106,6 +108,7 @@ struct TexturePreviewSimulationSettings
     float minimum_visibility_offset_factor = 0.f;
     std::vector<unsigned int> component_ids;
     std::vector<std::array<float, 3>> component_colors;
+    std::vector<ColorSolverStackComponentRole> component_roles;
     std::vector<float> component_strength_factors;
     std::vector<float> component_minimum_offset_factors;
     std::vector<size_t> semantic_component_indices;
@@ -2522,7 +2525,9 @@ std::array<float, 3> contoning_flat_surface_rgb_for_texture_preview(
                                                  settings.contoning_flat_surface_background_rgb,
                                                  color_solver_mix_model_from_index(settings.generic_solver_mix_model),
                                                  settings.contoning_flat_surface_surface_scatter,
-                                                 settings.contoning_flat_surface_beer_lambert_rgb_correction);
+                                                 settings.contoning_flat_surface_beer_lambert_rgb_correction,
+                                                 settings.contoning_flat_surface_td_effective_alpha_correction,
+                                                 settings.component_roles);
         }
     }
     if (!candidates.empty()) {
@@ -2679,7 +2684,11 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
             zone->top_surface_contoning_active() && zone->top_surface_contoning_td_adjustment_enabled;
         settings.contoning_flat_surface_beer_lambert_rgb_correction =
             settings.contoning_flat_surface_td_adjustment &&
+            !zone->top_surface_contoning_td_effective_alpha_correction_enabled &&
             zone->top_surface_contoning_beer_lambert_rgb_correction_enabled;
+        settings.contoning_flat_surface_td_effective_alpha_correction =
+            settings.contoning_flat_surface_td_adjustment &&
+            zone->top_surface_contoning_td_effective_alpha_correction_enabled;
         settings.contoning_flat_surface_surface_scatter =
             settings.contoning_flat_surface_td_adjustment &&
             zone->top_surface_contoning_surface_scatter_enabled ?
@@ -2696,6 +2705,7 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
     settings.component_ids = TextureMappingManager::effective_texture_component_ids(*zone, num_physical, physical_colors);
     if (settings.component_ids.empty())
         return std::nullopt;
+    settings.component_roles = texture_mapping_contoning_component_roles(*zone, settings.component_ids.size());
     settings.simulate_top_surface_lod =
         texture_preview_simulate_top_surface_lod() &&
         zone->top_surface_image_printing_enabled;
@@ -2739,6 +2749,7 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
         if (settings.contoning_flat_surface_layer_opacities.size() != settings.component_colors.size()) {
             settings.contoning_flat_surface_td_adjustment = false;
             settings.contoning_flat_surface_beer_lambert_rgb_correction = false;
+            settings.contoning_flat_surface_td_effective_alpha_correction = false;
         }
     }
 
@@ -2779,6 +2790,7 @@ size_t texture_preview_simulation_signature(const ModelVolume &model_volume,
     mix(std::hash<int>{}(settings.contoning_flat_surface_pattern_blend ? 1 : 0));
     mix(std::hash<int>{}(settings.contoning_flat_surface_td_adjustment ? 1 : 0));
     mix(std::hash<int>{}(settings.contoning_flat_surface_beer_lambert_rgb_correction ? 1 : 0));
+    mix(std::hash<int>{}(settings.contoning_flat_surface_td_effective_alpha_correction ? 1 : 0));
     if (settings.contoning_flat_surface_quantization) {
         mix(std::hash<int>{}(settings.contoning_flat_surface_pattern_filaments));
         mix(std::hash<int>{}(settings.simulate_top_surface_lod ? 1 : 0));
@@ -2790,6 +2802,9 @@ size_t texture_preview_simulation_signature(const ModelVolume &model_volume,
         mix(std::hash<int>{}(int(std::lround(settings.contoning_flat_surface_surface_scatter * 1000000.f))));
         for (const float opacity : settings.contoning_flat_surface_layer_opacities)
             mix(std::hash<int>{}(int(std::lround(opacity * 1000000.f))));
+        if (settings.contoning_flat_surface_td_effective_alpha_correction)
+            for (const ColorSolverStackComponentRole role : settings.component_roles)
+                mix(std::hash<int>{}(int(role)));
     }
     mix(std::hash<int>{}(int(std::lround(settings.contrast_pct * 100.f))));
     mix(std::hash<int>{}(int(std::lround(settings.tone_gamma * 1000.f))));
@@ -2879,7 +2894,9 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                                                        k_contoning_flat_surface_preview_max_ordered_candidates,
                                                        k_contoning_flat_surface_preview_max_ordered_stack_items,
                                                        settings.contoning_flat_surface_surface_scatter,
-                                                       settings.contoning_flat_surface_beer_lambert_rgb_correction) :
+                                                       settings.contoning_flat_surface_beer_lambert_rgb_correction,
+                                                       settings.contoning_flat_surface_td_effective_alpha_correction,
+                                                       settings.component_roles) :
             ColorSolverOrderedStackCandidateSet{};
     const std::vector<TexturePreviewMixCandidate> contoning_flat_surface_candidates =
         use_contoning_flat_surface_quantization && contoning_flat_surface_ordered_candidates.empty() ?
@@ -5694,6 +5711,7 @@ static size_t texture_preview_settings_signature_impl(size_t num_physical,
         signature_mix(std::hash<int>{}(zone.top_surface_contoning_td_adjustment_enabled ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.top_surface_contoning_surface_scatter_enabled ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.top_surface_contoning_beer_lambert_rgb_correction_enabled ? 1 : 0));
+        signature_mix(std::hash<int>{}(zone.top_surface_contoning_td_effective_alpha_correction_enabled ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.nonlinear_offset_adjustment ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.compact_offset_mode ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.use_legacy_fixed_color_mode ? 1 : 0));
@@ -5849,6 +5867,7 @@ static void texture_preview_mix_zone_baked_model_settings(size_t &signature,
     signature_mix(std::hash<int>{}(zone.top_surface_contoning_td_adjustment_enabled ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.top_surface_contoning_surface_scatter_enabled ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.top_surface_contoning_beer_lambert_rgb_correction_enabled ? 1 : 0));
+    signature_mix(std::hash<int>{}(zone.top_surface_contoning_td_effective_alpha_correction_enabled ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.nonlinear_offset_adjustment ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.compact_offset_mode ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.use_legacy_fixed_color_mode ? 1 : 0));

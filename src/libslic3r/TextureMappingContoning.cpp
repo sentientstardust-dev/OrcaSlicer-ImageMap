@@ -70,6 +70,51 @@ bool black_role_component(int filament_color_mode, size_t component_idx, size_t 
     }
 }
 
+ColorSolverStackComponentRole cmy_component_role(int filament_color_mode, size_t component_idx, size_t component_count)
+{
+    switch (std::clamp(filament_color_mode,
+                       int(TextureMappingZone::FilamentColorAny),
+                       int(TextureMappingZone::FilamentColorRGBKW))) {
+    case int(TextureMappingZone::FilamentColorCMY):
+        if (component_count == 3) {
+            if (component_idx == 0)
+                return ColorSolverStackComponentRole::Cyan;
+            if (component_idx == 1)
+                return ColorSolverStackComponentRole::Magenta;
+            if (component_idx == 2)
+                return ColorSolverStackComponentRole::Yellow;
+        }
+        break;
+    case int(TextureMappingZone::FilamentColorCMYK):
+        if (component_count == 4) {
+            if (component_idx == 0)
+                return ColorSolverStackComponentRole::Cyan;
+            if (component_idx == 1)
+                return ColorSolverStackComponentRole::Magenta;
+            if (component_idx == 2)
+                return ColorSolverStackComponentRole::Yellow;
+            if (component_idx == 3)
+                return ColorSolverStackComponentRole::Black;
+        }
+        break;
+    case int(TextureMappingZone::FilamentColorCMYW):
+        if (component_count == 4) {
+            if (component_idx == 0)
+                return ColorSolverStackComponentRole::Cyan;
+            if (component_idx == 1)
+                return ColorSolverStackComponentRole::Magenta;
+            if (component_idx == 2)
+                return ColorSolverStackComponentRole::Yellow;
+            if (component_idx == 3)
+                return ColorSolverStackComponentRole::White;
+        }
+        break;
+    default:
+        break;
+    }
+    return ColorSolverStackComponentRole::Generic;
+}
+
 bool is_black_color_filament(const PrintConfig &config, unsigned int component_id)
 {
     ColorRGB color;
@@ -270,6 +315,15 @@ std::optional<std::array<float, 3>> texture_mapping_contoning_component_colors(
     return out.front();
 }
 
+std::vector<ColorSolverStackComponentRole> texture_mapping_contoning_component_roles(const TextureMappingZone &zone,
+                                                                                    size_t component_count)
+{
+    std::vector<ColorSolverStackComponentRole> roles(component_count, ColorSolverStackComponentRole::Generic);
+    for (size_t idx = 0; idx < component_count; ++idx)
+        roles[idx] = cmy_component_role(zone.filament_color_mode, idx, component_count);
+    return roles;
+}
+
 std::vector<unsigned int> texture_mapping_contoning_components_bottom_to_top(
     const TextureMappingZone &zone,
     const PrintConfig &config,
@@ -353,8 +407,12 @@ TextureMappingContoningSolver::TextureMappingContoningSolver(const TextureMappin
 {
     m_mix_model = color_solver_mix_model_from_index(zone.generic_solver_mix_model);
     m_td_adjustment_enabled = zone.top_surface_contoning_td_adjustment_enabled;
+    m_td_effective_alpha_correction_enabled =
+        m_td_adjustment_enabled && zone.top_surface_contoning_td_effective_alpha_correction_enabled;
     m_beer_lambert_rgb_correction_enabled =
-        m_td_adjustment_enabled && zone.top_surface_contoning_beer_lambert_rgb_correction_enabled;
+        m_td_adjustment_enabled &&
+        !m_td_effective_alpha_correction_enabled &&
+        zone.top_surface_contoning_beer_lambert_rgb_correction_enabled;
     m_layer_height_mm = std::isfinite(layer_height_mm) && layer_height_mm > 0.f ? layer_height_mm : 0.2f;
     if (!std::isfinite(m_layer_height_mm) || m_layer_height_mm <= 0.f)
         m_layer_height_mm = 0.2f;
@@ -370,6 +428,7 @@ TextureMappingContoningSolver::TextureMappingContoningSolver(const TextureMappin
         m_component_ids.clear();
     if (m_component_ids.empty())
         return;
+    m_component_roles = texture_mapping_contoning_component_roles(zone, m_component_ids.size());
 
     m_component_luminance.reserve(m_component_ids.size());
     for (const unsigned int id : m_component_ids)
@@ -488,7 +547,9 @@ std::optional<std::array<float, 3>> TextureMappingContoningSolver::stack_rgb(
                                           m_background_rgb,
                                           m_mix_model,
                                           m_surface_scatter,
-                                          m_beer_lambert_rgb_correction_enabled);
+                                          m_beer_lambert_rgb_correction_enabled,
+                                          m_td_effective_alpha_correction_enabled,
+                                          m_component_roles);
 }
 
 void TextureMappingContoningSolver::arrange_stack_for_light_path(std::vector<unsigned int> &bottom_to_top,
@@ -589,7 +650,9 @@ TextureMappingContoningStack TextureMappingContoningSolver::solve(const std::arr
                                                        MAX_TD_ORDERED_CONTONING_CANDIDATES,
                                                        MAX_TD_ORDERED_CONTONING_STACK_ITEMS,
                                                        m_surface_scatter,
-                                                       m_beer_lambert_rgb_correction_enabled);
+                                                       m_beer_lambert_rgb_correction_enabled,
+                                                       m_td_effective_alpha_correction_enabled,
+                                                       m_component_roles);
         }
         const std::vector<uint16_t> surface_to_deep =
             solve_color_solver_ordered_stack_for_target(*ordered_candidates, target_rgb, ColorSolverMode::V2);

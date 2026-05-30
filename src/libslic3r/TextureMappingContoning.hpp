@@ -69,6 +69,8 @@ private:
     ColorSolverMixModel m_mix_model { ColorSolverMixModel::PigmentPainter };
     bool m_td_adjustment_enabled { false };
     bool m_beer_lambert_rgb_correction_enabled { false };
+    bool m_td_effective_alpha_correction_enabled { false };
+    std::vector<ColorSolverStackComponentRole> m_component_roles;
     mutable std::map<int, std::vector<Candidate>> m_candidates_by_depth;
     mutable std::shared_ptr<ColorSolverOrderedStackCandidateCache> m_ordered_candidate_cache { std::make_shared<ColorSolverOrderedStackCandidateCache>() };
     mutable std::shared_ptr<std::mutex> m_ordered_candidate_cache_mutex { std::make_shared<std::mutex>() };
@@ -85,6 +87,8 @@ bool texture_mapping_contoning_normal_eligible(float normal_z, float threshold_d
 std::optional<std::array<float, 3>> texture_mapping_contoning_component_colors(const PrintConfig               &config,
                                                                               const std::vector<unsigned int> &component_ids,
                                                                               std::vector<std::array<float, 3>> &out);
+std::vector<ColorSolverStackComponentRole> texture_mapping_contoning_component_roles(const TextureMappingZone &zone,
+                                                                                     size_t                    component_count);
 
 } // namespace Slic3r
 
