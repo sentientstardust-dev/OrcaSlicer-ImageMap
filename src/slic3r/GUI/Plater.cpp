@@ -3068,6 +3068,11 @@ public:
                 queue_top_surface_contoning_message_update(true);
             });
         }
+        if (m_top_surface_contoning_surface_anchored_stacks_checkbox != nullptr) {
+            m_top_surface_contoning_surface_anchored_stacks_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+                update_top_surface_image_options_visibility(true);
+            });
+        }
         m_top_surface_image_printing_enabled_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
             update_top_surface_image_options_visibility(true);
         });
@@ -3470,6 +3475,8 @@ public:
     {
         if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
             return false;
+        if (top_surface_contoning_surface_anchored_stacks_enabled())
+            return false;
         return m_top_surface_contoning_layer_phase_checkbox != nullptr &&
                m_top_surface_contoning_layer_phase_checkbox->GetValue();
     }
@@ -3481,6 +3488,8 @@ public:
     bool top_surface_contoning_blue_noise_error_diffusion_enabled() const
     {
         if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
+            return false;
+        if (top_surface_contoning_surface_anchored_stacks_enabled())
             return false;
         return m_top_surface_contoning_blue_noise_error_diffusion_checkbox != nullptr &&
                m_top_surface_contoning_blue_noise_error_diffusion_checkbox->GetValue();
@@ -4396,9 +4405,19 @@ private:
             m_top_surface_contoning_perimeter_mode_panel->Show(show_perimeter_mode);
         if (m_top_surface_contoning_perimeter_mode_choice != nullptr)
             m_top_surface_contoning_perimeter_mode_choice->Enable(show_perimeter_mode);
+        const bool surface_anchored_stacks =
+            contoning &&
+            m_top_surface_contoning_surface_anchored_stacks_checkbox != nullptr &&
+            m_top_surface_contoning_surface_anchored_stacks_checkbox->GetValue();
+        if (surface_anchored_stacks) {
+            if (m_top_surface_contoning_layer_phase_checkbox != nullptr)
+                m_top_surface_contoning_layer_phase_checkbox->SetValue(false);
+            if (m_top_surface_contoning_blue_noise_error_diffusion_checkbox != nullptr)
+                m_top_surface_contoning_blue_noise_error_diffusion_checkbox->SetValue(false);
+        }
         if (m_top_surface_contoning_layer_phase_checkbox != nullptr) {
             m_top_surface_contoning_layer_phase_checkbox->Show(contoning);
-            m_top_surface_contoning_layer_phase_checkbox->Enable(contoning);
+            m_top_surface_contoning_layer_phase_checkbox->Enable(contoning && !surface_anchored_stacks);
         }
         if (m_top_surface_contoning_varied_infill_angles_checkbox != nullptr) {
             m_top_surface_contoning_varied_infill_angles_checkbox->Show(contoning);
@@ -4406,7 +4425,7 @@ private:
         }
         if (m_top_surface_contoning_blue_noise_error_diffusion_checkbox != nullptr) {
             m_top_surface_contoning_blue_noise_error_diffusion_checkbox->Show(contoning);
-            m_top_surface_contoning_blue_noise_error_diffusion_checkbox->Enable(contoning);
+            m_top_surface_contoning_blue_noise_error_diffusion_checkbox->Enable(contoning && !surface_anchored_stacks);
         }
         if (m_top_surface_contoning_supersampled_cells_checkbox != nullptr) {
             m_top_surface_contoning_supersampled_cells_checkbox->Show(contoning);

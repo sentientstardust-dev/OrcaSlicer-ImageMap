@@ -169,7 +169,7 @@ struct TextureMappingZone
     static constexpr float MinTopSurfaceImageLineWidthMm = 0.32f;
     static constexpr float MaxTopSurfaceImageLineWidthMm = 0.80f;
     static constexpr float DefaultTopSurfaceImageMinLineWidthMm = 0.32f;
-    static constexpr float DefaultTopSurfaceImageMaxLineWidthMm = 0.80f;
+    static constexpr float DefaultTopSurfaceImageMaxLineWidthMm = 0.64f;
     static constexpr int   MinTopSurfaceImageColoredTopLayers = 1;
     static constexpr int   MaxTopSurfaceImageColoredTopLayers = 20;
     static constexpr int   DefaultTopSurfaceImageColoredTopLayers = 3;
@@ -303,6 +303,18 @@ struct TextureMappingZone
     static bool effective_top_surface_contoning_supersampled_cells_enabled(bool value)
     {
         return ShowExperimentalTopSurfaceContoningOptions && value;
+    }
+
+    static bool effective_top_surface_contoning_layer_phase_enabled(bool value, bool surface_anchored_stacks)
+    {
+        return effective_top_surface_contoning_layer_phase_enabled(value) &&
+               !effective_top_surface_contoning_surface_anchored_stacks_enabled(surface_anchored_stacks);
+    }
+
+    static bool effective_top_surface_contoning_blue_noise_error_diffusion_enabled(bool value, bool surface_anchored_stacks)
+    {
+        return effective_top_surface_contoning_blue_noise_error_diffusion_enabled(value) &&
+               !effective_top_surface_contoning_surface_anchored_stacks_enabled(surface_anchored_stacks);
     }
 
     static constexpr int normalize_top_surface_contoning_polygonize_resolution(int value)
@@ -520,13 +532,15 @@ struct TextureMappingZone
     bool effective_top_surface_contoning_layer_phase_enabled() const
     {
         return TextureMappingZone::effective_top_surface_contoning_layer_phase_enabled(
-            top_surface_contoning_layer_phase_enabled);
+            top_surface_contoning_layer_phase_enabled,
+            top_surface_contoning_surface_anchored_stacks_enabled);
     }
 
     bool effective_top_surface_contoning_blue_noise_error_diffusion_enabled() const
     {
         return TextureMappingZone::effective_top_surface_contoning_blue_noise_error_diffusion_enabled(
-            top_surface_contoning_blue_noise_error_diffusion_enabled);
+            top_surface_contoning_blue_noise_error_diffusion_enabled,
+            top_surface_contoning_surface_anchored_stacks_enabled);
     }
 
     bool effective_top_surface_contoning_supersampled_cells_enabled() const
@@ -557,6 +571,10 @@ struct TextureMappingZone
             top_surface_contoning_supersampled_cells_enabled = false;
         } else if (top_surface_contoning_replace_top_perimeters_with_infill) {
             top_surface_contoning_recolor_surrounding_perimeters = false;
+        }
+        if (effective_top_surface_contoning_surface_anchored_stacks_enabled()) {
+            top_surface_contoning_layer_phase_enabled = false;
+            top_surface_contoning_blue_noise_error_diffusion_enabled = false;
         }
     }
 
