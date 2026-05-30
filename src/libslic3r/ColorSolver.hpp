@@ -40,8 +40,9 @@ enum class ColorSolverLookupMode : int
 
 enum class ColorSolverMode : int
 {
-    Legacy = 0,
-    V2 = 1
+    RGB = 0,
+    Oklab = 1,
+    OklabSoftCap4Dark4 = 2
 };
 
 enum class ColorSolverStackComponentRole : uint8_t

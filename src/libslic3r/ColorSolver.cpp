@@ -33,6 +33,10 @@ namespace {
 constexpr float TD_EFFECTIVE_ALPHA_DENSITY_SCALE = 0.6761904762f;
 constexpr float TD_EFFECTIVE_ALPHA_PASS_DENSITY = 0.05f;
 constexpr float TD_EFFECTIVE_ALPHA_WHITE_DENSITY = 0.35f;
+constexpr float OKLAB_SOFT_CAP4_DARK4_MIN_L_WEIGHT = 1.f;
+constexpr float OKLAB_SOFT_CAP4_DARK4_MAX_AB_WEIGHT = 4.f;
+constexpr float OKLAB_SOFT_CAP4_DARK4_DARK_PENALTY = 4.f;
+constexpr float OKLAB_SOFT_CAP4_DARK4_DARK_TOLERANCE = 0.04f;
 
 float clamp01(float value)
 {
@@ -182,7 +186,7 @@ std::array<float, 3> srgb_from_oklab(const std::array<float, 3> &oklab)
     };
 }
 
-std::array<float, 3> color_solver_v2_axis_weights(const std::array<float, 3> &target_oklab)
+std::array<float, 3> color_solver_oklab_axis_weights(const std::array<float, 3> &target_oklab)
 {
     const float chroma = std::hypot(target_oklab[1], target_oklab[2]);
     const float chroma_factor = std::clamp((chroma - 0.015f) / 0.13f, 0.f, 1.f);
@@ -191,6 +195,29 @@ std::array<float, 3> color_solver_v2_axis_weights(const std::array<float, 3> &ta
         1.25f + (8.f - 1.25f) * chroma_factor,
         1.25f + (8.f - 1.25f) * chroma_factor
     };
+}
+
+float color_solver_oklab_chroma_factor(const std::array<float, 3> &target_oklab)
+{
+    const float chroma = std::hypot(target_oklab[1], target_oklab[2]);
+    return std::clamp((chroma - 0.015f) / 0.13f, 0.f, 1.f);
+}
+
+std::array<float, 3> color_solver_perceptual_axis_weights(const std::array<float, 3> &target_oklab,
+                                                          ColorSolverMode             solver_mode)
+{
+    std::array<float, 3> weights = color_solver_oklab_axis_weights(target_oklab);
+    if (solver_mode == ColorSolverMode::OklabSoftCap4Dark4) {
+        weights[0] = std::max(weights[0], OKLAB_SOFT_CAP4_DARK4_MIN_L_WEIGHT);
+        weights[1] = std::min(weights[1], OKLAB_SOFT_CAP4_DARK4_MAX_AB_WEIGHT);
+        weights[2] = std::min(weights[2], OKLAB_SOFT_CAP4_DARK4_MAX_AB_WEIGHT);
+    }
+    return weights;
+}
+
+bool color_solver_mode_is_perceptual(ColorSolverMode solver_mode)
+{
+    return solver_mode == ColorSolverMode::Oklab || solver_mode == ColorSolverMode::OklabSoftCap4Dark4;
 }
 
 uint8_t stack_role_index(ColorSolverStackComponentRole role)
@@ -362,19 +389,27 @@ template <class CandidateSet>
 float color_solver_candidate_perceptual_error(const CandidateSet             &candidates,
                                               size_t                         candidate_idx,
                                               const std::array<float, 3>    &target_oklab,
-                                              const std::array<float, 3>    &axis_weights)
+                                              const std::array<float, 3>    &axis_weights,
+                                              ColorSolverMode                solver_mode)
 {
     const size_t coord_idx = candidate_idx * 3;
     const float dl = candidates.perceptual_coords[coord_idx + 0] - target_oklab[0];
     const float da = candidates.perceptual_coords[coord_idx + 1] - target_oklab[1];
     const float db = candidates.perceptual_coords[coord_idx + 2] - target_oklab[2];
-    return axis_weights[0] * dl * dl + axis_weights[1] * da * da + axis_weights[2] * db * db;
+    float error = axis_weights[0] * dl * dl + axis_weights[1] * da * da + axis_weights[2] * db * db;
+    if (solver_mode == ColorSolverMode::OklabSoftCap4Dark4) {
+        const float under_l = std::max(0.f, target_oklab[0] - candidates.perceptual_coords[coord_idx + 0] -
+                                                OKLAB_SOFT_CAP4_DARK4_DARK_TOLERANCE);
+        error += OKLAB_SOFT_CAP4_DARK4_DARK_PENALTY * color_solver_oklab_chroma_factor(target_oklab) * under_l * under_l;
+    }
+    return error;
 }
 
 template <class CandidateSet>
 ColorSolverNearestResult nearest_color_solver_candidates_perceptual_linear(const CandidateSet             &candidates,
                                                                            const std::array<float, 3>    &target_oklab,
-                                                                           const std::array<float, 3>    &axis_weights)
+                                                                           const std::array<float, 3>    &axis_weights,
+                                                                           ColorSolverMode                solver_mode)
 {
     ColorSolverNearestResult result;
     const size_t candidate_count = candidates.perceptual_coords.size() / 3;
@@ -382,7 +417,7 @@ ColorSolverNearestResult nearest_color_solver_candidates_perceptual_linear(const
         update_color_solver_nearest_result(
             result,
             candidate_idx,
-            color_solver_candidate_perceptual_error(candidates, candidate_idx, target_oklab, axis_weights));
+            color_solver_candidate_perceptual_error(candidates, candidate_idx, target_oklab, axis_weights, solver_mode));
     return result;
 }
 
@@ -390,6 +425,7 @@ template <class CandidateSet>
 void query_color_solver_perceptual_kd_tree(const CandidateSet             &candidates,
                                            const std::array<float, 3>    &target_oklab,
                                            const std::array<float, 3>    &axis_weights,
+                                           ColorSolverMode                solver_mode,
                                            int                            node_idx,
                                            ColorSolverNearestResult      &result)
 {
@@ -399,15 +435,15 @@ void query_color_solver_perceptual_kd_tree(const CandidateSet             &candi
     const size_t candidate_count = candidates.perceptual_coords.size() / 3;
     const ColorSolverCandidateSet::KdNode &node = candidates.perceptual_kd_nodes[size_t(node_idx)];
     if (size_t(node.candidate_idx) >= candidate_count) {
-        query_color_solver_perceptual_kd_tree(candidates, target_oklab, axis_weights, node.left, result);
-        query_color_solver_perceptual_kd_tree(candidates, target_oklab, axis_weights, node.right, result);
+        query_color_solver_perceptual_kd_tree(candidates, target_oklab, axis_weights, solver_mode, node.left, result);
+        query_color_solver_perceptual_kd_tree(candidates, target_oklab, axis_weights, solver_mode, node.right, result);
         return;
     }
 
     update_color_solver_nearest_result(
         result,
         size_t(node.candidate_idx),
-        color_solver_candidate_perceptual_error(candidates, size_t(node.candidate_idx), target_oklab, axis_weights));
+        color_solver_candidate_perceptual_error(candidates, size_t(node.candidate_idx), target_oklab, axis_weights, solver_mode));
 
     const size_t coord_idx = size_t(node.candidate_idx) * 3;
     const size_t axis = std::min<size_t>(node.axis, 2);
@@ -415,14 +451,15 @@ void query_color_solver_perceptual_kd_tree(const CandidateSet             &candi
     const int near_node = split_delta <= 0.f ? node.left : node.right;
     const int far_node = split_delta <= 0.f ? node.right : node.left;
 
-    query_color_solver_perceptual_kd_tree(candidates, target_oklab, axis_weights, near_node, result);
+    query_color_solver_perceptual_kd_tree(candidates, target_oklab, axis_weights, solver_mode, near_node, result);
     if (axis_weights[axis] * split_delta * split_delta <= result.second_error)
-        query_color_solver_perceptual_kd_tree(candidates, target_oklab, axis_weights, far_node, result);
+        query_color_solver_perceptual_kd_tree(candidates, target_oklab, axis_weights, solver_mode, far_node, result);
 }
 
 template <class CandidateSet>
 ColorSolverNearestResult nearest_color_solver_candidates_perceptual(const CandidateSet             &candidates,
-                                                                    const std::array<float, 3>    &target_rgb)
+                                                                    const std::array<float, 3>    &target_rgb,
+                                                                    ColorSolverMode                solver_mode)
 {
     ColorSolverNearestResult result;
     const size_t candidate_count = candidates.perceptual_coords.size() / 3;
@@ -430,11 +467,11 @@ ColorSolverNearestResult nearest_color_solver_candidates_perceptual(const Candid
         return result;
 
     const std::array<float, 3> target_oklab = oklab_from_srgb(target_rgb);
-    const std::array<float, 3> axis_weights = color_solver_v2_axis_weights(target_oklab);
+    const std::array<float, 3> axis_weights = color_solver_perceptual_axis_weights(target_oklab, solver_mode);
     if (candidates.perceptual_kd_root >= 0 && !candidates.perceptual_kd_nodes.empty())
-        query_color_solver_perceptual_kd_tree(candidates, target_oklab, axis_weights, candidates.perceptual_kd_root, result);
+        query_color_solver_perceptual_kd_tree(candidates, target_oklab, axis_weights, solver_mode, candidates.perceptual_kd_root, result);
     if (result.best_idx >= candidate_count)
-        result = nearest_color_solver_candidates_perceptual_linear(candidates, target_oklab, axis_weights);
+        result = nearest_color_solver_candidates_perceptual_linear(candidates, target_oklab, axis_weights, solver_mode);
     return result;
 }
 
@@ -1019,7 +1056,7 @@ ColorSolverLookupMode color_solver_lookup_mode_from_index(int mode)
 
 ColorSolverMode color_solver_mode_from_index(int mode)
 {
-    return ColorSolverMode(std::clamp(mode, int(ColorSolverMode::Legacy), int(ColorSolverMode::V2)));
+    return ColorSolverMode(std::clamp(mode, int(ColorSolverMode::RGB), int(ColorSolverMode::OklabSoftCap4Dark4)));
 }
 
 int color_solver_total_units_for_component_count(size_t component_count)
@@ -1186,10 +1223,10 @@ std::vector<float> solve_color_solver_weights_for_target(const ColorSolverCandid
 
     const size_t candidate_count = candidates.rgbs.size() / 3;
     ColorSolverNearestResult nearest =
-        solver_mode == ColorSolverMode::V2 ?
-            nearest_color_solver_candidates_perceptual(candidates, target_rgb) :
+        color_solver_mode_is_perceptual(solver_mode) ?
+            nearest_color_solver_candidates_perceptual(candidates, target_rgb, solver_mode) :
             nearest_color_solver_candidates(candidates, target_rgb);
-    if (nearest.best_idx >= candidate_count && solver_mode == ColorSolverMode::V2)
+    if (nearest.best_idx >= candidate_count && color_solver_mode_is_perceptual(solver_mode))
         nearest = nearest_color_solver_candidates(candidates, target_rgb);
     if (nearest.best_idx >= candidate_count)
         return {};
@@ -1454,10 +1491,10 @@ std::vector<uint16_t> solve_color_solver_ordered_stack_for_target(
 
     const size_t candidate_count = candidates.rgbs.size() / 3;
     ColorSolverNearestResult nearest =
-        solver_mode == ColorSolverMode::V2 ?
-            nearest_color_solver_candidates_perceptual(candidates, target_rgb) :
+        color_solver_mode_is_perceptual(solver_mode) ?
+            nearest_color_solver_candidates_perceptual(candidates, target_rgb, solver_mode) :
             nearest_color_solver_candidates(candidates, target_rgb);
-    if (nearest.best_idx >= candidate_count && solver_mode == ColorSolverMode::V2)
+    if (nearest.best_idx >= candidate_count && color_solver_mode_is_perceptual(solver_mode))
         nearest = nearest_color_solver_candidates(candidates, target_rgb);
     if (nearest.best_idx >= candidate_count)
         return {};

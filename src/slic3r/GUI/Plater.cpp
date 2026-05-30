@@ -2538,12 +2538,13 @@ public:
         auto *generic_solver_mode_row = new wxBoxSizer(wxHORIZONTAL);
         generic_solver_mode_row->Add(new wxStaticText(experimental_page, wxID_ANY, _L("Generic solver")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         wxArrayString generic_solver_mode_choices;
-        generic_solver_mode_choices.Add(_L("Legacy RGB"));
-        generic_solver_mode_choices.Add(_L("V2 Oklab"));
+        generic_solver_mode_choices.Add(_L("RGB"));
+        generic_solver_mode_choices.Add(_L("Oklab"));
+        generic_solver_mode_choices.Add(_L("Oklab soft cap dark correction"));
         m_generic_solver_mode_choice = new wxChoice(experimental_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, generic_solver_mode_choices);
         m_generic_solver_mode_choice->SetSelection(std::clamp(generic_solver_mode,
-                                                              int(TextureMappingZone::GenericSolverLegacy),
-                                                              int(TextureMappingZone::GenericSolverV2)));
+                                                              int(TextureMappingZone::GenericSolverRGB),
+                                                              int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4)));
         generic_solver_mode_row->Add(m_generic_solver_mode_choice, 1, wxALIGN_CENTER_VERTICAL);
         experimental_box->Add(generic_solver_mode_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
 
@@ -3607,9 +3608,9 @@ public:
     {
         return m_generic_solver_mode_choice ?
             std::clamp(m_generic_solver_mode_choice->GetSelection(),
-                       int(TextureMappingZone::GenericSolverLegacy),
-                       int(TextureMappingZone::GenericSolverV2)) :
-            int(TextureMappingZone::GenericSolverV2);
+                       int(TextureMappingZone::GenericSolverRGB),
+                       int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4)) :
+            TextureMappingZone::DefaultGenericSolverMode;
     }
 
     int generic_solver_mix_model() const

@@ -108,8 +108,9 @@ struct TextureMappingZone
     };
 
     enum GenericSolverMode : uint8_t {
-        GenericSolverLegacy = 0,
-        GenericSolverV2 = 1
+        GenericSolverRGB = 0,
+        GenericSolverOklab = 1,
+        GenericSolverOklabSoftCap4Dark4 = 2
     };
 
     enum GenericSolverMixModel : uint8_t {
@@ -213,7 +214,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultMinimumVisibilityOffsetEnabled = true;
     static constexpr float DefaultMinimumVisibilityOffsetPct = 30.f;
     static constexpr int   DefaultGenericSolverLookupMode = int(GenericSolverClosestMix);
-    static constexpr int   DefaultGenericSolverMode = int(GenericSolverV2);
+    static constexpr int   DefaultGenericSolverMode = int(GenericSolverOklabSoftCap4Dark4);
     static constexpr int   DefaultGenericSolverMixModel = int(GenericSolverPigmentPainter);
     static constexpr bool  DefaultDitheringEnabled = false;
     static constexpr int   DefaultDitheringMethod = int(DitheringHalftoneV2);

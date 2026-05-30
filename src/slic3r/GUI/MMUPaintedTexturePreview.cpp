@@ -91,7 +91,7 @@ struct TexturePreviewSimulationSettings
     float contrast_pct = 100.f;
     float tone_gamma = 1.f;
     int generic_solver_lookup_mode = int(TextureMappingZone::GenericSolverClosestMix);
-    int generic_solver_mode = int(TextureMappingZone::GenericSolverV2);
+    int generic_solver_mode = TextureMappingZone::DefaultGenericSolverMode;
     int generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
     bool contoning_flat_surface_quantization = false;
     bool contoning_flat_surface_pattern_blend = false;
@@ -657,7 +657,7 @@ std::array<float, 3> oklab_from_srgb(const std::array<float, 3> &rgb)
     };
 }
 
-std::array<float, 3> generic_solver_v2_axis_weights(const std::array<float, 3> &target_oklab)
+std::array<float, 3> generic_solver_oklab_axis_weights(const std::array<float, 3> &target_oklab)
 {
     const float chroma = std::hypot(target_oklab[1], target_oklab[2]);
     const float chroma_factor = std::clamp((chroma - 0.015f) / 0.13f, 0.f, 1.f);
@@ -666,6 +666,29 @@ std::array<float, 3> generic_solver_v2_axis_weights(const std::array<float, 3> &
         1.25f + (8.f - 1.25f) * chroma_factor,
         1.25f + (8.f - 1.25f) * chroma_factor
     };
+}
+
+float generic_solver_oklab_chroma_factor(const std::array<float, 3> &target_oklab)
+{
+    const float chroma = std::hypot(target_oklab[1], target_oklab[2]);
+    return std::clamp((chroma - 0.015f) / 0.13f, 0.f, 1.f);
+}
+
+std::array<float, 3> generic_solver_perceptual_axis_weights(const std::array<float, 3> &target_oklab,
+                                                            int                         generic_solver_mode)
+{
+    std::array<float, 3> weights = generic_solver_oklab_axis_weights(target_oklab);
+    if (generic_solver_mode == int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4)) {
+        weights[0] = std::max(weights[0], 1.f);
+        weights[1] = std::min(weights[1], 4.f);
+        weights[2] = std::min(weights[2], 4.f);
+    }
+    return weights;
+}
+
+bool generic_solver_mode_is_perceptual(int generic_solver_mode)
+{
+    return generic_solver_mode != int(TextureMappingZone::GenericSolverRGB);
 }
 
 unsigned char to_u8(float value)
@@ -1627,24 +1650,31 @@ TexturePreviewMixNearestResult nearest_texture_preview_mix_candidates(const std:
 
 float texture_preview_mix_candidate_perceptual_error(const TexturePreviewMixCandidate &candidate,
                                                      const std::array<float, 3> &target_oklab,
-                                                     const std::array<float, 3> &axis_weights)
+                                                     const std::array<float, 3> &axis_weights,
+                                                     int                         generic_solver_mode)
 {
     const float dl = candidate.perceptual[0] - target_oklab[0];
     const float da = candidate.perceptual[1] - target_oklab[1];
     const float db = candidate.perceptual[2] - target_oklab[2];
-    return axis_weights[0] * dl * dl + axis_weights[1] * da * da + axis_weights[2] * db * db;
+    float error = axis_weights[0] * dl * dl + axis_weights[1] * da * da + axis_weights[2] * db * db;
+    if (generic_solver_mode == int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4)) {
+        const float under_l = std::max(0.f, target_oklab[0] - candidate.perceptual[0] - 0.04f);
+        error += 4.f * generic_solver_oklab_chroma_factor(target_oklab) * under_l * under_l;
+    }
+    return error;
 }
 
 TexturePreviewMixNearestResult nearest_texture_preview_mix_candidates_perceptual_linear(
     const std::vector<TexturePreviewMixCandidate> &candidates,
     const std::array<float, 3> &target_oklab,
-    const std::array<float, 3> &axis_weights)
+    const std::array<float, 3> &axis_weights,
+    int                         generic_solver_mode)
 {
     TexturePreviewMixNearestResult result;
     for (size_t candidate_idx = 0; candidate_idx < candidates.size(); ++candidate_idx)
         update_texture_preview_mix_nearest_result(result,
                                                   candidate_idx,
-                                                  texture_preview_mix_candidate_perceptual_error(candidates[candidate_idx], target_oklab, axis_weights));
+                                                  texture_preview_mix_candidate_perceptual_error(candidates[candidate_idx], target_oklab, axis_weights, generic_solver_mode));
     return result;
 }
 
@@ -1652,6 +1682,7 @@ void query_texture_preview_mix_candidate_perceptual_kd_tree(const std::vector<Te
                                                             const std::vector<TexturePreviewMixCandidateKdNode> &nodes,
                                                             const std::array<float, 3> &target_oklab,
                                                             const std::array<float, 3> &axis_weights,
+                                                            int                         generic_solver_mode,
                                                             int node_idx,
                                                             TexturePreviewMixNearestResult &result)
 {
@@ -1660,8 +1691,8 @@ void query_texture_preview_mix_candidate_perceptual_kd_tree(const std::vector<Te
 
     const TexturePreviewMixCandidateKdNode &node = nodes[size_t(node_idx)];
     if (size_t(node.candidate_idx) >= candidates.size()) {
-        query_texture_preview_mix_candidate_perceptual_kd_tree(candidates, nodes, target_oklab, axis_weights, node.left, result);
-        query_texture_preview_mix_candidate_perceptual_kd_tree(candidates, nodes, target_oklab, axis_weights, node.right, result);
+        query_texture_preview_mix_candidate_perceptual_kd_tree(candidates, nodes, target_oklab, axis_weights, generic_solver_mode, node.left, result);
+        query_texture_preview_mix_candidate_perceptual_kd_tree(candidates, nodes, target_oklab, axis_weights, generic_solver_mode, node.right, result);
         return;
     }
 
@@ -1669,34 +1700,35 @@ void query_texture_preview_mix_candidate_perceptual_kd_tree(const std::vector<Te
     update_texture_preview_mix_nearest_result(
         result,
         size_t(node.candidate_idx),
-        texture_preview_mix_candidate_perceptual_error(candidate, target_oklab, axis_weights));
+        texture_preview_mix_candidate_perceptual_error(candidate, target_oklab, axis_weights, generic_solver_mode));
 
     const size_t axis = std::min<size_t>(node.axis, 2);
     const float split_delta = target_oklab[axis] - candidate.perceptual[axis];
     const int near_node = split_delta <= 0.f ? node.left : node.right;
     const int far_node = split_delta <= 0.f ? node.right : node.left;
 
-    query_texture_preview_mix_candidate_perceptual_kd_tree(candidates, nodes, target_oklab, axis_weights, near_node, result);
+    query_texture_preview_mix_candidate_perceptual_kd_tree(candidates, nodes, target_oklab, axis_weights, generic_solver_mode, near_node, result);
     if (axis_weights[axis] * split_delta * split_delta <= result.second_error)
-        query_texture_preview_mix_candidate_perceptual_kd_tree(candidates, nodes, target_oklab, axis_weights, far_node, result);
+        query_texture_preview_mix_candidate_perceptual_kd_tree(candidates, nodes, target_oklab, axis_weights, generic_solver_mode, far_node, result);
 }
 
 TexturePreviewMixNearestResult nearest_texture_preview_mix_candidates_perceptual(
     const std::vector<TexturePreviewMixCandidate> &candidates,
     const std::vector<TexturePreviewMixCandidateKdNode> &nodes,
     int root,
-    const std::array<float, 3> &target_rgb)
+    const std::array<float, 3> &target_rgb,
+    int generic_solver_mode)
 {
     TexturePreviewMixNearestResult result;
     if (candidates.empty())
         return result;
 
     const std::array<float, 3> target_oklab = oklab_from_srgb(target_rgb);
-    const std::array<float, 3> axis_weights = generic_solver_v2_axis_weights(target_oklab);
+    const std::array<float, 3> axis_weights = generic_solver_perceptual_axis_weights(target_oklab, generic_solver_mode);
     if (root >= 0 && !nodes.empty())
-        query_texture_preview_mix_candidate_perceptual_kd_tree(candidates, nodes, target_oklab, axis_weights, root, result);
+        query_texture_preview_mix_candidate_perceptual_kd_tree(candidates, nodes, target_oklab, axis_weights, generic_solver_mode, root, result);
     if (result.best_idx >= candidates.size())
-        result = nearest_texture_preview_mix_candidates_perceptual_linear(candidates, target_oklab, axis_weights);
+        result = nearest_texture_preview_mix_candidates_perceptual_linear(candidates, target_oklab, axis_weights, generic_solver_mode);
     return result;
 }
 
@@ -1713,13 +1745,13 @@ std::vector<float> best_component_mix_weights_for_target(const std::vector<Textu
         return {};
 
     const int clamped_solver_mode = std::clamp(generic_solver_mode,
-                                               int(TextureMappingZone::GenericSolverLegacy),
-                                               int(TextureMappingZone::GenericSolverV2));
+                                               int(TextureMappingZone::GenericSolverRGB),
+                                               int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4));
     TexturePreviewMixNearestResult nearest =
-        clamped_solver_mode == int(TextureMappingZone::GenericSolverV2) ?
-            nearest_texture_preview_mix_candidates_perceptual(candidates, perceptual_nodes, perceptual_root, target_rgb) :
+        generic_solver_mode_is_perceptual(clamped_solver_mode) ?
+            nearest_texture_preview_mix_candidates_perceptual(candidates, perceptual_nodes, perceptual_root, target_rgb, clamped_solver_mode) :
             nearest_texture_preview_mix_candidates(candidates, nodes, root, target_rgb);
-    if (nearest.best_idx >= candidates.size() && clamped_solver_mode == int(TextureMappingZone::GenericSolverV2))
+    if (nearest.best_idx >= candidates.size() && generic_solver_mode_is_perceptual(clamped_solver_mode))
         nearest = nearest_texture_preview_mix_candidates(candidates, nodes, root, target_rgb);
     if (nearest.best_idx >= candidates.size())
         return {};
@@ -1815,9 +1847,11 @@ TexturePreviewMixNearestResult nearest_contoning_flat_surface_mix_candidate(
     const std::array<float, 3> target_oklab = oklab_from_srgb(target_rgb);
     const std::array<float, 3> axis_weights = { 1.f, 4.f, 4.f };
     if (root >= 0 && !nodes.empty())
-        query_texture_preview_mix_candidate_perceptual_kd_tree(candidates, nodes, target_oklab, axis_weights, root, result);
+        query_texture_preview_mix_candidate_perceptual_kd_tree(
+            candidates, nodes, target_oklab, axis_weights, int(TextureMappingZone::GenericSolverOklab), root, result);
     if (result.best_idx >= candidates.size())
-        result = nearest_texture_preview_mix_candidates_perceptual_linear(candidates, target_oklab, axis_weights);
+        result = nearest_texture_preview_mix_candidates_perceptual_linear(
+            candidates, target_oklab, axis_weights, int(TextureMappingZone::GenericSolverOklab));
     return result;
 }
 
@@ -1987,7 +2021,7 @@ TexturePreviewBinaryDitherNearestResult nearest_binary_dither_candidates_for_tex
     const std::array<float, 3>                             &target_oklab)
 {
     TexturePreviewBinaryDitherNearestResult result;
-    const std::array<float, 3> axis_weights = generic_solver_v2_axis_weights(target_oklab);
+    const std::array<float, 3> axis_weights = generic_solver_oklab_axis_weights(target_oklab);
     for (size_t idx = 0; idx < candidates.size(); ++idx) {
         const std::array<float, 3> &candidate = candidates[idx].oklab;
         const float dl = candidate[0] - target_oklab[0];
@@ -2021,7 +2055,7 @@ float binary_dither_alternate_fraction_for_texture_preview(const std::vector<Tex
     if (base_idx >= candidates.size() || alternate_idx >= candidates.size() || base_idx == alternate_idx)
         return 0.f;
 
-    const std::array<float, 3> axis_weights = generic_solver_v2_axis_weights(target_oklab);
+    const std::array<float, 3> axis_weights = generic_solver_oklab_axis_weights(target_oklab);
     const std::array<float, 3> &base = candidates[base_idx].oklab;
     const std::array<float, 3> &alternate = candidates[alternate_idx].oklab;
     float numerator = 0.f;
@@ -2510,7 +2544,7 @@ std::array<float, 3> contoning_flat_surface_rgb_for_texture_preview(
     const std::array<float, 3> target_rgb = texture_preview_target_rgb(settings, sample_rgba);
     if (settings.contoning_flat_surface_td_adjustment && !ordered_candidates.empty()) {
         const std::vector<uint16_t> surface_to_deep =
-            solve_color_solver_ordered_stack_for_target(ordered_candidates, target_rgb, ColorSolverMode::V2);
+            solve_color_solver_ordered_stack_for_target(ordered_candidates, target_rgb, ColorSolverMode::OklabSoftCap4Dark4);
         if (!surface_to_deep.empty()) {
             std::vector<uint16_t> simulated_surface_to_deep = surface_to_deep;
             if (ordered_candidates.simulated_stack_depth > 0 &&
@@ -2665,8 +2699,8 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
                                                      int(TextureMappingZone::GenericSolverClosestMix),
                                                      int(TextureMappingZone::GenericSolverBlendClosestTwo));
     settings.generic_solver_mode = std::clamp(zone->generic_solver_mode,
-                                              int(TextureMappingZone::GenericSolverLegacy),
-                                              int(TextureMappingZone::GenericSolverV2));
+                                              int(TextureMappingZone::GenericSolverRGB),
+                                              int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4));
     settings.generic_solver_mix_model = std::clamp(zone->generic_solver_mix_model,
                                                    int(TextureMappingZone::GenericSolverPigmentPainter),
                                                    int(TextureMappingZone::GenericSolverPrusaFdmMixer));

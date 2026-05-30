@@ -922,7 +922,7 @@ std::array<float, 3> texture_sample_target_rgb(const WeightedTextureSample &samp
     return apply_texture_contrast_to_rgb(target, contrast_factor);
 }
 
-std::array<float, 3> generic_solver_v2_axis_weights(const std::array<float, 3> &target_oklab)
+std::array<float, 3> generic_solver_oklab_axis_weights(const std::array<float, 3> &target_oklab)
 {
     const float chroma = std::hypot(target_oklab[1], target_oklab[2]);
     const float chroma_factor = std::clamp((chroma - 0.015f) / 0.13f, 0.f, 1.f);
@@ -995,7 +995,7 @@ TextureMappingBinaryDitherNearestResult nearest_binary_dither_candidates(
     const std::array<float, 3>                             &target_oklab)
 {
     TextureMappingBinaryDitherNearestResult result;
-    const std::array<float, 3> axis_weights = generic_solver_v2_axis_weights(target_oklab);
+    const std::array<float, 3> axis_weights = generic_solver_oklab_axis_weights(target_oklab);
     for (size_t idx = 0; idx < candidates.size(); ++idx) {
         const std::array<float, 3> &candidate = candidates[idx].oklab;
         const float dl = candidate[0] - target_oklab[0];
@@ -1029,7 +1029,7 @@ float binary_dither_alternate_fraction(const std::vector<TextureMappingBinaryDit
     if (base_idx >= candidates.size() || alternate_idx >= candidates.size() || base_idx == alternate_idx)
         return 0.f;
 
-    const std::array<float, 3> axis_weights = generic_solver_v2_axis_weights(target_oklab);
+    const std::array<float, 3> axis_weights = generic_solver_oklab_axis_weights(target_oklab);
     const std::array<float, 3> &base = candidates[base_idx].oklab;
     const std::array<float, 3> &alternate = candidates[alternate_idx].oklab;
     float numerator = 0.f;
@@ -3081,8 +3081,8 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
                                                       int(TextureMappingZone::GenericSolverClosestMix),
                                                       int(TextureMappingZone::GenericSolverBlendClosestTwo));
     const int generic_solver_mode = std::clamp(zone.generic_solver_mode,
-                                               int(TextureMappingZone::GenericSolverLegacy),
-                                               int(TextureMappingZone::GenericSolverV2));
+                                               int(TextureMappingZone::GenericSolverRGB),
+                                               int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4));
     const int generic_solver_mix_model = std::clamp(zone.generic_solver_mix_model,
                                                     int(TextureMappingZone::GenericSolverPigmentPainter),
                                                     int(TextureMappingZone::GenericSolverPrusaFdmMixer));

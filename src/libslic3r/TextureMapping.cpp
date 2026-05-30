@@ -798,20 +798,36 @@ static int generic_solver_lookup_mode_from_name(const std::string &name)
 
 static std::string generic_solver_mode_name(int mode)
 {
-    return clamp_int(mode,
-                     int(TextureMappingZone::GenericSolverLegacy),
-                     int(TextureMappingZone::GenericSolverV2)) ==
-               int(TextureMappingZone::GenericSolverLegacy) ?
-        std::string("legacy") :
-        std::string("v2");
+    switch (clamp_int(mode,
+                      int(TextureMappingZone::GenericSolverRGB),
+                      int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4))) {
+    case int(TextureMappingZone::GenericSolverRGB):
+        return "rgb";
+    case int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4):
+        return "oklab_soft_cap4_dark4";
+    default:
+        return "oklab";
+    }
 }
 
 static int generic_solver_mode_from_name(std::string name)
 {
-    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return char(std::tolower(c)); });
-    return name == "legacy" || name == "v1" ?
-        int(TextureMappingZone::GenericSolverLegacy) :
-        int(TextureMappingZone::GenericSolverV2);
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+        const char lowered = char(std::tolower(c));
+        return lowered == '-' || lowered == ' ' ? '_' : lowered;
+    });
+    if (name == "rgb" || name == "legacy" || name == "v1")
+        return int(TextureMappingZone::GenericSolverRGB);
+    if (name == "oklab_soft_cap4_dark4" ||
+        name == "oklab_soft_cap" ||
+        name == "oklab_soft" ||
+        name == "v2_soft_cap4_dark4" ||
+        name == "v2_soft_cap" ||
+        name == "v2_soft")
+        return int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4);
+    if (name == "oklab" || name == "v2")
+        return int(TextureMappingZone::GenericSolverOklab);
+    return TextureMappingZone::DefaultGenericSolverMode;
 }
 
 static std::string generic_solver_mix_model_name(int mode)
@@ -1920,8 +1936,8 @@ void TextureMappingManager::load_entries(const std::string &serialized,
             generic_solver_mode_it != texture.end() && generic_solver_mode_it->is_string() ?
                 generic_solver_mode_from_name(generic_solver_mode_it->get<std::string>()) :
                 (zone.filament_color_mode == int(TextureMappingZone::FilamentColorAny) ?
-                     int(TextureMappingZone::GenericSolverLegacy) :
-                     int(TextureMappingZone::GenericSolverV2));
+                     int(TextureMappingZone::GenericSolverRGB) :
+                     int(TextureMappingZone::GenericSolverOklab));
         zone.generic_solver_mix_model =
             generic_solver_mix_model_from_name(texture.value("generic_solver_mix_model", std::string("pigment_painter")));
         zone.dithering_enabled = texture.value("dithering_enabled", TextureMappingZone::DefaultDitheringEnabled);

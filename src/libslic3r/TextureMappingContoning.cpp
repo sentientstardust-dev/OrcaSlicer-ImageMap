@@ -657,7 +657,7 @@ TextureMappingContoningStack TextureMappingContoningSolver::solve(const std::arr
                                                        m_beam_search_stack_expansion_enabled);
         }
         const std::vector<uint16_t> surface_to_deep =
-            solve_color_solver_ordered_stack_for_target(*ordered_candidates, target_rgb, ColorSolverMode::V2);
+            solve_color_solver_ordered_stack_for_target(*ordered_candidates, target_rgb, ColorSolverMode::OklabSoftCap4Dark4);
         if (!surface_to_deep.empty()) {
             out.bottom_to_top.reserve(surface_to_deep.size());
             auto append_component = [this, &out](uint16_t component_idx) {

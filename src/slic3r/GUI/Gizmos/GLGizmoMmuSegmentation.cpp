@@ -1825,7 +1825,7 @@ static std::vector<uint8_t> raw_offset_values_from_color(const std::vector<Color
             solve_color_solver_weights_for_target(solver->candidates,
                                                   { color.r(), color.g(), color.b() },
                                                   ColorSolverLookupMode::ClosestMix,
-                                                  ColorSolverMode::Legacy);
+                                                  ColorSolverMode::RGB);
         if (weights.size() == values.size()) {
             for (size_t idx = 0; idx < values.size(); ++idx)
                 values[idx] = uint8_t(std::clamp(int(std::lround(std::clamp(weights[idx], 0.f, 1.f) * 255.f)), 0, 255));
