@@ -66,6 +66,7 @@ private:
     std::vector<float> m_component_layer_opacity;
     float m_layer_height_mm { 0.2f };
     float m_surface_scatter { 0.f };
+    ColorSolverMixModel m_mix_model { ColorSolverMixModel::PigmentPainter };
     bool m_td_adjustment_enabled { false };
     bool m_beer_lambert_rgb_correction_enabled { false };
     mutable std::map<int, std::vector<Candidate>> m_candidates_by_depth;

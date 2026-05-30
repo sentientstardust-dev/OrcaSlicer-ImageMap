@@ -812,14 +812,24 @@ static int generic_solver_mode_from_name(std::string name)
         int(TextureMappingZone::GenericSolverV2);
 }
 
-static std::string generic_solver_mix_model_name(int)
+static std::string generic_solver_mix_model_name(int mode)
 {
-    return "pigment_painter";
+    return clamp_int(mode,
+                     int(TextureMappingZone::GenericSolverPigmentPainter),
+                     int(TextureMappingZone::GenericSolverPrusaFdmMixer)) ==
+               int(TextureMappingZone::GenericSolverPrusaFdmMixer) ?
+        std::string("prusa_fdm_mixer") :
+        std::string("pigment_painter");
 }
 
-static int generic_solver_mix_model_from_name(std::string)
+static int generic_solver_mix_model_from_name(std::string name)
 {
-    return TextureMappingZone::DefaultGenericSolverMixModel;
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+        return c == '-' ? '_' : char(std::tolower(c));
+    });
+    return name == "prusa_fdm_mixer" || name == "prusa" ?
+        int(TextureMappingZone::GenericSolverPrusaFdmMixer) :
+        int(TextureMappingZone::GenericSolverPigmentPainter);
 }
 
 static std::string dithering_method_name(int mode)

@@ -421,7 +421,9 @@ std::array<float, 3> decode_color(const std::string &color)
     };
 }
 
-ColorRGBA blend_component_colors(const std::vector<std::array<float, 3>> &colors, const std::vector<float> &weights)
+ColorRGBA blend_component_colors(const std::vector<std::array<float, 3>> &colors,
+                                 const std::vector<float>                &weights,
+                                 ColorSolverMixModel                      mix_model = ColorSolverMixModel::PigmentPainter)
 {
     if (colors.empty() || weights.empty())
         return { 0.15f, 0.65f, 0.6f, 1.f };
@@ -438,7 +440,7 @@ ColorRGBA blend_component_colors(const std::vector<std::array<float, 3>> &colors
 
     std::vector<std::array<float, 3>> mix_colors(colors.begin(), colors.begin() + count);
     std::vector<float> mix_weights(weights.begin(), weights.begin() + count);
-    const std::array<float, 3> rgb = mix_color_solver_components(mix_colors, mix_weights, ColorSolverMixModel::PigmentPainter);
+    const std::array<float, 3> rgb = mix_color_solver_components(mix_colors, mix_weights, mix_model);
     return { std::clamp(rgb[0], 0.f, 1.f), std::clamp(rgb[1], 0.f, 1.f), std::clamp(rgb[2], 0.f, 1.f), 1.f };
 }
 
@@ -1442,7 +1444,8 @@ bool texture_preview_uses_generic_solver(const TexturePreviewSimulationSettings 
     return settings.component_colors.size() != expected_component_count;
 }
 
-std::vector<TexturePreviewMixCandidate> build_generic_mix_candidates(const std::vector<std::array<float, 3>> &component_colors)
+std::vector<TexturePreviewMixCandidate> build_generic_mix_candidates(const std::vector<std::array<float, 3>> &component_colors,
+                                                                     ColorSolverMixModel                       mix_model)
 {
     if (component_colors.empty())
         return {};
@@ -1466,7 +1469,7 @@ std::vector<TexturePreviewMixCandidate> build_generic_mix_candidates(const std::
             candidate.weights.assign(component_count, 0.f);
             for (size_t weight_idx = 0; weight_idx < component_count; ++weight_idx)
                 candidate.weights[weight_idx] = float(units[weight_idx]) / float(std::max(1, total_units));
-            candidate.rgb = mix_color_solver_components(component_colors, candidate.weights, ColorSolverMixModel::PigmentPainter);
+            candidate.rgb = mix_color_solver_components(component_colors, candidate.weights, mix_model);
             candidate.perceptual = oklab_from_srgb(candidate.rgb);
             candidates.emplace_back(std::move(candidate));
             return;
@@ -1757,6 +1760,7 @@ size_t contoning_flat_surface_preview_candidate_count(size_t component_count, in
 
 std::vector<TexturePreviewMixCandidate> build_contoning_flat_surface_mix_candidates(
     const std::vector<std::array<float, 3>> &component_colors,
+    ColorSolverMixModel                       mix_model,
     int                                      total_units)
 {
     const size_t candidate_count =
@@ -1779,7 +1783,7 @@ std::vector<TexturePreviewMixCandidate> build_contoning_flat_surface_mix_candida
                 weights[weight_idx] = float(units[weight_idx]) / float(std::max(1, total_units));
 
             TexturePreviewMixCandidate candidate;
-            candidate.rgb = mix_color_solver_components(component_colors, weights, ColorSolverMixModel::PigmentPainter);
+            candidate.rgb = mix_color_solver_components(component_colors, weights, mix_model);
             candidate.perceptual = oklab_from_srgb(candidate.rgb);
             candidates.emplace_back(std::move(candidate));
             return;
@@ -1908,7 +1912,9 @@ ColorRGBA halftone_preview_color_from_mask(const TexturePreviewSimulationSetting
         return { 0.f, 0.f, 0.f, 1.f };
 
     const std::array<float, 3> rgb =
-        mix_color_solver_components(settings.component_colors, weights, ColorSolverMixModel::PigmentPainter);
+        mix_color_solver_components(settings.component_colors,
+                                    weights,
+                                    color_solver_mix_model_from_index(settings.generic_solver_mix_model));
     return { clamp01(rgb[0]), clamp01(rgb[1]), clamp01(rgb[2]), 1.f };
 }
 
@@ -2453,7 +2459,9 @@ std::array<float, 3> fallback_contoning_flat_surface_rgb_for_texture_preview(
         }
         std::vector<float> one_hot(component_count, 0.f);
         one_hot[best_idx] = 1.f;
-        return mix_color_solver_components(settings.component_colors, one_hot, ColorSolverMixModel::PigmentPainter);
+        return mix_color_solver_components(settings.component_colors,
+                                          one_hot,
+                                          color_solver_mix_model_from_index(settings.generic_solver_mix_model));
     }
 
     struct QuantizedWeight {
@@ -2481,7 +2489,9 @@ std::array<float, 3> fallback_contoning_flat_surface_rgb_for_texture_preview(
     std::vector<float> quantized_weights(component_count, 0.f);
     for (size_t idx = 0; idx < component_count; ++idx)
         quantized_weights[idx] = float(counts[idx]) / float(total_units);
-    return mix_color_solver_components(settings.component_colors, quantized_weights, ColorSolverMixModel::PigmentPainter);
+    return mix_color_solver_components(settings.component_colors,
+                                      quantized_weights,
+                                      color_solver_mix_model_from_index(settings.generic_solver_mix_model));
 }
 
 std::array<float, 3> contoning_flat_surface_rgb_for_texture_preview(
@@ -2510,7 +2520,7 @@ std::array<float, 3> contoning_flat_surface_rgb_for_texture_preview(
                                                  simulated_surface_to_deep,
                                                  settings.contoning_flat_surface_layer_opacities,
                                                  settings.contoning_flat_surface_background_rgb,
-                                                 ColorSolverMixModel::PigmentPainter,
+                                                 color_solver_mix_model_from_index(settings.generic_solver_mix_model),
                                                  settings.contoning_flat_surface_surface_scatter,
                                                  settings.contoning_flat_surface_beer_lambert_rgb_correction);
         }
@@ -2651,7 +2661,9 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
     settings.generic_solver_mode = std::clamp(zone->generic_solver_mode,
                                               int(TextureMappingZone::GenericSolverLegacy),
                                               int(TextureMappingZone::GenericSolverV2));
-    settings.generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
+    settings.generic_solver_mix_model = std::clamp(zone->generic_solver_mix_model,
+                                                   int(TextureMappingZone::GenericSolverPigmentPainter),
+                                                   int(TextureMappingZone::GenericSolverPrusaFdmMixer));
     settings.contoning_flat_surface_layer_height_mm = texture_preview_layer_height_mm();
     if (zone->top_surface_image_printing_enabled) {
         const int stack_layers =
@@ -2719,7 +2731,9 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
     if (settings.contoning_flat_surface_td_adjustment && !settings.component_colors.empty()) {
         std::vector<float> background_weights(settings.component_colors.size(), 1.f / float(settings.component_colors.size()));
         settings.contoning_flat_surface_background_rgb =
-            mix_color_solver_components(settings.component_colors, background_weights, ColorSolverMixModel::PigmentPainter);
+            mix_color_solver_components(settings.component_colors,
+                                        background_weights,
+                                        color_solver_mix_model_from_index(settings.generic_solver_mix_model));
         settings.contoning_flat_surface_layer_opacities =
             contoning_flat_surface_preview_layer_opacities(*zone, settings);
         if (settings.contoning_flat_surface_layer_opacities.size() != settings.component_colors.size()) {
@@ -2828,7 +2842,9 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
     if (use_contoning_flat_surface_pattern_blend) {
         std::vector<float> weights(settings.component_colors.size(), 1.f / float(settings.component_colors.size()));
         const std::array<float, 3> rgb =
-            mix_color_solver_components(settings.component_colors, weights, ColorSolverMixModel::PigmentPainter);
+            mix_color_solver_components(settings.component_colors,
+                                        weights,
+                                        color_solver_mix_model_from_index(settings.generic_solver_mix_model));
         for (size_t idx = 0; idx + 3 < result.rgba.size(); idx += 4) {
             result.rgba[idx + 0] = to_u8(rgb[0]);
             result.rgba[idx + 1] = to_u8(rgb[1]);
@@ -2857,7 +2873,7 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
             build_color_solver_ordered_stack_candidates(settings.component_colors,
                                                        settings.contoning_flat_surface_layer_opacities,
                                                        settings.contoning_flat_surface_background_rgb,
-                                                       ColorSolverMixModel::PigmentPainter,
+                                                       color_solver_mix_model_from_index(settings.generic_solver_mix_model),
                                                        contoning_flat_surface_pattern_filaments,
                                                        contoning_flat_surface_pattern_filaments,
                                                        k_contoning_flat_surface_preview_max_ordered_candidates,
@@ -2867,7 +2883,9 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
             ColorSolverOrderedStackCandidateSet{};
     const std::vector<TexturePreviewMixCandidate> contoning_flat_surface_candidates =
         use_contoning_flat_surface_quantization && contoning_flat_surface_ordered_candidates.empty() ?
-            build_contoning_flat_surface_mix_candidates(settings.component_colors, contoning_flat_surface_pattern_filaments) :
+            build_contoning_flat_surface_mix_candidates(settings.component_colors,
+                                                       color_solver_mix_model_from_index(settings.generic_solver_mix_model),
+                                                       contoning_flat_surface_pattern_filaments) :
             std::vector<TexturePreviewMixCandidate>{};
     std::vector<TexturePreviewMixCandidateKdNode> contoning_flat_surface_nodes;
     const int contoning_flat_surface_root = contoning_flat_surface_candidates.empty() ?
@@ -3176,9 +3194,7 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                 (activity > k_epsilon ?
                 mix_color_solver_components(settings.component_colors,
                                             component_weights,
-                                            use_halftone_dithering ?
-                                                ColorSolverMixModel::PigmentPainter :
-                                                color_solver_mix_model_from_index(settings.generic_solver_mix_model)) :
+                                            color_solver_mix_model_from_index(settings.generic_solver_mix_model)) :
                 std::array<float, 3>{ sample_rgba[0], sample_rgba[1], sample_rgba[2] });
 
             const std::array<unsigned char, 4> out_rgba = {
@@ -4953,7 +4969,10 @@ std::optional<SurfaceGradientPreviewSettings> surface_gradient_preview_settings_
         settings.minimum_offset_factors.emplace_back(std::clamp((std::isfinite(minimum_offset_pct) ? minimum_offset_pct : 0.f) / 100.f, 0.f, 1.f));
     }
     const std::vector<float> base_weights(settings.component_colors.size(), 1.f);
-    const ColorRGBA base_color = blend_component_colors(settings.component_colors, base_weights);
+    const ColorRGBA base_color =
+        blend_component_colors(settings.component_colors,
+                               base_weights,
+                               color_solver_mix_model_from_index(zone.generic_solver_mix_model));
     settings.base_color = { base_color.r(), base_color.g(), base_color.b() };
     if (zone.is_linear_gradient()) {
         settings.linear_gradient_stops = TextureMappingManager::normalized_linear_gradient_stops(zone, num_physical);
@@ -4965,7 +4984,9 @@ std::optional<SurfaceGradientPreviewSettings> surface_gradient_preview_settings_
             const std::vector<float> weights =
                 TextureMappingManager::linear_gradient_compact_weights(t, settings.linear_gradient_stops, settings.component_ids);
             const std::array<float, 3> rgb =
-                mix_color_solver_components(settings.component_colors, weights, ColorSolverMixModel::PigmentPainter);
+                mix_color_solver_components(settings.component_colors,
+                                            weights,
+                                            color_solver_mix_model_from_index(zone.generic_solver_mix_model));
             settings.linear_gradient_lut_colors.push_back({ std::clamp(rgb[0], 0.f, 1.f),
                                                             std::clamp(rgb[1], 0.f, 1.f),
                                                             std::clamp(rgb[2], 0.f, 1.f) });

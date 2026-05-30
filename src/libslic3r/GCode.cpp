@@ -9444,7 +9444,9 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
     const int generic_solver_mode = std::clamp(zone->generic_solver_mode,
                                                int(TextureMappingZone::GenericSolverLegacy),
                                                int(TextureMappingZone::GenericSolverV2));
-    const int generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
+    const int generic_solver_mix_model = std::clamp(zone->generic_solver_mix_model,
+                                                    int(TextureMappingZone::GenericSolverPigmentPainter),
+                                                    int(TextureMappingZone::GenericSolverPrusaFdmMixer));
     const bool dithering_enabled =
         zone->dithering_enabled &&
         zone->texture_mapping_mode != int(TextureMappingZone::TextureMappingRawValues);

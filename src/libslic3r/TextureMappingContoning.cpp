@@ -351,6 +351,7 @@ TextureMappingContoningSolver::TextureMappingContoningSolver(const TextureMappin
                                                              std::vector<unsigned int> component_ids,
                                                              float layer_height_mm)
 {
+    m_mix_model = color_solver_mix_model_from_index(zone.generic_solver_mix_model);
     m_td_adjustment_enabled = zone.top_surface_contoning_td_adjustment_enabled;
     m_beer_lambert_rgb_correction_enabled =
         m_td_adjustment_enabled && zone.top_surface_contoning_beer_lambert_rgb_correction_enabled;
@@ -374,7 +375,7 @@ TextureMappingContoningSolver::TextureMappingContoningSolver(const TextureMappin
     for (const unsigned int id : m_component_ids)
         m_component_luminance.emplace_back(filament_luminance(config, id));
     std::vector<float> background_weights(m_component_colors.size(), 1.f / float(m_component_colors.size()));
-    m_background_rgb = mix_color_solver_components(m_component_colors, background_weights, ColorSolverMixModel::PigmentPainter);
+    m_background_rgb = mix_color_solver_components(m_component_colors, background_weights, m_mix_model);
     m_effective_transmission_distances_mm =
         effective_transmission_distances_mm(zone, config, m_component_ids, m_td_adjustment_enabled);
     m_component_layer_opacity.reserve(m_effective_transmission_distances_mm.size());
@@ -408,7 +409,7 @@ TextureMappingContoningSolver::candidates_for_depth(int stack_layers) const
 
         Candidate candidate;
         candidate.counts = std::move(candidate_counts);
-        candidate.rgb = mix_color_solver_components(m_component_colors, weights, ColorSolverMixModel::PigmentPainter);
+        candidate.rgb = mix_color_solver_components(m_component_colors, weights, m_mix_model);
         candidate.oklab = color_solver_oklab_from_srgb(candidate.rgb);
         for (size_t idx = 0; idx < candidate.counts.size() && idx < m_component_luminance.size(); ++idx)
             candidate.dark_score += float(candidate.counts[idx]) * (1.f - clamp01(m_component_luminance[idx]));
@@ -447,7 +448,7 @@ std::optional<std::array<float, 3>> TextureMappingContoningSolver::stack_rgb(
             colors.emplace_back(m_component_colors[*idx]);
             weights.emplace_back(weight);
         }
-        return mix_color_solver_components(colors, weights, ColorSolverMixModel::PigmentPainter);
+        return mix_color_solver_components(colors, weights, m_mix_model);
     }
 
     const int visible_depth = visible_stack_layers > 0 ?
@@ -485,7 +486,7 @@ std::optional<std::array<float, 3>> TextureMappingContoningSolver::stack_rgb(
                                           surface_to_deep,
                                           m_component_layer_opacity,
                                           m_background_rgb,
-                                          ColorSolverMixModel::PigmentPainter,
+                                          m_mix_model,
                                           m_surface_scatter,
                                           m_beer_lambert_rgb_correction_enabled);
 }
@@ -582,7 +583,7 @@ TextureMappingContoningStack TextureMappingContoningSolver::solve(const std::arr
                                                        m_component_colors,
                                                        m_component_layer_opacity,
                                                        m_background_rgb,
-                                                       ColorSolverMixModel::PigmentPainter,
+                                                       m_mix_model,
                                                        depth,
                                                        visible_depth,
                                                        MAX_TD_ORDERED_CONTONING_CANDIDATES,

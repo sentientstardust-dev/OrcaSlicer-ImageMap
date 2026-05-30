@@ -28,7 +28,8 @@ namespace Slic3r {
 
 enum class ColorSolverMixModel : int
 {
-    PigmentPainter = 0
+    PigmentPainter = 0,
+    PrusaFdmMixer = 1
 };
 
 enum class ColorSolverLookupMode : int

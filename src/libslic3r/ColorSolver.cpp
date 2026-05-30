@@ -17,9 +17,11 @@
 #include "ColorSolver.hpp"
 
 #include "pigment_painter_mixer.hpp"
+#include "prusa_fdm_mixer.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <functional>
 #include <limits>
 #include <sstream>
@@ -35,9 +37,9 @@ float clamp01(float value)
     return std::clamp(value, 0.f, 1.f);
 }
 
-int mix_model_index(ColorSolverMixModel)
+int mix_model_index(ColorSolverMixModel mix_model)
 {
-    return int(ColorSolverMixModel::PigmentPainter);
+    return std::clamp(int(mix_model), int(ColorSolverMixModel::PigmentPainter), int(ColorSolverMixModel::PrusaFdmMixer));
 }
 
 float srgb_to_linear_component(float value)
@@ -73,6 +75,69 @@ std::array<float, 3> linear_to_srgb_color(const std::array<float, 3> &rgb)
 float linear_luminance(const std::array<float, 3> &rgb)
 {
     return 0.2126f * rgb[0] + 0.7152f * rgb[1] + 0.0722f * rgb[2];
+}
+
+std::string srgb_color_to_hex(const std::array<float, 3> &rgb)
+{
+    const int r = std::clamp(int(std::lround(clamp01(rgb[0]) * 255.f)), 0, 255);
+    const int g = std::clamp(int(std::lround(clamp01(rgb[1]) * 255.f)), 0, 255);
+    const int b = std::clamp(int(std::lround(clamp01(rgb[2]) * 255.f)), 0, 255);
+    char buf[8];
+    std::snprintf(buf, sizeof(buf), "#%02x%02x%02x", unsigned(r), unsigned(g), unsigned(b));
+    return std::string(buf);
+}
+
+std::array<float, 3> mix_prusa_fdm_components(const std::vector<std::array<float, 3>> &colors,
+                                              const std::vector<float>                &weights)
+{
+    const size_t count = std::min(colors.size(), weights.size());
+    if (count == 0)
+        return { 0.f, 0.f, 0.f };
+
+    float total_weight = 0.f;
+    for (size_t idx = 0; idx < count; ++idx)
+        if (std::isfinite(weights[idx]) && weights[idx] > 0.f)
+            total_weight += weights[idx];
+    if (total_weight <= 0.f)
+        return {
+            clamp01(colors.front()[0]),
+            clamp01(colors.front()[1]),
+            clamp01(colors.front()[2])
+        };
+
+    std::vector<prusa_fdm_mixer::Part> parts;
+    parts.reserve(count);
+    const double inv_total_weight = 1.0 / double(total_weight);
+    for (size_t idx = 0; idx < count; ++idx) {
+        const float weight = weights[idx];
+        if (!std::isfinite(weight) || weight <= 0.f)
+            continue;
+        parts.push_back({ srgb_color_to_hex(colors[idx]), double(weight) * inv_total_weight });
+    }
+    if (parts.empty())
+        return {
+            clamp01(colors.front()[0]),
+            clamp01(colors.front()[1]),
+            clamp01(colors.front()[2])
+        };
+
+    const prusa_fdm_mixer::RGB rgb = prusa_fdm_mixer::mix_rgb(parts);
+    return {
+        float(rgb.r) / 255.f,
+        float(rgb.g) / 255.f,
+        float(rgb.b) / 255.f
+    };
+}
+
+std::array<float, 3> mix_components_by_model(const std::vector<std::array<float, 3>> &colors,
+                                             const std::vector<float>                &weights,
+                                             ColorSolverMixModel                       mix_model)
+{
+    if (colors.empty() || colors.size() != weights.size())
+        return { 0.f, 0.f, 0.f };
+    return mix_model == ColorSolverMixModel::PrusaFdmMixer ?
+        mix_prusa_fdm_components(colors, weights) :
+        pigment_painter::mix_srgb(colors, weights);
 }
 
 std::array<float, 3> oklab_from_srgb(const std::array<float, 3> &rgb)
@@ -459,6 +524,7 @@ std::array<float, 3> mix_ordered_stack_with_buffers(const std::vector<std::array
                                                     std::vector<float>                      &weights,
                                                     const std::vector<uint16_t>             &surface_to_deep,
                                                     const std::vector<float>                &layer_opacities,
+                                                    ColorSolverMixModel                       mix_model,
                                                     float                                    surface_scatter,
                                                     bool                                     beer_lambert_rgb_correction)
 {
@@ -491,7 +557,7 @@ std::array<float, 3> mix_ordered_stack_with_buffers(const std::vector<std::array
             break;
     }
     weights.back() = std::max(0.f, transmission);
-    return pigment_painter::mix_srgb(colors_with_background, weights);
+    return mix_components_by_model(colors_with_background, weights, mix_model);
 }
 
 size_t ordered_stack_candidate_count(size_t component_count, int stack_depth, size_t candidate_limit)
@@ -659,6 +725,7 @@ void append_ordered_stack_candidate(ColorSolverOrderedStackCandidateSet       &c
                                     std::vector<float>                       &weights,
                                     const std::vector<uint16_t>              &surface_to_deep,
                                     const std::vector<float>                 &layer_opacities,
+                                    ColorSolverMixModel                       mix_model,
                                     int                                       simulated_stack_depth,
                                     float                                     surface_scatter,
                                     bool                                      beer_lambert_rgb_correction)
@@ -670,7 +737,7 @@ void append_ordered_stack_candidate(ColorSolverOrderedStackCandidateSet       &c
         mix_stack = &simulated_surface_to_deep;
     }
     const std::array<float, 3> mixed =
-        mix_ordered_stack_with_buffers(colors_with_background, weights, *mix_stack, layer_opacities, surface_scatter, beer_lambert_rgb_correction);
+        mix_ordered_stack_with_buffers(colors_with_background, weights, *mix_stack, layer_opacities, mix_model, surface_scatter, beer_lambert_rgb_correction);
     const std::array<float, 3> perceptual = oklab_from_srgb(mixed);
     candidates.rgbs.emplace_back(mixed[0]);
     candidates.rgbs.emplace_back(mixed[1]);
@@ -685,8 +752,7 @@ void append_ordered_stack_candidate(ColorSolverOrderedStackCandidateSet       &c
 
 ColorSolverMixModel color_solver_mix_model_from_index(int model)
 {
-    (void) model;
-    return ColorSolverMixModel::PigmentPainter;
+    return ColorSolverMixModel(std::clamp(model, int(ColorSolverMixModel::PigmentPainter), int(ColorSolverMixModel::PrusaFdmMixer)));
 }
 
 ColorSolverLookupMode color_solver_lookup_mode_from_index(int mode)
@@ -723,20 +789,22 @@ std::array<float, 3> mix_color_solver_components(const std::vector<std::array<fl
                                                  const std::vector<int>                  &weights,
                                                  ColorSolverMixModel                       mix_model)
 {
-    (void) mix_model;
-    return pigment_painter::mix_srgb(component_colors, weights);
+    std::vector<float> float_weights;
+    float_weights.reserve(weights.size());
+    for (const int weight : weights)
+        float_weights.emplace_back(float(std::max(0, weight)));
+    return mix_components_by_model(component_colors, float_weights, mix_model);
 }
 
 std::array<float, 3> mix_color_solver_components(const std::vector<std::array<float, 3>> &component_colors,
                                                  const std::vector<float>                &weights,
                                                  ColorSolverMixModel                       mix_model)
 {
-    (void) mix_model;
     std::vector<float> safe_weights;
     safe_weights.reserve(weights.size());
     for (const float weight : weights)
         safe_weights.emplace_back(std::isfinite(weight) ? std::clamp(weight, 0.f, 1.f) : 0.f);
-    return pigment_painter::mix_srgb(component_colors, safe_weights);
+    return mix_components_by_model(component_colors, safe_weights, mix_model);
 }
 
 std::array<float, 3> mix_color_solver_ordered_stack(const std::vector<std::array<float, 3>> &component_colors,
@@ -747,7 +815,6 @@ std::array<float, 3> mix_color_solver_ordered_stack(const std::vector<std::array
                                                     float                                     surface_scatter,
                                                     bool                                      beer_lambert_rgb_correction)
 {
-    (void) mix_model;
     if (component_colors.empty() || surface_to_deep.empty())
         return background_rgb;
 
@@ -758,6 +825,7 @@ std::array<float, 3> mix_color_solver_ordered_stack(const std::vector<std::array
                                           weights,
                                           surface_to_deep,
                                           layer_opacities,
+                                          mix_model,
                                           surface_scatter,
                                           beer_lambert_rgb_correction);
 }
@@ -940,7 +1008,6 @@ ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
     float                                     surface_scatter,
     bool                                      beer_lambert_rgb_correction)
 {
-    (void) mix_model;
     ColorSolverOrderedStackCandidateSet candidates;
     int simulated_depth = simulated_stack_depth > 0 ? simulated_stack_depth : stack_depth;
     if (component_colors.empty() || stack_depth <= 0 || simulated_depth <= 0 ||
@@ -975,6 +1042,7 @@ ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
                                                weights,
                                                surface_to_deep,
                                                layer_opacities,
+                                               mix_model,
                                                simulated_depth,
                                                surface_scatter,
                                                beer_lambert_rgb_correction);
@@ -1023,6 +1091,7 @@ ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
                                                weights,
                                                surface_to_deep,
                                                layer_opacities,
+                                               mix_model,
                                                simulated_depth,
                                                surface_scatter,
                                                beer_lambert_rgb_correction);

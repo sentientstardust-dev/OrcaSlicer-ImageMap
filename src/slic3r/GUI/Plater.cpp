@@ -1235,7 +1235,8 @@ public:
                   const wxColour &fallback,
                   const std::vector<TextureMappingZone::LinearGradientStop> &linear_gradient_stops = {},
                   bool linear_gradient = false,
-                  bool radial_gradient = false)
+                  bool radial_gradient = false,
+                  int generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel)
     {
         m_palette = palette;
         m_component_ids = component_ids;
@@ -1243,6 +1244,9 @@ public:
         m_linear_gradient_stops = linear_gradient_stops;
         m_linear_gradient = linear_gradient;
         m_radial_gradient = radial_gradient;
+        m_generic_solver_mix_model = std::clamp(generic_solver_mix_model,
+                                                int(TextureMappingZone::GenericSolverPigmentPainter),
+                                                int(TextureMappingZone::GenericSolverPrusaFdmMixer));
         Refresh();
     }
 
@@ -1266,7 +1270,8 @@ private:
         }
         const std::vector<float> weights =
             TextureMappingManager::linear_gradient_compact_weights(float(t), m_linear_gradient_stops, m_component_ids);
-        const std::array<float, 3> mixed = mix_color_solver_components(colors, weights, ColorSolverMixModel::PigmentPainter);
+        const std::array<float, 3> mixed =
+            mix_color_solver_components(colors, weights, color_solver_mix_model_from_index(m_generic_solver_mix_model));
         return wxColour(std::clamp(int(std::lround(mixed[0] * 255.f)), 0, 255),
                         std::clamp(int(std::lround(mixed[1] * 255.f)), 0, 255),
                         std::clamp(int(std::lround(mixed[2] * 255.f)), 0, 255));
@@ -1322,6 +1327,7 @@ private:
     wxColour                  m_fallback {wxColour("#26A69A")};
     bool                      m_linear_gradient { false };
     bool                      m_radial_gradient { false };
+    int                       m_generic_solver_mix_model { TextureMappingZone::DefaultGenericSolverMixModel };
 };
 
 class TextureMappingUsageDot : public wxPanel
@@ -1368,11 +1374,15 @@ public:
     void set_data(const std::vector<wxColour> &palette,
                   size_t num_physical,
                   const std::vector<TextureMappingZone::LinearGradientStop> &stops,
-                  int selected_index)
+                  int selected_index,
+                  int generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel)
     {
         m_palette = palette;
         m_num_physical = num_physical;
         m_stops = stops;
+        m_generic_solver_mix_model = std::clamp(generic_solver_mix_model,
+                                                int(TextureMappingZone::GenericSolverPigmentPainter),
+                                                int(TextureMappingZone::GenericSolverPrusaFdmMixer));
         sort_stops();
         m_selected_index = selected_index >= 0 && selected_index < int(m_stops.size()) ? selected_index : -1;
         Refresh();
@@ -1480,7 +1490,8 @@ private:
             colors.push_back({float(color.Red()) / 255.f, float(color.Green()) / 255.f, float(color.Blue()) / 255.f});
         }
         const std::vector<float> weights = TextureMappingManager::linear_gradient_compact_weights(t, m_stops, component_ids);
-        const std::array<float, 3> mixed = mix_color_solver_components(colors, weights, ColorSolverMixModel::PigmentPainter);
+        const std::array<float, 3> mixed =
+            mix_color_solver_components(colors, weights, color_solver_mix_model_from_index(m_generic_solver_mix_model));
         return wxColour(std::clamp(int(std::lround(mixed[0] * 255.f)), 0, 255),
                         std::clamp(int(std::lround(mixed[1] * 255.f)), 0, 255),
                         std::clamp(int(std::lround(mixed[2] * 255.f)), 0, 255));
@@ -1663,6 +1674,7 @@ private:
     std::vector<wxColour> m_palette;
     size_t m_num_physical { 0 };
     std::vector<TextureMappingZone::LinearGradientStop> m_stops;
+    int m_generic_solver_mix_model { TextureMappingZone::DefaultGenericSolverMixModel };
     int m_selected_index { -1 };
     bool m_dragging { false };
     std::function<void(const std::vector<TextureMappingZone::LinearGradientStop> &, int)> m_changed_callback;
@@ -2108,7 +2120,6 @@ public:
         , m_prime_tower_image(prime_tower_image)
         , m_prime_tower_image_back(prime_tower_image_back)
     {
-        (void) generic_solver_mix_model;
         (void) reduce_outer_surface_texture;
         (void) top_surface_contoning_min_feature_mm;
         m_modulation_mode_manually_changed = modulation_mode_manually_changed;
@@ -2540,9 +2551,12 @@ public:
                                           gap);
         wxArrayString generic_solver_mix_model_choices;
         generic_solver_mix_model_choices.Add(_L("Pigment Painter"));
+        generic_solver_mix_model_choices.Add(_L("prusa-fdm-mixer"));
         m_generic_solver_mix_model_choice =
             new wxChoice(experimental_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, generic_solver_mix_model_choices);
-        m_generic_solver_mix_model_choice->SetSelection(TextureMappingZone::DefaultGenericSolverMixModel);
+        m_generic_solver_mix_model_choice->SetSelection(std::clamp(generic_solver_mix_model,
+                                                                   int(TextureMappingZone::GenericSolverPigmentPainter),
+                                                                   int(TextureMappingZone::GenericSolverPrusaFdmMixer)));
         generic_solver_mix_model_row->Add(m_generic_solver_mix_model_choice, 1, wxALIGN_CENTER_VERTICAL);
         experimental_box->Add(generic_solver_mix_model_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
 
@@ -3521,7 +3535,11 @@ public:
 
     int generic_solver_mix_model() const
     {
-        return TextureMappingZone::DefaultGenericSolverMixModel;
+        return m_generic_solver_mix_model_choice ?
+            std::clamp(m_generic_solver_mix_model_choice->GetSelection(),
+                       int(TextureMappingZone::GenericSolverPigmentPainter),
+                       int(TextureMappingZone::GenericSolverPrusaFdmMixer)) :
+            TextureMappingZone::DefaultGenericSolverMixModel;
     }
 
     TextureMappingGlobalSettings global_settings() const
@@ -8490,7 +8508,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                           parse_texture_mapping_color(entry.display_color),
                           entry.is_linear_gradient() ? TextureMappingManager::normalized_linear_gradient_stops(entry, num_physical) : std::vector<TextureMappingZone::LinearGradientStop>(),
                           entry.is_linear_gradient(),
-                          entry.is_radial_linear_gradient());
+                          entry.is_radial_linear_gradient(),
+                          entry.generic_solver_mix_model);
         header_sizer->Add(preview, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         row_sizer->Add(header, 0, wxEXPAND | wxTOP | wxBOTTOM, gap);
 
@@ -8514,7 +8533,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                   parse_texture_mapping_color(zone.display_color),
                                   zone.is_linear_gradient() ? TextureMappingManager::normalized_linear_gradient_stops(zone, num_physical) : std::vector<TextureMappingZone::LinearGradientStop>(),
                                   zone.is_linear_gradient(),
-                                  zone.is_radial_linear_gradient());
+                                  zone.is_radial_linear_gradient(),
+                                  zone.generic_solver_mix_model);
             }
             if (swatch != nullptr)
                 swatch->set_data(parse_texture_mapping_color(zone.display_color), zone_id);
@@ -8596,7 +8616,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         const unsigned int initial_end_filament = initial_linear_gradient_stops.empty() ? initial_start_filament : initial_linear_gradient_stops.back().filament_id;
         auto *linear_gradient_stops_bar = new LinearGradientStopsBar(editor);
         linear_gradient_stops_bar->SetBackgroundColour(row_bg);
-        linear_gradient_stops_bar->set_data(palette, num_physical, initial_linear_gradient_stops, -1);
+        linear_gradient_stops_bar->set_data(palette, num_physical, initial_linear_gradient_stops, -1, entry.generic_solver_mix_model);
         editor_sizer->Add(linear_gradient_stops_bar, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
 
         auto *linear_gradient_row = new wxBoxSizer(wxHORIZONTAL);

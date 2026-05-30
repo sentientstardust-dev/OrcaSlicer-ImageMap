@@ -117,7 +117,8 @@ struct TextureMappingZone
     };
 
     enum GenericSolverMixModel : uint8_t {
-        GenericSolverPigmentPainter = 0
+        GenericSolverPigmentPainter = 0,
+        GenericSolverPrusaFdmMixer = 1
     };
 
     enum DitheringMethod : uint8_t {

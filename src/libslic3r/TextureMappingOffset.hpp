@@ -63,6 +63,7 @@ struct TextureMappingOffsetContext {
     bool                            halftone_increased_detail_enabled { false };
     bool                            halftone_v2_enabled { false };
     bool                            nonlinear_offset_adjustment { false };
+    int                             generic_solver_mix_model { TextureMappingZone::DefaultGenericSolverMixModel };
     Point                           object_center;
     Vec3f                           linear_gradient_start_mm { Vec3f::Zero() };
     Vec3f                           linear_gradient_end_mm { Vec3f::Zero() };

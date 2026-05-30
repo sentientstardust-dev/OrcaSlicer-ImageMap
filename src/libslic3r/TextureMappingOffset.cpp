@@ -2946,7 +2946,9 @@ std::optional<std::array<float, 3>> texture_mapping_offset_target_rgb_at_point(c
         weights.assign(context.component_colors.size(), 1.f);
 
     const std::array<float, 3> rgb =
-        mix_color_solver_components(context.component_colors, weights, ColorSolverMixModel::PigmentPainter);
+        mix_color_solver_components(context.component_colors,
+                                    weights,
+                                    color_solver_mix_model_from_index(context.generic_solver_mix_model));
     return std::array<float, 3>{ clamp01f(rgb[0]), clamp01f(rgb[1]), clamp01f(rgb[2]) };
 }
 
@@ -3083,7 +3085,7 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
                                                int(TextureMappingZone::GenericSolverV2));
     const int generic_solver_mix_model = std::clamp(zone.generic_solver_mix_model,
                                                     int(TextureMappingZone::GenericSolverPigmentPainter),
-                                                    int(TextureMappingZone::GenericSolverPigmentPainter));
+                                                    int(TextureMappingZone::GenericSolverPrusaFdmMixer));
     const float texture_contrast_pct = std::clamp(zone.contrast_pct, 25.f, 300.f);
     const float texture_tone_gamma =
         (!std::isfinite(zone.tone_gamma) || zone.tone_gamma <= 0.f) ?
@@ -3299,6 +3301,7 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     context.halftone_increased_detail_enabled = halftone_increased_detail_enabled;
     context.halftone_v2_enabled = halftone_v2_enabled;
     context.nonlinear_offset_adjustment = zone.nonlinear_offset_adjustment;
+    context.generic_solver_mix_model = generic_solver_mix_model;
     context.object_center = print_object.bounding_box().center();
     if (linear_gradient_mode) {
         const bool radial_mode = zone.linear_gradient_mode == int(TextureMappingZone::LinearGradientRadial);

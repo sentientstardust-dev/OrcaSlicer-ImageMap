@@ -507,6 +507,7 @@ struct TopSurfaceImageRegionPlan {
     bool contoning_td_adjustment_enabled = TextureMappingZone::DefaultTopSurfaceContoningTdAdjustmentEnabled;
     bool contoning_surface_scatter_enabled = TextureMappingZone::DefaultTopSurfaceContoningSurfaceScatterEnabled;
     bool contoning_beer_lambert_rgb_correction_enabled = TextureMappingZone::DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled;
+    int contoning_generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
     int contoning_flat_surface_infill_mode = TextureMappingZone::SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode;
 };
 
@@ -862,7 +863,8 @@ static std::vector<unsigned int> top_surface_image_components_bottom_to_top(cons
 }
 
 static std::optional<std::array<float, 4>> top_surface_image_equal_blend_background(const PrintConfig &config,
-                                                                                   const std::vector<unsigned int> &component_ids)
+                                                                                   const std::vector<unsigned int> &component_ids,
+                                                                                   int generic_solver_mix_model)
 {
     std::vector<std::array<float, 3>> colors;
     colors.reserve(component_ids.size());
@@ -877,7 +879,8 @@ static std::optional<std::array<float, 4>> top_surface_image_equal_blend_backgro
     if (colors.empty())
         return std::nullopt;
     std::vector<float> weights(colors.size(), 1.f / float(colors.size()));
-    const std::array<float, 3> mixed = mix_color_solver_components(colors, weights, ColorSolverMixModel::PigmentPainter);
+    const std::array<float, 3> mixed =
+        mix_color_solver_components(colors, weights, color_solver_mix_model_from_index(generic_solver_mix_model));
     return std::array<float, 4> { mixed[0], mixed[1], mixed[2], 1.f };
 }
 
@@ -1173,6 +1176,7 @@ struct TopSurfaceImageContoningStackPlanKey {
     bool td_adjustment { false };
     bool surface_scatter { false };
     bool beer_lambert_rgb_correction { false };
+    int mix_model { TextureMappingZone::DefaultGenericSolverMixModel };
 
     bool operator<(const TopSurfaceImageContoningStackPlanKey &rhs) const
     {
@@ -1202,7 +1206,8 @@ struct TopSurfaceImageContoningStackPlanKey {
                         polygonize_resolution,
                         td_adjustment,
                         surface_scatter,
-                        beer_lambert_rgb_correction) <
+                        beer_lambert_rgb_correction,
+                        mix_model) <
                std::tie(rhs.source_layer,
                         rhs.source_layer_id,
                         rhs.target_layer,
@@ -1229,7 +1234,8 @@ struct TopSurfaceImageContoningStackPlanKey {
                         rhs.polygonize_resolution,
                         rhs.td_adjustment,
                         rhs.surface_scatter,
-                        rhs.beer_lambert_rgb_correction);
+                        rhs.beer_lambert_rgb_correction,
+                        rhs.mix_model);
     }
 };
 
@@ -2145,7 +2151,9 @@ static std::optional<TopSurfaceImageContoningSourceContext> top_surface_image_co
                                                        float(source_layer.height),
                                                        std::nullopt,
                                                        plan.min_width_mm,
-                                                       top_surface_image_equal_blend_background(print_config, solver.component_ids()),
+                                                       top_surface_image_equal_blend_background(print_config,
+                                                                                                solver.component_ids(),
+                                                                                                zone.generic_solver_mix_model),
                                                        sample_z_mm);
     if (!offset_context)
         return std::nullopt;
@@ -2632,6 +2640,7 @@ static TopSurfaceImageContoningStackPlanKey top_surface_image_contoning_stack_pl
     key.td_adjustment = plan.contoning_td_adjustment_enabled;
     key.surface_scatter = plan.contoning_surface_scatter_enabled;
     key.beer_lambert_rgb_correction = plan.contoning_beer_lambert_rgb_correction_enabled;
+    key.mix_model = plan.contoning_generic_solver_mix_model;
     return key;
 }
 
@@ -3299,6 +3308,10 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
             plan.contoning_td_adjustment_enabled && zone->top_surface_contoning_surface_scatter_enabled;
         plan.contoning_beer_lambert_rgb_correction_enabled =
             plan.contoning_td_adjustment_enabled && zone->top_surface_contoning_beer_lambert_rgb_correction_enabled;
+        plan.contoning_generic_solver_mix_model =
+            std::clamp(zone->generic_solver_mix_model,
+                       int(TextureMappingZone::GenericSolverPigmentPainter),
+                       int(TextureMappingZone::GenericSolverPrusaFdmMixer));
         const TextureMappingContoningSolver contoning_solver(*zone, print_config, components, float(layer.height));
 
         const int stack_depth = plan.contoning ?
@@ -6489,7 +6502,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree,
                                                                                filament_colours) :
                         TextureMappingManager::selected_component_ids(*zone, print_config.filament_colour.values.size());
                 const std::optional<std::array<float, 4>> background =
-                    top_surface_image_equal_blend_background(print_config, components);
+                    top_surface_image_equal_blend_background(print_config, components, zone->generic_solver_mix_model);
                 top_surface_image_context =
                     build_texture_mapping_offset_context_for_layer(*this->object(),
                                                                    *this,
