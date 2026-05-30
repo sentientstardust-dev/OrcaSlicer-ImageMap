@@ -201,6 +201,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled = true;
     static constexpr int   DefaultTopSurfaceContoningPolygonizeResolution = 4;
     static constexpr bool  DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled = false;
+    static constexpr bool  DefaultTopSurfaceContoningSurfaceAnchoredStackOptimizationsEnabled = true;
     static constexpr bool  DefaultTopSurfaceContoningTdAdjustmentEnabled = true;
     static constexpr bool  DefaultTopSurfaceContoningSurfaceScatterEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled = false;
@@ -283,6 +284,11 @@ struct TextureMappingZone
     static bool effective_top_surface_contoning_surface_anchored_stacks_enabled(bool value)
     {
         return ShowExperimentalTopSurfaceContoningOptions && value;
+    }
+
+    static bool effective_top_surface_contoning_surface_anchored_stack_optimizations_enabled(bool value)
+    {
+        return ShowExperimentalTopSurfaceContoningOptions ? value : true;
     }
 
     static bool effective_top_surface_contoning_beam_search_stack_expansion_enabled(bool value)
@@ -401,6 +407,7 @@ struct TextureMappingZone
     bool        top_surface_contoning_polygonize_color_regions_enabled = DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled;
     int         top_surface_contoning_polygonize_resolution = DefaultTopSurfaceContoningPolygonizeResolution;
     bool        top_surface_contoning_surface_anchored_stacks_enabled = DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled;
+    bool        top_surface_contoning_surface_anchored_stack_optimizations_enabled = DefaultTopSurfaceContoningSurfaceAnchoredStackOptimizationsEnabled;
     bool        top_surface_contoning_td_adjustment_enabled = DefaultTopSurfaceContoningTdAdjustmentEnabled;
     bool        top_surface_contoning_surface_scatter_enabled = DefaultTopSurfaceContoningSurfaceScatterEnabled;
     bool        top_surface_contoning_beer_lambert_rgb_correction_enabled = DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled;
@@ -523,6 +530,12 @@ struct TextureMappingZone
             top_surface_contoning_surface_anchored_stacks_enabled);
     }
 
+    bool effective_top_surface_contoning_surface_anchored_stack_optimizations_enabled() const
+    {
+        return TextureMappingZone::effective_top_surface_contoning_surface_anchored_stack_optimizations_enabled(
+            top_surface_contoning_surface_anchored_stack_optimizations_enabled);
+    }
+
     bool effective_top_surface_contoning_beam_search_stack_expansion_enabled() const
     {
         return TextureMappingZone::effective_top_surface_contoning_beam_search_stack_expansion_enabled(
@@ -565,6 +578,7 @@ struct TextureMappingZone
             top_surface_contoning_perimeter_mode = DefaultTopSurfaceContoningPerimeterMode;
             top_surface_contoning_flat_surface_infill_mode = DefaultTopSurfaceContoningFlatSurfaceInfillMode;
             top_surface_contoning_surface_anchored_stacks_enabled = false;
+            top_surface_contoning_surface_anchored_stack_optimizations_enabled = true;
             top_surface_contoning_beam_search_stack_expansion_enabled = true;
             top_surface_contoning_layer_phase_enabled = false;
             top_surface_contoning_blue_noise_error_diffusion_enabled = false;
@@ -638,6 +652,7 @@ struct TextureMappingZone
         top_surface_contoning_polygonize_color_regions_enabled = DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled;
         top_surface_contoning_polygonize_resolution = DefaultTopSurfaceContoningPolygonizeResolution;
         top_surface_contoning_surface_anchored_stacks_enabled = DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled;
+        top_surface_contoning_surface_anchored_stack_optimizations_enabled = DefaultTopSurfaceContoningSurfaceAnchoredStackOptimizationsEnabled;
         top_surface_contoning_td_adjustment_enabled = DefaultTopSurfaceContoningTdAdjustmentEnabled;
         top_surface_contoning_surface_scatter_enabled = DefaultTopSurfaceContoningSurfaceScatterEnabled;
         top_surface_contoning_beer_lambert_rgb_correction_enabled = DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled;

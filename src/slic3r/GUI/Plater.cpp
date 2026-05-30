@@ -2105,6 +2105,7 @@ public:
                                         bool top_surface_contoning_polygonize_color_regions_enabled,
                                         int top_surface_contoning_polygonize_resolution,
                                         bool top_surface_contoning_surface_anchored_stacks_enabled,
+                                        bool top_surface_contoning_surface_anchored_stack_optimizations_enabled,
                                         bool top_surface_contoning_beam_search_stack_expansion_enabled,
                                         bool top_surface_contoning_td_adjustment_enabled,
                                         bool top_surface_contoning_surface_scatter_enabled,
@@ -2970,6 +2971,16 @@ public:
                                            0,
                                            wxEXPAND | wxTOP | wxBOTTOM,
                                            gap / 2);
+            m_top_surface_contoning_surface_anchored_stack_optimizations_checkbox =
+                new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Surface-anchored stack optimizations"));
+            m_top_surface_contoning_surface_anchored_stack_optimizations_checkbox->SetValue(
+                top_surface_contoning_surface_anchored_stack_optimizations_enabled);
+            m_top_surface_contoning_surface_anchored_stack_optimizations_checkbox->SetMinSize(
+                wxSize(-1, std::max(m_top_surface_contoning_surface_anchored_stack_optimizations_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+            contoning_checkboxes_root->Add(m_top_surface_contoning_surface_anchored_stack_optimizations_checkbox,
+                                           0,
+                                           wxEXPAND | wxTOP | wxBOTTOM,
+                                           gap / 2);
             m_top_surface_contoning_beam_search_stack_expansion_checkbox =
                 new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Use beam search for stack expansion"));
             m_top_surface_contoning_beam_search_stack_expansion_checkbox->SetValue(top_surface_contoning_beam_search_stack_expansion_enabled);
@@ -3527,6 +3538,14 @@ public:
         return m_top_surface_contoning_surface_anchored_stacks_checkbox == nullptr ?
             TextureMappingZone::DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled :
             m_top_surface_contoning_surface_anchored_stacks_checkbox->GetValue();
+    }
+    bool top_surface_contoning_surface_anchored_stack_optimizations_enabled() const
+    {
+        if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
+            return true;
+        return m_top_surface_contoning_surface_anchored_stack_optimizations_checkbox == nullptr ?
+            TextureMappingZone::DefaultTopSurfaceContoningSurfaceAnchoredStackOptimizationsEnabled :
+            m_top_surface_contoning_surface_anchored_stack_optimizations_checkbox->GetValue();
     }
     bool top_surface_contoning_beam_search_stack_expansion_enabled() const
     {
@@ -4447,6 +4466,10 @@ private:
             m_top_surface_contoning_surface_anchored_stacks_checkbox->Show(contoning);
             m_top_surface_contoning_surface_anchored_stacks_checkbox->Enable(contoning);
         }
+        if (m_top_surface_contoning_surface_anchored_stack_optimizations_checkbox != nullptr) {
+            m_top_surface_contoning_surface_anchored_stack_optimizations_checkbox->Show(contoning);
+            m_top_surface_contoning_surface_anchored_stack_optimizations_checkbox->Enable(contoning && surface_anchored_stacks);
+        }
         if (m_top_surface_contoning_beam_search_stack_expansion_checkbox != nullptr) {
             m_top_surface_contoning_beam_search_stack_expansion_checkbox->Show(contoning);
             m_top_surface_contoning_beam_search_stack_expansion_checkbox->Enable(contoning);
@@ -4540,6 +4563,7 @@ private:
     wxPanel *m_top_surface_contoning_polygonize_resolution_panel {nullptr};
     wxChoice *m_top_surface_contoning_polygonize_resolution_choice {nullptr};
     wxCheckBox *m_top_surface_contoning_surface_anchored_stacks_checkbox {nullptr};
+    wxCheckBox *m_top_surface_contoning_surface_anchored_stack_optimizations_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_beam_search_stack_expansion_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_td_adjustment_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_surface_scatter_checkbox {nullptr};
@@ -9574,6 +9598,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.top_surface_contoning_polygonize_color_regions_enabled,
                                                     updated.top_surface_contoning_polygonize_resolution,
                                                     updated.top_surface_contoning_surface_anchored_stacks_enabled,
+                                                    updated.top_surface_contoning_surface_anchored_stack_optimizations_enabled,
                                                     updated.top_surface_contoning_beam_search_stack_expansion_enabled,
                                                     updated.top_surface_contoning_td_adjustment_enabled,
                                                     updated.top_surface_contoning_surface_scatter_enabled,
@@ -9655,6 +9680,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 dlg.top_surface_contoning_polygonize_resolution();
             updated.top_surface_contoning_surface_anchored_stacks_enabled =
                 dlg.top_surface_contoning_surface_anchored_stacks_enabled();
+            updated.top_surface_contoning_surface_anchored_stack_optimizations_enabled =
+                dlg.top_surface_contoning_surface_anchored_stack_optimizations_enabled();
             updated.top_surface_contoning_beam_search_stack_expansion_enabled =
                 dlg.top_surface_contoning_beam_search_stack_expansion_enabled();
             updated.top_surface_contoning_td_adjustment_enabled =
