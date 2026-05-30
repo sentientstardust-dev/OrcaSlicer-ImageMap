@@ -206,7 +206,7 @@ struct TextureMappingZone
     static constexpr int   DefaultTopSurfaceContoningPolygonizeResolution = 4;
     static constexpr bool  DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningTdAdjustmentEnabled = true;
-    static constexpr bool  DefaultTopSurfaceContoningSurfaceScatterEnabled = true;
+    static constexpr bool  DefaultTopSurfaceContoningSurfaceScatterEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled = false;
     static constexpr bool  DefaultCompactOffsetMode = true;
     static constexpr bool  DefaultUseLegacyFixedColorMode = false;
@@ -304,7 +304,7 @@ struct TextureMappingZone
 
     static constexpr int normalize_top_surface_contoning_polygonize_resolution(int value)
     {
-        return value <= 1 ? 1 : (value >= 4 ? 4 : 2);
+        return value <= 1 ? 1 : (value >= 8 ? 8 : (value >= 4 ? 4 : 2));
     }
 
     struct LinearGradientAnchor {

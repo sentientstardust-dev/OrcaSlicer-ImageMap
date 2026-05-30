@@ -2936,11 +2936,14 @@ public:
         wxArrayString contoning_polygonize_resolution_choices;
         contoning_polygonize_resolution_choices.Add(_L("1x"));
         contoning_polygonize_resolution_choices.Add(_L("2x"));
-        contoning_polygonize_resolution_choices.Add(_L("4x (slow)"));
+        contoning_polygonize_resolution_choices.Add(_L("4x"));
+        contoning_polygonize_resolution_choices.Add(_L("8x (slow)"));
         m_top_surface_contoning_polygonize_resolution_choice =
             new wxChoice(m_top_surface_contoning_polygonize_resolution_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, contoning_polygonize_resolution_choices);
         const int polygonize_resolution = TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(top_surface_contoning_polygonize_resolution);
-        m_top_surface_contoning_polygonize_resolution_choice->SetSelection(polygonize_resolution == 1 ? 0 : (polygonize_resolution == 4 ? 2 : 1));
+        m_top_surface_contoning_polygonize_resolution_choice->SetSelection(
+            polygonize_resolution == 1 ? 0 :
+            (polygonize_resolution == 2 ? 1 : (polygonize_resolution == 4 ? 2 : 3)));
         contoning_polygonize_resolution_row->Add(m_top_surface_contoning_polygonize_resolution_choice, 1, wxEXPAND);
         contoning_checkboxes_root->Add(m_top_surface_contoning_polygonize_resolution_panel,
                                        0,
@@ -3474,7 +3477,13 @@ public:
         if (m_top_surface_contoning_polygonize_resolution_choice == nullptr)
             return TextureMappingZone::DefaultTopSurfaceContoningPolygonizeResolution;
         const int selection = m_top_surface_contoning_polygonize_resolution_choice->GetSelection();
-        return selection == 0 ? 1 : (selection == 2 ? 4 : 2);
+        switch (selection) {
+        case 0: return 1;
+        case 1: return 2;
+        case 2: return 4;
+        case 3: return 8;
+        default: return TextureMappingZone::DefaultTopSurfaceContoningPolygonizeResolution;
+        }
     }
     bool top_surface_contoning_surface_anchored_stacks_enabled() const
     {
@@ -3876,7 +3885,7 @@ private:
         upper = std::max(upper, lower);
         strong = std::max(strong, upper);
         return wxString::Format(_L("Recommendation based on highest TD: %d+ layers"),
-                                lower);
+                                upper);
     }
 
     wxString top_surface_contoning_shell_warning_text() const
