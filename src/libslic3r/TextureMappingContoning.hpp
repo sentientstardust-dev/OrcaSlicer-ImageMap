@@ -70,6 +70,7 @@ private:
     bool m_td_adjustment_enabled { false };
     bool m_beer_lambert_rgb_correction_enabled { false };
     bool m_td_effective_alpha_correction_enabled { false };
+    bool m_beam_search_stack_expansion_enabled { false };
     std::vector<ColorSolverStackComponentRole> m_component_roles;
     mutable std::map<int, std::vector<Candidate>> m_candidates_by_depth;
     mutable std::shared_ptr<ColorSolverOrderedStackCandidateCache> m_ordered_candidate_cache { std::make_shared<ColorSolverOrderedStackCandidateCache>() };

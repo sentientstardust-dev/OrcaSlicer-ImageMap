@@ -98,6 +98,7 @@ struct TexturePreviewSimulationSettings
     bool contoning_flat_surface_td_adjustment = false;
     bool contoning_flat_surface_beer_lambert_rgb_correction = false;
     bool contoning_flat_surface_td_effective_alpha_correction = false;
+    bool contoning_flat_surface_beam_search_stack_expansion = false;
     int contoning_flat_surface_pattern_filaments = TextureMappingZone::DefaultTopSurfaceContoningPatternFilaments;
     bool simulate_top_surface_lod = false;
     float top_surface_lod_pitch_mm = 0.f;
@@ -2689,6 +2690,8 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
         settings.contoning_flat_surface_td_effective_alpha_correction =
             settings.contoning_flat_surface_td_adjustment &&
             zone->top_surface_contoning_td_effective_alpha_correction_enabled;
+        settings.contoning_flat_surface_beam_search_stack_expansion =
+            zone->effective_top_surface_contoning_beam_search_stack_expansion_enabled();
         settings.contoning_flat_surface_surface_scatter =
             settings.contoning_flat_surface_td_adjustment &&
             zone->top_surface_contoning_surface_scatter_enabled ?
@@ -2791,6 +2794,7 @@ size_t texture_preview_simulation_signature(const ModelVolume &model_volume,
     mix(std::hash<int>{}(settings.contoning_flat_surface_td_adjustment ? 1 : 0));
     mix(std::hash<int>{}(settings.contoning_flat_surface_beer_lambert_rgb_correction ? 1 : 0));
     mix(std::hash<int>{}(settings.contoning_flat_surface_td_effective_alpha_correction ? 1 : 0));
+    mix(std::hash<int>{}(settings.contoning_flat_surface_beam_search_stack_expansion ? 1 : 0));
     if (settings.contoning_flat_surface_quantization) {
         mix(std::hash<int>{}(settings.contoning_flat_surface_pattern_filaments));
         mix(std::hash<int>{}(settings.simulate_top_surface_lod ? 1 : 0));
@@ -2896,7 +2900,8 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                                                        settings.contoning_flat_surface_surface_scatter,
                                                        settings.contoning_flat_surface_beer_lambert_rgb_correction,
                                                        settings.contoning_flat_surface_td_effective_alpha_correction,
-                                                       settings.component_roles) :
+                                                       settings.component_roles,
+                                                       settings.contoning_flat_surface_beam_search_stack_expansion) :
             ColorSolverOrderedStackCandidateSet{};
     const std::vector<TexturePreviewMixCandidate> contoning_flat_surface_candidates =
         use_contoning_flat_surface_quantization && contoning_flat_surface_ordered_candidates.empty() ?
@@ -5712,6 +5717,7 @@ static size_t texture_preview_settings_signature_impl(size_t num_physical,
         signature_mix(std::hash<int>{}(zone.top_surface_contoning_surface_scatter_enabled ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.top_surface_contoning_beer_lambert_rgb_correction_enabled ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.top_surface_contoning_td_effective_alpha_correction_enabled ? 1 : 0));
+        signature_mix(std::hash<int>{}(zone.effective_top_surface_contoning_beam_search_stack_expansion_enabled() ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.nonlinear_offset_adjustment ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.compact_offset_mode ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.use_legacy_fixed_color_mode ? 1 : 0));
@@ -5868,6 +5874,7 @@ static void texture_preview_mix_zone_baked_model_settings(size_t &signature,
     signature_mix(std::hash<int>{}(zone.top_surface_contoning_surface_scatter_enabled ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.top_surface_contoning_beer_lambert_rgb_correction_enabled ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.top_surface_contoning_td_effective_alpha_correction_enabled ? 1 : 0));
+    signature_mix(std::hash<int>{}(zone.effective_top_surface_contoning_beam_search_stack_expansion_enabled() ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.nonlinear_offset_adjustment ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.compact_offset_mode ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.use_legacy_fixed_color_mode ? 1 : 0));

@@ -823,6 +823,150 @@ std::vector<std::vector<uint16_t>> stretched_ordered_stack_variants(const std::v
     return variants;
 }
 
+struct OrderedStackExpansionBeamState {
+    std::vector<uint16_t> stack;
+    size_t next_control_idx { 0 };
+    float score { 0.f };
+};
+
+int ordered_stack_run_length(const std::vector<uint16_t> &stack, uint16_t component)
+{
+    int run = 0;
+    for (auto it = stack.rbegin(); it != stack.rend() && *it == component; ++it)
+        ++run;
+    return run;
+}
+
+float ordered_stack_beam_transition_score(const std::vector<uint16_t> &control,
+                                          const std::vector<float>    &layer_opacities,
+                                          const OrderedStackExpansionBeamState &state,
+                                          uint16_t                     component,
+                                          bool                         consume,
+                                          int                          stack_depth)
+{
+    const int slot = int(state.stack.size());
+    const float control_pos =
+        stack_depth > 0 ?
+            ((float(slot) + 0.5f) * float(control.size()) / float(stack_depth) - 0.5f) :
+            float(state.next_control_idx);
+    const float layout_penalty = std::abs(float(state.next_control_idx) - control_pos);
+    const float depth_t =
+        stack_depth > 1 ?
+            std::clamp(float(slot) / float(stack_depth - 1), 0.f, 1.f) :
+            0.f;
+    const size_t component_idx = size_t(component);
+    const float layer_opacity =
+        component_idx < layer_opacities.size() && std::isfinite(layer_opacities[component_idx]) ?
+            std::clamp(layer_opacities[component_idx], 1e-4f, 0.9999f) :
+            0.5f;
+    const float transmission = 1.f - layer_opacity;
+    const int run = ordered_stack_run_length(state.stack, component);
+
+    float score = -0.55f * layout_penalty;
+    if (!consume)
+        score += 0.20f * transmission + 0.12f * depth_t - 0.10f * (1.f - depth_t);
+    else
+        score += 0.02f;
+    if (run > 0)
+        score -= (0.12f + 0.30f * (1.f - depth_t)) * float(std::min(run, 5));
+    return score;
+}
+
+void prune_ordered_stack_expansion_beam(std::vector<OrderedStackExpansionBeamState> &states, size_t beam_width)
+{
+    std::sort(states.begin(), states.end(), [](const OrderedStackExpansionBeamState &lhs,
+                                               const OrderedStackExpansionBeamState &rhs) {
+        return lhs.score > rhs.score;
+    });
+    std::vector<OrderedStackExpansionBeamState> pruned;
+    pruned.reserve(std::min(states.size(), beam_width));
+    for (OrderedStackExpansionBeamState &state : states) {
+        const bool duplicate =
+            std::any_of(pruned.begin(), pruned.end(), [&state](const OrderedStackExpansionBeamState &existing) {
+                return existing.next_control_idx == state.next_control_idx && existing.stack == state.stack;
+            });
+        if (duplicate)
+            continue;
+        pruned.emplace_back(std::move(state));
+        if (pruned.size() >= beam_width)
+            break;
+    }
+    states = std::move(pruned);
+}
+
+std::vector<std::vector<uint16_t>> beam_stretched_ordered_stack_variants(const std::vector<uint16_t> &control,
+                                                                         const std::vector<float>    &layer_opacities,
+                                                                         int                          stack_depth,
+                                                                         size_t                       variant_limit)
+{
+    std::vector<std::vector<uint16_t>> variants;
+    if (control.empty() || stack_depth <= 0 || variant_limit == 0)
+        return variants;
+    if (int(control.size()) >= stack_depth) {
+        std::vector<uint16_t> variant(control.begin(), control.begin() + std::min(control.size(), size_t(stack_depth)));
+        append_unique_ordered_stack_variant(variants, std::move(variant));
+        return variants;
+    }
+
+    const size_t beam_width = std::max<size_t>(variant_limit, std::min<size_t>(32, variant_limit * 2));
+    std::vector<OrderedStackExpansionBeamState> beam(1);
+    beam.front().stack.reserve(size_t(stack_depth));
+
+    for (int slot = 0; slot < stack_depth; ++slot) {
+        std::vector<OrderedStackExpansionBeamState> next;
+        next.reserve(beam.size() * 2);
+        for (const OrderedStackExpansionBeamState &state : beam) {
+            if (state.next_control_idx >= control.size())
+                continue;
+            const uint16_t component = control[state.next_control_idx];
+            const int remaining_slots = stack_depth - slot - 1;
+            const int remaining_after_consume = int(control.size() - state.next_control_idx - 1);
+            if (remaining_slots >= remaining_after_consume) {
+                OrderedStackExpansionBeamState consumed = state;
+                consumed.stack.emplace_back(component);
+                consumed.score += ordered_stack_beam_transition_score(control, layer_opacities, state, component, true, stack_depth);
+                ++consumed.next_control_idx;
+                next.emplace_back(std::move(consumed));
+            }
+
+            const int remaining_after_duplicate = int(control.size() - state.next_control_idx);
+            if (remaining_slots >= remaining_after_duplicate) {
+                OrderedStackExpansionBeamState duplicated = state;
+                duplicated.stack.emplace_back(component);
+                duplicated.score += ordered_stack_beam_transition_score(control, layer_opacities, state, component, false, stack_depth);
+                next.emplace_back(std::move(duplicated));
+            }
+        }
+        if (next.empty())
+            break;
+        prune_ordered_stack_expansion_beam(next, beam_width);
+        beam = std::move(next);
+    }
+
+    std::sort(beam.begin(), beam.end(), [](const OrderedStackExpansionBeamState &lhs,
+                                           const OrderedStackExpansionBeamState &rhs) {
+        return lhs.score > rhs.score;
+    });
+    for (OrderedStackExpansionBeamState &state : beam) {
+        if (state.next_control_idx != control.size() || int(state.stack.size()) != stack_depth)
+            continue;
+        append_unique_ordered_stack_variant(variants, std::move(state.stack));
+        if (variants.size() >= variant_limit)
+            break;
+    }
+
+    if (variants.size() < variant_limit) {
+        std::vector<std::vector<uint16_t>> fallback =
+            stretched_ordered_stack_variants(control, layer_opacities, stack_depth);
+        for (std::vector<uint16_t> &variant : fallback) {
+            append_unique_ordered_stack_variant(variants, std::move(variant));
+            if (variants.size() >= variant_limit)
+                break;
+        }
+    }
+    return variants;
+}
+
 void append_ordered_stack_candidate(ColorSolverOrderedStackCandidateSet       &candidates,
                                     const std::vector<std::array<float, 3>>  &colors_with_background,
                                     std::vector<float>                       &weights,
@@ -1081,7 +1225,8 @@ std::string color_solver_ordered_stack_candidate_cache_key(const std::vector<std
                                                            float                                     surface_scatter,
                                                            bool                                      beer_lambert_rgb_correction,
                                                            bool                                      td_effective_alpha_correction,
-                                                           const std::vector<ColorSolverStackComponentRole> &component_roles)
+                                                           const std::vector<ColorSolverStackComponentRole> &component_roles,
+                                                           bool                                      beam_search_stack_expansion)
 {
     std::ostringstream key;
     key << component_colors.size();
@@ -1095,6 +1240,7 @@ std::string color_solver_ordered_stack_candidate_cache_key(const std::vector<std
     key << "|ss" << int(std::lround(safe_surface_scatter * 1000000.f));
     key << "|bl" << (beer_lambert_rgb_correction ? 1 : 0);
     key << "|ea" << (td_effective_alpha_correction ? 1 : 0);
+    key << "|beam" << (beam_search_stack_expansion ? 1 : 0);
     if (td_effective_alpha_correction) {
         key << "|role";
         for (size_t idx = 0; idx < component_colors.size(); ++idx) {
@@ -1136,7 +1282,8 @@ ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
     float                                     surface_scatter,
     bool                                      beer_lambert_rgb_correction,
     bool                                      td_effective_alpha_correction,
-    const std::vector<ColorSolverStackComponentRole> &component_roles)
+    const std::vector<ColorSolverStackComponentRole> &component_roles,
+    bool                                      beam_search_stack_expansion)
 {
     ColorSolverOrderedStackCandidateSet candidates;
     int simulated_depth = simulated_stack_depth > 0 ? simulated_stack_depth : stack_depth;
@@ -1212,7 +1359,9 @@ ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
             return;
         if (depth_idx == control_depth) {
             std::vector<std::vector<uint16_t>> variants =
-                stretched_ordered_stack_variants(control, layer_opacities, stack_depth);
+                beam_search_stack_expansion ?
+                    beam_stretched_ordered_stack_variants(control, layer_opacities, stack_depth, variant_budget) :
+                    stretched_ordered_stack_variants(control, layer_opacities, stack_depth);
             for (const std::vector<uint16_t> &surface_to_deep : variants) {
                 if (candidates.rgbs.size() / 3 >= max_candidate_count) {
                     limit_reached = true;
@@ -1258,7 +1407,8 @@ const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates
     float                                          surface_scatter,
     bool                                           beer_lambert_rgb_correction,
     bool                                           td_effective_alpha_correction,
-    const std::vector<ColorSolverStackComponentRole> &component_roles)
+    const std::vector<ColorSolverStackComponentRole> &component_roles,
+    bool                                           beam_search_stack_expansion)
 {
     const std::string key =
         color_solver_ordered_stack_candidate_cache_key(component_colors,
@@ -1272,7 +1422,8 @@ const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates
                                                        surface_scatter,
                                                        beer_lambert_rgb_correction,
                                                        td_effective_alpha_correction,
-                                                       component_roles);
+                                                       component_roles,
+                                                       beam_search_stack_expansion);
     auto it = cache.find(key);
     if (it != cache.end())
         return it->second;
@@ -1289,7 +1440,8 @@ const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates
                                                    surface_scatter,
                                                    beer_lambert_rgb_correction,
                                                    td_effective_alpha_correction,
-                                                   component_roles)).first->second;
+                                                   component_roles,
+                                                   beam_search_stack_expansion)).first->second;
 }
 
 std::vector<uint16_t> solve_color_solver_ordered_stack_for_target(

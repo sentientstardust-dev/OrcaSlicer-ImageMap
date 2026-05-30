@@ -3,10 +3,6 @@
 #ifndef slic3r_TextureMapping_hpp_
 #define slic3r_TextureMapping_hpp_
 
-#ifndef SLIC3R_SHOW_EXPERIMENTAL_CONTONING_OPTIONS
-#define SLIC3R_SHOW_EXPERIMENTAL_CONTONING_OPTIONS 0
-#endif
-
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -208,6 +204,8 @@ struct TextureMappingZone
     static constexpr bool  DefaultTopSurfaceContoningTdAdjustmentEnabled = true;
     static constexpr bool  DefaultTopSurfaceContoningSurfaceScatterEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled = false;
+    static constexpr bool  DefaultTopSurfaceContoningTdEffectiveAlphaCorrectionEnabled = true;
+    static constexpr bool  DefaultTopSurfaceContoningBeamSearchStackExpansionEnabled = true;
     static constexpr bool  DefaultCompactOffsetMode = true;
     static constexpr bool  DefaultUseLegacyFixedColorMode = false;
     static constexpr bool  DefaultHighSpeedImageTextureSampling = true;
@@ -232,7 +230,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultPreviewLimitResolution = true;
     static constexpr bool  DefaultPreviewSimulateTopSurfaceLod = true;
     static constexpr bool  DefaultAutoAdjustFilamentSelection = true;
-    static constexpr bool  ShowExperimentalTopSurfaceContoningOptions = SLIC3R_SHOW_EXPERIMENTAL_CONTONING_OPTIONS != 0;
+    static const bool      ShowExperimentalTopSurfaceContoningOptions;
 
     static constexpr int default_modulation_mode_for_surface_pattern(int surface_pattern)
     {
@@ -243,7 +241,7 @@ struct TextureMappingZone
         }
     }
 
-    static constexpr int effective_top_surface_contoning_flat_surface_infill_mode(int mode)
+    static int effective_top_surface_contoning_flat_surface_infill_mode(int mode)
     {
         if (!ShowExperimentalTopSurfaceContoningOptions)
             return SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode;
@@ -252,52 +250,57 @@ struct TextureMappingZone
             mode;
     }
 
-    static constexpr int stored_top_surface_contoning_flat_surface_infill_mode(int mode)
+    static int stored_top_surface_contoning_flat_surface_infill_mode(int mode)
     {
         return ShowExperimentalTopSurfaceContoningOptions ? mode : DefaultTopSurfaceContoningFlatSurfaceInfillMode;
     }
 
-    static constexpr int stored_top_surface_contoning_perimeter_mode(int mode)
+    static int stored_top_surface_contoning_perimeter_mode(int mode)
     {
         return ShowExperimentalTopSurfaceContoningOptions ? mode : DefaultTopSurfaceContoningPerimeterMode;
     }
 
-    static constexpr float effective_top_surface_contoning_angle_threshold_deg(float value)
+    static float effective_top_surface_contoning_angle_threshold_deg(float value)
     {
         return ShowExperimentalTopSurfaceContoningOptions ? value : MaxTopSurfaceContoningAngleThresholdDeg;
     }
 
-    static constexpr bool effective_top_surface_contoning_only_color_surface_infill(bool value)
+    static bool effective_top_surface_contoning_only_color_surface_infill(bool value)
     {
         return ShowExperimentalTopSurfaceContoningOptions ? value : true;
     }
 
-    static constexpr bool effective_top_surface_contoning_replace_top_perimeters_with_infill(bool value)
+    static bool effective_top_surface_contoning_replace_top_perimeters_with_infill(bool value)
     {
         return ShowExperimentalTopSurfaceContoningOptions && value;
     }
 
-    static constexpr bool effective_top_surface_contoning_recolor_surrounding_perimeters(bool value, bool replace)
+    static bool effective_top_surface_contoning_recolor_surrounding_perimeters(bool value, bool replace)
     {
         return ShowExperimentalTopSurfaceContoningOptions && value && !replace;
     }
 
-    static constexpr bool effective_top_surface_contoning_surface_anchored_stacks_enabled(bool value)
+    static bool effective_top_surface_contoning_surface_anchored_stacks_enabled(bool value)
     {
         return ShowExperimentalTopSurfaceContoningOptions && value;
     }
 
-    static constexpr bool effective_top_surface_contoning_layer_phase_enabled(bool value)
+    static bool effective_top_surface_contoning_beam_search_stack_expansion_enabled(bool value)
+    {
+        return ShowExperimentalTopSurfaceContoningOptions ? value : true;
+    }
+
+    static bool effective_top_surface_contoning_layer_phase_enabled(bool value)
     {
         return ShowExperimentalTopSurfaceContoningOptions && value;
     }
 
-    static constexpr bool effective_top_surface_contoning_blue_noise_error_diffusion_enabled(bool value)
+    static bool effective_top_surface_contoning_blue_noise_error_diffusion_enabled(bool value)
     {
         return ShowExperimentalTopSurfaceContoningOptions && value;
     }
 
-    static constexpr bool effective_top_surface_contoning_supersampled_cells_enabled(bool value)
+    static bool effective_top_surface_contoning_supersampled_cells_enabled(bool value)
     {
         return ShowExperimentalTopSurfaceContoningOptions && value;
     }
@@ -389,6 +392,8 @@ struct TextureMappingZone
     bool        top_surface_contoning_td_adjustment_enabled = DefaultTopSurfaceContoningTdAdjustmentEnabled;
     bool        top_surface_contoning_surface_scatter_enabled = DefaultTopSurfaceContoningSurfaceScatterEnabled;
     bool        top_surface_contoning_beer_lambert_rgb_correction_enabled = DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled;
+    bool        top_surface_contoning_td_effective_alpha_correction_enabled = DefaultTopSurfaceContoningTdEffectiveAlphaCorrectionEnabled;
+    bool        top_surface_contoning_beam_search_stack_expansion_enabled = DefaultTopSurfaceContoningBeamSearchStackExpansionEnabled;
     bool        compact_offset_mode = DefaultCompactOffsetMode;
     bool        use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
     bool        high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;
@@ -506,6 +511,12 @@ struct TextureMappingZone
             top_surface_contoning_surface_anchored_stacks_enabled);
     }
 
+    bool effective_top_surface_contoning_beam_search_stack_expansion_enabled() const
+    {
+        return TextureMappingZone::effective_top_surface_contoning_beam_search_stack_expansion_enabled(
+            top_surface_contoning_beam_search_stack_expansion_enabled);
+    }
+
     bool effective_top_surface_contoning_layer_phase_enabled() const
     {
         return TextureMappingZone::effective_top_surface_contoning_layer_phase_enabled(
@@ -540,6 +551,7 @@ struct TextureMappingZone
             top_surface_contoning_perimeter_mode = DefaultTopSurfaceContoningPerimeterMode;
             top_surface_contoning_flat_surface_infill_mode = DefaultTopSurfaceContoningFlatSurfaceInfillMode;
             top_surface_contoning_surface_anchored_stacks_enabled = false;
+            top_surface_contoning_beam_search_stack_expansion_enabled = true;
             top_surface_contoning_layer_phase_enabled = false;
             top_surface_contoning_blue_noise_error_diffusion_enabled = false;
             top_surface_contoning_supersampled_cells_enabled = false;
@@ -611,6 +623,8 @@ struct TextureMappingZone
         top_surface_contoning_td_adjustment_enabled = DefaultTopSurfaceContoningTdAdjustmentEnabled;
         top_surface_contoning_surface_scatter_enabled = DefaultTopSurfaceContoningSurfaceScatterEnabled;
         top_surface_contoning_beer_lambert_rgb_correction_enabled = DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled;
+        top_surface_contoning_td_effective_alpha_correction_enabled = DefaultTopSurfaceContoningTdEffectiveAlphaCorrectionEnabled;
+        top_surface_contoning_beam_search_stack_expansion_enabled = DefaultTopSurfaceContoningBeamSearchStackExpansionEnabled;
         compact_offset_mode = DefaultCompactOffsetMode;
         use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
         high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;

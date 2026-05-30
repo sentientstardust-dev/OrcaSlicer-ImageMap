@@ -2105,6 +2105,7 @@ public:
                                         bool top_surface_contoning_polygonize_color_regions_enabled,
                                         int top_surface_contoning_polygonize_resolution,
                                         bool top_surface_contoning_surface_anchored_stacks_enabled,
+                                        bool top_surface_contoning_beam_search_stack_expansion_enabled,
                                         bool top_surface_contoning_td_adjustment_enabled,
                                         bool top_surface_contoning_surface_scatter_enabled,
                                         bool top_surface_contoning_beer_lambert_rgb_correction_enabled,
@@ -2969,6 +2970,15 @@ public:
                                            0,
                                            wxEXPAND | wxTOP | wxBOTTOM,
                                            gap / 2);
+            m_top_surface_contoning_beam_search_stack_expansion_checkbox =
+                new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Use beam search for stack expansion"));
+            m_top_surface_contoning_beam_search_stack_expansion_checkbox->SetValue(top_surface_contoning_beam_search_stack_expansion_enabled);
+            m_top_surface_contoning_beam_search_stack_expansion_checkbox->SetMinSize(
+                wxSize(-1, std::max(m_top_surface_contoning_beam_search_stack_expansion_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+            contoning_checkboxes_root->Add(m_top_surface_contoning_beam_search_stack_expansion_checkbox,
+                                           0,
+                                           wxEXPAND | wxTOP | wxBOTTOM,
+                                           gap / 2);
         }
         top_surface_box->Add(m_top_surface_contoning_checkboxes_panel, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, gap);
         if (m_top_surface_contoning_only_color_surface_infill_checkbox != nullptr) {
@@ -3508,6 +3518,14 @@ public:
         return m_top_surface_contoning_surface_anchored_stacks_checkbox == nullptr ?
             TextureMappingZone::DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled :
             m_top_surface_contoning_surface_anchored_stacks_checkbox->GetValue();
+    }
+    bool top_surface_contoning_beam_search_stack_expansion_enabled() const
+    {
+        if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
+            return true;
+        return m_top_surface_contoning_beam_search_stack_expansion_checkbox == nullptr ?
+            TextureMappingZone::DefaultTopSurfaceContoningBeamSearchStackExpansionEnabled :
+            m_top_surface_contoning_beam_search_stack_expansion_checkbox->GetValue();
     }
     bool top_surface_contoning_td_adjustment_enabled() const
     {
@@ -4410,6 +4428,10 @@ private:
             m_top_surface_contoning_surface_anchored_stacks_checkbox->Show(contoning);
             m_top_surface_contoning_surface_anchored_stacks_checkbox->Enable(contoning);
         }
+        if (m_top_surface_contoning_beam_search_stack_expansion_checkbox != nullptr) {
+            m_top_surface_contoning_beam_search_stack_expansion_checkbox->Show(contoning);
+            m_top_surface_contoning_beam_search_stack_expansion_checkbox->Enable(contoning);
+        }
         if (m_top_surface_image_fixed_coloring_filaments_checkbox != nullptr) {
             m_top_surface_image_fixed_coloring_filaments_checkbox->Show(!contoning_selected);
             m_top_surface_image_fixed_coloring_filaments_checkbox->Enable(enabled && !contoning_selected);
@@ -4499,6 +4521,7 @@ private:
     wxPanel *m_top_surface_contoning_polygonize_resolution_panel {nullptr};
     wxChoice *m_top_surface_contoning_polygonize_resolution_choice {nullptr};
     wxCheckBox *m_top_surface_contoning_surface_anchored_stacks_checkbox {nullptr};
+    wxCheckBox *m_top_surface_contoning_beam_search_stack_expansion_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_td_adjustment_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_surface_scatter_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_beer_lambert_rgb_correction_checkbox {nullptr};
@@ -9532,6 +9555,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.top_surface_contoning_polygonize_color_regions_enabled,
                                                     updated.top_surface_contoning_polygonize_resolution,
                                                     updated.top_surface_contoning_surface_anchored_stacks_enabled,
+                                                    updated.top_surface_contoning_beam_search_stack_expansion_enabled,
                                                     updated.top_surface_contoning_td_adjustment_enabled,
                                                     updated.top_surface_contoning_surface_scatter_enabled,
                                                     updated.top_surface_contoning_beer_lambert_rgb_correction_enabled,
@@ -9612,6 +9636,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 dlg.top_surface_contoning_polygonize_resolution();
             updated.top_surface_contoning_surface_anchored_stacks_enabled =
                 dlg.top_surface_contoning_surface_anchored_stacks_enabled();
+            updated.top_surface_contoning_beam_search_stack_expansion_enabled =
+                dlg.top_surface_contoning_beam_search_stack_expansion_enabled();
             updated.top_surface_contoning_td_adjustment_enabled =
                 dlg.top_surface_contoning_td_adjustment_enabled();
             updated.top_surface_contoning_surface_scatter_enabled =

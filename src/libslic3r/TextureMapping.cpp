@@ -17,6 +17,8 @@
 
 namespace Slic3r {
 
+const bool TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions = false;
+
 namespace {
 
 constexpr unsigned int TextureMappingZoneIdBase = 99;
@@ -1165,6 +1167,7 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            top_surface_contoning_surface_scatter_enabled == rhs.top_surface_contoning_surface_scatter_enabled &&
            top_surface_contoning_beer_lambert_rgb_correction_enabled == rhs.top_surface_contoning_beer_lambert_rgb_correction_enabled &&
            top_surface_contoning_td_effective_alpha_correction_enabled == rhs.top_surface_contoning_td_effective_alpha_correction_enabled &&
+           effective_top_surface_contoning_beam_search_stack_expansion_enabled() == rhs.effective_top_surface_contoning_beam_search_stack_expansion_enabled() &&
            compact_offset_mode == rhs.compact_offset_mode &&
            use_legacy_fixed_color_mode == rhs.use_legacy_fixed_color_mode &&
            high_speed_image_texture_sampling == rhs.high_speed_image_texture_sampling &&
@@ -1575,6 +1578,8 @@ std::string TextureMappingManager::serialize_entries()
             zone.top_surface_contoning_beer_lambert_rgb_correction_enabled;
         texture["top_surface_contoning_td_effective_alpha_correction_enabled"] =
             zone.top_surface_contoning_td_effective_alpha_correction_enabled;
+        texture["top_surface_contoning_beam_search_stack_expansion_enabled"] =
+            zone.effective_top_surface_contoning_beam_search_stack_expansion_enabled();
         texture["compact_offset_mode"] = zone.compact_offset_mode;
         texture["use_legacy_fixed_color_mode"] = zone.use_legacy_fixed_color_mode;
         texture["high_speed_image_texture_sampling"] = true;
@@ -1886,6 +1891,9 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.top_surface_contoning_td_effective_alpha_correction_enabled =
             texture.value("top_surface_contoning_td_effective_alpha_correction_enabled",
                           TextureMappingZone::DefaultTopSurfaceContoningTdEffectiveAlphaCorrectionEnabled);
+        zone.top_surface_contoning_beam_search_stack_expansion_enabled =
+            texture.value("top_surface_contoning_beam_search_stack_expansion_enabled",
+                          TextureMappingZone::DefaultTopSurfaceContoningBeamSearchStackExpansionEnabled);
         zone.apply_top_surface_contoning_experimental_defaults();
         zone.compact_offset_mode = texture.value("compact_offset_mode", TextureMappingZone::DefaultCompactOffsetMode);
         zone.use_legacy_fixed_color_mode =

@@ -413,6 +413,7 @@ TextureMappingContoningSolver::TextureMappingContoningSolver(const TextureMappin
         m_td_adjustment_enabled &&
         !m_td_effective_alpha_correction_enabled &&
         zone.top_surface_contoning_beer_lambert_rgb_correction_enabled;
+    m_beam_search_stack_expansion_enabled = zone.effective_top_surface_contoning_beam_search_stack_expansion_enabled();
     m_layer_height_mm = std::isfinite(layer_height_mm) && layer_height_mm > 0.f ? layer_height_mm : 0.2f;
     if (!std::isfinite(m_layer_height_mm) || m_layer_height_mm <= 0.f)
         m_layer_height_mm = 0.2f;
@@ -652,7 +653,8 @@ TextureMappingContoningStack TextureMappingContoningSolver::solve(const std::arr
                                                        m_surface_scatter,
                                                        m_beer_lambert_rgb_correction_enabled,
                                                        m_td_effective_alpha_correction_enabled,
-                                                       m_component_roles);
+                                                       m_component_roles,
+                                                       m_beam_search_stack_expansion_enabled);
         }
         const std::vector<uint16_t> surface_to_deep =
             solve_color_solver_ordered_stack_for_target(*ordered_candidates, target_rgb, ColorSolverMode::V2);
