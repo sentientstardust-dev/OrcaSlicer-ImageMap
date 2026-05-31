@@ -2435,8 +2435,7 @@ static float top_surface_image_contoning_oklab_error(const std::array<float, 3> 
     return dl * dl + 4.f * da * da + 4.f * db * db;
 }
 
-static float top_surface_image_contoning_sample_pitch_mm(const TopSurfaceImageRegionPlan &plan,
-                                                         const BoundingBox               &bbox)
+static float top_surface_image_contoning_nominal_sample_pitch_mm(const TopSurfaceImageRegionPlan &plan)
 {
     float pitch = std::clamp(plan.contoning_external_width_mm,
                              0.25f,
@@ -2447,6 +2446,28 @@ static float top_surface_image_contoning_sample_pitch_mm(const TopSurfaceImageRe
     const float min_pitch = 0.25f / float(polygonize_resolution);
     if (polygonize_resolution > 1)
         pitch = std::max(min_pitch, pitch / float(polygonize_resolution));
+    return std::clamp(pitch, min_pitch, std::max(min_pitch, plan.contoning_min_feature_mm));
+}
+
+static std::optional<float> top_surface_image_contoning_texture_sample_pitch_mm(const TopSurfaceImageRegionPlan &plan)
+{
+    if (!plan.contoning_polygonize_color_regions_enabled)
+        return std::nullopt;
+    const int polygonize_resolution =
+        TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(plan.contoning_polygonize_resolution);
+    if (polygonize_resolution <= 1)
+        return std::nullopt;
+    return top_surface_image_contoning_nominal_sample_pitch_mm(plan);
+}
+
+static float top_surface_image_contoning_sample_pitch_mm(const TopSurfaceImageRegionPlan &plan,
+                                                         const BoundingBox               &bbox)
+{
+    float pitch = top_surface_image_contoning_nominal_sample_pitch_mm(plan);
+    const int polygonize_resolution = plan.contoning_polygonize_color_regions_enabled ?
+        TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(plan.contoning_polygonize_resolution) :
+        1;
+    const float min_pitch = 0.25f / float(polygonize_resolution);
     const double width_mm = unscale<double>(bbox.max.x() - bbox.min.x());
     const double height_mm = unscale<double>(bbox.max.y() - bbox.min.y());
     const double max_samples = 650000.0 * double(polygonize_resolution) * double(polygonize_resolution);
@@ -4006,7 +4027,8 @@ static std::optional<TopSurfaceImageContoningSourceContext> top_surface_image_co
                                                        top_surface_image_equal_blend_background(print_config,
                                                                                                 solver.component_ids(),
                                                                                                 zone.generic_solver_mix_model),
-                                                       sample_z_mm);
+                                                       sample_z_mm,
+                                                       top_surface_image_contoning_texture_sample_pitch_mm(plan));
     if (!offset_context)
         return std::nullopt;
 

@@ -1573,6 +1573,7 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
     float layer_z_falloff_mm,
     bool high_resolution_texture_sampling,
     bool high_speed_image_texture_sampling,
+    std::optional<float> texture_sample_pitch_mm_override,
     std::optional<std::array<float, 4>> image_background_rgba_override)
 {
     TextureMappingOffsetWeightField weight_field;
@@ -1601,10 +1602,18 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
     const float contrast_factor = std::clamp(texture_contrast_pct, 25.f, 300.f) / 100.f;
     const float tone_gamma =
         (!std::isfinite(texture_tone_gamma) || texture_tone_gamma <= 0.f) ? 1.f : std::clamp(texture_tone_gamma, 0.5f, 3.f);
-    const float physical_sample_pitch_mm =
+    const float default_physical_sample_pitch_mm =
         dithering_enabled && !raw_values_mode && std::isfinite(dither_pitch_mm) && dither_pitch_mm > EPSILON ?
             dither_pitch_mm :
             (high_resolution_texture_sampling ? 0.08f : 0.16f);
+    const bool has_texture_sample_pitch_override =
+        texture_sample_pitch_mm_override &&
+        std::isfinite(*texture_sample_pitch_mm_override) &&
+        *texture_sample_pitch_mm_override > EPSILON;
+    const float physical_sample_pitch_mm =
+        has_texture_sample_pitch_override ?
+            std::min(default_physical_sample_pitch_mm, std::max(0.02f, *texture_sample_pitch_mm_override)) :
+            default_physical_sample_pitch_mm;
 
     std::vector<WeightedTextureSample> samples;
     samples.reserve(8192);
@@ -1647,7 +1656,10 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
             return;
 
         const float pitch_mm = physical_sample_pitch_mm;
-        const int max_bary_steps = dithering_enabled && !raw_values_mode ? 160 : (high_resolution_texture_sampling ? 80 : 40);
+        const int max_bary_steps =
+            has_texture_sample_pitch_override ?
+                2000 :
+                (dithering_enabled && !raw_values_mode ? 160 : (high_resolution_texture_sampling ? 80 : 40));
         const int bary_steps = std::clamp(int(std::ceil(max_world_edge_mm / pitch_mm)), 1, max_bary_steps);
         const int sample_count = bary_steps * (bary_steps + 1) / 2;
         if (sample_count <= 0)
@@ -1817,7 +1829,10 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
                 if (!std::isfinite(max_world_edge_mm) || !std::isfinite(tri_area_mm2))
                     continue;
                 const float pitch_mm = physical_sample_pitch_mm;
-                const int max_bary_steps = dithering_enabled && !raw_values_mode ? 160 : (high_resolution_texture_sampling ? 80 : 40);
+                const int max_bary_steps =
+                    has_texture_sample_pitch_override ?
+                        2000 :
+                        (dithering_enabled && !raw_values_mode ? 160 : (high_resolution_texture_sampling ? 80 : 40));
                 const int bary_steps = std::clamp(int(std::ceil(max_world_edge_mm / pitch_mm)), 1, max_bary_steps);
                 const int sample_count = bary_steps * (bary_steps + 1) / 2;
                 if (sample_count <= 0)
@@ -2092,7 +2107,11 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
             weight_field.fallback_weights[component_idx] = clamp01f(fallback_acc[component_idx] / fallback_weight);
     }
 
-    const float target_bucket_mm = high_resolution_texture_sampling ? 0.12f : 0.22f;
+    const float default_target_bucket_mm = high_resolution_texture_sampling ? 0.12f : 0.22f;
+    const float target_bucket_mm =
+        has_texture_sample_pitch_override ?
+            std::clamp(physical_sample_pitch_mm, 0.02f, default_target_bucket_mm) :
+            default_target_bucket_mm;
     constexpr int min_bucket_dim = 16;
     constexpr int max_bucket_dim = 320;
     constexpr int max_buckets = 72000;
@@ -2107,6 +2126,11 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
 
     weight_field.min_x_mm = min_x_mm;
     weight_field.min_y_mm = min_y_mm;
+    weight_field.sample_lookup_radius_mm =
+        has_texture_sample_pitch_override ?
+            std::min(high_resolution_texture_sampling ? 0.18f : 0.32f,
+                     std::max(physical_sample_pitch_mm * 2.5f, physical_sample_pitch_mm + 0.02f)) :
+            0.f;
     weight_field.bucket_width = bucket_width;
     weight_field.bucket_height = bucket_height;
     weight_field.bucket_width_mm = std::max(1e-3f, span_x_mm / std::max(1, bucket_width - 1));
@@ -2199,15 +2223,23 @@ std::vector<float> sample_weight_field_components_impl(const TextureMappingOffse
         return fallback;
     }
 
+    const bool has_lookup_radius_override =
+        std::isfinite(weight_field.sample_lookup_radius_mm) && weight_field.sample_lookup_radius_mm > EPSILON;
     const float sigma_scale = high_resolution_texture_sampling ? 0.45f : 0.7f;
     const float min_sigma_mm = high_resolution_texture_sampling ? 0.04f : 0.06f;
-    const float sigma_x_mm = std::max(min_sigma_mm, weight_field.bucket_width_mm * sigma_scale);
-    const float sigma_y_mm = std::max(min_sigma_mm, weight_field.bucket_height_mm * sigma_scale);
+    const float sigma_x_mm = has_lookup_radius_override ?
+        std::max(0.01f, weight_field.sample_lookup_radius_mm * 0.4f) :
+        std::max(min_sigma_mm, weight_field.bucket_width_mm * sigma_scale);
+    const float sigma_y_mm = has_lookup_radius_override ?
+        std::max(0.01f, weight_field.sample_lookup_radius_mm * 0.4f) :
+        std::max(min_sigma_mm, weight_field.bucket_height_mm * sigma_scale);
     const float inv_two_sigma_x2 = 1.f / std::max(2.f * sigma_x_mm * sigma_x_mm, 1e-8f);
     const float inv_two_sigma_y2 = 1.f / std::max(2.f * sigma_y_mm * sigma_y_mm, 1e-8f);
     const float min_radius_mm = high_resolution_texture_sampling ? 0.16f : 0.30f;
     const float radius_scale = high_resolution_texture_sampling ? 1.75f : 3.f;
-    const float max_radius_mm = std::max(min_radius_mm, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * radius_scale);
+    const float max_radius_mm = has_lookup_radius_override ?
+        weight_field.sample_lookup_radius_mm :
+        std::max(min_radius_mm, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * radius_scale);
     const float max_radius2 = max_radius_mm * max_radius_mm;
     const float min_bucket_span_mm = std::max(1e-3f, std::min(weight_field.bucket_width_mm, weight_field.bucket_height_mm));
     const int max_ring = std::max(1, int(std::ceil(max_radius_mm / min_bucket_span_mm)));
@@ -2746,10 +2778,14 @@ std::optional<std::array<float, 3>> sample_weight_field_rgb(const TextureMapping
     const float gy = (y_mm - weight_field.min_y_mm) / std::max(weight_field.bucket_height_mm, 1e-6f);
     const int cx = std::clamp(int(std::floor(gx)), 0, weight_field.bucket_width - 1);
     const int cy = std::clamp(int(std::floor(gy)), 0, weight_field.bucket_height - 1);
+    const bool has_lookup_radius_override =
+        std::isfinite(weight_field.sample_lookup_radius_mm) && weight_field.sample_lookup_radius_mm > EPSILON;
     const float max_radius_mm =
-        high_resolution_texture_sampling ?
-            std::max(0.18f, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * 2.5f) :
-            std::max(0.32f, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * 3.0f);
+        has_lookup_radius_override ?
+            weight_field.sample_lookup_radius_mm :
+            (high_resolution_texture_sampling ?
+                std::max(0.18f, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * 2.5f) :
+                std::max(0.32f, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * 3.0f));
     const int max_ring = std::clamp(int(std::ceil(max_radius_mm / std::max(std::min(weight_field.bucket_width_mm,
                                                                                        weight_field.bucket_height_mm),
                                                                                1e-3f))),
@@ -2828,10 +2864,14 @@ std::optional<float> sample_weight_field_normal_z(const TextureMappingOffsetWeig
     const float gy = (y_mm - weight_field.min_y_mm) / std::max(weight_field.bucket_height_mm, 1e-6f);
     const int cx = std::clamp(int(std::floor(gx)), 0, weight_field.bucket_width - 1);
     const int cy = std::clamp(int(std::floor(gy)), 0, weight_field.bucket_height - 1);
+    const bool has_lookup_radius_override =
+        std::isfinite(weight_field.sample_lookup_radius_mm) && weight_field.sample_lookup_radius_mm > EPSILON;
     const float max_radius_mm =
-        high_resolution_texture_sampling ?
-            std::max(0.18f, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * 2.5f) :
-            std::max(0.32f, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * 3.0f);
+        has_lookup_radius_override ?
+            weight_field.sample_lookup_radius_mm :
+            (high_resolution_texture_sampling ?
+                std::max(0.18f, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * 2.5f) :
+                std::max(0.32f, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * 3.0f));
     const int max_ring = std::clamp(int(std::ceil(max_radius_mm / std::max(std::min(weight_field.bucket_width_mm,
                                                                                        weight_field.bucket_height_mm),
                                                                                1e-3f))),
@@ -3100,7 +3140,8 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     std::optional<Vec2d>     plate_origin_mm_override,
     std::optional<float>     min_outer_width_mm_override,
     std::optional<std::array<float, 4>> image_background_rgba_override,
-    std::optional<float>     sample_z_mm_override)
+    std::optional<float>     sample_z_mm_override,
+    std::optional<float>     texture_sample_pitch_mm_override)
 {
     const Print *print = print_object.print();
     if (print == nullptr)
@@ -3309,6 +3350,7 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
                                                            layer_sample_falloff_mm,
                                                            high_resolution_texture_sampling,
                                                            zone.high_speed_image_texture_sampling,
+                                                           texture_sample_pitch_mm_override,
                                                            image_background_rgba_override);
         if (weight_field.empty())
             return std::nullopt;
