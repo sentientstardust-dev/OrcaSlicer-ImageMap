@@ -619,7 +619,7 @@ private:
     bool                 m_projection_panel_expanded = true;
     bool                 m_apply_transparency_as_background = false;
     bool                 m_pass_through_model = false;
-    bool                 m_improve_projection_accuracy = false;
+    bool                 m_improve_projection_accuracy = true;
     bool                 m_erase_region_painting = true;
     bool                 m_convert_existing_colors_to_raw_offsets = true;
     std::atomic_bool     m_projection_job_active { false };

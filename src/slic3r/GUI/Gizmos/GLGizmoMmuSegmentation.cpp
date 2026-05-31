@@ -5622,6 +5622,31 @@ static bool projection_point_allowed_by_camera_facing(const ProjectionContext   
     return projection_sample_allowed_by_camera_facing(context, world_point, world_normal);
 }
 
+static bool projection_triangle_allowed_by_facing_angle(const ProjectionContext     &context,
+                                                        const Transform3d          &world_matrix,
+                                                        const std::array<Vec3f, 3> &vertices)
+{
+    static constexpr double perpendicular_threshold = 0.01745240643728351;
+
+    const Vec3d world_v0 = world_matrix * vertices[0].cast<double>();
+    const Vec3d world_v1 = world_matrix * vertices[1].cast<double>();
+    const Vec3d world_v2 = world_matrix * vertices[2].cast<double>();
+    Vec3d world_normal = (world_v1 - world_v0).cross(world_v2 - world_v0);
+    if (world_normal.squaredNorm() <= EPSILON)
+        return true;
+    world_normal.normalize();
+
+    const Vec3d world_point = (world_v0 + world_v1 + world_v2) / 3.0;
+    Vec3d projection_direction = context.camera_perspective ?
+        world_point - context.camera_position :
+        context.camera_forward;
+    if (projection_direction.squaredNorm() <= EPSILON)
+        return true;
+    projection_direction.normalize();
+
+    return std::abs(world_normal.dot(projection_direction)) > perpendicular_threshold;
+}
+
 struct ProjectionExactVisibilityVolume
 {
     size_t                    volume_idx = 0;
@@ -6489,9 +6514,11 @@ static bool projection_triangle_should_project(const ProjectionContext          
                                                const ProjectionPaintableImageMask &paintable_mask,
                                                const Transform3d                 &world_matrix,
                                                const std::array<Vec3f, 3>        &vertices,
-                                               uint64_t                           triangle_key)
+                                               uint64_t                           triangle_key,
+                                               bool                               reject_perpendicular_facing = true)
 {
-    return projection_triangle_intersects_overlay(context, world_matrix, vertices) &&
+    return (!reject_perpendicular_facing || projection_triangle_allowed_by_facing_angle(context, world_matrix, vertices)) &&
+           projection_triangle_intersects_overlay(context, world_matrix, vertices) &&
            projection_triangle_intersects_paintable_image(context, paintable_mask, world_matrix, vertices) &&
            projection_triangle_has_visible_sample(visibility, context, world_matrix, vertices, triangle_key);
 }
@@ -6956,7 +6983,8 @@ static bool project_texture_mapping_zone_to_regions(ModelObject             &obj
                                                     paintable_mask,
                                                     world_matrix,
                                                     vertices,
-                                                    projection_visibility_triangle_key(volume_idx, tri_idx)))
+                                                    projection_visibility_triangle_key(volume_idx, tri_idx),
+                                                    !pass_through_model))
                 continue;
 
             projected_triangles[tri_idx] = true;
@@ -16750,7 +16778,7 @@ void GLGizmoImageProjection::on_load(cereal::BinaryInputArchive& ar)
     try {
         ar(m_improve_projection_accuracy);
     } catch (...) {
-        m_improve_projection_accuracy = false;
+        m_improve_projection_accuracy = true;
     }
 
     m_projection_mode = ProjectionMode(std::clamp(mode, 0, 2));
@@ -18270,6 +18298,9 @@ bool GLGizmoImageProjection::project_to_vertex_colors(ModelObject *object,
                 its.vertices[size_t(tri[1])].cast<float>(),
                 its.vertices[size_t(tri[2])].cast<float>()
             };
+            if (!input.pass_through_model &&
+                !projection_triangle_allowed_by_facing_angle(context, world_matrix, vertices))
+                continue;
 
             for (int corner = 0; corner < 3; ++corner) {
                 const size_t vertex_idx = size_t(tri[corner]);
@@ -18459,7 +18490,8 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object,
                                                            paintable_mask,
                                                            world_matrix,
                                                            vertices,
-                                                           projection_visibility_triangle_key(volume_idx, tri_idx)))
+                                                           projection_visibility_triangle_key(volume_idx, tri_idx),
+                                                           !input.pass_through_model))
                         exact_projected_triangles[tri_idx] = 1;
                 }
             });
@@ -18494,6 +18526,9 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object,
                 its.vertices[size_t(tri[1])].cast<float>(),
                 its.vertices[size_t(tri[2])].cast<float>()
             };
+            const bool triangle_allowed_by_facing =
+                input.pass_through_model ||
+                projection_triangle_allowed_by_facing_angle(context, world_matrix, vertices);
             const float texture_width = float(volume->imported_texture_width);
             const float texture_height = float(volume->imported_texture_height);
             if (texture_width <= 0.f || texture_height <= 0.f)
@@ -18588,6 +18623,7 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object,
                             exact_projected_triangles.empty() || exact_projected_triangles[tri_idx] != 0;
                         const bool sample_visible =
                             projection_sample &&
+                            triangle_allowed_by_facing &&
                             exact_triangle_projected &&
                             (input.pass_through_model ||
                              (projection_point_allowed_by_camera_facing(context,
@@ -18736,7 +18772,8 @@ bool GLGizmoImageProjection::project_to_rgb_data(ModelObject *object,
                                                                                paintable_mask,
                                                                                world_matrix,
                                                                                vertices,
-                                                                               projection_visibility_triangle_key(volume_idx, tri_idx));
+                                                                               projection_visibility_triangle_key(volume_idx, tri_idx),
+                                                                               !input.pass_through_model);
             projected_triangles[tri_idx] = projected_triangle;
             if (projected_triangle) {
                 projected_triangle_depths[tri_idx] =
