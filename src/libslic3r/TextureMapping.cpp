@@ -1175,6 +1175,7 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            effective_top_surface_contoning_supersampled_cells_enabled() ==
                rhs.effective_top_surface_contoning_supersampled_cells_enabled() &&
            top_surface_contoning_polygonize_color_regions_enabled == rhs.top_surface_contoning_polygonize_color_regions_enabled &&
+           top_surface_contoning_fast_mode_enabled == rhs.top_surface_contoning_fast_mode_enabled &&
            TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(top_surface_contoning_polygonize_resolution) ==
            TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(rhs.top_surface_contoning_polygonize_resolution) &&
            effective_top_surface_contoning_surface_anchored_stacks_enabled() == rhs.effective_top_surface_contoning_surface_anchored_stacks_enabled() &&
@@ -1583,6 +1584,8 @@ std::string TextureMappingManager::serialize_entries()
             zone.effective_top_surface_contoning_supersampled_cells_enabled();
         texture["top_surface_contoning_polygonize_color_regions_enabled"] =
             zone.top_surface_contoning_polygonize_color_regions_enabled;
+        texture["top_surface_contoning_fast_mode_enabled"] =
+            zone.top_surface_contoning_fast_mode_enabled;
         texture["top_surface_contoning_polygonize_resolution"] =
             TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(zone.top_surface_contoning_polygonize_resolution);
         texture["top_surface_contoning_surface_anchored_stacks_enabled"] =
@@ -1889,6 +1892,9 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.top_surface_contoning_polygonize_color_regions_enabled =
             texture.value("top_surface_contoning_polygonize_color_regions_enabled",
                           TextureMappingZone::DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled);
+        zone.top_surface_contoning_fast_mode_enabled =
+            texture.value("top_surface_contoning_fast_mode_enabled",
+                          TextureMappingZone::DefaultTopSurfaceContoningFastModeEnabled);
         auto polygonize_resolution_it = texture.find("top_surface_contoning_polygonize_resolution");
         zone.top_surface_contoning_polygonize_resolution =
             TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(

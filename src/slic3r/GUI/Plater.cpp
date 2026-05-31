@@ -2152,6 +2152,7 @@ public:
                                         bool top_surface_contoning_blue_noise_error_diffusion_enabled,
                                         bool top_surface_contoning_supersampled_cells_enabled,
                                         bool top_surface_contoning_polygonize_color_regions_enabled,
+                                        bool top_surface_contoning_fast_mode_enabled,
                                         int top_surface_contoning_polygonize_resolution,
                                         bool top_surface_contoning_surface_anchored_stacks_enabled,
                                         bool top_surface_contoning_surface_anchored_stack_optimizations_enabled,
@@ -2987,6 +2988,15 @@ public:
                                        0,
                                        wxEXPAND | wxTOP | wxBOTTOM,
                                        gap / 2);
+        m_top_surface_contoning_fast_mode_checkbox =
+            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Fast mode"));
+        m_top_surface_contoning_fast_mode_checkbox->SetValue(top_surface_contoning_fast_mode_enabled);
+        m_top_surface_contoning_fast_mode_checkbox->SetMinSize(
+            wxSize(-1, std::max(m_top_surface_contoning_fast_mode_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+        contoning_checkboxes_root->Add(m_top_surface_contoning_fast_mode_checkbox,
+                                       0,
+                                       wxEXPAND | wxTOP | wxBOTTOM,
+                                       gap / 2);
         m_top_surface_contoning_polygonize_resolution_panel = new wxPanel(m_top_surface_contoning_checkboxes_panel, wxID_ANY);
         auto *contoning_polygonize_resolution_row = new wxBoxSizer(wxHORIZONTAL);
         m_top_surface_contoning_polygonize_resolution_panel->SetSizer(contoning_polygonize_resolution_row);
@@ -3566,6 +3576,12 @@ public:
         return m_top_surface_contoning_polygonize_color_regions_checkbox != nullptr ?
             m_top_surface_contoning_polygonize_color_regions_checkbox->GetValue() :
             TextureMappingZone::DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled;
+    }
+    bool top_surface_contoning_fast_mode_enabled() const
+    {
+        return m_top_surface_contoning_fast_mode_checkbox != nullptr ?
+            m_top_surface_contoning_fast_mode_checkbox->GetValue() :
+            TextureMappingZone::DefaultTopSurfaceContoningFastModeEnabled;
     }
     int top_surface_contoning_polygonize_resolution() const
     {
@@ -4505,6 +4521,10 @@ private:
             contoning &&
             m_top_surface_contoning_polygonize_color_regions_checkbox != nullptr &&
             m_top_surface_contoning_polygonize_color_regions_checkbox->GetValue();
+        if (m_top_surface_contoning_fast_mode_checkbox != nullptr) {
+            m_top_surface_contoning_fast_mode_checkbox->Show(contoning);
+            m_top_surface_contoning_fast_mode_checkbox->Enable(polygonize_color_regions);
+        }
         if (m_top_surface_contoning_polygonize_resolution_panel != nullptr)
             m_top_surface_contoning_polygonize_resolution_panel->Show(polygonize_color_regions);
         if (m_top_surface_contoning_polygonize_resolution_choice != nullptr)
@@ -4607,6 +4627,7 @@ private:
     wxCheckBox *m_top_surface_contoning_blue_noise_error_diffusion_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_supersampled_cells_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_polygonize_color_regions_checkbox {nullptr};
+    wxCheckBox *m_top_surface_contoning_fast_mode_checkbox {nullptr};
     wxPanel *m_top_surface_contoning_polygonize_resolution_panel {nullptr};
     wxChoice *m_top_surface_contoning_polygonize_resolution_choice {nullptr};
     wxCheckBox *m_top_surface_contoning_surface_anchored_stacks_checkbox {nullptr};
@@ -9643,6 +9664,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.top_surface_contoning_blue_noise_error_diffusion_enabled,
                                                     updated.top_surface_contoning_supersampled_cells_enabled,
                                                     updated.top_surface_contoning_polygonize_color_regions_enabled,
+                                                    updated.top_surface_contoning_fast_mode_enabled,
                                                     updated.top_surface_contoning_polygonize_resolution,
                                                     updated.top_surface_contoning_surface_anchored_stacks_enabled,
                                                     updated.top_surface_contoning_surface_anchored_stack_optimizations_enabled,
@@ -9723,6 +9745,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 dlg.top_surface_contoning_supersampled_cells_enabled();
             updated.top_surface_contoning_polygonize_color_regions_enabled =
                 dlg.top_surface_contoning_polygonize_color_regions_enabled();
+            updated.top_surface_contoning_fast_mode_enabled =
+                dlg.top_surface_contoning_fast_mode_enabled();
             updated.top_surface_contoning_polygonize_resolution =
                 dlg.top_surface_contoning_polygonize_resolution();
             updated.top_surface_contoning_surface_anchored_stacks_enabled =

@@ -509,6 +509,7 @@ struct TopSurfaceImageRegionPlan {
     bool contoning_blue_noise_error_diffusion_enabled = false;
     bool contoning_supersampled_cells_enabled = false;
     bool contoning_polygonize_color_regions_enabled = false;
+    bool contoning_fast_mode_enabled = TextureMappingZone::DefaultTopSurfaceContoningFastModeEnabled;
     int contoning_polygonize_resolution = TextureMappingZone::DefaultTopSurfaceContoningPolygonizeResolution;
     bool contoning_surface_anchored_stacks_enabled = false;
     bool contoning_surface_anchored_stack_optimizations_enabled = TextureMappingZone::DefaultTopSurfaceContoningSurfaceAnchoredStackOptimizationsEnabled;
@@ -2176,6 +2177,7 @@ struct TopSurfaceImageContoningStackPlanKey {
     bool supersampled { false };
     bool blue_noise { false };
     bool polygonize { false };
+    bool fast_mode { false };
     int polygonize_resolution { 1 };
     bool surface_anchored_stack_optimizations { false };
     bool td_adjustment { false };
@@ -2210,6 +2212,7 @@ struct TopSurfaceImageContoningStackPlanKey {
                         supersampled,
                         blue_noise,
                         polygonize,
+                        fast_mode,
                         polygonize_resolution,
                         surface_anchored_stack_optimizations,
                         td_adjustment,
@@ -2241,6 +2244,7 @@ struct TopSurfaceImageContoningStackPlanKey {
                         rhs.supersampled,
                         rhs.blue_noise,
                         rhs.polygonize,
+                        rhs.fast_mode,
                         rhs.polygonize_resolution,
                         rhs.surface_anchored_stack_optimizations,
                         rhs.td_adjustment,
@@ -2765,6 +2769,140 @@ static ExPolygons top_surface_image_contoning_area_from_grid_label(const std::ve
                                                   throw_if_canceled);
 }
 
+static ExPolygons top_surface_image_contoning_hierarchy_expolygons(Polygons &&polygons,
+                                                                   const ThrowIfCanceled *throw_if_canceled)
+{
+    struct Node {
+        size_t index { 0 };
+        int parent { -1 };
+        int depth { 0 };
+        double area { 0. };
+        BoundingBox bbox;
+    };
+
+    if (polygons.empty())
+        return {};
+
+    std::vector<Node> nodes(polygons.size());
+    for (size_t idx = 0; idx < polygons.size(); ++idx) {
+        nodes[idx].index = idx;
+        nodes[idx].area = std::abs(polygons[idx].area());
+        nodes[idx].bbox = get_extents(polygons[idx]);
+    }
+
+    for (size_t idx = 0; idx < polygons.size(); ++idx) {
+        check_canceled(throw_if_canceled);
+        if (polygons[idx].empty() || nodes[idx].area <= 0.)
+            continue;
+        double best_area = std::numeric_limits<double>::max();
+        int best_parent = -1;
+        for (size_t parent_idx = 0; parent_idx < polygons.size(); ++parent_idx) {
+            if (idx == parent_idx ||
+                polygons[parent_idx].empty() ||
+                nodes[parent_idx].area <= nodes[idx].area ||
+                !nodes[parent_idx].bbox.defined ||
+                !nodes[idx].bbox.defined ||
+                !nodes[parent_idx].bbox.contains(nodes[idx].bbox))
+                continue;
+            if (Slic3r::contains(polygons[parent_idx], polygons[idx].points.front(), true) &&
+                nodes[parent_idx].area < best_area) {
+                best_area = nodes[parent_idx].area;
+                best_parent = int(parent_idx);
+            }
+        }
+        nodes[idx].parent = best_parent;
+    }
+
+    for (Node &node : nodes) {
+        int depth = 0;
+        int parent = node.parent;
+        while (parent >= 0 && depth < int(nodes.size())) {
+            ++depth;
+            parent = nodes[size_t(parent)].parent;
+        }
+        node.depth = depth;
+    }
+
+    std::vector<Node> ordered = nodes;
+    std::stable_sort(ordered.begin(), ordered.end(), [](const Node &lhs, const Node &rhs) {
+        if (lhs.depth != rhs.depth)
+            return lhs.depth < rhs.depth;
+        if (lhs.parent != rhs.parent)
+            return lhs.parent < rhs.parent;
+        return lhs.index < rhs.index;
+    });
+
+    ExPolygons out;
+    out.reserve(polygons.size());
+    std::vector<int> expolygon_by_index(polygons.size(), -1);
+    for (const Node &node : ordered) {
+        check_canceled(throw_if_canceled);
+        Polygon polygon = std::move(polygons[node.index]);
+        if (polygon.points.size() < 3 || node.area <= 0.)
+            continue;
+        if ((node.depth & 1) == 0) {
+            polygon.make_counter_clockwise();
+            expolygon_by_index[node.index] = int(out.size());
+            out.emplace_back(std::move(polygon));
+        } else {
+            int parent = node.parent;
+            while (parent >= 0 && (nodes[size_t(parent)].depth & 1) != 0)
+                parent = nodes[size_t(parent)].parent;
+            if (parent >= 0 && expolygon_by_index[size_t(parent)] >= 0) {
+                polygon.make_clockwise();
+                out[size_t(expolygon_by_index[size_t(parent)])].holes.emplace_back(std::move(polygon));
+            } else {
+                polygon.make_counter_clockwise();
+                expolygon_by_index[node.index] = int(out.size());
+                out.emplace_back(std::move(polygon));
+            }
+        }
+    }
+    return out;
+}
+
+static ExPolygons top_surface_image_contoning_raw_partition_hierarchy_area_from_grid_label(const std::vector<int> &grid,
+                                                                                           int                     cols,
+                                                                                           int                     rows,
+                                                                                           int                     label,
+                                                                                           coord_t                 min_x,
+                                                                                           coord_t                 min_y,
+                                                                                           coord_t                 step,
+                                                                                           const BoundingBox      &bbox,
+                                                                                           const ThrowIfCanceled  *throw_if_canceled)
+{
+    if (grid.empty() || cols <= 0 || rows <= 0 || grid.size() != size_t(cols) * size_t(rows))
+        return {};
+
+    const TopSurfaceImageContoningLabelRaster raster{ &grid, cols, rows, label };
+    std::vector<marchsq::Ring> rings =
+        marchsq::execute(raster, TopSurfaceImageContoningLabelRaster::ValueType(128), marchsq::Coord(1, 1));
+    if (rings.empty())
+        return {};
+
+    Polygons polygons;
+    polygons.reserve(rings.size());
+    for (const marchsq::Ring &ring : rings) {
+        check_canceled(throw_if_canceled);
+        if (ring.size() < 3)
+            continue;
+        Polygon polygon;
+        polygon.points.reserve(ring.size());
+        for (const marchsq::Coord &coord : ring) {
+            const coord_t x = std::min<coord_t>(min_x + coord_t(coord.c) * step, bbox.max.x());
+            const coord_t y = std::min<coord_t>(min_y + coord_t(coord.r) * step, bbox.max.y());
+            if (polygon.points.empty() || polygon.points.back() != Point(x, y))
+                polygon.points.emplace_back(x, y);
+        }
+        if (polygon.points.size() >= 3 && polygon.points.front() == polygon.points.back())
+            polygon.points.pop_back();
+        if (polygon.points.size() >= 3 && std::abs(polygon.area()) > 0.)
+            polygons.emplace_back(std::move(polygon));
+    }
+
+    return top_surface_image_contoning_hierarchy_expolygons(std::move(polygons), throw_if_canceled);
+}
+
 static ExPolygons top_surface_image_contoning_polygonized_area_from_grid_label(const std::vector<int> &grid,
                                                                               int                     cols,
                                                                               int                     rows,
@@ -2832,6 +2970,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
     const ExPolygons                                            &area,
     float                                                        min_feature_mm,
     bool                                                         polygonize_color_regions,
+    bool                                                         fast_mode_enabled,
     bool                                                         cleanup_optimizations_enabled,
     bool                                                         lower_surface,
     const ThrowIfCanceled                                       *throw_if_canceled)
@@ -2891,28 +3030,42 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
         return lhs < rhs;
     });
 
+    const bool raw_partition_hierarchy_convert = fast_mode_enabled && polygonize_color_regions;
     const ExPolygons empty_blocked_area;
-    ExPolygons valid_area = top_surface_image_contoning_area_from_grid_label(valid_grid,
-                                                                             cols,
-                                                                             rows,
-                                                                             1,
-                                                                             min_x,
-                                                                             min_y,
-                                                                             step,
-                                                                             bbox,
-                                                                             area,
-                                                                             empty_blocked_area,
-                                                                             min_feature_mm,
-                                                                             cleanup_optimizations_enabled,
-                                                                             throw_if_canceled);
-    if (valid_area.empty())
-        return regions;
+    ExPolygons valid_area;
+    if (!raw_partition_hierarchy_convert) {
+        valid_area = top_surface_image_contoning_area_from_grid_label(valid_grid,
+                                                                      cols,
+                                                                      rows,
+                                                                      1,
+                                                                      min_x,
+                                                                      min_y,
+                                                                      step,
+                                                                      bbox,
+                                                                      area,
+                                                                      empty_blocked_area,
+                                                                      min_feature_mm,
+                                                                      cleanup_optimizations_enabled,
+                                                                      throw_if_canceled);
+        if (valid_area.empty())
+            return regions;
+    }
 
     ExPolygons taken;
     for (int component_id : component_order) {
         check_canceled(throw_if_canceled);
         ExPolygons component_area =
-            polygonize_color_regions ?
+            raw_partition_hierarchy_convert ?
+                top_surface_image_contoning_raw_partition_hierarchy_area_from_grid_label(component_grid,
+                                                                                         cols,
+                                                                                         rows,
+                                                                                         component_id,
+                                                                                         min_x,
+                                                                                         min_y,
+                                                                                         step,
+                                                                                         bbox,
+                                                                                         throw_if_canceled) :
+            (polygonize_color_regions ?
                 top_surface_image_contoning_polygonized_area_from_grid_label(component_grid,
                                                                              cols,
                                                                              rows,
@@ -2938,10 +3091,11 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                                  taken,
                                                                  min_feature_mm,
                                                                  cleanup_optimizations_enabled,
-                                                                 throw_if_canceled);
+                                                                 throw_if_canceled));
         if (component_area.empty())
             continue;
-        append(taken, component_area);
+        if (!raw_partition_hierarchy_convert)
+            append(taken, component_area);
         TopSurfaceImageContoningVectorRegion region;
         region.bottom_to_top.emplace_back(static_cast<unsigned int>(component_id));
         region.cell_count = cell_counts[size_t(component_id)];
@@ -2949,7 +3103,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
         regions.emplace_back(std::move(region));
     }
 
-    if (!regions.empty()) {
+    if (!raw_partition_hierarchy_convert && !regions.empty()) {
         check_canceled(throw_if_canceled);
         ExPolygons covered = top_surface_clip_union_ex(taken);
         ExPolygons leftover = top_surface_clip_diff_ex(valid_area, covered, ApplySafetyOffset::Yes);
@@ -2974,6 +3128,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
     const ExPolygons                                      &area,
     float                                                  min_feature_mm,
     bool                                                   polygonize_color_regions,
+    bool                                                   fast_mode_enabled,
     bool                                                   cleanup_optimizations_enabled,
     const ThrowIfCanceled                                 *throw_if_canceled)
 {
@@ -2999,12 +3154,23 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
         return lhs < rhs;
     });
 
+    const bool raw_partition_hierarchy_convert = fast_mode_enabled && polygonize_color_regions;
     ExPolygons covered_parts;
     const ExPolygons empty_blocked_area;
     for (int label : label_order) {
         check_canceled(throw_if_canceled);
         ExPolygons label_area =
-            polygonize_color_regions ?
+            raw_partition_hierarchy_convert ?
+                top_surface_image_contoning_raw_partition_hierarchy_area_from_grid_label(label_grid,
+                                                                                         cols,
+                                                                                         rows,
+                                                                                         label,
+                                                                                         min_x,
+                                                                                         min_y,
+                                                                                         step,
+                                                                                         bbox,
+                                                                                         throw_if_canceled) :
+            (polygonize_color_regions ?
                 top_surface_image_contoning_polygonized_area_from_grid_label(label_grid,
                                                                              cols,
                                                                              rows,
@@ -3030,10 +3196,11 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                                  empty_blocked_area,
                                                                  min_feature_mm,
                                                                  cleanup_optimizations_enabled,
-                                                                 throw_if_canceled);
+                                                                 throw_if_canceled));
         if (label_area.empty())
             continue;
-        append(covered_parts, label_area);
+        if (!raw_partition_hierarchy_convert)
+            append(covered_parts, label_area);
         TopSurfaceImageContoningVectorRegion region;
         region.bottom_to_top = labels[size_t(label)].bottom_to_top;
         region.cell_count = cell_counts[size_t(label)];
@@ -3041,7 +3208,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
         regions.emplace_back(std::move(region));
     }
 
-    if (!regions.empty()) {
+    if (!raw_partition_hierarchy_convert && !regions.empty()) {
         check_canceled(throw_if_canceled);
         ExPolygons covered = top_surface_clip_union_ex(covered_parts);
         ExPolygons leftover = top_surface_clip_diff_ex(area, covered, ApplySafetyOffset::Yes);
@@ -4274,6 +4441,7 @@ static void top_surface_image_contoning_solve_anchored_region(
                                                                 anchored_region.union_area,
                                                                 plan.contoning_min_feature_mm,
                                                                 plan.contoning_polygonize_color_regions_enabled,
+                                                                plan.contoning_fast_mode_enabled,
                                                                 plan.contoning_surface_anchored_stack_optimizations_enabled,
                                                                 throw_if_canceled);
         top_surface_image_debug_accumulate_timing_step(debug_timing.steps,
@@ -4320,6 +4488,7 @@ static void top_surface_image_contoning_solve_anchored_region(
                                                                     depth_area,
                                                                     plan.contoning_min_feature_mm,
                                                                     plan.contoning_polygonize_color_regions_enabled,
+                                                                    plan.contoning_fast_mode_enabled,
                                                                     plan.contoning_surface_anchored_stack_optimizations_enabled,
                                                                     source_surface == TopSurfaceImageSourceSurface::Bottom &&
                                                                         plan.contoning_td_adjustment_enabled,
@@ -4719,6 +4888,7 @@ static TopSurfaceImageContoningStackPlanKey top_surface_image_contoning_anchored
     key.supersampled = plan.contoning_supersampled_cells_enabled;
     key.blue_noise = false;
     key.polygonize = plan.contoning_polygonize_color_regions_enabled;
+    key.fast_mode = plan.contoning_fast_mode_enabled;
     key.polygonize_resolution = plan.contoning_polygonize_color_regions_enabled ?
         TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(plan.contoning_polygonize_resolution) :
         1;
@@ -5005,6 +5175,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                                   area,
                                                                   plan.contoning_min_feature_mm,
                                                                   plan.contoning_polygonize_color_regions_enabled,
+                                                                  plan.contoning_fast_mode_enabled,
                                                                   plan.contoning_surface_anchored_stack_optimizations_enabled,
                                                                   source_surface == TopSurfaceImageSourceSurface::Bottom &&
                                                                       plan.contoning_td_adjustment_enabled,
@@ -5254,6 +5425,7 @@ static TopSurfaceImageContoningStackPlanKey top_surface_image_contoning_stack_pl
     key.supersampled = plan.contoning_supersampled_cells_enabled;
     key.blue_noise = use_blue_noise_error_diffusion;
     key.polygonize = plan.contoning_polygonize_color_regions_enabled;
+    key.fast_mode = plan.contoning_fast_mode_enabled;
     key.polygonize_resolution = plan.contoning_polygonize_color_regions_enabled ?
         TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(plan.contoning_polygonize_resolution) :
         1;
@@ -5348,6 +5520,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                                   area,
                                                                   plan.contoning_min_feature_mm,
                                                                   plan.contoning_polygonize_color_regions_enabled,
+                                                                  plan.contoning_fast_mode_enabled,
                                                                   plan.contoning_surface_anchored_stack_optimizations_enabled,
                                                                   source_surface == TopSurfaceImageSourceSurface::Bottom &&
                                                                       plan.contoning_td_adjustment_enabled,
@@ -5940,6 +6113,7 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
         plan.contoning_supersampled_cells_enabled =
             zone->effective_top_surface_contoning_supersampled_cells_enabled();
         plan.contoning_polygonize_color_regions_enabled = zone->top_surface_contoning_polygonize_color_regions_enabled;
+        plan.contoning_fast_mode_enabled = zone->top_surface_contoning_fast_mode_enabled;
         plan.contoning_polygonize_resolution =
             TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(zone->top_surface_contoning_polygonize_resolution);
         plan.contoning_surface_anchored_stacks_enabled =

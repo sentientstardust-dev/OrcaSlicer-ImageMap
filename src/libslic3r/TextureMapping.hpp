@@ -201,6 +201,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningSupersampledCellsEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled = true;
+    static constexpr bool  DefaultTopSurfaceContoningFastModeEnabled = true;
     static constexpr int   DefaultTopSurfaceContoningPolygonizeResolution = 4;
     static constexpr bool  DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled = true;
     static constexpr bool  DefaultTopSurfaceContoningSurfaceAnchoredStackOptimizationsEnabled = true;
@@ -415,6 +416,7 @@ struct TextureMappingZone
     bool        top_surface_contoning_blue_noise_error_diffusion_enabled = DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled;
     bool        top_surface_contoning_supersampled_cells_enabled = DefaultTopSurfaceContoningSupersampledCellsEnabled;
     bool        top_surface_contoning_polygonize_color_regions_enabled = DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled;
+    bool        top_surface_contoning_fast_mode_enabled = DefaultTopSurfaceContoningFastModeEnabled;
     int         top_surface_contoning_polygonize_resolution = DefaultTopSurfaceContoningPolygonizeResolution;
     bool        top_surface_contoning_surface_anchored_stacks_enabled = DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled;
     bool        top_surface_contoning_surface_anchored_stack_optimizations_enabled = DefaultTopSurfaceContoningSurfaceAnchoredStackOptimizationsEnabled;
@@ -660,6 +662,7 @@ struct TextureMappingZone
         top_surface_contoning_blue_noise_error_diffusion_enabled = DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled;
         top_surface_contoning_supersampled_cells_enabled = DefaultTopSurfaceContoningSupersampledCellsEnabled;
         top_surface_contoning_polygonize_color_regions_enabled = DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled;
+        top_surface_contoning_fast_mode_enabled = DefaultTopSurfaceContoningFastModeEnabled;
         top_surface_contoning_polygonize_resolution = DefaultTopSurfaceContoningPolygonizeResolution;
         top_surface_contoning_surface_anchored_stacks_enabled = DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled;
         top_surface_contoning_surface_anchored_stack_optimizations_enabled = DefaultTopSurfaceContoningSurfaceAnchoredStackOptimizationsEnabled;
