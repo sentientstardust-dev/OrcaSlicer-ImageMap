@@ -2138,6 +2138,19 @@ static int texture_mapping_contoning_color_prediction_mode_from_choice_selection
     }
 }
 
+static int texture_mapping_contoning_polygonization_mode_choice_selection(int mode)
+{
+    return TextureMappingZone::effective_top_surface_contoning_polygonization_mode(mode) ==
+            int(TextureMappingZone::ContoningPolygonizationMarchingSquares) ? 1 : 0;
+}
+
+static int texture_mapping_contoning_polygonization_mode_from_choice_selection(int selection)
+{
+    return selection == 1 ?
+        int(TextureMappingZone::ContoningPolygonizationMarchingSquares) :
+        TextureMappingZone::DefaultTopSurfaceContoningPolygonizationMode;
+}
+
 class TextureMappingAdvancedOptionsDialog : public wxDialog
 {
 public:
@@ -2197,6 +2210,7 @@ public:
                                         bool top_surface_contoning_supersampled_cells_enabled,
                                         bool top_surface_contoning_polygonize_color_regions_enabled,
                                         bool top_surface_contoning_fast_mode_enabled,
+                                        int top_surface_contoning_polygonization_mode,
                                         int top_surface_contoning_polygonize_resolution,
                                         bool top_surface_contoning_surface_anchored_stacks_enabled,
                                         bool top_surface_contoning_surface_anchored_stack_optimizations_enabled,
@@ -2849,30 +2863,47 @@ public:
             evt.Skip();
             queue_top_surface_contoning_message_resize_wrap();
         });
+        auto *contoning_flat_infill_row = new wxBoxSizer(wxHORIZONTAL);
+        contoning_flat_infill_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Infill type")),
+                                       0,
+                                       wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                                       gap);
+        wxArrayString contoning_flat_infill_choices;
+        auto add_contoning_flat_infill_choice = [&](const wxString &label, int mode) {
+            contoning_flat_infill_choices.Add(label);
+            m_top_surface_contoning_flat_surface_infill_modes.push_back(mode);
+        };
+        add_contoning_flat_infill_choice(_L("Default (Boundary Skin variable width)"),
+                                         int(TextureMappingZone::ContoningFlatSurfaceInfillDefault));
+        add_contoning_flat_infill_choice(_L("Rectilinear"),
+                                         int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinear));
         if (TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions) {
-            auto *contoning_flat_infill_row = new wxBoxSizer(wxHORIZONTAL);
-            contoning_flat_infill_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Flat surface infill mode")),
-                                           0,
-                                           wxALIGN_CENTER_VERTICAL | wxRIGHT,
-                                           gap);
-            wxArrayString contoning_flat_infill_choices;
-            contoning_flat_infill_choices.Add(_L("Default (Boundary Skin variable width)"));
-            contoning_flat_infill_choices.Add(_L("Rectilinear"));
-            contoning_flat_infill_choices.Add(_L("Concentric"));
-            contoning_flat_infill_choices.Add(_L("Boundary Skin (fixed width)"));
-            contoning_flat_infill_choices.Add(_L("Boundary Skin (variable width)"));
-            contoning_flat_infill_choices.Add(_L("Spiral"));
-            contoning_flat_infill_choices.Add(_L("Boundary Skin Hybrid"));
-            contoning_flat_infill_choices.Add(_L("Rectilinear with Boundary"));
-            m_top_surface_contoning_flat_surface_infill_choice =
-                new wxChoice(m_top_surface_contoning_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, contoning_flat_infill_choices);
-            m_top_surface_contoning_flat_surface_infill_choice->SetSelection(
-                std::clamp(top_surface_contoning_flat_surface_infill_mode,
-                           int(TextureMappingZone::ContoningFlatSurfaceInfillDefault),
-                           int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithBoundary)));
-            contoning_flat_infill_row->Add(m_top_surface_contoning_flat_surface_infill_choice, 1, wxEXPAND);
-            top_surface_contoning_root->Add(contoning_flat_infill_row, 0, wxEXPAND | wxTOP, gap);
+            add_contoning_flat_infill_choice(_L("Concentric"),
+                                             int(TextureMappingZone::ContoningFlatSurfaceInfillConcentric));
+            add_contoning_flat_infill_choice(_L("Boundary Skin (fixed width)"),
+                                             int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinFixed));
+            add_contoning_flat_infill_choice(_L("Boundary Skin (variable width)"),
+                                             int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariable));
+            add_contoning_flat_infill_choice(_L("Spiral"),
+                                             int(TextureMappingZone::ContoningFlatSurfaceInfillSpiral));
+            add_contoning_flat_infill_choice(_L("Boundary Skin Hybrid"),
+                                             int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinHybrid));
+            add_contoning_flat_infill_choice(_L("Rectilinear with Boundary"),
+                                             int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithBoundary));
         }
+        m_top_surface_contoning_flat_surface_infill_choice =
+            new wxChoice(m_top_surface_contoning_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, contoning_flat_infill_choices);
+        const int stored_flat_infill_mode =
+            TextureMappingZone::stored_top_surface_contoning_flat_surface_infill_mode(top_surface_contoning_flat_surface_infill_mode);
+        const auto flat_infill_mode_it = std::find(m_top_surface_contoning_flat_surface_infill_modes.begin(),
+                                                   m_top_surface_contoning_flat_surface_infill_modes.end(),
+                                                   stored_flat_infill_mode);
+        m_top_surface_contoning_flat_surface_infill_choice->SetSelection(
+            flat_infill_mode_it != m_top_surface_contoning_flat_surface_infill_modes.end() ?
+                int(flat_infill_mode_it - m_top_surface_contoning_flat_surface_infill_modes.begin()) :
+                0);
+        contoning_flat_infill_row->Add(m_top_surface_contoning_flat_surface_infill_choice, 1, wxEXPAND);
+        top_surface_contoning_root->Add(contoning_flat_infill_row, 0, wxEXPAND | wxTOP, gap);
         top_surface_box->Add(m_top_surface_contoning_panel, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
         m_top_surface_image_fixed_coloring_filaments_checkbox =
             new wxCheckBox(top_surface_page, wxID_ANY, _L("Fixed top-surface coloring filaments"));
@@ -3065,16 +3096,35 @@ public:
                                        0,
                                        wxEXPAND | wxTOP | wxBOTTOM,
                                        gap / 2);
-        m_top_surface_contoning_fast_mode_checkbox =
-            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Fast mode"));
-        m_top_surface_contoning_fast_mode_checkbox->SetValue(top_surface_contoning_fast_mode_enabled);
-        m_top_surface_contoning_fast_mode_checkbox->SetMinSize(
-            wxSize(-1, std::max(m_top_surface_contoning_fast_mode_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
-        contoning_checkboxes_root->Add(m_top_surface_contoning_fast_mode_checkbox,
+        m_top_surface_contoning_polygonization_mode_panel = new wxPanel(m_top_surface_contoning_checkboxes_panel, wxID_ANY);
+        auto *contoning_polygonization_mode_row = new wxBoxSizer(wxHORIZONTAL);
+        m_top_surface_contoning_polygonization_mode_panel->SetSizer(contoning_polygonization_mode_row);
+        contoning_polygonization_mode_row->Add(new wxStaticText(m_top_surface_contoning_polygonization_mode_panel, wxID_ANY, _L("Technique")),
+                                               0,
+                                               wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                                               gap);
+        wxArrayString contoning_polygonization_mode_choices;
+        contoning_polygonization_mode_choices.Add(_L("Vector-border shared Gaussian partition"));
+        contoning_polygonization_mode_choices.Add(_L("Marching squares"));
+        m_top_surface_contoning_polygonization_mode_choice =
+            new wxChoice(m_top_surface_contoning_polygonization_mode_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, contoning_polygonization_mode_choices);
+        m_top_surface_contoning_polygonization_mode_choice->SetSelection(
+            texture_mapping_contoning_polygonization_mode_choice_selection(top_surface_contoning_polygonization_mode));
+        contoning_polygonization_mode_row->Add(m_top_surface_contoning_polygonization_mode_choice, 1, wxEXPAND);
+        contoning_checkboxes_root->Add(m_top_surface_contoning_polygonization_mode_panel,
                                        0,
                                        wxEXPAND | wxTOP | wxBOTTOM,
                                        gap / 2);
         if (TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions) {
+            m_top_surface_contoning_fast_mode_checkbox =
+                new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Fast mode"));
+            m_top_surface_contoning_fast_mode_checkbox->SetValue(top_surface_contoning_fast_mode_enabled);
+            m_top_surface_contoning_fast_mode_checkbox->SetMinSize(
+                wxSize(-1, std::max(m_top_surface_contoning_fast_mode_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+            contoning_checkboxes_root->Add(m_top_surface_contoning_fast_mode_checkbox,
+                                           0,
+                                           wxEXPAND | wxTOP | wxBOTTOM,
+                                           gap / 2);
             m_top_surface_contoning_surface_anchored_stacks_checkbox =
                 new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Surface-anchored stacks"));
             m_top_surface_contoning_surface_anchored_stacks_checkbox->SetValue(top_surface_contoning_surface_anchored_stacks_enabled);
@@ -3581,13 +3631,12 @@ public:
     }
     int top_surface_contoning_flat_surface_infill_mode() const
     {
-        if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
-            return TextureMappingZone::DefaultTopSurfaceContoningFlatSurfaceInfillMode;
-        return m_top_surface_contoning_flat_surface_infill_choice != nullptr ?
-            std::clamp(m_top_surface_contoning_flat_surface_infill_choice->GetSelection(),
-                       int(TextureMappingZone::ContoningFlatSurfaceInfillDefault),
-                       int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithBoundary)) :
-            TextureMappingZone::DefaultTopSurfaceContoningFlatSurfaceInfillMode;
+        if (m_top_surface_contoning_flat_surface_infill_choice != nullptr) {
+            const int selection = m_top_surface_contoning_flat_surface_infill_choice->GetSelection();
+            if (selection >= 0 && size_t(selection) < m_top_surface_contoning_flat_surface_infill_modes.size())
+                return m_top_surface_contoning_flat_surface_infill_modes[size_t(selection)];
+        }
+        return TextureMappingZone::DefaultTopSurfaceContoningFlatSurfaceInfillMode;
     }
     bool top_surface_contoning_layer_phase_enabled() const
     {
@@ -3627,9 +3676,18 @@ public:
     }
     bool top_surface_contoning_fast_mode_enabled() const
     {
+        if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
+            return true;
         return m_top_surface_contoning_fast_mode_checkbox != nullptr ?
             m_top_surface_contoning_fast_mode_checkbox->GetValue() :
             TextureMappingZone::DefaultTopSurfaceContoningFastModeEnabled;
+    }
+    int top_surface_contoning_polygonization_mode() const
+    {
+        return m_top_surface_contoning_polygonization_mode_choice != nullptr ?
+            texture_mapping_contoning_polygonization_mode_from_choice_selection(
+                m_top_surface_contoning_polygonization_mode_choice->GetSelection()) :
+            TextureMappingZone::DefaultTopSurfaceContoningPolygonizationMode;
     }
     int top_surface_contoning_polygonize_resolution() const
     {
@@ -4581,6 +4639,10 @@ private:
             m_top_surface_contoning_polygonize_resolution_panel->Show(polygonize_color_regions);
         if (m_top_surface_contoning_polygonize_resolution_choice != nullptr)
             m_top_surface_contoning_polygonize_resolution_choice->Enable(polygonize_color_regions);
+        if (m_top_surface_contoning_polygonization_mode_panel != nullptr)
+            m_top_surface_contoning_polygonization_mode_panel->Show(polygonize_color_regions);
+        if (m_top_surface_contoning_polygonization_mode_choice != nullptr)
+            m_top_surface_contoning_polygonization_mode_choice->Enable(polygonize_color_regions);
         if (m_top_surface_contoning_surface_anchored_stacks_checkbox != nullptr) {
             m_top_surface_contoning_surface_anchored_stacks_checkbox->Show(contoning);
             m_top_surface_contoning_surface_anchored_stacks_checkbox->Enable(contoning);
@@ -4666,6 +4728,7 @@ private:
     wxStaticText *m_top_surface_contoning_pattern_recommendation_text {nullptr};
     wxStaticText *m_top_surface_contoning_shell_warning_text {nullptr};
     wxChoice *m_top_surface_contoning_flat_surface_infill_choice {nullptr};
+    std::vector<int> m_top_surface_contoning_flat_surface_infill_modes;
     wxPanel *m_top_surface_contoning_checkboxes_panel {nullptr};
     wxCheckBox *m_top_surface_contoning_color_lower_surfaces_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox {nullptr};
@@ -4680,6 +4743,8 @@ private:
     wxCheckBox *m_top_surface_contoning_supersampled_cells_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_polygonize_color_regions_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_fast_mode_checkbox {nullptr};
+    wxPanel *m_top_surface_contoning_polygonization_mode_panel {nullptr};
+    wxChoice *m_top_surface_contoning_polygonization_mode_choice {nullptr};
     wxPanel *m_top_surface_contoning_polygonize_resolution_panel {nullptr};
     wxChoice *m_top_surface_contoning_polygonize_resolution_choice {nullptr};
     wxCheckBox *m_top_surface_contoning_surface_anchored_stacks_checkbox {nullptr};
@@ -9716,6 +9781,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.top_surface_contoning_supersampled_cells_enabled,
                                                     updated.top_surface_contoning_polygonize_color_regions_enabled,
                                                     updated.top_surface_contoning_fast_mode_enabled,
+                                                    updated.top_surface_contoning_polygonization_mode,
                                                     updated.top_surface_contoning_polygonize_resolution,
                                                     updated.top_surface_contoning_surface_anchored_stacks_enabled,
                                                     updated.top_surface_contoning_surface_anchored_stack_optimizations_enabled,
@@ -9800,6 +9866,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 dlg.top_surface_contoning_polygonize_color_regions_enabled();
             updated.top_surface_contoning_fast_mode_enabled =
                 dlg.top_surface_contoning_fast_mode_enabled();
+            updated.top_surface_contoning_polygonization_mode =
+                dlg.top_surface_contoning_polygonization_mode();
             updated.top_surface_contoning_polygonize_resolution =
                 dlg.top_surface_contoning_polygonize_resolution();
             updated.top_surface_contoning_surface_anchored_stacks_enabled =

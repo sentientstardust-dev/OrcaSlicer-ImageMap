@@ -511,6 +511,7 @@ struct TopSurfaceImageRegionPlan {
     bool contoning_supersampled_cells_enabled = false;
     bool contoning_polygonize_color_regions_enabled = false;
     bool contoning_fast_mode_enabled = TextureMappingZone::DefaultTopSurfaceContoningFastModeEnabled;
+    int contoning_polygonization_mode = TextureMappingZone::DefaultTopSurfaceContoningPolygonizationMode;
     int contoning_polygonize_resolution = TextureMappingZone::DefaultTopSurfaceContoningPolygonizeResolution;
     bool contoning_surface_anchored_stacks_enabled = false;
     bool contoning_surface_anchored_stack_optimizations_enabled = TextureMappingZone::DefaultTopSurfaceContoningSurfaceAnchoredStackOptimizationsEnabled;
@@ -2277,6 +2278,7 @@ struct TopSurfaceImageContoningStackPlanKey {
     bool blue_noise { false };
     bool polygonize { false };
     bool fast_mode { false };
+    int polygonization_mode { TextureMappingZone::DefaultTopSurfaceContoningPolygonizationMode };
     int polygonize_resolution { 1 };
     bool surface_anchored_stack_optimizations { false };
     bool td_adjustment { false };
@@ -2313,6 +2315,7 @@ struct TopSurfaceImageContoningStackPlanKey {
                         blue_noise,
                         polygonize,
                         fast_mode,
+                        polygonization_mode,
                         polygonize_resolution,
                         surface_anchored_stack_optimizations,
                         td_adjustment,
@@ -2346,6 +2349,7 @@ struct TopSurfaceImageContoningStackPlanKey {
                         rhs.blue_noise,
                         rhs.polygonize,
                         rhs.fast_mode,
+                        rhs.polygonization_mode,
                         rhs.polygonize_resolution,
                         rhs.surface_anchored_stack_optimizations,
                         rhs.td_adjustment,
@@ -3058,6 +3062,217 @@ static ExPolygons top_surface_image_contoning_polygonized_area_from_grid_label(c
                                                   throw_if_canceled);
 }
 
+static std::vector<int> top_surface_image_contoning_shared_gaussian_partition_grid(const std::vector<int> &grid,
+                                                                                  int                     cols,
+                                                                                  int                     rows,
+                                                                                  const std::vector<int> &ids,
+                                                                                  const ThrowIfCanceled  *throw_if_canceled)
+{
+    if (grid.empty() || ids.empty() || cols <= 0 || rows <= 0 || grid.size() != size_t(cols) * size_t(rows))
+        return grid;
+
+    int max_id = -1;
+    for (int id : ids)
+        if (id >= 0)
+            max_id = std::max(max_id, id);
+    if (max_id < 0)
+        return grid;
+
+    std::vector<int> id_to_slot(size_t(max_id) + 1, -1);
+    std::vector<int> active_ids;
+    active_ids.reserve(ids.size());
+    for (int id : ids) {
+        if (id < 0 || id > max_id || id_to_slot[size_t(id)] >= 0)
+            continue;
+        id_to_slot[size_t(id)] = int(active_ids.size());
+        active_ids.emplace_back(id);
+    }
+    if (active_ids.empty())
+        return grid;
+
+    static constexpr std::array<int, 5> kernel = { 1, 4, 6, 4, 1 };
+    std::vector<int> out(grid.size(), -1);
+    std::vector<int> scores(active_ids.size(), 0);
+    for (int row = 0; row < rows; ++row) {
+        check_canceled(throw_if_canceled);
+        for (int col = 0; col < cols; ++col) {
+            const size_t idx = size_t(row) * size_t(cols) + size_t(col);
+            const int center_id = grid[idx];
+            if (center_id < 0 || center_id > max_id || id_to_slot[size_t(center_id)] < 0)
+                continue;
+
+            std::fill(scores.begin(), scores.end(), 0);
+            for (int dy = -2; dy <= 2; ++dy) {
+                const int yy = row + dy;
+                if (yy < 0 || yy >= rows)
+                    continue;
+                for (int dx = -2; dx <= 2; ++dx) {
+                    const int xx = col + dx;
+                    if (xx < 0 || xx >= cols)
+                        continue;
+                    const int neighbor_id = grid[size_t(yy) * size_t(cols) + size_t(xx)];
+                    if (neighbor_id < 0 || neighbor_id > max_id)
+                        continue;
+                    const int slot = id_to_slot[size_t(neighbor_id)];
+                    if (slot < 0)
+                        continue;
+                    scores[size_t(slot)] += kernel[size_t(dy + 2)] * kernel[size_t(dx + 2)];
+                }
+            }
+
+            int best_slot = id_to_slot[size_t(center_id)];
+            int best_score = scores[size_t(best_slot)];
+            for (size_t slot = 0; slot < scores.size(); ++slot) {
+                if (scores[slot] > best_score) {
+                    best_slot = int(slot);
+                    best_score = scores[slot];
+                }
+            }
+            out[idx] = active_ids[size_t(best_slot)];
+        }
+    }
+
+    return out;
+}
+
+static int top_surface_image_contoning_best_completion_index(const std::vector<ExPolygons> &areas,
+                                                             const ExPolygons              &leftover,
+                                                             const std::vector<int>        &fallback_indices,
+                                                             coord_t                        touch_radius)
+{
+    int best_index = -1;
+    double best_contact = 0.;
+    double best_area = 0.;
+    ExPolygons expanded_leftover = top_surface_clip_offset_ex(leftover, float(touch_radius));
+    for (int index : fallback_indices) {
+        if (index < 0 || size_t(index) >= areas.size() || areas[size_t(index)].empty())
+            continue;
+        const ExPolygons contact =
+            top_surface_clip_intersection_ex(expanded_leftover, areas[size_t(index)], ApplySafetyOffset::Yes);
+        const double contact_area = top_surface_image_abs_area(contact);
+        const double area = top_surface_image_abs_area(areas[size_t(index)]);
+        if (contact_area > best_contact + EPSILON ||
+            (std::abs(contact_area - best_contact) <= EPSILON && area > best_area)) {
+            best_index = index;
+            best_contact = contact_area;
+            best_area = area;
+        }
+    }
+    if (best_index >= 0)
+        return best_index;
+    for (int index : fallback_indices) {
+        if (index < 0 || size_t(index) >= areas.size() || areas[size_t(index)].empty())
+            continue;
+        const double area = top_surface_image_abs_area(areas[size_t(index)]);
+        if (area > best_area) {
+            best_index = index;
+            best_area = area;
+        }
+    }
+    if (best_index >= 0)
+        return best_index;
+    for (int index : fallback_indices)
+        if (index >= 0 && size_t(index) < areas.size())
+            return index;
+    return -1;
+}
+
+static void top_surface_image_contoning_complete_indexed_area(std::vector<ExPolygons> &areas,
+                                                              const ExPolygons        &target_area,
+                                                              const std::vector<int>  &fallback_indices,
+                                                              float                    line_width_mm,
+                                                              const ThrowIfCanceled   *throw_if_canceled)
+{
+    if (areas.empty() || target_area.empty() || fallback_indices.empty())
+        return;
+
+    ExPolygons covered;
+    for (const ExPolygons &area : areas) {
+        check_canceled(throw_if_canceled);
+        if (!area.empty())
+            append(covered, area);
+    }
+
+    ExPolygons leftover = covered.empty() ?
+        top_surface_clip_union_ex(target_area) :
+        top_surface_clip_diff_ex(target_area, top_surface_clip_union_ex(covered), ApplySafetyOffset::Yes);
+    if (leftover.empty())
+        return;
+
+    const coord_t touch_radius =
+        std::max<coord_t>(1, scale_(std::clamp(double(line_width_mm) * 0.25, 0.02, 0.20)));
+    for (ExPolygon &leftover_part : leftover) {
+        check_canceled(throw_if_canceled);
+        ExPolygons piece;
+        piece.emplace_back(std::move(leftover_part));
+        const int index = top_surface_image_contoning_best_completion_index(areas, piece, fallback_indices, touch_radius);
+        if (index < 0)
+            continue;
+        append(areas[size_t(index)], std::move(piece));
+        areas[size_t(index)] = top_surface_clip_union_ex(areas[size_t(index)]);
+    }
+}
+
+static std::vector<ExPolygons> top_surface_image_contoning_vector_border_shared_gaussian_partition_areas(
+    const std::vector<int> &grid,
+    int                     cols,
+    int                     rows,
+    const std::vector<int> &ids,
+    size_t                  area_count,
+    coord_t                 min_x,
+    coord_t                 min_y,
+    coord_t                 step,
+    const BoundingBox      &bbox,
+    const ExPolygons       &target_area,
+    float                   min_feature_mm,
+    bool                    cleanup_optimizations_enabled,
+    const ThrowIfCanceled  *throw_if_canceled)
+{
+    std::vector<ExPolygons> areas(area_count);
+    if (grid.empty() || ids.empty() || area_count == 0 || target_area.empty() ||
+        cols <= 0 || rows <= 0 || grid.size() != size_t(cols) * size_t(rows))
+        return areas;
+
+    const std::vector<int> partition_grid =
+        top_surface_image_contoning_shared_gaussian_partition_grid(grid, cols, rows, ids, throw_if_canceled);
+
+    ExPolygons taken;
+    for (int id : ids) {
+        check_canceled(throw_if_canceled);
+        if (id < 0 || size_t(id) >= areas.size())
+            continue;
+        ExPolygons raw_area =
+            top_surface_image_contoning_raw_partition_hierarchy_area_from_grid_label(partition_grid,
+                                                                                     cols,
+                                                                                     rows,
+                                                                                     id,
+                                                                                     min_x,
+                                                                                     min_y,
+                                                                                     step,
+                                                                                     bbox,
+                                                                                     throw_if_canceled);
+        if (raw_area.empty())
+            continue;
+        ExPolygons clean_area = top_surface_image_contoning_clean_area(std::move(raw_area),
+                                                                       target_area,
+                                                                       taken,
+                                                                       min_feature_mm,
+                                                                       cleanup_optimizations_enabled,
+                                                                       throw_if_canceled);
+        if (clean_area.empty())
+            continue;
+        areas[size_t(id)] = std::move(clean_area);
+        append(taken, areas[size_t(id)]);
+    }
+
+    top_surface_image_contoning_complete_indexed_area(areas,
+                                                      target_area,
+                                                      ids,
+                                                      min_feature_mm > 0.f ? min_feature_mm : 0.4f,
+                                                      throw_if_canceled);
+    return areas;
+}
+
 static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_contoning_component_regions_from_grid(
     const std::vector<int>                                      &label_grid,
     int                                                          cols,
@@ -3073,6 +3288,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
     float                                                        min_feature_mm,
     bool                                                         polygonize_color_regions,
     bool                                                         fast_mode_enabled,
+    int                                                          polygonization_mode,
     bool                                                         cleanup_optimizations_enabled,
     bool                                                         lower_surface,
     const ThrowIfCanceled                                       *throw_if_canceled)
@@ -3132,7 +3348,16 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
         return lhs < rhs;
     });
 
-    const bool raw_partition_hierarchy_convert = fast_mode_enabled && polygonize_color_regions;
+    const int effective_polygonization_mode =
+        TextureMappingZone::effective_top_surface_contoning_polygonization_mode(polygonization_mode);
+    const bool vector_border_shared_gaussian_partition =
+        fast_mode_enabled &&
+        polygonize_color_regions &&
+        effective_polygonization_mode == int(TextureMappingZone::ContoningPolygonizationVectorBorderSharedGaussianPartition);
+    const bool raw_partition_hierarchy_convert =
+        fast_mode_enabled &&
+        polygonize_color_regions &&
+        effective_polygonization_mode == int(TextureMappingZone::ContoningPolygonizationMarchingSquares);
     const ExPolygons empty_blocked_area;
     ExPolygons valid_area;
     if (!raw_partition_hierarchy_convert) {
@@ -3151,6 +3376,35 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                                       throw_if_canceled);
         if (valid_area.empty())
             return regions;
+    }
+
+    if (vector_border_shared_gaussian_partition) {
+        std::vector<ExPolygons> component_areas =
+            top_surface_image_contoning_vector_border_shared_gaussian_partition_areas(component_grid,
+                                                                                      cols,
+                                                                                      rows,
+                                                                                      component_order,
+                                                                                      size_t(max_component_id) + 1,
+                                                                                      min_x,
+                                                                                      min_y,
+                                                                                      step,
+                                                                                      bbox,
+                                                                                      valid_area,
+                                                                                      min_feature_mm,
+                                                                                      cleanup_optimizations_enabled,
+                                                                                      throw_if_canceled);
+        for (int component_id : component_order) {
+            check_canceled(throw_if_canceled);
+            if (component_id <= 0 || size_t(component_id) >= component_areas.size() ||
+                component_areas[size_t(component_id)].empty())
+                continue;
+            TopSurfaceImageContoningVectorRegion region;
+            region.bottom_to_top.emplace_back(static_cast<unsigned int>(component_id));
+            region.cell_count = cell_counts[size_t(component_id)];
+            region.area = std::move(component_areas[size_t(component_id)]);
+            regions.emplace_back(std::move(region));
+        }
+        return regions;
     }
 
     ExPolygons taken;
@@ -3231,6 +3485,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
     float                                                  min_feature_mm,
     bool                                                   polygonize_color_regions,
     bool                                                   fast_mode_enabled,
+    int                                                    polygonization_mode,
     bool                                                   cleanup_optimizations_enabled,
     const ThrowIfCanceled                                 *throw_if_canceled)
 {
@@ -3256,7 +3511,44 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
         return lhs < rhs;
     });
 
-    const bool raw_partition_hierarchy_convert = fast_mode_enabled && polygonize_color_regions;
+    const int effective_polygonization_mode =
+        TextureMappingZone::effective_top_surface_contoning_polygonization_mode(polygonization_mode);
+    const bool vector_border_shared_gaussian_partition =
+        fast_mode_enabled &&
+        polygonize_color_regions &&
+        effective_polygonization_mode == int(TextureMappingZone::ContoningPolygonizationVectorBorderSharedGaussianPartition);
+    const bool raw_partition_hierarchy_convert =
+        fast_mode_enabled &&
+        polygonize_color_regions &&
+        effective_polygonization_mode == int(TextureMappingZone::ContoningPolygonizationMarchingSquares);
+    if (vector_border_shared_gaussian_partition) {
+        std::vector<ExPolygons> label_areas =
+            top_surface_image_contoning_vector_border_shared_gaussian_partition_areas(label_grid,
+                                                                                      cols,
+                                                                                      rows,
+                                                                                      label_order,
+                                                                                      labels.size(),
+                                                                                      min_x,
+                                                                                      min_y,
+                                                                                      step,
+                                                                                      bbox,
+                                                                                      area,
+                                                                                      min_feature_mm,
+                                                                                      cleanup_optimizations_enabled,
+                                                                                      throw_if_canceled);
+        for (int label : label_order) {
+            check_canceled(throw_if_canceled);
+            if (label < 0 || size_t(label) >= label_areas.size() || label_areas[size_t(label)].empty())
+                continue;
+            TopSurfaceImageContoningVectorRegion region;
+            region.bottom_to_top = labels[size_t(label)].bottom_to_top;
+            region.cell_count = cell_counts[size_t(label)];
+            region.area = std::move(label_areas[size_t(label)]);
+            regions.emplace_back(std::move(region));
+        }
+        return regions;
+    }
+
     ExPolygons covered_parts;
     const ExPolygons empty_blocked_area;
     for (int label : label_order) {
@@ -4643,6 +4935,7 @@ static void top_surface_image_contoning_solve_anchored_region(
                                                                 plan.contoning_min_feature_mm,
                                                                 plan.contoning_polygonize_color_regions_enabled,
                                                                 plan.contoning_fast_mode_enabled,
+                                                                plan.contoning_polygonization_mode,
                                                                 plan.contoning_surface_anchored_stack_optimizations_enabled,
                                                                 throw_if_canceled);
         top_surface_image_debug_accumulate_timing_step(debug_timing.steps,
@@ -4690,6 +4983,7 @@ static void top_surface_image_contoning_solve_anchored_region(
                                                                     plan.contoning_min_feature_mm,
                                                                     plan.contoning_polygonize_color_regions_enabled,
                                                                     plan.contoning_fast_mode_enabled,
+                                                                    plan.contoning_polygonization_mode,
                                                                     plan.contoning_surface_anchored_stack_optimizations_enabled,
                                                                     source_surface == TopSurfaceImageSourceSurface::Bottom &&
                                                                         plan.contoning_td_adjustment_enabled,
@@ -5090,6 +5384,9 @@ static TopSurfaceImageContoningStackPlanKey top_surface_image_contoning_anchored
     key.blue_noise = false;
     key.polygonize = plan.contoning_polygonize_color_regions_enabled;
     key.fast_mode = plan.contoning_fast_mode_enabled;
+    key.polygonization_mode = plan.contoning_polygonize_color_regions_enabled && plan.contoning_fast_mode_enabled ?
+        TextureMappingZone::effective_top_surface_contoning_polygonization_mode(plan.contoning_polygonization_mode) :
+        TextureMappingZone::DefaultTopSurfaceContoningPolygonizationMode;
     key.polygonize_resolution = plan.contoning_polygonize_color_regions_enabled ?
         TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(plan.contoning_polygonize_resolution) :
         1;
@@ -5380,6 +5677,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                                   plan.contoning_min_feature_mm,
                                                                   plan.contoning_polygonize_color_regions_enabled,
                                                                   plan.contoning_fast_mode_enabled,
+                                                                  plan.contoning_polygonization_mode,
                                                                   plan.contoning_surface_anchored_stack_optimizations_enabled,
                                                                   source_surface == TopSurfaceImageSourceSurface::Bottom &&
                                                                       plan.contoning_td_adjustment_enabled,
@@ -5632,6 +5930,9 @@ static TopSurfaceImageContoningStackPlanKey top_surface_image_contoning_stack_pl
     key.blue_noise = use_blue_noise_error_diffusion;
     key.polygonize = plan.contoning_polygonize_color_regions_enabled;
     key.fast_mode = plan.contoning_fast_mode_enabled;
+    key.polygonization_mode = plan.contoning_polygonize_color_regions_enabled && plan.contoning_fast_mode_enabled ?
+        TextureMappingZone::effective_top_surface_contoning_polygonization_mode(plan.contoning_polygonization_mode) :
+        TextureMappingZone::DefaultTopSurfaceContoningPolygonizationMode;
     key.polygonize_resolution = plan.contoning_polygonize_color_regions_enabled ?
         TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(plan.contoning_polygonize_resolution) :
         1;
@@ -5728,6 +6029,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                                   plan.contoning_min_feature_mm,
                                                                   plan.contoning_polygonize_color_regions_enabled,
                                                                   plan.contoning_fast_mode_enabled,
+                                                                  plan.contoning_polygonization_mode,
                                                                   plan.contoning_surface_anchored_stack_optimizations_enabled,
                                                                   source_surface == TopSurfaceImageSourceSurface::Bottom &&
                                                                       plan.contoning_td_adjustment_enabled,
@@ -6320,7 +6622,8 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
         plan.contoning_supersampled_cells_enabled =
             zone->effective_top_surface_contoning_supersampled_cells_enabled();
         plan.contoning_polygonize_color_regions_enabled = zone->top_surface_contoning_polygonize_color_regions_enabled;
-        plan.contoning_fast_mode_enabled = zone->top_surface_contoning_fast_mode_enabled;
+        plan.contoning_fast_mode_enabled = zone->effective_top_surface_contoning_fast_mode_enabled();
+        plan.contoning_polygonization_mode = zone->effective_top_surface_contoning_polygonization_mode();
         plan.contoning_polygonize_resolution =
             TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(zone->top_surface_contoning_polygonize_resolution);
         plan.contoning_surface_anchored_stacks_enabled =
