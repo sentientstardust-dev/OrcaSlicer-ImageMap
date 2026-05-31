@@ -17,6 +17,8 @@
 
 namespace Slic3r {
 
+const bool TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions = false;
+
 namespace {
 
 constexpr unsigned int TextureMappingZoneIdBase = 99;
@@ -727,6 +729,28 @@ static int top_surface_contoning_flat_surface_infill_mode_from_name(const std::s
     return int(TextureMappingZone::ContoningFlatSurfaceInfillDefault);
 }
 
+static std::string top_surface_contoning_color_prediction_mode_name(int mode)
+{
+    if (mode == int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha))
+        return "td_effective_alpha";
+    if (mode == int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb))
+        return "rgb_beer_lambert";
+    return "default";
+}
+
+static int top_surface_contoning_color_prediction_mode_from_name(std::string name)
+{
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+        const char lowered = char(std::tolower(c));
+        return lowered == '-' || lowered == ' ' ? '_' : lowered;
+    });
+    if (name == "td_effective_alpha" || name == "effective_alpha")
+        return int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha);
+    if (name == "rgb_beer_lambert" || name == "beer_lambert_rgb" || name == "beer_lambert")
+        return int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb);
+    return TextureMappingZone::DefaultTopSurfaceContoningColorPredictionMode;
+}
+
 static std::string top_visible_recolor_aggressiveness_name(int mode)
 {
     switch (clamp_int(mode,
@@ -796,30 +820,55 @@ static int generic_solver_lookup_mode_from_name(const std::string &name)
 
 static std::string generic_solver_mode_name(int mode)
 {
-    return clamp_int(mode,
-                     int(TextureMappingZone::GenericSolverLegacy),
-                     int(TextureMappingZone::GenericSolverV2)) ==
-               int(TextureMappingZone::GenericSolverLegacy) ?
-        std::string("legacy") :
-        std::string("v2");
+    if (mode == int(TextureMappingZone::GenericSolverDefault))
+        return "default";
+    switch (clamp_int(mode,
+                      int(TextureMappingZone::GenericSolverRGB),
+                      int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4))) {
+    case int(TextureMappingZone::GenericSolverRGB):
+        return "rgb";
+    case int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4):
+        return "oklab_soft_cap4_dark4";
+    default:
+        return "oklab";
+    }
 }
 
 static int generic_solver_mode_from_name(std::string name)
 {
-    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return char(std::tolower(c)); });
-    return name == "legacy" || name == "v1" ?
-        int(TextureMappingZone::GenericSolverLegacy) :
-        int(TextureMappingZone::GenericSolverV2);
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+        const char lowered = char(std::tolower(c));
+        return lowered == '-' || lowered == ' ' ? '_' : lowered;
+    });
+    if (name == "rgb")
+        return int(TextureMappingZone::GenericSolverRGB);
+    if (name == "oklab_soft_cap4_dark4" ||
+        name == "oklab_soft_cap" ||
+        name == "oklab_soft")
+        return int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4);
+    if (name == "oklab")
+        return int(TextureMappingZone::GenericSolverOklab);
+    return TextureMappingZone::DefaultGenericSolverMode;
 }
 
-static std::string generic_solver_mix_model_name(int)
+static std::string generic_solver_mix_model_name(int mode)
 {
-    return "pigment_painter";
+    return clamp_int(mode,
+                     int(TextureMappingZone::GenericSolverPigmentPainter),
+                     int(TextureMappingZone::GenericSolverPrusaFdmMixer)) ==
+               int(TextureMappingZone::GenericSolverPrusaFdmMixer) ?
+        std::string("prusa_fdm_mixer") :
+        std::string("pigment_painter");
 }
 
-static int generic_solver_mix_model_from_name(std::string)
+static int generic_solver_mix_model_from_name(std::string name)
 {
-    return TextureMappingZone::DefaultGenericSolverMixModel;
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+        return c == '-' ? '_' : char(std::tolower(c));
+    });
+    return name == "prusa_fdm_mixer" || name == "prusa" ?
+        int(TextureMappingZone::GenericSolverPrusaFdmMixer) :
+        int(TextureMappingZone::GenericSolverPigmentPainter);
 }
 
 static std::string dithering_method_name(int mode)
@@ -1129,7 +1178,8 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            std::abs(top_surface_image_max_line_width_mm - rhs.top_surface_image_max_line_width_mm) <= eps &&
            top_surface_image_colored_top_layers == rhs.top_surface_image_colored_top_layers &&
            top_surface_image_fixed_coloring_filaments_active() == rhs.top_surface_image_fixed_coloring_filaments_active() &&
-           std::abs(top_surface_contoning_angle_threshold_deg - rhs.top_surface_contoning_angle_threshold_deg) <= eps &&
+           std::abs(effective_top_surface_contoning_angle_threshold_deg() -
+                    rhs.effective_top_surface_contoning_angle_threshold_deg()) <= eps &&
            top_surface_contoning_stack_layers == rhs.top_surface_contoning_stack_layers &&
            top_surface_contoning_pattern_filaments == rhs.top_surface_contoning_pattern_filaments &&
            std::abs(top_surface_contoning_min_feature_mm - rhs.top_surface_contoning_min_feature_mm) <= eps &&
@@ -1140,14 +1190,26 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            effective_top_surface_contoning_recolor_surrounding_perimeters() == rhs.effective_top_surface_contoning_recolor_surrounding_perimeters() &&
            stored_top_surface_contoning_perimeter_mode() == rhs.stored_top_surface_contoning_perimeter_mode() &&
            stored_top_surface_contoning_flat_surface_infill_mode() == rhs.stored_top_surface_contoning_flat_surface_infill_mode() &&
-           top_surface_contoning_layer_phase_enabled == rhs.top_surface_contoning_layer_phase_enabled &&
+           effective_top_surface_contoning_layer_phase_enabled() == rhs.effective_top_surface_contoning_layer_phase_enabled() &&
            top_surface_contoning_varied_infill_angles_enabled == rhs.top_surface_contoning_varied_infill_angles_enabled &&
-           top_surface_contoning_blue_noise_error_diffusion_enabled == rhs.top_surface_contoning_blue_noise_error_diffusion_enabled &&
-           top_surface_contoning_supersampled_cells_enabled == rhs.top_surface_contoning_supersampled_cells_enabled &&
+           effective_top_surface_contoning_blue_noise_error_diffusion_enabled() ==
+               rhs.effective_top_surface_contoning_blue_noise_error_diffusion_enabled() &&
+           effective_top_surface_contoning_supersampled_cells_enabled() ==
+               rhs.effective_top_surface_contoning_supersampled_cells_enabled() &&
            top_surface_contoning_polygonize_color_regions_enabled == rhs.top_surface_contoning_polygonize_color_regions_enabled &&
+           top_surface_contoning_fast_mode_enabled == rhs.top_surface_contoning_fast_mode_enabled &&
            TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(top_surface_contoning_polygonize_resolution) ==
-               TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(rhs.top_surface_contoning_polygonize_resolution) &&
+           TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(rhs.top_surface_contoning_polygonize_resolution) &&
            effective_top_surface_contoning_surface_anchored_stacks_enabled() == rhs.effective_top_surface_contoning_surface_anchored_stacks_enabled() &&
+           effective_top_surface_contoning_surface_anchored_stack_optimizations_enabled() ==
+               rhs.effective_top_surface_contoning_surface_anchored_stack_optimizations_enabled() &&
+           top_surface_contoning_td_adjustment_enabled == rhs.top_surface_contoning_td_adjustment_enabled &&
+           effective_top_surface_contoning_surface_scatter_enabled() == rhs.effective_top_surface_contoning_surface_scatter_enabled() &&
+           top_surface_contoning_color_prediction_mode == rhs.top_surface_contoning_color_prediction_mode &&
+           top_surface_contoning_beer_lambert_rgb_correction_enabled == rhs.top_surface_contoning_beer_lambert_rgb_correction_enabled &&
+           top_surface_contoning_td_effective_alpha_correction_enabled == rhs.top_surface_contoning_td_effective_alpha_correction_enabled &&
+           top_surface_contoning_variable_layer_height_compensation_enabled == rhs.top_surface_contoning_variable_layer_height_compensation_enabled &&
+           effective_top_surface_contoning_beam_search_stack_expansion_enabled() == rhs.effective_top_surface_contoning_beam_search_stack_expansion_enabled() &&
            compact_offset_mode == rhs.compact_offset_mode &&
            use_legacy_fixed_color_mode == rhs.use_legacy_fixed_color_mode &&
            high_speed_image_texture_sampling == rhs.high_speed_image_texture_sampling &&
@@ -1503,18 +1565,20 @@ std::string TextureMappingManager::serialize_entries()
                       TextureMappingZone::MaxTopSurfaceImageColoredTopLayers);
         texture["top_surface_image_fixed_coloring_filaments"] = zone.top_surface_image_fixed_coloring_filaments_active();
         texture["top_surface_contoning_angle_threshold_deg"] =
-            std::clamp(finite_or(zone.top_surface_contoning_angle_threshold_deg,
+            std::clamp(finite_or(zone.effective_top_surface_contoning_angle_threshold_deg(),
                                  TextureMappingZone::DefaultTopSurfaceContoningAngleThresholdDeg),
                        TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg,
                        TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg);
-        texture["top_surface_contoning_stack_layers"] =
-            clamp_int(zone.top_surface_contoning_stack_layers,
-                      TextureMappingZone::MinTopSurfaceContoningStackLayers,
-                      TextureMappingZone::MaxTopSurfaceContoningStackLayers);
-        texture["top_surface_contoning_pattern_filaments"] =
+        const int top_surface_contoning_pattern_filaments =
             clamp_int(zone.top_surface_contoning_pattern_filaments,
                       TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
                       TextureMappingZone::MaxTopSurfaceContoningPatternFilaments);
+        texture["top_surface_contoning_stack_layers"] =
+            std::max(top_surface_contoning_pattern_filaments,
+                     clamp_int(zone.top_surface_contoning_stack_layers,
+                               TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                               TextureMappingZone::MaxTopSurfaceContoningStackLayers));
+        texture["top_surface_contoning_pattern_filaments"] = top_surface_contoning_pattern_filaments;
         texture["top_surface_contoning_min_feature_mm"] =
             std::clamp(finite_or(zone.top_surface_contoning_min_feature_mm,
                                  TextureMappingZone::DefaultTopSurfaceContoningMinFeatureMm),
@@ -1535,19 +1599,37 @@ std::string TextureMappingManager::serialize_entries()
                       int(TextureMappingZone::ContoningPerimeterSegmentInfill));
         texture["top_surface_contoning_flat_surface_infill_mode"] =
             top_surface_contoning_flat_surface_infill_mode_name(zone.stored_top_surface_contoning_flat_surface_infill_mode());
-        texture["top_surface_contoning_layer_phase_enabled"] = zone.top_surface_contoning_layer_phase_enabled;
+        texture["top_surface_contoning_layer_phase_enabled"] = zone.effective_top_surface_contoning_layer_phase_enabled();
         texture["top_surface_contoning_varied_infill_angles_enabled"] =
             zone.top_surface_contoning_varied_infill_angles_enabled;
         texture["top_surface_contoning_blue_noise_error_diffusion_enabled"] =
-            zone.top_surface_contoning_blue_noise_error_diffusion_enabled;
+            zone.effective_top_surface_contoning_blue_noise_error_diffusion_enabled();
         texture["top_surface_contoning_supersampled_cells_enabled"] =
-            zone.top_surface_contoning_supersampled_cells_enabled;
+            zone.effective_top_surface_contoning_supersampled_cells_enabled();
         texture["top_surface_contoning_polygonize_color_regions_enabled"] =
             zone.top_surface_contoning_polygonize_color_regions_enabled;
+        texture["top_surface_contoning_fast_mode_enabled"] =
+            zone.top_surface_contoning_fast_mode_enabled;
         texture["top_surface_contoning_polygonize_resolution"] =
             TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(zone.top_surface_contoning_polygonize_resolution);
         texture["top_surface_contoning_surface_anchored_stacks_enabled"] =
             zone.effective_top_surface_contoning_surface_anchored_stacks_enabled();
+        texture["top_surface_contoning_surface_anchored_stack_optimizations_enabled"] =
+            zone.effective_top_surface_contoning_surface_anchored_stack_optimizations_enabled();
+        texture["top_surface_contoning_td_adjustment_enabled"] =
+            zone.top_surface_contoning_td_adjustment_enabled;
+        texture["top_surface_contoning_surface_scatter_enabled"] =
+            zone.effective_top_surface_contoning_surface_scatter_enabled();
+        texture["top_surface_contoning_color_prediction_mode"] =
+            top_surface_contoning_color_prediction_mode_name(zone.top_surface_contoning_color_prediction_mode);
+        texture["top_surface_contoning_beer_lambert_rgb_correction_enabled"] =
+            zone.top_surface_contoning_beer_lambert_rgb_correction_enabled;
+        texture["top_surface_contoning_td_effective_alpha_correction_enabled"] =
+            zone.top_surface_contoning_td_effective_alpha_correction_enabled;
+        texture["top_surface_contoning_variable_layer_height_compensation_enabled"] =
+            zone.top_surface_contoning_variable_layer_height_compensation_enabled;
+        texture["top_surface_contoning_beam_search_stack_expansion_enabled"] =
+            zone.effective_top_surface_contoning_beam_search_stack_expansion_enabled();
         texture["compact_offset_mode"] = zone.compact_offset_mode;
         texture["use_legacy_fixed_color_mode"] = zone.use_legacy_fixed_color_mode;
         texture["high_speed_image_texture_sampling"] = true;
@@ -1785,6 +1867,9 @@ void TextureMappingManager::load_entries(const std::string &serialized,
                                     TextureMappingZone::DefaultTopSurfaceContoningPatternFilaments),
                       TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
                       TextureMappingZone::MaxTopSurfaceContoningPatternFilaments);
+        zone.top_surface_contoning_stack_layers =
+            std::max(zone.top_surface_contoning_stack_layers,
+                     zone.top_surface_contoning_pattern_filaments);
         zone.top_surface_contoning_min_feature_mm =
             std::clamp(finite_or(texture.value("top_surface_contoning_min_feature_mm",
                                                TextureMappingZone::DefaultTopSurfaceContoningMinFeatureMm),
@@ -1835,6 +1920,9 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.top_surface_contoning_polygonize_color_regions_enabled =
             texture.value("top_surface_contoning_polygonize_color_regions_enabled",
                           TextureMappingZone::DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled);
+        zone.top_surface_contoning_fast_mode_enabled =
+            texture.value("top_surface_contoning_fast_mode_enabled",
+                          TextureMappingZone::DefaultTopSurfaceContoningFastModeEnabled);
         auto polygonize_resolution_it = texture.find("top_surface_contoning_polygonize_resolution");
         zone.top_surface_contoning_polygonize_resolution =
             TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(
@@ -1844,6 +1932,34 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.top_surface_contoning_surface_anchored_stacks_enabled =
             texture.value("top_surface_contoning_surface_anchored_stacks_enabled",
                           TextureMappingZone::DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled);
+        zone.top_surface_contoning_surface_anchored_stack_optimizations_enabled =
+            texture.value("top_surface_contoning_surface_anchored_stack_optimizations_enabled",
+                          TextureMappingZone::DefaultTopSurfaceContoningSurfaceAnchoredStackOptimizationsEnabled);
+        zone.top_surface_contoning_td_adjustment_enabled =
+            texture.value("top_surface_contoning_td_adjustment_enabled",
+                          TextureMappingZone::DefaultTopSurfaceContoningTdAdjustmentEnabled);
+        zone.top_surface_contoning_surface_scatter_enabled =
+            texture.value("top_surface_contoning_surface_scatter_enabled",
+                          TextureMappingZone::DefaultTopSurfaceContoningSurfaceScatterEnabled);
+        auto color_prediction_mode_it = texture.find("top_surface_contoning_color_prediction_mode");
+        zone.top_surface_contoning_color_prediction_mode =
+            color_prediction_mode_it != texture.end() && color_prediction_mode_it->is_string() ?
+                top_surface_contoning_color_prediction_mode_from_name(color_prediction_mode_it->get<std::string>()) :
+                clamp_int(color_prediction_mode_it != texture.end() && color_prediction_mode_it->is_number_integer() ?
+                              color_prediction_mode_it->get<int>() :
+                              TextureMappingZone::DefaultTopSurfaceContoningColorPredictionMode,
+                          int(TextureMappingZone::ContoningColorPredictionDefault),
+                          int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb));
+        zone.top_surface_contoning_beer_lambert_rgb_correction_enabled =
+            TextureMappingZone::DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled;
+        zone.top_surface_contoning_td_effective_alpha_correction_enabled =
+            TextureMappingZone::DefaultTopSurfaceContoningTdEffectiveAlphaCorrectionEnabled;
+        zone.top_surface_contoning_variable_layer_height_compensation_enabled =
+            texture.value("top_surface_contoning_variable_layer_height_compensation_enabled",
+                          TextureMappingZone::DefaultTopSurfaceContoningVariableLayerHeightCompensationEnabled);
+        zone.top_surface_contoning_beam_search_stack_expansion_enabled =
+            texture.value("top_surface_contoning_beam_search_stack_expansion_enabled",
+                          TextureMappingZone::DefaultTopSurfaceContoningBeamSearchStackExpansionEnabled);
         zone.apply_top_surface_contoning_experimental_defaults();
         zone.compact_offset_mode = texture.value("compact_offset_mode", TextureMappingZone::DefaultCompactOffsetMode);
         zone.use_legacy_fixed_color_mode =
@@ -1858,13 +1974,8 @@ void TextureMappingManager::load_entries(const std::string &serialized,
                        100.f);
         zone.generic_solver_lookup_mode =
             generic_solver_lookup_mode_from_name(texture.value("generic_solver_lookup", std::string("closest_mix")));
-        const auto generic_solver_mode_it = texture.find("generic_solver_mode");
         zone.generic_solver_mode =
-            generic_solver_mode_it != texture.end() && generic_solver_mode_it->is_string() ?
-                generic_solver_mode_from_name(generic_solver_mode_it->get<std::string>()) :
-                (zone.filament_color_mode == int(TextureMappingZone::FilamentColorAny) ?
-                     int(TextureMappingZone::GenericSolverLegacy) :
-                     int(TextureMappingZone::GenericSolverV2));
+            generic_solver_mode_from_name(texture.value("generic_solver_mode", std::string("default")));
         zone.generic_solver_mix_model =
             generic_solver_mix_model_from_name(texture.value("generic_solver_mix_model", std::string("pigment_painter")));
         zone.dithering_enabled = texture.value("dithering_enabled", TextureMappingZone::DefaultDitheringEnabled);

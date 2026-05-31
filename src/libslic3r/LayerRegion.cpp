@@ -528,7 +528,10 @@ static std::optional<PerimeterTextureRecolorSampler> perimeter_texture_make_reco
         if (zone.top_surface_contoning_perimeters_active()) {
             sampler.contoning = true;
             sampler.contoning_solver =
-                TextureMappingContoningSolver(zone, print_config, sampler.image_context->component_ids);
+                TextureMappingContoningSolver(zone,
+                                              print_config,
+                                              sampler.image_context->component_ids,
+                                              layer != nullptr ? float(layer->height) : 0.f);
             sampler.contoning_stack_layers =
                 std::clamp(zone.top_surface_contoning_stack_layers,
                            TextureMappingZone::MinTopSurfaceContoningStackLayers,
@@ -538,7 +541,7 @@ static std::optional<PerimeterTextureRecolorSampler> perimeter_texture_make_reco
                            TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
                            TextureMappingZone::MaxTopSurfaceContoningPatternFilaments);
             sampler.contoning_angle_threshold_deg =
-                std::clamp(zone.top_surface_contoning_angle_threshold_deg,
+                std::clamp(zone.effective_top_surface_contoning_angle_threshold_deg(),
                            TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg,
                            TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg);
             if (!sampler.contoning_solver.valid())
@@ -2825,7 +2828,7 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const LayerRe
                                                              wall_depth_mm,
                                                              perimeter_path_zone->top_visible_perimeter_recolor_above_layers,
                                                              &wall_band);
-            if (perimeter_path_zone->top_surface_contoning_angle_threshold_deg >=
+            if (perimeter_path_zone->effective_top_surface_contoning_angle_threshold_deg() >=
                 TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg - 1e-4f)
                 top_visible_recolor_path_mask = std::move(wall_band);
             contoning_min_recolor_run_length_mm =

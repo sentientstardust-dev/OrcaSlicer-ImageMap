@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <numeric>
 
@@ -17,6 +18,9 @@ namespace {
 
 constexpr float OPAQUE_CONTONING_TD_THRESHOLD_MM = 0.5f;
 constexpr float INFERRED_BLACK_TD_MM = 0.1f;
+constexpr float CONTONING_SURFACE_SCATTER = 0.12f;
+constexpr size_t MAX_TD_ORDERED_CONTONING_CANDIDATES = 2500000;
+constexpr size_t MAX_TD_ORDERED_CONTONING_STACK_ITEMS = 20000000;
 
 float clamp01(float value)
 {
@@ -66,6 +70,51 @@ bool black_role_component(int filament_color_mode, size_t component_idx, size_t 
     }
 }
 
+ColorSolverStackComponentRole cmy_component_role(int filament_color_mode, size_t component_idx, size_t component_count)
+{
+    switch (std::clamp(filament_color_mode,
+                       int(TextureMappingZone::FilamentColorAny),
+                       int(TextureMappingZone::FilamentColorRGBKW))) {
+    case int(TextureMappingZone::FilamentColorCMY):
+        if (component_count == 3) {
+            if (component_idx == 0)
+                return ColorSolverStackComponentRole::Cyan;
+            if (component_idx == 1)
+                return ColorSolverStackComponentRole::Magenta;
+            if (component_idx == 2)
+                return ColorSolverStackComponentRole::Yellow;
+        }
+        break;
+    case int(TextureMappingZone::FilamentColorCMYK):
+        if (component_count == 4) {
+            if (component_idx == 0)
+                return ColorSolverStackComponentRole::Cyan;
+            if (component_idx == 1)
+                return ColorSolverStackComponentRole::Magenta;
+            if (component_idx == 2)
+                return ColorSolverStackComponentRole::Yellow;
+            if (component_idx == 3)
+                return ColorSolverStackComponentRole::Black;
+        }
+        break;
+    case int(TextureMappingZone::FilamentColorCMYW):
+        if (component_count == 4) {
+            if (component_idx == 0)
+                return ColorSolverStackComponentRole::Cyan;
+            if (component_idx == 1)
+                return ColorSolverStackComponentRole::Magenta;
+            if (component_idx == 2)
+                return ColorSolverStackComponentRole::Yellow;
+            if (component_idx == 3)
+                return ColorSolverStackComponentRole::White;
+        }
+        break;
+    default:
+        break;
+    }
+    return ColorSolverStackComponentRole::Generic;
+}
+
 bool is_black_color_filament(const PrintConfig &config, unsigned int component_id)
 {
     ColorRGB color;
@@ -81,9 +130,16 @@ bool is_black_color_filament(const PrintConfig &config, unsigned int component_i
     return max_channel <= 0.20f && luminance <= 0.12f && max_channel - min_channel <= 0.08f;
 }
 
+float estimated_transmission_distance_mm(const PrintConfig &config, unsigned int component_id)
+{
+    const float luminance = std::clamp(filament_luminance(config, component_id), 0.f, 1.f);
+    return std::clamp(0.1f + 2.9f * std::pow(luminance, 1.35f), 0.12f, 3.f);
+}
+
 std::vector<float> effective_transmission_distances_mm(const TextureMappingZone &zone,
                                                        const PrintConfig        &config,
-                                                       const std::vector<unsigned int> &component_ids)
+                                                       const std::vector<unsigned int> &component_ids,
+                                                       bool estimate_missing)
 {
     std::vector<float> out(component_ids.size(), 0.f);
     for (size_t idx = 0; idx < component_ids.size(); ++idx) {
@@ -93,9 +149,18 @@ std::vector<float> effective_transmission_distances_mm(const TextureMappingZone 
         } else if (black_role_component(zone.filament_color_mode, idx, component_ids.size()) ||
                    is_black_color_filament(config, component_ids[idx])) {
             out[idx] = INFERRED_BLACK_TD_MM;
+        } else if (estimate_missing) {
+            out[idx] = estimated_transmission_distance_mm(config, component_ids[idx]);
         }
     }
     return out;
+}
+
+float layer_opacity_from_td(float td_mm, float layer_height_mm)
+{
+    const float safe_td = std::clamp(td_mm, 0.01f, 50.f);
+    const float safe_layer_height = std::clamp(layer_height_mm, 0.01f, 2.f);
+    return std::clamp(1.f - std::pow(0.05f, 2.f * safe_layer_height / safe_td), 1e-4f, 0.9999f);
 }
 
 float effective_transmission_distance_for_component(const std::vector<unsigned int> &component_ids,
@@ -250,6 +315,15 @@ std::optional<std::array<float, 3>> texture_mapping_contoning_component_colors(
     return out.front();
 }
 
+std::vector<ColorSolverStackComponentRole> texture_mapping_contoning_component_roles(const TextureMappingZone &zone,
+                                                                                    size_t component_count)
+{
+    std::vector<ColorSolverStackComponentRole> roles(component_count, ColorSolverStackComponentRole::Generic);
+    for (size_t idx = 0; idx < component_count; ++idx)
+        roles[idx] = cmy_component_role(zone.filament_color_mode, idx, component_count);
+    return roles;
+}
+
 std::vector<unsigned int> texture_mapping_contoning_components_bottom_to_top(
     const TextureMappingZone &zone,
     const PrintConfig &config,
@@ -263,7 +337,8 @@ std::vector<unsigned int> texture_mapping_contoning_components_bottom_to_top(
         return component_ids;
 
     const std::vector<unsigned int> td_component_ids = component_ids;
-    const std::vector<float> effective_tds = effective_transmission_distances_mm(zone, config, td_component_ids);
+    const std::vector<float> effective_tds =
+        effective_transmission_distances_mm(zone, config, td_component_ids, zone.top_surface_contoning_td_adjustment_enabled);
     const bool has_complete_td =
         std::all_of(effective_tds.begin(), effective_tds.end(), [](float td) { return std::isfinite(td) && td > 0.f; });
     if (has_complete_td) {
@@ -327,8 +402,25 @@ bool texture_mapping_contoning_normal_eligible(float normal_z, float threshold_d
 
 TextureMappingContoningSolver::TextureMappingContoningSolver(const TextureMappingZone &zone,
                                                              const PrintConfig &config,
-                                                             std::vector<unsigned int> component_ids)
+                                                             std::vector<unsigned int> component_ids,
+                                                             float layer_height_mm)
 {
+    m_mix_model = color_solver_mix_model_from_index(zone.generic_solver_mix_model);
+    m_td_adjustment_enabled = zone.top_surface_contoning_td_adjustment_enabled;
+    m_td_effective_alpha_correction_enabled =
+        m_td_adjustment_enabled && zone.top_surface_contoning_td_effective_alpha_correction_enabled;
+    m_beer_lambert_rgb_correction_enabled =
+        m_td_adjustment_enabled &&
+        !m_td_effective_alpha_correction_enabled &&
+        zone.top_surface_contoning_beer_lambert_rgb_correction_enabled;
+    m_variable_layer_height_compensation_enabled =
+        m_td_adjustment_enabled && zone.top_surface_contoning_variable_layer_height_compensation_enabled;
+    m_beam_search_stack_expansion_enabled = zone.effective_top_surface_contoning_beam_search_stack_expansion_enabled();
+    m_layer_height_mm = std::isfinite(layer_height_mm) && layer_height_mm > 0.f ? layer_height_mm : 0.2f;
+    if (!std::isfinite(m_layer_height_mm) || m_layer_height_mm <= 0.f)
+        m_layer_height_mm = 0.2f;
+    m_surface_scatter = zone.effective_top_surface_contoning_surface_scatter_enabled() ? CONTONING_SURFACE_SCATTER : 0.f;
+
     component_ids.erase(std::remove_if(component_ids.begin(), component_ids.end(), [&config](unsigned int id) {
         return id == 0 || id > config.filament_colour.values.size();
     }), component_ids.end());
@@ -338,11 +430,18 @@ TextureMappingContoningSolver::TextureMappingContoningSolver(const TextureMappin
         m_component_ids.clear();
     if (m_component_ids.empty())
         return;
+    m_component_roles = texture_mapping_contoning_component_roles(zone, m_component_ids.size());
 
     m_component_luminance.reserve(m_component_ids.size());
     for (const unsigned int id : m_component_ids)
         m_component_luminance.emplace_back(filament_luminance(config, id));
-    m_effective_transmission_distances_mm = effective_transmission_distances_mm(zone, config, m_component_ids);
+    std::vector<float> background_weights(m_component_colors.size(), 1.f / float(m_component_colors.size()));
+    m_background_rgb = mix_color_solver_components(m_component_colors, background_weights, m_mix_model);
+    m_effective_transmission_distances_mm =
+        effective_transmission_distances_mm(zone, config, m_component_ids, m_td_adjustment_enabled);
+    m_component_layer_opacity.reserve(m_effective_transmission_distances_mm.size());
+    for (float td_mm : m_effective_transmission_distances_mm)
+        m_component_layer_opacity.emplace_back(layer_opacity_from_td(td_mm > 0.f ? td_mm : 3.f, m_layer_height_mm));
     m_components_bottom_to_top = texture_mapping_contoning_components_bottom_to_top(zone, config, m_component_ids);
 }
 
@@ -352,6 +451,7 @@ TextureMappingContoningSolver::candidates_for_depth(int stack_layers) const
     const int depth = std::clamp(stack_layers,
                                  TextureMappingZone::MinTopSurfaceContoningStackLayers,
                                  TextureMappingZone::MaxTopSurfaceContoningStackLayers);
+    std::lock_guard<std::mutex> lock(*m_candidate_mutex);
     auto found = m_candidates_by_depth.find(depth);
     if (found != m_candidates_by_depth.end())
         return found->second;
@@ -371,7 +471,7 @@ TextureMappingContoningSolver::candidates_for_depth(int stack_layers) const
 
         Candidate candidate;
         candidate.counts = std::move(candidate_counts);
-        candidate.rgb = mix_color_solver_components(m_component_colors, weights, ColorSolverMixModel::PigmentPainter);
+        candidate.rgb = mix_color_solver_components(m_component_colors, weights, m_mix_model);
         candidate.oklab = color_solver_oklab_from_srgb(candidate.rgb);
         for (size_t idx = 0; idx < candidate.counts.size() && idx < m_component_luminance.size(); ++idx)
             candidate.dark_score += float(candidate.counts[idx]) * (1.f - clamp01(m_component_luminance[idx]));
@@ -379,6 +479,110 @@ TextureMappingContoningSolver::candidates_for_depth(int stack_layers) const
     }
 
     return m_candidates_by_depth.emplace(depth, std::move(candidates)).first->second;
+}
+
+std::optional<size_t> TextureMappingContoningSolver::component_index(unsigned int component_id) const
+{
+    const auto it = std::find(m_component_ids.begin(), m_component_ids.end(), component_id);
+    if (it == m_component_ids.end())
+        return std::nullopt;
+    return size_t(it - m_component_ids.begin());
+}
+
+std::optional<std::array<float, 3>> TextureMappingContoningSolver::stack_rgb(
+    const std::vector<unsigned int> &bottom_to_top,
+    bool lower_surface,
+    int visible_stack_layers,
+    const std::vector<float> &surface_to_deep_layer_heights_mm) const
+{
+    if (bottom_to_top.empty() || !valid())
+        return std::nullopt;
+
+    if (!m_td_adjustment_enabled) {
+        std::vector<std::array<float, 3>> colors;
+        std::vector<float> weights;
+        colors.reserve(bottom_to_top.size());
+        weights.reserve(bottom_to_top.size());
+        const float weight = 1.f / float(bottom_to_top.size());
+        for (unsigned int component_id : bottom_to_top) {
+            const std::optional<size_t> idx = component_index(component_id);
+            if (!idx || *idx >= m_component_colors.size())
+                return std::nullopt;
+            colors.emplace_back(m_component_colors[*idx]);
+            weights.emplace_back(weight);
+        }
+        return mix_color_solver_components(colors, weights, m_mix_model);
+    }
+
+    const int visible_depth = visible_stack_layers > 0 ?
+        std::clamp(visible_stack_layers,
+                   TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                   TextureMappingZone::MaxTopSurfaceContoningStackLayers) :
+        int(bottom_to_top.size());
+    std::vector<uint16_t> surface_to_deep;
+    surface_to_deep.reserve(size_t(visible_depth));
+    auto append_component = [this, &surface_to_deep](unsigned int component_id) {
+        const std::optional<size_t> idx = component_index(component_id);
+        if (!idx || *idx > size_t(std::numeric_limits<uint16_t>::max()))
+            return false;
+        surface_to_deep.emplace_back(uint16_t(*idx));
+        return true;
+    };
+    if (lower_surface) {
+        for (unsigned int component_id : bottom_to_top)
+            if (!append_component(component_id))
+                return std::nullopt;
+    } else {
+        for (auto it = bottom_to_top.rbegin(); it != bottom_to_top.rend(); ++it)
+            if (!append_component(*it))
+                return std::nullopt;
+    }
+    if (visible_depth > 0 && int(surface_to_deep.size()) != visible_depth) {
+        std::vector<uint16_t> repeated;
+        repeated.reserve(size_t(visible_depth));
+        for (int idx = 0; idx < visible_depth; ++idx)
+            repeated.emplace_back(surface_to_deep[size_t(idx) % surface_to_deep.size()]);
+        surface_to_deep = std::move(repeated);
+    }
+
+    const std::vector<float> depth_layer_opacities =
+        layer_opacities_by_depth(surface_to_deep_layer_heights_mm, visible_depth);
+    return mix_color_solver_ordered_stack(m_component_colors,
+                                          surface_to_deep,
+                                          m_component_layer_opacity,
+                                          m_background_rgb,
+                                          m_mix_model,
+                                          m_surface_scatter,
+                                          m_beer_lambert_rgb_correction_enabled,
+                                          m_td_effective_alpha_correction_enabled,
+                                          m_component_roles,
+                                          depth_layer_opacities);
+}
+
+std::vector<float> TextureMappingContoningSolver::layer_opacities_by_depth(
+    const std::vector<float> &surface_to_deep_layer_heights_mm,
+    int                       visible_depth) const
+{
+    if (!m_variable_layer_height_compensation_enabled ||
+        surface_to_deep_layer_heights_mm.empty() ||
+        visible_depth <= 0 ||
+        m_effective_transmission_distances_mm.empty())
+        return {};
+
+    const int depth = std::min(visible_depth, TextureMappingZone::MaxTopSurfaceContoningStackLayers);
+    std::vector<float> out;
+    out.reserve(size_t(depth) * m_effective_transmission_distances_mm.size());
+    for (int depth_idx = 0; depth_idx < depth; ++depth_idx) {
+        float layer_height_mm =
+            depth_idx < int(surface_to_deep_layer_heights_mm.size()) ?
+                surface_to_deep_layer_heights_mm[size_t(depth_idx)] :
+                m_layer_height_mm;
+        if (!std::isfinite(layer_height_mm) || layer_height_mm <= 0.f)
+            layer_height_mm = m_layer_height_mm;
+        for (float td_mm : m_effective_transmission_distances_mm)
+            out.emplace_back(layer_opacity_from_td(td_mm > 0.f ? td_mm : 3.f, layer_height_mm));
+    }
+    return out;
 }
 
 void TextureMappingContoningSolver::arrange_stack_for_light_path(std::vector<unsigned int> &bottom_to_top,
@@ -446,15 +650,72 @@ void TextureMappingContoningSolver::arrange_stack_for_light_path(std::vector<uns
         bottom_to_top.emplace_back(*it);
 }
 
-TextureMappingContoningStack TextureMappingContoningSolver::solve(const std::array<float, 3> &target_rgb, int stack_layers) const
+TextureMappingContoningStack TextureMappingContoningSolver::solve(const std::array<float, 3> &target_rgb,
+                                                                  int stack_layers,
+                                                                  bool lower_surface,
+                                                                  int visible_stack_layers,
+                                                                  const std::vector<float> &surface_to_deep_layer_heights_mm) const
 {
     TextureMappingContoningStack out;
     if (!valid())
         return out;
 
-    const int depth = std::clamp(stack_layers,
-                                 TextureMappingZone::MinTopSurfaceContoningStackLayers,
-                                 TextureMappingZone::MaxTopSurfaceContoningStackLayers);
+    const int requested_depth = std::clamp(stack_layers,
+                                           TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                                           TextureMappingZone::MaxTopSurfaceContoningStackLayers);
+    const int visible_depth = visible_stack_layers > 0 ?
+        std::clamp(visible_stack_layers,
+                   TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                   TextureMappingZone::MaxTopSurfaceContoningStackLayers) :
+        requested_depth;
+    const int depth = std::min(requested_depth, visible_depth);
+    if (m_td_adjustment_enabled) {
+        const std::vector<float> depth_layer_opacities =
+            layer_opacities_by_depth(surface_to_deep_layer_heights_mm, visible_depth);
+        const ColorSolverOrderedStackCandidateSet *ordered_candidates = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(*m_ordered_candidate_cache_mutex);
+            ordered_candidates =
+                &color_solver_ordered_stack_candidates(*m_ordered_candidate_cache,
+                                                       m_component_colors,
+                                                       m_component_layer_opacity,
+                                                       m_background_rgb,
+                                                       m_mix_model,
+                                                       depth,
+                                                       visible_depth,
+                                                       MAX_TD_ORDERED_CONTONING_CANDIDATES,
+                                                       MAX_TD_ORDERED_CONTONING_STACK_ITEMS,
+                                                       m_surface_scatter,
+                                                       m_beer_lambert_rgb_correction_enabled,
+                                                       m_td_effective_alpha_correction_enabled,
+                                                       m_component_roles,
+                                                       m_beam_search_stack_expansion_enabled,
+                                                       depth_layer_opacities);
+        }
+        const ColorSolverOrderedStackResult solved =
+            solve_color_solver_ordered_stack_result_for_target(*ordered_candidates, target_rgb, ColorSolverMode::OklabSoftCap4Dark4);
+        const std::vector<uint16_t> &surface_to_deep = solved.surface_to_deep;
+        if (!surface_to_deep.empty()) {
+            out.bottom_to_top.reserve(surface_to_deep.size());
+            auto append_component = [this, &out](uint16_t component_idx) {
+                if (size_t(component_idx) < m_component_ids.size())
+                    out.bottom_to_top.emplace_back(m_component_ids[size_t(component_idx)]);
+            };
+            if (lower_surface) {
+                for (uint16_t component_idx : surface_to_deep)
+                    append_component(component_idx);
+            } else {
+                for (auto it = surface_to_deep.rbegin(); it != surface_to_deep.rend(); ++it)
+                    append_component(*it);
+            }
+            if (!out.bottom_to_top.empty()) {
+                if (solved.has_rgb)
+                    out.rgb = solved.rgb;
+                return out;
+            }
+        }
+    }
+
     const std::vector<Candidate> &candidates = candidates_for_depth(depth);
     if (candidates.empty())
         return out;
@@ -492,18 +753,23 @@ TextureMappingContoningStack TextureMappingContoningSolver::solve(const std::arr
     if (int(out.bottom_to_top.size()) > depth)
         out.bottom_to_top.resize(size_t(depth));
     arrange_stack_for_light_path(out.bottom_to_top, target_rgb);
+    if (lower_surface && m_td_adjustment_enabled)
+        std::reverse(out.bottom_to_top.begin(), out.bottom_to_top.end());
     return out;
 }
 
 unsigned int TextureMappingContoningSolver::component_for_depth(const std::array<float, 3> &target_rgb,
                                                                 int stack_layers,
-                                                                int depth_from_top) const
+                                                                int depth_from_top,
+                                                                bool lower_surface) const
 {
-    TextureMappingContoningStack stack = solve(target_rgb, stack_layers);
+    TextureMappingContoningStack stack = solve(target_rgb, stack_layers, lower_surface);
     if (stack.bottom_to_top.empty())
         return 0;
     const int depth = int(stack.bottom_to_top.size());
-    const int idx = std::clamp(depth - 1 - depth_from_top, 0, depth - 1);
+    const int idx = lower_surface ?
+        std::clamp(depth_from_top, 0, depth - 1) :
+        std::clamp(depth - 1 - depth_from_top, 0, depth - 1);
     return stack.bottom_to_top[size_t(idx)];
 }
 

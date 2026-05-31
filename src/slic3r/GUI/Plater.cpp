@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <iomanip>
 #include <numeric>
 #include <limits>
@@ -20,6 +21,7 @@
 #include <future>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <boost/algorithm/string.hpp>
 #include <boost/iterator/counting_iterator.hpp>
 #include <boost/optional.hpp>
@@ -710,6 +712,113 @@ static bool model_uses_texture_mapping_zone_id(const Model &model, const ConfigO
     return false;
 }
 
+struct TextureMappingZoneShellUsageSummary {
+    int object_count { 0 };
+    int min_top_shell_layers { 0 };
+    int min_bottom_shell_layers { 0 };
+};
+
+static int texture_mapping_config_int_or(const ConfigOptionResolver &config, const char *key, int fallback)
+{
+    const ConfigOptionInt *opt = dynamic_cast<const ConfigOptionInt *>(config.option(key));
+    return opt != nullptr ? opt->getInt() : fallback;
+}
+
+static bool texture_mapping_effective_config_uses_zone_id(const ConfigOptionResolver  &config,
+                                                          const ConfigOptionResolver *fallback_config,
+                                                          const ConfigOptionResolver *secondary_fallback_config,
+                                                          unsigned int                zone_id)
+{
+    const int target = int(zone_id);
+    const std::array<const ConfigOptionResolver *, 3> configs { &config, fallback_config, secondary_fallback_config };
+    for (const char *key : texture_mapping_filament_config_keys()) {
+        for (const ConfigOptionResolver *resolver : configs) {
+            if (resolver == nullptr)
+                continue;
+            const ConfigOptionInt *opt = dynamic_cast<const ConfigOptionInt *>(resolver->option(key));
+            if (opt == nullptr)
+                continue;
+            if (opt->getInt() == target)
+                return true;
+            break;
+        }
+    }
+    return false;
+}
+
+static TextureMappingZoneShellUsageSummary texture_mapping_zone_shell_usage_summary(
+    const Model &model,
+    const DynamicPrintConfig &print_config,
+    unsigned int zone_id)
+{
+    TextureMappingZoneShellUsageSummary out;
+    if (zone_id == 0)
+        return out;
+
+    const int global_top_shell_layers = texture_mapping_config_int_or(print_config, "top_shell_layers", 0);
+    const int global_bottom_shell_layers = texture_mapping_config_int_or(print_config, "bottom_shell_layers", 0);
+    int min_top_shell_layers = std::numeric_limits<int>::max();
+    int min_bottom_shell_layers = std::numeric_limits<int>::max();
+
+    for (const ModelObject *object : model.objects) {
+        if (object == nullptr)
+            continue;
+
+        const ConfigOptionResolver &object_config = object->config.get();
+        const int object_top_shell_layers =
+            texture_mapping_config_int_or(object_config, "top_shell_layers", global_top_shell_layers);
+        const int object_bottom_shell_layers =
+            texture_mapping_config_int_or(object_config, "bottom_shell_layers", global_bottom_shell_layers);
+        int object_min_top_shell_layers = object_top_shell_layers;
+        int object_min_bottom_shell_layers = object_bottom_shell_layers;
+        bool object_uses_zone = false;
+
+        auto note_usage = [&](int top_shell_layers, int bottom_shell_layers) {
+            object_uses_zone = true;
+            object_min_top_shell_layers = std::min(object_min_top_shell_layers, top_shell_layers);
+            object_min_bottom_shell_layers = std::min(object_min_bottom_shell_layers, bottom_shell_layers);
+        };
+
+        if (texture_mapping_effective_config_uses_zone_id(object_config, &print_config, nullptr, zone_id))
+            note_usage(object_top_shell_layers, object_bottom_shell_layers);
+
+        for (const auto &layer_range : object->layer_config_ranges) {
+            const ConfigOptionResolver &layer_config = layer_range.second.get();
+            if (!texture_mapping_effective_config_uses_zone_id(layer_config, &object_config, &print_config, zone_id))
+                continue;
+            note_usage(texture_mapping_config_int_or(layer_config, "top_shell_layers", object_top_shell_layers),
+                       texture_mapping_config_int_or(layer_config, "bottom_shell_layers", object_bottom_shell_layers));
+        }
+
+        for (const ModelVolume *volume : object->volumes) {
+            if (volume == nullptr)
+                continue;
+            const ConfigOptionResolver &volume_config = volume->config.get();
+            const int volume_top_shell_layers =
+                texture_mapping_config_int_or(volume_config, "top_shell_layers", object_top_shell_layers);
+            const int volume_bottom_shell_layers =
+                texture_mapping_config_int_or(volume_config, "bottom_shell_layers", object_bottom_shell_layers);
+            if (texture_mapping_effective_config_uses_zone_id(volume_config, &object_config, &print_config, zone_id))
+                note_usage(volume_top_shell_layers, volume_bottom_shell_layers);
+            const std::vector<bool> &used_states = volume->mmu_segmentation_facets.get_data().used_states;
+            if (size_t(zone_id) < used_states.size() && used_states[zone_id])
+                note_usage(volume_top_shell_layers, volume_bottom_shell_layers);
+        }
+
+        if (!object_uses_zone)
+            continue;
+        ++out.object_count;
+        min_top_shell_layers = std::min(min_top_shell_layers, object_min_top_shell_layers);
+        min_bottom_shell_layers = std::min(min_bottom_shell_layers, object_min_bottom_shell_layers);
+    }
+
+    if (out.object_count > 0) {
+        out.min_top_shell_layers = min_top_shell_layers == std::numeric_limits<int>::max() ? 0 : min_top_shell_layers;
+        out.min_bottom_shell_layers = min_bottom_shell_layers == std::numeric_limits<int>::max() ? 0 : min_bottom_shell_layers;
+    }
+    return out;
+}
+
 static std::set<unsigned int> texture_mapping_zone_ids_from_import_config(const DynamicPrintConfig &config)
 {
     const ConfigOptionString *defs = config.option<ConfigOptionString>("texture_mapping_definitions");
@@ -1126,7 +1235,8 @@ public:
                   const wxColour &fallback,
                   const std::vector<TextureMappingZone::LinearGradientStop> &linear_gradient_stops = {},
                   bool linear_gradient = false,
-                  bool radial_gradient = false)
+                  bool radial_gradient = false,
+                  int generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel)
     {
         m_palette = palette;
         m_component_ids = component_ids;
@@ -1134,6 +1244,9 @@ public:
         m_linear_gradient_stops = linear_gradient_stops;
         m_linear_gradient = linear_gradient;
         m_radial_gradient = radial_gradient;
+        m_generic_solver_mix_model = std::clamp(generic_solver_mix_model,
+                                                int(TextureMappingZone::GenericSolverPigmentPainter),
+                                                int(TextureMappingZone::GenericSolverPrusaFdmMixer));
         Refresh();
     }
 
@@ -1157,7 +1270,8 @@ private:
         }
         const std::vector<float> weights =
             TextureMappingManager::linear_gradient_compact_weights(float(t), m_linear_gradient_stops, m_component_ids);
-        const std::array<float, 3> mixed = mix_color_solver_components(colors, weights, ColorSolverMixModel::PigmentPainter);
+        const std::array<float, 3> mixed =
+            mix_color_solver_components(colors, weights, color_solver_mix_model_from_index(m_generic_solver_mix_model));
         return wxColour(std::clamp(int(std::lround(mixed[0] * 255.f)), 0, 255),
                         std::clamp(int(std::lround(mixed[1] * 255.f)), 0, 255),
                         std::clamp(int(std::lround(mixed[2] * 255.f)), 0, 255));
@@ -1213,6 +1327,7 @@ private:
     wxColour                  m_fallback {wxColour("#26A69A")};
     bool                      m_linear_gradient { false };
     bool                      m_radial_gradient { false };
+    int                       m_generic_solver_mix_model { TextureMappingZone::DefaultGenericSolverMixModel };
 };
 
 class TextureMappingUsageDot : public wxPanel
@@ -1259,11 +1374,15 @@ public:
     void set_data(const std::vector<wxColour> &palette,
                   size_t num_physical,
                   const std::vector<TextureMappingZone::LinearGradientStop> &stops,
-                  int selected_index)
+                  int selected_index,
+                  int generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel)
     {
         m_palette = palette;
         m_num_physical = num_physical;
         m_stops = stops;
+        m_generic_solver_mix_model = std::clamp(generic_solver_mix_model,
+                                                int(TextureMappingZone::GenericSolverPigmentPainter),
+                                                int(TextureMappingZone::GenericSolverPrusaFdmMixer));
         sort_stops();
         m_selected_index = selected_index >= 0 && selected_index < int(m_stops.size()) ? selected_index : -1;
         Refresh();
@@ -1371,7 +1490,8 @@ private:
             colors.push_back({float(color.Red()) / 255.f, float(color.Green()) / 255.f, float(color.Blue()) / 255.f});
         }
         const std::vector<float> weights = TextureMappingManager::linear_gradient_compact_weights(t, m_stops, component_ids);
-        const std::array<float, 3> mixed = mix_color_solver_components(colors, weights, ColorSolverMixModel::PigmentPainter);
+        const std::array<float, 3> mixed =
+            mix_color_solver_components(colors, weights, color_solver_mix_model_from_index(m_generic_solver_mix_model));
         return wxColour(std::clamp(int(std::lround(mixed[0] * 255.f)), 0, 255),
                         std::clamp(int(std::lround(mixed[1] * 255.f)), 0, 255),
                         std::clamp(int(std::lround(mixed[2] * 255.f)), 0, 255));
@@ -1554,6 +1674,7 @@ private:
     std::vector<wxColour> m_palette;
     size_t m_num_physical { 0 };
     std::vector<TextureMappingZone::LinearGradientStop> m_stops;
+    int m_generic_solver_mix_model { TextureMappingZone::DefaultGenericSolverMixModel };
     int m_selected_index { -1 };
     bool m_dragging { false };
     std::function<void(const std::vector<TextureMappingZone::LinearGradientStop> &, int)> m_changed_callback;
@@ -1924,6 +2045,99 @@ static bool texture_mapping_prime_tower_images_equal(const TextureMappingPrimeTo
            lhs.rgba == rhs.rgba;
 }
 
+static wxString texture_mapping_generic_solver_mode_label(int mode)
+{
+    switch (TextureMappingZone::effective_generic_solver_mode(mode)) {
+    case int(TextureMappingZone::GenericSolverRGB):
+        return _L("RGB");
+    case int(TextureMappingZone::GenericSolverOklab):
+        return _L("Oklab");
+    default:
+        return _L("Oklab soft cap dark correction");
+    }
+}
+
+static wxString texture_mapping_generic_solver_default_label()
+{
+    wxString label = _L("Default");
+    label += " (";
+    label += texture_mapping_generic_solver_mode_label(TextureMappingZone::SlicerDefaultGenericSolverMode);
+    label += ")";
+    return label;
+}
+
+static int texture_mapping_generic_solver_mode_choice_selection(int mode)
+{
+    if (mode == int(TextureMappingZone::GenericSolverDefault))
+        return 0;
+    switch (TextureMappingZone::effective_generic_solver_mode(mode)) {
+    case int(TextureMappingZone::GenericSolverRGB):
+        return 1;
+    case int(TextureMappingZone::GenericSolverOklab):
+        return 2;
+    default:
+        return 3;
+    }
+}
+
+static int texture_mapping_generic_solver_mode_from_choice_selection(int selection)
+{
+    switch (selection) {
+    case 1:
+        return int(TextureMappingZone::GenericSolverRGB);
+    case 2:
+        return int(TextureMappingZone::GenericSolverOklab);
+    case 3:
+        return int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4);
+    default:
+        return TextureMappingZone::DefaultGenericSolverMode;
+    }
+}
+
+static wxString texture_mapping_contoning_color_prediction_mode_label(int mode)
+{
+    switch (TextureMappingZone::effective_top_surface_contoning_color_prediction_mode(mode)) {
+    case int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb):
+        return _L("RGB Beer-Lambert - not recommended");
+    default:
+        return _L("TD Effective Alpha");
+    }
+}
+
+static wxString texture_mapping_contoning_color_prediction_default_label()
+{
+    wxString label = _L("Default");
+    label += " (";
+    label += texture_mapping_contoning_color_prediction_mode_label(
+        TextureMappingZone::SlicerDefaultTopSurfaceContoningColorPredictionMode);
+    label += ")";
+    return label;
+}
+
+static int texture_mapping_contoning_color_prediction_mode_choice_selection(int mode)
+{
+    if (mode == int(TextureMappingZone::ContoningColorPredictionDefault))
+        return 0;
+    switch (TextureMappingZone::effective_top_surface_contoning_color_prediction_mode(mode)) {
+    case int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb):
+        return 2;
+    default:
+        return 1;
+    }
+}
+
+static int texture_mapping_contoning_color_prediction_mode_from_choice_selection(int selection)
+{
+    switch (selection) {
+    case 1:
+        return int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha);
+    case 2:
+        return int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb);
+    default:
+        return TextureMappingZone::DefaultTopSurfaceContoningColorPredictionMode;
+    }
+}
+
 class TextureMappingAdvancedOptionsDialog : public wxDialog
 {
 public:
@@ -1982,8 +2196,18 @@ public:
                                         bool top_surface_contoning_blue_noise_error_diffusion_enabled,
                                         bool top_surface_contoning_supersampled_cells_enabled,
                                         bool top_surface_contoning_polygonize_color_regions_enabled,
+                                        bool top_surface_contoning_fast_mode_enabled,
                                         int top_surface_contoning_polygonize_resolution,
                                         bool top_surface_contoning_surface_anchored_stacks_enabled,
+                                        bool top_surface_contoning_surface_anchored_stack_optimizations_enabled,
+                                        bool top_surface_contoning_beam_search_stack_expansion_enabled,
+                                        bool top_surface_contoning_td_adjustment_enabled,
+                                        bool top_surface_contoning_surface_scatter_enabled,
+                                        int top_surface_contoning_color_prediction_mode,
+                                        bool top_surface_contoning_beer_lambert_rgb_correction_enabled,
+                                        bool top_surface_contoning_td_effective_alpha_correction_enabled,
+                                        bool top_surface_contoning_variable_layer_height_compensation_enabled,
+                                        const TextureMappingZoneShellUsageSummary &top_surface_contoning_shell_usage,
                                         const TextureMappingManager &texture_mapping_zones,
                                         const TextureMappingGlobalSettings &global_settings,
                                         const TextureMappingPrimeTowerImage &prime_tower_image,
@@ -1995,10 +2219,14 @@ public:
         , m_prime_tower_image(prime_tower_image)
         , m_prime_tower_image_back(prime_tower_image_back)
     {
-        (void) generic_solver_mix_model;
         (void) reduce_outer_surface_texture;
+        (void) top_surface_contoning_min_feature_mm;
+        (void) top_surface_contoning_td_adjustment_enabled;
+        (void) top_surface_contoning_beer_lambert_rgb_correction_enabled;
+        (void) top_surface_contoning_td_effective_alpha_correction_enabled;
         m_modulation_mode_manually_changed = modulation_mode_manually_changed;
         m_strength_offsets_expanded = initial_strength_offsets_expanded;
+        m_top_surface_contoning_shell_usage = top_surface_contoning_shell_usage;
         const int gap = FromDIP(8);
         auto *root = new wxBoxSizer(wxVERTICAL);
         auto *tab_row = new wxBoxSizer(wxHORIZONTAL);
@@ -2196,19 +2424,19 @@ public:
         filament_root->Add(m_force_sequential_filaments_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
 
         filament_root->AddStretchSpacer(1);
-        auto *filament_calibration_note =
-            new wxStaticText(filament_page,
-                             wxID_ANY,
-                             _L("NOTE: Filament/TD calibration is not currently used in top-surface coloring"),
-                             wxDefaultPosition,
-                             wxSize(FromDIP(390), -1));
-        filament_calibration_note->Wrap(FromDIP(390));
-        filament_root->Add(filament_calibration_note, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
-        filament_page->Bind(wxEVT_SIZE, [this, filament_page, filament_calibration_note, gap](wxSizeEvent &evt) {
-            const int wrap_width = std::max(FromDIP(120), filament_page->GetClientSize().GetWidth() - gap * 2);
-            filament_calibration_note->Wrap(wrap_width);
-            evt.Skip();
-        });
+        // auto *filament_calibration_note =
+        //     new wxStaticText(filament_page,
+        //                      wxID_ANY,
+        //                      _L("NOTE: TD calibration is used by overhang modulation and Contoning TD adjustment"),
+        //                      wxDefaultPosition,
+        //                      wxSize(FromDIP(390), -1));
+        // filament_calibration_note->Wrap(FromDIP(390));
+        // filament_root->Add(filament_calibration_note, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        // filament_page->Bind(wxEVT_SIZE, [this, filament_page, filament_calibration_note, gap](wxSizeEvent &evt) {
+        //     const int wrap_width = std::max(FromDIP(120), filament_page->GetClientSize().GetWidth() - gap * 2);
+        //     filament_calibration_note->Wrap(wrap_width);
+        //     evt.Skip();
+        // });
 
         auto *preview_box = new wxStaticBoxSizer(wxVERTICAL, preview_page, _L("3D Preview"));
         auto *preview_opacity_row = new wxBoxSizer(wxHORIZONTAL);
@@ -2409,12 +2637,12 @@ public:
         auto *generic_solver_mode_row = new wxBoxSizer(wxHORIZONTAL);
         generic_solver_mode_row->Add(new wxStaticText(experimental_page, wxID_ANY, _L("Generic solver")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         wxArrayString generic_solver_mode_choices;
-        generic_solver_mode_choices.Add(_L("Legacy RGB"));
-        generic_solver_mode_choices.Add(_L("V2 Oklab"));
+        generic_solver_mode_choices.Add(texture_mapping_generic_solver_default_label());
+        generic_solver_mode_choices.Add(texture_mapping_generic_solver_mode_label(int(TextureMappingZone::GenericSolverRGB)));
+        generic_solver_mode_choices.Add(texture_mapping_generic_solver_mode_label(int(TextureMappingZone::GenericSolverOklab)));
+        generic_solver_mode_choices.Add(texture_mapping_generic_solver_mode_label(int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4)));
         m_generic_solver_mode_choice = new wxChoice(experimental_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, generic_solver_mode_choices);
-        m_generic_solver_mode_choice->SetSelection(std::clamp(generic_solver_mode,
-                                                              int(TextureMappingZone::GenericSolverLegacy),
-                                                              int(TextureMappingZone::GenericSolverV2)));
+        m_generic_solver_mode_choice->SetSelection(texture_mapping_generic_solver_mode_choice_selection(generic_solver_mode));
         generic_solver_mode_row->Add(m_generic_solver_mode_choice, 1, wxALIGN_CENTER_VERTICAL);
         experimental_box->Add(generic_solver_mode_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
 
@@ -2425,9 +2653,12 @@ public:
                                           gap);
         wxArrayString generic_solver_mix_model_choices;
         generic_solver_mix_model_choices.Add(_L("Pigment Painter"));
+        generic_solver_mix_model_choices.Add(_L("prusa-fdm-mixer"));
         m_generic_solver_mix_model_choice =
             new wxChoice(experimental_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, generic_solver_mix_model_choices);
-        m_generic_solver_mix_model_choice->SetSelection(TextureMappingZone::DefaultGenericSolverMixModel);
+        m_generic_solver_mix_model_choice->SetSelection(std::clamp(generic_solver_mix_model,
+                                                                   int(TextureMappingZone::GenericSolverPigmentPainter),
+                                                                   int(TextureMappingZone::GenericSolverPrusaFdmMixer)));
         generic_solver_mix_model_row->Add(m_generic_solver_mix_model_choice, 1, wxALIGN_CENTER_VERTICAL);
         experimental_box->Add(generic_solver_mix_model_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
 
@@ -2537,30 +2768,41 @@ public:
         m_top_surface_contoning_panel = new wxPanel(top_surface_page, wxID_ANY);
         auto *top_surface_contoning_root = new wxBoxSizer(wxVERTICAL);
         m_top_surface_contoning_panel->SetSizer(top_surface_contoning_root);
-        auto *contoning_angle_row = new wxBoxSizer(wxHORIZONTAL);
-        contoning_angle_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Surface angle threshold")),
-                                 0,
-                                 wxALIGN_CENTER_VERTICAL | wxRIGHT,
-                                 gap);
-        m_top_surface_contoning_angle_threshold_spin =
-            new wxSpinCtrlDouble(m_top_surface_contoning_panel,
-                                 wxID_ANY,
-                                 wxEmptyString,
-                                 wxDefaultPosition,
-                                 wxSize(FromDIP(84), -1),
-                                 wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER,
-                                 double(TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg),
-                                 double(TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg),
-                                 std::clamp(double(top_surface_contoning_angle_threshold_deg),
-                                            double(TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg),
-                                            double(TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg)),
-                                 1.0);
-        m_top_surface_contoning_angle_threshold_spin->SetDigits(0);
-        contoning_angle_row->Add(m_top_surface_contoning_angle_threshold_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
-        contoning_angle_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("deg")), 0, wxALIGN_CENTER_VERTICAL);
-        top_surface_contoning_root->Add(contoning_angle_row, 0, wxEXPAND | wxBOTTOM, gap);
+        if (TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions) {
+            auto *contoning_angle_row = new wxBoxSizer(wxHORIZONTAL);
+            contoning_angle_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Surface angle threshold")),
+                                     0,
+                                     wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                                     gap);
+            m_top_surface_contoning_angle_threshold_spin =
+                new wxSpinCtrlDouble(m_top_surface_contoning_panel,
+                                     wxID_ANY,
+                                     wxEmptyString,
+                                     wxDefaultPosition,
+                                     wxSize(FromDIP(84), -1),
+                                     wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER,
+                                     double(TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg),
+                                     double(TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg),
+                                     std::clamp(double(top_surface_contoning_angle_threshold_deg),
+                                                double(TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg),
+                                                double(TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg)),
+                                     1.0);
+            m_top_surface_contoning_angle_threshold_spin->SetDigits(0);
+            contoning_angle_row->Add(m_top_surface_contoning_angle_threshold_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+            contoning_angle_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("deg")), 0, wxALIGN_CENTER_VERTICAL);
+            top_surface_contoning_root->Add(contoning_angle_row, 0, wxEXPAND | wxBOTTOM, gap);
+        }
+        const int clamped_contoning_pattern_filaments =
+            std::clamp(top_surface_contoning_pattern_filaments,
+                       TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
+                       TextureMappingZone::MaxTopSurfaceContoningPatternFilaments);
+        const int clamped_contoning_stack_layers =
+            std::max(clamped_contoning_pattern_filaments,
+                     std::clamp(top_surface_contoning_stack_layers,
+                                TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                                TextureMappingZone::MaxTopSurfaceContoningStackLayers));
         auto *contoning_layers_row = new wxBoxSizer(wxHORIZONTAL);
-        contoning_layers_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Max infill/perimeter layer depth")),
+        contoning_layers_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Max infill layer depth")),
                                   0,
                                   wxALIGN_CENTER_VERTICAL | wxRIGHT,
                                   gap);
@@ -2573,9 +2815,7 @@ public:
                            wxSP_ARROW_KEYS | wxALIGN_RIGHT,
                            TextureMappingZone::MinTopSurfaceContoningStackLayers,
                            TextureMappingZone::MaxTopSurfaceContoningStackLayers,
-                           std::clamp(top_surface_contoning_stack_layers,
-                                      TextureMappingZone::MinTopSurfaceContoningStackLayers,
-                                      TextureMappingZone::MaxTopSurfaceContoningStackLayers));
+                           clamped_contoning_stack_layers);
         contoning_layers_row->Add(m_top_surface_contoning_stack_layers_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
         contoning_layers_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("layers")), 0, wxALIGN_CENTER_VERTICAL);
         top_surface_contoning_root->Add(contoning_layers_row, 0, wxEXPAND | wxBOTTOM, gap);
@@ -2593,34 +2833,22 @@ public:
                            wxSP_ARROW_KEYS | wxALIGN_RIGHT,
                            TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
                            TextureMappingZone::MaxTopSurfaceContoningPatternFilaments,
-                           std::clamp(top_surface_contoning_pattern_filaments,
-                                      TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
-                                      TextureMappingZone::MaxTopSurfaceContoningPatternFilaments));
+                           clamped_contoning_pattern_filaments);
         contoning_pattern_row->Add(m_top_surface_contoning_pattern_filaments_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
         contoning_pattern_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("layers")), 0, wxALIGN_CENTER_VERTICAL);
-        top_surface_contoning_root->Add(contoning_pattern_row, 0, wxEXPAND | wxBOTTOM, gap);
-        auto *contoning_feature_row = new wxBoxSizer(wxHORIZONTAL);
-        contoning_feature_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Minimum feature")),
-                                   0,
-                                   wxALIGN_CENTER_VERTICAL | wxRIGHT,
-                                   gap);
-        m_top_surface_contoning_min_feature_spin =
-            new wxSpinCtrlDouble(m_top_surface_contoning_panel,
-                                 wxID_ANY,
-                                 wxEmptyString,
-                                 wxDefaultPosition,
-                                 wxSize(FromDIP(84), -1),
-                                 wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER,
-                                 double(TextureMappingZone::MinTopSurfaceContoningMinFeatureMm),
-                                 double(TextureMappingZone::MaxTopSurfaceContoningMinFeatureMm),
-                                 std::clamp(double(top_surface_contoning_min_feature_mm),
-                                            double(TextureMappingZone::MinTopSurfaceContoningMinFeatureMm),
-                                            double(TextureMappingZone::MaxTopSurfaceContoningMinFeatureMm)),
-                                 0.1);
-        m_top_surface_contoning_min_feature_spin->SetDigits(1);
-        contoning_feature_row->Add(m_top_surface_contoning_min_feature_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
-        contoning_feature_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("mm")), 0, wxALIGN_CENTER_VERTICAL);
-        top_surface_contoning_root->Add(contoning_feature_row, 0, wxEXPAND);
+        top_surface_contoning_root->Add(contoning_pattern_row, 0, wxEXPAND);
+        m_top_surface_contoning_pattern_recommendation_text =
+            new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize, wxST_NO_AUTORESIZE);
+        top_surface_contoning_root->Add(m_top_surface_contoning_pattern_recommendation_text, 0, wxEXPAND | wxTOP | wxBOTTOM, gap / 2);
+        m_top_surface_contoning_shell_warning_text =
+            new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize, wxST_NO_AUTORESIZE);
+        m_top_surface_contoning_shell_warning_text->SetForegroundColour(wxColour(180, 86, 0));
+        top_surface_contoning_root->Add(m_top_surface_contoning_shell_warning_text, 0, wxEXPAND | wxBOTTOM, gap / 2);
+        wrap_top_surface_contoning_message_texts(false);
+        m_top_surface_contoning_panel->Bind(wxEVT_SIZE, [this](wxSizeEvent &evt) {
+            evt.Skip();
+            queue_top_surface_contoning_message_resize_wrap();
+        });
         if (TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions) {
             auto *contoning_flat_infill_row = new wxBoxSizer(wxHORIZONTAL);
             contoning_flat_infill_row->Add(new wxStaticText(m_top_surface_contoning_panel, wxID_ANY, _L("Flat surface infill mode")),
@@ -2628,7 +2856,7 @@ public:
                                            wxALIGN_CENTER_VERTICAL | wxRIGHT,
                                            gap);
             wxArrayString contoning_flat_infill_choices;
-            contoning_flat_infill_choices.Add(_L("Default (Rectilinear)"));
+            contoning_flat_infill_choices.Add(_L("Default (Boundary Skin variable width)"));
             contoning_flat_infill_choices.Add(_L("Rectilinear"));
             contoning_flat_infill_choices.Add(_L("Concentric"));
             contoning_flat_infill_choices.Add(_L("Boundary Skin (fixed width)"));
@@ -2659,6 +2887,46 @@ public:
         m_top_surface_contoning_color_lower_surfaces_checkbox->SetMinSize(
             wxSize(-1, std::max(m_top_surface_contoning_color_lower_surfaces_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
         contoning_checkboxes_root->Add(m_top_surface_contoning_color_lower_surfaces_checkbox,
+                                       0,
+                                       wxEXPAND | wxTOP | wxBOTTOM,
+                                       gap / 2);
+        const bool top_surface_contoning_td_effective_alpha_correction_selected =
+            TextureMappingZone::effective_top_surface_contoning_color_prediction_mode(top_surface_contoning_color_prediction_mode) ==
+            int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha);
+        m_top_surface_contoning_surface_scatter_checkbox =
+            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Surface scatter correction"));
+        m_top_surface_contoning_surface_scatter_checkbox->SetValue(
+            TextureMappingZone::effective_top_surface_contoning_surface_scatter_enabled(
+                true,
+                top_surface_contoning_surface_scatter_enabled,
+                top_surface_contoning_td_effective_alpha_correction_selected));
+        m_top_surface_contoning_surface_scatter_checkbox->SetMinSize(
+            wxSize(-1, std::max(m_top_surface_contoning_surface_scatter_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+        contoning_checkboxes_root->Add(m_top_surface_contoning_surface_scatter_checkbox,
+                                       0,
+                                       wxEXPAND | wxTOP | wxBOTTOM,
+                                       gap / 2);
+        auto *contoning_td_correction_row = new wxBoxSizer(wxHORIZONTAL);
+        contoning_td_correction_row->Add(new wxStaticText(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Color prediction mode")),
+                                         0,
+                                         wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                                         gap);
+        wxArrayString contoning_td_correction_choices;
+        contoning_td_correction_choices.Add(texture_mapping_contoning_color_prediction_default_label());
+        contoning_td_correction_choices.Add(texture_mapping_contoning_color_prediction_mode_label(int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha)));
+        contoning_td_correction_choices.Add(texture_mapping_contoning_color_prediction_mode_label(int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb)));
+        m_top_surface_contoning_td_correction_choice =
+            new wxChoice(m_top_surface_contoning_checkboxes_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, contoning_td_correction_choices);
+        m_top_surface_contoning_td_correction_choice->SetSelection(
+            texture_mapping_contoning_color_prediction_mode_choice_selection(top_surface_contoning_color_prediction_mode));
+        contoning_td_correction_row->Add(m_top_surface_contoning_td_correction_choice, 1, wxALIGN_CENTER_VERTICAL);
+        contoning_checkboxes_root->Add(contoning_td_correction_row, 0, wxEXPAND | wxTOP | wxBOTTOM, gap / 2);
+        m_top_surface_contoning_variable_layer_height_compensation_checkbox =
+            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Variable layer height compensation"));
+        m_top_surface_contoning_variable_layer_height_compensation_checkbox->SetValue(top_surface_contoning_variable_layer_height_compensation_enabled);
+        m_top_surface_contoning_variable_layer_height_compensation_checkbox->SetMinSize(
+            wxSize(-1, std::max(m_top_surface_contoning_variable_layer_height_compensation_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+        contoning_checkboxes_root->Add(m_top_surface_contoning_variable_layer_height_compensation_checkbox,
                                        0,
                                        wxEXPAND | wxTOP | wxBOTTOM,
                                        gap / 2);
@@ -2724,15 +2992,17 @@ public:
                                            wxEXPAND | wxTOP | wxBOTTOM,
                                            gap / 2);
         }
-        m_top_surface_contoning_layer_phase_checkbox =
-            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Layer phase detail"));
-        m_top_surface_contoning_layer_phase_checkbox->SetValue(top_surface_contoning_layer_phase_enabled);
-        m_top_surface_contoning_layer_phase_checkbox->SetMinSize(
-            wxSize(-1, std::max(m_top_surface_contoning_layer_phase_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
-        contoning_checkboxes_root->Add(m_top_surface_contoning_layer_phase_checkbox,
-                                       0,
-                                       wxEXPAND | wxTOP | wxBOTTOM,
-                                       gap / 2);
+        if (TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions) {
+            m_top_surface_contoning_layer_phase_checkbox =
+                new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Layer phase detail"));
+            m_top_surface_contoning_layer_phase_checkbox->SetValue(top_surface_contoning_layer_phase_enabled);
+            m_top_surface_contoning_layer_phase_checkbox->SetMinSize(
+                wxSize(-1, std::max(m_top_surface_contoning_layer_phase_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+            contoning_checkboxes_root->Add(m_top_surface_contoning_layer_phase_checkbox,
+                                           0,
+                                           wxEXPAND | wxTOP | wxBOTTOM,
+                                           gap / 2);
+        }
         m_top_surface_contoning_varied_infill_angles_checkbox =
             new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Varied infill angles"));
         m_top_surface_contoning_varied_infill_angles_checkbox->SetValue(top_surface_contoning_varied_infill_angles_enabled);
@@ -2742,24 +3012,26 @@ public:
                                        0,
                                        wxEXPAND | wxTOP | wxBOTTOM,
                                        gap / 2);
-        m_top_surface_contoning_blue_noise_error_diffusion_checkbox =
-            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Blue-noise error diffusion"));
-        m_top_surface_contoning_blue_noise_error_diffusion_checkbox->SetValue(top_surface_contoning_blue_noise_error_diffusion_enabled);
-        m_top_surface_contoning_blue_noise_error_diffusion_checkbox->SetMinSize(
-            wxSize(-1, std::max(m_top_surface_contoning_blue_noise_error_diffusion_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
-        contoning_checkboxes_root->Add(m_top_surface_contoning_blue_noise_error_diffusion_checkbox,
-                                       0,
-                                       wxEXPAND | wxTOP | wxBOTTOM,
-                                       gap / 2);
-        m_top_surface_contoning_supersampled_cells_checkbox =
-            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Supersampled cell colors"));
-        m_top_surface_contoning_supersampled_cells_checkbox->SetValue(top_surface_contoning_supersampled_cells_enabled);
-        m_top_surface_contoning_supersampled_cells_checkbox->SetMinSize(
-            wxSize(-1, std::max(m_top_surface_contoning_supersampled_cells_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
-        contoning_checkboxes_root->Add(m_top_surface_contoning_supersampled_cells_checkbox,
-                                       0,
-                                       wxEXPAND | wxTOP | wxBOTTOM,
-                                       gap / 2);
+        if (TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions) {
+            m_top_surface_contoning_blue_noise_error_diffusion_checkbox =
+                new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Blue-noise error diffusion"));
+            m_top_surface_contoning_blue_noise_error_diffusion_checkbox->SetValue(top_surface_contoning_blue_noise_error_diffusion_enabled);
+            m_top_surface_contoning_blue_noise_error_diffusion_checkbox->SetMinSize(
+                wxSize(-1, std::max(m_top_surface_contoning_blue_noise_error_diffusion_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+            contoning_checkboxes_root->Add(m_top_surface_contoning_blue_noise_error_diffusion_checkbox,
+                                           0,
+                                           wxEXPAND | wxTOP | wxBOTTOM,
+                                           gap / 2);
+            m_top_surface_contoning_supersampled_cells_checkbox =
+                new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Supersampled cell colors"));
+            m_top_surface_contoning_supersampled_cells_checkbox->SetValue(top_surface_contoning_supersampled_cells_enabled);
+            m_top_surface_contoning_supersampled_cells_checkbox->SetMinSize(
+                wxSize(-1, std::max(m_top_surface_contoning_supersampled_cells_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+            contoning_checkboxes_root->Add(m_top_surface_contoning_supersampled_cells_checkbox,
+                                           0,
+                                           wxEXPAND | wxTOP | wxBOTTOM,
+                                           gap / 2);
+        }
         m_top_surface_contoning_polygonize_color_regions_checkbox =
             new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Polygonize color regions"));
         m_top_surface_contoning_polygonize_color_regions_checkbox->SetValue(top_surface_contoning_polygonize_color_regions_enabled);
@@ -2779,13 +3051,26 @@ public:
         wxArrayString contoning_polygonize_resolution_choices;
         contoning_polygonize_resolution_choices.Add(_L("1x"));
         contoning_polygonize_resolution_choices.Add(_L("2x"));
-        contoning_polygonize_resolution_choices.Add(_L("4x (slow)"));
+        contoning_polygonize_resolution_choices.Add(_L("3x"));
+        contoning_polygonize_resolution_choices.Add(_L("4x"));
+        contoning_polygonize_resolution_choices.Add(_L("8x (slow)"));
         m_top_surface_contoning_polygonize_resolution_choice =
             new wxChoice(m_top_surface_contoning_polygonize_resolution_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, contoning_polygonize_resolution_choices);
         const int polygonize_resolution = TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(top_surface_contoning_polygonize_resolution);
-        m_top_surface_contoning_polygonize_resolution_choice->SetSelection(polygonize_resolution == 1 ? 0 : (polygonize_resolution == 4 ? 2 : 1));
+        m_top_surface_contoning_polygonize_resolution_choice->SetSelection(
+            polygonize_resolution == 1 ? 0 :
+            (polygonize_resolution == 2 ? 1 : (polygonize_resolution == 3 ? 2 : (polygonize_resolution == 4 ? 3 : 4))));
         contoning_polygonize_resolution_row->Add(m_top_surface_contoning_polygonize_resolution_choice, 1, wxEXPAND);
         contoning_checkboxes_root->Add(m_top_surface_contoning_polygonize_resolution_panel,
+                                       0,
+                                       wxEXPAND | wxTOP | wxBOTTOM,
+                                       gap / 2);
+        m_top_surface_contoning_fast_mode_checkbox =
+            new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Fast mode"));
+        m_top_surface_contoning_fast_mode_checkbox->SetValue(top_surface_contoning_fast_mode_enabled);
+        m_top_surface_contoning_fast_mode_checkbox->SetMinSize(
+            wxSize(-1, std::max(m_top_surface_contoning_fast_mode_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+        contoning_checkboxes_root->Add(m_top_surface_contoning_fast_mode_checkbox,
                                        0,
                                        wxEXPAND | wxTOP | wxBOTTOM,
                                        gap / 2);
@@ -2796,6 +3081,25 @@ public:
             m_top_surface_contoning_surface_anchored_stacks_checkbox->SetMinSize(
                 wxSize(-1, std::max(m_top_surface_contoning_surface_anchored_stacks_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
             contoning_checkboxes_root->Add(m_top_surface_contoning_surface_anchored_stacks_checkbox,
+                                           0,
+                                           wxEXPAND | wxTOP | wxBOTTOM,
+                                           gap / 2);
+            m_top_surface_contoning_surface_anchored_stack_optimizations_checkbox =
+                new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Surface-anchored stack optimizations"));
+            m_top_surface_contoning_surface_anchored_stack_optimizations_checkbox->SetValue(
+                top_surface_contoning_surface_anchored_stack_optimizations_enabled);
+            m_top_surface_contoning_surface_anchored_stack_optimizations_checkbox->SetMinSize(
+                wxSize(-1, std::max(m_top_surface_contoning_surface_anchored_stack_optimizations_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+            contoning_checkboxes_root->Add(m_top_surface_contoning_surface_anchored_stack_optimizations_checkbox,
+                                           0,
+                                           wxEXPAND | wxTOP | wxBOTTOM,
+                                           gap / 2);
+            m_top_surface_contoning_beam_search_stack_expansion_checkbox =
+                new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Use beam search for stack expansion"));
+            m_top_surface_contoning_beam_search_stack_expansion_checkbox->SetValue(top_surface_contoning_beam_search_stack_expansion_enabled);
+            m_top_surface_contoning_beam_search_stack_expansion_checkbox->SetMinSize(
+                wxSize(-1, std::max(m_top_surface_contoning_beam_search_stack_expansion_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+            contoning_checkboxes_root->Add(m_top_surface_contoning_beam_search_stack_expansion_checkbox,
                                            0,
                                            wxEXPAND | wxTOP | wxBOTTOM,
                                            gap / 2);
@@ -2828,6 +3132,62 @@ public:
         }
         if (m_top_surface_contoning_polygonize_color_regions_checkbox != nullptr) {
             m_top_surface_contoning_polygonize_color_regions_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+                update_top_surface_image_options_visibility(true);
+            });
+        }
+        if (m_top_surface_contoning_surface_scatter_checkbox != nullptr) {
+            m_top_surface_contoning_surface_scatter_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+                queue_top_surface_contoning_message_update(true);
+            });
+        }
+        if (m_top_surface_contoning_td_correction_choice != nullptr) {
+            m_top_surface_contoning_td_correction_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) {
+                update_top_surface_image_options_visibility(false);
+                queue_top_surface_contoning_message_update(true);
+            });
+        }
+        if (m_top_surface_contoning_variable_layer_height_compensation_checkbox != nullptr) {
+            m_top_surface_contoning_variable_layer_height_compensation_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+                queue_top_surface_contoning_message_update(true);
+            });
+        }
+        if (m_top_surface_contoning_color_lower_surfaces_checkbox != nullptr) {
+            m_top_surface_contoning_color_lower_surfaces_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+                queue_top_surface_contoning_message_update(true);
+            });
+        }
+        if (m_top_surface_contoning_stack_layers_spin != nullptr) {
+            m_top_surface_contoning_stack_layers_spin->Bind(wxEVT_SPINCTRL, [this](wxSpinEvent &) {
+                enforce_top_surface_contoning_stack_depth_at_least_pattern();
+                queue_top_surface_contoning_message_update(true);
+            });
+            m_top_surface_contoning_stack_layers_spin->Bind(wxEVT_TEXT, [this](wxCommandEvent &) {
+                enforce_top_surface_contoning_stack_depth_at_least_pattern();
+                queue_top_surface_contoning_message_update(true);
+            });
+        }
+        if (m_top_surface_contoning_pattern_filaments_spin != nullptr) {
+            m_top_surface_contoning_pattern_filaments_spin->Bind(wxEVT_SPINCTRL, [this](wxSpinEvent &) {
+                enforce_top_surface_contoning_stack_depth_at_least_pattern();
+                queue_top_surface_contoning_message_update(true);
+            });
+            m_top_surface_contoning_pattern_filaments_spin->Bind(wxEVT_TEXT, [this](wxCommandEvent &) {
+                enforce_top_surface_contoning_stack_depth_at_least_pattern();
+                queue_top_surface_contoning_message_update(true);
+            });
+        }
+        for (wxSpinCtrlDouble *spin : m_transmission_distance_spins) {
+            if (spin == nullptr)
+                continue;
+            spin->Bind(wxEVT_SPINCTRLDOUBLE, [this](wxSpinDoubleEvent &) {
+                queue_top_surface_contoning_message_update(true);
+            });
+            spin->Bind(wxEVT_TEXT, [this](wxCommandEvent &) {
+                queue_top_surface_contoning_message_update(true);
+            });
+        }
+        if (m_top_surface_contoning_surface_anchored_stacks_checkbox != nullptr) {
+            m_top_surface_contoning_surface_anchored_stacks_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
                 update_top_surface_image_options_visibility(true);
             });
         }
@@ -2980,8 +3340,11 @@ public:
         m_options_book->AddPage(global_page, _L("Prime Tower Texture Mapping"));
         update_options_book_min_size();
         m_options_tab_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &evt) {
+            const int selection = std::clamp(evt.GetSelection(), 0, 6);
             if (m_options_book)
-                m_options_book->SetSelection(std::clamp(evt.GetSelection(), 0, 6));
+                m_options_book->SetSelection(selection);
+            if (selection == 5)
+                queue_top_surface_contoning_message_update(true);
         });
         if (m_options_book)
             m_options_book->SetSelection(std::clamp(initial_options_tab, 0, 6));
@@ -2991,6 +3354,7 @@ public:
         SetSizerAndFit(root);
         SetMinSize(wxSize(FromDIP(420), GetBestSize().GetHeight()));
         CentreOnParent();
+        CallAfter([this]() { update_top_surface_contoning_td_recommendation(true); });
     }
 
     int texture_mapping_mode() const
@@ -3144,6 +3508,8 @@ public:
     }
     float top_surface_contoning_angle_threshold_deg() const
     {
+        if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
+            return TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg;
         return float(std::clamp(m_top_surface_contoning_angle_threshold_spin != nullptr ?
                                     m_top_surface_contoning_angle_threshold_spin->GetValue() :
                                     double(TextureMappingZone::DefaultTopSurfaceContoningAngleThresholdDeg),
@@ -3152,11 +3518,12 @@ public:
     }
     int top_surface_contoning_stack_layers() const
     {
-        return m_top_surface_contoning_stack_layers_spin ?
+        const int stack_layers = m_top_surface_contoning_stack_layers_spin ?
             std::clamp(m_top_surface_contoning_stack_layers_spin->GetValue(),
                        TextureMappingZone::MinTopSurfaceContoningStackLayers,
                        TextureMappingZone::MaxTopSurfaceContoningStackLayers) :
             TextureMappingZone::DefaultTopSurfaceContoningStackLayers;
+        return std::max(stack_layers, top_surface_contoning_pattern_filaments());
     }
     int top_surface_contoning_pattern_filaments() const
     {
@@ -3168,11 +3535,7 @@ public:
     }
     float top_surface_contoning_min_feature_mm() const
     {
-        return float(std::clamp(m_top_surface_contoning_min_feature_spin != nullptr ?
-                                    m_top_surface_contoning_min_feature_spin->GetValue() :
-                                    double(TextureMappingZone::DefaultTopSurfaceContoningMinFeatureMm),
-                                double(TextureMappingZone::MinTopSurfaceContoningMinFeatureMm),
-                                double(TextureMappingZone::MaxTopSurfaceContoningMinFeatureMm)));
+        return TextureMappingZone::DefaultTopSurfaceContoningMinFeatureMm;
     }
     bool top_surface_contoning_color_lower_surfaces() const
     {
@@ -3228,6 +3591,10 @@ public:
     }
     bool top_surface_contoning_layer_phase_enabled() const
     {
+        if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
+            return false;
+        if (top_surface_contoning_surface_anchored_stacks_enabled())
+            return false;
         return m_top_surface_contoning_layer_phase_checkbox != nullptr &&
                m_top_surface_contoning_layer_phase_checkbox->GetValue();
     }
@@ -3238,11 +3605,17 @@ public:
     }
     bool top_surface_contoning_blue_noise_error_diffusion_enabled() const
     {
+        if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
+            return false;
+        if (top_surface_contoning_surface_anchored_stacks_enabled())
+            return false;
         return m_top_surface_contoning_blue_noise_error_diffusion_checkbox != nullptr &&
                m_top_surface_contoning_blue_noise_error_diffusion_checkbox->GetValue();
     }
     bool top_surface_contoning_supersampled_cells_enabled() const
     {
+        if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
+            return false;
         return m_top_surface_contoning_supersampled_cells_checkbox != nullptr &&
                m_top_surface_contoning_supersampled_cells_checkbox->GetValue();
     }
@@ -3252,20 +3625,93 @@ public:
             m_top_surface_contoning_polygonize_color_regions_checkbox->GetValue() :
             TextureMappingZone::DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled;
     }
+    bool top_surface_contoning_fast_mode_enabled() const
+    {
+        return m_top_surface_contoning_fast_mode_checkbox != nullptr ?
+            m_top_surface_contoning_fast_mode_checkbox->GetValue() :
+            TextureMappingZone::DefaultTopSurfaceContoningFastModeEnabled;
+    }
     int top_surface_contoning_polygonize_resolution() const
     {
         if (m_top_surface_contoning_polygonize_resolution_choice == nullptr)
             return TextureMappingZone::DefaultTopSurfaceContoningPolygonizeResolution;
         const int selection = m_top_surface_contoning_polygonize_resolution_choice->GetSelection();
-        return selection == 0 ? 1 : (selection == 2 ? 4 : 2);
+        switch (selection) {
+        case 0: return 1;
+        case 1: return 2;
+        case 2: return 3;
+        case 3: return 4;
+        case 4: return 8;
+        default: return TextureMappingZone::DefaultTopSurfaceContoningPolygonizeResolution;
+        }
     }
     bool top_surface_contoning_surface_anchored_stacks_enabled() const
     {
         if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
-            return false;
+            return true;
         return m_top_surface_contoning_surface_anchored_stacks_checkbox == nullptr ?
             TextureMappingZone::DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled :
             m_top_surface_contoning_surface_anchored_stacks_checkbox->GetValue();
+    }
+    bool top_surface_contoning_surface_anchored_stack_optimizations_enabled() const
+    {
+        if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
+            return true;
+        return m_top_surface_contoning_surface_anchored_stack_optimizations_checkbox == nullptr ?
+            TextureMappingZone::DefaultTopSurfaceContoningSurfaceAnchoredStackOptimizationsEnabled :
+            m_top_surface_contoning_surface_anchored_stack_optimizations_checkbox->GetValue();
+    }
+    bool top_surface_contoning_beam_search_stack_expansion_enabled() const
+    {
+        if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
+            return true;
+        return m_top_surface_contoning_beam_search_stack_expansion_checkbox == nullptr ?
+            TextureMappingZone::DefaultTopSurfaceContoningBeamSearchStackExpansionEnabled :
+            m_top_surface_contoning_beam_search_stack_expansion_checkbox->GetValue();
+    }
+    bool top_surface_contoning_td_adjustment_enabled() const
+    {
+        return true;
+    }
+    int top_surface_contoning_color_prediction_mode() const
+    {
+        return m_top_surface_contoning_td_correction_choice == nullptr ?
+            TextureMappingZone::DefaultTopSurfaceContoningColorPredictionMode :
+            texture_mapping_contoning_color_prediction_mode_from_choice_selection(
+                m_top_surface_contoning_td_correction_choice->GetSelection());
+    }
+    bool top_surface_contoning_td_effective_alpha_correction_selected() const
+    {
+        return TextureMappingZone::effective_top_surface_contoning_color_prediction_mode(
+            top_surface_contoning_color_prediction_mode()) ==
+            int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha);
+    }
+    bool top_surface_contoning_surface_scatter_enabled() const
+    {
+        return TextureMappingZone::effective_top_surface_contoning_surface_scatter_enabled(
+            top_surface_contoning_td_adjustment_enabled(),
+            m_top_surface_contoning_surface_scatter_checkbox == nullptr ?
+                TextureMappingZone::DefaultTopSurfaceContoningSurfaceScatterEnabled :
+                m_top_surface_contoning_surface_scatter_checkbox->GetValue(),
+            top_surface_contoning_td_effective_alpha_correction_enabled());
+    }
+    bool top_surface_contoning_beer_lambert_rgb_correction_enabled() const
+    {
+        return top_surface_contoning_td_adjustment_enabled() &&
+            TextureMappingZone::effective_top_surface_contoning_color_prediction_mode(
+                top_surface_contoning_color_prediction_mode()) ==
+                int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb);
+    }
+    bool top_surface_contoning_td_effective_alpha_correction_enabled() const
+    {
+        return top_surface_contoning_td_adjustment_enabled() &&
+            top_surface_contoning_td_effective_alpha_correction_selected();
+    }
+    bool top_surface_contoning_variable_layer_height_compensation_enabled() const
+    {
+        return m_top_surface_contoning_variable_layer_height_compensation_checkbox == nullptr ?
+            TextureMappingZone::DefaultTopSurfaceContoningVariableLayerHeightCompensationEnabled :
+            m_top_surface_contoning_variable_layer_height_compensation_checkbox->GetValue();
     }
     bool minimum_visibility_offset_enabled() const
     {
@@ -3291,15 +3737,17 @@ public:
     int generic_solver_mode() const
     {
         return m_generic_solver_mode_choice ?
-            std::clamp(m_generic_solver_mode_choice->GetSelection(),
-                       int(TextureMappingZone::GenericSolverLegacy),
-                       int(TextureMappingZone::GenericSolverV2)) :
-            int(TextureMappingZone::GenericSolverV2);
+            texture_mapping_generic_solver_mode_from_choice_selection(m_generic_solver_mode_choice->GetSelection()) :
+            TextureMappingZone::DefaultGenericSolverMode;
     }
 
     int generic_solver_mix_model() const
     {
-        return TextureMappingZone::DefaultGenericSolverMixModel;
+        return m_generic_solver_mix_model_choice ?
+            std::clamp(m_generic_solver_mix_model_choice->GetSelection(),
+                       int(TextureMappingZone::GenericSolverPigmentPainter),
+                       int(TextureMappingZone::GenericSolverPrusaFdmMixer)) :
+            TextureMappingZone::DefaultGenericSolverMixModel;
     }
 
     TextureMappingGlobalSettings global_settings() const
@@ -3572,6 +4020,334 @@ private:
         }
     }
 
+    float top_surface_contoning_layer_height_mm() const
+    {
+        auto read_layer_height = [](const DynamicPrintConfig &config, float &value) {
+            if (!config.has("layer_height"))
+                return false;
+            const ConfigOptionFloat *opt = config.option<ConfigOptionFloat>("layer_height");
+            if (opt == nullptr || !std::isfinite(opt->value) || opt->value <= 0.0)
+                return false;
+            value = float(opt->value);
+            return true;
+        };
+
+        float value = 0.2f;
+        PresetBundle *bundle = wxGetApp().preset_bundle;
+        if (bundle != nullptr) {
+            if (read_layer_height(bundle->project_config, value))
+                return std::clamp(value, 0.01f, 2.f);
+            if (read_layer_height(bundle->prints.get_edited_preset().config, value))
+                return std::clamp(value, 0.01f, 2.f);
+        }
+        return value;
+    }
+
+    int top_surface_contoning_layers_for_strength(float td_mm, float strength) const
+    {
+        if (!std::isfinite(td_mm) || td_mm <= 0.f)
+            return 0;
+        const float layer_height = top_surface_contoning_layer_height_mm();
+        const float safe_strength = std::clamp(strength, 0.01f, 0.99f);
+        const float surface_scatter = top_surface_contoning_surface_scatter_enabled() ? 0.12f : 0.f;
+        if (safe_strength <= surface_scatter)
+            return 1;
+        const float remaining = std::clamp((1.f - safe_strength) / (1.f - surface_scatter), 1e-6f, 0.999999f);
+        const float density_scale = top_surface_contoning_td_effective_alpha_correction_enabled() ? 0.6761904762f : 1.f;
+        const float layers = (td_mm / (2.f * layer_height * density_scale)) * (std::log(remaining) / std::log(0.05f));
+        return std::max(1, int(std::ceil(layers)));
+    }
+
+    wxString top_surface_contoning_td_recommendation_text() const
+    {
+        if (!top_surface_contoning_td_adjustment_enabled() || m_transmission_distance_spins.empty())
+            return wxEmptyString;
+
+        int lower = 0;
+        int upper = 0;
+        int strong = 0;
+        bool has_translucent = false;
+        for (wxSpinCtrlDouble *spin : m_transmission_distance_spins) {
+            const double td_value = spin != nullptr ? spin->GetValue() : 0.0;
+            if (!std::isfinite(td_value) || td_value <= 0.0)
+                return wxEmptyString;
+            const float td_mm = float(std::clamp(td_value, 0.01, 50.0));
+            if (top_surface_contoning_layers_for_strength(td_mm, 0.95f) <= 3)
+                continue;
+            has_translucent = true;
+            lower = std::max(lower, top_surface_contoning_layers_for_strength(td_mm, 0.30f));
+            upper = std::max(upper, top_surface_contoning_layers_for_strength(td_mm, 0.50f));
+            strong = std::max(strong, top_surface_contoning_layers_for_strength(td_mm, 0.75f));
+        }
+
+        if (!has_translucent)
+            return _L("Recommendation based on TD: 1-3 layers.");
+        upper = std::max(upper, lower);
+        strong = std::max(strong, upper);
+        return wxString::Format(_L("Recommendation based on highest TD: %d+ layers"),
+                                upper);
+    }
+
+    wxString top_surface_contoning_shell_warning_text() const
+    {
+        if (m_top_surface_contoning_shell_usage.object_count <= 0)
+            return wxEmptyString;
+
+        const int pattern_layers = top_surface_contoning_pattern_filaments();
+        const bool top_too_shallow = m_top_surface_contoning_shell_usage.min_top_shell_layers < pattern_layers;
+        const bool bottom_too_shallow =
+            top_surface_contoning_color_lower_surfaces() &&
+            m_top_surface_contoning_shell_usage.min_bottom_shell_layers < pattern_layers;
+        if (!top_too_shallow && !bottom_too_shallow)
+            return wxEmptyString;
+
+        const wxString object_text = m_top_surface_contoning_shell_usage.object_count == 1 ?
+            _L("1 object") :
+            wxString::Format(_L("%d objects"), m_top_surface_contoning_shell_usage.object_count);
+        wxString shell_text;
+        if (top_too_shallow && bottom_too_shallow) {
+            shell_text = wxString::Format(_L("top shell (%d) and bottom shell count (%d)"),
+                                          m_top_surface_contoning_shell_usage.min_top_shell_layers,
+                                          m_top_surface_contoning_shell_usage.min_bottom_shell_layers);
+        } else if (top_too_shallow) {
+            shell_text = wxString::Format(_L("top shell count (%d)"),
+                                          m_top_surface_contoning_shell_usage.min_top_shell_layers);
+        } else {
+            shell_text = wxString::Format(_L("bottom shell count (%d)"),
+                                          m_top_surface_contoning_shell_usage.min_bottom_shell_layers);
+        }
+        return wxString::Format(_L("Warning: this zone is used by %s, but the lowest %s is lower than the %d-layer color pattern."),
+                                object_text.c_str(),
+                                shell_text.c_str(),
+                                pattern_layers);
+    }
+
+    void enforce_top_surface_contoning_stack_depth_at_least_pattern()
+    {
+        if (m_top_surface_contoning_stack_layers_spin == nullptr ||
+            m_top_surface_contoning_pattern_filaments_spin == nullptr)
+            return;
+        const int pattern_layers = top_surface_contoning_pattern_filaments();
+        if (m_top_surface_contoning_stack_layers_spin->GetValue() < pattern_layers)
+            m_top_surface_contoning_stack_layers_spin->SetValue(pattern_layers);
+    }
+
+    int top_surface_contoning_message_wrap_width()
+    {
+        int width = 0;
+        auto consider_width = [this, &width](int candidate) {
+            if (candidate <= FromDIP(120))
+                return;
+            width = width <= FromDIP(120) ? candidate : std::min(width, candidate);
+        };
+        if (m_top_surface_contoning_panel != nullptr)
+            consider_width(m_top_surface_contoning_panel->GetClientSize().GetWidth());
+        if (m_options_book != nullptr)
+            consider_width(m_options_book->GetClientSize().GetWidth() - FromDIP(16));
+        consider_width(GetClientSize().GetWidth() - FromDIP(56));
+        if (width <= FromDIP(120))
+            width = FromDIP(360);
+        return std::clamp(width - FromDIP(16), FromDIP(120), FromDIP(380));
+    }
+
+    int wrapped_static_text_height(wxStaticText *text, const wxSize &best_size)
+    {
+        if (text == nullptr || !text->IsShown())
+            return 0;
+        const wxString label = text->GetLabel();
+        if (label.empty())
+            return 0;
+        int line_height = 0;
+        int lines = 0;
+        size_t start = 0;
+        while (start <= label.length()) {
+            size_t end = label.find('\n', start);
+            const wxString line = end == wxString::npos ? label.Mid(start) : label.Mid(start, end - start);
+            int line_width = 0;
+            int measured_height = 0;
+            const wxString measured_line = line.empty() ? wxString(" ") : line;
+            text->GetTextExtent(measured_line, &line_width, &measured_height);
+            line_height = std::max(line_height, measured_height);
+            ++lines;
+            if (end == wxString::npos)
+                break;
+            start = end + 1;
+        }
+        return std::max(best_size.GetHeight(), lines * std::max(1, line_height) + FromDIP(6));
+    }
+
+    int static_text_width(wxStaticText *text, const wxString &label)
+    {
+        if (text == nullptr || label.empty())
+            return 0;
+        int width = 0;
+        int height = 0;
+        text->GetTextExtent(label, &width, &height);
+        return width;
+    }
+
+    void append_wrapped_static_text_line(wxString &wrapped, const wxString &line)
+    {
+        if (line.empty())
+            return;
+        if (!wrapped.empty())
+            wrapped += '\n';
+        wrapped += line;
+    }
+
+    wxString wrapped_static_text_label(wxStaticText *text, const wxString &label, int wrap_width)
+    {
+        if (label.empty() || text == nullptr)
+            return wxEmptyString;
+        wxString wrapped;
+        wxString line;
+        wxStringTokenizer tokens(label, " \t\r\n");
+        while (tokens.HasMoreTokens()) {
+            const wxString word = tokens.GetNextToken();
+            const wxString candidate = line.empty() ? word : line + " " + word;
+            if (line.empty() || static_text_width(text, candidate) <= wrap_width) {
+                line = candidate;
+                continue;
+            }
+            append_wrapped_static_text_line(wrapped, line);
+            line = word;
+        }
+        append_wrapped_static_text_line(wrapped, line);
+        return wrapped.empty() ? label : wrapped;
+    }
+
+    void wrap_top_surface_contoning_message_text(wxStaticText *text, const wxString &label, int wrap_width)
+    {
+        if (text == nullptr)
+            return;
+        text->SetMinSize(wxDefaultSize);
+        text->SetLabel(wrapped_static_text_label(text, label, wrap_width));
+        text->InvalidateBestSize();
+        const wxSize best_size = text->GetBestSize();
+        const int height = wrapped_static_text_height(text, best_size);
+        text->SetMinSize(wxSize(wrap_width, height));
+        text->SetSize(wxSize(wrap_width, height));
+    }
+
+    void refresh_top_surface_contoning_message_layout()
+    {
+        for (wxWindow *window = m_top_surface_contoning_panel; window != nullptr; window = window->GetParent()) {
+            window->InvalidateBestSize();
+            if (window == this)
+                break;
+        }
+        if (m_top_surface_contoning_panel != nullptr)
+            m_top_surface_contoning_panel->Layout();
+        layout_current_options_page();
+        update_options_book_min_size();
+        if (GetSizer() != nullptr) {
+            GetSizer()->Layout();
+            Layout();
+        }
+    }
+
+    void wrap_top_surface_contoning_message_texts(bool refresh_layout, bool fit_dialog = false)
+    {
+        const int wrap_width = top_surface_contoning_message_wrap_width();
+        m_top_surface_contoning_message_last_wrap_width = wrap_width;
+        wrap_top_surface_contoning_message_text(m_top_surface_contoning_pattern_recommendation_text,
+                                                m_top_surface_contoning_pattern_recommendation_label,
+                                                wrap_width);
+        wrap_top_surface_contoning_message_text(m_top_surface_contoning_shell_warning_text,
+                                                m_top_surface_contoning_shell_warning_label,
+                                                wrap_width);
+        if (!refresh_layout || m_top_surface_contoning_message_wrap_refreshing)
+            return;
+        m_top_surface_contoning_message_wrap_fit_pending = m_top_surface_contoning_message_wrap_fit_pending || fit_dialog;
+        m_top_surface_contoning_message_wrap_refreshing = true;
+        refresh_top_surface_contoning_message_layout();
+        m_top_surface_contoning_message_wrap_refreshing = false;
+        if (m_top_surface_contoning_message_wrap_pending)
+            return;
+        m_top_surface_contoning_message_wrap_pending = true;
+        CallAfter([this]() {
+            m_top_surface_contoning_message_wrap_pending = false;
+            const bool deferred_fit = m_top_surface_contoning_message_wrap_fit_pending;
+            m_top_surface_contoning_message_wrap_fit_pending = false;
+            if (m_top_surface_contoning_pattern_recommendation_text == nullptr)
+                return;
+            wrap_top_surface_contoning_message_texts(false);
+            refresh_top_surface_contoning_message_layout();
+            if (deferred_fit && GetSizer() != nullptr) {
+                Layout();
+                Fit();
+            }
+        });
+    }
+
+    void wrap_top_surface_contoning_message_texts_for_resize()
+    {
+        const int wrap_width = top_surface_contoning_message_wrap_width();
+        if (wrap_width == m_top_surface_contoning_message_last_wrap_width)
+            return;
+        wrap_top_surface_contoning_message_texts(false);
+        if (m_top_surface_contoning_panel != nullptr)
+            m_top_surface_contoning_panel->Layout();
+    }
+
+    void queue_top_surface_contoning_message_resize_wrap()
+    {
+        if (m_top_surface_contoning_message_resize_wrap_pending)
+            return;
+        m_top_surface_contoning_message_resize_wrap_pending = true;
+        CallAfter([this]() {
+            m_top_surface_contoning_message_resize_wrap_pending = false;
+            if (m_top_surface_contoning_panel == nullptr)
+                return;
+            wrap_top_surface_contoning_message_texts_for_resize();
+        });
+    }
+
+    void queue_top_surface_contoning_message_update(bool fit_dialog)
+    {
+        m_top_surface_contoning_message_update_fit_pending = m_top_surface_contoning_message_update_fit_pending || fit_dialog;
+        if (m_top_surface_contoning_message_update_pending)
+            return;
+        m_top_surface_contoning_message_update_pending = true;
+        CallAfter([this]() {
+            m_top_surface_contoning_message_update_pending = false;
+            const bool deferred_fit = m_top_surface_contoning_message_update_fit_pending;
+            m_top_surface_contoning_message_update_fit_pending = false;
+            if (m_top_surface_contoning_panel == nullptr)
+                return;
+            layout_current_options_page();
+            m_top_surface_contoning_message_last_wrap_width = 0;
+            update_top_surface_contoning_td_recommendation(deferred_fit);
+        });
+    }
+
+    void update_top_surface_contoning_td_recommendation(bool fit_dialog)
+    {
+        if (m_top_surface_contoning_pattern_recommendation_text == nullptr)
+            return;
+        const bool contoning =
+            m_top_surface_image_printing_enabled_checkbox != nullptr &&
+            m_top_surface_image_printing_enabled_checkbox->GetValue() &&
+            m_top_surface_image_method_choice != nullptr &&
+            m_top_surface_image_method_choice->GetSelection() == int(TextureMappingZone::TopSurfaceImageContoning);
+        enforce_top_surface_contoning_stack_depth_at_least_pattern();
+        m_top_surface_contoning_pattern_recommendation_label = contoning ? top_surface_contoning_td_recommendation_text() : wxString();
+        m_top_surface_contoning_pattern_recommendation_text->Show(!m_top_surface_contoning_pattern_recommendation_label.empty());
+        if (m_top_surface_contoning_shell_warning_text != nullptr) {
+            m_top_surface_contoning_shell_warning_label = contoning ? top_surface_contoning_shell_warning_text() : wxString();
+            m_top_surface_contoning_shell_warning_text->Show(!m_top_surface_contoning_shell_warning_label.empty());
+        }
+        wrap_top_surface_contoning_message_texts(true, fit_dialog);
+        if (!fit_dialog)
+            return;
+        layout_current_options_page();
+        update_options_book_min_size();
+        if (GetSizer() != nullptr) {
+            Layout();
+            Fit();
+        }
+    }
+
     void update_modulation_mode_options_visibility(bool fit_dialog)
     {
         const bool perimeter_path_mode = modulation_mode() == int(TextureMappingZone::ModulationPerimeterPath) ||
@@ -3713,8 +4489,6 @@ private:
             m_top_surface_contoning_stack_layers_spin->Enable(contoning);
         if (m_top_surface_contoning_pattern_filaments_spin != nullptr)
             m_top_surface_contoning_pattern_filaments_spin->Enable(contoning);
-        if (m_top_surface_contoning_min_feature_spin != nullptr)
-            m_top_surface_contoning_min_feature_spin->Enable(contoning);
         if (m_top_surface_contoning_flat_surface_infill_choice != nullptr)
             m_top_surface_contoning_flat_surface_infill_choice->Enable(contoning);
         if (m_top_surface_contoning_checkboxes_panel != nullptr)
@@ -3722,6 +4496,24 @@ private:
         if (m_top_surface_contoning_color_lower_surfaces_checkbox != nullptr) {
             m_top_surface_contoning_color_lower_surfaces_checkbox->Show(contoning);
             m_top_surface_contoning_color_lower_surfaces_checkbox->Enable(contoning);
+        }
+        if (m_top_surface_contoning_surface_scatter_checkbox != nullptr) {
+            const bool td_adjustment = contoning;
+            const bool td_effective_alpha =
+                td_adjustment &&
+                top_surface_contoning_td_effective_alpha_correction_selected();
+            m_top_surface_contoning_surface_scatter_checkbox->Show(contoning);
+            m_top_surface_contoning_surface_scatter_checkbox->Enable(td_adjustment && !td_effective_alpha);
+            if (td_effective_alpha && m_top_surface_contoning_surface_scatter_checkbox->GetValue())
+                m_top_surface_contoning_surface_scatter_checkbox->SetValue(false);
+        }
+        if (m_top_surface_contoning_td_correction_choice != nullptr) {
+            m_top_surface_contoning_td_correction_choice->Show(contoning);
+            m_top_surface_contoning_td_correction_choice->Enable(contoning);
+        }
+        if (m_top_surface_contoning_variable_layer_height_compensation_checkbox != nullptr) {
+            m_top_surface_contoning_variable_layer_height_compensation_checkbox->Show(contoning);
+            m_top_surface_contoning_variable_layer_height_compensation_checkbox->Enable(contoning);
         }
         if (m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox != nullptr) {
             m_top_surface_contoning_only_one_perimeter_around_shell_infill_checkbox->Show(contoning);
@@ -3747,9 +4539,19 @@ private:
             m_top_surface_contoning_perimeter_mode_panel->Show(show_perimeter_mode);
         if (m_top_surface_contoning_perimeter_mode_choice != nullptr)
             m_top_surface_contoning_perimeter_mode_choice->Enable(show_perimeter_mode);
+        const bool surface_anchored_stacks =
+            contoning &&
+            m_top_surface_contoning_surface_anchored_stacks_checkbox != nullptr &&
+            m_top_surface_contoning_surface_anchored_stacks_checkbox->GetValue();
+        if (surface_anchored_stacks) {
+            if (m_top_surface_contoning_layer_phase_checkbox != nullptr)
+                m_top_surface_contoning_layer_phase_checkbox->SetValue(false);
+            if (m_top_surface_contoning_blue_noise_error_diffusion_checkbox != nullptr)
+                m_top_surface_contoning_blue_noise_error_diffusion_checkbox->SetValue(false);
+        }
         if (m_top_surface_contoning_layer_phase_checkbox != nullptr) {
             m_top_surface_contoning_layer_phase_checkbox->Show(contoning);
-            m_top_surface_contoning_layer_phase_checkbox->Enable(contoning);
+            m_top_surface_contoning_layer_phase_checkbox->Enable(contoning && !surface_anchored_stacks);
         }
         if (m_top_surface_contoning_varied_infill_angles_checkbox != nullptr) {
             m_top_surface_contoning_varied_infill_angles_checkbox->Show(contoning);
@@ -3757,7 +4559,7 @@ private:
         }
         if (m_top_surface_contoning_blue_noise_error_diffusion_checkbox != nullptr) {
             m_top_surface_contoning_blue_noise_error_diffusion_checkbox->Show(contoning);
-            m_top_surface_contoning_blue_noise_error_diffusion_checkbox->Enable(contoning);
+            m_top_surface_contoning_blue_noise_error_diffusion_checkbox->Enable(contoning && !surface_anchored_stacks);
         }
         if (m_top_surface_contoning_supersampled_cells_checkbox != nullptr) {
             m_top_surface_contoning_supersampled_cells_checkbox->Show(contoning);
@@ -3771,6 +4573,10 @@ private:
             contoning &&
             m_top_surface_contoning_polygonize_color_regions_checkbox != nullptr &&
             m_top_surface_contoning_polygonize_color_regions_checkbox->GetValue();
+        if (m_top_surface_contoning_fast_mode_checkbox != nullptr) {
+            m_top_surface_contoning_fast_mode_checkbox->Show(contoning);
+            m_top_surface_contoning_fast_mode_checkbox->Enable(polygonize_color_regions);
+        }
         if (m_top_surface_contoning_polygonize_resolution_panel != nullptr)
             m_top_surface_contoning_polygonize_resolution_panel->Show(polygonize_color_regions);
         if (m_top_surface_contoning_polygonize_resolution_choice != nullptr)
@@ -3779,10 +4585,19 @@ private:
             m_top_surface_contoning_surface_anchored_stacks_checkbox->Show(contoning);
             m_top_surface_contoning_surface_anchored_stacks_checkbox->Enable(contoning);
         }
+        if (m_top_surface_contoning_surface_anchored_stack_optimizations_checkbox != nullptr) {
+            m_top_surface_contoning_surface_anchored_stack_optimizations_checkbox->Show(contoning);
+            m_top_surface_contoning_surface_anchored_stack_optimizations_checkbox->Enable(contoning && surface_anchored_stacks);
+        }
+        if (m_top_surface_contoning_beam_search_stack_expansion_checkbox != nullptr) {
+            m_top_surface_contoning_beam_search_stack_expansion_checkbox->Show(contoning);
+            m_top_surface_contoning_beam_search_stack_expansion_checkbox->Enable(contoning);
+        }
         if (m_top_surface_image_fixed_coloring_filaments_checkbox != nullptr) {
             m_top_surface_image_fixed_coloring_filaments_checkbox->Show(!contoning_selected);
             m_top_surface_image_fixed_coloring_filaments_checkbox->Enable(enabled && !contoning_selected);
         }
+        update_top_surface_contoning_td_recommendation(false);
         layout_current_options_page();
         if (!fit_dialog)
             return;
@@ -3813,6 +4628,16 @@ private:
     wxChoice *m_modulation_mode_choice {nullptr};
     std::vector<int> m_modulation_mode_choice_values;
     bool m_modulation_mode_manually_changed {false};
+    TextureMappingZoneShellUsageSummary m_top_surface_contoning_shell_usage;
+    bool m_top_surface_contoning_message_wrap_refreshing {false};
+    bool m_top_surface_contoning_message_wrap_pending {false};
+    bool m_top_surface_contoning_message_wrap_fit_pending {false};
+    bool m_top_surface_contoning_message_resize_wrap_pending {false};
+    bool m_top_surface_contoning_message_update_pending {false};
+    bool m_top_surface_contoning_message_update_fit_pending {false};
+    int m_top_surface_contoning_message_last_wrap_width {0};
+    wxString m_top_surface_contoning_pattern_recommendation_label;
+    wxString m_top_surface_contoning_shell_warning_label;
     wxCheckBox *m_recolor_small_perimeter_loops_checkbox {nullptr};
     wxCheckBox *m_recolor_top_visible_perimeter_sections_checkbox {nullptr};
     wxStaticText *m_top_visible_perimeter_recolor_aggressiveness_label {nullptr};
@@ -3838,7 +4663,8 @@ private:
     wxSpinCtrlDouble *m_top_surface_contoning_angle_threshold_spin {nullptr};
     wxSpinCtrl *m_top_surface_contoning_stack_layers_spin {nullptr};
     wxSpinCtrl *m_top_surface_contoning_pattern_filaments_spin {nullptr};
-    wxSpinCtrlDouble *m_top_surface_contoning_min_feature_spin {nullptr};
+    wxStaticText *m_top_surface_contoning_pattern_recommendation_text {nullptr};
+    wxStaticText *m_top_surface_contoning_shell_warning_text {nullptr};
     wxChoice *m_top_surface_contoning_flat_surface_infill_choice {nullptr};
     wxPanel *m_top_surface_contoning_checkboxes_panel {nullptr};
     wxCheckBox *m_top_surface_contoning_color_lower_surfaces_checkbox {nullptr};
@@ -3853,9 +4679,15 @@ private:
     wxCheckBox *m_top_surface_contoning_blue_noise_error_diffusion_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_supersampled_cells_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_polygonize_color_regions_checkbox {nullptr};
+    wxCheckBox *m_top_surface_contoning_fast_mode_checkbox {nullptr};
     wxPanel *m_top_surface_contoning_polygonize_resolution_panel {nullptr};
     wxChoice *m_top_surface_contoning_polygonize_resolution_choice {nullptr};
     wxCheckBox *m_top_surface_contoning_surface_anchored_stacks_checkbox {nullptr};
+    wxCheckBox *m_top_surface_contoning_surface_anchored_stack_optimizations_checkbox {nullptr};
+    wxCheckBox *m_top_surface_contoning_beam_search_stack_expansion_checkbox {nullptr};
+    wxCheckBox *m_top_surface_contoning_surface_scatter_checkbox {nullptr};
+    wxChoice *m_top_surface_contoning_td_correction_choice {nullptr};
+    wxCheckBox *m_top_surface_contoning_variable_layer_height_compensation_checkbox {nullptr};
     wxCheckBox *m_use_legacy_fixed_color_mode_checkbox {nullptr};
     wxCheckBox *m_minimum_visibility_offset_checkbox {nullptr};
     wxSpinCtrl *m_minimum_visibility_offset_spin {nullptr};
@@ -7908,7 +8740,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                           parse_texture_mapping_color(entry.display_color),
                           entry.is_linear_gradient() ? TextureMappingManager::normalized_linear_gradient_stops(entry, num_physical) : std::vector<TextureMappingZone::LinearGradientStop>(),
                           entry.is_linear_gradient(),
-                          entry.is_radial_linear_gradient());
+                          entry.is_radial_linear_gradient(),
+                          entry.generic_solver_mix_model);
         header_sizer->Add(preview, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         row_sizer->Add(header, 0, wxEXPAND | wxTOP | wxBOTTOM, gap);
 
@@ -7932,7 +8765,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                   parse_texture_mapping_color(zone.display_color),
                                   zone.is_linear_gradient() ? TextureMappingManager::normalized_linear_gradient_stops(zone, num_physical) : std::vector<TextureMappingZone::LinearGradientStop>(),
                                   zone.is_linear_gradient(),
-                                  zone.is_radial_linear_gradient());
+                                  zone.is_radial_linear_gradient(),
+                                  zone.generic_solver_mix_model);
             }
             if (swatch != nullptr)
                 swatch->set_data(parse_texture_mapping_color(zone.display_color), zone_id);
@@ -8014,7 +8848,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         const unsigned int initial_end_filament = initial_linear_gradient_stops.empty() ? initial_start_filament : initial_linear_gradient_stops.back().filament_id;
         auto *linear_gradient_stops_bar = new LinearGradientStopsBar(editor);
         linear_gradient_stops_bar->SetBackgroundColour(row_bg);
-        linear_gradient_stops_bar->set_data(palette, num_physical, initial_linear_gradient_stops, -1);
+        linear_gradient_stops_bar->set_data(palette, num_physical, initial_linear_gradient_stops, -1, entry.generic_solver_mix_model);
         editor_sizer->Add(linear_gradient_stops_bar, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
 
         auto *linear_gradient_row = new wxBoxSizer(wxHORIZONTAL);
@@ -8798,6 +9632,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                       physical_colors,
                                       apply_zone,
                                       bundle,
+                                      print_cfg,
                                       set_config_string,
                                       notify_change,
                                       refresh_texture_mapping_preview]() {
@@ -8823,6 +9658,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                         updated.filament_transmission_distances_mm[idx] :
                                                         0.f);
             }
+            const TextureMappingZoneShellUsageSummary shell_usage =
+                texture_mapping_zone_shell_usage_summary(wxGetApp().model(), *print_cfg, mgr_ptr->zone_id_for_index(zone_index));
             TextureMappingAdvancedOptionsDialog dlg(this,
                                                     updated.texture_mapping_mode,
                                                     updated.filament_color_mode,
@@ -8878,8 +9715,18 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.top_surface_contoning_blue_noise_error_diffusion_enabled,
                                                     updated.top_surface_contoning_supersampled_cells_enabled,
                                                     updated.top_surface_contoning_polygonize_color_regions_enabled,
+                                                    updated.top_surface_contoning_fast_mode_enabled,
                                                     updated.top_surface_contoning_polygonize_resolution,
                                                     updated.top_surface_contoning_surface_anchored_stacks_enabled,
+                                                    updated.top_surface_contoning_surface_anchored_stack_optimizations_enabled,
+                                                    updated.top_surface_contoning_beam_search_stack_expansion_enabled,
+                                                    updated.top_surface_contoning_td_adjustment_enabled,
+                                                    updated.top_surface_contoning_surface_scatter_enabled,
+                                                    updated.top_surface_contoning_color_prediction_mode,
+                                                    updated.top_surface_contoning_beer_lambert_rgb_correction_enabled,
+                                                    updated.top_surface_contoning_td_effective_alpha_correction_enabled,
+                                                    updated.top_surface_contoning_variable_layer_height_compensation_enabled,
+                                                    shell_usage,
                                                     bundle->texture_mapping_zones,
                                                     bundle->texture_mapping_global_settings,
                                                     wxGetApp().model().texture_mapping_prime_tower_image,
@@ -8951,10 +9798,28 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 dlg.top_surface_contoning_supersampled_cells_enabled();
             updated.top_surface_contoning_polygonize_color_regions_enabled =
                 dlg.top_surface_contoning_polygonize_color_regions_enabled();
+            updated.top_surface_contoning_fast_mode_enabled =
+                dlg.top_surface_contoning_fast_mode_enabled();
             updated.top_surface_contoning_polygonize_resolution =
                 dlg.top_surface_contoning_polygonize_resolution();
             updated.top_surface_contoning_surface_anchored_stacks_enabled =
                 dlg.top_surface_contoning_surface_anchored_stacks_enabled();
+            updated.top_surface_contoning_surface_anchored_stack_optimizations_enabled =
+                dlg.top_surface_contoning_surface_anchored_stack_optimizations_enabled();
+            updated.top_surface_contoning_beam_search_stack_expansion_enabled =
+                dlg.top_surface_contoning_beam_search_stack_expansion_enabled();
+            updated.top_surface_contoning_td_adjustment_enabled =
+                dlg.top_surface_contoning_td_adjustment_enabled();
+            updated.top_surface_contoning_surface_scatter_enabled =
+                dlg.top_surface_contoning_surface_scatter_enabled();
+            updated.top_surface_contoning_color_prediction_mode =
+                dlg.top_surface_contoning_color_prediction_mode();
+            updated.top_surface_contoning_beer_lambert_rgb_correction_enabled =
+                dlg.top_surface_contoning_beer_lambert_rgb_correction_enabled();
+            updated.top_surface_contoning_td_effective_alpha_correction_enabled =
+                dlg.top_surface_contoning_td_effective_alpha_correction_enabled();
+            updated.top_surface_contoning_variable_layer_height_compensation_enabled =
+                dlg.top_surface_contoning_variable_layer_height_compensation_enabled();
             if (updated.top_surface_image_printing_enabled &&
                 updated.top_surface_image_printing_method == int(TextureMappingZone::TopSurfaceImageContoning)) {
                 updated.modulation_mode = int(TextureMappingZone::ModulationPerimeterPathV2);
@@ -10087,6 +10952,9 @@ struct Plater::priv
     }
     void export_gcode(fs::path output_path, bool output_path_on_removable_media);
     void export_gcode(fs::path output_path, bool output_path_on_removable_media, PrintHostJob upload_job);
+    void update_plate_toolpath_outside_state(PartPlate* plate);
+    bool is_plate_ready_for_gcode_output(int plate_idx);
+    bool is_plate_ready_for_sliced_file_export(int plate_idx);
 
     void reload_from_disk();
     bool replace_volume_with_stl(int object_idx, int volume_idx, const fs::path& new_path, const std::string& snapshot = "");
@@ -15247,6 +16115,56 @@ bool Plater::priv::warnings_dialog()
 
 }
 
+void Plater::priv::update_plate_toolpath_outside_state(PartPlate* plate)
+{
+    if (plate == nullptr || !plate->is_slice_result_valid())
+        return;
+
+    GCodeProcessorResult* result = plate->get_slice_result();
+    if (result == nullptr)
+        return;
+
+    result->lock();
+    if (result->moves.empty()) {
+        result->unlock();
+        return;
+    }
+    result->toolpath_outside = !bed.build_volume().all_paths_inside(*result, BoundingBoxf3());
+    result->unlock();
+}
+
+bool Plater::priv::is_plate_ready_for_gcode_output(int plate_idx)
+{
+    if (printer_technology != ptFFF)
+        return true;
+
+    if (plate_idx == PLATE_ALL_IDX) {
+        for (PartPlate* plate : partplate_list.get_plate_list())
+            update_plate_toolpath_outside_state(plate);
+        return partplate_list.is_all_slice_results_ready_for_print();
+    }
+
+    PartPlate* plate = plate_idx == PLATE_CURRENT_IDX ? partplate_list.get_curr_plate() : partplate_list.get_plate(plate_idx);
+    update_plate_toolpath_outside_state(plate);
+    return plate != nullptr && plate->is_slice_result_ready_for_print();
+}
+
+bool Plater::priv::is_plate_ready_for_sliced_file_export(int plate_idx)
+{
+    if (printer_technology != ptFFF)
+        return true;
+
+    if (plate_idx == PLATE_ALL_IDX) {
+        for (PartPlate* plate : partplate_list.get_plate_list())
+            update_plate_toolpath_outside_state(plate);
+        return partplate_list.is_all_slice_result_ready_for_export();
+    }
+
+    PartPlate* plate = plate_idx == PLATE_CURRENT_IDX ? partplate_list.get_curr_plate() : partplate_list.get_plate(plate_idx);
+    update_plate_toolpath_outside_state(plate);
+    return plate != nullptr && plate->is_slice_result_ready_for_export();
+}
+
 //BBS: add project slice logic
 void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
 {
@@ -15596,6 +16514,9 @@ void Plater::priv::on_action_print_plate(SimpleEvent&)
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received print plate event\n" ;
     }
 
+    if (!is_plate_ready_for_gcode_output(PLATE_CURRENT_IDX))
+        return;
+
     PresetBundle& preset_bundle = *wxGetApp().preset_bundle;
     if (preset_bundle.use_bbl_network()) {
         // BBS
@@ -15611,6 +16532,9 @@ void Plater::priv::on_action_print_plate(SimpleEvent&)
 
 void Plater::priv::on_action_send_to_multi_machine(SimpleEvent&)
 {
+    if (!is_plate_ready_for_gcode_output(PLATE_CURRENT_IDX))
+        return;
+
     if (!m_send_multi_dlg)
         m_send_multi_dlg = new SendMultiMachinePage(q);
     m_send_multi_dlg->prepare(partplate_list.get_curr_plate_index());
@@ -15696,6 +16620,9 @@ void Plater::priv::on_action_print_all(SimpleEvent&)
     if (q != nullptr) {
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received print all event\n" ;
     }
+
+    if (!is_plate_ready_for_gcode_output(PLATE_ALL_IDX))
+        return;
 
     PresetBundle& preset_bundle = *wxGetApp().preset_bundle;
     if (preset_bundle.use_bbl_network()) {
@@ -20267,6 +21194,9 @@ void Plater::export_gcode(bool prefer_removable)
     if (p->model.objects.empty())
         return;
 
+    if (!p->is_plate_ready_for_gcode_output(PLATE_CURRENT_IDX))
+        return;
+
     //if (get_view3D_canvas3D()->get_gizmos_manager().is_in_editing_mode(true))
     //    return;
 
@@ -20363,6 +21293,9 @@ void Plater::export_gcode(bool prefer_removable)
 
 void Plater::send_to_printer(bool isall)
 {
+    if (!p->is_plate_ready_for_gcode_output(isall ? PLATE_ALL_IDX : PLATE_CURRENT_IDX))
+        return;
+
     p->on_action_send_to_printer(isall);
 }
 
@@ -20370,6 +21303,9 @@ void Plater::send_to_printer(bool isall)
 void Plater::export_gcode_3mf(bool export_all)
 {
     if (p->model.objects.empty())
+        return;
+
+    if (!p->is_plate_ready_for_sliced_file_export(export_all ? PLATE_ALL_IDX : PLATE_CURRENT_IDX))
         return;
 
     if (p->process_completed_with_error == p->partplate_list.get_curr_plate_index())
@@ -21519,6 +22455,9 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn, bool us
     if (! physical_printer_config || p->model.objects.empty())
         return;
 
+    if (!p->is_plate_ready_for_gcode_output(plate_idx))
+        return;
+
     PrintHostJob upload_job(physical_printer_config);
     if (upload_job.empty())
         return;
@@ -21623,6 +22562,9 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn, bool us
 int Plater::send_gcode(int plate_idx, Export3mfProgressFn proFn)
 {
     int result = 0;
+    if (!p->is_plate_ready_for_gcode_output(plate_idx))
+        return -1;
+
     /* generate 3mf */
     set_print_job_plate_idx(plate_idx);
 

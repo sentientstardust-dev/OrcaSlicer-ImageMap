@@ -922,7 +922,7 @@ std::array<float, 3> texture_sample_target_rgb(const WeightedTextureSample &samp
     return apply_texture_contrast_to_rgb(target, contrast_factor);
 }
 
-std::array<float, 3> generic_solver_v2_axis_weights(const std::array<float, 3> &target_oklab)
+std::array<float, 3> generic_solver_oklab_axis_weights(const std::array<float, 3> &target_oklab)
 {
     const float chroma = std::hypot(target_oklab[1], target_oklab[2]);
     const float chroma_factor = std::clamp((chroma - 0.015f) / 0.13f, 0.f, 1.f);
@@ -933,11 +933,63 @@ std::array<float, 3> generic_solver_v2_axis_weights(const std::array<float, 3> &
     };
 }
 
+float generic_solver_oklab_chroma_factor(const std::array<float, 3> &target_oklab)
+{
+    const float chroma = std::hypot(target_oklab[1], target_oklab[2]);
+    return std::clamp((chroma - 0.015f) / 0.13f, 0.f, 1.f);
+}
+
+std::array<float, 3> generic_solver_perceptual_axis_weights(const std::array<float, 3> &target_oklab,
+                                                            int                         generic_solver_mode)
+{
+    const int effective_solver_mode = TextureMappingZone::effective_generic_solver_mode(generic_solver_mode);
+    std::array<float, 3> weights = generic_solver_oklab_axis_weights(target_oklab);
+    if (effective_solver_mode == int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4)) {
+        weights[0] = std::max(weights[0], 1.f);
+        weights[1] = std::min(weights[1], 4.f);
+        weights[2] = std::min(weights[2], 4.f);
+    }
+    return weights;
+}
+
 struct TextureMappingBinaryDitherCandidate {
     uint32_t             mask { 0 };
     std::array<float, 3> rgb { { 1.f, 1.f, 1.f } };
     std::array<float, 3> oklab { { 1.f, 0.f, 0.f } };
 };
+
+const std::array<float, 3> &binary_dither_candidate_color(const TextureMappingBinaryDitherCandidate &candidate,
+                                                          int                                        generic_solver_mode)
+{
+    return TextureMappingZone::effective_generic_solver_mode(generic_solver_mode) == int(TextureMappingZone::GenericSolverRGB) ?
+        candidate.rgb :
+        candidate.oklab;
+}
+
+std::array<float, 3> binary_dither_axis_weights(const std::array<float, 3> &target_color,
+                                                int                         generic_solver_mode)
+{
+    return TextureMappingZone::effective_generic_solver_mode(generic_solver_mode) == int(TextureMappingZone::GenericSolverRGB) ?
+        std::array<float, 3>{ { 1.f, 1.f, 1.f } } :
+        generic_solver_perceptual_axis_weights(target_color, generic_solver_mode);
+}
+
+float binary_dither_candidate_error(const TextureMappingBinaryDitherCandidate &candidate,
+                                    const std::array<float, 3>                &target_color,
+                                    const std::array<float, 3>                &axis_weights,
+                                    int                                        generic_solver_mode)
+{
+    const std::array<float, 3> &candidate_color = binary_dither_candidate_color(candidate, generic_solver_mode);
+    const float d0 = candidate_color[0] - target_color[0];
+    const float d1 = candidate_color[1] - target_color[1];
+    const float d2 = candidate_color[2] - target_color[2];
+    float error = axis_weights[0] * d0 * d0 + axis_weights[1] * d1 * d1 + axis_weights[2] * d2 * d2;
+    if (TextureMappingZone::effective_generic_solver_mode(generic_solver_mode) == int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4)) {
+        const float under_l = std::max(0.f, target_color[0] - candidate_color[0] - 0.04f);
+        error += 4.f * generic_solver_oklab_chroma_factor(target_color) * under_l * under_l;
+    }
+    return error;
+}
 
 std::vector<TextureMappingBinaryDitherCandidate> binary_dither_candidates(
     const std::vector<std::array<float, 3>> &component_colors,
@@ -992,16 +1044,17 @@ struct TextureMappingBinaryDitherNearestResult {
 
 TextureMappingBinaryDitherNearestResult nearest_binary_dither_candidates(
     const std::vector<TextureMappingBinaryDitherCandidate> &candidates,
-    const std::array<float, 3>                             &target_oklab)
+    const std::array<float, 3>                             &target_color,
+    int                                                     generic_solver_mode)
 {
     TextureMappingBinaryDitherNearestResult result;
-    const std::array<float, 3> axis_weights = generic_solver_v2_axis_weights(target_oklab);
+    const int clamped_solver_mode = TextureMappingZone::effective_generic_solver_mode(generic_solver_mode);
+    const std::array<float, 3> axis_weights = binary_dither_axis_weights(target_color, clamped_solver_mode);
     for (size_t idx = 0; idx < candidates.size(); ++idx) {
-        const std::array<float, 3> &candidate = candidates[idx].oklab;
-        const float dl = candidate[0] - target_oklab[0];
-        const float da = candidate[1] - target_oklab[1];
-        const float db = candidate[2] - target_oklab[2];
-        const float error = axis_weights[0] * dl * dl + axis_weights[1] * da * da + axis_weights[2] * db * db;
+        const float error = binary_dither_candidate_error(candidates[idx],
+                                                          target_color,
+                                                          axis_weights,
+                                                          clamped_solver_mode);
         if (error < result.best_error) {
             result.second_error = result.best_error;
             result.second_idx = result.best_idx;
@@ -1016,27 +1069,30 @@ TextureMappingBinaryDitherNearestResult nearest_binary_dither_candidates(
 }
 
 size_t nearest_binary_dither_candidate(const std::vector<TextureMappingBinaryDitherCandidate> &candidates,
-                                       const std::array<float, 3>                             &target_oklab)
+                                       const std::array<float, 3>                             &target_color,
+                                       int                                                     generic_solver_mode)
 {
-    return nearest_binary_dither_candidates(candidates, target_oklab).best_idx;
+    return nearest_binary_dither_candidates(candidates, target_color, generic_solver_mode).best_idx;
 }
 
 float binary_dither_alternate_fraction(const std::vector<TextureMappingBinaryDitherCandidate> &candidates,
-                                       const std::array<float, 3>                             &target_oklab,
+                                       const std::array<float, 3>                             &target_color,
                                        size_t                                                  base_idx,
-                                       size_t                                                  alternate_idx)
+                                       size_t                                                  alternate_idx,
+                                       int                                                     generic_solver_mode)
 {
     if (base_idx >= candidates.size() || alternate_idx >= candidates.size() || base_idx == alternate_idx)
         return 0.f;
 
-    const std::array<float, 3> axis_weights = generic_solver_v2_axis_weights(target_oklab);
-    const std::array<float, 3> &base = candidates[base_idx].oklab;
-    const std::array<float, 3> &alternate = candidates[alternate_idx].oklab;
+    const int clamped_solver_mode = TextureMappingZone::effective_generic_solver_mode(generic_solver_mode);
+    const std::array<float, 3> axis_weights = binary_dither_axis_weights(target_color, clamped_solver_mode);
+    const std::array<float, 3> &base = binary_dither_candidate_color(candidates[base_idx], clamped_solver_mode);
+    const std::array<float, 3> &alternate = binary_dither_candidate_color(candidates[alternate_idx], clamped_solver_mode);
     float numerator = 0.f;
     float denominator = 0.f;
     for (size_t axis = 0; axis < 3; ++axis) {
         const float delta = alternate[axis] - base[axis];
-        numerator += axis_weights[axis] * (target_oklab[axis] - base[axis]) * delta;
+        numerator += axis_weights[axis] * (target_color[axis] - base[axis]) * delta;
         denominator += axis_weights[axis] * delta * delta;
     }
     if (!std::isfinite(numerator) || !std::isfinite(denominator) || denominator <= 1e-12f)
@@ -1045,17 +1101,19 @@ float binary_dither_alternate_fraction(const std::vector<TextureMappingBinaryDit
 }
 
 size_t thresholded_binary_dither_candidate(const std::vector<TextureMappingBinaryDitherCandidate> &candidates,
-                                           const std::array<float, 3>                             &target_oklab,
-                                           float                                                   threshold)
+                                           const std::array<float, 3>                             &target_color,
+                                           float                                                   threshold,
+                                           int                                                     generic_solver_mode)
 {
-    const TextureMappingBinaryDitherNearestResult nearest = nearest_binary_dither_candidates(candidates, target_oklab);
+    const TextureMappingBinaryDitherNearestResult nearest =
+        nearest_binary_dither_candidates(candidates, target_color, generic_solver_mode);
     if (nearest.best_idx >= candidates.size())
         return size_t(-1);
     if (nearest.second_idx >= candidates.size())
         return nearest.best_idx;
 
     const float alternate_fraction =
-        binary_dither_alternate_fraction(candidates, target_oklab, nearest.best_idx, nearest.second_idx);
+        binary_dither_alternate_fraction(candidates, target_color, nearest.best_idx, nearest.second_idx, generic_solver_mode);
     return std::clamp(threshold, 0.f, 1.f) < alternate_fraction ? nearest.second_idx : nearest.best_idx;
 }
 
@@ -1437,6 +1495,7 @@ std::vector<float> component_weights_for_sample(const WeightedTextureSample &sam
     std::vector<float> desired(component_count, 0.f);
     size_t mapped_component_count = component_count;
     const bool has_raw_component_weights = sample.raw_component_weights.size() == component_count;
+    const int effective_solver_mode = TextureMappingZone::effective_generic_solver_mode(generic_solver_mode);
     if (has_raw_component_weights) {
         float raw_activity = 0.f;
         for (size_t component_idx = 0; component_idx < component_count; ++component_idx)
@@ -1478,7 +1537,7 @@ std::vector<float> component_weights_for_sample(const WeightedTextureSample &sam
                     solve_color_solver_weights_for_target(*generic_mix_candidates,
                                                           target,
                                                           color_solver_lookup_mode_from_index(generic_solver_lookup_mode),
-                                                          color_solver_mode_from_index(generic_solver_mode));
+                                                          color_solver_mode_from_index(effective_solver_mode));
                 if (best.size() == component_count)
                     desired = std::move(best);
             }
@@ -1514,12 +1573,14 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
     float layer_z_falloff_mm,
     bool high_resolution_texture_sampling,
     bool high_speed_image_texture_sampling,
+    std::optional<float> texture_sample_pitch_mm_override,
     std::optional<std::array<float, 4>> image_background_rgba_override)
 {
     TextureMappingOffsetWeightField weight_field;
     if (component_colors.empty())
         return weight_field;
 
+    const int effective_solver_mode = TextureMappingZone::effective_generic_solver_mode(generic_solver_mode);
     const size_t component_count = component_colors.size();
     const ModelObject *model_object = print_object.model_object();
     if (model_object == nullptr)
@@ -1541,10 +1602,18 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
     const float contrast_factor = std::clamp(texture_contrast_pct, 25.f, 300.f) / 100.f;
     const float tone_gamma =
         (!std::isfinite(texture_tone_gamma) || texture_tone_gamma <= 0.f) ? 1.f : std::clamp(texture_tone_gamma, 0.5f, 3.f);
-    const float physical_sample_pitch_mm =
+    const float default_physical_sample_pitch_mm =
         dithering_enabled && !raw_values_mode && std::isfinite(dither_pitch_mm) && dither_pitch_mm > EPSILON ?
             dither_pitch_mm :
             (high_resolution_texture_sampling ? 0.08f : 0.16f);
+    const bool has_texture_sample_pitch_override =
+        texture_sample_pitch_mm_override &&
+        std::isfinite(*texture_sample_pitch_mm_override) &&
+        *texture_sample_pitch_mm_override > EPSILON;
+    const float physical_sample_pitch_mm =
+        has_texture_sample_pitch_override ?
+            std::min(default_physical_sample_pitch_mm, std::max(0.02f, *texture_sample_pitch_mm_override)) :
+            default_physical_sample_pitch_mm;
 
     std::vector<WeightedTextureSample> samples;
     samples.reserve(8192);
@@ -1587,7 +1656,10 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
             return;
 
         const float pitch_mm = physical_sample_pitch_mm;
-        const int max_bary_steps = dithering_enabled && !raw_values_mode ? 160 : (high_resolution_texture_sampling ? 80 : 40);
+        const int max_bary_steps =
+            has_texture_sample_pitch_override ?
+                2000 :
+                (dithering_enabled && !raw_values_mode ? 160 : (high_resolution_texture_sampling ? 80 : 40));
         const int bary_steps = std::clamp(int(std::ceil(max_world_edge_mm / pitch_mm)), 1, max_bary_steps);
         const int sample_count = bary_steps * (bary_steps + 1) / 2;
         if (sample_count <= 0)
@@ -1757,7 +1829,10 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
                 if (!std::isfinite(max_world_edge_mm) || !std::isfinite(tri_area_mm2))
                     continue;
                 const float pitch_mm = physical_sample_pitch_mm;
-                const int max_bary_steps = dithering_enabled && !raw_values_mode ? 160 : (high_resolution_texture_sampling ? 80 : 40);
+                const int max_bary_steps =
+                    has_texture_sample_pitch_override ?
+                        2000 :
+                        (dithering_enabled && !raw_values_mode ? 160 : (high_resolution_texture_sampling ? 80 : 40));
                 const int bary_steps = std::clamp(int(std::ceil(max_world_edge_mm / pitch_mm)), 1, max_bary_steps);
                 const int sample_count = bary_steps * (bary_steps + 1) / 2;
                 if (sample_count <= 0)
@@ -1845,12 +1920,15 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
                 int                  x { 0 };
                 int                  y { 0 };
                 float                weight { 0.f };
-                std::array<float, 3> target_oklab { { 0.f, 0.f, 0.f } };
+                std::array<float, 3> target_color { { 0.f, 0.f, 0.f } };
                 std::vector<size_t>  sample_indices;
             };
 
-            auto sample_target_oklab = [tone_gamma, contrast_factor](const WeightedTextureSample &sample) {
-                return color_solver_oklab_from_srgb(texture_sample_target_rgb(sample, tone_gamma, contrast_factor));
+            auto sample_target_color = [tone_gamma, contrast_factor, effective_solver_mode](const WeightedTextureSample &sample) {
+                const std::array<float, 3> target_rgb = texture_sample_target_rgb(sample, tone_gamma, contrast_factor);
+                return effective_solver_mode == int(TextureMappingZone::GenericSolverRGB) ?
+                    target_rgb :
+                    color_solver_oklab_from_srgb(target_rgb);
             };
 
             std::vector<BinaryDitherCell> cells;
@@ -1873,10 +1951,10 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
                 }
 
                 BinaryDitherCell &cell = cells[cell_it->second];
-                const std::array<float, 3> target_oklab = sample_target_oklab(sample);
+                const std::array<float, 3> target_color = sample_target_color(sample);
                 const float sample_weight = std::max(sample.weight, 0.f);
                 for (size_t axis = 0; axis < 3; ++axis)
-                    cell.target_oklab[axis] += target_oklab[axis] * sample_weight;
+                    cell.target_color[axis] += target_color[axis] * sample_weight;
                 cell.weight += sample_weight;
                 cell.sample_indices.emplace_back(sample_idx);
             }
@@ -1884,7 +1962,7 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
             if (!cells.empty()) {
                 for (BinaryDitherCell &cell : cells)
                     if (cell.weight > EPSILON)
-                        for (float &value : cell.target_oklab)
+                        for (float &value : cell.target_color)
                             value /= cell.weight;
 
                 std::vector<size_t> order(cells.size(), 0);
@@ -1899,12 +1977,12 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
                 std::map<std::pair<int, int>, std::array<float, 3>> floyd_error;
                 for (const size_t cell_idx : order) {
                     BinaryDitherCell &cell = cells[cell_idx];
-                    std::array<float, 3> target_oklab = cell.target_oklab;
+                    std::array<float, 3> target_color = cell.target_color;
                     if (clamped_binary_dither_method == int(TextureMappingZone::DitheringFloydSteinberg)) {
                         const auto error_it = floyd_error.find({ cell.x, cell.y });
                         if (error_it != floyd_error.end())
                             for (size_t axis = 0; axis < 3; ++axis)
-                                target_oklab[axis] += error_it->second[axis];
+                                target_color[axis] += error_it->second[axis];
                     }
 
                     bool thresholded_dither = false;
@@ -1916,8 +1994,8 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
 
                     const size_t candidate_idx =
                         thresholded_dither ?
-                            thresholded_binary_dither_candidate(binary_candidates, target_oklab, threshold) :
-                            nearest_binary_dither_candidate(binary_candidates, target_oklab);
+                            thresholded_binary_dither_candidate(binary_candidates, target_color, threshold, effective_solver_mode) :
+                            nearest_binary_dither_candidate(binary_candidates, target_color, effective_solver_mode);
                     if (candidate_idx >= binary_candidates.size())
                         continue;
 
@@ -1927,10 +2005,12 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
                             binary_dither_masks[sample_idx] = candidate.mask;
 
                     if (clamped_binary_dither_method == int(TextureMappingZone::DitheringFloydSteinberg)) {
+                        const std::array<float, 3> &candidate_color =
+                            binary_dither_candidate_color(candidate, effective_solver_mode);
                         std::array<float, 3> error = {
-                            target_oklab[0] - candidate.oklab[0],
-                            target_oklab[1] - candidate.oklab[1],
-                            target_oklab[2] - candidate.oklab[2]
+                            target_color[0] - candidate_color[0],
+                            target_color[1] - candidate_color[1],
+                            target_color[2] - candidate_color[2]
                         };
                         auto add_error = [&floyd_error, &cell_index_by_coord, &error](int x, int y, float factor) {
                             if (cell_index_by_coord.find({ x, y }) == cell_index_by_coord.end())
@@ -2006,7 +2086,7 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
                                                    filament_color_mode,
                                                    force_sequential_filaments,
                                                    generic_solver_lookup_mode,
-                                                   generic_solver_mode,
+                                                   effective_solver_mode,
                                                    use_fixed_color_generic_solver,
                                                    contrast_factor,
                                                    tone_gamma,
@@ -2027,7 +2107,11 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
             weight_field.fallback_weights[component_idx] = clamp01f(fallback_acc[component_idx] / fallback_weight);
     }
 
-    const float target_bucket_mm = high_resolution_texture_sampling ? 0.12f : 0.22f;
+    const float default_target_bucket_mm = high_resolution_texture_sampling ? 0.12f : 0.22f;
+    const float target_bucket_mm =
+        has_texture_sample_pitch_override ?
+            std::clamp(physical_sample_pitch_mm, 0.02f, default_target_bucket_mm) :
+            default_target_bucket_mm;
     constexpr int min_bucket_dim = 16;
     constexpr int max_bucket_dim = 320;
     constexpr int max_buckets = 72000;
@@ -2042,6 +2126,11 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
 
     weight_field.min_x_mm = min_x_mm;
     weight_field.min_y_mm = min_y_mm;
+    weight_field.sample_lookup_radius_mm =
+        has_texture_sample_pitch_override ?
+            std::min(high_resolution_texture_sampling ? 0.18f : 0.32f,
+                     std::max(physical_sample_pitch_mm * 2.5f, physical_sample_pitch_mm + 0.02f)) :
+            0.f;
     weight_field.bucket_width = bucket_width;
     weight_field.bucket_height = bucket_height;
     weight_field.bucket_width_mm = std::max(1e-3f, span_x_mm / std::max(1, bucket_width - 1));
@@ -2134,15 +2223,23 @@ std::vector<float> sample_weight_field_components_impl(const TextureMappingOffse
         return fallback;
     }
 
+    const bool has_lookup_radius_override =
+        std::isfinite(weight_field.sample_lookup_radius_mm) && weight_field.sample_lookup_radius_mm > EPSILON;
     const float sigma_scale = high_resolution_texture_sampling ? 0.45f : 0.7f;
     const float min_sigma_mm = high_resolution_texture_sampling ? 0.04f : 0.06f;
-    const float sigma_x_mm = std::max(min_sigma_mm, weight_field.bucket_width_mm * sigma_scale);
-    const float sigma_y_mm = std::max(min_sigma_mm, weight_field.bucket_height_mm * sigma_scale);
+    const float sigma_x_mm = has_lookup_radius_override ?
+        std::max(0.01f, weight_field.sample_lookup_radius_mm * 0.4f) :
+        std::max(min_sigma_mm, weight_field.bucket_width_mm * sigma_scale);
+    const float sigma_y_mm = has_lookup_radius_override ?
+        std::max(0.01f, weight_field.sample_lookup_radius_mm * 0.4f) :
+        std::max(min_sigma_mm, weight_field.bucket_height_mm * sigma_scale);
     const float inv_two_sigma_x2 = 1.f / std::max(2.f * sigma_x_mm * sigma_x_mm, 1e-8f);
     const float inv_two_sigma_y2 = 1.f / std::max(2.f * sigma_y_mm * sigma_y_mm, 1e-8f);
     const float min_radius_mm = high_resolution_texture_sampling ? 0.16f : 0.30f;
     const float radius_scale = high_resolution_texture_sampling ? 1.75f : 3.f;
-    const float max_radius_mm = std::max(min_radius_mm, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * radius_scale);
+    const float max_radius_mm = has_lookup_radius_override ?
+        weight_field.sample_lookup_radius_mm :
+        std::max(min_radius_mm, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * radius_scale);
     const float max_radius2 = max_radius_mm * max_radius_mm;
     const float min_bucket_span_mm = std::max(1e-3f, std::min(weight_field.bucket_width_mm, weight_field.bucket_height_mm));
     const int max_ring = std::max(1, int(std::ceil(max_radius_mm / min_bucket_span_mm)));
@@ -2681,10 +2778,14 @@ std::optional<std::array<float, 3>> sample_weight_field_rgb(const TextureMapping
     const float gy = (y_mm - weight_field.min_y_mm) / std::max(weight_field.bucket_height_mm, 1e-6f);
     const int cx = std::clamp(int(std::floor(gx)), 0, weight_field.bucket_width - 1);
     const int cy = std::clamp(int(std::floor(gy)), 0, weight_field.bucket_height - 1);
+    const bool has_lookup_radius_override =
+        std::isfinite(weight_field.sample_lookup_radius_mm) && weight_field.sample_lookup_radius_mm > EPSILON;
     const float max_radius_mm =
-        high_resolution_texture_sampling ?
-            std::max(0.18f, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * 2.5f) :
-            std::max(0.32f, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * 3.0f);
+        has_lookup_radius_override ?
+            weight_field.sample_lookup_radius_mm :
+            (high_resolution_texture_sampling ?
+                std::max(0.18f, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * 2.5f) :
+                std::max(0.32f, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * 3.0f));
     const int max_ring = std::clamp(int(std::ceil(max_radius_mm / std::max(std::min(weight_field.bucket_width_mm,
                                                                                        weight_field.bucket_height_mm),
                                                                                1e-3f))),
@@ -2763,10 +2864,14 @@ std::optional<float> sample_weight_field_normal_z(const TextureMappingOffsetWeig
     const float gy = (y_mm - weight_field.min_y_mm) / std::max(weight_field.bucket_height_mm, 1e-6f);
     const int cx = std::clamp(int(std::floor(gx)), 0, weight_field.bucket_width - 1);
     const int cy = std::clamp(int(std::floor(gy)), 0, weight_field.bucket_height - 1);
+    const bool has_lookup_radius_override =
+        std::isfinite(weight_field.sample_lookup_radius_mm) && weight_field.sample_lookup_radius_mm > EPSILON;
     const float max_radius_mm =
-        high_resolution_texture_sampling ?
-            std::max(0.18f, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * 2.5f) :
-            std::max(0.32f, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * 3.0f);
+        has_lookup_radius_override ?
+            weight_field.sample_lookup_radius_mm :
+            (high_resolution_texture_sampling ?
+                std::max(0.18f, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * 2.5f) :
+                std::max(0.32f, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * 3.0f));
     const int max_ring = std::clamp(int(std::ceil(max_radius_mm / std::max(std::min(weight_field.bucket_width_mm,
                                                                                        weight_field.bucket_height_mm),
                                                                                1e-3f))),
@@ -2946,7 +3051,9 @@ std::optional<std::array<float, 3>> texture_mapping_offset_target_rgb_at_point(c
         weights.assign(context.component_colors.size(), 1.f);
 
     const std::array<float, 3> rgb =
-        mix_color_solver_components(context.component_colors, weights, ColorSolverMixModel::PigmentPainter);
+        mix_color_solver_components(context.component_colors,
+                                    weights,
+                                    color_solver_mix_model_from_index(context.generic_solver_mix_model));
     return std::array<float, 3>{ clamp01f(rgb[0]), clamp01f(rgb[1]), clamp01f(rgb[2]) };
 }
 
@@ -3033,7 +3140,8 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     std::optional<Vec2d>     plate_origin_mm_override,
     std::optional<float>     min_outer_width_mm_override,
     std::optional<std::array<float, 4>> image_background_rgba_override,
-    std::optional<float>     sample_z_mm_override)
+    std::optional<float>     sample_z_mm_override,
+    std::optional<float>     texture_sample_pitch_mm_override)
 {
     const Print *print = print_object.print();
     if (print == nullptr)
@@ -3078,12 +3186,10 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     const int generic_solver_lookup_mode = std::clamp(zone.generic_solver_lookup_mode,
                                                       int(TextureMappingZone::GenericSolverClosestMix),
                                                       int(TextureMappingZone::GenericSolverBlendClosestTwo));
-    const int generic_solver_mode = std::clamp(zone.generic_solver_mode,
-                                               int(TextureMappingZone::GenericSolverLegacy),
-                                               int(TextureMappingZone::GenericSolverV2));
+    const int generic_solver_mode = TextureMappingZone::effective_generic_solver_mode(zone.generic_solver_mode);
     const int generic_solver_mix_model = std::clamp(zone.generic_solver_mix_model,
                                                     int(TextureMappingZone::GenericSolverPigmentPainter),
-                                                    int(TextureMappingZone::GenericSolverPigmentPainter));
+                                                    int(TextureMappingZone::GenericSolverPrusaFdmMixer));
     const float texture_contrast_pct = std::clamp(zone.contrast_pct, 25.f, 300.f);
     const float texture_tone_gamma =
         (!std::isfinite(zone.tone_gamma) || zone.tone_gamma <= 0.f) ?
@@ -3244,6 +3350,7 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
                                                            layer_sample_falloff_mm,
                                                            high_resolution_texture_sampling,
                                                            zone.high_speed_image_texture_sampling,
+                                                           texture_sample_pitch_mm_override,
                                                            image_background_rgba_override);
         if (weight_field.empty())
             return std::nullopt;
@@ -3299,6 +3406,7 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     context.halftone_increased_detail_enabled = halftone_increased_detail_enabled;
     context.halftone_v2_enabled = halftone_v2_enabled;
     context.nonlinear_offset_adjustment = zone.nonlinear_offset_adjustment;
+    context.generic_solver_mix_model = generic_solver_mix_model;
     context.object_center = print_object.bounding_box().center();
     if (linear_gradient_mode) {
         const bool radial_mode = zone.linear_gradient_mode == int(TextureMappingZone::LinearGradientRadial);

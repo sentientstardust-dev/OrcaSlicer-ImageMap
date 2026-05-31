@@ -3,10 +3,6 @@
 #ifndef slic3r_TextureMapping_hpp_
 #define slic3r_TextureMapping_hpp_
 
-#ifndef SLIC3R_SHOW_EXPERIMENTAL_CONTONING_OPTIONS
-#define SLIC3R_SHOW_EXPERIMENTAL_CONTONING_OPTIONS 0
-#endif
-
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -93,6 +89,12 @@ struct TextureMappingZone
         ContoningFlatSurfaceInfillRectilinearWithBoundary = 7
     };
 
+    enum TopSurfaceContoningColorPredictionMode : uint8_t {
+        ContoningColorPredictionDefault = 0,
+        ContoningColorPredictionTdEffectiveAlpha = 1,
+        ContoningColorPredictionBeerLambertRgb = 2
+    };
+
     enum FilamentColorMode : uint8_t {
         FilamentColorAny = 0,
         FilamentColorRGB = 1,
@@ -112,12 +114,15 @@ struct TextureMappingZone
     };
 
     enum GenericSolverMode : uint8_t {
-        GenericSolverLegacy = 0,
-        GenericSolverV2 = 1
+        GenericSolverRGB = 0,
+        GenericSolverOklab = 1,
+        GenericSolverOklabSoftCap4Dark4 = 2,
+        GenericSolverDefault = 255
     };
 
     enum GenericSolverMixModel : uint8_t {
-        GenericSolverPigmentPainter = 0
+        GenericSolverPigmentPainter = 0,
+        GenericSolverPrusaFdmMixer = 1
     };
 
     enum DitheringMethod : uint8_t {
@@ -172,7 +177,7 @@ struct TextureMappingZone
     static constexpr float MinTopSurfaceImageLineWidthMm = 0.32f;
     static constexpr float MaxTopSurfaceImageLineWidthMm = 0.80f;
     static constexpr float DefaultTopSurfaceImageMinLineWidthMm = 0.32f;
-    static constexpr float DefaultTopSurfaceImageMaxLineWidthMm = 0.80f;
+    static constexpr float DefaultTopSurfaceImageMaxLineWidthMm = 0.64f;
     static constexpr int   MinTopSurfaceImageColoredTopLayers = 1;
     static constexpr int   MaxTopSurfaceImageColoredTopLayers = 20;
     static constexpr int   DefaultTopSurfaceImageColoredTopLayers = 3;
@@ -181,11 +186,11 @@ struct TextureMappingZone
     static constexpr float MaxTopSurfaceContoningAngleThresholdDeg = 180.f;
     static constexpr float DefaultTopSurfaceContoningAngleThresholdDeg = 20.f;
     static constexpr int   MinTopSurfaceContoningStackLayers = 1;
-    static constexpr int   MaxTopSurfaceContoningStackLayers = 20;
-    static constexpr int   DefaultTopSurfaceContoningStackLayers = 15;
+    static constexpr int   MaxTopSurfaceContoningStackLayers = 100;
+    static constexpr int   DefaultTopSurfaceContoningStackLayers = 100;
     static constexpr int   MinTopSurfaceContoningPatternFilaments = 1;
-    static constexpr int   MaxTopSurfaceContoningPatternFilaments = 20;
-    static constexpr int   DefaultTopSurfaceContoningPatternFilaments = 5;
+    static constexpr int   MaxTopSurfaceContoningPatternFilaments = 100;
+    static constexpr int   DefaultTopSurfaceContoningPatternFilaments = 8;
     static constexpr float MinTopSurfaceContoningMinFeatureMm = 0.f;
     static constexpr float MaxTopSurfaceContoningMinFeatureMm = 20.f;
     static constexpr float DefaultTopSurfaceContoningMinFeatureMm = 0.f;
@@ -196,21 +201,34 @@ struct TextureMappingZone
     static constexpr bool  DefaultTopSurfaceContoningRecolorSurroundingPerimeters = false;
     static constexpr int   DefaultTopSurfaceContoningPerimeterMode = int(ContoningPerimeterDividedLine);
     static constexpr int   DefaultTopSurfaceContoningFlatSurfaceInfillMode = int(ContoningFlatSurfaceInfillDefault);
-    static constexpr int   SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode = int(ContoningFlatSurfaceInfillRectilinear);
+    static constexpr int   SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode = int(ContoningFlatSurfaceInfillBoundarySkinVariable);
     static constexpr bool  DefaultTopSurfaceContoningLayerPhaseEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningVariedInfillAnglesEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningSupersampledCellsEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled = true;
+    static constexpr bool  DefaultTopSurfaceContoningFastModeEnabled = true;
     static constexpr int   DefaultTopSurfaceContoningPolygonizeResolution = 4;
-    static constexpr bool  DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled = false;
+    static constexpr bool  DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled = true;
+    static constexpr bool  DefaultTopSurfaceContoningSurfaceAnchoredStackOptimizationsEnabled = true;
+    static constexpr bool  DefaultTopSurfaceContoningTdAdjustmentEnabled = true;
+    static constexpr bool  DefaultTopSurfaceContoningSurfaceScatterEnabled = false;
+    static constexpr int   DefaultTopSurfaceContoningColorPredictionMode = int(ContoningColorPredictionDefault);
+    static constexpr int   SlicerDefaultTopSurfaceContoningColorPredictionMode = int(ContoningColorPredictionTdEffectiveAlpha);
+    static constexpr bool  DefaultTopSurfaceContoningVariableLayerHeightCompensationEnabled = true;
+    static constexpr bool  DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled =
+        SlicerDefaultTopSurfaceContoningColorPredictionMode == int(ContoningColorPredictionBeerLambertRgb);
+    static constexpr bool  DefaultTopSurfaceContoningTdEffectiveAlphaCorrectionEnabled =
+        SlicerDefaultTopSurfaceContoningColorPredictionMode == int(ContoningColorPredictionTdEffectiveAlpha);
+    static constexpr bool  DefaultTopSurfaceContoningBeamSearchStackExpansionEnabled = true;
     static constexpr bool  DefaultCompactOffsetMode = true;
     static constexpr bool  DefaultUseLegacyFixedColorMode = false;
     static constexpr bool  DefaultHighSpeedImageTextureSampling = true;
     static constexpr bool  DefaultMinimumVisibilityOffsetEnabled = true;
     static constexpr float DefaultMinimumVisibilityOffsetPct = 30.f;
     static constexpr int   DefaultGenericSolverLookupMode = int(GenericSolverClosestMix);
-    static constexpr int   DefaultGenericSolverMode = int(GenericSolverV2);
+    static constexpr int   SlicerDefaultGenericSolverMode = int(GenericSolverOklabSoftCap4Dark4);
+    static constexpr int   DefaultGenericSolverMode = int(GenericSolverDefault);
     static constexpr int   DefaultGenericSolverMixModel = int(GenericSolverPigmentPainter);
     static constexpr bool  DefaultDitheringEnabled = false;
     static constexpr int   DefaultDitheringMethod = int(DitheringHalftoneV2);
@@ -228,7 +246,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultPreviewLimitResolution = true;
     static constexpr bool  DefaultPreviewSimulateTopSurfaceLod = true;
     static constexpr bool  DefaultAutoAdjustFilamentSelection = true;
-    static constexpr bool  ShowExperimentalTopSurfaceContoningOptions = SLIC3R_SHOW_EXPERIMENTAL_CONTONING_OPTIONS != 0;
+    static const bool      ShowExperimentalTopSurfaceContoningOptions;
 
     static constexpr int default_modulation_mode_for_surface_pattern(int surface_pattern)
     {
@@ -239,7 +257,14 @@ struct TextureMappingZone
         }
     }
 
-    static constexpr int effective_top_surface_contoning_flat_surface_infill_mode(int mode)
+    static int effective_generic_solver_mode(int mode)
+    {
+        if (mode == int(GenericSolverDefault))
+            return SlicerDefaultGenericSolverMode;
+        return std::clamp(mode, int(GenericSolverRGB), int(GenericSolverOklabSoftCap4Dark4));
+    }
+
+    static int effective_top_surface_contoning_flat_surface_infill_mode(int mode)
     {
         if (!ShowExperimentalTopSurfaceContoningOptions)
             return SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode;
@@ -248,39 +273,97 @@ struct TextureMappingZone
             mode;
     }
 
-    static constexpr int stored_top_surface_contoning_flat_surface_infill_mode(int mode)
+    static int stored_top_surface_contoning_flat_surface_infill_mode(int mode)
     {
         return ShowExperimentalTopSurfaceContoningOptions ? mode : DefaultTopSurfaceContoningFlatSurfaceInfillMode;
     }
 
-    static constexpr int stored_top_surface_contoning_perimeter_mode(int mode)
+    static int stored_top_surface_contoning_perimeter_mode(int mode)
     {
         return ShowExperimentalTopSurfaceContoningOptions ? mode : DefaultTopSurfaceContoningPerimeterMode;
     }
 
-    static constexpr bool effective_top_surface_contoning_only_color_surface_infill(bool value)
+    static float effective_top_surface_contoning_angle_threshold_deg(float value)
+    {
+        return ShowExperimentalTopSurfaceContoningOptions ? value : MaxTopSurfaceContoningAngleThresholdDeg;
+    }
+
+    static bool effective_top_surface_contoning_only_color_surface_infill(bool value)
     {
         return ShowExperimentalTopSurfaceContoningOptions ? value : true;
     }
 
-    static constexpr bool effective_top_surface_contoning_replace_top_perimeters_with_infill(bool value)
+    static bool effective_top_surface_contoning_replace_top_perimeters_with_infill(bool value)
     {
         return ShowExperimentalTopSurfaceContoningOptions && value;
     }
 
-    static constexpr bool effective_top_surface_contoning_recolor_surrounding_perimeters(bool value, bool replace)
+    static bool effective_top_surface_contoning_recolor_surrounding_perimeters(bool value, bool replace)
     {
         return ShowExperimentalTopSurfaceContoningOptions && value && !replace;
     }
 
-    static constexpr bool effective_top_surface_contoning_surface_anchored_stacks_enabled(bool value)
+    static bool effective_top_surface_contoning_surface_anchored_stacks_enabled(bool value)
+    {
+        return ShowExperimentalTopSurfaceContoningOptions ? value : true;
+    }
+
+    static bool effective_top_surface_contoning_surface_anchored_stack_optimizations_enabled(bool value)
+    {
+        return ShowExperimentalTopSurfaceContoningOptions ? value : true;
+    }
+
+    static bool effective_top_surface_contoning_beam_search_stack_expansion_enabled(bool value)
+    {
+        return ShowExperimentalTopSurfaceContoningOptions ? value : true;
+    }
+
+    static bool effective_top_surface_contoning_layer_phase_enabled(bool value)
     {
         return ShowExperimentalTopSurfaceContoningOptions && value;
     }
 
+    static bool effective_top_surface_contoning_blue_noise_error_diffusion_enabled(bool value)
+    {
+        return ShowExperimentalTopSurfaceContoningOptions && value;
+    }
+
+    static bool effective_top_surface_contoning_supersampled_cells_enabled(bool value)
+    {
+        return ShowExperimentalTopSurfaceContoningOptions && value;
+    }
+
+    static bool effective_top_surface_contoning_surface_scatter_enabled(bool td_adjustment,
+                                                                        bool surface_scatter,
+                                                                        bool td_effective_alpha)
+    {
+        return td_adjustment && surface_scatter && !td_effective_alpha;
+    }
+
+    static int effective_top_surface_contoning_color_prediction_mode(int mode)
+    {
+        if (mode == int(ContoningColorPredictionDefault))
+            return SlicerDefaultTopSurfaceContoningColorPredictionMode;
+        return std::clamp(mode,
+                          int(ContoningColorPredictionTdEffectiveAlpha),
+                          int(ContoningColorPredictionBeerLambertRgb));
+    }
+
+    static bool effective_top_surface_contoning_layer_phase_enabled(bool value, bool surface_anchored_stacks)
+    {
+        return effective_top_surface_contoning_layer_phase_enabled(value) &&
+               !effective_top_surface_contoning_surface_anchored_stacks_enabled(surface_anchored_stacks);
+    }
+
+    static bool effective_top_surface_contoning_blue_noise_error_diffusion_enabled(bool value, bool surface_anchored_stacks)
+    {
+        return effective_top_surface_contoning_blue_noise_error_diffusion_enabled(value) &&
+               !effective_top_surface_contoning_surface_anchored_stacks_enabled(surface_anchored_stacks);
+    }
+
     static constexpr int normalize_top_surface_contoning_polygonize_resolution(int value)
     {
-        return value <= 1 ? 1 : (value >= 4 ? 4 : 2);
+        return value <= 1 ? 1 : (value >= 8 ? 8 : (value >= 4 ? 4 : (value >= 3 ? 3 : 2)));
     }
 
     struct LinearGradientAnchor {
@@ -360,8 +443,17 @@ struct TextureMappingZone
     bool        top_surface_contoning_blue_noise_error_diffusion_enabled = DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled;
     bool        top_surface_contoning_supersampled_cells_enabled = DefaultTopSurfaceContoningSupersampledCellsEnabled;
     bool        top_surface_contoning_polygonize_color_regions_enabled = DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled;
+    bool        top_surface_contoning_fast_mode_enabled = DefaultTopSurfaceContoningFastModeEnabled;
     int         top_surface_contoning_polygonize_resolution = DefaultTopSurfaceContoningPolygonizeResolution;
     bool        top_surface_contoning_surface_anchored_stacks_enabled = DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled;
+    bool        top_surface_contoning_surface_anchored_stack_optimizations_enabled = DefaultTopSurfaceContoningSurfaceAnchoredStackOptimizationsEnabled;
+    bool        top_surface_contoning_td_adjustment_enabled = DefaultTopSurfaceContoningTdAdjustmentEnabled;
+    bool        top_surface_contoning_surface_scatter_enabled = DefaultTopSurfaceContoningSurfaceScatterEnabled;
+    bool        top_surface_contoning_beer_lambert_rgb_correction_enabled = DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled;
+    bool        top_surface_contoning_td_effective_alpha_correction_enabled = DefaultTopSurfaceContoningTdEffectiveAlphaCorrectionEnabled;
+    int         top_surface_contoning_color_prediction_mode = DefaultTopSurfaceContoningColorPredictionMode;
+    bool        top_surface_contoning_variable_layer_height_compensation_enabled = DefaultTopSurfaceContoningVariableLayerHeightCompensationEnabled;
+    bool        top_surface_contoning_beam_search_stack_expansion_enabled = DefaultTopSurfaceContoningBeamSearchStackExpansionEnabled;
     bool        compact_offset_mode = DefaultCompactOffsetMode;
     bool        use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
     bool        high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;
@@ -434,6 +526,12 @@ struct TextureMappingZone
                !effective_top_surface_contoning_recolor_surrounding_perimeters();
     }
 
+    float effective_top_surface_contoning_angle_threshold_deg() const
+    {
+        return TextureMappingZone::effective_top_surface_contoning_angle_threshold_deg(
+            top_surface_contoning_angle_threshold_deg);
+    }
+
     bool effective_top_surface_contoning_only_color_surface_infill() const
     {
         return effective_top_surface_contoning_only_color_surface_infill(top_surface_contoning_only_color_surface_infill);
@@ -473,6 +571,60 @@ struct TextureMappingZone
             top_surface_contoning_surface_anchored_stacks_enabled);
     }
 
+    bool effective_top_surface_contoning_surface_anchored_stack_optimizations_enabled() const
+    {
+        return TextureMappingZone::effective_top_surface_contoning_surface_anchored_stack_optimizations_enabled(
+            top_surface_contoning_surface_anchored_stack_optimizations_enabled);
+    }
+
+    bool effective_top_surface_contoning_beam_search_stack_expansion_enabled() const
+    {
+        return TextureMappingZone::effective_top_surface_contoning_beam_search_stack_expansion_enabled(
+            top_surface_contoning_beam_search_stack_expansion_enabled);
+    }
+
+    bool effective_top_surface_contoning_layer_phase_enabled() const
+    {
+        return TextureMappingZone::effective_top_surface_contoning_layer_phase_enabled(
+            top_surface_contoning_layer_phase_enabled,
+            top_surface_contoning_surface_anchored_stacks_enabled);
+    }
+
+    bool effective_top_surface_contoning_blue_noise_error_diffusion_enabled() const
+    {
+        return TextureMappingZone::effective_top_surface_contoning_blue_noise_error_diffusion_enabled(
+            top_surface_contoning_blue_noise_error_diffusion_enabled,
+            top_surface_contoning_surface_anchored_stacks_enabled);
+    }
+
+    bool effective_top_surface_contoning_supersampled_cells_enabled() const
+    {
+        return TextureMappingZone::effective_top_surface_contoning_supersampled_cells_enabled(
+            top_surface_contoning_supersampled_cells_enabled);
+    }
+
+    bool effective_top_surface_contoning_surface_scatter_enabled() const
+    {
+        return TextureMappingZone::effective_top_surface_contoning_surface_scatter_enabled(
+            top_surface_contoning_td_adjustment_enabled,
+            top_surface_contoning_surface_scatter_enabled,
+            top_surface_contoning_td_effective_alpha_correction_enabled);
+    }
+
+    int effective_top_surface_contoning_color_prediction_mode() const
+    {
+        return TextureMappingZone::effective_top_surface_contoning_color_prediction_mode(
+            top_surface_contoning_color_prediction_mode);
+    }
+
+    void normalize_top_surface_contoning_td_correction()
+    {
+        const bool beer_lambert_rgb =
+            effective_top_surface_contoning_color_prediction_mode() == int(ContoningColorPredictionBeerLambertRgb);
+        top_surface_contoning_beer_lambert_rgb_correction_enabled = beer_lambert_rgb;
+        top_surface_contoning_td_effective_alpha_correction_enabled = !beer_lambert_rgb;
+    }
+
     void apply_top_surface_contoning_experimental_defaults()
     {
         if (top_surface_image_printing_enabled &&
@@ -482,15 +634,29 @@ struct TextureMappingZone
             top_surface_image_fixed_coloring_filaments = true;
         }
         if (!ShowExperimentalTopSurfaceContoningOptions) {
+            top_surface_contoning_angle_threshold_deg = MaxTopSurfaceContoningAngleThresholdDeg;
             top_surface_contoning_only_color_surface_infill = true;
             top_surface_contoning_replace_top_perimeters_with_infill = false;
             top_surface_contoning_recolor_surrounding_perimeters = false;
             top_surface_contoning_perimeter_mode = DefaultTopSurfaceContoningPerimeterMode;
             top_surface_contoning_flat_surface_infill_mode = DefaultTopSurfaceContoningFlatSurfaceInfillMode;
-            top_surface_contoning_surface_anchored_stacks_enabled = false;
+            top_surface_contoning_surface_anchored_stacks_enabled = true;
+            top_surface_contoning_surface_anchored_stack_optimizations_enabled = true;
+            top_surface_contoning_beam_search_stack_expansion_enabled = true;
+            top_surface_contoning_layer_phase_enabled = false;
+            top_surface_contoning_blue_noise_error_diffusion_enabled = false;
+            top_surface_contoning_supersampled_cells_enabled = false;
         } else if (top_surface_contoning_replace_top_perimeters_with_infill) {
             top_surface_contoning_recolor_surrounding_perimeters = false;
         }
+        if (effective_top_surface_contoning_surface_anchored_stacks_enabled()) {
+            top_surface_contoning_layer_phase_enabled = false;
+            top_surface_contoning_blue_noise_error_diffusion_enabled = false;
+        }
+        top_surface_contoning_td_adjustment_enabled = true;
+        normalize_top_surface_contoning_td_correction();
+        if (top_surface_contoning_td_effective_alpha_correction_enabled)
+            top_surface_contoning_surface_scatter_enabled = false;
     }
 
     void apply_default_modulation_mode()
@@ -551,8 +717,17 @@ struct TextureMappingZone
         top_surface_contoning_blue_noise_error_diffusion_enabled = DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled;
         top_surface_contoning_supersampled_cells_enabled = DefaultTopSurfaceContoningSupersampledCellsEnabled;
         top_surface_contoning_polygonize_color_regions_enabled = DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled;
+        top_surface_contoning_fast_mode_enabled = DefaultTopSurfaceContoningFastModeEnabled;
         top_surface_contoning_polygonize_resolution = DefaultTopSurfaceContoningPolygonizeResolution;
         top_surface_contoning_surface_anchored_stacks_enabled = DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled;
+        top_surface_contoning_surface_anchored_stack_optimizations_enabled = DefaultTopSurfaceContoningSurfaceAnchoredStackOptimizationsEnabled;
+        top_surface_contoning_td_adjustment_enabled = DefaultTopSurfaceContoningTdAdjustmentEnabled;
+        top_surface_contoning_surface_scatter_enabled = DefaultTopSurfaceContoningSurfaceScatterEnabled;
+        top_surface_contoning_beer_lambert_rgb_correction_enabled = DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled;
+        top_surface_contoning_td_effective_alpha_correction_enabled = DefaultTopSurfaceContoningTdEffectiveAlphaCorrectionEnabled;
+        top_surface_contoning_color_prediction_mode = DefaultTopSurfaceContoningColorPredictionMode;
+        top_surface_contoning_variable_layer_height_compensation_enabled = DefaultTopSurfaceContoningVariableLayerHeightCompensationEnabled;
+        top_surface_contoning_beam_search_stack_expansion_enabled = DefaultTopSurfaceContoningBeamSearchStackExpansionEnabled;
         compact_offset_mode = DefaultCompactOffsetMode;
         use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
         high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;

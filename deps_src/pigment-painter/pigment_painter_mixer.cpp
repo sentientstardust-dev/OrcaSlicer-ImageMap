@@ -137,11 +137,8 @@ const LutImage *lut_image()
     return image.loaded ? &image : nullptr;
 }
 
-std::array<float, 3> sample_lut(const LutImage &image, const std::array<float, 3> &color, int z_offset)
+std::array<float, 3> sample_lut_texel(const LutImage &image, int x, int y, int z)
 {
-    const int x = int(std::floor(clamp01(color[0]) * float(k_lut_dimen - 1)));
-    const int y = int(std::floor(clamp01(color[1]) * float(k_lut_dimen - 1)));
-    const int z = int(std::floor(clamp01(color[2]) * float(k_lut_dimen - 1))) + z_offset;
     const int col = z % image.row_size;
     const int row = z / image.row_size;
     const int ix = x + col * k_lut_dimen;
@@ -153,6 +150,50 @@ std::array<float, 3> sample_lut(const LutImage &image, const std::array<float, 3
         float(image.rgba[idx + 2]) / 255.f,
         float(image.rgba[idx + 1]) / 255.f
     };
+}
+
+std::array<float, 3> lerp_color(const std::array<float, 3> &a, const std::array<float, 3> &b, float t)
+{
+    return {
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t
+    };
+}
+
+std::array<float, 3> sample_lut(const LutImage &image, const std::array<float, 3> &color, int z_offset)
+{
+    const float xf = clamp01(color[0]) * float(k_lut_dimen - 1);
+    const float yf = clamp01(color[1]) * float(k_lut_dimen - 1);
+    const float zf = clamp01(color[2]) * float(k_lut_dimen - 1);
+
+    const int x0 = int(std::floor(xf));
+    const int y0 = int(std::floor(yf));
+    const int z0 = int(std::floor(zf));
+    const int x1 = std::min(x0 + 1, k_lut_dimen - 1);
+    const int y1 = std::min(y0 + 1, k_lut_dimen - 1);
+    const int z1 = std::min(z0 + 1, k_lut_dimen - 1);
+
+    const float tx = xf - float(x0);
+    const float ty = yf - float(y0);
+    const float tz = zf - float(z0);
+
+    const std::array<float, 3> c000 = sample_lut_texel(image, x0, y0, z0 + z_offset);
+    const std::array<float, 3> c100 = sample_lut_texel(image, x1, y0, z0 + z_offset);
+    const std::array<float, 3> c010 = sample_lut_texel(image, x0, y1, z0 + z_offset);
+    const std::array<float, 3> c110 = sample_lut_texel(image, x1, y1, z0 + z_offset);
+    const std::array<float, 3> c001 = sample_lut_texel(image, x0, y0, z1 + z_offset);
+    const std::array<float, 3> c101 = sample_lut_texel(image, x1, y0, z1 + z_offset);
+    const std::array<float, 3> c011 = sample_lut_texel(image, x0, y1, z1 + z_offset);
+    const std::array<float, 3> c111 = sample_lut_texel(image, x1, y1, z1 + z_offset);
+
+    const std::array<float, 3> c00 = lerp_color(c000, c100, tx);
+    const std::array<float, 3> c10 = lerp_color(c010, c110, tx);
+    const std::array<float, 3> c01 = lerp_color(c001, c101, tx);
+    const std::array<float, 3> c11 = lerp_color(c011, c111, tx);
+    const std::array<float, 3> c0 = lerp_color(c00, c10, ty);
+    const std::array<float, 3> c1 = lerp_color(c01, c11, ty);
+    return lerp_color(c0, c1, tz);
 }
 
 std::array<float, 4> color_to_pigment(const LutImage &image, const std::array<float, 3> &color)

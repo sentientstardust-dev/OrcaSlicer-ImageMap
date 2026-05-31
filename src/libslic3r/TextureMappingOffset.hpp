@@ -24,6 +24,7 @@ struct TextureMappingOffsetWeightField {
     float min_y_mm { 0.f };
     float bucket_width_mm { 1.f };
     float bucket_height_mm { 1.f };
+    float sample_lookup_radius_mm { 0.f };
     int bucket_width { 0 };
     int bucket_height { 0 };
     size_t component_count { 0 };
@@ -63,6 +64,7 @@ struct TextureMappingOffsetContext {
     bool                            halftone_increased_detail_enabled { false };
     bool                            halftone_v2_enabled { false };
     bool                            nonlinear_offset_adjustment { false };
+    int                             generic_solver_mix_model { TextureMappingZone::DefaultGenericSolverMixModel };
     Point                           object_center;
     Vec3f                           linear_gradient_start_mm { Vec3f::Zero() };
     Vec3f                           linear_gradient_end_mm { Vec3f::Zero() };
@@ -109,7 +111,8 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     std::optional<Vec2d>     plate_origin_mm_override = std::nullopt,
     std::optional<float>     min_outer_width_mm_override = std::nullopt,
     std::optional<std::array<float, 4>> image_background_rgba_override = std::nullopt,
-    std::optional<float>     sample_z_mm_override = std::nullopt);
+    std::optional<float>     sample_z_mm_override = std::nullopt,
+    std::optional<float>     texture_sample_pitch_mm_override = std::nullopt);
 
 std::vector<float> sample_weight_field_components(const TextureMappingOffsetWeightField &weight_field,
                                                   float                                  x_mm,

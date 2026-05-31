@@ -394,10 +394,11 @@ std::array<float, 3> linear_gradient_filament_color(unsigned int filament_id, co
 ColorRGBA linear_gradient_arrow_color(const std::vector<std::array<float, 3>> &component_colors,
                                       const std::vector<TextureMappingZone::LinearGradientStop> &stops,
                                       const std::vector<unsigned int> &component_ids,
+                                      ColorSolverMixModel mix_model,
                                       float t)
 {
     const std::vector<float> weights = TextureMappingManager::linear_gradient_compact_weights(t, stops, component_ids);
-    const std::array<float, 3> mixed = mix_color_solver_components(component_colors, weights, ColorSolverMixModel::PigmentPainter);
+    const std::array<float, 3> mixed = mix_color_solver_components(component_colors, weights, mix_model);
     return { std::clamp(mixed[0], 0.f, 1.f), std::clamp(mixed[1], 0.f, 1.f), std::clamp(mixed[2], 0.f, 1.f), 1.f };
 }
 
@@ -514,6 +515,7 @@ void append_linear_gradient_cylinder(GUI::GLModel::Geometry &geometry,
                                      const std::vector<std::array<float, 3>> &component_colors,
                                      const std::vector<TextureMappingZone::LinearGradientStop> &stops,
                                      const std::vector<unsigned int> &component_ids,
+                                     ColorSolverMixModel mix_model,
                                      bool black)
 {
     constexpr int sectors = 32;
@@ -524,7 +526,7 @@ void append_linear_gradient_cylinder(GUI::GLModel::Geometry &geometry,
         const float step_t = float(step) / float(axial_steps);
         const Vec3f center = start + (end - start) * step_t;
         const float arrow_t = linear_gradient_arrow_t(center, arrow_start, axis, arrow_length);
-        const ColorRGBA color = black ? black_color : linear_gradient_arrow_color(component_colors, stops, component_ids, arrow_t);
+        const ColorRGBA color = black ? black_color : linear_gradient_arrow_color(component_colors, stops, component_ids, mix_model, arrow_t);
         for (int sector = 0; sector <= sectors; ++sector) {
             const float a = 2.f * float(PI) * float(sector) / float(sectors);
             const Vec3f radial = std::cos(a) * u + std::sin(a) * v;
@@ -537,7 +539,7 @@ void append_linear_gradient_cylinder(GUI::GLModel::Geometry &geometry,
         linear_gradient_add_vertex(geometry,
                                    start,
                                    -axis,
-                                   black ? black_color : linear_gradient_arrow_color(component_colors, stops, component_ids, linear_gradient_arrow_t(start, arrow_start, axis, arrow_length)));
+                                   black ? black_color : linear_gradient_arrow_color(component_colors, stops, component_ids, mix_model, linear_gradient_arrow_t(start, arrow_start, axis, arrow_length)));
     for (int i = 0; i < sectors; ++i) {
         geometry.add_triangle(start_center, ring_ids[0][size_t(i + 1)], ring_ids[0][size_t(i)]);
         for (int step = 0; step < axial_steps; ++step) {
@@ -563,19 +565,20 @@ void append_linear_gradient_cone(GUI::GLModel::Geometry &geometry,
                                  const std::vector<std::array<float, 3>> &component_colors,
                                  const std::vector<TextureMappingZone::LinearGradientStop> &stops,
                                  const std::vector<unsigned int> &component_ids,
+                                 ColorSolverMixModel mix_model,
                                  bool black)
 {
     constexpr int sectors = 32;
     constexpr int axial_steps = 24;
     const ColorRGBA black_color = ColorRGBA::BLACK();
-    const ColorRGBA tip_color = black ? black_color : linear_gradient_arrow_color(component_colors, stops, component_ids, linear_gradient_arrow_t(tip, arrow_start, axis, arrow_length));
+    const ColorRGBA tip_color = black ? black_color : linear_gradient_arrow_color(component_colors, stops, component_ids, mix_model, linear_gradient_arrow_t(tip, arrow_start, axis, arrow_length));
     std::vector<std::vector<unsigned int>> ring_ids(size_t(axial_steps), std::vector<unsigned int>(size_t(sectors + 1), 0));
     const Vec3f cone_axis = tip - base;
     for (int step = 0; step < axial_steps; ++step) {
         const float step_t = float(step) / float(axial_steps);
         const Vec3f center = base + cone_axis * step_t;
         const float ring_radius = radius * (1.f - step_t);
-        const ColorRGBA color = black ? black_color : linear_gradient_arrow_color(component_colors, stops, component_ids, linear_gradient_arrow_t(center, arrow_start, axis, arrow_length));
+        const ColorRGBA color = black ? black_color : linear_gradient_arrow_color(component_colors, stops, component_ids, mix_model, linear_gradient_arrow_t(center, arrow_start, axis, arrow_length));
         for (int sector = 0; sector <= sectors; ++sector) {
             const float a = 2.f * float(PI) * float(sector) / float(sectors);
             const Vec3f radial = std::cos(a) * u + std::sin(a) * v;
@@ -700,6 +703,7 @@ void append_linear_gradient_arrow(GUI::GLModel::Geometry &geometry,
                                   const std::vector<std::array<float, 3>> &component_colors,
                                   const std::vector<TextureMappingZone::LinearGradientStop> &stops,
                                   const std::vector<unsigned int> &component_ids,
+                                  ColorSolverMixModel mix_model,
                                   bool black)
 {
     const Vec3f delta = end - start;
@@ -713,8 +717,8 @@ void append_linear_gradient_arrow(GUI::GLModel::Geometry &geometry,
     float clamped_head_length = std::min(head_length, length * 0.75f);
     clamped_head_length = std::max(clamped_head_length, std::min(radius * 2.f, length * 0.5f));
     const Vec3f shaft_end = start + axis * std::max(radius, length - clamped_head_length);
-    append_linear_gradient_cylinder(geometry, start, shaft_end, start, length, axis, u, v, radius, component_colors, stops, component_ids, black);
-    append_linear_gradient_cone(geometry, shaft_end, end, start, length, axis, u, v, head_radius, component_colors, stops, component_ids, black);
+    append_linear_gradient_cylinder(geometry, start, shaft_end, start, length, axis, u, v, radius, component_colors, stops, component_ids, mix_model, black);
+    append_linear_gradient_cone(geometry, shaft_end, end, start, length, axis, u, v, head_radius, component_colors, stops, component_ids, mix_model, black);
 }
 
 } // namespace
@@ -3218,6 +3222,7 @@ void GLVolumeCollection::render_linear_gradient_direction_arrows(const Transform
         component_colors.reserve(component_ids.size());
         for (const unsigned int component_id : component_ids)
             component_colors.emplace_back(linear_gradient_filament_color(component_id, filament_colors));
+        const ColorSolverMixModel mix_model = color_solver_mix_model_from_index(zone.generic_solver_mix_model);
 
         const LinearGradientArrowUsage usage = linear_gradient_arrow_usage(volumes, zone.zone_id);
         const bool stale_unused_start_anchor =
@@ -3280,6 +3285,7 @@ void GLVolumeCollection::render_linear_gradient_direction_arrows(const Transform
                                      component_colors,
                                      gradient_stops,
                                      component_ids,
+                                     mix_model,
                                      true);
         append_linear_gradient_arrow(color_geometry,
                                      start,
@@ -3290,6 +3296,7 @@ void GLVolumeCollection::render_linear_gradient_direction_arrows(const Transform
                                      component_colors,
                                      gradient_stops,
                                      component_ids,
+                                     mix_model,
                                      false);
 
         const float sphere_radius = shaft_radius * 2.45f;

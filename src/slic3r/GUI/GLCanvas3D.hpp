@@ -1140,7 +1140,7 @@ public:
     void highlight_gizmo(const std::string& gizmo_name);
 
     ArrangeSettings get_arrange_settings() const {
-        const ArrangeSettings &settings = get_arrange_settings();
+        const ArrangeSettings &settings = const_cast<GLCanvas3D*>(this)->get_arrange_settings();
         ArrangeSettings ret = settings;
         if (&settings == &m_arrange_settings_fff_seq_print) {
             ret.distance = std::max(ret.distance,

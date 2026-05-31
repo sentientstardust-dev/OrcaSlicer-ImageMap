@@ -609,6 +609,7 @@ target_link_libraries(libslic3r
         miniz
         opencv_world
         pigment_painter
+        prusa_fdm_mixer
     PRIVATE
         ${CMAKE_DL_LIBS}
         ${EXPAT_LIBRARIES}
