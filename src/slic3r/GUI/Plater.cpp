@@ -10871,6 +10871,9 @@ struct Plater::priv
     }
     void export_gcode(fs::path output_path, bool output_path_on_removable_media);
     void export_gcode(fs::path output_path, bool output_path_on_removable_media, PrintHostJob upload_job);
+    void update_plate_toolpath_outside_state(PartPlate* plate);
+    bool is_plate_ready_for_gcode_output(int plate_idx);
+    bool is_plate_ready_for_sliced_file_export(int plate_idx);
 
     void reload_from_disk();
     bool replace_volume_with_stl(int object_idx, int volume_idx, const fs::path& new_path, const std::string& snapshot = "");
@@ -16031,6 +16034,56 @@ bool Plater::priv::warnings_dialog()
 
 }
 
+void Plater::priv::update_plate_toolpath_outside_state(PartPlate* plate)
+{
+    if (plate == nullptr || !plate->is_slice_result_valid())
+        return;
+
+    GCodeProcessorResult* result = plate->get_slice_result();
+    if (result == nullptr)
+        return;
+
+    result->lock();
+    if (result->moves.empty()) {
+        result->unlock();
+        return;
+    }
+    result->toolpath_outside = !bed.build_volume().all_paths_inside(*result, BoundingBoxf3());
+    result->unlock();
+}
+
+bool Plater::priv::is_plate_ready_for_gcode_output(int plate_idx)
+{
+    if (printer_technology != ptFFF)
+        return true;
+
+    if (plate_idx == PLATE_ALL_IDX) {
+        for (PartPlate* plate : partplate_list.get_plate_list())
+            update_plate_toolpath_outside_state(plate);
+        return partplate_list.is_all_slice_results_ready_for_print();
+    }
+
+    PartPlate* plate = plate_idx == PLATE_CURRENT_IDX ? partplate_list.get_curr_plate() : partplate_list.get_plate(plate_idx);
+    update_plate_toolpath_outside_state(plate);
+    return plate != nullptr && plate->is_slice_result_ready_for_print();
+}
+
+bool Plater::priv::is_plate_ready_for_sliced_file_export(int plate_idx)
+{
+    if (printer_technology != ptFFF)
+        return true;
+
+    if (plate_idx == PLATE_ALL_IDX) {
+        for (PartPlate* plate : partplate_list.get_plate_list())
+            update_plate_toolpath_outside_state(plate);
+        return partplate_list.is_all_slice_result_ready_for_export();
+    }
+
+    PartPlate* plate = plate_idx == PLATE_CURRENT_IDX ? partplate_list.get_curr_plate() : partplate_list.get_plate(plate_idx);
+    update_plate_toolpath_outside_state(plate);
+    return plate != nullptr && plate->is_slice_result_ready_for_export();
+}
+
 //BBS: add project slice logic
 void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
 {
@@ -16380,6 +16433,9 @@ void Plater::priv::on_action_print_plate(SimpleEvent&)
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received print plate event\n" ;
     }
 
+    if (!is_plate_ready_for_gcode_output(PLATE_CURRENT_IDX))
+        return;
+
     PresetBundle& preset_bundle = *wxGetApp().preset_bundle;
     if (preset_bundle.use_bbl_network()) {
         // BBS
@@ -16395,6 +16451,9 @@ void Plater::priv::on_action_print_plate(SimpleEvent&)
 
 void Plater::priv::on_action_send_to_multi_machine(SimpleEvent&)
 {
+    if (!is_plate_ready_for_gcode_output(PLATE_CURRENT_IDX))
+        return;
+
     if (!m_send_multi_dlg)
         m_send_multi_dlg = new SendMultiMachinePage(q);
     m_send_multi_dlg->prepare(partplate_list.get_curr_plate_index());
@@ -16480,6 +16539,9 @@ void Plater::priv::on_action_print_all(SimpleEvent&)
     if (q != nullptr) {
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received print all event\n" ;
     }
+
+    if (!is_plate_ready_for_gcode_output(PLATE_ALL_IDX))
+        return;
 
     PresetBundle& preset_bundle = *wxGetApp().preset_bundle;
     if (preset_bundle.use_bbl_network()) {
@@ -21051,6 +21113,9 @@ void Plater::export_gcode(bool prefer_removable)
     if (p->model.objects.empty())
         return;
 
+    if (!p->is_plate_ready_for_gcode_output(PLATE_CURRENT_IDX))
+        return;
+
     //if (get_view3D_canvas3D()->get_gizmos_manager().is_in_editing_mode(true))
     //    return;
 
@@ -21147,6 +21212,9 @@ void Plater::export_gcode(bool prefer_removable)
 
 void Plater::send_to_printer(bool isall)
 {
+    if (!p->is_plate_ready_for_gcode_output(isall ? PLATE_ALL_IDX : PLATE_CURRENT_IDX))
+        return;
+
     p->on_action_send_to_printer(isall);
 }
 
@@ -21154,6 +21222,9 @@ void Plater::send_to_printer(bool isall)
 void Plater::export_gcode_3mf(bool export_all)
 {
     if (p->model.objects.empty())
+        return;
+
+    if (!p->is_plate_ready_for_sliced_file_export(export_all ? PLATE_ALL_IDX : PLATE_CURRENT_IDX))
         return;
 
     if (p->process_completed_with_error == p->partplate_list.get_curr_plate_index())
@@ -22303,6 +22374,9 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn, bool us
     if (! physical_printer_config || p->model.objects.empty())
         return;
 
+    if (!p->is_plate_ready_for_gcode_output(plate_idx))
+        return;
+
     PrintHostJob upload_job(physical_printer_config);
     if (upload_job.empty())
         return;
@@ -22407,6 +22481,9 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn, bool us
 int Plater::send_gcode(int plate_idx, Export3mfProgressFn proFn)
 {
     int result = 0;
+    if (!p->is_plate_ready_for_gcode_output(plate_idx))
+        return -1;
+
     /* generate 3mf */
     set_print_job_plate_idx(plate_idx);
 

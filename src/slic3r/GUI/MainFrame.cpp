@@ -2249,7 +2249,7 @@ bool MainFrame::get_enable_print_status()
     }
     else if (m_print_select == eExportGcode)
     {
-        if (!current_plate->is_slice_result_valid())
+        if (!current_plate->is_slice_result_ready_for_print())
         {
             enable = false;
         }
@@ -2257,7 +2257,7 @@ bool MainFrame::get_enable_print_status()
     }
     else if (m_print_select == eSendGcode)
     {
-        if (!current_plate->is_slice_result_valid())
+        if (!current_plate->is_slice_result_ready_for_print())
             enable = false;
         if (!can_send_gcode())
             enable = false;
@@ -2265,7 +2265,7 @@ bool MainFrame::get_enable_print_status()
     }
     else if (m_print_select == eUploadGcode)
     {
-        if (!current_plate->is_slice_result_valid())
+        if (!current_plate->is_slice_result_ready_for_print())
             enable = false;
         if (!can_send_gcode())
             enable = false;
