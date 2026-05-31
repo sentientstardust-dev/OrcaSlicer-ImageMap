@@ -102,6 +102,12 @@ struct ColorSolverOrderedStackCandidateSet {
     }
 };
 
+struct ColorSolverOrderedStackResult {
+    std::vector<uint16_t> surface_to_deep;
+    std::array<float, 3> rgb { { 0.f, 0.f, 0.f } };
+    bool has_rgb { false };
+};
+
 using ColorSolverOrderedStackCandidateCache = std::map<std::string, ColorSolverOrderedStackCandidateSet>;
 
 ColorSolverMixModel color_solver_mix_model_from_index(int model);
@@ -185,6 +191,10 @@ const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates
     bool                                           td_effective_alpha_correction = false,
     const std::vector<ColorSolverStackComponentRole> &component_roles = {},
     bool                                           beam_search_stack_expansion = false);
+ColorSolverOrderedStackResult solve_color_solver_ordered_stack_result_for_target(
+    const ColorSolverOrderedStackCandidateSet &candidates,
+    const std::array<float, 3>                &target_rgb,
+    ColorSolverMode                            solver_mode);
 std::vector<uint16_t> solve_color_solver_ordered_stack_for_target(
     const ColorSolverOrderedStackCandidateSet &candidates,
     const std::array<float, 3>                &target_rgb,

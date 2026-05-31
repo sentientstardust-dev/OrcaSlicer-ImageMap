@@ -670,7 +670,7 @@ std::array<float, 3> mix_ordered_stack_with_buffers(const std::vector<std::array
         return colors_with_background.empty() ? std::array<float, 3>{ { 0.f, 0.f, 0.f } } : colors_with_background.back();
 
     if (td_effective_alpha_correction)
-        return mix_ordered_stack_td_effective_alpha(colors_with_background, surface_to_deep, layer_opacities, surface_scatter, component_roles);
+        return mix_ordered_stack_td_effective_alpha(colors_with_background, surface_to_deep, layer_opacities, 0.f, component_roles);
     if (beer_lambert_rgb_correction)
         return mix_ordered_stack_beer_lambert_rgb(colors_with_background, surface_to_deep, layer_opacities, surface_scatter);
 
@@ -1273,7 +1273,9 @@ std::string color_solver_ordered_stack_candidate_cache_key(const std::vector<std
     key << "|lim" << candidate_limit;
     key << "|item" << stack_item_limit;
     const float safe_surface_scatter =
-        std::clamp(std::isfinite(surface_scatter) ? surface_scatter : 0.f, 0.f, 0.5f);
+        td_effective_alpha_correction ?
+            0.f :
+            std::clamp(std::isfinite(surface_scatter) ? surface_scatter : 0.f, 0.f, 0.5f);
     key << "|ss" << int(std::lround(safe_surface_scatter * 1000000.f));
     key << "|bl" << (beer_lambert_rgb_correction ? 1 : 0);
     key << "|ea" << (td_effective_alpha_correction ? 1 : 0);
@@ -1481,13 +1483,15 @@ const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates
                                                    beam_search_stack_expansion)).first->second;
 }
 
-std::vector<uint16_t> solve_color_solver_ordered_stack_for_target(
+ColorSolverOrderedStackResult solve_color_solver_ordered_stack_result_for_target(
     const ColorSolverOrderedStackCandidateSet &candidates,
     const std::array<float, 3>                &target_rgb,
     ColorSolverMode                            solver_mode)
 {
+    ColorSolverOrderedStackResult result;
+
     if (candidates.empty())
-        return {};
+        return result;
 
     const size_t candidate_count = candidates.rgbs.size() / 3;
     ColorSolverNearestResult nearest =
@@ -1497,13 +1501,34 @@ std::vector<uint16_t> solve_color_solver_ordered_stack_for_target(
     if (nearest.best_idx >= candidate_count && color_solver_mode_is_perceptual(solver_mode))
         nearest = nearest_color_solver_candidates(candidates, target_rgb);
     if (nearest.best_idx >= candidate_count)
-        return {};
+        return result;
 
     const size_t stack_begin = nearest.best_idx * size_t(candidates.stack_depth);
     if (stack_begin + size_t(candidates.stack_depth) > candidates.stacks.size())
-        return {};
-    return std::vector<uint16_t>(candidates.stacks.begin() + stack_begin,
-                                 candidates.stacks.begin() + stack_begin + candidates.stack_depth);
+        return result;
+
+    result.surface_to_deep = std::vector<uint16_t>(candidates.stacks.begin() + stack_begin,
+                                                   candidates.stacks.begin() + stack_begin + candidates.stack_depth);
+
+    const size_t rgb_begin = nearest.best_idx * 3;
+    if (rgb_begin + 2 < candidates.rgbs.size()) {
+        result.rgb = { {
+            candidates.rgbs[rgb_begin + 0],
+            candidates.rgbs[rgb_begin + 1],
+            candidates.rgbs[rgb_begin + 2],
+        } };
+        result.has_rgb = true;
+    }
+
+    return result;
+}
+
+std::vector<uint16_t> solve_color_solver_ordered_stack_for_target(
+    const ColorSolverOrderedStackCandidateSet &candidates,
+    const std::array<float, 3>                &target_rgb,
+    ColorSolverMode                            solver_mode)
+{
+    return solve_color_solver_ordered_stack_result_for_target(candidates, target_rgb, solver_mode).surface_to_deep;
 }
 
 } // namespace Slic3r

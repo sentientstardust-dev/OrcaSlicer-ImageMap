@@ -20,6 +20,7 @@ class PrintConfig;
 
 struct TextureMappingContoningStack {
     std::vector<unsigned int> bottom_to_top;
+    std::optional<std::array<float, 3>> rgb;
 };
 
 class TextureMappingContoningSolver
@@ -73,6 +74,7 @@ private:
     bool m_beam_search_stack_expansion_enabled { false };
     std::vector<ColorSolverStackComponentRole> m_component_roles;
     mutable std::map<int, std::vector<Candidate>> m_candidates_by_depth;
+    mutable std::shared_ptr<std::mutex> m_candidate_mutex { std::make_shared<std::mutex>() };
     mutable std::shared_ptr<ColorSolverOrderedStackCandidateCache> m_ordered_candidate_cache { std::make_shared<ColorSolverOrderedStackCandidateCache>() };
     mutable std::shared_ptr<std::mutex> m_ordered_candidate_cache_mutex { std::make_shared<std::mutex>() };
 };

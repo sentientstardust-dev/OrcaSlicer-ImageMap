@@ -2773,8 +2773,7 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
         settings.contoning_flat_surface_beam_search_stack_expansion =
             zone->effective_top_surface_contoning_beam_search_stack_expansion_enabled();
         settings.contoning_flat_surface_surface_scatter =
-            settings.contoning_flat_surface_td_adjustment &&
-            zone->top_surface_contoning_surface_scatter_enabled ?
+            zone->effective_top_surface_contoning_surface_scatter_enabled() ?
                 k_contoning_preview_surface_scatter :
                 0.f;
     }
@@ -5798,7 +5797,7 @@ static size_t texture_preview_settings_signature_impl(size_t num_physical,
         signature_mix(std::hash<int>{}(zone.top_surface_contoning_pattern_filaments));
         signature_mix(std::hash<int>{}(zone.top_surface_contoning_color_lower_surfaces ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.top_surface_contoning_td_adjustment_enabled ? 1 : 0));
-        signature_mix(std::hash<int>{}(zone.top_surface_contoning_surface_scatter_enabled ? 1 : 0));
+        signature_mix(std::hash<int>{}(zone.effective_top_surface_contoning_surface_scatter_enabled() ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.top_surface_contoning_beer_lambert_rgb_correction_enabled ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.top_surface_contoning_td_effective_alpha_correction_enabled ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.effective_top_surface_contoning_beam_search_stack_expansion_enabled() ? 1 : 0));
@@ -5955,7 +5954,7 @@ static void texture_preview_mix_zone_baked_model_settings(size_t &signature,
     signature_mix(std::hash<int>{}(zone.top_surface_contoning_pattern_filaments));
     signature_mix(std::hash<int>{}(zone.top_surface_contoning_color_lower_surfaces ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.top_surface_contoning_td_adjustment_enabled ? 1 : 0));
-    signature_mix(std::hash<int>{}(zone.top_surface_contoning_surface_scatter_enabled ? 1 : 0));
+    signature_mix(std::hash<int>{}(zone.effective_top_surface_contoning_surface_scatter_enabled() ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.top_surface_contoning_beer_lambert_rgb_correction_enabled ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.top_surface_contoning_td_effective_alpha_correction_enabled ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.effective_top_surface_contoning_beam_search_stack_expansion_enabled() ? 1 : 0));

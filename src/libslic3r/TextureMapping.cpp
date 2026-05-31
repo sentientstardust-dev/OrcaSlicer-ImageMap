@@ -1182,7 +1182,7 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            effective_top_surface_contoning_surface_anchored_stack_optimizations_enabled() ==
                rhs.effective_top_surface_contoning_surface_anchored_stack_optimizations_enabled() &&
            top_surface_contoning_td_adjustment_enabled == rhs.top_surface_contoning_td_adjustment_enabled &&
-           top_surface_contoning_surface_scatter_enabled == rhs.top_surface_contoning_surface_scatter_enabled &&
+           effective_top_surface_contoning_surface_scatter_enabled() == rhs.effective_top_surface_contoning_surface_scatter_enabled() &&
            top_surface_contoning_beer_lambert_rgb_correction_enabled == rhs.top_surface_contoning_beer_lambert_rgb_correction_enabled &&
            top_surface_contoning_td_effective_alpha_correction_enabled == rhs.top_surface_contoning_td_effective_alpha_correction_enabled &&
            effective_top_surface_contoning_beam_search_stack_expansion_enabled() == rhs.effective_top_surface_contoning_beam_search_stack_expansion_enabled() &&
@@ -1595,7 +1595,7 @@ std::string TextureMappingManager::serialize_entries()
         texture["top_surface_contoning_td_adjustment_enabled"] =
             zone.top_surface_contoning_td_adjustment_enabled;
         texture["top_surface_contoning_surface_scatter_enabled"] =
-            zone.top_surface_contoning_surface_scatter_enabled;
+            zone.effective_top_surface_contoning_surface_scatter_enabled();
         texture["top_surface_contoning_beer_lambert_rgb_correction_enabled"] =
             zone.top_surface_contoning_beer_lambert_rgb_correction_enabled;
         texture["top_surface_contoning_td_effective_alpha_correction_enabled"] =

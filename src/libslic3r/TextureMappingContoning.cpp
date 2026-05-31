@@ -417,8 +417,7 @@ TextureMappingContoningSolver::TextureMappingContoningSolver(const TextureMappin
     m_layer_height_mm = std::isfinite(layer_height_mm) && layer_height_mm > 0.f ? layer_height_mm : 0.2f;
     if (!std::isfinite(m_layer_height_mm) || m_layer_height_mm <= 0.f)
         m_layer_height_mm = 0.2f;
-    m_surface_scatter =
-        m_td_adjustment_enabled && zone.top_surface_contoning_surface_scatter_enabled ? CONTONING_SURFACE_SCATTER : 0.f;
+    m_surface_scatter = zone.effective_top_surface_contoning_surface_scatter_enabled() ? CONTONING_SURFACE_SCATTER : 0.f;
 
     component_ids.erase(std::remove_if(component_ids.begin(), component_ids.end(), [&config](unsigned int id) {
         return id == 0 || id > config.filament_colour.values.size();
@@ -450,6 +449,7 @@ TextureMappingContoningSolver::candidates_for_depth(int stack_layers) const
     const int depth = std::clamp(stack_layers,
                                  TextureMappingZone::MinTopSurfaceContoningStackLayers,
                                  TextureMappingZone::MaxTopSurfaceContoningStackLayers);
+    std::lock_guard<std::mutex> lock(*m_candidate_mutex);
     auto found = m_candidates_by_depth.find(depth);
     if (found != m_candidates_by_depth.end())
         return found->second;
@@ -656,8 +656,9 @@ TextureMappingContoningStack TextureMappingContoningSolver::solve(const std::arr
                                                        m_component_roles,
                                                        m_beam_search_stack_expansion_enabled);
         }
-        const std::vector<uint16_t> surface_to_deep =
-            solve_color_solver_ordered_stack_for_target(*ordered_candidates, target_rgb, ColorSolverMode::OklabSoftCap4Dark4);
+        const ColorSolverOrderedStackResult solved =
+            solve_color_solver_ordered_stack_result_for_target(*ordered_candidates, target_rgb, ColorSolverMode::OklabSoftCap4Dark4);
+        const std::vector<uint16_t> &surface_to_deep = solved.surface_to_deep;
         if (!surface_to_deep.empty()) {
             out.bottom_to_top.reserve(surface_to_deep.size());
             auto append_component = [this, &out](uint16_t component_idx) {
@@ -671,8 +672,11 @@ TextureMappingContoningStack TextureMappingContoningSolver::solve(const std::arr
                 for (auto it = surface_to_deep.rbegin(); it != surface_to_deep.rend(); ++it)
                     append_component(*it);
             }
-            if (!out.bottom_to_top.empty())
+            if (!out.bottom_to_top.empty()) {
+                if (solved.has_rgb)
+                    out.rgb = solved.rgb;
                 return out;
+            }
         }
     }
 
