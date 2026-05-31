@@ -2806,7 +2806,7 @@ public:
                                            wxALIGN_CENTER_VERTICAL | wxRIGHT,
                                            gap);
             wxArrayString contoning_flat_infill_choices;
-            contoning_flat_infill_choices.Add(_L("Default (Rectilinear)"));
+            contoning_flat_infill_choices.Add(_L("Default (Boundary Skin variable width)"));
             contoning_flat_infill_choices.Add(_L("Rectilinear"));
             contoning_flat_infill_choices.Add(_L("Concentric"));
             contoning_flat_infill_choices.Add(_L("Boundary Skin (fixed width)"));
