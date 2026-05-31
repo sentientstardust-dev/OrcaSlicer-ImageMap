@@ -518,6 +518,7 @@ struct TopSurfaceImageRegionPlan {
     bool contoning_surface_scatter_enabled = TextureMappingZone::DefaultTopSurfaceContoningSurfaceScatterEnabled;
     bool contoning_beer_lambert_rgb_correction_enabled = TextureMappingZone::DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled;
     bool contoning_td_effective_alpha_correction_enabled = TextureMappingZone::DefaultTopSurfaceContoningTdEffectiveAlphaCorrectionEnabled;
+    bool contoning_variable_layer_height_compensation_enabled = TextureMappingZone::DefaultTopSurfaceContoningVariableLayerHeightCompensationEnabled;
     bool contoning_beam_search_stack_expansion_enabled = TextureMappingZone::DefaultTopSurfaceContoningBeamSearchStackExpansionEnabled;
     int contoning_generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
     int contoning_flat_surface_infill_mode = TextureMappingZone::SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode;
@@ -1649,6 +1650,24 @@ static std::vector<ExPolygons> top_surface_image_contoning_stack_areas(const Lay
     return out;
 }
 
+static std::vector<float> top_surface_image_contoning_surface_to_deep_layer_heights(
+    const Layer                   &source_layer,
+    int                            stack_layers,
+    TopSurfaceImageSourceSurface   source_surface)
+{
+    std::vector<float> out;
+    out.reserve(size_t(std::max(0, stack_layers)));
+    const Layer *stack_layer = &source_layer;
+    for (int depth = 0; depth < stack_layers && stack_layer != nullptr; ++depth) {
+        const float height = float(stack_layer->height);
+        out.emplace_back(std::isfinite(height) && height > 0.f ? height : 0.f);
+        stack_layer = source_surface == TopSurfaceImageSourceSurface::Top ?
+            stack_layer->lower_layer :
+            stack_layer->upper_layer;
+    }
+    return out;
+}
+
 static double top_surface_image_scaled_area_mm2(double scaled_area)
 {
     return std::abs(scaled_area) * SCALING_FACTOR * SCALING_FACTOR;
@@ -2219,6 +2238,7 @@ private:
 struct TopSurfaceImageContoningSourceContext {
     TextureMappingOffsetContext offset_context;
     std::vector<ExPolygons> stack_areas;
+    std::vector<float> surface_to_deep_layer_heights_mm;
     ExPolygons normal_filter_bypass_area;
     float threshold_deg { 0.f };
     int stack_layers { 0 };
@@ -2263,6 +2283,7 @@ struct TopSurfaceImageContoningStackPlanKey {
     bool surface_scatter { false };
     bool beer_lambert_rgb_correction { false };
     bool td_effective_alpha_correction { false };
+    bool variable_layer_height_compensation { false };
     bool beam_search_stack_expansion { false };
     int mix_model { TextureMappingZone::DefaultGenericSolverMixModel };
 
@@ -2298,6 +2319,7 @@ struct TopSurfaceImageContoningStackPlanKey {
                         surface_scatter,
                         beer_lambert_rgb_correction,
                         td_effective_alpha_correction,
+                        variable_layer_height_compensation,
                         beam_search_stack_expansion,
                         mix_model) <
                std::tie(rhs.source_layer,
@@ -2330,6 +2352,7 @@ struct TopSurfaceImageContoningStackPlanKey {
                         rhs.surface_scatter,
                         rhs.beer_lambert_rgb_correction,
                         rhs.td_effective_alpha_correction,
+                        rhs.variable_layer_height_compensation,
                         rhs.beam_search_stack_expansion,
                         rhs.mix_model);
     }
@@ -4079,6 +4102,7 @@ static std::optional<TopSurfaceImageContoningSolvedLabel> top_surface_image_cont
     const TextureMappingContoningSolver                &solver,
     bool                                                lower_surface,
     int                                                 visible_layers,
+    const std::vector<float>                           &surface_to_deep_layer_heights_mm,
     std::vector<TopSurfaceImageContoningVectorLabel>   &labels,
     std::map<std::pair<std::vector<unsigned int>, int>, int> &label_by_stack)
 {
@@ -4101,7 +4125,10 @@ static std::optional<TopSurfaceImageContoningSolvedLabel> top_surface_image_cont
         if (stack.rgb)
             stack_rgb = stack.rgb;
         else
-            stack_rgb = solver.stack_rgb(stack.bottom_to_top, lower_surface, visible_layers);
+            stack_rgb = solver.stack_rgb(stack.bottom_to_top,
+                                         lower_surface,
+                                         visible_layers,
+                                         surface_to_deep_layer_heights_mm);
         if (!stack_rgb)
             return std::nullopt;
 
@@ -4127,11 +4154,22 @@ static std::optional<TopSurfaceImageContoningSolvedLabel> top_surface_image_cont
     int                                                 visible_layers,
     const TextureMappingContoningSolver                &solver,
     bool                                                lower_surface,
+    const std::vector<float>                           &surface_to_deep_layer_heights_mm,
     std::vector<TopSurfaceImageContoningVectorLabel>   &labels,
     std::map<std::pair<std::vector<unsigned int>, int>, int> &label_by_stack)
 {
-    TextureMappingContoningStack stack = solver.solve(rgb, solve_layers, lower_surface, visible_layers);
-    return top_surface_image_contoning_label_for_stack(stack, solver, lower_surface, visible_layers, labels, label_by_stack);
+    TextureMappingContoningStack stack = solver.solve(rgb,
+                                                      solve_layers,
+                                                      lower_surface,
+                                                      visible_layers,
+                                                      surface_to_deep_layer_heights_mm);
+    return top_surface_image_contoning_label_for_stack(stack,
+                                                       solver,
+                                                       lower_surface,
+                                                       visible_layers,
+                                                       surface_to_deep_layer_heights_mm,
+                                                       labels,
+                                                       label_by_stack);
 }
 
 static void top_surface_image_contoning_resolve_merged_grid_regions(
@@ -4145,6 +4183,7 @@ static void top_surface_image_contoning_resolve_merged_grid_regions(
     int                                                                stack_layers,
     int                                                                pattern_filaments,
     bool                                                               lower_surface,
+    const std::vector<float>                                           &surface_to_deep_layer_heights_mm,
     const ThrowIfCanceled                                             *throw_if_canceled)
 {
     if (grid.empty() || labels.empty() || cols <= 0 || rows <= 0 ||
@@ -4243,6 +4282,7 @@ static void top_surface_image_contoning_resolve_merged_grid_regions(
                                                                 visible_layers,
                                                                 solver,
                                                                 lower_surface,
+                                                                surface_to_deep_layer_heights_mm,
                                                                 resolved_labels,
                                                                 label_by_stack);
                     if (solved)
@@ -4313,6 +4353,9 @@ static std::optional<TopSurfaceImageContoningSourceContext> top_surface_image_co
         top_surface_image_contoning_pattern_filaments(out.stack_layers, plan.contoning_pattern_filaments);
     out.stack_areas =
         top_surface_image_contoning_stack_areas(source_layer, plan.zone_id, out.stack_layers, source_surface, throw_if_canceled);
+    if (plan.contoning_variable_layer_height_compensation_enabled)
+        out.surface_to_deep_layer_heights_mm =
+            top_surface_image_contoning_surface_to_deep_layer_heights(source_layer, out.stack_layers, source_surface);
     if (stack_area_extensions != nullptr) {
         const size_t count = std::min(out.stack_areas.size(), stack_area_extensions->size());
         for (size_t idx = 0; idx < count; ++idx) {
@@ -4401,6 +4444,7 @@ static void top_surface_image_contoning_solve_anchored_region(
                                                         solver,
                                                         lower_surface,
                                                         available_depth,
+                                                        source_context.surface_to_deep_layer_heights_mm,
                                                         labels,
                                                         label_by_stack);
         if (!solved)
@@ -4448,7 +4492,11 @@ static void top_surface_image_contoning_solve_anchored_region(
         cell_samples[grid_idx] = sample;
         cell_available_depths[grid_idx] = sample->available_depth;
         ++debug_sampled_cell_count;
-        cell_stacks[grid_idx] = solver.solve(sample->rgb, sample->solve_layers, lower_surface, sample->available_depth);
+        cell_stacks[grid_idx] = solver.solve(sample->rgb,
+                                             sample->solve_layers,
+                                             lower_surface,
+                                             sample->available_depth,
+                                             source_context.surface_to_deep_layer_heights_mm);
         if (debug_stride > 0 &&
             row % debug_stride == 0 &&
             col % debug_stride == 0) {
@@ -4550,6 +4598,7 @@ static void top_surface_image_contoning_solve_anchored_region(
                                                                 source_context.stack_layers,
                                                                 source_context.pattern_filaments,
                                                                 source_surface == TopSurfaceImageSourceSurface::Bottom,
+                                                                source_context.surface_to_deep_layer_heights_mm,
                                                                 throw_if_canceled);
         if (debug_enabled)
             top_surface_image_debug_accumulate_timing_step(debug_timing.steps,
@@ -5049,6 +5098,7 @@ static TopSurfaceImageContoningStackPlanKey top_surface_image_contoning_anchored
     key.surface_scatter = plan.contoning_surface_scatter_enabled;
     key.beer_lambert_rgb_correction = plan.contoning_beer_lambert_rgb_correction_enabled;
     key.td_effective_alpha_correction = plan.contoning_td_effective_alpha_correction_enabled;
+    key.variable_layer_height_compensation = plan.contoning_variable_layer_height_compensation_enabled;
     key.beam_search_stack_expansion = plan.contoning_beam_search_stack_expansion_enabled;
     key.mix_model = plan.contoning_generic_solver_mix_model;
     return key;
@@ -5184,6 +5234,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                     solver,
                                                     source_surface == TopSurfaceImageSourceSurface::Bottom &&
                                                         plan.contoning_td_adjustment_enabled,
+                                                    source->surface_to_deep_layer_heights_mm,
                                                     labels,
                                                     label_by_stack);
         if (!solved)
@@ -5310,6 +5361,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                                 source->stack_layers,
                                                                 source->pattern_filaments,
                                                                 source_surface == TopSurfaceImageSourceSurface::Bottom,
+                                                                source->surface_to_deep_layer_heights_mm,
                                                                 throw_if_canceled);
     }
     check_canceled(throw_if_canceled);
@@ -5396,6 +5448,7 @@ static std::shared_ptr<const TopSurfaceImageContoningStackPlan> top_surface_imag
                                                     solver,
                                                     source_surface == TopSurfaceImageSourceSurface::Bottom &&
                                                         plan.contoning_td_adjustment_enabled,
+                                                    source_context->surface_to_deep_layer_heights_mm,
                                                     out->labels,
                                                     label_by_stack);
         if (!solved)
@@ -5527,6 +5580,7 @@ static std::shared_ptr<const TopSurfaceImageContoningStackPlan> top_surface_imag
                                                                 source_context->stack_layers,
                                                                 source_context->pattern_filaments,
                                                                 source_surface == TopSurfaceImageSourceSurface::Bottom,
+                                                                source_context->surface_to_deep_layer_heights_mm,
                                                                 throw_if_canceled);
     }
     for (size_t idx = 0; idx < out->cells.size(); ++idx)
@@ -5586,6 +5640,7 @@ static TopSurfaceImageContoningStackPlanKey top_surface_image_contoning_stack_pl
     key.surface_scatter = plan.contoning_surface_scatter_enabled;
     key.beer_lambert_rgb_correction = plan.contoning_beer_lambert_rgb_correction_enabled;
     key.td_effective_alpha_correction = plan.contoning_td_effective_alpha_correction_enabled;
+    key.variable_layer_height_compensation = plan.contoning_variable_layer_height_compensation_enabled;
     key.beam_search_stack_expansion = plan.contoning_beam_search_stack_expansion_enabled;
     key.mix_model = plan.contoning_generic_solver_mix_model;
     return key;
@@ -6284,6 +6339,8 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
             plan.contoning_td_adjustment_enabled &&
             !plan.contoning_td_effective_alpha_correction_enabled &&
             zone->top_surface_contoning_beer_lambert_rgb_correction_enabled;
+        plan.contoning_variable_layer_height_compensation_enabled =
+            zone->top_surface_contoning_variable_layer_height_compensation_enabled;
         plan.contoning_generic_solver_mix_model =
             std::clamp(zone->generic_solver_mix_model,
                        int(TextureMappingZone::GenericSolverPigmentPainter),

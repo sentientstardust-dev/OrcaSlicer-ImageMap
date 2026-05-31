@@ -89,6 +89,12 @@ struct TextureMappingZone
         ContoningFlatSurfaceInfillRectilinearWithBoundary = 7
     };
 
+    enum TopSurfaceContoningColorPredictionMode : uint8_t {
+        ContoningColorPredictionDefault = 0,
+        ContoningColorPredictionTdEffectiveAlpha = 1,
+        ContoningColorPredictionBeerLambertRgb = 2
+    };
+
     enum FilamentColorMode : uint8_t {
         FilamentColorAny = 0,
         FilamentColorRGB = 1,
@@ -207,8 +213,13 @@ struct TextureMappingZone
     static constexpr bool  DefaultTopSurfaceContoningSurfaceAnchoredStackOptimizationsEnabled = true;
     static constexpr bool  DefaultTopSurfaceContoningTdAdjustmentEnabled = true;
     static constexpr bool  DefaultTopSurfaceContoningSurfaceScatterEnabled = false;
-    static constexpr bool  DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled = false;
-    static constexpr bool  DefaultTopSurfaceContoningTdEffectiveAlphaCorrectionEnabled = true;
+    static constexpr int   DefaultTopSurfaceContoningColorPredictionMode = int(ContoningColorPredictionDefault);
+    static constexpr int   SlicerDefaultTopSurfaceContoningColorPredictionMode = int(ContoningColorPredictionTdEffectiveAlpha);
+    static constexpr bool  DefaultTopSurfaceContoningVariableLayerHeightCompensationEnabled = true;
+    static constexpr bool  DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled =
+        SlicerDefaultTopSurfaceContoningColorPredictionMode == int(ContoningColorPredictionBeerLambertRgb);
+    static constexpr bool  DefaultTopSurfaceContoningTdEffectiveAlphaCorrectionEnabled =
+        SlicerDefaultTopSurfaceContoningColorPredictionMode == int(ContoningColorPredictionTdEffectiveAlpha);
     static constexpr bool  DefaultTopSurfaceContoningBeamSearchStackExpansionEnabled = true;
     static constexpr bool  DefaultCompactOffsetMode = true;
     static constexpr bool  DefaultUseLegacyFixedColorMode = false;
@@ -329,6 +340,15 @@ struct TextureMappingZone
         return td_adjustment && surface_scatter && !td_effective_alpha;
     }
 
+    static int effective_top_surface_contoning_color_prediction_mode(int mode)
+    {
+        if (mode == int(ContoningColorPredictionDefault))
+            return SlicerDefaultTopSurfaceContoningColorPredictionMode;
+        return std::clamp(mode,
+                          int(ContoningColorPredictionTdEffectiveAlpha),
+                          int(ContoningColorPredictionBeerLambertRgb));
+    }
+
     static bool effective_top_surface_contoning_layer_phase_enabled(bool value, bool surface_anchored_stacks)
     {
         return effective_top_surface_contoning_layer_phase_enabled(value) &&
@@ -343,7 +363,7 @@ struct TextureMappingZone
 
     static constexpr int normalize_top_surface_contoning_polygonize_resolution(int value)
     {
-        return value <= 1 ? 1 : (value >= 8 ? 8 : (value >= 4 ? 4 : 2));
+        return value <= 1 ? 1 : (value >= 8 ? 8 : (value >= 4 ? 4 : (value >= 3 ? 3 : 2)));
     }
 
     struct LinearGradientAnchor {
@@ -431,6 +451,8 @@ struct TextureMappingZone
     bool        top_surface_contoning_surface_scatter_enabled = DefaultTopSurfaceContoningSurfaceScatterEnabled;
     bool        top_surface_contoning_beer_lambert_rgb_correction_enabled = DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled;
     bool        top_surface_contoning_td_effective_alpha_correction_enabled = DefaultTopSurfaceContoningTdEffectiveAlphaCorrectionEnabled;
+    int         top_surface_contoning_color_prediction_mode = DefaultTopSurfaceContoningColorPredictionMode;
+    bool        top_surface_contoning_variable_layer_height_compensation_enabled = DefaultTopSurfaceContoningVariableLayerHeightCompensationEnabled;
     bool        top_surface_contoning_beam_search_stack_expansion_enabled = DefaultTopSurfaceContoningBeamSearchStackExpansionEnabled;
     bool        compact_offset_mode = DefaultCompactOffsetMode;
     bool        use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
@@ -589,6 +611,20 @@ struct TextureMappingZone
             top_surface_contoning_td_effective_alpha_correction_enabled);
     }
 
+    int effective_top_surface_contoning_color_prediction_mode() const
+    {
+        return TextureMappingZone::effective_top_surface_contoning_color_prediction_mode(
+            top_surface_contoning_color_prediction_mode);
+    }
+
+    void normalize_top_surface_contoning_td_correction()
+    {
+        const bool beer_lambert_rgb =
+            effective_top_surface_contoning_color_prediction_mode() == int(ContoningColorPredictionBeerLambertRgb);
+        top_surface_contoning_beer_lambert_rgb_correction_enabled = beer_lambert_rgb;
+        top_surface_contoning_td_effective_alpha_correction_enabled = !beer_lambert_rgb;
+    }
+
     void apply_top_surface_contoning_experimental_defaults()
     {
         if (top_surface_image_printing_enabled &&
@@ -617,6 +653,8 @@ struct TextureMappingZone
             top_surface_contoning_layer_phase_enabled = false;
             top_surface_contoning_blue_noise_error_diffusion_enabled = false;
         }
+        top_surface_contoning_td_adjustment_enabled = true;
+        normalize_top_surface_contoning_td_correction();
         if (top_surface_contoning_td_effective_alpha_correction_enabled)
             top_surface_contoning_surface_scatter_enabled = false;
     }
@@ -687,6 +725,8 @@ struct TextureMappingZone
         top_surface_contoning_surface_scatter_enabled = DefaultTopSurfaceContoningSurfaceScatterEnabled;
         top_surface_contoning_beer_lambert_rgb_correction_enabled = DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled;
         top_surface_contoning_td_effective_alpha_correction_enabled = DefaultTopSurfaceContoningTdEffectiveAlphaCorrectionEnabled;
+        top_surface_contoning_color_prediction_mode = DefaultTopSurfaceContoningColorPredictionMode;
+        top_surface_contoning_variable_layer_height_compensation_enabled = DefaultTopSurfaceContoningVariableLayerHeightCompensationEnabled;
         top_surface_contoning_beam_search_stack_expansion_enabled = DefaultTopSurfaceContoningBeamSearchStackExpansionEnabled;
         compact_offset_mode = DefaultCompactOffsetMode;
         use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;

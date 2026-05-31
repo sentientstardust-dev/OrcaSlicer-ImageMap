@@ -729,6 +729,28 @@ static int top_surface_contoning_flat_surface_infill_mode_from_name(const std::s
     return int(TextureMappingZone::ContoningFlatSurfaceInfillDefault);
 }
 
+static std::string top_surface_contoning_color_prediction_mode_name(int mode)
+{
+    if (mode == int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha))
+        return "td_effective_alpha";
+    if (mode == int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb))
+        return "rgb_beer_lambert";
+    return "default";
+}
+
+static int top_surface_contoning_color_prediction_mode_from_name(std::string name)
+{
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+        const char lowered = char(std::tolower(c));
+        return lowered == '-' || lowered == ' ' ? '_' : lowered;
+    });
+    if (name == "td_effective_alpha" || name == "effective_alpha")
+        return int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha);
+    if (name == "rgb_beer_lambert" || name == "beer_lambert_rgb" || name == "beer_lambert")
+        return int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb);
+    return TextureMappingZone::DefaultTopSurfaceContoningColorPredictionMode;
+}
+
 static std::string top_visible_recolor_aggressiveness_name(int mode)
 {
     switch (clamp_int(mode,
@@ -1183,8 +1205,10 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
                rhs.effective_top_surface_contoning_surface_anchored_stack_optimizations_enabled() &&
            top_surface_contoning_td_adjustment_enabled == rhs.top_surface_contoning_td_adjustment_enabled &&
            effective_top_surface_contoning_surface_scatter_enabled() == rhs.effective_top_surface_contoning_surface_scatter_enabled() &&
+           top_surface_contoning_color_prediction_mode == rhs.top_surface_contoning_color_prediction_mode &&
            top_surface_contoning_beer_lambert_rgb_correction_enabled == rhs.top_surface_contoning_beer_lambert_rgb_correction_enabled &&
            top_surface_contoning_td_effective_alpha_correction_enabled == rhs.top_surface_contoning_td_effective_alpha_correction_enabled &&
+           top_surface_contoning_variable_layer_height_compensation_enabled == rhs.top_surface_contoning_variable_layer_height_compensation_enabled &&
            effective_top_surface_contoning_beam_search_stack_expansion_enabled() == rhs.effective_top_surface_contoning_beam_search_stack_expansion_enabled() &&
            compact_offset_mode == rhs.compact_offset_mode &&
            use_legacy_fixed_color_mode == rhs.use_legacy_fixed_color_mode &&
@@ -1596,10 +1620,14 @@ std::string TextureMappingManager::serialize_entries()
             zone.top_surface_contoning_td_adjustment_enabled;
         texture["top_surface_contoning_surface_scatter_enabled"] =
             zone.effective_top_surface_contoning_surface_scatter_enabled();
+        texture["top_surface_contoning_color_prediction_mode"] =
+            top_surface_contoning_color_prediction_mode_name(zone.top_surface_contoning_color_prediction_mode);
         texture["top_surface_contoning_beer_lambert_rgb_correction_enabled"] =
             zone.top_surface_contoning_beer_lambert_rgb_correction_enabled;
         texture["top_surface_contoning_td_effective_alpha_correction_enabled"] =
             zone.top_surface_contoning_td_effective_alpha_correction_enabled;
+        texture["top_surface_contoning_variable_layer_height_compensation_enabled"] =
+            zone.top_surface_contoning_variable_layer_height_compensation_enabled;
         texture["top_surface_contoning_beam_search_stack_expansion_enabled"] =
             zone.effective_top_surface_contoning_beam_search_stack_expansion_enabled();
         texture["compact_offset_mode"] = zone.compact_offset_mode;
@@ -1913,12 +1941,22 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.top_surface_contoning_surface_scatter_enabled =
             texture.value("top_surface_contoning_surface_scatter_enabled",
                           TextureMappingZone::DefaultTopSurfaceContoningSurfaceScatterEnabled);
+        auto color_prediction_mode_it = texture.find("top_surface_contoning_color_prediction_mode");
+        zone.top_surface_contoning_color_prediction_mode =
+            color_prediction_mode_it != texture.end() && color_prediction_mode_it->is_string() ?
+                top_surface_contoning_color_prediction_mode_from_name(color_prediction_mode_it->get<std::string>()) :
+                clamp_int(color_prediction_mode_it != texture.end() && color_prediction_mode_it->is_number_integer() ?
+                              color_prediction_mode_it->get<int>() :
+                              TextureMappingZone::DefaultTopSurfaceContoningColorPredictionMode,
+                          int(TextureMappingZone::ContoningColorPredictionDefault),
+                          int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb));
         zone.top_surface_contoning_beer_lambert_rgb_correction_enabled =
-            texture.value("top_surface_contoning_beer_lambert_rgb_correction_enabled",
-                          TextureMappingZone::DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled);
+            TextureMappingZone::DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled;
         zone.top_surface_contoning_td_effective_alpha_correction_enabled =
-            texture.value("top_surface_contoning_td_effective_alpha_correction_enabled",
-                          TextureMappingZone::DefaultTopSurfaceContoningTdEffectiveAlphaCorrectionEnabled);
+            TextureMappingZone::DefaultTopSurfaceContoningTdEffectiveAlphaCorrectionEnabled;
+        zone.top_surface_contoning_variable_layer_height_compensation_enabled =
+            texture.value("top_surface_contoning_variable_layer_height_compensation_enabled",
+                          TextureMappingZone::DefaultTopSurfaceContoningVariableLayerHeightCompensationEnabled);
         zone.top_surface_contoning_beam_search_stack_expansion_enabled =
             texture.value("top_surface_contoning_beam_search_stack_expansion_enabled",
                           TextureMappingZone::DefaultTopSurfaceContoningBeamSearchStackExpansionEnabled);

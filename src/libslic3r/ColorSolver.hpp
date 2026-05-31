@@ -131,7 +131,8 @@ std::array<float, 3> mix_color_solver_ordered_stack(const std::vector<std::array
                                                     float                                     surface_scatter = 0.f,
                                                     bool                                      beer_lambert_rgb_correction = false,
                                                     bool                                      td_effective_alpha_correction = false,
-                                                    const std::vector<ColorSolverStackComponentRole> &component_roles = {});
+                                                    const std::vector<ColorSolverStackComponentRole> &component_roles = {},
+                                                    const std::vector<float>                &layer_opacities_by_depth = {});
 std::array<float, 3> color_solver_oklab_from_srgb(const std::array<float, 3> &rgb);
 std::array<float, 3> color_solver_srgb_from_oklab(const std::array<float, 3> &oklab);
 
@@ -161,7 +162,8 @@ std::string color_solver_ordered_stack_candidate_cache_key(const std::vector<std
                                                            bool                                      beer_lambert_rgb_correction = false,
                                                            bool                                      td_effective_alpha_correction = false,
                                                            const std::vector<ColorSolverStackComponentRole> &component_roles = {},
-                                                           bool                                      beam_search_stack_expansion = false);
+                                                           bool                                      beam_search_stack_expansion = false,
+                                                           const std::vector<float>                  &layer_opacities_by_depth = {});
 ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
     const std::vector<std::array<float, 3>> &component_colors,
     const std::vector<float>                &layer_opacities,
@@ -175,7 +177,8 @@ ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
     bool                                      beer_lambert_rgb_correction = false,
     bool                                      td_effective_alpha_correction = false,
     const std::vector<ColorSolverStackComponentRole> &component_roles = {},
-    bool                                      beam_search_stack_expansion = false);
+    bool                                      beam_search_stack_expansion = false,
+    const std::vector<float>                 &layer_opacities_by_depth = {});
 const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates(
     ColorSolverOrderedStackCandidateCache        &cache,
     const std::vector<std::array<float, 3>>      &component_colors,
@@ -190,7 +193,8 @@ const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates
     bool                                           beer_lambert_rgb_correction = false,
     bool                                           td_effective_alpha_correction = false,
     const std::vector<ColorSolverStackComponentRole> &component_roles = {},
-    bool                                           beam_search_stack_expansion = false);
+    bool                                           beam_search_stack_expansion = false,
+    const std::vector<float>                      &layer_opacities_by_depth = {});
 ColorSolverOrderedStackResult solve_color_solver_ordered_stack_result_for_target(
     const ColorSolverOrderedStackCandidateSet &candidates,
     const std::array<float, 3>                &target_rgb,

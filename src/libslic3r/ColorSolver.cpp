@@ -553,10 +553,28 @@ std::array<float, 3> td_effective_alpha_transmission(const std::array<float, 3> 
     return transmission_from_density_bias(td_effective_alpha_density_bias(srgb_color, role), scalar_transmission);
 }
 
+float ordered_stack_layer_opacity(const std::vector<float> &layer_opacities,
+                                  const std::vector<float> &layer_opacities_by_depth,
+                                  size_t                    component_count,
+                                  size_t                    depth_idx,
+                                  uint16_t                  component_idx)
+{
+    const size_t component = size_t(component_idx);
+    const size_t depth_opacity_idx = depth_idx * component_count + component;
+    if (component_count > 0 &&
+        depth_opacity_idx < layer_opacities_by_depth.size() &&
+        std::isfinite(layer_opacities_by_depth[depth_opacity_idx]))
+        return std::clamp(layer_opacities_by_depth[depth_opacity_idx], 1e-4f, 0.9999f);
+    return component < layer_opacities.size() && std::isfinite(layer_opacities[component]) ?
+        std::clamp(layer_opacities[component], 1e-4f, 0.9999f) :
+        0.5f;
+}
+
 std::array<float, 3> mix_ordered_stack_beer_lambert_rgb(const std::vector<std::array<float, 3>> &colors_with_background,
                                                         const std::vector<uint16_t>             &surface_to_deep,
                                                         const std::vector<float>                &layer_opacities,
-                                                        float                                    surface_scatter)
+                                                        float                                    surface_scatter,
+                                                        const std::vector<float>                &layer_opacities_by_depth)
 {
     if (colors_with_background.empty() || surface_to_deep.empty())
         return colors_with_background.empty() ? std::array<float, 3>{ { 0.f, 0.f, 0.f } } : colors_with_background.back();
@@ -567,13 +585,15 @@ std::array<float, 3> mix_ordered_stack_beer_lambert_rgb(const std::vector<std::a
     bool surface_layer = true;
     const float safe_surface_scatter =
         std::clamp(std::isfinite(surface_scatter) ? surface_scatter : 0.f, 0.f, 0.5f);
-    for (uint16_t component_idx : surface_to_deep) {
+    for (size_t depth_idx = 0; depth_idx < surface_to_deep.size(); ++depth_idx) {
+        const uint16_t component_idx = surface_to_deep[depth_idx];
         if (size_t(component_idx) >= component_count)
             continue;
-        const float opacity =
-            size_t(component_idx) < layer_opacities.size() && std::isfinite(layer_opacities[size_t(component_idx)]) ?
-                std::clamp(layer_opacities[size_t(component_idx)], 1e-4f, 0.9999f) :
-                0.5f;
+        const float opacity = ordered_stack_layer_opacity(layer_opacities,
+                                                          layer_opacities_by_depth,
+                                                          component_count,
+                                                          depth_idx,
+                                                          component_idx);
         std::array<float, 3> transmission =
             beer_lambert_rgb_transmission(colors_with_background[size_t(component_idx)], 1.f - opacity);
         if (surface_layer) {
@@ -606,7 +626,8 @@ std::array<float, 3> mix_ordered_stack_td_effective_alpha(
     const std::vector<uint16_t>                   &surface_to_deep,
     const std::vector<float>                      &layer_opacities,
     float                                          surface_scatter,
-    const std::vector<ColorSolverStackComponentRole> &component_roles)
+    const std::vector<ColorSolverStackComponentRole> &component_roles,
+    const std::vector<float>                      &layer_opacities_by_depth)
 {
     if (colors_with_background.empty() || surface_to_deep.empty())
         return colors_with_background.empty() ? std::array<float, 3>{ { 0.f, 0.f, 0.f } } : colors_with_background.back();
@@ -617,13 +638,15 @@ std::array<float, 3> mix_ordered_stack_td_effective_alpha(
     bool surface_layer = true;
     const float safe_surface_scatter =
         std::clamp(std::isfinite(surface_scatter) ? surface_scatter : 0.f, 0.f, 0.5f);
-    for (uint16_t component_idx : surface_to_deep) {
+    for (size_t depth_idx = 0; depth_idx < surface_to_deep.size(); ++depth_idx) {
+        const uint16_t component_idx = surface_to_deep[depth_idx];
         if (size_t(component_idx) >= component_count)
             continue;
-        const float opacity =
-            size_t(component_idx) < layer_opacities.size() && std::isfinite(layer_opacities[size_t(component_idx)]) ?
-                std::clamp(layer_opacities[size_t(component_idx)], 1e-4f, 0.9999f) :
-                0.5f;
+        const float opacity = ordered_stack_layer_opacity(layer_opacities,
+                                                          layer_opacities_by_depth,
+                                                          component_count,
+                                                          depth_idx,
+                                                          component_idx);
         const float scalar_transmission = std::pow(1.f - opacity, TD_EFFECTIVE_ALPHA_DENSITY_SCALE);
         const ColorSolverStackComponentRole role =
             size_t(component_idx) < component_roles.size() ?
@@ -664,15 +687,16 @@ std::array<float, 3> mix_ordered_stack_with_buffers(const std::vector<std::array
                                                     float                                    surface_scatter,
                                                     bool                                     beer_lambert_rgb_correction,
                                                     bool                                     td_effective_alpha_correction,
-                                                    const std::vector<ColorSolverStackComponentRole> &component_roles)
+                                                    const std::vector<ColorSolverStackComponentRole> &component_roles,
+                                                    const std::vector<float>                &layer_opacities_by_depth)
 {
     if (colors_with_background.empty() || surface_to_deep.empty())
         return colors_with_background.empty() ? std::array<float, 3>{ { 0.f, 0.f, 0.f } } : colors_with_background.back();
 
     if (td_effective_alpha_correction)
-        return mix_ordered_stack_td_effective_alpha(colors_with_background, surface_to_deep, layer_opacities, 0.f, component_roles);
+        return mix_ordered_stack_td_effective_alpha(colors_with_background, surface_to_deep, layer_opacities, 0.f, component_roles, layer_opacities_by_depth);
     if (beer_lambert_rgb_correction)
-        return mix_ordered_stack_beer_lambert_rgb(colors_with_background, surface_to_deep, layer_opacities, surface_scatter);
+        return mix_ordered_stack_beer_lambert_rgb(colors_with_background, surface_to_deep, layer_opacities, surface_scatter, layer_opacities_by_depth);
 
     const size_t component_count = colors_with_background.size() - 1;
     weights.assign(colors_with_background.size(), 0.f);
@@ -680,13 +704,15 @@ std::array<float, 3> mix_ordered_stack_with_buffers(const std::vector<std::array
     bool surface_layer = true;
     const float safe_surface_scatter =
         std::clamp(std::isfinite(surface_scatter) ? surface_scatter : 0.f, 0.f, 0.5f);
-    for (uint16_t component_idx : surface_to_deep) {
+    for (size_t depth_idx = 0; depth_idx < surface_to_deep.size(); ++depth_idx) {
+        const uint16_t component_idx = surface_to_deep[depth_idx];
         if (size_t(component_idx) >= component_count)
             continue;
-        float opacity =
-            size_t(component_idx) < layer_opacities.size() && std::isfinite(layer_opacities[size_t(component_idx)]) ?
-                std::clamp(layer_opacities[size_t(component_idx)], 1e-4f, 0.9999f) :
-                0.5f;
+        float opacity = ordered_stack_layer_opacity(layer_opacities,
+                                                    layer_opacities_by_depth,
+                                                    component_count,
+                                                    depth_idx,
+                                                    component_idx);
         if (surface_layer) {
             opacity = std::clamp(safe_surface_scatter + (1.f - safe_surface_scatter) * opacity, 1e-4f, 0.9999f);
             surface_layer = false;
@@ -1014,7 +1040,8 @@ void append_ordered_stack_candidate(ColorSolverOrderedStackCandidateSet       &c
                                     float                                     surface_scatter,
                                     bool                                      beer_lambert_rgb_correction,
                                     bool                                      td_effective_alpha_correction,
-                                    const std::vector<ColorSolverStackComponentRole> &component_roles)
+                                    const std::vector<ColorSolverStackComponentRole> &component_roles,
+                                    const std::vector<float>                 &layer_opacities_by_depth)
 {
     std::vector<uint16_t> simulated_surface_to_deep;
     const std::vector<uint16_t> *mix_stack = &surface_to_deep;
@@ -1031,7 +1058,8 @@ void append_ordered_stack_candidate(ColorSolverOrderedStackCandidateSet       &c
                                        surface_scatter,
                                        beer_lambert_rgb_correction,
                                        td_effective_alpha_correction,
-                                       component_roles);
+                                       component_roles,
+                                       layer_opacities_by_depth);
     const std::array<float, 3> perceptual = oklab_from_srgb(mixed);
     candidates.rgbs.emplace_back(mixed[0]);
     candidates.rgbs.emplace_back(mixed[1]);
@@ -1109,7 +1137,8 @@ std::array<float, 3> mix_color_solver_ordered_stack(const std::vector<std::array
                                                     float                                     surface_scatter,
                                                     bool                                      beer_lambert_rgb_correction,
                                                     bool                                      td_effective_alpha_correction,
-                                                    const std::vector<ColorSolverStackComponentRole> &component_roles)
+                                                    const std::vector<ColorSolverStackComponentRole> &component_roles,
+                                                    const std::vector<float>                &layer_opacities_by_depth)
 {
     if (component_colors.empty() || surface_to_deep.empty())
         return background_rgb;
@@ -1125,7 +1154,8 @@ std::array<float, 3> mix_color_solver_ordered_stack(const std::vector<std::array
                                           surface_scatter,
                                           beer_lambert_rgb_correction,
                                           td_effective_alpha_correction,
-                                          component_roles);
+                                          component_roles,
+                                          layer_opacities_by_depth);
 }
 
 std::array<float, 3> color_solver_oklab_from_srgb(const std::array<float, 3> &rgb)
@@ -1263,7 +1293,8 @@ std::string color_solver_ordered_stack_candidate_cache_key(const std::vector<std
                                                            bool                                      beer_lambert_rgb_correction,
                                                            bool                                      td_effective_alpha_correction,
                                                            const std::vector<ColorSolverStackComponentRole> &component_roles,
-                                                           bool                                      beam_search_stack_expansion)
+                                                           bool                                      beam_search_stack_expansion,
+                                                           const std::vector<float>                  &layer_opacities_by_depth)
 {
     std::ostringstream key;
     key << component_colors.size();
@@ -1306,6 +1337,15 @@ std::string color_solver_ordered_stack_candidate_cache_key(const std::vector<std
                 0.5f;
         key << ',' << int(std::lround(opacity * 1000000.f));
     }
+    if (!layer_opacities_by_depth.empty()) {
+        key << "|opd";
+        for (const float opacity_value : layer_opacities_by_depth) {
+            const float opacity = std::isfinite(opacity_value) ?
+                std::clamp(opacity_value, 1e-4f, 0.9999f) :
+                0.5f;
+            key << ',' << int(std::lround(opacity * 1000000.f));
+        }
+    }
     return key.str();
 }
 
@@ -1322,7 +1362,8 @@ ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
     bool                                      beer_lambert_rgb_correction,
     bool                                      td_effective_alpha_correction,
     const std::vector<ColorSolverStackComponentRole> &component_roles,
-    bool                                      beam_search_stack_expansion)
+    bool                                      beam_search_stack_expansion,
+    const std::vector<float>                 &layer_opacities_by_depth)
 {
     ColorSolverOrderedStackCandidateSet candidates;
     int simulated_depth = simulated_stack_depth > 0 ? simulated_stack_depth : stack_depth;
@@ -1363,7 +1404,8 @@ ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
                                                surface_scatter,
                                                beer_lambert_rgb_correction,
                                                td_effective_alpha_correction,
-                                               component_roles);
+                                               component_roles,
+                                               layer_opacities_by_depth);
                 return;
             }
 
@@ -1416,7 +1458,8 @@ ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
                                                surface_scatter,
                                                beer_lambert_rgb_correction,
                                                td_effective_alpha_correction,
-                                               component_roles);
+                                               component_roles,
+                                               layer_opacities_by_depth);
             }
             return;
         }
@@ -1447,7 +1490,8 @@ const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates
     bool                                           beer_lambert_rgb_correction,
     bool                                           td_effective_alpha_correction,
     const std::vector<ColorSolverStackComponentRole> &component_roles,
-    bool                                           beam_search_stack_expansion)
+    bool                                           beam_search_stack_expansion,
+    const std::vector<float>                      &layer_opacities_by_depth)
 {
     const std::string key =
         color_solver_ordered_stack_candidate_cache_key(component_colors,
@@ -1462,7 +1506,8 @@ const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates
                                                        beer_lambert_rgb_correction,
                                                        td_effective_alpha_correction,
                                                        component_roles,
-                                                       beam_search_stack_expansion);
+                                                       beam_search_stack_expansion,
+                                                       layer_opacities_by_depth);
     auto it = cache.find(key);
     if (it != cache.end())
         return it->second;
@@ -1480,7 +1525,8 @@ const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates
                                                    beer_lambert_rgb_correction,
                                                    td_effective_alpha_correction,
                                                    component_roles,
-                                                   beam_search_stack_expansion)).first->second;
+                                                   beam_search_stack_expansion,
+                                                   layer_opacities_by_depth)).first->second;
 }
 
 ColorSolverOrderedStackResult solve_color_solver_ordered_stack_result_for_target(

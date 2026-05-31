@@ -39,11 +39,13 @@ public:
     TextureMappingContoningStack solve(const std::array<float, 3> &target_rgb,
                                        int                         stack_layers,
                                        bool                        lower_surface = false,
-                                       int                         visible_stack_layers = 0) const;
+                                       int                         visible_stack_layers = 0,
+                                       const std::vector<float>    &surface_to_deep_layer_heights_mm = {}) const;
     unsigned int component_for_depth(const std::array<float, 3> &target_rgb, int stack_layers, int depth_from_top, bool lower_surface = false) const;
     std::optional<std::array<float, 3>> stack_rgb(const std::vector<unsigned int> &bottom_to_top,
                                                  bool                             lower_surface = false,
-                                                 int                              visible_stack_layers = 0) const;
+                                                 int                              visible_stack_layers = 0,
+                                                 const std::vector<float>         &surface_to_deep_layer_heights_mm = {}) const;
 
 private:
     struct Candidate {
@@ -57,6 +59,8 @@ private:
     void arrange_stack_for_light_path(std::vector<unsigned int> &bottom_to_top,
                                       const std::array<float, 3> &target_rgb) const;
     std::optional<size_t> component_index(unsigned int component_id) const;
+    std::vector<float> layer_opacities_by_depth(const std::vector<float> &surface_to_deep_layer_heights_mm,
+                                                int                       visible_depth) const;
 
     std::vector<unsigned int> m_component_ids;
     std::vector<unsigned int> m_components_bottom_to_top;
@@ -71,6 +75,7 @@ private:
     bool m_td_adjustment_enabled { false };
     bool m_beer_lambert_rgb_correction_enabled { false };
     bool m_td_effective_alpha_correction_enabled { false };
+    bool m_variable_layer_height_compensation_enabled { false };
     bool m_beam_search_stack_expansion_enabled { false };
     std::vector<ColorSolverStackComponentRole> m_component_roles;
     mutable std::map<int, std::vector<Candidate>> m_candidates_by_depth;
