@@ -3187,7 +3187,7 @@ public:
                                        wxEXPAND | wxTOP | wxBOTTOM,
                                        gap / 2);
         auto *color_calibration_row = new wxBoxSizer(wxHORIZONTAL);
-        color_calibration_row->Add(new wxStaticText(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Top-surface color calibration")),
+        color_calibration_row->Add(new wxStaticText(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Calibration")),
                                    0,
                                    wxALIGN_CENTER_VERTICAL | wxRIGHT,
                                    gap);
