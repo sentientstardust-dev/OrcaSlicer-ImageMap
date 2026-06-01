@@ -244,6 +244,7 @@ wxDEFINE_EVENT(EVT_ADD_CUSTOM_FILAMENT, ColorEvent);
 wxDEFINE_EVENT(EVT_NOTICE_CHILDE_SIZE_CHANGED, SimpleEvent);
 wxDEFINE_EVENT(EVT_NOTICE_FULL_SCREEN_CHANGED, IntEvent);
 static constexpr float WIPE_TOWER_EDGE_BUFFER = 20.f;
+static constexpr float WIPE_TOWER_OBJECT_CLEARANCE = 10.f;
 #define PRINTER_THUMBNAIL_SIZE (wxSize(40, 40)) // ORCA
 #define PRINTER_PANEL_SIZE (    wxSize(70, 60)) // ORCA
 #define PRINTER_PANEL_RADIUS (6) // ORCA
@@ -382,6 +383,111 @@ namespace {
 
 static void clamp_wipe_tower_positions_for_slicing(PartPlateList &partplate_list, PresetBundle &preset_bundle)
 {
+    struct Rectf {
+        float min_x;
+        float min_y;
+        float max_x;
+        float max_y;
+    };
+
+    auto rects_overlap = [](const Rectf &lhs, const Rectf &rhs) {
+        return lhs.min_x < rhs.max_x && lhs.max_x > rhs.min_x && lhs.min_y < rhs.max_y && lhs.max_y > rhs.min_y;
+    };
+
+    auto clamp_axis = [](float value, coordf_t min_value, coordf_t max_value, double size, float margin) {
+        const float axis_min = float(min_value) + margin;
+        const float axis_max = float(max_value) - margin - float(size);
+        return axis_max < axis_min ? axis_min : std::min(std::max(value, axis_min), axis_max);
+    };
+
+    auto collect_object_rects = [](PartPlate *part_plate, float clearance) {
+        std::vector<Rectf> rects;
+        Model &model = wxGetApp().model();
+        const Vec3d plate_origin = part_plate->get_origin();
+        for (int obj_id = 0; obj_id < int(model.objects.size()); ++obj_id) {
+            ModelObject *object = model.objects[obj_id];
+            if (object == nullptr)
+                continue;
+            for (int instance_id = 0; instance_id < int(object->instances.size()); ++instance_id) {
+                if (!part_plate->contain_instance_totally(obj_id, instance_id))
+                    continue;
+                const BoundingBoxf3 bbox = object->instance_bounding_box(size_t(instance_id));
+                if (!bbox.defined)
+                    continue;
+                rects.push_back({
+                    float(bbox.min(0) - plate_origin(0) - clearance),
+                    float(bbox.min(1) - plate_origin(1) - clearance),
+                    float(bbox.max(0) - plate_origin(0) + clearance),
+                    float(bbox.max(1) - plate_origin(1) + clearance)
+                });
+            }
+        }
+        return rects;
+    };
+
+    auto choose_safe_position = [&](float desired_x,
+                                    float desired_y,
+                                    double width,
+                                    double depth,
+                                    coordf_t min_x,
+                                    coordf_t max_x,
+                                    coordf_t min_y,
+                                    coordf_t max_y,
+                                    float margin,
+                                    const std::vector<Rectf> &object_rects) {
+        const float axis_min_x = float(min_x) + margin;
+        const float axis_max_x = float(max_x) - margin - float(width);
+        const float axis_min_y = float(min_y) + margin;
+        const float axis_max_y = float(max_y) - margin - float(depth);
+        const float fallback_x = clamp_axis(desired_x, min_x, max_x, width, margin);
+        const float fallback_y = clamp_axis(desired_y, min_y, max_y, depth, margin);
+        if (axis_max_x < axis_min_x || axis_max_y < axis_min_y)
+            return Vec2f(fallback_x, fallback_y);
+
+        std::vector<float> x_candidates = { fallback_x, axis_min_x, axis_max_x };
+        std::vector<float> y_candidates = { fallback_y, axis_min_y, axis_max_y };
+        for (const Rectf &rect : object_rects) {
+            x_candidates.emplace_back(rect.min_x - float(width));
+            x_candidates.emplace_back(rect.max_x);
+            y_candidates.emplace_back(rect.min_y - float(depth));
+            y_candidates.emplace_back(rect.max_y);
+        }
+
+        auto normalize_candidates = [](std::vector<float> &values, float min_value, float max_value) {
+            for (float &value : values)
+                value = std::clamp(value, min_value, max_value);
+            std::sort(values.begin(), values.end());
+            values.erase(std::unique(values.begin(), values.end(), [](float lhs, float rhs) { return std::abs(lhs - rhs) <= EPSILON; }), values.end());
+        };
+        normalize_candidates(x_candidates, axis_min_x, axis_max_x);
+        normalize_candidates(y_candidates, axis_min_y, axis_max_y);
+
+        Vec2f best(fallback_x, fallback_y);
+        float best_score = std::numeric_limits<float>::max();
+        for (const float x : x_candidates) {
+            for (const float y : y_candidates) {
+                const Rectf tower_rect { x, y, x + float(width), y + float(depth) };
+                bool overlaps = false;
+                for (const Rectf &object_rect : object_rects) {
+                    if (rects_overlap(tower_rect, object_rect)) {
+                        overlaps = true;
+                        break;
+                    }
+                }
+                if (overlaps)
+                    continue;
+                const float dx = x - desired_x;
+                const float dy = y - desired_y;
+                const float score = dx * dx + dy * dy;
+                if (score < best_score) {
+                    best_score = score;
+                    best = Vec2f(x, y);
+                }
+            }
+        }
+        return best;
+    };
+
     DynamicPrintConfig &proj_cfg = preset_bundle.project_config;
     ConfigOptionFloats *wipe_tower_x = proj_cfg.option<ConfigOptionFloats>("wipe_tower_x", true);
     ConfigOptionFloats *wipe_tower_y = proj_cfg.option<ConfigOptionFloats>("wipe_tower_y", true);
@@ -451,14 +557,19 @@ static void clamp_wipe_tower_positions_for_slicing(PartPlateList &partplate_list
         const coordf_t max_x = plate_bbox_2d.max(0) - plate_origin(0);
         const coordf_t min_y = plate_bbox_2d.min(1) - plate_origin(1);
         const coordf_t max_y = plate_bbox_2d.max(1) - plate_origin(1);
-        auto clamp_axis = [](float value, coordf_t min_value, coordf_t max_value, double size, float margin) {
-            const float axis_min = float(min_value) + margin;
-            const float axis_max = float(max_value) - margin - float(size);
-            return axis_max < axis_min ? axis_min : std::min(std::max(value, axis_min), axis_max);
-        };
-
-        ConfigOptionFloat x_opt(clamp_axis(wipe_tower_x->get_at(plate_id), min_x, max_x, wipe_tower_size(0), margin));
-        ConfigOptionFloat y_opt(clamp_axis(wipe_tower_y->get_at(plate_id), min_y, max_y, wipe_tower_size(1), margin));
+        const std::vector<Rectf> object_rects = collect_object_rects(part_plate, brim_width + WIPE_TOWER_OBJECT_CLEARANCE);
+        const Vec2f safe_pos = choose_safe_position(wipe_tower_x->get_at(plate_id),
+                                                    wipe_tower_y->get_at(plate_id),
+                                                    wipe_tower_size(0),
+                                                    wipe_tower_size(1),
+                                                    min_x,
+                                                    max_x,
+                                                    min_y,
+                                                    max_y,
+                                                    margin,
+                                                    object_rects);
+        ConfigOptionFloat x_opt(safe_pos.x());
+        ConfigOptionFloat y_opt(safe_pos.y());
         wipe_tower_x->set_at(&x_opt, plate_id, 0);
         wipe_tower_y->set_at(&y_opt, plate_id, 0);
     }
@@ -2999,7 +3110,7 @@ public:
         };
         add_contoning_flat_infill_choice(_L("Default (Boundary Skin variable width)"),
                                          int(TextureMappingZone::ContoningFlatSurfaceInfillDefault));
-        add_contoning_flat_infill_choice(_L("Rectilinear"),
+        add_contoning_flat_infill_choice(_L("Rectilinear - not recommended"),
                                          int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinear));
         if (TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions) {
             add_contoning_flat_infill_choice(_L("Concentric"),

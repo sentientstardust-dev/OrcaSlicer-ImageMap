@@ -24,6 +24,7 @@
 #include "../PNGReadWrite.hpp"
 #include "../Print.hpp"
 #include "../PrintConfig.hpp"
+#include "../ShortestPath.hpp"
 #include "../SVG.hpp"
 #include "../Surface.hpp"
 #include "../TextureMapping.hpp"
@@ -8498,6 +8499,14 @@ static void top_surface_image_filter_short_boundary_skin_entities(ExtrusionEntit
     collection.entities = std::move(kept);
 }
 
+static void top_surface_image_reorder_boundary_skin_entities(ExtrusionEntityCollection &collection)
+{
+    if (collection.entities.size() < 2)
+        return;
+    const Point start_near = collection.entities.front()->first_point();
+    reorder_extrusion_entities(collection.entities, chain_extrusion_entities(collection.entities, &start_near));
+}
+
 static ExPolygons top_surface_image_boundary_skin_leftover(const Surface &surface,
                                                            const ExtrusionEntityCollection &collection)
 {
@@ -8771,6 +8780,7 @@ static std::unique_ptr<ExtrusionEntityCollection> top_surface_image_boundary_ski
                            variable ? max_flow : output_flow,
                            collection->entities);
             top_surface_image_filter_short_boundary_skin_entities(*collection, min_length_mm);
+            top_surface_image_reorder_boundary_skin_entities(*collection);
         } else {
             for (const ThickPolyline &thick_polyline : thick_polylines) {
                 check_canceled(throw_if_canceled);
@@ -8785,6 +8795,7 @@ static std::unique_ptr<ExtrusionEntityCollection> top_surface_image_boundary_ski
                 path->polyline = std::move(polyline);
                 collection->entities.emplace_back(path);
             }
+            top_surface_image_reorder_boundary_skin_entities(*collection);
         }
     }
 
