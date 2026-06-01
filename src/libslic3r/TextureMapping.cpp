@@ -735,6 +735,8 @@ static std::string top_surface_contoning_color_prediction_mode_name(int mode)
         return "td_effective_alpha";
     if (mode == int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb))
         return "rgb_beer_lambert";
+    if (mode == int(TextureMappingZone::ContoningColorPredictionBasicReflectance))
+        return "basic_reflectance";
     return "default";
 }
 
@@ -748,6 +750,10 @@ static int top_surface_contoning_color_prediction_mode_from_name(std::string nam
         return int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha);
     if (name == "rgb_beer_lambert" || name == "beer_lambert_rgb" || name == "beer_lambert")
         return int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb);
+    if (name == "basic_reflectance" ||
+        name == "basic_reflectance_no_td_correction" ||
+        name == "no_td_correction")
+        return int(TextureMappingZone::ContoningColorPredictionBasicReflectance);
     return TextureMappingZone::DefaultTopSurfaceContoningColorPredictionMode;
 }
 
@@ -767,6 +773,8 @@ static int top_surface_contoning_polygonization_mode_from_name(std::string name)
     });
     if (name == "marching_squares" || name == "marching_square")
         return int(TextureMappingZone::ContoningPolygonizationMarchingSquares);
+    if (name == "vector_border_shared_gaussian_partition")
+        return int(TextureMappingZone::ContoningPolygonizationVectorBorderSharedGaussianPartition);
     return TextureMappingZone::DefaultTopSurfaceContoningPolygonizationMode;
 }
 
@@ -1979,7 +1987,7 @@ void TextureMappingManager::load_entries(const std::string &serialized,
                               color_prediction_mode_it->get<int>() :
                               TextureMappingZone::DefaultTopSurfaceContoningColorPredictionMode,
                           int(TextureMappingZone::ContoningColorPredictionDefault),
-                          int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb));
+                          int(TextureMappingZone::ContoningColorPredictionBasicReflectance));
         zone.top_surface_contoning_beer_lambert_rgb_correction_enabled =
             TextureMappingZone::DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled;
         zone.top_surface_contoning_td_effective_alpha_correction_enabled =

@@ -92,7 +92,8 @@ struct TextureMappingZone
     enum TopSurfaceContoningColorPredictionMode : uint8_t {
         ContoningColorPredictionDefault = 0,
         ContoningColorPredictionTdEffectiveAlpha = 1,
-        ContoningColorPredictionBeerLambertRgb = 2
+        ContoningColorPredictionBeerLambertRgb = 2,
+        ContoningColorPredictionBasicReflectance = 3
     };
 
     enum TopSurfaceContoningPolygonizationMode : uint8_t {
@@ -214,7 +215,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled = true;
     static constexpr bool  DefaultTopSurfaceContoningFastModeEnabled = true;
     static constexpr int   DefaultTopSurfaceContoningPolygonizationMode =
-        int(ContoningPolygonizationVectorBorderSharedGaussianPartition);
+        int(ContoningPolygonizationMarchingSquares);
     static constexpr int   DefaultTopSurfaceContoningPolygonizeResolution = 4;
     static constexpr bool  DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled = true;
     static constexpr bool  DefaultTopSurfaceContoningSurfaceAnchoredStackOptimizationsEnabled = true;
@@ -353,8 +354,9 @@ struct TextureMappingZone
 
     static constexpr int normalize_top_surface_contoning_polygonization_mode(int mode)
     {
-        return mode == int(ContoningPolygonizationMarchingSquares) ?
-            int(ContoningPolygonizationMarchingSquares) :
+        return mode == int(ContoningPolygonizationVectorBorderSharedGaussianPartition) ||
+               mode == int(ContoningPolygonizationMarchingSquares) ?
+            mode :
             DefaultTopSurfaceContoningPolygonizationMode;
     }
 
@@ -365,9 +367,10 @@ struct TextureMappingZone
 
     static bool effective_top_surface_contoning_surface_scatter_enabled(bool td_adjustment,
                                                                         bool surface_scatter,
+                                                                        bool beer_lambert_rgb,
                                                                         bool td_effective_alpha)
     {
-        return td_adjustment && surface_scatter && !td_effective_alpha;
+        return td_adjustment && surface_scatter && beer_lambert_rgb && !td_effective_alpha;
     }
 
     static int effective_top_surface_contoning_color_prediction_mode(int mode)
@@ -376,7 +379,7 @@ struct TextureMappingZone
             return SlicerDefaultTopSurfaceContoningColorPredictionMode;
         return std::clamp(mode,
                           int(ContoningColorPredictionTdEffectiveAlpha),
-                          int(ContoningColorPredictionBeerLambertRgb));
+                          int(ContoningColorPredictionBasicReflectance));
     }
 
     static bool effective_top_surface_contoning_layer_phase_enabled(bool value, bool surface_anchored_stacks)
@@ -651,6 +654,7 @@ struct TextureMappingZone
         return TextureMappingZone::effective_top_surface_contoning_surface_scatter_enabled(
             top_surface_contoning_td_adjustment_enabled,
             top_surface_contoning_surface_scatter_enabled,
+            top_surface_contoning_beer_lambert_rgb_correction_enabled,
             top_surface_contoning_td_effective_alpha_correction_enabled);
     }
 
@@ -662,10 +666,13 @@ struct TextureMappingZone
 
     void normalize_top_surface_contoning_td_correction()
     {
+        const int mode = effective_top_surface_contoning_color_prediction_mode();
+        top_surface_contoning_td_adjustment_enabled = true;
         const bool beer_lambert_rgb =
-            effective_top_surface_contoning_color_prediction_mode() == int(ContoningColorPredictionBeerLambertRgb);
+            mode == int(ContoningColorPredictionBeerLambertRgb);
         top_surface_contoning_beer_lambert_rgb_correction_enabled = beer_lambert_rgb;
-        top_surface_contoning_td_effective_alpha_correction_enabled = !beer_lambert_rgb;
+        top_surface_contoning_td_effective_alpha_correction_enabled =
+            mode == int(ContoningColorPredictionTdEffectiveAlpha);
     }
 
     void apply_top_surface_contoning_experimental_defaults()
@@ -698,9 +705,10 @@ struct TextureMappingZone
             top_surface_contoning_layer_phase_enabled = false;
             top_surface_contoning_blue_noise_error_diffusion_enabled = false;
         }
-        top_surface_contoning_td_adjustment_enabled = true;
         normalize_top_surface_contoning_td_correction();
-        if (top_surface_contoning_td_effective_alpha_correction_enabled)
+        if (!top_surface_contoning_td_adjustment_enabled ||
+            !top_surface_contoning_beer_lambert_rgb_correction_enabled ||
+            top_surface_contoning_td_effective_alpha_correction_enabled)
             top_surface_contoning_surface_scatter_enabled = false;
     }
 

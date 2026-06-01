@@ -824,6 +824,8 @@ struct TopSurfaceImageDebugAnchoredRegionTiming {
 };
 
 struct TopSurfaceImageDebugAnchoredSurfaceExport {
+    size_t print_object_id { 0 };
+    size_t model_object_id { 0 };
     unsigned int zone_id { 0 };
     size_t region_id { 0 };
     int source_layer_id { -1 };
@@ -839,6 +841,8 @@ struct TopSurfaceImageDebugAnchoredSurfaceExport {
 };
 
 struct TopSurfaceImageDebugAnchoredLayerTiming {
+    size_t print_object_id { 0 };
+    size_t model_object_id { 0 };
     unsigned int zone_id { 0 };
     size_t region_id { 0 };
     int source_layer_id { -1 };
@@ -863,6 +867,17 @@ static TopSurfaceImageDebugManifest& top_surface_image_debug_manifest()
 {
     static TopSurfaceImageDebugManifest manifest;
     return manifest;
+}
+
+static size_t top_surface_image_debug_print_object_id(const PrintObject &object)
+{
+    return object.id().id;
+}
+
+static size_t top_surface_image_debug_model_object_id(const PrintObject &object)
+{
+    const ModelObject *model_object = object.model_object();
+    return model_object == nullptr ? 0 : model_object->id().id;
 }
 
 static nlohmann::json top_surface_image_debug_bbox_json(const BoundingBox &bbox)
@@ -993,6 +1008,8 @@ static nlohmann::json top_surface_image_debug_region_timing_json(const TopSurfac
 static nlohmann::json top_surface_image_debug_layer_timing_json(const TopSurfaceImageDebugAnchoredLayerTiming &timing)
 {
     return {
+        { "print_object_id", timing.print_object_id },
+        { "model_object_id", timing.model_object_id },
         { "zone_id", timing.zone_id },
         { "region_id", timing.region_id },
         { "source_layer_id", timing.source_layer_id },
@@ -1134,7 +1151,7 @@ static void top_surface_image_debug_write_manifest_locked(const TopSurfaceImageD
 {
     const std::filesystem::path path = top_surface_image_debug_output_dir() / "debug_manifest.json";
     nlohmann::json root;
-    root["schema_version"] = 4;
+    root["schema_version"] = 5;
     root["output_dir"] = top_surface_image_debug_output_dir().string();
 
     root["object_exports"] = nlohmann::json::array();
@@ -1156,6 +1173,8 @@ static void top_surface_image_debug_write_manifest_locked(const TopSurfaceImageD
     root["anchored_surfaces"] = nlohmann::json::array();
     for (const TopSurfaceImageDebugAnchoredSurfaceExport &surface : manifest.anchored_surfaces) {
         nlohmann::json surface_json;
+        surface_json["print_object_id"] = surface.print_object_id;
+        surface_json["model_object_id"] = surface.model_object_id;
         surface_json["zone_id"] = surface.zone_id;
         surface_json["region_id"] = surface.region_id;
         surface_json["source_layer_id"] = surface.source_layer_id;
@@ -1215,7 +1234,7 @@ static void top_surface_image_debug_export_object_mesh(const PrintObject &object
 
     TopSurfaceImageDebugManifest &manifest = top_surface_image_debug_manifest();
     std::lock_guard<std::mutex> lock(manifest.mutex);
-    const size_t print_object_id = object.get_id();
+    const size_t print_object_id = top_surface_image_debug_print_object_id(object);
     auto it = std::find_if(manifest.object_exports.begin(),
                            manifest.object_exports.end(),
                            [print_object_id](const TopSurfaceImageDebugObjectExport &entry) {
@@ -1237,7 +1256,7 @@ static void top_surface_image_debug_export_object_mesh(const PrintObject &object
     filename << "object_"
              << print_object_id
              << "_model_"
-             << model_object->id().id
+             << top_surface_image_debug_model_object_id(object)
              << "_slicing_space.obj";
     const std::string path = filename.str();
     const std::string full_path = (top_surface_image_debug_output_dir() / path).string();
@@ -1248,7 +1267,7 @@ static void top_surface_image_debug_export_object_mesh(const PrintObject &object
 
     TopSurfaceImageDebugObjectExport entry;
     entry.print_object_id = print_object_id;
-    entry.model_object_id = model_object->id().id;
+    entry.model_object_id = top_surface_image_debug_model_object_id(object);
     entry.path = path;
     entry.vertex_count = mesh.its.vertices.size();
     entry.face_count = mesh.its.indices.size();
@@ -3822,6 +3841,7 @@ static ExPolygons top_surface_image_debug_bbox_expolygons(const BoundingBox &bbo
 
 static std::string top_surface_image_debug_anchored_base_filename(const TopSurfaceImageRegionPlan &plan,
                                                                   const Layer                     &source_layer,
+                                                                  const PrintObject               &object,
                                                                   TopSurfaceImageSourceSurface     source_surface,
                                                                   size_t                           region_idx)
 {
@@ -3830,6 +3850,10 @@ static std::string top_surface_image_debug_anchored_base_filename(const TopSurfa
              << plan.zone_id
              << "_region_"
              << plan.region_id
+             << "_object_"
+             << top_surface_image_debug_print_object_id(object)
+             << "_model_"
+             << top_surface_image_debug_model_object_id(object)
              << "_"
              << top_surface_image_source_surface_debug_name(source_surface)
              << "_source_layer_"
@@ -3894,6 +3918,100 @@ static bool top_surface_image_debug_export_region_infos(const std::string       
             << '\n';
     }
     return true;
+}
+
+static bool top_surface_image_debug_export_merged_texture_rgb_patches(
+    const std::string                                                   &filename,
+    const std::vector<int>                                              &grid,
+    int                                                                 cols,
+    int                                                                 rows,
+    const std::vector<TopSurfaceImageContoningVectorLabel>              &labels,
+    const std::vector<std::optional<TopSurfaceImageContoningCellSample>> &cell_samples,
+    size_t                                                             &valid_pixels,
+    const ThrowIfCanceled                                               *throw_if_canceled)
+{
+    valid_pixels = 0;
+    if (grid.empty() || labels.empty() || cols <= 0 || rows <= 0 ||
+        grid.size() != size_t(cols) * size_t(rows) ||
+        cell_samples.size() != grid.size())
+        return false;
+
+    std::vector<uint8_t> image(grid.size() * 3, 0);
+    std::vector<unsigned char> visited(grid.size(), 0);
+    for (int row = 0; row < rows; ++row) {
+        if ((row & 15) == 0)
+            check_canceled(throw_if_canceled);
+        for (int col = 0; col < cols; ++col) {
+            const int start_idx = row * cols + col;
+            const int label = grid[size_t(start_idx)];
+            if (label < 0 || label >= int(labels.size()) || visited[size_t(start_idx)])
+                continue;
+
+            std::vector<int> queue;
+            queue.push_back(start_idx);
+            visited[size_t(start_idx)] = 1;
+
+            double sample_weight = 0.;
+            std::array<double, 3> oklab_sum { { 0., 0., 0. } };
+            for (size_t queue_idx = 0; queue_idx < queue.size(); ++queue_idx) {
+                if ((queue_idx & 255) == 0)
+                    check_canceled(throw_if_canceled);
+                const int idx = queue[queue_idx];
+                if (cell_samples[size_t(idx)]) {
+                    const TopSurfaceImageContoningCellSample &sample = *cell_samples[size_t(idx)];
+                    const std::array<float, 3> sample_oklab = color_solver_oklab_from_srgb(sample.rgb);
+                    const double weight = double(std::max(1, sample.sample_count));
+                    oklab_sum[0] += double(sample_oklab[0]) * weight;
+                    oklab_sum[1] += double(sample_oklab[1]) * weight;
+                    oklab_sum[2] += double(sample_oklab[2]) * weight;
+                    sample_weight += weight;
+                }
+
+                const int r = idx / cols;
+                const int c = idx - r * cols;
+                const std::array<std::pair<int, int>, 4> neighbors{
+                    std::pair<int, int>{ c - 1, r },
+                    std::pair<int, int>{ c + 1, r },
+                    std::pair<int, int>{ c, r - 1 },
+                    std::pair<int, int>{ c, r + 1 }
+                };
+                for (const std::pair<int, int> &neighbor : neighbors) {
+                    const int nc = neighbor.first;
+                    const int nr = neighbor.second;
+                    if (nc < 0 || nc >= cols || nr < 0 || nr >= rows)
+                        continue;
+                    const int nidx = nr * cols + nc;
+                    if (visited[size_t(nidx)] || grid[size_t(nidx)] != label)
+                        continue;
+                    visited[size_t(nidx)] = 1;
+                    queue.push_back(nidx);
+                }
+            }
+
+            std::array<float, 3> patch_rgb = labels[size_t(label)].rgb;
+            if (sample_weight > 0.) {
+                const std::array<float, 3> average_oklab {
+                    float(oklab_sum[0] / sample_weight),
+                    float(oklab_sum[1] / sample_weight),
+                    float(oklab_sum[2] / sample_weight)
+                };
+                patch_rgb = color_solver_srgb_from_oklab(average_oklab);
+            }
+            const std::array<unsigned char, 3> patch_bytes = top_surface_image_debug_rgb_bytes(patch_rgb);
+            for (int idx : queue) {
+                const int r = idx / cols;
+                const int c = idx - r * cols;
+                top_surface_image_debug_set_raster_pixel(image, cols, rows, r, c, patch_bytes);
+                ++valid_pixels;
+            }
+        }
+    }
+
+    return valid_pixels > 0 &&
+           png::write_rgb_to_file((top_surface_image_debug_output_dir() / filename).string(),
+                                  size_t(cols),
+                                  size_t(rows),
+                                  image);
 }
 
 static void top_surface_image_debug_export_anchored_rasters(
@@ -3990,6 +4108,27 @@ static void top_surface_image_debug_export_anchored_rasters(
                                                                            source_z_mm));
     }
 
+    {
+        size_t valid_pixels = 0;
+        const std::string filename = base + "_merged_texture_rgb_patches.png";
+        if (top_surface_image_debug_export_merged_texture_rgb_patches(filename,
+                                                                      grid,
+                                                                      cols,
+                                                                      rows,
+                                                                      labels,
+                                                                      cell_samples,
+                                                                      valid_pixels,
+                                                                      throw_if_canceled)) {
+            TopSurfaceImageDebugRasterExport raster = base_raster;
+            raster.valid_pixels = valid_pixels;
+            out_files.push_back(top_surface_image_debug_raster_file_export("merged_texture_rgb_patches_png",
+                                                                           filename,
+                                                                           raster,
+                                                                           -1,
+                                                                           source_z_mm));
+        }
+    }
+
     for (int depth : active_depths) {
         check_canceled(throw_if_canceled);
         if (depth < 0)
@@ -4058,6 +4197,7 @@ static void top_surface_image_debug_export_anchored_rasters(
 
 static void top_surface_image_debug_write_anchored_surface_plan(const TopSurfaceImageRegionPlan               &plan,
                                                                const Layer                                   &source_layer,
+                                                               const PrintObject                             &object,
                                                                const TopSurfaceImageContoningAnchoredSurfacePlan &anchored_plan,
                                                                TopSurfaceImageSourceSurface                   source_surface,
                                                                const ThrowIfCanceled                         *throw_if_canceled)
@@ -4072,7 +4212,7 @@ static void top_surface_image_debug_write_anchored_surface_plan(const TopSurface
             continue;
 
         const std::string base =
-            top_surface_image_debug_anchored_base_filename(plan, source_layer, source_surface, region_idx);
+            top_surface_image_debug_anchored_base_filename(plan, source_layer, object, source_surface, region_idx);
         std::vector<TopSurfaceImageDebugFileExport> exported_files = region.debug_raster_files;
         std::vector<TopSurfaceImageDebugDepthExport> exported_depths;
 
@@ -4204,6 +4344,8 @@ static void top_surface_image_debug_write_anchored_surface_plan(const TopSurface
 
         if (!exported_files.empty()) {
             TopSurfaceImageDebugAnchoredSurfaceExport metadata;
+            metadata.print_object_id = top_surface_image_debug_print_object_id(object);
+            metadata.model_object_id = top_surface_image_debug_model_object_id(object);
             metadata.zone_id = plan.zone_id;
             metadata.region_id = plan.region_id;
             metadata.source_layer_id = source_layer.id();
@@ -5088,7 +5230,7 @@ static void top_surface_image_contoning_solve_anchored_region(
                         });
         if (has_depth_regions) {
             const std::string base =
-                top_surface_image_debug_anchored_base_filename(plan, source_layer, source_surface, debug_region_idx);
+                top_surface_image_debug_anchored_base_filename(plan, source_layer, object, source_surface, debug_region_idx);
             const double source_z_mm = source_surface == TopSurfaceImageSourceSurface::Bottom ?
                 source_layer.bottom_z() :
                 source_layer.print_z;
@@ -5144,6 +5286,8 @@ static std::shared_ptr<TopSurfaceImageContoningAnchoredSurfacePlan> top_surface_
     const auto debug_total_start = top_surface_image_debug_now();
     TopSurfaceImageDebugAnchoredLayerTiming debug_timing;
     if (debug_enabled) {
+        debug_timing.print_object_id = top_surface_image_debug_print_object_id(object);
+        debug_timing.model_object_id = top_surface_image_debug_model_object_id(object);
         debug_timing.zone_id = plan.zone_id;
         debug_timing.region_id = plan.region_id;
         debug_timing.source_layer_id = source_layer.id();
@@ -5340,7 +5484,7 @@ static std::shared_ptr<TopSurfaceImageContoningAnchoredSurfacePlan> top_surface_
     }
 
     debug_step_start = top_surface_image_debug_now();
-    top_surface_image_debug_write_anchored_surface_plan(plan, source_layer, *out, source_surface, throw_if_canceled);
+    top_surface_image_debug_write_anchored_surface_plan(plan, source_layer, object, *out, source_surface, throw_if_canceled);
     if (debug_enabled)
         top_surface_image_debug_accumulate_timing_step(debug_timing.steps,
                                                        "write_debug_exports",
@@ -6643,6 +6787,7 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
             !plan.contoning_td_effective_alpha_correction_enabled &&
             zone->top_surface_contoning_beer_lambert_rgb_correction_enabled;
         plan.contoning_variable_layer_height_compensation_enabled =
+            plan.contoning_td_adjustment_enabled &&
             zone->top_surface_contoning_variable_layer_height_compensation_enabled;
         plan.contoning_generic_solver_mix_model =
             std::clamp(zone->generic_solver_mix_model,
