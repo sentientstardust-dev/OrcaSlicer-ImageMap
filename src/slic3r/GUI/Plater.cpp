@@ -17,6 +17,7 @@
 #include <vector>
 #include <string>
 #include <regex>
+#include <fstream>
 #include <functional>
 #include <future>
 #include <memory>
@@ -29,6 +30,7 @@
 #include <boost/filesystem/operations.hpp>
 #include <boost/log/trivial.hpp>
 #include <boost/nowide/convert.hpp>
+#include <boost/nowide/fstream.hpp>
 #include <boost/uuid/uuid.hpp>
 #include <boost/uuid/uuid_generators.hpp>
 #include <boost/uuid/uuid_io.hpp>
@@ -1036,6 +1038,50 @@ static wxColour parse_texture_mapping_color(const std::string &hex)
     unsigned char rgba[4] = {38, 166, 154, 255};
     Slic3r::GUI::BitmapCache::parse_color4(hex, rgba);
     return wxColour(rgba[0], rgba[1], rgba[2], rgba[3]);
+}
+
+static std::array<float, 3> texture_mapping_color_array(const std::string &hex)
+{
+    const wxColour color = parse_texture_mapping_color(hex);
+    return { { float(color.Red()) / 255.f, float(color.Green()) / 255.f, float(color.Blue()) / 255.f } };
+}
+
+static std::vector<std::array<float, 3>> texture_mapping_component_color_arrays(const std::vector<unsigned int> &ids,
+                                                                                const std::vector<std::string>  &physical_colors)
+{
+    std::vector<std::array<float, 3>> out;
+    out.reserve(ids.size());
+    for (unsigned int id : ids) {
+        if (id > 0 && size_t(id - 1) < physical_colors.size())
+            out.emplace_back(texture_mapping_color_array(physical_colors[size_t(id - 1)]));
+        else
+            out.emplace_back(std::array<float, 3>{ { 0.5f, 0.5f, 0.5f } });
+    }
+    return out;
+}
+
+static std::vector<float> texture_mapping_component_tds(const TextureMappingZone &zone,
+                                                        const std::vector<unsigned int> &ids)
+{
+    std::vector<float> out;
+    out.reserve(ids.size());
+    for (unsigned int id : ids) {
+        const size_t idx = id > 0 ? size_t(id - 1) : size_t(-1);
+        out.emplace_back(idx < zone.filament_transmission_distances_mm.size() ?
+                             zone.filament_transmission_distances_mm[idx] :
+                             0.f);
+    }
+    return out;
+}
+
+static wxString texture_mapping_zone_color_calibration_warning(const TextureMappingZone        &zone,
+                                                               const std::vector<unsigned int> &ids,
+                                                               const std::vector<std::string>  &physical_colors)
+{
+    return from_u8(texture_mapping_top_surface_color_calibration_warning(
+        zone,
+        texture_mapping_component_color_arrays(ids, physical_colors),
+        texture_mapping_component_tds(zone, ids)));
 }
 
 static std::string encode_texture_mapping_component_ids(const std::vector<unsigned int> &ids)
@@ -2101,6 +2147,14 @@ static wxString texture_mapping_contoning_color_prediction_mode_label(int mode)
         return _L("RGB Beer-Lambert - not recommended");
     case int(TextureMappingZone::ContoningColorPredictionBasicReflectance):
         return _L("Basic Reflectance");
+    case int(TextureMappingZone::ContoningColorPredictionCalibratedCurrentLinearAffine):
+        return _L("Calibrated: current linear affine");
+    case int(TextureMappingZone::ContoningColorPredictionCalibratedTdAlphaEffective):
+        return _L("Calibrated: TD alpha effective");
+    case int(TextureMappingZone::ContoningColorPredictionCalibratedFreeAlphaEffective):
+        return _L("Calibrated: free alpha effective");
+    case int(TextureMappingZone::ContoningColorPredictionCalibratedDepthKernelLinear):
+        return _L("Calibrated: depth kernel linear");
     default:
         return _L("TD Effective Alpha");
     }
@@ -2114,34 +2168,6 @@ static wxString texture_mapping_contoning_color_prediction_default_label()
         TextureMappingZone::SlicerDefaultTopSurfaceContoningColorPredictionMode);
     label += ")";
     return label;
-}
-
-static int texture_mapping_contoning_color_prediction_mode_choice_selection(int mode)
-{
-    if (mode == int(TextureMappingZone::ContoningColorPredictionDefault))
-        return 0;
-    switch (TextureMappingZone::effective_top_surface_contoning_color_prediction_mode(mode)) {
-    case int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb):
-        return 2;
-    case int(TextureMappingZone::ContoningColorPredictionBasicReflectance):
-        return 3;
-    default:
-        return 1;
-    }
-}
-
-static int texture_mapping_contoning_color_prediction_mode_from_choice_selection(int selection)
-{
-    switch (selection) {
-    case 1:
-        return int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha);
-    case 2:
-        return int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb);
-    case 3:
-        return int(TextureMappingZone::ContoningColorPredictionBasicReflectance);
-    default:
-        return TextureMappingZone::DefaultTopSurfaceContoningColorPredictionMode;
-    }
 }
 
 static int texture_mapping_contoning_polygonization_mode_choice_selection(int mode)
@@ -2164,6 +2190,7 @@ public:
                                         int texture_mapping_mode,
                                         int filament_color_mode,
                                         const std::vector<unsigned int> &component_ids,
+                                        const std::vector<std::string> &component_color_hexes,
                                         const std::vector<float> &component_strengths_pct,
                                         const std::vector<float> &component_minimum_offsets_pct,
                                         const std::vector<float> &component_transmission_distances_mm,
@@ -2227,6 +2254,8 @@ public:
                                         bool top_surface_contoning_beer_lambert_rgb_correction_enabled,
                                         bool top_surface_contoning_td_effective_alpha_correction_enabled,
                                         bool top_surface_contoning_variable_layer_height_compensation_enabled,
+                                        const std::string &top_surface_color_calibration_name,
+                                        const std::string &top_surface_color_calibration_json,
                                         const TextureMappingZoneShellUsageSummary &top_surface_contoning_shell_usage,
                                         const TextureMappingManager &texture_mapping_zones,
                                         const TextureMappingGlobalSettings &global_settings,
@@ -2238,6 +2267,9 @@ public:
         , m_global_settings(global_settings)
         , m_prime_tower_image(prime_tower_image)
         , m_prime_tower_image_back(prime_tower_image_back)
+        , m_component_color_hexes(component_color_hexes)
+        , m_top_surface_color_calibration_name(top_surface_color_calibration_name)
+        , m_top_surface_color_calibration_json(top_surface_color_calibration_json)
     {
         (void) reduce_outer_surface_texture;
         (void) top_surface_contoning_min_feature_mm;
@@ -2946,20 +2978,40 @@ public:
                                        0,
                                        wxEXPAND | wxTOP | wxBOTTOM,
                                        gap / 2);
+        auto *color_calibration_row = new wxBoxSizer(wxHORIZONTAL);
+        color_calibration_row->Add(new wxStaticText(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Top-surface color calibration")),
+                                   0,
+                                   wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                                   gap);
+        m_top_surface_color_calibration_label =
+            new wxStaticText(m_top_surface_contoning_checkboxes_panel, wxID_ANY, wxEmptyString);
+        color_calibration_row->Add(m_top_surface_color_calibration_label, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+        auto *load_top_surface_color_calibration_button =
+            new wxButton(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Load..."));
+        auto *clear_top_surface_color_calibration_button =
+            new wxButton(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Clear"));
+        color_calibration_row->Add(load_top_surface_color_calibration_button, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, std::max(FromDIP(2), gap / 2));
+        color_calibration_row->Add(clear_top_surface_color_calibration_button, 0, wxALIGN_CENTER_VERTICAL);
+        contoning_checkboxes_root->Add(color_calibration_row, 0, wxEXPAND | wxTOP | wxBOTTOM, gap / 2);
+        m_top_surface_color_calibration_warning_text =
+            new wxStaticText(m_top_surface_contoning_checkboxes_panel, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize, wxST_NO_AUTORESIZE);
+        m_top_surface_color_calibration_warning_text->SetForegroundColour(wxColour(180, 86, 0));
+        contoning_checkboxes_root->Add(m_top_surface_color_calibration_warning_text, 0, wxEXPAND | wxBOTTOM, gap / 2);
+        load_top_surface_color_calibration_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+            load_top_surface_color_calibration();
+        });
+        clear_top_surface_color_calibration_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+            clear_top_surface_color_calibration();
+        });
         auto *contoning_td_correction_row = new wxBoxSizer(wxHORIZONTAL);
         contoning_td_correction_row->Add(new wxStaticText(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Color prediction mode")),
                                          0,
                                          wxALIGN_CENTER_VERTICAL | wxRIGHT,
                                          gap);
-        wxArrayString contoning_td_correction_choices;
-        contoning_td_correction_choices.Add(texture_mapping_contoning_color_prediction_default_label());
-        contoning_td_correction_choices.Add(texture_mapping_contoning_color_prediction_mode_label(int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha)));
-        contoning_td_correction_choices.Add(texture_mapping_contoning_color_prediction_mode_label(int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb)));
-        contoning_td_correction_choices.Add(texture_mapping_contoning_color_prediction_mode_label(int(TextureMappingZone::ContoningColorPredictionBasicReflectance)));
         m_top_surface_contoning_td_correction_choice =
-            new wxChoice(m_top_surface_contoning_checkboxes_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, contoning_td_correction_choices);
-        m_top_surface_contoning_td_correction_choice->SetSelection(
-            texture_mapping_contoning_color_prediction_mode_choice_selection(top_surface_contoning_color_prediction_mode));
+            new wxChoice(m_top_surface_contoning_checkboxes_panel, wxID_ANY);
+        rebuild_top_surface_contoning_color_prediction_choices(top_surface_contoning_color_prediction_mode);
+        update_top_surface_color_calibration_label();
         contoning_td_correction_row->Add(m_top_surface_contoning_td_correction_choice, 1, wxALIGN_CENTER_VERTICAL);
         contoning_checkboxes_root->Add(contoning_td_correction_row, 0, wxEXPAND | wxTOP | wxBOTTOM, gap / 2);
         m_top_surface_contoning_variable_layer_height_compensation_checkbox =
@@ -3202,6 +3254,7 @@ public:
         }
         if (m_top_surface_contoning_td_correction_choice != nullptr) {
             m_top_surface_contoning_td_correction_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) {
+                update_top_surface_color_calibration_label();
                 update_top_surface_image_options_visibility(false);
                 queue_top_surface_contoning_message_update(true);
             });
@@ -3240,9 +3293,11 @@ public:
             if (spin == nullptr)
                 continue;
             spin->Bind(wxEVT_SPINCTRLDOUBLE, [this](wxSpinDoubleEvent &) {
+                update_top_surface_color_calibration_label();
                 queue_top_surface_contoning_message_update(true);
             });
             spin->Bind(wxEVT_TEXT, [this](wxCommandEvent &) {
+                update_top_surface_color_calibration_label();
                 queue_top_surface_contoning_message_update(true);
             });
         }
@@ -3743,16 +3798,27 @@ public:
     }
     int top_surface_contoning_color_prediction_mode() const
     {
-        return m_top_surface_contoning_td_correction_choice == nullptr ?
-            TextureMappingZone::DefaultTopSurfaceContoningColorPredictionMode :
-            texture_mapping_contoning_color_prediction_mode_from_choice_selection(
-                m_top_surface_contoning_td_correction_choice->GetSelection());
+        if (m_top_surface_contoning_td_correction_choice == nullptr)
+            return TextureMappingZone::DefaultTopSurfaceContoningColorPredictionMode;
+        const int selection = m_top_surface_contoning_td_correction_choice->GetSelection();
+        return selection >= 0 && size_t(selection) < m_top_surface_contoning_color_prediction_modes.size() ?
+            m_top_surface_contoning_color_prediction_modes[size_t(selection)] :
+            TextureMappingZone::DefaultTopSurfaceContoningColorPredictionMode;
+    }
+    std::string top_surface_color_calibration_name() const
+    {
+        return m_top_surface_color_calibration_name;
+    }
+    std::string top_surface_color_calibration_json() const
+    {
+        return m_top_surface_color_calibration_json;
     }
     bool top_surface_contoning_td_effective_alpha_correction_selected() const
     {
-        return TextureMappingZone::effective_top_surface_contoning_color_prediction_mode(
-            top_surface_contoning_color_prediction_mode()) ==
-            int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha);
+        const int effective_mode = TextureMappingZone::effective_top_surface_contoning_color_prediction_mode(
+            top_surface_contoning_color_prediction_mode());
+        return effective_mode == int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha) ||
+               effective_mode == int(TextureMappingZone::ContoningColorPredictionCalibratedCurrentLinearAffine);
     }
     bool top_surface_contoning_surface_scatter_enabled() const
     {
@@ -4012,6 +4078,135 @@ private:
         if (m_prime_tower_mapping_enabled_checkbox != nullptr)
             m_prime_tower_mapping_enabled_checkbox->SetValue(true);
         update_prime_tower_image_label();
+    }
+
+    std::vector<std::array<float, 3>> top_surface_color_calibration_component_colors() const
+    {
+        std::vector<std::array<float, 3>> colors;
+        colors.reserve(m_component_color_hexes.size());
+        for (const std::string &hex : m_component_color_hexes)
+            colors.emplace_back(texture_mapping_color_array(hex));
+        return colors;
+    }
+
+    void rebuild_top_surface_contoning_color_prediction_choices(int selected_mode)
+    {
+        if (m_top_surface_contoning_td_correction_choice == nullptr)
+            return;
+
+        m_top_surface_contoning_color_prediction_modes.clear();
+        auto add_mode = [this](int mode) {
+            m_top_surface_contoning_color_prediction_modes.emplace_back(mode);
+            m_top_surface_contoning_td_correction_choice->Append(
+                mode == int(TextureMappingZone::ContoningColorPredictionDefault) ?
+                    texture_mapping_contoning_color_prediction_default_label() :
+                    texture_mapping_contoning_color_prediction_mode_label(mode));
+        };
+
+        m_top_surface_contoning_td_correction_choice->Clear();
+        add_mode(int(TextureMappingZone::ContoningColorPredictionDefault));
+        add_mode(int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha));
+        add_mode(int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb));
+        add_mode(int(TextureMappingZone::ContoningColorPredictionBasicReflectance));
+        for (int mode : texture_mapping_top_surface_color_calibration_supported_modes(m_top_surface_color_calibration_json))
+            add_mode(mode);
+
+        auto it = std::find(m_top_surface_contoning_color_prediction_modes.begin(),
+                            m_top_surface_contoning_color_prediction_modes.end(),
+                            selected_mode);
+        if (it == m_top_surface_contoning_color_prediction_modes.end())
+            it = std::find(m_top_surface_contoning_color_prediction_modes.begin(),
+                           m_top_surface_contoning_color_prediction_modes.end(),
+                           int(TextureMappingZone::ContoningColorPredictionDefault));
+        m_top_surface_contoning_td_correction_choice->SetSelection(
+            it != m_top_surface_contoning_color_prediction_modes.end() ?
+                int(it - m_top_surface_contoning_color_prediction_modes.begin()) :
+                0);
+    }
+
+    void update_top_surface_color_calibration_label()
+    {
+        if (m_top_surface_color_calibration_label != nullptr) {
+            wxString label = _L("No calibration loaded");
+            wxString tooltip;
+            if (!m_top_surface_color_calibration_json.empty()) {
+                std::string name = m_top_surface_color_calibration_name;
+                if (name.empty())
+                    name = texture_mapping_top_surface_color_calibration_display_name(m_top_surface_color_calibration_json);
+                if (name.empty())
+                    name = "Loaded calibration";
+                tooltip = from_u8(name);
+                wxString display = from_u8(name);
+                if (display.length() > 42)
+                    display = display.Left(19) + "..." + display.Right(20);
+                label = display;
+            }
+            m_top_surface_color_calibration_label->SetLabel(label);
+            m_top_surface_color_calibration_label->SetToolTip(tooltip);
+        }
+
+        if (m_top_surface_color_calibration_warning_text != nullptr) {
+            TextureMappingZone tmp;
+            tmp.top_surface_color_calibration_name = m_top_surface_color_calibration_name;
+            tmp.top_surface_color_calibration_json = m_top_surface_color_calibration_json;
+            tmp.top_surface_contoning_color_prediction_mode = top_surface_contoning_color_prediction_mode();
+            const wxString warning = from_u8(texture_mapping_top_surface_color_calibration_warning(
+                tmp,
+                top_surface_color_calibration_component_colors(),
+                component_transmission_distances_mm()));
+            m_top_surface_color_calibration_warning_text->SetLabel(warning);
+            m_top_surface_color_calibration_warning_text->Show(!warning.empty());
+            m_top_surface_color_calibration_warning_text->Wrap(FromDIP(390));
+        }
+        Layout();
+    }
+
+    void load_top_surface_color_calibration()
+    {
+        wxFileDialog dlg(this,
+                         _L("Load top-surface color calibration"),
+                         wxEmptyString,
+                         wxEmptyString,
+                         _L("JSON files (*.json)|*.json"),
+                         wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+        if (dlg.ShowModal() != wxID_OK)
+            return;
+
+        boost::nowide::ifstream file(into_u8(dlg.GetPath()), std::ios::binary);
+        if (!file) {
+            MessageDialog msg(this, _L("Could not read the selected calibration file."), _L("Invalid calibration"), wxOK | wxICON_WARNING);
+            msg.ShowModal();
+            return;
+        }
+        std::ostringstream ss;
+        ss << file.rdbuf();
+        const std::string json_text = ss.str();
+        std::string error;
+        if (!texture_mapping_parse_top_surface_color_calibration(json_text, &error)) {
+            MessageDialog msg(this,
+                              error.empty() ? _L("The selected file is not a supported top-surface color calibration.") : from_u8(error),
+                              _L("Invalid calibration"),
+                              wxOK | wxICON_WARNING);
+            msg.ShowModal();
+            return;
+        }
+
+        m_top_surface_color_calibration_json = json_text;
+        m_top_surface_color_calibration_name =
+            boost::filesystem::path(into_u8(dlg.GetPath())).filename().string();
+        const int mode = texture_mapping_top_surface_color_calibration_first_supported_mode(m_top_surface_color_calibration_json);
+        rebuild_top_surface_contoning_color_prediction_choices(mode);
+        update_top_surface_color_calibration_label();
+        update_top_surface_image_options_visibility(true);
+    }
+
+    void clear_top_surface_color_calibration()
+    {
+        m_top_surface_color_calibration_name.clear();
+        m_top_surface_color_calibration_json.clear();
+        rebuild_top_surface_contoning_color_prediction_choices(TextureMappingZone::DefaultTopSurfaceContoningColorPredictionMode);
+        update_top_surface_color_calibration_label();
+        update_top_surface_image_options_visibility(true);
     }
 
     void reset_strengths_and_offsets()
@@ -4770,6 +4965,9 @@ private:
     wxCheckBox *m_top_surface_contoning_beam_search_stack_expansion_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_surface_scatter_checkbox {nullptr};
     wxChoice *m_top_surface_contoning_td_correction_choice {nullptr};
+    std::vector<int> m_top_surface_contoning_color_prediction_modes;
+    wxStaticText *m_top_surface_color_calibration_label {nullptr};
+    wxStaticText *m_top_surface_color_calibration_warning_text {nullptr};
     wxCheckBox *m_top_surface_contoning_variable_layer_height_compensation_checkbox {nullptr};
     wxCheckBox *m_use_legacy_fixed_color_mode_checkbox {nullptr};
     wxCheckBox *m_minimum_visibility_offset_checkbox {nullptr};
@@ -4789,6 +4987,9 @@ private:
     TextureMappingGlobalSettings m_global_settings;
     TextureMappingPrimeTowerImage m_prime_tower_image;
     TextureMappingPrimeTowerImage m_prime_tower_image_back;
+    std::vector<std::string> m_component_color_hexes;
+    std::string m_top_surface_color_calibration_name;
+    std::string m_top_surface_color_calibration_json;
     std::vector<wxSlider*> m_minimum_offset_sliders;
     std::vector<wxSpinCtrl*> m_minimum_offset_spins;
     std::vector<wxSlider*> m_strength_sliders;
@@ -9128,6 +9329,21 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                              _L("Preview Result Colors"),
                                                              bundle->texture_mapping_global_settings.preview_simulate_colors);
         editor_sizer->Add(preview_colors_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+        auto *color_calibration_warning_text = new wxStaticText(editor, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize, wxST_NO_AUTORESIZE);
+        color_calibration_warning_text->SetForegroundColour(wxColour(180, 86, 0));
+        editor_sizer->Add(color_calibration_warning_text, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
+        auto update_color_calibration_warning_text = [this, color_calibration_warning_text, num_physical, physical_colors](const TextureMappingZone &zone) {
+            if (color_calibration_warning_text == nullptr)
+                return;
+            const std::vector<unsigned int> warning_ids = zone.is_image_texture() ?
+                TextureMappingManager::effective_texture_component_ids(zone, num_physical, physical_colors) :
+                texture_mapping_selected_ids(zone, num_physical);
+            const wxString warning = texture_mapping_zone_color_calibration_warning(zone, warning_ids, physical_colors);
+            color_calibration_warning_text->SetLabel(warning);
+            color_calibration_warning_text->Show(!warning.empty());
+            color_calibration_warning_text->Wrap(FromDIP(300));
+        };
+        update_color_calibration_warning_text(entry);
 
         auto *button_row = new wxBoxSizer(wxHORIZONTAL);
         auto *offset_btn = new wxButton(editor, wxID_ANY, _L("2D Gradient Settings"));
@@ -9141,7 +9357,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                linear_gradient_stops_bar, linear_gradient_mode_choice, linear_gradient_radius_spin,
                                linear_gradient_radius_percent_chk,
                                surface_pattern_from_selection, linear_gradient_mode_from_selection, mode_choice,
-                               show_direction_arrow_chk, contrast_spin, apply_zone]() {
+                               show_direction_arrow_chk, contrast_spin, apply_zone, update_color_calibration_warning_text]() {
             if (mgr_ptr == nullptr)
                 return;
             auto &rows = mgr_ptr->zones();
@@ -9193,6 +9409,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.show_linear_gradient_direction_arrow = show_direction_arrow_chk != nullptr && show_direction_arrow_chk->GetValue();
             updated.contrast_pct = contrast_spin != nullptr ? std::clamp(float(contrast_spin->GetValue()), 25.f, 300.f) : updated.contrast_pct;
             updated.high_resolution_sampling = true;
+            update_color_calibration_warning_text(updated);
             apply_zone(std::move(updated));
         };
 
@@ -9216,7 +9433,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             }
             evt.Skip();
         });
-        auto update_pattern_visibility = [this, editor_sizer, filaments_row, linear_gradient_mode_row, linear_gradient_mode_choice, linear_gradient_stops_bar, linear_gradient_row, linear_gradient_point_row, linear_gradient_buttons_row, linear_gradient_radius_row, show_direction_arrow_row, mode_row, contrast_row, preview_colors_row, offset_btn, advanced_btn, surface_choice, row, editor, update_texture_mapping_area_height, set_linear_gradient_picker_button_labels, sync_linear_gradient_stop_controls]() {
+        auto update_pattern_visibility = [this, editor_sizer, filaments_row, linear_gradient_mode_row, linear_gradient_mode_choice, linear_gradient_stops_bar, linear_gradient_row, linear_gradient_point_row, linear_gradient_buttons_row, linear_gradient_radius_row, show_direction_arrow_row, mode_row, contrast_row, preview_colors_row, color_calibration_warning_text, offset_btn, advanced_btn, surface_choice, row, editor, update_texture_mapping_area_height, set_linear_gradient_picker_button_labels, sync_linear_gradient_stop_controls]() {
             const int selection = surface_choice == nullptr ? 0 : surface_choice->GetSelection();
             const bool image_texture = selection == 0;
             const bool linear_gradient = selection == 1;
@@ -9233,6 +9450,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             editor_sizer->Show(mode_row, image_texture, true);
             editor_sizer->Show(contrast_row, image_texture, true);
             editor_sizer->Show(preview_colors_row, image_texture, true);
+            if (color_calibration_warning_text != nullptr)
+                editor_sizer->Show(color_calibration_warning_text, !color_calibration_warning_text->GetLabel().empty(), true);
             if (offset_btn != nullptr)
                 offset_btn->Show(selection == 2);
             if (advanced_btn != nullptr)
@@ -9306,6 +9525,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                surface_choice,
                                contrast_spin,
                                set_sidebar_checkbox_value,
+                               update_color_calibration_warning_text,
                                surface_pattern_from_selection,
                                apply_zone,
                                last_mode_selection](wxCommandEvent &) mutable {
@@ -9388,6 +9608,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 if (filament_checks[idx] != nullptr)
                     set_sidebar_checkbox_value(filament_checks[idx],
                                                std::find(ids.begin(), ids.end(), unsigned(idx + 1)) != ids.end());
+            update_color_calibration_warning_text(updated);
             apply_zone(std::move(updated));
         };
         mode_choice->Bind(wxEVT_COMBOBOX, on_mode_choice);
@@ -9733,8 +9954,11 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             strengths.reserve(ids.size());
             offsets.reserve(ids.size());
             transmission_distances.reserve(ids.size());
+            std::vector<std::string> component_color_hexes;
+            component_color_hexes.reserve(ids.size());
             for (const unsigned int id : ids) {
                 const size_t idx = id > 0 ? size_t(id - 1) : size_t(0);
+                component_color_hexes.emplace_back(idx < physical_colors.size() ? physical_colors[idx] : std::string("#808080"));
                 strengths.emplace_back(idx < updated.filament_strengths_pct.size() ? updated.filament_strengths_pct[idx] : 100.f);
                 offsets.emplace_back(idx < updated.filament_minimum_offsets_pct.size() ? updated.filament_minimum_offsets_pct[idx] : 0.f);
                 transmission_distances.emplace_back(idx < updated.filament_transmission_distances_mm.size() ?
@@ -9747,6 +9971,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.texture_mapping_mode,
                                                     updated.filament_color_mode,
                                                     ids,
+                                                    component_color_hexes,
                                                     strengths,
                                                     offsets,
                                                     transmission_distances,
@@ -9810,6 +10035,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.top_surface_contoning_beer_lambert_rgb_correction_enabled,
                                                     updated.top_surface_contoning_td_effective_alpha_correction_enabled,
                                                     updated.top_surface_contoning_variable_layer_height_compensation_enabled,
+                                                    updated.top_surface_color_calibration_name,
+                                                    updated.top_surface_color_calibration_json,
                                                     shell_usage,
                                                     bundle->texture_mapping_zones,
                                                     bundle->texture_mapping_global_settings,
@@ -9906,6 +10133,10 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 dlg.top_surface_contoning_td_effective_alpha_correction_enabled();
             updated.top_surface_contoning_variable_layer_height_compensation_enabled =
                 dlg.top_surface_contoning_variable_layer_height_compensation_enabled();
+            updated.top_surface_color_calibration_name =
+                dlg.top_surface_color_calibration_name();
+            updated.top_surface_color_calibration_json =
+                dlg.top_surface_color_calibration_json();
             if (updated.top_surface_image_printing_enabled &&
                 updated.top_surface_image_printing_method == int(TextureMappingZone::TopSurfaceImageContoning)) {
                 updated.modulation_mode = int(TextureMappingZone::ModulationPerimeterPathV2);

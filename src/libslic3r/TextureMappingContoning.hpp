@@ -77,6 +77,7 @@ private:
     bool m_td_effective_alpha_correction_enabled { false };
     bool m_variable_layer_height_compensation_enabled { false };
     bool m_beam_search_stack_expansion_enabled { false };
+    ColorSolverCalibratedStackModel m_calibrated_stack_model;
     std::vector<ColorSolverStackComponentRole> m_component_roles;
     mutable std::map<int, std::vector<Candidate>> m_candidates_by_depth;
     mutable std::shared_ptr<std::mutex> m_candidate_mutex { std::make_shared<std::mutex>() };

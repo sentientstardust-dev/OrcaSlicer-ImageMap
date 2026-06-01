@@ -80,6 +80,106 @@ std::array<float, 3> linear_to_srgb_color(const std::array<float, 3> &rgb)
     };
 }
 
+std::array<float, 3> eval_linear_rgb_model(const std::vector<float> &features,
+                                           const std::vector<float> &coefficients)
+{
+    if (features.empty() || coefficients.size() != features.size() * 3)
+        return { 0.f, 0.f, 0.f };
+
+    std::array<float, 3> linear { 0.f, 0.f, 0.f };
+    for (size_t feature_idx = 0; feature_idx < features.size(); ++feature_idx) {
+        const float feature = std::isfinite(features[feature_idx]) ? features[feature_idx] : 0.f;
+        for (size_t channel = 0; channel < 3; ++channel) {
+            const float coeff = coefficients[feature_idx * 3 + channel];
+            if (std::isfinite(coeff))
+                linear[channel] += feature * coeff;
+        }
+    }
+    for (float &channel : linear)
+        channel = clamp01(channel);
+    return linear_to_srgb_color(linear);
+}
+
+std::array<float, 3> eval_current_linear_affine_model(const std::array<float, 3> &base_srgb,
+                                                      const std::vector<float>   &coefficients)
+{
+    if (coefficients.size() != 12)
+        return base_srgb;
+    const std::array<float, 3> base_linear = srgb_to_linear_color(base_srgb);
+    return eval_linear_rgb_model({ base_linear[0], base_linear[1], base_linear[2], 1.f }, coefficients);
+}
+
+std::array<float, 3> eval_alpha_effective_model(const std::vector<uint16_t>                 &surface_to_deep,
+                                                const ColorSolverCalibratedStackModel       &model)
+{
+    const size_t component_count = model.component_count;
+    if (component_count == 0 || model.alphas.size() < component_count ||
+        model.coefficients_linear_rgb.size() != (component_count + 1) * 3)
+        return { 0.f, 0.f, 0.f };
+
+    std::vector<float> features(component_count + 1, 0.f);
+    float remaining = 1.f;
+    for (uint16_t component_idx : surface_to_deep) {
+        const size_t component = size_t(component_idx);
+        if (component >= component_count)
+            continue;
+        const float alpha = std::clamp(std::isfinite(model.alphas[component]) ? model.alphas[component] : 0.f, 0.f, 0.9999f);
+        features[component] += remaining * alpha;
+        remaining *= 1.f - alpha;
+        if (remaining <= 1e-5f)
+            break;
+    }
+    features[component_count] = std::max(0.f, remaining);
+    return eval_linear_rgb_model(features, model.coefficients_linear_rgb);
+}
+
+std::array<float, 3> eval_depth_kernel_linear_model(const std::vector<uint16_t>           &surface_to_deep,
+                                                    const ColorSolverCalibratedStackModel &model)
+{
+    const size_t component_count = model.component_count;
+    const size_t kernel_count = model.taus.size();
+    const size_t feature_count = 1 + component_count + component_count * kernel_count;
+    if (component_count == 0 || kernel_count == 0 ||
+        model.coefficients_linear_rgb.size() != feature_count * 3)
+        return { 0.f, 0.f, 0.f };
+
+    std::vector<float> features(feature_count, 0.f);
+    features[0] = 1.f;
+    if (!surface_to_deep.empty() && size_t(surface_to_deep.front()) < component_count)
+        features[1 + size_t(surface_to_deep.front())] = 1.f;
+
+    for (size_t kernel_idx = 0; kernel_idx < kernel_count; ++kernel_idx) {
+        const float tau = model.taus[kernel_idx];
+        const size_t base = 1 + component_count + kernel_idx * component_count;
+        float norm = 0.f;
+        for (size_t depth_idx = 0; depth_idx < surface_to_deep.size(); ++depth_idx) {
+            const size_t component = size_t(surface_to_deep[depth_idx]);
+            if (component >= component_count)
+                continue;
+            const float weight =
+                std::isfinite(tau) && tau > 0.f ?
+                    std::exp(-float(depth_idx) / tau) :
+                    1.f;
+            norm += weight;
+            features[base + component] += weight;
+        }
+        if (norm > 1e-12f) {
+            const float inv_norm = 1.f / norm;
+            for (size_t component = 0; component < component_count; ++component)
+                features[base + component] *= inv_norm;
+        }
+    }
+    return eval_linear_rgb_model(features, model.coefficients_linear_rgb);
+}
+
+bool calibrated_stack_model_valid_for_mix(const ColorSolverCalibratedStackModel *model,
+                                          size_t                                component_count)
+{
+    return model != nullptr && model->valid() &&
+           (model->kind == ColorSolverCalibratedStackModelKind::CurrentLinearAffine ||
+            model->component_count == component_count);
+}
+
 float linear_luminance(const std::array<float, 3> &rgb)
 {
     return 0.2126f * rgb[0] + 0.7152f * rgb[1] + 0.0722f * rgb[2];
@@ -688,17 +788,44 @@ std::array<float, 3> mix_ordered_stack_with_buffers(const std::vector<std::array
                                                     bool                                     beer_lambert_rgb_correction,
                                                     bool                                     td_effective_alpha_correction,
                                                     const std::vector<ColorSolverStackComponentRole> &component_roles,
-                                                    const std::vector<float>                &layer_opacities_by_depth)
+                                                    const std::vector<float>                &layer_opacities_by_depth,
+                                                    const ColorSolverCalibratedStackModel   *calibrated_stack_model)
 {
     if (colors_with_background.empty() || surface_to_deep.empty())
         return colors_with_background.empty() ? std::array<float, 3>{ { 0.f, 0.f, 0.f } } : colors_with_background.back();
+
+    const size_t component_count = colors_with_background.size() - 1;
+    if (calibrated_stack_model_valid_for_mix(calibrated_stack_model, component_count)) {
+        switch (calibrated_stack_model->kind) {
+        case ColorSolverCalibratedStackModelKind::CurrentLinearAffine: {
+            const std::array<float, 3> base =
+                mix_ordered_stack_with_buffers(colors_with_background,
+                                               weights,
+                                               surface_to_deep,
+                                               layer_opacities,
+                                               mix_model,
+                                               surface_scatter,
+                                               beer_lambert_rgb_correction,
+                                               td_effective_alpha_correction,
+                                               component_roles,
+                                               layer_opacities_by_depth,
+                                               nullptr);
+            return eval_current_linear_affine_model(base, calibrated_stack_model->coefficients_linear_rgb);
+        }
+        case ColorSolverCalibratedStackModelKind::AlphaEffective:
+            return eval_alpha_effective_model(surface_to_deep, *calibrated_stack_model);
+        case ColorSolverCalibratedStackModelKind::DepthKernelLinear:
+            return eval_depth_kernel_linear_model(surface_to_deep, *calibrated_stack_model);
+        default:
+            break;
+        }
+    }
 
     if (td_effective_alpha_correction)
         return mix_ordered_stack_td_effective_alpha(colors_with_background, surface_to_deep, layer_opacities, 0.f, component_roles, layer_opacities_by_depth);
     if (beer_lambert_rgb_correction)
         return mix_ordered_stack_beer_lambert_rgb(colors_with_background, surface_to_deep, layer_opacities, surface_scatter, layer_opacities_by_depth);
 
-    const size_t component_count = colors_with_background.size() - 1;
     weights.assign(colors_with_background.size(), 0.f);
     float transmission = 1.f;
     bool surface_layer = true;
@@ -1041,7 +1168,8 @@ void append_ordered_stack_candidate(ColorSolverOrderedStackCandidateSet       &c
                                     bool                                      beer_lambert_rgb_correction,
                                     bool                                      td_effective_alpha_correction,
                                     const std::vector<ColorSolverStackComponentRole> &component_roles,
-                                    const std::vector<float>                 &layer_opacities_by_depth)
+                                    const std::vector<float>                 &layer_opacities_by_depth,
+                                    const ColorSolverCalibratedStackModel    *calibrated_stack_model)
 {
     std::vector<uint16_t> simulated_surface_to_deep;
     const std::vector<uint16_t> *mix_stack = &surface_to_deep;
@@ -1059,7 +1187,8 @@ void append_ordered_stack_candidate(ColorSolverOrderedStackCandidateSet       &c
                                        beer_lambert_rgb_correction,
                                        td_effective_alpha_correction,
                                        component_roles,
-                                       layer_opacities_by_depth);
+                                       layer_opacities_by_depth,
+                                       calibrated_stack_model);
     const std::array<float, 3> perceptual = oklab_from_srgb(mixed);
     candidates.rgbs.emplace_back(mixed[0]);
     candidates.rgbs.emplace_back(mixed[1]);
@@ -1085,6 +1214,43 @@ ColorSolverLookupMode color_solver_lookup_mode_from_index(int mode)
 ColorSolverMode color_solver_mode_from_index(int mode)
 {
     return ColorSolverMode(std::clamp(mode, int(ColorSolverMode::RGB), int(ColorSolverMode::OklabSoftCap4Dark4)));
+}
+
+bool ColorSolverCalibratedStackModel::valid() const
+{
+    switch (kind) {
+    case ColorSolverCalibratedStackModelKind::CurrentLinearAffine:
+        return coefficients_linear_rgb.size() == 12;
+    case ColorSolverCalibratedStackModelKind::AlphaEffective:
+        return component_count > 0 &&
+               alphas.size() >= component_count &&
+               coefficients_linear_rgb.size() == (component_count + 1) * 3;
+    case ColorSolverCalibratedStackModelKind::DepthKernelLinear:
+        return component_count > 0 &&
+               !taus.empty() &&
+               coefficients_linear_rgb.size() == (1 + component_count + component_count * taus.size()) * 3;
+    default:
+        return false;
+    }
+}
+
+std::string ColorSolverCalibratedStackModel::cache_key() const
+{
+    if (!valid())
+        return std::string();
+    std::ostringstream key;
+    key << "cal" << int(kind) << "n" << component_count;
+    auto append_values = [&key](const char *label, const std::vector<float> &values) {
+        key << '|' << label;
+        for (float value : values) {
+            const float safe = std::isfinite(value) ? std::clamp(value, -1000.f, 1000.f) : 0.f;
+            key << ',' << int(std::lround(safe * 1000000.f));
+        }
+    };
+    append_values("a", alphas);
+    append_values("t", taus);
+    append_values("w", coefficients_linear_rgb);
+    return key.str();
 }
 
 int color_solver_total_units_for_component_count(size_t component_count)
@@ -1138,7 +1304,8 @@ std::array<float, 3> mix_color_solver_ordered_stack(const std::vector<std::array
                                                     bool                                      beer_lambert_rgb_correction,
                                                     bool                                      td_effective_alpha_correction,
                                                     const std::vector<ColorSolverStackComponentRole> &component_roles,
-                                                    const std::vector<float>                &layer_opacities_by_depth)
+                                                    const std::vector<float>                &layer_opacities_by_depth,
+                                                    const ColorSolverCalibratedStackModel   *calibrated_stack_model)
 {
     if (component_colors.empty() || surface_to_deep.empty())
         return background_rgb;
@@ -1155,7 +1322,8 @@ std::array<float, 3> mix_color_solver_ordered_stack(const std::vector<std::array
                                           beer_lambert_rgb_correction,
                                           td_effective_alpha_correction,
                                           component_roles,
-                                          layer_opacities_by_depth);
+                                          layer_opacities_by_depth,
+                                          calibrated_stack_model);
 }
 
 std::array<float, 3> color_solver_oklab_from_srgb(const std::array<float, 3> &rgb)
@@ -1294,7 +1462,8 @@ std::string color_solver_ordered_stack_candidate_cache_key(const std::vector<std
                                                            bool                                      td_effective_alpha_correction,
                                                            const std::vector<ColorSolverStackComponentRole> &component_roles,
                                                            bool                                      beam_search_stack_expansion,
-                                                           const std::vector<float>                  &layer_opacities_by_depth)
+                                                           const std::vector<float>                  &layer_opacities_by_depth,
+                                                           const ColorSolverCalibratedStackModel     *calibrated_stack_model)
 {
     std::ostringstream key;
     key << component_colors.size();
@@ -1346,6 +1515,8 @@ std::string color_solver_ordered_stack_candidate_cache_key(const std::vector<std
             key << ',' << int(std::lround(opacity * 1000000.f));
         }
     }
+    if (calibrated_stack_model != nullptr && calibrated_stack_model->valid())
+        key << '|' << calibrated_stack_model->cache_key();
     return key.str();
 }
 
@@ -1363,7 +1534,8 @@ ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
     bool                                      td_effective_alpha_correction,
     const std::vector<ColorSolverStackComponentRole> &component_roles,
     bool                                      beam_search_stack_expansion,
-    const std::vector<float>                 &layer_opacities_by_depth)
+    const std::vector<float>                 &layer_opacities_by_depth,
+    const ColorSolverCalibratedStackModel    *calibrated_stack_model)
 {
     ColorSolverOrderedStackCandidateSet candidates;
     int simulated_depth = simulated_stack_depth > 0 ? simulated_stack_depth : stack_depth;
@@ -1405,7 +1577,8 @@ ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
                                                beer_lambert_rgb_correction,
                                                td_effective_alpha_correction,
                                                component_roles,
-                                               layer_opacities_by_depth);
+                                               layer_opacities_by_depth,
+                                               calibrated_stack_model);
                 return;
             }
 
@@ -1459,7 +1632,8 @@ ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
                                                beer_lambert_rgb_correction,
                                                td_effective_alpha_correction,
                                                component_roles,
-                                               layer_opacities_by_depth);
+                                               layer_opacities_by_depth,
+                                               calibrated_stack_model);
             }
             return;
         }
@@ -1491,7 +1665,8 @@ const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates
     bool                                           td_effective_alpha_correction,
     const std::vector<ColorSolverStackComponentRole> &component_roles,
     bool                                           beam_search_stack_expansion,
-    const std::vector<float>                      &layer_opacities_by_depth)
+    const std::vector<float>                      &layer_opacities_by_depth,
+    const ColorSolverCalibratedStackModel         *calibrated_stack_model)
 {
     const std::string key =
         color_solver_ordered_stack_candidate_cache_key(component_colors,
@@ -1507,7 +1682,8 @@ const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates
                                                        td_effective_alpha_correction,
                                                        component_roles,
                                                        beam_search_stack_expansion,
-                                                       layer_opacities_by_depth);
+                                                       layer_opacities_by_depth,
+                                                       calibrated_stack_model);
     auto it = cache.find(key);
     if (it != cache.end())
         return it->second;
@@ -1526,7 +1702,8 @@ const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates
                                                    td_effective_alpha_correction,
                                                    component_roles,
                                                    beam_search_stack_expansion,
-                                                   layer_opacities_by_depth)).first->second;
+                                                   layer_opacities_by_depth,
+                                                   calibrated_stack_model)).first->second;
 }
 
 ColorSolverOrderedStackResult solve_color_solver_ordered_stack_result_for_target(

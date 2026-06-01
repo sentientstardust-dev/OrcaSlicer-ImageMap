@@ -8,9 +8,12 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "ColorSolver.hpp"
 
 namespace Slic3r {
 
@@ -93,7 +96,11 @@ struct TextureMappingZone
         ContoningColorPredictionDefault = 0,
         ContoningColorPredictionTdEffectiveAlpha = 1,
         ContoningColorPredictionBeerLambertRgb = 2,
-        ContoningColorPredictionBasicReflectance = 3
+        ContoningColorPredictionBasicReflectance = 3,
+        ContoningColorPredictionCalibratedCurrentLinearAffine = 4,
+        ContoningColorPredictionCalibratedTdAlphaEffective = 5,
+        ContoningColorPredictionCalibratedFreeAlphaEffective = 6,
+        ContoningColorPredictionCalibratedDepthKernelLinear = 7
     };
 
     enum TopSurfaceContoningPolygonizationMode : uint8_t {
@@ -379,7 +386,14 @@ struct TextureMappingZone
             return SlicerDefaultTopSurfaceContoningColorPredictionMode;
         return std::clamp(mode,
                           int(ContoningColorPredictionTdEffectiveAlpha),
-                          int(ContoningColorPredictionBasicReflectance));
+                          int(ContoningColorPredictionCalibratedDepthKernelLinear));
+    }
+
+    static bool top_surface_contoning_color_prediction_mode_is_calibrated(int mode)
+    {
+        const int effective_mode = effective_top_surface_contoning_color_prediction_mode(mode);
+        return effective_mode >= int(ContoningColorPredictionCalibratedCurrentLinearAffine) &&
+               effective_mode <= int(ContoningColorPredictionCalibratedDepthKernelLinear);
     }
 
     static bool effective_top_surface_contoning_layer_phase_enabled(bool value, bool surface_anchored_stacks)
@@ -488,6 +502,8 @@ struct TextureMappingZone
     int         top_surface_contoning_color_prediction_mode = DefaultTopSurfaceContoningColorPredictionMode;
     bool        top_surface_contoning_variable_layer_height_compensation_enabled = DefaultTopSurfaceContoningVariableLayerHeightCompensationEnabled;
     bool        top_surface_contoning_beam_search_stack_expansion_enabled = DefaultTopSurfaceContoningBeamSearchStackExpansionEnabled;
+    std::string top_surface_color_calibration_name;
+    std::string top_surface_color_calibration_json;
     bool        compact_offset_mode = DefaultCompactOffsetMode;
     bool        use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
     bool        high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;
@@ -672,7 +688,8 @@ struct TextureMappingZone
             mode == int(ContoningColorPredictionBeerLambertRgb);
         top_surface_contoning_beer_lambert_rgb_correction_enabled = beer_lambert_rgb;
         top_surface_contoning_td_effective_alpha_correction_enabled =
-            mode == int(ContoningColorPredictionTdEffectiveAlpha);
+            mode == int(ContoningColorPredictionTdEffectiveAlpha) ||
+            mode == int(ContoningColorPredictionCalibratedCurrentLinearAffine);
     }
 
     void apply_top_surface_contoning_experimental_defaults()
@@ -782,6 +799,8 @@ struct TextureMappingZone
         top_surface_contoning_color_prediction_mode = DefaultTopSurfaceContoningColorPredictionMode;
         top_surface_contoning_variable_layer_height_compensation_enabled = DefaultTopSurfaceContoningVariableLayerHeightCompensationEnabled;
         top_surface_contoning_beam_search_stack_expansion_enabled = DefaultTopSurfaceContoningBeamSearchStackExpansionEnabled;
+        top_surface_color_calibration_name.clear();
+        top_surface_color_calibration_json.clear();
         compact_offset_mode = DefaultCompactOffsetMode;
         use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
         high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;
@@ -833,6 +852,39 @@ struct TextureMappingZone
     bool operator==(const TextureMappingZone &rhs) const;
     bool operator!=(const TextureMappingZone &rhs) const { return !(*this == rhs); }
 };
+
+struct TextureMappingColorCalibrationFilament {
+    std::string name;
+    std::array<float, 3> color { { 0.f, 0.f, 0.f } };
+    float td_mm { 0.f };
+};
+
+struct TextureMappingColorCalibration {
+    std::string display_name;
+    std::vector<TextureMappingColorCalibrationFilament> filaments;
+    ColorSolverCalibratedStackModel current_linear_affine;
+    ColorSolverCalibratedStackModel td_alpha_effective;
+    ColorSolverCalibratedStackModel free_alpha_effective;
+    ColorSolverCalibratedStackModel depth_kernel_linear;
+
+    bool has_mode(int mode) const;
+};
+
+std::optional<TextureMappingColorCalibration> texture_mapping_parse_top_surface_color_calibration(
+    const std::string &json_text,
+    std::string       *error = nullptr);
+std::vector<int> texture_mapping_top_surface_color_calibration_supported_modes(const std::string &json_text);
+int texture_mapping_top_surface_color_calibration_first_supported_mode(const std::string &json_text);
+std::string texture_mapping_top_surface_color_calibration_display_name(const std::string &json_text);
+std::string texture_mapping_top_surface_color_calibration_warning(const TextureMappingZone                  &zone,
+                                                                  const std::vector<std::array<float, 3>> &component_colors,
+                                                                  const std::vector<float>                &component_tds_mm);
+std::optional<ColorSolverCalibratedStackModel> texture_mapping_top_surface_color_calibrated_model(
+    const TextureMappingZone                  &zone,
+    int                                        mode,
+    const std::vector<std::array<float, 3>>   &component_colors,
+    const std::vector<float>                  &component_tds_mm,
+    std::string                               *warning = nullptr);
 
 struct TextureMappingPrimeTowerImage
 {

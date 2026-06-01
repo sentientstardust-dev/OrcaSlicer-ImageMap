@@ -407,12 +407,17 @@ TextureMappingContoningSolver::TextureMappingContoningSolver(const TextureMappin
 {
     m_mix_model = color_solver_mix_model_from_index(zone.generic_solver_mix_model);
     m_td_adjustment_enabled = zone.top_surface_contoning_td_adjustment_enabled;
+    const int effective_color_prediction_mode =
+        TextureMappingZone::effective_top_surface_contoning_color_prediction_mode(
+            zone.top_surface_contoning_color_prediction_mode);
     m_td_effective_alpha_correction_enabled =
-        m_td_adjustment_enabled && zone.top_surface_contoning_td_effective_alpha_correction_enabled;
+        m_td_adjustment_enabled &&
+        (effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha) ||
+         effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionCalibratedCurrentLinearAffine));
     m_beer_lambert_rgb_correction_enabled =
         m_td_adjustment_enabled &&
         !m_td_effective_alpha_correction_enabled &&
-        zone.top_surface_contoning_beer_lambert_rgb_correction_enabled;
+        effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb);
     m_variable_layer_height_compensation_enabled =
         m_td_adjustment_enabled && zone.top_surface_contoning_variable_layer_height_compensation_enabled;
     m_beam_search_stack_expansion_enabled = zone.effective_top_surface_contoning_beam_search_stack_expansion_enabled();
@@ -439,6 +444,17 @@ TextureMappingContoningSolver::TextureMappingContoningSolver(const TextureMappin
     m_background_rgb = mix_color_solver_components(m_component_colors, background_weights, m_mix_model);
     m_effective_transmission_distances_mm =
         effective_transmission_distances_mm(zone, config, m_component_ids, m_td_adjustment_enabled);
+    if (TextureMappingZone::top_surface_contoning_color_prediction_mode_is_calibrated(effective_color_prediction_mode)) {
+        std::string warning;
+        std::optional<ColorSolverCalibratedStackModel> calibrated_model =
+            texture_mapping_top_surface_color_calibrated_model(zone,
+                                                               effective_color_prediction_mode,
+                                                               m_component_colors,
+                                                               m_effective_transmission_distances_mm,
+                                                               &warning);
+        if (calibrated_model && calibrated_model->valid())
+            m_calibrated_stack_model = *calibrated_model;
+    }
     m_component_layer_opacity.reserve(m_effective_transmission_distances_mm.size());
     for (float td_mm : m_effective_transmission_distances_mm)
         m_component_layer_opacity.emplace_back(layer_opacity_from_td(td_mm > 0.f ? td_mm : 3.f, m_layer_height_mm));
@@ -556,7 +572,8 @@ std::optional<std::array<float, 3>> TextureMappingContoningSolver::stack_rgb(
                                           m_beer_lambert_rgb_correction_enabled,
                                           m_td_effective_alpha_correction_enabled,
                                           m_component_roles,
-                                          depth_layer_opacities);
+                                          depth_layer_opacities,
+                                          m_calibrated_stack_model.valid() ? &m_calibrated_stack_model : nullptr);
 }
 
 std::vector<float> TextureMappingContoningSolver::layer_opacities_by_depth(
@@ -690,7 +707,8 @@ TextureMappingContoningStack TextureMappingContoningSolver::solve(const std::arr
                                                        m_td_effective_alpha_correction_enabled,
                                                        m_component_roles,
                                                        m_beam_search_stack_expansion_enabled,
-                                                       depth_layer_opacities);
+                                                       depth_layer_opacities,
+                                                       m_calibrated_stack_model.valid() ? &m_calibrated_stack_model : nullptr);
         }
         const ColorSolverOrderedStackResult solved =
             solve_color_solver_ordered_stack_result_for_target(*ordered_candidates, target_rgb, ColorSolverMode::OklabSoftCap4Dark4);

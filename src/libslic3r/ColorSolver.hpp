@@ -55,6 +55,25 @@ enum class ColorSolverStackComponentRole : uint8_t
     White = 5
 };
 
+enum class ColorSolverCalibratedStackModelKind : uint8_t
+{
+    None = 0,
+    CurrentLinearAffine = 1,
+    AlphaEffective = 2,
+    DepthKernelLinear = 3
+};
+
+struct ColorSolverCalibratedStackModel {
+    ColorSolverCalibratedStackModelKind kind { ColorSolverCalibratedStackModelKind::None };
+    size_t component_count { 0 };
+    std::vector<float> alphas;
+    std::vector<float> taus;
+    std::vector<float> coefficients_linear_rgb;
+
+    bool valid() const;
+    std::string cache_key() const;
+};
+
 struct ColorSolverCandidateSet {
     struct KdNode {
         uint32_t candidate_idx { 0 };
@@ -132,7 +151,8 @@ std::array<float, 3> mix_color_solver_ordered_stack(const std::vector<std::array
                                                     bool                                      beer_lambert_rgb_correction = false,
                                                     bool                                      td_effective_alpha_correction = false,
                                                     const std::vector<ColorSolverStackComponentRole> &component_roles = {},
-                                                    const std::vector<float>                &layer_opacities_by_depth = {});
+                                                    const std::vector<float>                &layer_opacities_by_depth = {},
+                                                    const ColorSolverCalibratedStackModel   *calibrated_stack_model = nullptr);
 std::array<float, 3> color_solver_oklab_from_srgb(const std::array<float, 3> &rgb);
 std::array<float, 3> color_solver_srgb_from_oklab(const std::array<float, 3> &oklab);
 
@@ -163,7 +183,8 @@ std::string color_solver_ordered_stack_candidate_cache_key(const std::vector<std
                                                            bool                                      td_effective_alpha_correction = false,
                                                            const std::vector<ColorSolverStackComponentRole> &component_roles = {},
                                                            bool                                      beam_search_stack_expansion = false,
-                                                           const std::vector<float>                  &layer_opacities_by_depth = {});
+                                                           const std::vector<float>                  &layer_opacities_by_depth = {},
+                                                           const ColorSolverCalibratedStackModel     *calibrated_stack_model = nullptr);
 ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
     const std::vector<std::array<float, 3>> &component_colors,
     const std::vector<float>                &layer_opacities,
@@ -178,7 +199,8 @@ ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
     bool                                      td_effective_alpha_correction = false,
     const std::vector<ColorSolverStackComponentRole> &component_roles = {},
     bool                                      beam_search_stack_expansion = false,
-    const std::vector<float>                 &layer_opacities_by_depth = {});
+    const std::vector<float>                 &layer_opacities_by_depth = {},
+    const ColorSolverCalibratedStackModel    *calibrated_stack_model = nullptr);
 const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates(
     ColorSolverOrderedStackCandidateCache        &cache,
     const std::vector<std::array<float, 3>>      &component_colors,
@@ -194,7 +216,8 @@ const ColorSolverOrderedStackCandidateSet &color_solver_ordered_stack_candidates
     bool                                           td_effective_alpha_correction = false,
     const std::vector<ColorSolverStackComponentRole> &component_roles = {},
     bool                                           beam_search_stack_expansion = false,
-    const std::vector<float>                      &layer_opacities_by_depth = {});
+    const std::vector<float>                      &layer_opacities_by_depth = {},
+    const ColorSolverCalibratedStackModel         *calibrated_stack_model = nullptr);
 ColorSolverOrderedStackResult solve_color_solver_ordered_stack_result_for_target(
     const ColorSolverOrderedStackCandidateSet &candidates,
     const std::array<float, 3>                &target_rgb,
