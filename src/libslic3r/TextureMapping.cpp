@@ -859,10 +859,12 @@ static int top_surface_contoning_color_prediction_mode_from_name(std::string nam
 
 static std::string top_surface_contoning_polygonization_mode_name(int mode)
 {
-    if (TextureMappingZone::effective_top_surface_contoning_polygonization_mode(mode) ==
-        int(TextureMappingZone::ContoningPolygonizationMarchingSquares))
+    const int effective_mode = TextureMappingZone::effective_top_surface_contoning_polygonization_mode(mode);
+    if (effective_mode == int(TextureMappingZone::ContoningPolygonizationMarchingSquares))
         return "marching_squares";
-    return "vector_border_shared_gaussian_partition";
+    if (effective_mode == int(TextureMappingZone::ContoningPolygonizationVectorBorderSharedGaussianPartition))
+        return "vector_border_shared_gaussian_partition";
+    return "mid_gaussian_shared_chain_fit";
 }
 
 static int top_surface_contoning_polygonization_mode_from_name(std::string name)
@@ -875,6 +877,12 @@ static int top_surface_contoning_polygonization_mode_from_name(std::string name)
         return int(TextureMappingZone::ContoningPolygonizationMarchingSquares);
     if (name == "vector_border_shared_gaussian_partition")
         return int(TextureMappingZone::ContoningPolygonizationVectorBorderSharedGaussianPartition);
+    if (name == "mid_gaussian_shared_chain_fit" ||
+        name == "mid_gaussian_shared_chain_fit_0_16" ||
+        name == "mid_gaussian_shared_chain_fit_0p16" ||
+        name == "mid_gaussian_shared_chain_fit_0_16_cells" ||
+        name == "mid_gaussian_shared_chain_fit_0p16_cells")
+        return int(TextureMappingZone::ContoningPolygonizationMidGaussianSharedChainFit);
     return TextureMappingZone::DefaultTopSurfaceContoningPolygonizationMode;
 }
 

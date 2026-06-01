@@ -105,7 +105,8 @@ struct TextureMappingZone
 
     enum TopSurfaceContoningPolygonizationMode : uint8_t {
         ContoningPolygonizationVectorBorderSharedGaussianPartition = 0,
-        ContoningPolygonizationMarchingSquares = 1
+        ContoningPolygonizationMarchingSquares = 1,
+        ContoningPolygonizationMidGaussianSharedChainFit = 2
     };
 
     enum FilamentColorMode : uint8_t {
@@ -222,7 +223,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled = true;
     static constexpr bool  DefaultTopSurfaceContoningFastModeEnabled = true;
     static constexpr int   DefaultTopSurfaceContoningPolygonizationMode =
-        int(ContoningPolygonizationMarchingSquares);
+        int(ContoningPolygonizationMidGaussianSharedChainFit);
     static constexpr int   DefaultTopSurfaceContoningPolygonizeResolution = 4;
     static constexpr bool  DefaultTopSurfaceContoningSurfaceAnchoredStacksEnabled = true;
     static constexpr bool  DefaultTopSurfaceContoningSurfaceAnchoredStackOptimizationsEnabled = true;
@@ -362,7 +363,8 @@ struct TextureMappingZone
     static constexpr int normalize_top_surface_contoning_polygonization_mode(int mode)
     {
         return mode == int(ContoningPolygonizationVectorBorderSharedGaussianPartition) ||
-               mode == int(ContoningPolygonizationMarchingSquares) ?
+               mode == int(ContoningPolygonizationMarchingSquares) ||
+               mode == int(ContoningPolygonizationMidGaussianSharedChainFit) ?
             mode :
             DefaultTopSurfaceContoningPolygonizationMode;
     }

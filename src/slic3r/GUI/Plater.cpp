@@ -2369,15 +2369,26 @@ static wxString texture_mapping_contoning_color_prediction_default_label()
 
 static int texture_mapping_contoning_polygonization_mode_choice_selection(int mode)
 {
-    return TextureMappingZone::effective_top_surface_contoning_polygonization_mode(mode) ==
-            int(TextureMappingZone::ContoningPolygonizationMarchingSquares) ? 1 : 0;
+    switch (TextureMappingZone::effective_top_surface_contoning_polygonization_mode(mode)) {
+    case int(TextureMappingZone::ContoningPolygonizationVectorBorderSharedGaussianPartition):
+        return 1;
+    case int(TextureMappingZone::ContoningPolygonizationMarchingSquares):
+        return 2;
+    default:
+        return 0;
+    }
 }
 
 static int texture_mapping_contoning_polygonization_mode_from_choice_selection(int selection)
 {
-    return selection == 1 ?
-        int(TextureMappingZone::ContoningPolygonizationMarchingSquares) :
-        int(TextureMappingZone::ContoningPolygonizationVectorBorderSharedGaussianPartition);
+    switch (selection) {
+    case 1:
+        return int(TextureMappingZone::ContoningPolygonizationVectorBorderSharedGaussianPartition);
+    case 2:
+        return int(TextureMappingZone::ContoningPolygonizationMarchingSquares);
+    default:
+        return int(TextureMappingZone::ContoningPolygonizationMidGaussianSharedChainFit);
+    }
 }
 
 class TextureMappingAdvancedOptionsDialog : public wxDialog
@@ -3358,11 +3369,12 @@ public:
         m_top_surface_contoning_polygonization_mode_panel = new wxPanel(m_top_surface_contoning_checkboxes_panel, wxID_ANY);
         auto *contoning_polygonization_mode_row = new wxBoxSizer(wxHORIZONTAL);
         m_top_surface_contoning_polygonization_mode_panel->SetSizer(contoning_polygonization_mode_row);
-        contoning_polygonization_mode_row->Add(new wxStaticText(m_top_surface_contoning_polygonization_mode_panel, wxID_ANY, _L("Technique")),
+        contoning_polygonization_mode_row->Add(new wxStaticText(m_top_surface_contoning_polygonization_mode_panel, wxID_ANY, _L("Polygonization mode")),
                                                0,
                                                wxALIGN_CENTER_VERTICAL | wxRIGHT,
                                                gap);
         wxArrayString contoning_polygonization_mode_choices;
+        contoning_polygonization_mode_choices.Add(_L("Mid Gaussian shared chain fit"));
         contoning_polygonization_mode_choices.Add(_L("Vector-border shared Gaussian partition (very slow)"));
         contoning_polygonization_mode_choices.Add(_L("Marching squares"));
         m_top_surface_contoning_polygonization_mode_choice =

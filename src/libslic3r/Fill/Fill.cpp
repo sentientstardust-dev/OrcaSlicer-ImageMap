@@ -3087,6 +3087,507 @@ static ExPolygons top_surface_image_contoning_raw_partition_hierarchy_area_from_
     return top_surface_image_contoning_hierarchy_expolygons(std::move(polygons), throw_if_canceled);
 }
 
+struct TopSurfaceImageContoningSharedChainVertex {
+    int col { 0 };
+    int row { 0 };
+
+    bool operator<(const TopSurfaceImageContoningSharedChainVertex &rhs) const
+    {
+        return std::tie(col, row) < std::tie(rhs.col, rhs.row);
+    }
+
+    bool operator==(const TopSurfaceImageContoningSharedChainVertex &rhs) const
+    {
+        return col == rhs.col && row == rhs.row;
+    }
+
+    bool operator!=(const TopSurfaceImageContoningSharedChainVertex &rhs) const
+    {
+        return !(*this == rhs);
+    }
+};
+
+struct TopSurfaceImageContoningSharedChainLabelPair {
+    int first { -1 };
+    int second { -1 };
+
+    bool operator<(const TopSurfaceImageContoningSharedChainLabelPair &rhs) const
+    {
+        return std::tie(first, second) < std::tie(rhs.first, rhs.second);
+    }
+
+    bool operator==(const TopSurfaceImageContoningSharedChainLabelPair &rhs) const
+    {
+        return first == rhs.first && second == rhs.second;
+    }
+};
+
+struct TopSurfaceImageContoningSharedChainEdgeKey {
+    TopSurfaceImageContoningSharedChainVertex a;
+    TopSurfaceImageContoningSharedChainVertex b;
+
+    bool operator<(const TopSurfaceImageContoningSharedChainEdgeKey &rhs) const
+    {
+        return std::tie(a, b) < std::tie(rhs.a, rhs.b);
+    }
+};
+
+struct TopSurfaceImageContoningSharedChainEdge {
+    TopSurfaceImageContoningSharedChainVertex a;
+    TopSurfaceImageContoningSharedChainVertex b;
+    int left_label { -1 };
+    int right_label { -1 };
+};
+
+struct TopSurfaceImageContoningSharedChain {
+    TopSurfaceImageContoningSharedChainLabelPair labels;
+    std::vector<TopSurfaceImageContoningSharedChainVertex> vertices;
+    bool closed { false };
+};
+
+struct TopSurfaceImageContoningDirectedSharedChain {
+    int label { -1 };
+    TopSurfaceImageContoningSharedChainVertex start;
+    TopSurfaceImageContoningSharedChainVertex end;
+    Points points;
+    bool closed { false };
+};
+
+static TopSurfaceImageContoningSharedChainLabelPair top_surface_image_contoning_shared_chain_label_pair(int lhs, int rhs)
+{
+    return lhs <= rhs ?
+        TopSurfaceImageContoningSharedChainLabelPair{ lhs, rhs } :
+        TopSurfaceImageContoningSharedChainLabelPair{ rhs, lhs };
+}
+
+static TopSurfaceImageContoningSharedChainEdgeKey top_surface_image_contoning_shared_chain_edge_key(
+    TopSurfaceImageContoningSharedChainVertex a,
+    TopSurfaceImageContoningSharedChainVertex b)
+{
+    if (b < a)
+        std::swap(a, b);
+    return TopSurfaceImageContoningSharedChainEdgeKey{ a, b };
+}
+
+static void top_surface_image_contoning_add_shared_chain_label_pair(
+    std::vector<TopSurfaceImageContoningSharedChainLabelPair> &pairs,
+    const TopSurfaceImageContoningSharedChainLabelPair        &pair)
+{
+    if (std::find(pairs.begin(), pairs.end(), pair) == pairs.end())
+        pairs.emplace_back(pair);
+}
+
+static void top_surface_image_contoning_add_shared_chain_edge(
+    std::map<TopSurfaceImageContoningSharedChainEdgeKey, TopSurfaceImageContoningSharedChainEdge> &edges,
+    TopSurfaceImageContoningSharedChainVertex start,
+    TopSurfaceImageContoningSharedChainVertex end,
+    int left_label,
+    int right_label)
+{
+    if (start == end || left_label == right_label || (left_label < 0 && right_label < 0))
+        return;
+    const TopSurfaceImageContoningSharedChainEdgeKey key =
+        top_surface_image_contoning_shared_chain_edge_key(start, end);
+    if (edges.find(key) != edges.end())
+        return;
+    edges.emplace(key, TopSurfaceImageContoningSharedChainEdge{ start, end, left_label, right_label });
+}
+
+static std::map<TopSurfaceImageContoningSharedChainEdgeKey, TopSurfaceImageContoningSharedChainEdge>
+top_surface_image_contoning_shared_chain_edges_from_grid(const std::vector<int> &grid, int cols, int rows)
+{
+    std::map<TopSurfaceImageContoningSharedChainEdgeKey, TopSurfaceImageContoningSharedChainEdge> edges;
+    if (grid.empty() || cols <= 0 || rows <= 0 || grid.size() != size_t(cols) * size_t(rows))
+        return edges;
+
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col + 1 < cols; ++col) {
+            const int left_label = grid[size_t(row) * size_t(cols) + size_t(col)];
+            const int right_label = grid[size_t(row) * size_t(cols) + size_t(col + 1)];
+            if (left_label == right_label)
+                continue;
+            top_surface_image_contoning_add_shared_chain_edge(edges,
+                                                              TopSurfaceImageContoningSharedChainVertex{ col + 1, row },
+                                                              TopSurfaceImageContoningSharedChainVertex{ col + 1, row + 1 },
+                                                              left_label,
+                                                              right_label);
+        }
+    }
+
+    for (int row = 0; row + 1 < rows; ++row) {
+        for (int col = 0; col < cols; ++col) {
+            const int lower_label = grid[size_t(row) * size_t(cols) + size_t(col)];
+            const int upper_label = grid[size_t(row + 1) * size_t(cols) + size_t(col)];
+            if (lower_label == upper_label)
+                continue;
+            top_surface_image_contoning_add_shared_chain_edge(edges,
+                                                              TopSurfaceImageContoningSharedChainVertex{ col, row + 1 },
+                                                              TopSurfaceImageContoningSharedChainVertex{ col + 1, row + 1 },
+                                                              upper_label,
+                                                              lower_label);
+        }
+    }
+
+    for (int col = 0; col < cols; ++col) {
+        const int bottom_label = grid[size_t(col)];
+        if (bottom_label >= 0)
+            top_surface_image_contoning_add_shared_chain_edge(edges,
+                                                              TopSurfaceImageContoningSharedChainVertex{ col, 0 },
+                                                              TopSurfaceImageContoningSharedChainVertex{ col + 1, 0 },
+                                                              bottom_label,
+                                                              -1);
+        const int top_label = grid[size_t(rows - 1) * size_t(cols) + size_t(col)];
+        if (top_label >= 0)
+            top_surface_image_contoning_add_shared_chain_edge(edges,
+                                                              TopSurfaceImageContoningSharedChainVertex{ col + 1, rows },
+                                                              TopSurfaceImageContoningSharedChainVertex{ col, rows },
+                                                              top_label,
+                                                              -1);
+    }
+
+    for (int row = 0; row < rows; ++row) {
+        const int left_label = grid[size_t(row) * size_t(cols)];
+        if (left_label >= 0)
+            top_surface_image_contoning_add_shared_chain_edge(edges,
+                                                              TopSurfaceImageContoningSharedChainVertex{ 0, row + 1 },
+                                                              TopSurfaceImageContoningSharedChainVertex{ 0, row },
+                                                              left_label,
+                                                              -1);
+        const int right_label = grid[size_t(row) * size_t(cols) + size_t(cols - 1)];
+        if (right_label >= 0)
+            top_surface_image_contoning_add_shared_chain_edge(edges,
+                                                              TopSurfaceImageContoningSharedChainVertex{ cols, row },
+                                                              TopSurfaceImageContoningSharedChainVertex{ cols, row + 1 },
+                                                              right_label,
+                                                              -1);
+    }
+
+    return edges;
+}
+
+static bool top_surface_image_contoning_shared_chain_is_used(
+    const std::map<std::tuple<TopSurfaceImageContoningSharedChainLabelPair,
+                              TopSurfaceImageContoningSharedChainVertex,
+                              TopSurfaceImageContoningSharedChainVertex>, bool> &used,
+    const TopSurfaceImageContoningSharedChainLabelPair                           &labels,
+    TopSurfaceImageContoningSharedChainVertex                                     a,
+    TopSurfaceImageContoningSharedChainVertex                                     b)
+{
+    if (b < a)
+        std::swap(a, b);
+    return used.find(std::make_tuple(labels, a, b)) != used.end();
+}
+
+static void top_surface_image_contoning_mark_shared_chain_used(
+    std::map<std::tuple<TopSurfaceImageContoningSharedChainLabelPair,
+                        TopSurfaceImageContoningSharedChainVertex,
+                        TopSurfaceImageContoningSharedChainVertex>, bool> &used,
+    const TopSurfaceImageContoningSharedChainLabelPair                     &labels,
+    TopSurfaceImageContoningSharedChainVertex                               a,
+    TopSurfaceImageContoningSharedChainVertex                               b)
+{
+    if (b < a)
+        std::swap(a, b);
+    used.emplace(std::make_tuple(labels, a, b), true);
+}
+
+static std::vector<TopSurfaceImageContoningSharedChain> top_surface_image_contoning_extract_shared_chains(
+    const std::map<TopSurfaceImageContoningSharedChainEdgeKey, TopSurfaceImageContoningSharedChainEdge> &edges,
+    const ThrowIfCanceled                                                                               *throw_if_canceled)
+{
+    std::map<TopSurfaceImageContoningSharedChainLabelPair,
+             std::map<TopSurfaceImageContoningSharedChainVertex, std::vector<TopSurfaceImageContoningSharedChainVertex>>> pair_adj;
+    std::map<TopSurfaceImageContoningSharedChainVertex, int> global_degree;
+    std::map<TopSurfaceImageContoningSharedChainVertex, std::vector<TopSurfaceImageContoningSharedChainLabelPair>> global_pairs;
+
+    for (const auto &entry : edges) {
+        const TopSurfaceImageContoningSharedChainEdge &edge = entry.second;
+        const TopSurfaceImageContoningSharedChainLabelPair labels =
+            top_surface_image_contoning_shared_chain_label_pair(edge.left_label, edge.right_label);
+        pair_adj[labels][edge.a].emplace_back(edge.b);
+        pair_adj[labels][edge.b].emplace_back(edge.a);
+        ++global_degree[edge.a];
+        ++global_degree[edge.b];
+        top_surface_image_contoning_add_shared_chain_label_pair(global_pairs[edge.a], labels);
+        top_surface_image_contoning_add_shared_chain_label_pair(global_pairs[edge.b], labels);
+    }
+
+    auto is_junction = [&global_degree, &global_pairs](const TopSurfaceImageContoningSharedChainVertex &vertex) {
+        auto degree_it = global_degree.find(vertex);
+        const int degree = degree_it == global_degree.end() ? 0 : degree_it->second;
+        auto pair_it = global_pairs.find(vertex);
+        const size_t pair_count = pair_it == global_pairs.end() ? 0 : pair_it->second.size();
+        return degree != 2 || pair_count != 1;
+    };
+
+    std::vector<TopSurfaceImageContoningSharedChain> chains;
+    std::map<std::tuple<TopSurfaceImageContoningSharedChainLabelPair,
+                        TopSurfaceImageContoningSharedChainVertex,
+                        TopSurfaceImageContoningSharedChainVertex>, bool> used;
+
+    for (const auto &pair_entry : pair_adj) {
+        check_canceled(throw_if_canceled);
+        const TopSurfaceImageContoningSharedChainLabelPair &labels = pair_entry.first;
+        const auto &adj = pair_entry.second;
+        std::vector<std::pair<TopSurfaceImageContoningSharedChainVertex, TopSurfaceImageContoningSharedChainVertex>> pair_edges;
+        for (const auto &adj_entry : adj) {
+            for (const TopSurfaceImageContoningSharedChainVertex &neighbor : adj_entry.second)
+                if (adj_entry.first < neighbor)
+                    pair_edges.emplace_back(adj_entry.first, neighbor);
+        }
+
+        for (const auto &edge : pair_edges) {
+            if (top_surface_image_contoning_shared_chain_is_used(used, labels, edge.first, edge.second))
+                continue;
+            if (!is_junction(edge.first) && !is_junction(edge.second))
+                continue;
+
+            TopSurfaceImageContoningSharedChainVertex start = edge.first;
+            TopSurfaceImageContoningSharedChainVertex next = edge.second;
+            if (!is_junction(start) && is_junction(next))
+                std::swap(start, next);
+
+            TopSurfaceImageContoningSharedChain chain;
+            chain.labels = labels;
+            chain.vertices.emplace_back(start);
+            chain.vertices.emplace_back(next);
+            top_surface_image_contoning_mark_shared_chain_used(used, labels, start, next);
+
+            TopSurfaceImageContoningSharedChainVertex previous = start;
+            TopSurfaceImageContoningSharedChainVertex current = next;
+            while (!is_junction(current)) {
+                const auto adj_it = adj.find(current);
+                if (adj_it == adj.end())
+                    break;
+                bool advanced = false;
+                for (const TopSurfaceImageContoningSharedChainVertex &candidate : adj_it->second) {
+                    if (candidate == previous ||
+                        top_surface_image_contoning_shared_chain_is_used(used, labels, current, candidate))
+                        continue;
+                    chain.vertices.emplace_back(candidate);
+                    top_surface_image_contoning_mark_shared_chain_used(used, labels, current, candidate);
+                    previous = current;
+                    current = candidate;
+                    advanced = true;
+                    break;
+                }
+                if (!advanced)
+                    break;
+            }
+            chains.emplace_back(std::move(chain));
+        }
+
+        for (const auto &edge : pair_edges) {
+            if (top_surface_image_contoning_shared_chain_is_used(used, labels, edge.first, edge.second))
+                continue;
+
+            TopSurfaceImageContoningSharedChain chain;
+            chain.labels = labels;
+            chain.vertices.emplace_back(edge.first);
+            chain.vertices.emplace_back(edge.second);
+            top_surface_image_contoning_mark_shared_chain_used(used, labels, edge.first, edge.second);
+
+            TopSurfaceImageContoningSharedChainVertex previous = edge.first;
+            TopSurfaceImageContoningSharedChainVertex current = edge.second;
+            while (true) {
+                const auto adj_it = adj.find(current);
+                if (adj_it == adj.end())
+                    break;
+                bool advanced = false;
+                for (const TopSurfaceImageContoningSharedChainVertex &candidate : adj_it->second) {
+                    if (candidate == previous)
+                        continue;
+                    if (candidate == chain.vertices.front()) {
+                        chain.closed = true;
+                        top_surface_image_contoning_mark_shared_chain_used(used, labels, current, candidate);
+                        advanced = false;
+                        break;
+                    }
+                    if (top_surface_image_contoning_shared_chain_is_used(used, labels, current, candidate))
+                        continue;
+                    chain.vertices.emplace_back(candidate);
+                    top_surface_image_contoning_mark_shared_chain_used(used, labels, current, candidate);
+                    previous = current;
+                    current = candidate;
+                    advanced = true;
+                    break;
+                }
+                if (!advanced)
+                    break;
+            }
+            chains.emplace_back(std::move(chain));
+        }
+    }
+
+    return chains;
+}
+
+static Point top_surface_image_contoning_shared_chain_point(TopSurfaceImageContoningSharedChainVertex vertex,
+                                                            coord_t                                  min_x,
+                                                            coord_t                                  min_y,
+                                                            coord_t                                  step,
+                                                            const BoundingBox                       &bbox)
+{
+    const coord_t x = std::min<coord_t>(min_x + coord_t(vertex.col) * step, bbox.max.x());
+    const coord_t y = std::min<coord_t>(min_y + coord_t(vertex.row) * step, bbox.max.y());
+    return Point(x, y);
+}
+
+static Points top_surface_image_contoning_simplified_shared_chain_points(
+    const std::vector<TopSurfaceImageContoningSharedChainVertex> &vertices,
+    bool                                                         closed,
+    coord_t                                                      min_x,
+    coord_t                                                      min_y,
+    coord_t                                                      step,
+    const BoundingBox                                           &bbox,
+    double                                                       tolerance)
+{
+    Points points;
+    points.reserve(vertices.size() + (closed ? 1 : 0));
+    for (TopSurfaceImageContoningSharedChainVertex vertex : vertices) {
+        Point point = top_surface_image_contoning_shared_chain_point(vertex, min_x, min_y, step, bbox);
+        if (points.empty() || points.back() != point)
+            points.emplace_back(point);
+    }
+    if ((!closed && points.size() < 2) || (closed && points.size() < 3))
+        return {};
+
+    if (closed) {
+        Points closed_points = points;
+        closed_points.emplace_back(closed_points.front());
+        Points simplified = MultiPoint::_douglas_peucker(closed_points, tolerance);
+        if (!simplified.empty() && simplified.front() == simplified.back())
+            simplified.pop_back();
+        simplified.erase(std::unique(simplified.begin(), simplified.end()), simplified.end());
+        if (simplified.size() >= 2 && simplified.front() == simplified.back())
+            simplified.pop_back();
+        return simplified.size() >= 3 ? simplified : points;
+    }
+
+    Points simplified = MultiPoint::_douglas_peucker(points, tolerance);
+    simplified.erase(std::unique(simplified.begin(), simplified.end()), simplified.end());
+    return simplified.size() >= 2 ? simplified : points;
+}
+
+static bool top_surface_image_contoning_shared_chain_label_is_left(
+    const std::map<TopSurfaceImageContoningSharedChainEdgeKey, TopSurfaceImageContoningSharedChainEdge> &edges,
+    TopSurfaceImageContoningSharedChainVertex                                                           start,
+    TopSurfaceImageContoningSharedChainVertex                                                           end,
+    int                                                                                                  label)
+{
+    const auto edge_it = edges.find(top_surface_image_contoning_shared_chain_edge_key(start, end));
+    if (edge_it == edges.end())
+        return true;
+    const TopSurfaceImageContoningSharedChainEdge &edge = edge_it->second;
+    const bool same_direction = edge.a == start && edge.b == end;
+    const int left_label = same_direction ? edge.left_label : edge.right_label;
+    return label == left_label;
+}
+
+static double top_surface_image_contoning_shared_chain_angle(const Point &from, const Point &to)
+{
+    return std::atan2(double(to.y() - from.y()), double(to.x() - from.x()));
+}
+
+static double top_surface_image_contoning_shared_chain_clockwise_delta(double reference_angle, double candidate_angle)
+{
+    double delta = reference_angle - candidate_angle;
+    while (delta < 0.)
+        delta += 2. * PI;
+    while (delta >= 2. * PI)
+        delta -= 2. * PI;
+    return delta;
+}
+
+static int top_surface_image_contoning_next_shared_chain_index(
+    const std::vector<TopSurfaceImageContoningDirectedSharedChain> &chains,
+    const std::vector<int>                                         &candidates,
+    const std::vector<bool>                                        &used,
+    const Point                                                    &previous_point,
+    const Point                                                    &current_point)
+{
+    int best_index = -1;
+    double best_delta = std::numeric_limits<double>::max();
+    const double reference_angle = top_surface_image_contoning_shared_chain_angle(current_point, previous_point);
+    for (int candidate_index : candidates) {
+        if (candidate_index < 0 || size_t(candidate_index) >= chains.size() || used[size_t(candidate_index)])
+            continue;
+        const TopSurfaceImageContoningDirectedSharedChain &candidate = chains[size_t(candidate_index)];
+        if (candidate.points.size() < 2)
+            continue;
+        const double candidate_angle =
+            top_surface_image_contoning_shared_chain_angle(candidate.points.front(), candidate.points[1]);
+        const double delta =
+            top_surface_image_contoning_shared_chain_clockwise_delta(reference_angle, candidate_angle);
+        if (delta < best_delta) {
+            best_delta = delta;
+            best_index = candidate_index;
+        }
+    }
+    return best_index;
+}
+
+static bool top_surface_image_contoning_append_shared_chain_polygons(
+    const std::vector<TopSurfaceImageContoningDirectedSharedChain> &chains,
+    Polygons                                                       &polygons,
+    const ThrowIfCanceled                                         *throw_if_canceled)
+{
+    if (chains.empty())
+        return true;
+
+    std::map<TopSurfaceImageContoningSharedChainVertex, std::vector<int>> start_to_chain;
+    for (size_t idx = 0; idx < chains.size(); ++idx)
+        if (!chains[idx].closed && chains[idx].points.size() >= 2)
+            start_to_chain[chains[idx].start].emplace_back(int(idx));
+
+    std::vector<bool> used(chains.size(), false);
+    for (size_t idx = 0; idx < chains.size(); ++idx) {
+        check_canceled(throw_if_canceled);
+        if (used[idx] || chains[idx].closed || chains[idx].points.size() < 2)
+            continue;
+
+        used[idx] = true;
+        Points loop = chains[idx].points;
+        const TopSurfaceImageContoningSharedChainVertex start = chains[idx].start;
+        TopSurfaceImageContoningSharedChainVertex current = chains[idx].end;
+
+        size_t guard = 0;
+        while (current != start && guard++ <= chains.size()) {
+            auto candidates_it = start_to_chain.find(current);
+            if (candidates_it == start_to_chain.end())
+                return false;
+            if (loop.size() < 2)
+                return false;
+            const int next_index =
+                top_surface_image_contoning_next_shared_chain_index(chains,
+                                                                    candidates_it->second,
+                                                                    used,
+                                                                    loop[loop.size() - 2],
+                                                                    loop.back());
+            if (next_index < 0)
+                return false;
+            used[size_t(next_index)] = true;
+            const Points &next_points = chains[size_t(next_index)].points;
+            loop.insert(loop.end(), next_points.begin() + 1, next_points.end());
+            current = chains[size_t(next_index)].end;
+        }
+
+        if (current != start || loop.size() < 3)
+            return false;
+        if (loop.size() >= 2 && loop.front() == loop.back())
+            loop.pop_back();
+        loop.erase(std::unique(loop.begin(), loop.end()), loop.end());
+        if (loop.size() >= 3) {
+            Polygon polygon(std::move(loop));
+            top_surface_image_contoning_remove_collinear_points(polygon);
+            if (polygon.points.size() >= 3 && std::abs(polygon.area()) > 0.)
+                polygons.emplace_back(std::move(polygon));
+        }
+    }
+
+    return true;
+}
+
 static ExPolygons top_surface_image_contoning_polygonized_area_from_grid_label(const std::vector<int> &grid,
                                                                               int                     cols,
                                                                               int                     rows,
@@ -3351,6 +3852,147 @@ static std::vector<ExPolygons> top_surface_image_contoning_vector_border_shared_
     return areas;
 }
 
+static std::vector<ExPolygons> top_surface_image_contoning_mid_gaussian_shared_chain_fit_areas(
+    const std::vector<int> &grid,
+    int                     cols,
+    int                     rows,
+    const std::vector<int> &ids,
+    size_t                  area_count,
+    coord_t                 min_x,
+    coord_t                 min_y,
+    coord_t                 step,
+    const BoundingBox      &bbox,
+    const ThrowIfCanceled  *throw_if_canceled)
+{
+    std::vector<ExPolygons> areas(area_count);
+    if (grid.empty() || ids.empty() || area_count == 0 ||
+        cols <= 0 || rows <= 0 || grid.size() != size_t(cols) * size_t(rows))
+        return areas;
+
+    const std::vector<int> partition_grid =
+        top_surface_image_contoning_shared_gaussian_partition_grid(grid, cols, rows, ids, throw_if_canceled);
+    const double fit_tolerance = std::max<double>(1.0, double(step) * 0.16);
+    const std::map<TopSurfaceImageContoningSharedChainEdgeKey, TopSurfaceImageContoningSharedChainEdge> edges =
+        top_surface_image_contoning_shared_chain_edges_from_grid(partition_grid, cols, rows);
+    const std::vector<TopSurfaceImageContoningSharedChain> chains =
+        top_surface_image_contoning_extract_shared_chains(edges, throw_if_canceled);
+    std::vector<Polygons> polygons(area_count);
+    std::vector<std::vector<TopSurfaceImageContoningDirectedSharedChain>> open_chains(area_count);
+
+    for (const TopSurfaceImageContoningSharedChain &chain : chains) {
+        check_canceled(throw_if_canceled);
+        if (chain.vertices.size() < 2)
+            continue;
+        Points chain_points =
+            top_surface_image_contoning_simplified_shared_chain_points(chain.vertices,
+                                                                       chain.closed,
+                                                                       min_x,
+                                                                       min_y,
+                                                                       step,
+                                                                       bbox,
+                                                                       fit_tolerance);
+        if ((!chain.closed && chain_points.size() < 2) || (chain.closed && chain_points.size() < 3))
+            continue;
+
+        std::array<int, 2> chain_labels = { chain.labels.first, chain.labels.second };
+        for (int label : chain_labels) {
+            if (label < 0 || size_t(label) >= area_count)
+                continue;
+
+            Points directed_points = chain_points;
+            TopSurfaceImageContoningSharedChainVertex start = chain.vertices.front();
+            TopSurfaceImageContoningSharedChainVertex end = chain.vertices.back();
+            const bool label_is_left =
+                top_surface_image_contoning_shared_chain_label_is_left(edges,
+                                                                       chain.vertices[0],
+                                                                       chain.vertices[1],
+                                                                       label);
+            if (!label_is_left) {
+                std::reverse(directed_points.begin(), directed_points.end());
+                std::swap(start, end);
+            }
+
+            if (chain.closed) {
+                Polygon polygon(std::move(directed_points));
+                top_surface_image_contoning_remove_collinear_points(polygon);
+                if (polygon.points.size() >= 3 && std::abs(polygon.area()) > 0.)
+                    polygons[size_t(label)].emplace_back(std::move(polygon));
+            } else {
+                TopSurfaceImageContoningDirectedSharedChain directed_chain;
+                directed_chain.label = label;
+                directed_chain.start = start;
+                directed_chain.end = end;
+                directed_chain.points = std::move(directed_points);
+                open_chains[size_t(label)].emplace_back(std::move(directed_chain));
+            }
+        }
+    }
+
+    bool shared_chain_success = true;
+    for (int id : ids) {
+        check_canceled(throw_if_canceled);
+        if (id < 0 || size_t(id) >= area_count)
+            continue;
+        if (!top_surface_image_contoning_append_shared_chain_polygons(open_chains[size_t(id)],
+                                                                      polygons[size_t(id)],
+                                                                      throw_if_canceled)) {
+            shared_chain_success = false;
+            break;
+        }
+    }
+
+    if (shared_chain_success) {
+        for (int id : ids) {
+            check_canceled(throw_if_canceled);
+            if (id < 0 || size_t(id) >= areas.size())
+                continue;
+            if (polygons[size_t(id)].empty()) {
+                areas[size_t(id)] =
+                    top_surface_image_contoning_raw_partition_hierarchy_area_from_grid_label(partition_grid,
+                                                                                             cols,
+                                                                                             rows,
+                                                                                             id,
+                                                                                             min_x,
+                                                                                             min_y,
+                                                                                             step,
+                                                                                             bbox,
+                                                                                             throw_if_canceled);
+                continue;
+            }
+            areas[size_t(id)] =
+                top_surface_image_contoning_hierarchy_expolygons(std::move(polygons[size_t(id)]), throw_if_canceled);
+            if (areas[size_t(id)].empty())
+                areas[size_t(id)] =
+                    top_surface_image_contoning_raw_partition_hierarchy_area_from_grid_label(partition_grid,
+                                                                                             cols,
+                                                                                             rows,
+                                                                                             id,
+                                                                                             min_x,
+                                                                                             min_y,
+                                                                                             step,
+                                                                                             bbox,
+                                                                                             throw_if_canceled);
+        }
+    } else {
+        for (int id : ids) {
+            check_canceled(throw_if_canceled);
+            if (id < 0 || size_t(id) >= areas.size())
+                continue;
+            areas[size_t(id)] =
+                top_surface_image_contoning_raw_partition_hierarchy_area_from_grid_label(partition_grid,
+                                                                                         cols,
+                                                                                         rows,
+                                                                                         id,
+                                                                                         min_x,
+                                                                                         min_y,
+                                                                                         step,
+                                                                                         bbox,
+                                                                                         throw_if_canceled);
+        }
+    }
+    return areas;
+}
+
 static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_contoning_component_regions_from_grid(
     const std::vector<int>                                      &label_grid,
     int                                                          cols,
@@ -3432,13 +4074,17 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
         fast_mode_enabled &&
         polygonize_color_regions &&
         effective_polygonization_mode == int(TextureMappingZone::ContoningPolygonizationVectorBorderSharedGaussianPartition);
+    const bool mid_gaussian_shared_chain_fit =
+        fast_mode_enabled &&
+        polygonize_color_regions &&
+        effective_polygonization_mode == int(TextureMappingZone::ContoningPolygonizationMidGaussianSharedChainFit);
     const bool raw_partition_hierarchy_convert =
         fast_mode_enabled &&
         polygonize_color_regions &&
         effective_polygonization_mode == int(TextureMappingZone::ContoningPolygonizationMarchingSquares);
     const ExPolygons empty_blocked_area;
     ExPolygons valid_area;
-    if (!raw_partition_hierarchy_convert) {
+    if (!raw_partition_hierarchy_convert && !mid_gaussian_shared_chain_fit) {
         valid_area = top_surface_image_contoning_area_from_grid_label(valid_grid,
                                                                       cols,
                                                                       rows,
@@ -3471,6 +4117,32 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                                                       min_feature_mm,
                                                                                       cleanup_optimizations_enabled,
                                                                                       throw_if_canceled);
+        for (int component_id : component_order) {
+            check_canceled(throw_if_canceled);
+            if (component_id <= 0 || size_t(component_id) >= component_areas.size() ||
+                component_areas[size_t(component_id)].empty())
+                continue;
+            TopSurfaceImageContoningVectorRegion region;
+            region.bottom_to_top.emplace_back(static_cast<unsigned int>(component_id));
+            region.cell_count = cell_counts[size_t(component_id)];
+            region.area = std::move(component_areas[size_t(component_id)]);
+            regions.emplace_back(std::move(region));
+        }
+        return regions;
+    }
+
+    if (mid_gaussian_shared_chain_fit) {
+        std::vector<ExPolygons> component_areas =
+            top_surface_image_contoning_mid_gaussian_shared_chain_fit_areas(component_grid,
+                                                                            cols,
+                                                                            rows,
+                                                                            component_order,
+                                                                            size_t(max_component_id) + 1,
+                                                                            min_x,
+                                                                            min_y,
+                                                                            step,
+                                                                            bbox,
+                                                                            throw_if_canceled);
         for (int component_id : component_order) {
             check_canceled(throw_if_canceled);
             if (component_id <= 0 || size_t(component_id) >= component_areas.size() ||
@@ -3595,6 +4267,10 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
         fast_mode_enabled &&
         polygonize_color_regions &&
         effective_polygonization_mode == int(TextureMappingZone::ContoningPolygonizationVectorBorderSharedGaussianPartition);
+    const bool mid_gaussian_shared_chain_fit =
+        fast_mode_enabled &&
+        polygonize_color_regions &&
+        effective_polygonization_mode == int(TextureMappingZone::ContoningPolygonizationMidGaussianSharedChainFit);
     const bool raw_partition_hierarchy_convert =
         fast_mode_enabled &&
         polygonize_color_regions &&
@@ -3614,6 +4290,30 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                                                       min_feature_mm,
                                                                                       cleanup_optimizations_enabled,
                                                                                       throw_if_canceled);
+        for (int label : label_order) {
+            check_canceled(throw_if_canceled);
+            if (label < 0 || size_t(label) >= label_areas.size() || label_areas[size_t(label)].empty())
+                continue;
+            TopSurfaceImageContoningVectorRegion region;
+            region.bottom_to_top = labels[size_t(label)].bottom_to_top;
+            region.cell_count = cell_counts[size_t(label)];
+            region.area = std::move(label_areas[size_t(label)]);
+            regions.emplace_back(std::move(region));
+        }
+        return regions;
+    }
+    if (mid_gaussian_shared_chain_fit) {
+        std::vector<ExPolygons> label_areas =
+            top_surface_image_contoning_mid_gaussian_shared_chain_fit_areas(label_grid,
+                                                                            cols,
+                                                                            rows,
+                                                                            label_order,
+                                                                            labels.size(),
+                                                                            min_x,
+                                                                            min_y,
+                                                                            step,
+                                                                            bbox,
+                                                                            throw_if_canceled);
         for (int label : label_order) {
             check_canceled(throw_if_canceled);
             if (label < 0 || size_t(label) >= label_areas.size() || label_areas[size_t(label)].empty())
