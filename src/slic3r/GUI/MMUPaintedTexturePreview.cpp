@@ -43,6 +43,8 @@ constexpr size_t k_simulated_texture_preview_max_pixels = 2048ull * 2048ull;
 constexpr unsigned int k_temporary_simulated_texture_preview_max_edge = 1024;
 constexpr size_t k_temporary_simulated_texture_preview_max_pixels = 1024ull * 1024ull;
 constexpr size_t k_temporary_simulated_texture_preview_min_source_pixels = k_temporary_simulated_texture_preview_max_pixels * 3 / 2;
+constexpr unsigned int k_temporary_contoning_flat_surface_preview_max_edge = 384;
+constexpr size_t k_temporary_contoning_flat_surface_preview_max_pixels = 384ull * 384ull;
 constexpr size_t k_surface_gradient_preview_max_components = 10;
 constexpr size_t k_surface_gradient_preview_lut_size = 33;
 constexpr size_t k_contoning_flat_surface_preview_max_candidates = 250000;
@@ -99,6 +101,7 @@ struct TexturePreviewSimulationSettings
     bool contoning_flat_surface_beer_lambert_rgb_correction = false;
     bool contoning_flat_surface_td_effective_alpha_correction = false;
     bool contoning_flat_surface_beam_search_stack_expansion = false;
+    bool contoning_flat_surface_force_low_resolution = false;
     int contoning_flat_surface_pattern_filaments = TextureMappingZone::DefaultTopSurfaceContoningPatternFilaments;
     bool simulate_top_surface_lod = false;
     float top_surface_lod_pitch_mm = 0.f;
@@ -174,6 +177,12 @@ struct TexturePreviewSimulationCacheEntry
     bool ready_frame_requested { false };
     std::future<TexturePreviewSimulationResult> pending_future;
     std::shared_ptr<TexturePreviewSimulationJobState> pending_job_state;
+};
+
+struct TexturePreviewSizeLimit
+{
+    unsigned int max_edge { k_simulated_texture_preview_max_edge };
+    size_t max_pixels { k_simulated_texture_preview_max_pixels };
 };
 
 struct TexturePreviewVertexColorSimulationResult
@@ -891,6 +900,16 @@ std::array<unsigned int, 2> simulated_texture_preview_size(unsigned int width,
         limited_simulated_texture_preview_size(width, height) :
         std::array<unsigned int, 2>{ width, height };
 
+    if (settings.contoning_flat_surface_force_low_resolution) {
+        const std::array<unsigned int, 2> low_size =
+            limited_simulated_texture_preview_size(width,
+                                                   height,
+                                                   k_temporary_contoning_flat_surface_preview_max_edge,
+                                                   k_temporary_contoning_flat_surface_preview_max_pixels);
+        size[0] = std::min(size[0], low_size[0]);
+        size[1] = std::min(size[1], low_size[1]);
+    }
+
     if (settings.contoning_flat_surface_quantization &&
         settings.simulate_top_surface_lod &&
         std::isfinite(settings.texture_preview_mm_per_pixel) &&
@@ -922,26 +941,52 @@ bool simulated_texture_preview_needs_temporary_result(unsigned int width,
                                                       unsigned int height,
                                                       const TexturePreviewSimulationSettings &settings)
 {
+    auto final_and_temporary_pixels = [&settings, width, height]() {
+        const std::array<unsigned int, 2> final_size = simulated_texture_preview_size(width, height, settings);
+        const TexturePreviewSizeLimit temporary_limit =
+            settings.contoning_flat_surface_quantization ?
+                TexturePreviewSizeLimit{ k_temporary_contoning_flat_surface_preview_max_edge,
+                                         k_temporary_contoning_flat_surface_preview_max_pixels } :
+                TexturePreviewSizeLimit{ k_temporary_simulated_texture_preview_max_edge,
+                                         k_temporary_simulated_texture_preview_max_pixels };
+        const std::array<unsigned int, 2> temporary_size =
+            simulated_texture_preview_size(width,
+                                           height,
+                                           settings,
+                                           temporary_limit.max_edge,
+                                           temporary_limit.max_pixels);
+        return std::array<size_t, 2>{
+            size_t(final_size[0]) * size_t(final_size[1]),
+            size_t(temporary_size[0]) * size_t(temporary_size[1])
+        };
+    };
+
+    if (settings.contoning_flat_surface_quantization) {
+        const std::array<size_t, 2> pixels = final_and_temporary_pixels();
+        return pixels[0] > pixels[1] && pixels[0] > pixels[1] * 5 / 4;
+    }
+
     const size_t source_pixels = size_t(width) * size_t(height);
     if (source_pixels <= k_temporary_simulated_texture_preview_min_source_pixels)
         return false;
 
-    const std::array<unsigned int, 2> final_size = simulated_texture_preview_size(width, height, settings);
-    const std::array<unsigned int, 2> temporary_size =
-        simulated_texture_preview_size(width,
-                                       height,
-                                       settings,
-                                       k_temporary_simulated_texture_preview_max_edge,
-                                       k_temporary_simulated_texture_preview_max_pixels);
-    return size_t(final_size[0]) * size_t(final_size[1]) > size_t(temporary_size[0]) * size_t(temporary_size[1]);
+    const std::array<size_t, 2> pixels = final_and_temporary_pixels();
+    return pixels[0] > pixels[1];
 }
 
-size_t temporary_simulated_texture_preview_signature(size_t signature)
+TexturePreviewSizeLimit temporary_simulated_texture_preview_size_limit(const TexturePreviewSimulationSettings &settings)
+{
+    if (settings.contoning_flat_surface_quantization)
+        return { k_temporary_contoning_flat_surface_preview_max_edge, k_temporary_contoning_flat_surface_preview_max_pixels };
+    return { k_temporary_simulated_texture_preview_max_edge, k_temporary_simulated_texture_preview_max_pixels };
+}
+
+size_t temporary_simulated_texture_preview_signature(size_t signature, const TexturePreviewSizeLimit &limit)
 {
     signature ^= 0x4a7c15f17e315123ull + (signature << 6) + (signature >> 2);
-    signature ^= std::hash<unsigned int>{}(k_temporary_simulated_texture_preview_max_edge) + 0x9e3779b97f4a7c15ull +
+    signature ^= std::hash<unsigned int>{}(limit.max_edge) + 0x9e3779b97f4a7c15ull +
                  (signature << 6) + (signature >> 2);
-    signature ^= std::hash<size_t>{}(k_temporary_simulated_texture_preview_max_pixels) + 0x9e3779b97f4a7c15ull +
+    signature ^= std::hash<size_t>{}(limit.max_pixels) + 0x9e3779b97f4a7c15ull +
                  (signature << 6) + (signature >> 2);
     return signature;
 }
@@ -2782,6 +2827,8 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
         const int effective_color_prediction_mode =
             TextureMappingZone::effective_top_surface_contoning_color_prediction_mode(
                 zone->top_surface_contoning_color_prediction_mode);
+        const bool calibrated_color_prediction =
+            TextureMappingZone::top_surface_contoning_color_prediction_mode_is_calibrated(effective_color_prediction_mode);
         settings.contoning_flat_surface_beer_lambert_rgb_correction =
             settings.contoning_flat_surface_td_adjustment &&
             effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb);
@@ -2791,6 +2838,8 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
              effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionCalibratedCurrentLinearAffine));
         settings.contoning_flat_surface_beam_search_stack_expansion =
             zone->effective_top_surface_contoning_beam_search_stack_expansion_enabled();
+        settings.contoning_flat_surface_force_low_resolution =
+            settings.contoning_flat_surface_td_adjustment && calibrated_color_prediction;
         settings.contoning_flat_surface_surface_scatter =
             zone->effective_top_surface_contoning_surface_scatter_enabled() ?
                 k_contoning_preview_surface_scatter :
@@ -2908,6 +2957,7 @@ size_t texture_preview_simulation_signature(const ModelVolume &model_volume,
     mix(std::hash<int>{}(settings.contoning_flat_surface_beer_lambert_rgb_correction ? 1 : 0));
     mix(std::hash<int>{}(settings.contoning_flat_surface_td_effective_alpha_correction ? 1 : 0));
     mix(std::hash<int>{}(settings.contoning_flat_surface_beam_search_stack_expansion ? 1 : 0));
+    mix(std::hash<int>{}(settings.contoning_flat_surface_force_low_resolution ? 1 : 0));
     if (settings.contoning_flat_surface_quantization) {
         mix(std::hash<int>{}(settings.contoning_flat_surface_pattern_filaments));
         mix(std::hash<int>{}(settings.simulate_top_surface_lod ? 1 : 0));
@@ -3732,8 +3782,9 @@ const GUI::GLTexture *simulated_texture_preview_texture_for_filament(const Model
     const unsigned int width = model_volume.imported_texture_width;
     const unsigned int height = model_volume.imported_texture_height;
     const bool needs_temporary_result = simulated_texture_preview_needs_temporary_result(width, height, *settings);
+    const TexturePreviewSizeLimit temporary_size_limit = temporary_simulated_texture_preview_size_limit(*settings);
     const size_t temporary_signature = needs_temporary_result ?
-        temporary_simulated_texture_preview_signature(simulation_signature) :
+        temporary_simulated_texture_preview_signature(simulation_signature, temporary_size_limit) :
         size_t(0);
 
     consume_temporary_simulated_texture_preview_result(entry);
@@ -3783,10 +3834,9 @@ const GUI::GLTexture *simulated_texture_preview_texture_for_filament(const Model
                                            source_raw_component_channels = std::move(source_raw_component_channels),
                                            background_color,
                                            job_state,
+                                           temporary_size_limit,
                                            simulation_settings = std::move(simulation_settings)]() mutable {
                                               if (temporary_signature != 0 && job_state != nullptr) {
-                                                  const unsigned int temp_edge = k_temporary_simulated_texture_preview_max_edge;
-                                                  const size_t temp_pixels = k_temporary_simulated_texture_preview_max_pixels;
                                                   TexturePreviewSimulationResult temporary_result =
                                                       build_simulated_texture_preview_result(temporary_signature,
                                                                                              width,
@@ -3797,8 +3847,8 @@ const GUI::GLTexture *simulated_texture_preview_texture_for_filament(const Model
                                                                                              source_raw_component_channels,
                                                                                              background_color,
                                                                                              simulation_settings,
-                                                                                             temp_edge,
-                                                                                             temp_pixels);
+                                                                                             temporary_size_limit.max_edge,
+                                                                                             temporary_size_limit.max_pixels);
                                                   std::lock_guard<std::mutex> lock(job_state->mutex);
                                                   job_state->temporary_result = std::move(temporary_result);
                                               }
@@ -5837,6 +5887,7 @@ static size_t texture_preview_settings_signature_impl(size_t num_physical,
         signature_mix(std::hash<int>{}(zone.top_surface_contoning_pattern_filaments));
         signature_mix(std::hash<int>{}(zone.top_surface_contoning_color_lower_surfaces ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.top_surface_contoning_td_adjustment_enabled ? 1 : 0));
+        signature_mix(std::hash<int>{}(zone.effective_top_surface_contoning_color_prediction_mode()));
         signature_mix(std::hash<int>{}(zone.effective_top_surface_contoning_surface_scatter_enabled() ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.top_surface_contoning_beer_lambert_rgb_correction_enabled ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.top_surface_contoning_td_effective_alpha_correction_enabled ? 1 : 0));
@@ -5994,6 +6045,7 @@ static void texture_preview_mix_zone_baked_model_settings(size_t &signature,
     signature_mix(std::hash<int>{}(zone.top_surface_contoning_pattern_filaments));
     signature_mix(std::hash<int>{}(zone.top_surface_contoning_color_lower_surfaces ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.top_surface_contoning_td_adjustment_enabled ? 1 : 0));
+    signature_mix(std::hash<int>{}(zone.effective_top_surface_contoning_color_prediction_mode()));
     signature_mix(std::hash<int>{}(zone.effective_top_surface_contoning_surface_scatter_enabled() ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.top_surface_contoning_beer_lambert_rgb_correction_enabled ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.top_surface_contoning_td_effective_alpha_correction_enabled ? 1 : 0));
@@ -6186,7 +6238,7 @@ void render_model_texture_preview_models(
 
         const bool force_original_texture =
             color_match_active || texture_preview_halftone_simulation_enabled_for_filament(filament_ids[idx], num_physical, texture_mgr);
-        const GUI::GLTexture *preview_texture = force_original_texture ?
+        const GUI::GLTexture *base_preview_texture = force_original_texture ?
             &texture :
             simulated_texture_preview_texture_for_filament(model_volume,
                                                            model_matrix,
@@ -6195,14 +6247,8 @@ void render_model_texture_preview_models(
                                                            texture_mgr,
                                                            texture_signature,
                                                            texture);
-        if (preview_texture == nullptr || preview_texture->get_id() == 0)
+        if (base_preview_texture == nullptr || base_preview_texture->get_id() == 0)
             continue;
-
-        if (preview_texture->get_id() != bound_texture_id) {
-            glsafe(::glActiveTexture(GL_TEXTURE0));
-            glsafe(::glBindTexture(GL_TEXTURE_2D, preview_texture->get_id()));
-            bound_texture_id = preview_texture->get_id();
-        }
 
         bool contoning_flat_top_ready = false;
         bool contoning_flat_bottom_ready = false;
@@ -6256,6 +6302,20 @@ void render_model_texture_preview_models(
             contoning_flat_top_ready && contoning_flat_texture != nullptr && contoning_flat_texture->get_id() != 0;
         const bool contoning_flat_bottom_enabled =
             contoning_flat_bottom_ready && contoning_flat_bottom_texture != nullptr && contoning_flat_bottom_texture->get_id() != 0;
+        const bool contoning_flat_pending =
+            use_contoning_flat_texture &&
+            ((!contoning_flat_enabled && (contoning_flat_top_quantization || contoning_flat_top_pattern_blend)) ||
+             (!contoning_flat_bottom_enabled && (contoning_flat_bottom_quantization || contoning_flat_bottom_pattern_blend)));
+        const GUI::GLTexture *preview_texture = contoning_flat_pending ? &texture : base_preview_texture;
+        if (preview_texture == nullptr || preview_texture->get_id() == 0)
+            continue;
+
+        if (preview_texture->get_id() != bound_texture_id) {
+            glsafe(::glActiveTexture(GL_TEXTURE0));
+            glsafe(::glBindTexture(GL_TEXTURE_2D, preview_texture->get_id()));
+            bound_texture_id = preview_texture->get_id();
+        }
+
         if (contoning_flat_enabled && contoning_flat_texture->get_id() != bound_contoning_flat_texture_id) {
             glsafe(::glActiveTexture(GL_TEXTURE1));
             glsafe(::glBindTexture(GL_TEXTURE_2D, contoning_flat_texture->get_id()));
@@ -6324,7 +6384,7 @@ void render_model_texture_preview_model(
     const size_t texture_signature = model_volume_texture_preview_signature(model_volume);
     const bool force_original_texture =
         color_match_active || texture_preview_halftone_simulation_enabled_for_filament(filament_id, num_physical, texture_mgr);
-    const GUI::GLTexture *preview_texture = force_original_texture ?
+    const GUI::GLTexture *base_preview_texture = force_original_texture ?
         &texture :
         simulated_texture_preview_texture_for_filament(model_volume,
                                                        model_matrix,
@@ -6333,7 +6393,7 @@ void render_model_texture_preview_model(
                                                        texture_mgr,
                                                        texture_signature,
                                                        texture);
-    if (preview_texture == nullptr || preview_texture->get_id() == 0)
+    if (base_preview_texture == nullptr || base_preview_texture->get_id() == 0)
         return;
 
     const TexturePreviewRenderState render_state = begin_render_state(opaque);
@@ -6349,8 +6409,6 @@ void render_model_texture_preview_model(
                         print_volume_z);
     set_color_match_preview_uniforms(*shader, color_match);
 
-    glsafe(::glActiveTexture(GL_TEXTURE0));
-    glsafe(::glBindTexture(GL_TEXTURE_2D, preview_texture->get_id()));
     shader->set_uniform("uniform_texture", 0);
     shader->set_uniform("contoning_flat_surface_texture", 1);
     shader->set_uniform("contoning_flat_surface_bottom_texture", 2);
@@ -6406,6 +6464,19 @@ void render_model_texture_preview_model(
         contoning_flat_top_ready && contoning_flat_texture != nullptr && contoning_flat_texture->get_id() != 0;
     const bool contoning_flat_bottom_enabled =
         contoning_flat_bottom_ready && contoning_flat_bottom_texture != nullptr && contoning_flat_bottom_texture->get_id() != 0;
+    const bool contoning_flat_pending =
+        use_contoning_flat_texture &&
+        ((!contoning_flat_enabled && (contoning_flat_top_quantization || contoning_flat_top_pattern_blend)) ||
+         (!contoning_flat_bottom_enabled && (contoning_flat_bottom_quantization || contoning_flat_bottom_pattern_blend)));
+    const GUI::GLTexture *preview_texture = contoning_flat_pending ? &texture : base_preview_texture;
+    if (preview_texture == nullptr || preview_texture->get_id() == 0) {
+        shader->stop_using();
+        restore_render_state(render_state);
+        return;
+    }
+
+    glsafe(::glActiveTexture(GL_TEXTURE0));
+    glsafe(::glBindTexture(GL_TEXTURE_2D, preview_texture->get_id()));
     if (contoning_flat_enabled) {
         glsafe(::glActiveTexture(GL_TEXTURE1));
         glsafe(::glBindTexture(GL_TEXTURE_2D, contoning_flat_texture->get_id()));

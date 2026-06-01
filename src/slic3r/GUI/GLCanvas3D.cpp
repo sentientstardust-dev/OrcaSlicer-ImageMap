@@ -90,6 +90,7 @@ extern wxPopupWindow* wxCurrentPopupWindow;
 #endif
 
 static constexpr const float TRACKBALLSIZE = 0.8f;
+static constexpr float WIPE_TOWER_EDGE_BUFFER = 20.f;
 
 static Slic3r::ColorRGBA DEFAULT_BG_LIGHT_COLOR      = { 0.906f, 0.906f, 0.906f, 1.0f };
 static Slic3r::ColorRGBA DEFAULT_BG_LIGHT_COLOR_DARK = { 0.329f, 0.329f, 0.353f, 1.0f };
@@ -2877,7 +2878,7 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
                 const float texture_z_max = float(wipe_tower_size(2));
 
                 {
-                    const float                 margin     = WIPE_TOWER_MARGIN + brim_width;
+                    const float                 margin     = WIPE_TOWER_MARGIN + brim_width + WIPE_TOWER_EDGE_BUFFER;
                     BoundingBoxf3               plate_bbox = part_plate->get_bounding_box();
                     BoundingBoxf                plate_bbox_2d(Vec2d(plate_bbox.min(0), plate_bbox.min(1)), Vec2d(plate_bbox.max(0), plate_bbox.max(1)));
                     const std::vector<Pointfs> &extruder_areas = part_plate->get_extruder_areas();

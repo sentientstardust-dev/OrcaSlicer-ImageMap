@@ -673,6 +673,37 @@ TextureMappingContoningStack TextureMappingContoningSolver::solve(const std::arr
                                                                   int visible_stack_layers,
                                                                   const std::vector<float> &surface_to_deep_layer_heights_mm) const
 {
+    return solve_impl(target_rgb,
+                      stack_layers,
+                      lower_surface,
+                      visible_stack_layers,
+                      surface_to_deep_layer_heights_mm,
+                      m_beam_search_stack_expansion_enabled);
+}
+
+TextureMappingContoningStack TextureMappingContoningSolver::solve_without_beam_search_stack_expansion(
+    const std::array<float, 3> &target_rgb,
+    int stack_layers,
+    bool lower_surface,
+    int visible_stack_layers,
+    const std::vector<float> &surface_to_deep_layer_heights_mm) const
+{
+    return solve_impl(target_rgb,
+                      stack_layers,
+                      lower_surface,
+                      visible_stack_layers,
+                      surface_to_deep_layer_heights_mm,
+                      false);
+}
+
+TextureMappingContoningStack TextureMappingContoningSolver::solve_impl(
+    const std::array<float, 3> &target_rgb,
+    int stack_layers,
+    bool lower_surface,
+    int visible_stack_layers,
+    const std::vector<float> &surface_to_deep_layer_heights_mm,
+    bool beam_search_stack_expansion_enabled) const
+{
     TextureMappingContoningStack out;
     if (!valid())
         return out;
@@ -706,7 +737,7 @@ TextureMappingContoningStack TextureMappingContoningSolver::solve(const std::arr
                                                        m_beer_lambert_rgb_correction_enabled,
                                                        m_td_effective_alpha_correction_enabled,
                                                        m_component_roles,
-                                                       m_beam_search_stack_expansion_enabled,
+                                                       beam_search_stack_expansion_enabled,
                                                        depth_layer_opacities,
                                                        m_calibrated_stack_model.valid() ? &m_calibrated_stack_model : nullptr);
         }

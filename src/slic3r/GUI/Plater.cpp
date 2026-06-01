@@ -84,6 +84,7 @@
 #include "libslic3r/Polygon.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/GCode/WipeTower.hpp"
 #include "libslic3r/SLAPrint.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/PresetBundle.hpp"
@@ -242,6 +243,7 @@ wxDEFINE_EVENT(EVT_DEL_FILAMENT, SimpleEvent);
 wxDEFINE_EVENT(EVT_ADD_CUSTOM_FILAMENT, ColorEvent);
 wxDEFINE_EVENT(EVT_NOTICE_CHILDE_SIZE_CHANGED, SimpleEvent);
 wxDEFINE_EVENT(EVT_NOTICE_FULL_SCREEN_CHANGED, IntEvent);
+static constexpr float WIPE_TOWER_EDGE_BUFFER = 20.f;
 #define PRINTER_THUMBNAIL_SIZE (wxSize(40, 40)) // ORCA
 #define PRINTER_PANEL_SIZE (    wxSize(70, 60)) // ORCA
 #define PRINTER_PANEL_RADIUS (6) // ORCA
@@ -377,6 +379,90 @@ void SlicedInfo::SetTextAndShow(SlicedInfoIdx idx, const wxString& text, const w
 static wxString temp_dir;
 
 namespace {
+
+static void clamp_wipe_tower_positions_for_slicing(PartPlateList &partplate_list, PresetBundle &preset_bundle)
+{
+    DynamicPrintConfig &proj_cfg = preset_bundle.project_config;
+    ConfigOptionFloats *wipe_tower_x = proj_cfg.option<ConfigOptionFloats>("wipe_tower_x", true);
+    ConfigOptionFloats *wipe_tower_y = proj_cfg.option<ConfigOptionFloats>("wipe_tower_y", true);
+    if (wipe_tower_x == nullptr || wipe_tower_y == nullptr || wipe_tower_x->values.empty() || wipe_tower_y->values.empty())
+        return;
+
+    const DynamicPrintConfig &print_cfg = preset_bundle.prints.get_edited_preset().config;
+    const ConfigOptionBool *enable_prime_tower = print_cfg.option<ConfigOptionBool>("enable_prime_tower");
+    if (enable_prime_tower == nullptr || !enable_prime_tower->value)
+        return;
+
+    wipe_tower_x->values.resize(partplate_list.get_plate_count(), wipe_tower_x->values.front());
+    wipe_tower_y->values.resize(partplate_list.get_plate_count(), wipe_tower_y->values.front());
+
+    const ConfigOptionEnum<PrintSequence> *print_sequence = print_cfg.option<ConfigOptionEnum<PrintSequence>>("print_sequence");
+    const ConfigOptionEnum<TimelapseType> *timelapse_type = print_cfg.option<ConfigOptionEnum<TimelapseType>>("timelapse_type");
+    const ConfigOptionBool *wrapping_opt = print_cfg.option<ConfigOptionBool>("enable_wrapping_detection");
+    const bool need_wipe_tower = (timelapse_type != nullptr && timelapse_type->value == TimelapseType::tlSmooth) ||
+                                 (wrapping_opt != nullptr && wrapping_opt->value);
+    const float width = print_cfg.opt_float("prime_tower_width");
+    const float prime_volume = print_cfg.opt_float("prime_volume");
+    const int nozzle_nums = preset_bundle.get_printer_extruder_count();
+
+    for (int plate_id = 0; plate_id < partplate_list.get_plate_count(); ++plate_id) {
+        PartPlate *part_plate = partplate_list.get_plate(plate_id);
+        if (part_plate == nullptr || part_plate->get_objects_on_this_plate().empty())
+            continue;
+        if (part_plate->get_print_seq() == PrintSequence::ByObject ||
+            (part_plate->get_print_seq() == PrintSequence::ByDefault && print_sequence != nullptr && print_sequence->value == PrintSequence::ByObject)) {
+            if (part_plate->printable_instance_size() != 1)
+                continue;
+        }
+
+        const size_t texture_mapping_filaments_count = part_plate->estimate_wipe_tower_filaments_count(&proj_cfg);
+        const size_t wipe_tower_filaments_count = need_wipe_tower ?
+            std::max<size_t>(1, texture_mapping_filaments_count) :
+            texture_mapping_filaments_count;
+        if (!need_wipe_tower && wipe_tower_filaments_count < 2)
+            continue;
+
+        Vec3d wipe_tower_size = part_plate->estimate_wipe_tower_size(print_cfg,
+                                                                     width,
+                                                                     prime_volume,
+                                                                     nozzle_nums,
+                                                                     int(wipe_tower_filaments_count),
+                                                                     false,
+                                                                     wrapping_opt != nullptr && wrapping_opt->value);
+        if (wipe_tower_size(0) <= EPSILON || wipe_tower_size(1) <= EPSILON)
+            continue;
+
+        float brim_width = print_cfg.opt_float("prime_tower_brim_width");
+        if (brim_width < 0)
+            brim_width = WipeTower::get_auto_brim_by_height((float) wipe_tower_size.z());
+        const float margin = float(WIPE_TOWER_MARGIN) + brim_width + WIPE_TOWER_EDGE_BUFFER;
+
+        const Vec3d plate_origin = part_plate->get_origin();
+        BoundingBoxf3 plate_bbox = part_plate->get_bounding_box();
+        BoundingBoxf plate_bbox_2d(Vec2d(plate_bbox.min(0), plate_bbox.min(1)), Vec2d(plate_bbox.max(0), plate_bbox.max(1)));
+        const std::vector<Pointfs> &extruder_areas = part_plate->get_extruder_areas();
+        for (const Pointfs &points : extruder_areas) {
+            BoundingBoxf bboxf(points);
+            plate_bbox_2d.min = plate_bbox_2d.min(0) >= bboxf.min(0) ? plate_bbox_2d.min : bboxf.min;
+            plate_bbox_2d.max = plate_bbox_2d.max(0) <= bboxf.max(0) ? plate_bbox_2d.max : bboxf.max;
+        }
+
+        const coordf_t min_x = plate_bbox_2d.min(0) - plate_origin(0);
+        const coordf_t max_x = plate_bbox_2d.max(0) - plate_origin(0);
+        const coordf_t min_y = plate_bbox_2d.min(1) - plate_origin(1);
+        const coordf_t max_y = plate_bbox_2d.max(1) - plate_origin(1);
+        auto clamp_axis = [](float value, coordf_t min_value, coordf_t max_value, double size, float margin) {
+            const float axis_min = float(min_value) + margin;
+            const float axis_max = float(max_value) - margin - float(size);
+            return axis_max < axis_min ? axis_min : std::min(std::max(value, axis_min), axis_max);
+        };
+
+        ConfigOptionFloat x_opt(clamp_axis(wipe_tower_x->get_at(plate_id), min_x, max_x, wipe_tower_size(0), margin));
+        ConfigOptionFloat y_opt(clamp_axis(wipe_tower_y->get_at(plate_id), min_y, max_y, wipe_tower_size(1), margin));
+        wipe_tower_x->set_at(&x_opt, plate_id, 0);
+        wipe_tower_y->set_at(&y_opt, plate_id, 0);
+    }
+}
 
 static std::map<uint64_t, unsigned int> active_texture_zone_ids_by_stable_id_for_import(const TextureMappingManager &manager)
 {
@@ -14541,8 +14627,10 @@ unsigned int Plater::priv::update_background_process(bool force_validation, bool
         this->preview->update_gcode_result(partplate_list.get_current_slice_result());
     }
 
-    if (PresetBundle *preset_bundle = wxGetApp().preset_bundle; preset_bundle != nullptr)
+    if (PresetBundle *preset_bundle = wxGetApp().preset_bundle; preset_bundle != nullptr) {
         canonicalize_texture_mapping_config(*preset_bundle, true);
+        clamp_wipe_tower_positions_for_slicing(this->partplate_list, *preset_bundle);
+    }
 
     background_process.fff_print()->set_check_multi_filaments_compatibility(wxGetApp().app_config->get("enable_high_low_temp_mixed_printing") == "false");
 

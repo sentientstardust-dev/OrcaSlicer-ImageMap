@@ -992,6 +992,23 @@ void PrintObject::infill()
         const auto& support_fill_octree = this->m_adaptive_fill_octrees.second;
         const std::function<void()> throw_if_canceled = [print]() { print->throw_if_canceled(); };
         auto contoning_stack_plan_cache = make_top_surface_image_contoning_stack_plan_cache();
+        const bool prebuild_contoning_stack_plans =
+            std::any_of(print->texture_mapping_manager().zones().begin(),
+                        print->texture_mapping_manager().zones().end(),
+                        [](const TextureMappingZone &zone) {
+                            return zone.enabled &&
+                                   !zone.deleted &&
+                                   zone.top_surface_image_printing_active() &&
+                                   zone.top_surface_contoning_active() &&
+                                   zone.effective_top_surface_contoning_surface_anchored_stacks_enabled();
+                        });
+        if (prebuild_contoning_stack_plans) {
+            for (Layer *layer : m_layers) {
+                print->throw_if_canceled();
+                layer->prebuild_contoning_stack_plan_cache(throw_if_canceled, contoning_stack_plan_cache.get());
+            }
+            m_print->throw_if_canceled();
+        }
 
         BOOST_LOG_TRIVIAL(debug) << "Filling layers in parallel - start";
         tbb::parallel_for(

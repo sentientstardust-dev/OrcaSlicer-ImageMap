@@ -2070,14 +2070,17 @@ public:
 
     bool run_one() override
     {
-        int depth = -1;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_error || m_next >= m_depths.size())
-                return false;
-            depth = m_depths[m_next++];
-            ++m_active;
+        m_active.fetch_add(1, std::memory_order_acq_rel);
+        if (m_has_error.load(std::memory_order_acquire)) {
+            finish_active_call();
+            return false;
         }
+        const size_t work_idx = m_next.fetch_add(1, std::memory_order_acq_rel);
+        if (work_idx >= m_depths.size()) {
+            finish_active_call();
+            return false;
+        }
+        const int depth = m_depths[work_idx];
 
         std::vector<TopSurfaceImageContoningVectorRegion> regions;
         std::exception_ptr error;
@@ -2088,19 +2091,10 @@ public:
             error = std::current_exception();
         }
 
-        int completed = 0;
-        bool done = false;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (error && !m_error)
-                m_error = error;
-            --m_active;
-            completed = ++m_completed;
-            done = (m_error || m_next >= m_depths.size()) && m_active == 0;
-            m_done = m_done || done;
-        }
-        if (done)
-            m_cv.notify_all();
+        if (error)
+            store_error(error);
+        const int completed = int(m_completed.fetch_add(1, std::memory_order_acq_rel) + 1);
+        finish_active_call();
         if (!error && m_progress)
             m_progress(completed);
         return true;
@@ -2109,22 +2103,47 @@ public:
     void wait()
     {
         std::unique_lock<std::mutex> lock(m_mutex);
-        m_cv.wait(lock, [this]() { return m_done; });
+        m_cv.wait(lock, [this]() { return done(); });
         if (m_error)
             std::rethrow_exception(m_error);
     }
 
 private:
+    bool done() const
+    {
+        return (m_has_error.load(std::memory_order_acquire) ||
+                m_next.load(std::memory_order_acquire) >= m_depths.size()) &&
+               m_active.load(std::memory_order_acquire) == 0;
+    }
+
+    void store_error(std::exception_ptr error)
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_error)
+                m_error = error;
+        }
+        m_has_error.store(true, std::memory_order_release);
+        m_cv.notify_all();
+    }
+
+    void finish_active_call()
+    {
+        m_active.fetch_sub(1, std::memory_order_acq_rel);
+        if (done())
+            m_cv.notify_all();
+    }
+
     std::mutex m_mutex;
     std::condition_variable m_cv;
     std::vector<int> m_depths;
     BuildFn m_build;
     StoreFn m_store;
     ProgressFn m_progress;
-    size_t m_next { 0 };
-    int m_active { 0 };
-    int m_completed { 0 };
-    bool m_done { false };
+    std::atomic<size_t> m_next { 0 };
+    std::atomic<int> m_active { 0 };
+    std::atomic<int> m_completed { 0 };
+    std::atomic<bool> m_has_error { false };
     std::exception_ptr m_error;
 };
 
@@ -2134,46 +2153,53 @@ public:
     using RunFn = std::function<void(size_t)>;
     using ProgressFn = std::function<void(size_t)>;
 
-    TopSurfaceImageContoningAnchoredIndexWork(size_t count, RunFn run, ProgressFn progress)
+    TopSurfaceImageContoningAnchoredIndexWork(size_t count, RunFn run, ProgressFn progress, size_t chunk_size = 64)
         : m_count(count)
         , m_run(std::move(run))
         , m_progress(std::move(progress))
+        , m_chunk_size(std::max<size_t>(1, chunk_size))
     {
-        m_done = m_count == 0;
+    }
+
+    size_t task_count() const
+    {
+        return (m_count + m_chunk_size - 1) / m_chunk_size;
     }
 
     bool run_one() override
     {
-        size_t idx = 0;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_error || m_next >= m_count)
-                return false;
-            idx = m_next++;
-            ++m_active;
+        m_active.fetch_add(1, std::memory_order_acq_rel);
+        if (m_has_error.load(std::memory_order_acquire)) {
+            finish_active_call();
+            return false;
         }
+        const size_t begin = m_next.fetch_add(m_chunk_size, std::memory_order_acq_rel);
+        if (begin >= m_count) {
+            finish_active_call();
+            return false;
+        }
+        const size_t end = std::min(begin + m_chunk_size, m_count);
 
         std::exception_ptr error;
+        size_t processed = 0;
         try {
-            m_run(idx);
+            for (size_t idx = begin; idx < end; ++idx) {
+                if (m_has_error.load(std::memory_order_acquire))
+                    break;
+                m_run(idx);
+                ++processed;
+            }
         } catch (...) {
             error = std::current_exception();
         }
 
-        size_t completed = 0;
-        bool done = false;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (error && !m_error)
-                m_error = error;
-            --m_active;
-            completed = ++m_completed;
-            done = (m_error || m_next >= m_count) && m_active == 0;
-            m_done = m_done || done;
-        }
-        if (done)
-            m_cv.notify_all();
-        if (!error && m_progress)
+        if (error)
+            store_error(error);
+        const size_t completed = processed == 0 ?
+            m_completed.load(std::memory_order_acquire) :
+            m_completed.fetch_add(processed, std::memory_order_acq_rel) + processed;
+        finish_active_call();
+        if (!error && processed > 0 && m_progress)
             m_progress(completed);
         return true;
     }
@@ -2181,21 +2207,47 @@ public:
     void wait()
     {
         std::unique_lock<std::mutex> lock(m_mutex);
-        m_cv.wait(lock, [this]() { return m_done; });
+        m_cv.wait(lock, [this]() { return done(); });
         if (m_error)
             std::rethrow_exception(m_error);
     }
 
 private:
+    bool done() const
+    {
+        return (m_has_error.load(std::memory_order_acquire) ||
+                m_next.load(std::memory_order_acquire) >= m_count) &&
+               m_active.load(std::memory_order_acquire) == 0;
+    }
+
+    void store_error(std::exception_ptr error)
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_error)
+                m_error = error;
+        }
+        m_has_error.store(true, std::memory_order_release);
+        m_cv.notify_all();
+    }
+
+    void finish_active_call()
+    {
+        m_active.fetch_sub(1, std::memory_order_acq_rel);
+        if (done())
+            m_cv.notify_all();
+    }
+
     std::mutex m_mutex;
     std::condition_variable m_cv;
     size_t m_count { 0 };
     RunFn m_run;
     ProgressFn m_progress;
-    size_t m_next { 0 };
-    int m_active { 0 };
-    size_t m_completed { 0 };
-    bool m_done { false };
+    size_t m_chunk_size { 1 };
+    std::atomic<size_t> m_next { 0 };
+    std::atomic<int> m_active { 0 };
+    std::atomic<size_t> m_completed { 0 };
+    std::atomic<bool> m_has_error { false };
     std::exception_ptr m_error;
 };
 
@@ -2307,6 +2359,8 @@ struct TopSurfaceImageContoningStackPlanKey {
     bool variable_layer_height_compensation { false };
     bool beam_search_stack_expansion { false };
     int mix_model { TextureMappingZone::DefaultGenericSolverMixModel };
+    int color_prediction_mode { TextureMappingZone::DefaultTopSurfaceContoningColorPredictionMode };
+    std::string calibrated_stack_model_key;
 
     bool operator<(const TopSurfaceImageContoningStackPlanKey &rhs) const
     {
@@ -2343,7 +2397,9 @@ struct TopSurfaceImageContoningStackPlanKey {
                         td_effective_alpha_correction,
                         variable_layer_height_compensation,
                         beam_search_stack_expansion,
-                        mix_model) <
+                        mix_model,
+                        color_prediction_mode,
+                        calibrated_stack_model_key) <
                std::tie(rhs.source_layer,
                         rhs.source_layer_id,
                         rhs.target_layer,
@@ -2377,7 +2433,9 @@ struct TopSurfaceImageContoningStackPlanKey {
                         rhs.td_effective_alpha_correction,
                         rhs.variable_layer_height_compensation,
                         rhs.beam_search_stack_expansion,
-                        rhs.mix_model);
+                        rhs.mix_model,
+                        rhs.color_prediction_mode,
+                        rhs.calibrated_stack_model_key);
     }
 };
 
@@ -4606,6 +4664,31 @@ static std::optional<TopSurfaceImageContoningSolvedLabel> top_surface_image_cont
                                                        label_by_stack);
 }
 
+static std::optional<TopSurfaceImageContoningSolvedLabel> top_surface_image_contoning_solve_provisional_label(
+    const std::array<float, 3>                         &rgb,
+    int                                                 solve_layers,
+    const TextureMappingContoningSolver                &solver,
+    bool                                                lower_surface,
+    const std::vector<float>                           &surface_to_deep_layer_heights_mm,
+    std::vector<TopSurfaceImageContoningVectorLabel>   &labels,
+    std::map<std::pair<std::vector<unsigned int>, int>, int> &label_by_stack)
+{
+    const int visible_layers = solve_layers;
+    TextureMappingContoningStack stack =
+        solver.solve_without_beam_search_stack_expansion(rgb,
+                                                         solve_layers,
+                                                         lower_surface,
+                                                         visible_layers,
+                                                         surface_to_deep_layer_heights_mm);
+    return top_surface_image_contoning_label_for_stack(stack,
+                                                       solver,
+                                                       lower_surface,
+                                                       visible_layers,
+                                                       surface_to_deep_layer_heights_mm,
+                                                       labels,
+                                                       label_by_stack);
+}
+
 static void top_surface_image_contoning_resolve_merged_grid_regions(
     std::vector<int>                                                  &grid,
     int                                                                cols,
@@ -4926,11 +5009,12 @@ static void top_surface_image_contoning_solve_anchored_region(
         cell_samples[grid_idx] = sample;
         cell_available_depths[grid_idx] = sample->available_depth;
         ++debug_sampled_cell_count;
-        cell_stacks[grid_idx] = solver.solve(sample->rgb,
-                                             sample->solve_layers,
-                                             lower_surface,
-                                             sample->available_depth,
-                                             source_context.surface_to_deep_layer_heights_mm);
+        cell_stacks[grid_idx] =
+            solver.solve_without_beam_search_stack_expansion(sample->rgb,
+                                                             sample->solve_layers,
+                                                             lower_surface,
+                                                             sample->solve_layers,
+                                                             source_context.surface_to_deep_layer_heights_mm);
         if (debug_stride > 0 &&
             row % debug_stride == 0 &&
             col % debug_stride == 0) {
@@ -4969,7 +5053,7 @@ static void top_surface_image_contoning_solve_anchored_region(
     if (build_state != nullptr)
         build_state->set_work(sample_work);
     try {
-        tbb::parallel_for(tbb::blocked_range<size_t>(0, grid_cells, 32),
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, sample_work->task_count(), 1),
             [&](const tbb::blocked_range<size_t> &range) {
                 for (size_t idx = range.begin(); idx != range.end(); ++idx)
                     sample_work->run_one();
@@ -4990,7 +5074,7 @@ static void top_surface_image_contoning_solve_anchored_region(
             const size_t grid_idx = size_t(row * cols + col);
             if (!cell_samples[grid_idx])
                 continue;
-            label_cell(row, col, cell_stacks[grid_idx], cell_samples[grid_idx]->available_depth);
+            label_cell(row, col, cell_stacks[grid_idx], cell_samples[grid_idx]->solve_layers);
         }
     }
     if (debug_enabled) {
@@ -5542,6 +5626,8 @@ static TopSurfaceImageContoningStackPlanKey top_surface_image_contoning_anchored
     key.variable_layer_height_compensation = plan.contoning_variable_layer_height_compensation_enabled;
     key.beam_search_stack_expansion = plan.contoning_beam_search_stack_expansion_enabled;
     key.mix_model = plan.contoning_generic_solver_mix_model;
+    key.color_prediction_mode = zone.effective_top_surface_contoning_color_prediction_mode();
+    key.calibrated_stack_model_key = solver.calibrated_stack_model_key();
     return key;
 }
 
@@ -5667,17 +5753,16 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
     std::vector<TopSurfaceImageContoningVectorLabel> labels;
     std::map<std::pair<std::vector<unsigned int>, int>, int> label_by_stack;
 
-    auto solve_cell = [&](int row, int col, const std::array<float, 3> &target_rgb, int solve_layers, int available_depth) {
+    auto solve_cell = [&](int row, int col, const std::array<float, 3> &target_rgb, int solve_layers, int) {
         std::optional<TopSurfaceImageContoningSolvedLabel> solved =
-            top_surface_image_contoning_solve_label(target_rgb,
-                                                    solve_layers,
-                                                    available_depth,
-                                                    solver,
-                                                    source_surface == TopSurfaceImageSourceSurface::Bottom &&
-                                                        plan.contoning_td_adjustment_enabled,
-                                                    source->surface_to_deep_layer_heights_mm,
-                                                    labels,
-                                                    label_by_stack);
+            top_surface_image_contoning_solve_provisional_label(target_rgb,
+                                                                solve_layers,
+                                                                solver,
+                                                                source_surface == TopSurfaceImageSourceSurface::Bottom &&
+                                                                    plan.contoning_td_adjustment_enabled,
+                                                                source->surface_to_deep_layer_heights_mm,
+                                                                labels,
+                                                                label_by_stack);
         if (!solved)
             return std::optional<TopSurfaceImageContoningSolvedLabel>();
         grid[size_t(row * cols + col)] = solved->label;
@@ -5884,15 +5969,14 @@ static std::shared_ptr<const TopSurfaceImageContoningStackPlan> top_surface_imag
 
     auto solve_cell = [&](int row, int col, const std::array<float, 3> &target_rgb, int solve_layers, int available_depth) {
         std::optional<TopSurfaceImageContoningSolvedLabel> solved =
-            top_surface_image_contoning_solve_label(target_rgb,
-                                                    solve_layers,
-                                                    available_depth,
-                                                    solver,
-                                                    source_surface == TopSurfaceImageSourceSurface::Bottom &&
-                                                        plan.contoning_td_adjustment_enabled,
-                                                    source_context->surface_to_deep_layer_heights_mm,
-                                                    out->labels,
-                                                    label_by_stack);
+            top_surface_image_contoning_solve_provisional_label(target_rgb,
+                                                                solve_layers,
+                                                                solver,
+                                                                source_surface == TopSurfaceImageSourceSurface::Bottom &&
+                                                                    plan.contoning_td_adjustment_enabled,
+                                                                source_context->surface_to_deep_layer_heights_mm,
+                                                                out->labels,
+                                                                label_by_stack);
         if (!solved)
             return std::optional<TopSurfaceImageContoningSolvedLabel>();
         TopSurfaceImageContoningStackPlanCell &cell = out->cells[size_t(row * cols + col)];
@@ -6088,6 +6172,8 @@ static TopSurfaceImageContoningStackPlanKey top_surface_image_contoning_stack_pl
     key.variable_layer_height_compensation = plan.contoning_variable_layer_height_compensation_enabled;
     key.beam_search_stack_expansion = plan.contoning_beam_search_stack_expansion_enabled;
     key.mix_model = plan.contoning_generic_solver_mix_model;
+    key.color_prediction_mode = zone.effective_top_surface_contoning_color_prediction_mode();
+    key.calibrated_stack_model_key = solver.calibrated_stack_model_key();
     return key;
 }
 
@@ -9826,6 +9912,41 @@ void export_group_fills_to_svg(const char *path, const std::vector<SurfaceFill> 
 #endif
 
 // friend to Layer
+void Layer::prebuild_contoning_stack_plan_cache(std::function<void()> throw_if_canceled,
+                                                TopSurfaceImageContoningStackPlanCache *contoning_stack_plan_cache) const
+{
+    if (contoning_stack_plan_cache == nullptr)
+        return;
+    const ThrowIfCanceled *throw_if_canceled_ptr = throw_if_canceled ? &throw_if_canceled : nullptr;
+    check_canceled(throw_if_canceled_ptr);
+    const PrintObject *object = this->object();
+    if (object == nullptr || object->print() == nullptr)
+        return;
+    const TextureMappingManager &texture_mgr = object->print()->texture_mapping_manager();
+    bool has_surface_anchored_contoning = false;
+    for (const LayerRegion *layerm : m_regions) {
+        check_canceled(throw_if_canceled_ptr);
+        if (layerm == nullptr)
+            continue;
+        const int raw_zone_id = layerm->region().config().solid_infill_filament.value;
+        if (raw_zone_id <= 0)
+            continue;
+        const TextureMappingZone *zone = texture_mgr.zone_from_id(unsigned(raw_zone_id));
+        if (zone != nullptr &&
+            zone->enabled &&
+            !zone->deleted &&
+            zone->top_surface_image_printing_active() &&
+            zone->top_surface_contoning_active() &&
+            zone->effective_top_surface_contoning_surface_anchored_stacks_enabled()) {
+            has_surface_anchored_contoning = true;
+            break;
+        }
+    }
+    if (!has_surface_anchored_contoning)
+        return;
+    top_surface_image_region_plans(*this, contoning_stack_plan_cache, throw_if_canceled_ptr);
+}
+
 void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree,
                        FillAdaptive::Octree* support_fill_octree,
                        FillLightning::Generator* lightning_generator,

@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace Slic3r {
@@ -35,8 +36,15 @@ public:
     bool valid() const { return !m_component_ids.empty() && m_component_ids.size() == m_component_colors.size(); }
     const std::vector<unsigned int>& component_ids() const { return m_component_ids; }
     const std::vector<unsigned int>& components_bottom_to_top() const { return m_components_bottom_to_top; }
+    std::string calibrated_stack_model_key() const { return m_calibrated_stack_model.valid() ? m_calibrated_stack_model.cache_key() : std::string(); }
 
     TextureMappingContoningStack solve(const std::array<float, 3> &target_rgb,
+                                       int                         stack_layers,
+                                       bool                        lower_surface = false,
+                                       int                         visible_stack_layers = 0,
+                                       const std::vector<float>    &surface_to_deep_layer_heights_mm = {}) const;
+    TextureMappingContoningStack solve_without_beam_search_stack_expansion(
+                                       const std::array<float, 3> &target_rgb,
                                        int                         stack_layers,
                                        bool                        lower_surface = false,
                                        int                         visible_stack_layers = 0,
@@ -61,6 +69,12 @@ private:
     std::optional<size_t> component_index(unsigned int component_id) const;
     std::vector<float> layer_opacities_by_depth(const std::vector<float> &surface_to_deep_layer_heights_mm,
                                                 int                       visible_depth) const;
+    TextureMappingContoningStack solve_impl(const std::array<float, 3> &target_rgb,
+                                            int                         stack_layers,
+                                            bool                        lower_surface,
+                                            int                         visible_stack_layers,
+                                            const std::vector<float>    &surface_to_deep_layer_heights_mm,
+                                            bool                        beam_search_stack_expansion_enabled) const;
 
     std::vector<unsigned int> m_component_ids;
     std::vector<unsigned int> m_components_bottom_to_top;

@@ -204,6 +204,8 @@ public:
                                        FillLightning::Generator* lightning_generator = nullptr,
                                        std::function<void()> throw_if_canceled = {},
                                        TopSurfaceImageContoningStackPlanCache *contoning_stack_plan_cache = nullptr);
+    void                    prebuild_contoning_stack_plan_cache(std::function<void()> throw_if_canceled,
+                                                               TopSurfaceImageContoningStackPlanCache *contoning_stack_plan_cache) const;
     Polylines               generate_sparse_infill_polylines_for_anchoring(FillAdaptive::Octree *adaptive_fill_octree,
                                                                            FillAdaptive::Octree *support_fill_octree,
                                                                            FillLightning::Generator* lightning_generator) const;

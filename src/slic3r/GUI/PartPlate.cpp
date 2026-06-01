@@ -64,6 +64,7 @@ static const int PARTPLATE_TEXT_OFFSET_X1 = 3;
 static const int PARTPLATE_TEXT_OFFSET_X2 = 1;
 static const int PARTPLATE_TEXT_OFFSET_Y = 1;
 static const int PARTPLATE_PLATENAME_OFFSET_Y  = 10;
+static const float WIPE_TOWER_EDGE_BUFFER = 20.f;
 
 const float WIPE_TOWER_DEFAULT_X_POS = 165.;
 const float WIPE_TOWER_DEFAULT_Y_POS = 250.;  // Max y
@@ -4443,7 +4444,7 @@ void PartPlateList::set_default_wipe_tower_pos_for_plate(int plate_idx, bool ini
         brim_width = brim_opt->value;
         if (brim_width < 0) brim_width = WipeTower::get_auto_brim_by_height((float) wipe_tower_size.z());
     }
-    const float margin = WIPE_TOWER_MARGIN + brim_width;
+    const float margin = WIPE_TOWER_MARGIN + brim_width + WIPE_TOWER_EDGE_BUFFER;
 
     // clamp wipe tower position within plate boundaries
     {
