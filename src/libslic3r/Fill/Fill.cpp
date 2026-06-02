@@ -12030,6 +12030,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree,
                 FillParams fallback_params = params;
                 fallback_params.flow = fallback_flow;
                 fallback_params.pattern = ipRectilinear;
+                fallback_params.no_edge_overlap = true;
                 ExtrusionEntitiesPtr hybrid_interior_entities;
                 if (!hybrid_boundary_skin && collection && !collection->empty()) {
                     apply_top_surface_image_collection_metadata(*collection, surface_fill.params, std::nullopt, throw_if_canceled_ptr);

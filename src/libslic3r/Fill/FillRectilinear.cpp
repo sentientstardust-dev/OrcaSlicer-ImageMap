@@ -2768,7 +2768,7 @@ bool FillRectilinear::fill_surface_by_lines(const Surface *surface, const FillPa
     assert(params.density > 0.0001f && params.density <= 1.f);
     coord_t line_spacing = coord_t(scale_(this->spacing) / params.density);
     const coordf_t edge_width = std::max<coordf_t>(this->spacing, coordf_t(params.flow.width()));
-    const coordf_t edge_overlap_width = 0.075 * edge_width;
+    const coordf_t edge_overlap_width = std::min<coordf_t>(0.075 * edge_width, coordf_t(0.05));
     const coordf_t outer_clearance = params.no_edge_overlap ?
         std::max<coordf_t>(0.5 * edge_width - edge_overlap_width, coordf_t(0.0)) :
         (0.5f - INFILL_OVERLAP_OVER_SPACING) * this->spacing;
