@@ -2770,20 +2770,31 @@ static float top_surface_image_contoning_jitter(int col, int row, int depth, int
     return (unit - 0.5f) * 0.006f;
 }
 
-static bool top_surface_image_contoning_grid_component_printable(int cell_count,
-                                                                 int min_col,
-                                                                 int max_col,
-                                                                 int min_row,
-                                                                 int max_row,
-                                                                 float pitch_mm,
-                                                                 float min_feature_mm,
-                                                                 float line_width_mm)
+static constexpr bool improved_printabe_geometry_check = true;
+
+static bool top_surface_image_contoning_grid_component_basic_printable(int cell_count,
+                                                                       int min_col,
+                                                                       int max_col,
+                                                                       int min_row,
+                                                                       int max_row,
+                                                                       float pitch_mm,
+                                                                       float min_feature_mm,
+                                                                       float line_width_mm,
+                                                                       double *area_mm2_out = nullptr,
+                                                                       double *width_mm_out = nullptr,
+                                                                       double *height_mm_out = nullptr)
 {
     if (cell_count <= 0)
         return false;
     const double area_mm2 = double(cell_count) * double(pitch_mm) * double(pitch_mm);
     const double width_mm = double(max_col - min_col + 1) * double(pitch_mm);
     const double height_mm = double(max_row - min_row + 1) * double(pitch_mm);
+    if (area_mm2_out != nullptr)
+        *area_mm2_out = area_mm2;
+    if (width_mm_out != nullptr)
+        *width_mm_out = width_mm;
+    if (height_mm_out != nullptr)
+        *height_mm_out = height_mm;
     const double min_area_mm2 =
         std::max(double(line_width_mm) * double(min_feature_mm),
                  double(min_feature_mm) * double(min_feature_mm) * 0.20);
@@ -2796,6 +2807,121 @@ static bool top_surface_image_contoning_grid_component_printable(int cell_count,
         std::max(width_mm, height_mm) < 2.0 * double(min_feature_mm))
         return false;
     return true;
+}
+
+static bool top_surface_image_contoning_grid_component_needs_geometry_check(double area_mm2,
+                                                                            double width_mm,
+                                                                            double height_mm,
+                                                                            float pitch_mm,
+                                                                            float line_width_mm)
+{
+    if (area_mm2 <= 0. || width_mm <= 0. || height_mm <= 0.)
+        return true;
+    const double min_dimension_mm = std::min(width_mm, height_mm);
+    const double bbox_area_mm2 = width_mm * height_mm;
+    const double fill_ratio = bbox_area_mm2 > 0. ? area_mm2 / bbox_area_mm2 : 0.;
+    const double width_gate_mm = 2.0 * std::max(double(line_width_mm), double(pitch_mm));
+    return min_dimension_mm < width_gate_mm || fill_ratio < 0.45;
+}
+
+static bool top_surface_image_contoning_grid_component_geometry_printable(const std::vector<int> &cells,
+                                                                          int cols,
+                                                                          float pitch_mm,
+                                                                          float line_width_mm,
+                                                                          const ThrowIfCanceled *throw_if_canceled)
+{
+    if (cells.empty() || cols <= 0)
+        return false;
+    std::vector<int> sorted = cells;
+    std::sort(sorted.begin(), sorted.end());
+    const coord_t step = std::max<coord_t>(1, scale_(double(pitch_mm)));
+    ExPolygons component_area;
+    component_area.reserve(sorted.size());
+    size_t idx = 0;
+    while (idx < sorted.size()) {
+        check_canceled(throw_if_canceled);
+        const int row = sorted[idx] / cols;
+        int col_begin = sorted[idx] - row * cols;
+        int col_end = col_begin + 1;
+        ++idx;
+        while (idx < sorted.size()) {
+            const int next_row = sorted[idx] / cols;
+            const int next_col = sorted[idx] - next_row * cols;
+            if (next_row != row || next_col != col_end)
+                break;
+            ++col_end;
+            ++idx;
+        }
+        component_area.emplace_back(top_surface_image_cell_expolygon(coord_t(col_begin) * step,
+                                                                     coord_t(row) * step,
+                                                                     coord_t(col_end) * step,
+                                                                     coord_t(row + 1) * step));
+    }
+    if (component_area.empty())
+        return false;
+
+    ExPolygons area = top_surface_clip_union_ex(component_area);
+    if (area.empty())
+        return false;
+    const float centerline_radius = float(scale_(std::max(0.02f, line_width_mm * 0.45f)));
+    ExPolygons centerline_area = top_surface_clip_offset_ex(area,
+                                                            -centerline_radius,
+                                                            DefaultJoinType,
+                                                            DefaultMiterLimit);
+    if (centerline_area.empty())
+        return false;
+    const double min_length_mm = std::max(0.18, std::min(0.75, double(line_width_mm) * 0.55));
+    for (const ExPolygon &expolygon : centerline_area) {
+        check_canceled(throw_if_canceled);
+        const BoundingBox bbox = get_extents(expolygon);
+        if (!bbox.defined)
+            continue;
+        const double width_mm = unscale<double>(bbox.max.x() - bbox.min.x());
+        const double height_mm = unscale<double>(bbox.max.y() - bbox.min.y());
+        if (std::max(width_mm, height_mm) >= min_length_mm)
+            return true;
+    }
+    return false;
+}
+
+static bool top_surface_image_contoning_grid_component_printable(const std::vector<int> &cells,
+                                                                 int cols,
+                                                                 int min_col,
+                                                                 int max_col,
+                                                                 int min_row,
+                                                                 int max_row,
+                                                                 float pitch_mm,
+                                                                 float min_feature_mm,
+                                                                 float line_width_mm,
+                                                                 const ThrowIfCanceled *throw_if_canceled)
+{
+    double area_mm2 = 0.;
+    double width_mm = 0.;
+    double height_mm = 0.;
+    if (!top_surface_image_contoning_grid_component_basic_printable(int(cells.size()),
+                                                                    min_col,
+                                                                    max_col,
+                                                                    min_row,
+                                                                    max_row,
+                                                                    pitch_mm,
+                                                                    min_feature_mm,
+                                                                    line_width_mm,
+                                                                    &area_mm2,
+                                                                    &width_mm,
+                                                                    &height_mm))
+        return false;
+    if (!improved_printabe_geometry_check ||
+        !top_surface_image_contoning_grid_component_needs_geometry_check(area_mm2,
+                                                                         width_mm,
+                                                                         height_mm,
+                                                                         pitch_mm,
+                                                                         line_width_mm))
+        return true;
+    return top_surface_image_contoning_grid_component_geometry_printable(cells,
+                                                                        cols,
+                                                                        pitch_mm,
+                                                                        line_width_mm,
+                                                                        throw_if_canceled);
 }
 
 static void top_surface_image_contoning_merge_small_grid_regions(
@@ -2868,14 +2994,16 @@ static void top_surface_image_contoning_merge_small_grid_regions(
                     }
                 }
 
-                if (top_surface_image_contoning_grid_component_printable(int(cells.size()),
+                if (top_surface_image_contoning_grid_component_printable(cells,
+                                                                         cols,
                                                                          min_col,
                                                                          max_col,
                                                                          min_row,
                                                                          max_row,
                                                                          pitch_mm,
                                                                          min_feature_mm,
-                                                                         line_width_mm))
+                                                                         line_width_mm,
+                                                                         throw_if_canceled))
                     continue;
 
                 int best_label = -1;
