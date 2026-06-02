@@ -281,6 +281,8 @@ static bool model_volume_texture_mapping_data_equal_for_print_sharing(const Mode
            lhs.imported_texture_uv_valid == rhs.imported_texture_uv_valid &&
            lhs.imported_texture_rgba == rhs.imported_texture_rgba &&
            lhs.imported_texture_raw_filament_offsets == rhs.imported_texture_raw_filament_offsets &&
+           lhs.imported_texture_raw_top_surface_filament_slots == rhs.imported_texture_raw_top_surface_filament_slots &&
+           lhs.imported_texture_raw_top_surface_depths == rhs.imported_texture_raw_top_surface_depths &&
            lhs.imported_texture_width == rhs.imported_texture_width &&
            lhs.imported_texture_height == rhs.imported_texture_height &&
            lhs.imported_texture_raw_channels == rhs.imported_texture_raw_channels &&

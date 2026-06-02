@@ -3119,10 +3119,13 @@ public:
             contoning_flat_infill_choices.Add(label);
             m_top_surface_contoning_flat_surface_infill_modes.push_back(mode);
         };
-        add_contoning_flat_infill_choice(_L("Default (Boundary Skin variable width)"),
+        add_contoning_flat_infill_choice(_L("Default (Rectilinear)"),
                                          int(TextureMappingZone::ContoningFlatSurfaceInfillDefault));
-        add_contoning_flat_infill_choice(_L("Rectilinear - not recommended"),
+        add_contoning_flat_infill_choice(_L("Rectilinear"),
                                          int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinear));
+        if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
+            add_contoning_flat_infill_choice(_L("Boundary Skin (variable width) - not recommended"),
+                                             int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariable));
         if (TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions) {
             add_contoning_flat_infill_choice(_L("Concentric"),
                                              int(TextureMappingZone::ContoningFlatSurfaceInfillConcentric));

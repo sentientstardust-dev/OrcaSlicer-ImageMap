@@ -89,6 +89,8 @@ static inline void model_volume_list_copy_configs(ModelObject &model_object_dst,
         mv_dst.imported_texture_uv_valid = mv_src.imported_texture_uv_valid;
         mv_dst.imported_texture_rgba = mv_src.imported_texture_rgba;
         mv_dst.imported_texture_raw_filament_offsets = mv_src.imported_texture_raw_filament_offsets;
+        mv_dst.imported_texture_raw_top_surface_filament_slots = mv_src.imported_texture_raw_top_surface_filament_slots;
+        mv_dst.imported_texture_raw_top_surface_depths = mv_src.imported_texture_raw_top_surface_depths;
         mv_dst.imported_texture_width = mv_src.imported_texture_width;
         mv_dst.imported_texture_height = mv_src.imported_texture_height;
         mv_dst.imported_texture_raw_channels = mv_src.imported_texture_raw_channels;

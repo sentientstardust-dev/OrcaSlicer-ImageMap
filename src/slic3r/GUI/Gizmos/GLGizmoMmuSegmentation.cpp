@@ -566,6 +566,7 @@ static constexpr float  RawOffsetDataWarningWrapEm          = 24.f;
 struct RawAtlasProjectionLayout
 {
     std::vector<ImageMapRawFilament> filaments;
+    std::vector<ImageMapRawFilament> top_surface_filaments;
     std::vector<std::string>         channel_keys;
     std::vector<size_t>              atlas_to_target_channel;
     ImageMapRawExpectedLineWidth     expected_line_width_mm;
@@ -575,14 +576,17 @@ static bool model_volume_has_raw_atlas_texture_data(const ModelVolume *volume)
 {
     if (volume == nullptr ||
         volume->imported_texture_width == 0 ||
-        volume->imported_texture_height == 0 ||
-        volume->imported_texture_raw_channels == 0 ||
-        volume->imported_texture_raw_filament_offsets.empty())
+        volume->imported_texture_height == 0)
         return false;
-    return volume->imported_texture_raw_filament_offsets.size() >=
-           size_t(volume->imported_texture_width) *
-               size_t(volume->imported_texture_height) *
-               size_t(volume->imported_texture_raw_channels);
+    const size_t pixel_count = size_t(volume->imported_texture_width) * size_t(volume->imported_texture_height);
+    const bool has_offsets =
+        volume->imported_texture_raw_channels > 0 &&
+        volume->imported_texture_raw_filament_offsets.size() >= pixel_count * size_t(volume->imported_texture_raw_channels);
+    const bool has_top_surface =
+        !volume->imported_texture_raw_top_surface_depths.empty() &&
+        volume->imported_texture_raw_top_surface_filament_slots.size() >=
+            pixel_count * volume->imported_texture_raw_top_surface_depths.size();
+    return has_offsets || has_top_surface;
 }
 
 static wxString raw_offset_data_rgba_conversion_warning_text()
@@ -660,7 +664,9 @@ static std::string raw_atlas_color_mode_name_for_keys(const std::vector<std::str
 static std::string raw_atlas_color_mode_name_for_volume(const ModelVolume &volume)
 {
     const std::vector<ImageMapRawFilament> filaments =
-        image_map_raw_filaments_from_metadata_json(volume.imported_texture_raw_metadata_json, volume.imported_texture_raw_channels);
+        volume.imported_texture_raw_channels > 0 ?
+            image_map_raw_filaments_from_metadata_json(volume.imported_texture_raw_metadata_json, volume.imported_texture_raw_channels) :
+            image_map_raw_filaments_from_metadata_json(volume.imported_texture_raw_metadata_json);
     return raw_atlas_color_mode_name_for_keys(image_map_raw_filament_channel_keys(filaments));
 }
 
@@ -732,6 +738,10 @@ static bool raw_atlas_projection_layout_for_object(const ModelObject &object,
         return false;
     if (atlas.expected_line_width_mm.valid)
         layout.expected_line_width_mm = atlas.expected_line_width_mm;
+    if (!atlas.top_surface_layers.empty())
+        layout.top_surface_filaments = !atlas.filaments.empty() ?
+            atlas.filaments :
+            image_map_raw_filaments_from_metadata_json(atlas.metadata_json);
 
     const std::vector<ImageMapRawFilament> atlas_filaments =
         image_map_raw_filaments_for_channels(atlas.filaments, atlas.channels);
@@ -766,11 +776,26 @@ static std::string raw_layout_metadata_json(uint32_t width, uint32_t height, con
     root["image"] = {
         { "width", width },
         { "height", height },
-        { "channels", layout.filaments.size() }
+        { "channels", layout.filaments.size() },
+        { "offset_channels", layout.filaments.size() }
     };
     root["filaments"] = nlohmann::json::array();
-    for (size_t idx = 0; idx < layout.filaments.size(); ++idx) {
-        const ImageMapRawFilament &filament = layout.filaments[idx];
+    std::vector<ImageMapRawFilament> metadata_filaments;
+    metadata_filaments.reserve(layout.filaments.size() + layout.top_surface_filaments.size());
+    auto append_filament = [&metadata_filaments](const ImageMapRawFilament &filament) {
+        if (filament.slot != 0) {
+            for (const ImageMapRawFilament &existing : metadata_filaments)
+                if (existing.slot == filament.slot)
+                    return;
+        }
+        metadata_filaments.emplace_back(filament);
+    };
+    for (const ImageMapRawFilament &filament : layout.filaments)
+        append_filament(filament);
+    for (const ImageMapRawFilament &filament : layout.top_surface_filaments)
+        append_filament(filament);
+    for (size_t idx = 0; idx < metadata_filaments.size(); ++idx) {
+        const ImageMapRawFilament &filament = metadata_filaments[idx];
         nlohmann::json entry;
         entry["slot"] = filament.slot != 0 ? filament.slot : unsigned(idx + 1);
         entry["color"] = filament.color.empty() ? "custom" : filament.color;
@@ -1574,8 +1599,17 @@ static void refresh_imported_texture_raw_storage(ModelVolume &volume)
     std::vector<uint8_t> refreshed(volume.imported_texture_raw_filament_offsets.begin(),
                                    volume.imported_texture_raw_filament_offsets.end());
     volume.imported_texture_raw_filament_offsets.swap(refreshed);
-    if (image_projection_should_refresh_ids())
+    std::vector<uint16_t> refreshed_top_slots(volume.imported_texture_raw_top_surface_filament_slots.begin(),
+                                              volume.imported_texture_raw_top_surface_filament_slots.end());
+    volume.imported_texture_raw_top_surface_filament_slots.swap(refreshed_top_slots);
+    std::vector<int> refreshed_top_depths(volume.imported_texture_raw_top_surface_depths.begin(),
+                                          volume.imported_texture_raw_top_surface_depths.end());
+    volume.imported_texture_raw_top_surface_depths.swap(refreshed_top_depths);
+    if (image_projection_should_refresh_ids()) {
         volume.imported_texture_raw_filament_offsets.set_new_unique_id();
+        volume.imported_texture_raw_top_surface_filament_slots.set_new_unique_id();
+        volume.imported_texture_raw_top_surface_depths.set_new_unique_id();
+    }
 }
 
 static void touch_imported_texture_data(ModelVolume &volume)
@@ -1586,19 +1620,28 @@ static void touch_imported_texture_data(ModelVolume &volume)
     volume.imported_texture_uv_valid.set_new_unique_id();
     volume.imported_texture_rgba.set_new_unique_id();
     volume.imported_texture_raw_filament_offsets.set_new_unique_id();
+    volume.imported_texture_raw_top_surface_filament_slots.set_new_unique_id();
+    volume.imported_texture_raw_top_surface_depths.set_new_unique_id();
 }
 
 static void clear_imported_texture_raw_atlas(ModelVolume &volume)
 {
     const bool changed =
         !volume.imported_texture_raw_filament_offsets.empty() ||
+        !volume.imported_texture_raw_top_surface_filament_slots.empty() ||
+        !volume.imported_texture_raw_top_surface_depths.empty() ||
         volume.imported_texture_raw_channels != 0 ||
         !volume.imported_texture_raw_metadata_json.empty();
     volume.imported_texture_raw_filament_offsets.clear();
+    volume.imported_texture_raw_top_surface_filament_slots.clear();
+    volume.imported_texture_raw_top_surface_depths.clear();
     volume.imported_texture_raw_channels = 0;
     volume.imported_texture_raw_metadata_json.clear();
-    if (changed && image_projection_should_refresh_ids())
+    if (changed && image_projection_should_refresh_ids()) {
         volume.imported_texture_raw_filament_offsets.set_new_unique_id();
+        volume.imported_texture_raw_top_surface_filament_slots.set_new_unique_id();
+        volume.imported_texture_raw_top_surface_depths.set_new_unique_id();
+    }
 }
 
 static ColorRGBA raw_filament_color_for_projection_preview(const ImageMapRawFilament &filament)
@@ -1871,6 +1914,8 @@ static std::vector<uint8_t> image_projection_raw_atlas_simulated_preview_rgba(co
     std::vector<uint8_t> preview;
     if (!atlas.valid())
         return preview;
+    if (atlas.channels == 0)
+        return image_map_raw_filament_offset_preview_rgba(atlas);
 
     const std::vector<ImageMapRawFilament> filaments =
         image_map_raw_filaments_for_channels(atlas.filaments, atlas.channels);
@@ -1932,7 +1977,7 @@ static bool refresh_imported_texture_preview_from_raw_offsets(ModelVolume       
                                                               int                            generic_solver_mix_model =
                                                                   TextureMappingZone::DefaultGenericSolverMixModel)
 {
-    if (!model_volume_has_raw_atlas_texture_data(&volume))
+    if (!model_volume_has_raw_atlas_texture_data(&volume) || volume.imported_texture_raw_channels == 0)
         return false;
     const size_t pixel_count = size_t(volume.imported_texture_width) * size_t(volume.imported_texture_height);
     bool changed = false;
@@ -1978,15 +2023,55 @@ static bool refresh_imported_texture_preview_from_raw_offsets(ModelVolume       
     return changed;
 }
 
-static bool merge_imported_texture_raw_atlas(ModelVolume &volume, const RawAtlasProjectionLayout &layout)
+static bool merge_imported_texture_raw_atlas(ModelVolume &volume,
+                                             const RawAtlasProjectionLayout &layout,
+                                             const ImageMapRawFilamentOffsetAtlas *projection_atlas = nullptr)
 {
-    if (layout.filaments.empty() || volume.imported_texture_width == 0 || volume.imported_texture_height == 0)
+    const bool has_projection_top_surface =
+        projection_atlas != nullptr && !projection_atlas->top_surface_layers.empty();
+    if ((!has_projection_top_surface && layout.filaments.empty()) ||
+        volume.imported_texture_width == 0 ||
+        volume.imported_texture_height == 0)
         return false;
+    const size_t pixel_count = size_t(volume.imported_texture_width) * size_t(volume.imported_texture_height);
     const size_t expected_size =
-        size_t(volume.imported_texture_width) *
-        size_t(volume.imported_texture_height) *
-        layout.filaments.size();
+        pixel_count * layout.filaments.size();
     std::vector<uint8_t> merged(expected_size, 0);
+    std::vector<int> merged_top_depths = volume.imported_texture_raw_top_surface_depths;
+    std::vector<uint16_t> merged_top_slots(volume.imported_texture_raw_top_surface_filament_slots.begin(),
+                                           volume.imported_texture_raw_top_surface_filament_slots.end());
+    if (has_projection_top_surface) {
+        std::vector<int> projected_depths;
+        projected_depths.reserve(projection_atlas->top_surface_layers.size());
+        for (const ImageMapRawTopSurfaceLayer &layer : projection_atlas->top_surface_layers)
+            if (layer.depth >= 0 &&
+                layer.filament_slots.size() >= size_t(projection_atlas->width) * size_t(projection_atlas->height) &&
+                std::find(projected_depths.begin(), projected_depths.end(), layer.depth) == projected_depths.end())
+                projected_depths.emplace_back(layer.depth);
+
+        std::vector<uint16_t> projected_slots(pixel_count * projected_depths.size(), 0);
+        if (!projected_depths.empty() &&
+            volume.imported_texture_raw_top_surface_filament_slots.size() >=
+                pixel_count * volume.imported_texture_raw_top_surface_depths.size()) {
+            for (size_t new_idx = 0; new_idx < projected_depths.size(); ++new_idx) {
+                const auto old_it = std::find(volume.imported_texture_raw_top_surface_depths.begin(),
+                                              volume.imported_texture_raw_top_surface_depths.end(),
+                                              projected_depths[new_idx]);
+                if (old_it == volume.imported_texture_raw_top_surface_depths.end())
+                    continue;
+                const size_t old_idx = size_t(old_it - volume.imported_texture_raw_top_surface_depths.begin());
+                const size_t old_begin = old_idx * pixel_count;
+                const size_t new_begin = new_idx * pixel_count;
+                if (old_begin + pixel_count <= volume.imported_texture_raw_top_surface_filament_slots.size() &&
+                    new_begin + pixel_count <= projected_slots.size())
+                    std::copy(volume.imported_texture_raw_top_surface_filament_slots.begin() + old_begin,
+                              volume.imported_texture_raw_top_surface_filament_slots.begin() + old_begin + pixel_count,
+                              projected_slots.begin() + new_begin);
+            }
+        }
+        merged_top_depths = std::move(projected_depths);
+        merged_top_slots = std::move(projected_slots);
+    }
     if (model_volume_has_raw_atlas_texture_data(&volume)) {
         const std::vector<ImageMapRawFilament> old_filaments =
             image_map_raw_filaments_from_metadata_json(volume.imported_texture_raw_metadata_json, volume.imported_texture_raw_channels);
@@ -1998,7 +2083,6 @@ static bool merge_imported_texture_raw_atlas(ModelVolume &volume, const RawAtlas
                 old_to_new[old_channel] = size_t(std::distance(layout.channel_keys.begin(), found));
         }
 
-        const size_t pixel_count = size_t(volume.imported_texture_width) * size_t(volume.imported_texture_height);
         for (size_t pixel_idx = 0; pixel_idx < pixel_count; ++pixel_idx) {
             const size_t old_base = pixel_idx * size_t(volume.imported_texture_raw_channels);
             const size_t new_base = pixel_idx * layout.filaments.size();
@@ -2019,6 +2103,8 @@ static bool merge_imported_texture_raw_atlas(ModelVolume &volume, const RawAtlas
         volume.imported_texture_raw_channels != merged_channels ||
         volume.imported_texture_raw_filament_offsets.size() != expected_size ||
         volume.imported_texture_raw_metadata_json != metadata ||
+        volume.imported_texture_raw_top_surface_depths != merged_top_depths ||
+        volume.imported_texture_raw_top_surface_filament_slots != merged_top_slots ||
         !std::equal(volume.imported_texture_raw_filament_offsets.begin(),
                     volume.imported_texture_raw_filament_offsets.end(),
                     merged.begin(),
@@ -2026,8 +2112,13 @@ static bool merge_imported_texture_raw_atlas(ModelVolume &volume, const RawAtlas
     volume.imported_texture_raw_channels = merged_channels;
     volume.imported_texture_raw_metadata_json = metadata;
     volume.imported_texture_raw_filament_offsets = std::move(merged);
-    if (changed && image_projection_should_refresh_ids())
+    volume.imported_texture_raw_top_surface_depths = std::move(merged_top_depths);
+    volume.imported_texture_raw_top_surface_filament_slots = std::move(merged_top_slots);
+    if (changed && image_projection_should_refresh_ids()) {
         volume.imported_texture_raw_filament_offsets.set_new_unique_id();
+        volume.imported_texture_raw_top_surface_filament_slots.set_new_unique_id();
+        volume.imported_texture_raw_top_surface_depths.set_new_unique_id();
+    }
     return changed;
 }
 
@@ -3591,6 +3682,38 @@ static std::vector<uint8_t> resize_raw_offsets_bilinear(const std::vector<uint8_
     return resized;
 }
 
+static std::vector<uint16_t> resize_top_surface_slots_nearest(const std::vector<uint16_t>& slots,
+                                                              uint32_t                     width,
+                                                              uint32_t                     height,
+                                                              uint32_t                     layers,
+                                                              uint32_t                     resized_width,
+                                                              uint32_t                     resized_height)
+{
+    size_t resized_size = 0;
+    if (!checked_texture_buffer_size(resized_width, resized_height, layers, resized_size))
+        return {};
+
+    std::vector<uint16_t> resized(resized_size, 0);
+    size_t source_size = 0;
+    if (!checked_texture_buffer_size(width, height, layers, source_size) || slots.size() < source_size)
+        return resized;
+
+    for (uint32_t y = 0; y < resized_height; ++y) {
+        const uint32_t source_y = std::min<uint32_t>((uint64_t(y) * uint64_t(height)) / uint64_t(resized_height), height - 1);
+        for (uint32_t x = 0; x < resized_width; ++x) {
+            const uint32_t source_x = std::min<uint32_t>((uint64_t(x) * uint64_t(width)) / uint64_t(resized_width), width - 1);
+            const size_t source_pixel = size_t(source_y) * size_t(width) + size_t(source_x);
+            const size_t dest_pixel = size_t(y) * size_t(resized_width) + size_t(x);
+            const size_t source_layer_size = size_t(width) * size_t(height);
+            const size_t dest_layer_size = size_t(resized_width) * size_t(resized_height);
+            for (uint32_t layer = 0; layer < layers; ++layer)
+                resized[size_t(layer) * dest_layer_size + dest_pixel] =
+                    slots[size_t(layer) * source_layer_size + source_pixel];
+        }
+    }
+    return resized;
+}
+
 static std::string resized_raw_texture_metadata_json(const std::string& metadata_json, uint32_t width, uint32_t height, uint32_t channels)
 {
     nlohmann::json root;
@@ -3602,8 +3725,19 @@ static std::string resized_raw_texture_metadata_json(const std::string& metadata
         root = nlohmann::json::object();
     }
     root["format"] = "raw_filament_offset_atlas";
-    root["image"]  = {{"width", width}, {"height", height}, {"channels", channels}};
+    root["image"]  = {{"width", width}, {"height", height}, {"channels", channels}, {"offset_channels", channels}};
     root.erase("regions");
+    nlohmann::json top_surface = root.value("top_surface", nlohmann::json::object());
+    if (top_surface.is_object()) {
+        top_surface.erase("regions");
+        top_surface.erase("layers");
+        if (top_surface.empty())
+            root.erase("top_surface");
+        else
+            root["top_surface"] = std::move(top_surface);
+    } else {
+        root.erase("top_surface");
+    }
     return root.dump();
 }
 
@@ -3657,14 +3791,32 @@ static bool resize_projection_raw_atlas_to_max_dimension(ImageMapRawFilamentOffs
     if (!atlas.valid())
         return false;
 
-    std::vector<uint8_t> resized_offsets = resize_raw_offsets_bilinear(atlas.offsets,
-                                                                       atlas.width,
-                                                                       atlas.height,
-                                                                       atlas.channels,
-                                                                       resized_width,
-                                                                       resized_height);
-    if (resized_offsets.empty())
-        return false;
+    std::vector<uint8_t> resized_offsets;
+    if (atlas.channels > 0) {
+        resized_offsets = resize_raw_offsets_bilinear(atlas.offsets,
+                                                      atlas.width,
+                                                      atlas.height,
+                                                      atlas.channels,
+                                                      resized_width,
+                                                      resized_height);
+        if (resized_offsets.empty())
+            return false;
+    }
+
+    std::vector<std::vector<uint16_t>> resized_top_surface_layers;
+    resized_top_surface_layers.reserve(atlas.top_surface_layers.size());
+    for (const ImageMapRawTopSurfaceLayer &layer : atlas.top_surface_layers) {
+        std::vector<uint16_t> resized_slots =
+            resize_top_surface_slots_nearest(layer.filament_slots,
+                                             atlas.width,
+                                             atlas.height,
+                                             1,
+                                             resized_width,
+                                             resized_height);
+        if (resized_slots.empty())
+            return false;
+        resized_top_surface_layers.emplace_back(std::move(resized_slots));
+    }
 
     std::vector<uint8_t> resized_mask;
     if (!atlas.mask.empty()) {
@@ -3681,6 +3833,8 @@ static bool resize_projection_raw_atlas_to_max_dimension(ImageMapRawFilamentOffs
     atlas.width = resized_width;
     atlas.height = resized_height;
     atlas.offsets = std::move(resized_offsets);
+    for (size_t idx = 0; idx < atlas.top_surface_layers.size() && idx < resized_top_surface_layers.size(); ++idx)
+        atlas.top_surface_layers[idx].filament_slots = std::move(resized_top_surface_layers[idx]);
     if (!resized_mask.empty())
         atlas.mask = std::move(resized_mask);
     atlas.metadata_json = resized_raw_texture_metadata_json(atlas.metadata_json, atlas.width, atlas.height, atlas.channels);
@@ -3699,19 +3853,48 @@ static bool resize_volume_image_texture(ModelVolume& volume, uint32_t resized_wi
 
     const bool has_raw_atlas = model_volume_has_raw_atlas_texture_data(&volume);
     if (has_raw_atlas) {
-        std::vector<uint8_t> resized_offsets = resize_raw_offsets_bilinear(volume.imported_texture_raw_filament_offsets, old_width,
-                                                                           old_height, volume.imported_texture_raw_channels, resized_width,
-                                                                           resized_height);
-        if (resized_offsets.empty())
-            return false;
-        volume.imported_texture_raw_filament_offsets = std::move(resized_offsets);
+        if (volume.imported_texture_raw_channels > 0) {
+            std::vector<uint8_t> resized_offsets =
+                resize_raw_offsets_bilinear(volume.imported_texture_raw_filament_offsets,
+                                            old_width,
+                                            old_height,
+                                            volume.imported_texture_raw_channels,
+                                            resized_width,
+                                            resized_height);
+            if (resized_offsets.empty())
+                return false;
+            volume.imported_texture_raw_filament_offsets = std::move(resized_offsets);
+        }
+        if (!volume.imported_texture_raw_top_surface_depths.empty()) {
+            std::vector<uint16_t> resized_top_surface_slots =
+                resize_top_surface_slots_nearest(volume.imported_texture_raw_top_surface_filament_slots,
+                                                 old_width,
+                                                 old_height,
+                                                 uint32_t(volume.imported_texture_raw_top_surface_depths.size()),
+                                                 resized_width,
+                                                 resized_height);
+            if (resized_top_surface_slots.empty())
+                return false;
+            volume.imported_texture_raw_top_surface_filament_slots = std::move(resized_top_surface_slots);
+        }
         volume.imported_texture_width                = resized_width;
         volume.imported_texture_height               = resized_height;
         volume.imported_texture_raw_metadata_json    = resized_raw_texture_metadata_json(volume.imported_texture_raw_metadata_json,
                                                                                          resized_width, resized_height,
                                                                                          volume.imported_texture_raw_channels);
-        refresh_imported_texture_preview_from_raw_offsets(volume);
+        if (!refresh_imported_texture_preview_from_raw_offsets(volume)) {
+            std::vector<uint8_t> resized_rgba =
+                resize_rgba_texture_bilinear(volume.imported_texture_rgba,
+                                             old_width,
+                                             old_height,
+                                             resized_width,
+                                             resized_height);
+            if (!resized_rgba.empty())
+                volume.imported_texture_rgba = std::move(resized_rgba);
+        }
         volume.imported_texture_raw_filament_offsets.set_new_unique_id();
+        volume.imported_texture_raw_top_surface_filament_slots.set_new_unique_id();
+        volume.imported_texture_raw_top_surface_depths.set_new_unique_id();
         volume.imported_texture_rgba.set_new_unique_id();
         return true;
     }
@@ -3726,7 +3909,10 @@ static bool resize_volume_image_texture(ModelVolume& volume, uint32_t resized_wi
         return false;
 
     volume.imported_texture_rgba = std::move(resized_rgba);
-    const bool cleared_raw_data  = !volume.imported_texture_raw_filament_offsets.empty() || volume.imported_texture_raw_channels != 0 ||
+    const bool cleared_raw_data  = !volume.imported_texture_raw_filament_offsets.empty() ||
+                                  !volume.imported_texture_raw_top_surface_filament_slots.empty() ||
+                                  !volume.imported_texture_raw_top_surface_depths.empty() ||
+                                  volume.imported_texture_raw_channels != 0 ||
                                   !volume.imported_texture_raw_metadata_json.empty();
     if (cleared_raw_data)
         clear_imported_texture_raw_atlas(volume);
@@ -4160,6 +4346,45 @@ static std::vector<uint8_t> projected_raw_offsets_at_point(const ProjectionConte
     if (!projection_screen_to_image_uv(context, screen, uv, true))
         return {};
     return sample_raw_offsets_bilinear_clamped(atlas, uv.x(), uv.y());
+}
+
+static std::vector<uint16_t> projected_raw_top_surface_slots_at_point(const ProjectionContext &context,
+                                                                      const ImageMapRawFilamentOffsetAtlas &atlas,
+                                                                      const Transform3d &world_matrix,
+                                                                      const Vec3f &point)
+{
+    if (!atlas.valid() ||
+        atlas.top_surface_layers.empty() ||
+        context.overlay_width <= 0.f ||
+        context.overlay_height <= 0.f ||
+        atlas.width == 0 ||
+        atlas.height == 0)
+        return {};
+
+    const Vec3d world_point = world_matrix * point.cast<double>();
+    if (!projection_world_point_visible_in_section(context, world_point))
+        return {};
+
+    Vec2f screen = Vec2f::Zero();
+    if (!project_point_to_screen(context, world_point, screen))
+        return {};
+
+    Vec2f uv = Vec2f::Zero();
+    if (!projection_screen_to_image_uv(context, screen, uv, true))
+        return {};
+
+    const float u = std::clamp(uv.x(), 0.f, 1.f);
+    const float v = std::clamp(uv.y(), 0.f, 1.f);
+    const size_t x = std::min<size_t>(size_t(std::floor(u * float(atlas.width > 1 ? atlas.width - 1 : 0) + 0.5f)), size_t(atlas.width - 1));
+    const size_t y = std::min<size_t>(size_t(std::floor(v * float(atlas.height > 1 ? atlas.height - 1 : 0) + 0.5f)), size_t(atlas.height - 1));
+    const size_t pixel = y * size_t(atlas.width) + x;
+    const size_t pixel_count = size_t(atlas.width) * size_t(atlas.height);
+
+    std::vector<uint16_t> slots;
+    slots.reserve(atlas.top_surface_layers.size());
+    for (const ImageMapRawTopSurfaceLayer &layer : atlas.top_surface_layers)
+        slots.emplace_back(pixel < pixel_count && pixel < layer.filament_slots.size() ? layer.filament_slots[pixel] : 0);
+    return slots;
 }
 
 static bool projection_triangle_intersects_overlay(const ProjectionContext      &context,
@@ -5513,6 +5738,27 @@ static bool write_raw_offset_pixel(std::vector<uint8_t> &offsets,
         offsets[idx + channel] = value;
     }
     return changed;
+}
+
+static bool write_top_surface_slot_pixel(std::vector<uint16_t> &slots,
+                                         uint32_t               width,
+                                         uint32_t               height,
+                                         uint32_t               layer_count,
+                                         size_t                 layer_idx,
+                                         uint32_t               x,
+                                         uint32_t               y,
+                                         uint16_t               value)
+{
+    if (width == 0 || height == 0 || layer_count == 0 || layer_idx >= layer_count || x >= width || y >= height)
+        return false;
+    const size_t layer_size = size_t(width) * size_t(height);
+    const size_t idx = layer_idx * layer_size + size_t(y) * size_t(width) + size_t(x);
+    if (idx >= slots.size())
+        return false;
+    if (slots[idx] == value)
+        return false;
+    slots[idx] = value;
+    return true;
 }
 
 static ColorRGBA read_rgba_pixel(const std::vector<uint8_t> &rgba, uint32_t width, uint32_t x, uint32_t y)
@@ -7267,11 +7513,15 @@ struct ImageProjectionVolumeSignature
     ObjectID imported_texture_uv_valid_id;
     ObjectID imported_texture_rgba_id;
     ObjectID imported_texture_raw_id;
+    ObjectID imported_texture_raw_top_surface_slots_id;
+    ObjectID imported_texture_raw_top_surface_depths_id;
     size_t imported_vertex_colors_size = 0;
     size_t imported_texture_uvs_size = 0;
     size_t imported_texture_uv_valid_size = 0;
     size_t imported_texture_rgba_size = 0;
     size_t imported_texture_raw_size = 0;
+    size_t imported_texture_raw_top_surface_slots_size = 0;
+    size_t imported_texture_raw_top_surface_depths_size = 0;
     uint32_t imported_texture_width = 0;
     uint32_t imported_texture_height = 0;
     uint32_t imported_texture_raw_channels = 0;
@@ -7309,11 +7559,17 @@ static ImageProjectionObjectSignature image_projection_object_signature(const Mo
         volume_signature.imported_texture_uv_valid_id = volume->imported_texture_uv_valid.id();
         volume_signature.imported_texture_rgba_id = volume->imported_texture_rgba.id();
         volume_signature.imported_texture_raw_id = volume->imported_texture_raw_filament_offsets.id();
+        volume_signature.imported_texture_raw_top_surface_slots_id = volume->imported_texture_raw_top_surface_filament_slots.id();
+        volume_signature.imported_texture_raw_top_surface_depths_id = volume->imported_texture_raw_top_surface_depths.id();
         volume_signature.imported_vertex_colors_size = volume->imported_vertex_colors_rgba.size();
         volume_signature.imported_texture_uvs_size = volume->imported_texture_uvs_per_face.size();
         volume_signature.imported_texture_uv_valid_size = volume->imported_texture_uv_valid.size();
         volume_signature.imported_texture_rgba_size = volume->imported_texture_rgba.size();
         volume_signature.imported_texture_raw_size = volume->imported_texture_raw_filament_offsets.size();
+        volume_signature.imported_texture_raw_top_surface_slots_size =
+            volume->imported_texture_raw_top_surface_filament_slots.size();
+        volume_signature.imported_texture_raw_top_surface_depths_size =
+            volume->imported_texture_raw_top_surface_depths.size();
         volume_signature.imported_texture_width = volume->imported_texture_width;
         volume_signature.imported_texture_height = volume->imported_texture_height;
         volume_signature.imported_texture_raw_channels = volume->imported_texture_raw_channels;
@@ -7343,11 +7599,17 @@ static bool image_projection_object_signature_matches(const ModelObject &object,
             volume->imported_texture_uv_valid.id() != volume_signature.imported_texture_uv_valid_id ||
             volume->imported_texture_rgba.id() != volume_signature.imported_texture_rgba_id ||
             volume->imported_texture_raw_filament_offsets.id() != volume_signature.imported_texture_raw_id ||
+            volume->imported_texture_raw_top_surface_filament_slots.id() != volume_signature.imported_texture_raw_top_surface_slots_id ||
+            volume->imported_texture_raw_top_surface_depths.id() != volume_signature.imported_texture_raw_top_surface_depths_id ||
             volume->imported_vertex_colors_rgba.size() != volume_signature.imported_vertex_colors_size ||
             volume->imported_texture_uvs_per_face.size() != volume_signature.imported_texture_uvs_size ||
             volume->imported_texture_uv_valid.size() != volume_signature.imported_texture_uv_valid_size ||
             volume->imported_texture_rgba.size() != volume_signature.imported_texture_rgba_size ||
             volume->imported_texture_raw_filament_offsets.size() != volume_signature.imported_texture_raw_size ||
+            volume->imported_texture_raw_top_surface_filament_slots.size() !=
+                volume_signature.imported_texture_raw_top_surface_slots_size ||
+            volume->imported_texture_raw_top_surface_depths.size() !=
+                volume_signature.imported_texture_raw_top_surface_depths_size ||
             volume->imported_texture_width != volume_signature.imported_texture_width ||
             volume->imported_texture_height != volume_signature.imported_texture_height ||
             volume->imported_texture_raw_channels != volume_signature.imported_texture_raw_channels ||
@@ -7408,6 +7670,12 @@ static void image_projection_apply_volume_result(ModelVolume &dst, const ModelVo
     image_projection_assign_imported_vector(dst.imported_texture_uv_valid, src.imported_texture_uv_valid, texture_metadata_changed);
     image_projection_assign_imported_vector(dst.imported_texture_rgba, src.imported_texture_rgba, texture_metadata_changed);
     image_projection_assign_imported_vector(dst.imported_texture_raw_filament_offsets, src.imported_texture_raw_filament_offsets, raw_metadata_changed);
+    image_projection_assign_imported_vector(dst.imported_texture_raw_top_surface_filament_slots,
+                                            src.imported_texture_raw_top_surface_filament_slots,
+                                            raw_metadata_changed);
+    image_projection_assign_imported_vector(dst.imported_texture_raw_top_surface_depths,
+                                            src.imported_texture_raw_top_surface_depths,
+                                            raw_metadata_changed);
     dst.imported_texture_width = src.imported_texture_width;
     dst.imported_texture_height = src.imported_texture_height;
     dst.imported_texture_raw_channels = src.imported_texture_raw_channels;
@@ -16717,6 +16985,10 @@ void GLGizmoImageProjection::on_load(cereal::BinaryInputArchive& ar)
     std::vector<uint8_t> raw_offsets;
     std::vector<uint8_t> raw_mask;
     std::string raw_metadata_json;
+    std::vector<int> raw_top_surface_depths;
+    std::vector<uint16_t> raw_top_surface_slots;
+    std::vector<uint8_t> raw_top_surface_values;
+    std::vector<unsigned int> raw_top_surface_value_slots;
 
     ar(mode,
        m_image_path,
@@ -16780,6 +17052,17 @@ void GLGizmoImageProjection::on_load(cereal::BinaryInputArchive& ar)
     } catch (...) {
         m_improve_projection_accuracy = true;
     }
+    try {
+        ar(raw_top_surface_depths,
+           raw_top_surface_slots,
+           raw_top_surface_values,
+           raw_top_surface_value_slots);
+    } catch (...) {
+        raw_top_surface_depths.clear();
+        raw_top_surface_slots.clear();
+        raw_top_surface_values.clear();
+        raw_top_surface_value_slots.clear();
+    }
 
     m_projection_mode = ProjectionMode(std::clamp(mode, 0, 2));
     m_projection_mode_initialized = false;
@@ -16808,6 +17091,22 @@ void GLGizmoImageProjection::on_load(cereal::BinaryInputArchive& ar)
     m_raw_atlas.offsets = std::move(raw_offsets);
     m_raw_atlas.mask = std::move(raw_mask);
     m_raw_atlas.metadata_json = std::move(raw_metadata_json);
+    const size_t raw_pixel_count = size_t(m_raw_atlas.width) * size_t(m_raw_atlas.height);
+    if (raw_pixel_count > 0 &&
+        raw_top_surface_slots.size() >= raw_pixel_count * raw_top_surface_depths.size()) {
+        m_raw_atlas.top_surface_layers.reserve(raw_top_surface_depths.size());
+        for (size_t depth_idx = 0; depth_idx < raw_top_surface_depths.size(); ++depth_idx) {
+            ImageMapRawTopSurfaceLayer layer;
+            layer.depth = raw_top_surface_depths[depth_idx];
+            const auto begin = raw_top_surface_slots.begin() + depth_idx * raw_pixel_count;
+            layer.filament_slots.assign(begin, begin + raw_pixel_count);
+            m_raw_atlas.top_surface_layers.emplace_back(std::move(layer));
+        }
+    }
+    const size_t top_value_count = std::min(raw_top_surface_values.size(), raw_top_surface_value_slots.size());
+    m_raw_atlas.top_surface_filament_values.reserve(top_value_count);
+    for (size_t idx = 0; idx < top_value_count; ++idx)
+        m_raw_atlas.top_surface_filament_values.push_back({ raw_top_surface_values[idx], raw_top_surface_value_slots[idx] });
     m_raw_atlas.expected_line_width_mm = image_map_raw_expected_line_width_from_metadata_json(m_raw_atlas.metadata_json);
     if (!m_raw_atlas.valid())
         m_raw_atlas = {};
@@ -16842,6 +17141,10 @@ void GLGizmoImageProjection::on_save(cereal::BinaryOutputArchive& ar) const
     std::vector<unsigned int> raw_filament_slots;
     std::vector<std::string> raw_filament_colors;
     std::vector<std::string> raw_filament_hexes;
+    std::vector<int> raw_top_surface_depths;
+    std::vector<uint16_t> raw_top_surface_slots;
+    std::vector<uint8_t> raw_top_surface_values;
+    std::vector<unsigned int> raw_top_surface_value_slots;
     raw_filament_slots.reserve(m_raw_atlas.filaments.size());
     raw_filament_colors.reserve(m_raw_atlas.filaments.size());
     raw_filament_hexes.reserve(m_raw_atlas.filaments.size());
@@ -16849,6 +17152,25 @@ void GLGizmoImageProjection::on_save(cereal::BinaryOutputArchive& ar) const
         raw_filament_slots.push_back(filament.slot);
         raw_filament_colors.push_back(filament.color);
         raw_filament_hexes.push_back(filament.hex);
+    }
+    const size_t raw_pixel_count = size_t(m_raw_atlas.width) * size_t(m_raw_atlas.height);
+    if (raw_pixel_count > 0) {
+        raw_top_surface_depths.reserve(m_raw_atlas.top_surface_layers.size());
+        raw_top_surface_slots.reserve(raw_pixel_count * m_raw_atlas.top_surface_layers.size());
+        for (const ImageMapRawTopSurfaceLayer &layer : m_raw_atlas.top_surface_layers) {
+            if (layer.filament_slots.size() < raw_pixel_count)
+                continue;
+            raw_top_surface_depths.emplace_back(layer.depth);
+            raw_top_surface_slots.insert(raw_top_surface_slots.end(),
+                                         layer.filament_slots.begin(),
+                                         layer.filament_slots.begin() + raw_pixel_count);
+        }
+    }
+    raw_top_surface_values.reserve(m_raw_atlas.top_surface_filament_values.size());
+    raw_top_surface_value_slots.reserve(m_raw_atlas.top_surface_filament_values.size());
+    for (const ImageMapRawTopSurfaceFilamentValue &entry : m_raw_atlas.top_surface_filament_values) {
+        raw_top_surface_values.emplace_back(entry.value);
+        raw_top_surface_value_slots.emplace_back(entry.slot);
     }
 
     ar(mode,
@@ -16890,6 +17212,10 @@ void GLGizmoImageProjection::on_save(cereal::BinaryOutputArchive& ar) const
 
     ar(m_erase_region_painting);
     ar(m_improve_projection_accuracy);
+    ar(raw_top_surface_depths,
+       raw_top_surface_slots,
+       raw_top_surface_values,
+       raw_top_surface_value_slots);
 }
 
 void GLGizmoImageProjection::on_render()
@@ -17037,7 +17363,9 @@ bool GLGizmoImageProjection::load_projection_image()
     m_image_height = height;
     m_overlay_texture_dirty = true;
     m_show_overlay = true;
+    m_projection_panel_expanded = false;
     m_parent.set_as_dirty();
+    m_parent.request_extra_frame();
     return true;
 }
 
@@ -17598,7 +17926,7 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
     if (projection_job_active) {
         m_projection_panel_expanded = true;
     } else {
-        if (m_imgui->button(m_projection_panel_expanded ? _L("Collapse") : _L("Expand"))) {
+        if (m_imgui->button(m_projection_panel_expanded ? _L("Hide Panel") : _L("Show Panel"))) {
             m_projection_panel_expanded = !m_projection_panel_expanded;
             m_parent.set_as_dirty();
             m_parent.request_extra_frame();
@@ -18457,7 +18785,7 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object,
 
         bool volume_changed = generated_texture;
         if (raw_atlas_projection) {
-            volume_changed |= merge_imported_texture_raw_atlas(*volume, raw_layout);
+            volume_changed |= merge_imported_texture_raw_atlas(*volume, raw_layout, &raw_projection_atlas);
         } else if (model_volume_has_raw_atlas_texture_data(volume)) {
             clear_imported_texture_raw_atlas(*volume);
             volume_changed = true;
@@ -18652,36 +18980,64 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object,
                                     }
                                 } else {
                                     if (raw_atlas_projection) {
-                                        std::vector<uint8_t> atlas_raw_values =
-                                            projected_raw_offsets_at_point(context, raw_projection_atlas, world_matrix, point);
-                                        if (atlas_raw_values.empty())
+                                        const std::vector<uint8_t> atlas_raw_values =
+                                            raw_projection_atlas.channels > 0 ?
+                                                projected_raw_offsets_at_point(context, raw_projection_atlas, world_matrix, projection_point) :
+                                                std::vector<uint8_t>();
+                                        const std::vector<uint16_t> atlas_top_surface_slots =
+                                            !raw_projection_atlas.top_surface_layers.empty() ?
+                                                projected_raw_top_surface_slots_at_point(context, raw_projection_atlas, world_matrix, projection_point) :
+                                                std::vector<uint16_t>();
+                                        if (atlas_raw_values.empty() && atlas_top_surface_slots.empty())
                                             continue;
-                                        std::vector<uint8_t> raw_values = raw_offset_pixel_values(*volume, wrapped_x, wrapped_y);
-                                        if (raw_values.size() != size_t(volume->imported_texture_raw_channels))
-                                            raw_values.assign(size_t(volume->imported_texture_raw_channels), 0);
                                         const float alpha = projection_overlay_alpha(*projected, context);
-                                        for (size_t atlas_channel = 0;
-                                             atlas_channel < atlas_raw_values.size() &&
-                                             atlas_channel < raw_layout.atlas_to_target_channel.size();
-                                             ++atlas_channel) {
-                                            const size_t target_channel = raw_layout.atlas_to_target_channel[atlas_channel];
-                                            if (target_channel >= raw_values.size())
-                                                continue;
-                                            const float base = float(raw_values[target_channel]);
-                                            const float projected_value = float(atlas_raw_values[atlas_channel]);
-                                            raw_values[target_channel] = uint8_t(std::clamp(
-                                                int(std::lround(base * (1.f - alpha) + projected_value * alpha)), 0, 255));
+                                        if (!atlas_raw_values.empty()) {
+                                            std::vector<uint8_t> raw_values = raw_offset_pixel_values(*volume, wrapped_x, wrapped_y);
+                                            if (raw_values.size() != size_t(volume->imported_texture_raw_channels))
+                                                raw_values.assign(size_t(volume->imported_texture_raw_channels), 0);
+                                            for (size_t atlas_channel = 0;
+                                                 atlas_channel < atlas_raw_values.size() &&
+                                                 atlas_channel < raw_layout.atlas_to_target_channel.size();
+                                                 ++atlas_channel) {
+                                                const size_t target_channel = raw_layout.atlas_to_target_channel[atlas_channel];
+                                                if (target_channel >= raw_values.size())
+                                                    continue;
+                                                const float base = float(raw_values[target_channel]);
+                                                const float projected_value = float(atlas_raw_values[atlas_channel]);
+                                                raw_values[target_channel] = uint8_t(std::clamp(
+                                                    int(std::lround(base * (1.f - alpha) + projected_value * alpha)), 0, 255));
+                                            }
+                                            volume_changed |= write_raw_offset_pixel(volume->imported_texture_raw_filament_offsets,
+                                                                                    volume->imported_texture_width,
+                                                                                    volume->imported_texture_raw_channels,
+                                                                                    wrapped_x,
+                                                                                    wrapped_y,
+                                                                                    raw_values);
+                                            color = simulated_preview_color_from_raw_offsets(raw_projection_preview_settings,
+                                                                                            raw_values.data(),
+                                                                                            raw_values.size(),
+                                                                                            255);
+                                        } else {
+                                            color = apply_projection_color(color, *projected, context, true);
                                         }
-                                        volume_changed |= write_raw_offset_pixel(volume->imported_texture_raw_filament_offsets,
-                                                                                volume->imported_texture_width,
-                                                                                volume->imported_texture_raw_channels,
-                                                                                wrapped_x,
-                                                                                wrapped_y,
-                                                                                raw_values);
-                                        color = simulated_preview_color_from_raw_offsets(raw_projection_preview_settings,
-                                                                                        raw_values.data(),
-                                                                                        raw_values.size(),
-                                                                                        255);
+                                        if (!atlas_top_surface_slots.empty() && alpha >= 0.5f) {
+                                            const uint32_t top_surface_layer_count =
+                                                uint32_t(volume->imported_texture_raw_top_surface_depths.size());
+                                            for (size_t layer_idx = 0;
+                                                 layer_idx < atlas_top_surface_slots.size() &&
+                                                 layer_idx < size_t(top_surface_layer_count);
+                                                 ++layer_idx) {
+                                                volume_changed |= write_top_surface_slot_pixel(
+                                                    volume->imported_texture_raw_top_surface_filament_slots,
+                                                    volume->imported_texture_width,
+                                                    volume->imported_texture_height,
+                                                    top_surface_layer_count,
+                                                    layer_idx,
+                                                    wrapped_x,
+                                                    wrapped_y,
+                                                    atlas_top_surface_slots[layer_idx]);
+                                            }
+                                        }
                                     } else {
                                         color = apply_projection_color(color, *projected, context, true);
                                     }

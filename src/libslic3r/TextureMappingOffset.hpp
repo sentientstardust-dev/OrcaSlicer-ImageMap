@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace Slic3r {
@@ -39,6 +40,7 @@ struct TextureMappingOffsetWeightField {
     std::vector<std::vector<uint32_t>> buckets;
     std::vector<float> fallback_weights;
     bool raw_component_weights_from_texture { false };
+    bool raw_top_surface_labels_from_texture { false };
     bool binary_dithered { false };
 
     bool empty() const
@@ -95,6 +97,12 @@ struct TextureMappingOffsetContext {
 };
 
 std::vector<unsigned int> decode_texture_mapping_offset_component_ids(const TextureMappingZone &zone, size_t num_physical);
+void append_texture_mapping_raw_top_surface_component_ids(const PrintObject             &print_object,
+                                                          const TextureMappingZone      &zone,
+                                                          const std::vector<std::string> &filament_colours,
+                                                          std::vector<unsigned int>    &component_ids,
+                                                          size_t                        num_physical,
+                                                          std::optional<int>            depth = std::nullopt);
 float normalize_texture_mapping_offset_angle_deg(float angle);
 float texture_mapping_offset_fade_factor(int fade_mode, float progress01);
 float texture_mapping_offset_filament_strength_factor(const TextureMappingZone &zone, unsigned int physical_filament_id);
@@ -112,7 +120,8 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     std::optional<float>     min_outer_width_mm_override = std::nullopt,
     std::optional<std::array<float, 4>> image_background_rgba_override = std::nullopt,
     std::optional<float>     sample_z_mm_override = std::nullopt,
-    std::optional<float>     texture_sample_pitch_mm_override = std::nullopt);
+    std::optional<float>     texture_sample_pitch_mm_override = std::nullopt,
+    std::optional<int>       raw_top_surface_depth_override = std::nullopt);
 
 std::vector<float> sample_weight_field_components(const TextureMappingOffsetWeightField &weight_field,
                                                   float                                  x_mm,

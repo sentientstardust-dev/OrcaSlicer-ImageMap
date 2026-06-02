@@ -6,7 +6,9 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <map>
 #include <nlohmann/json.hpp>
+#include <set>
 #include <utility>
 
 namespace Slic3r {
@@ -104,6 +106,45 @@ static std::string standard_hex_for_color_code(const std::string &color)
     return "#FFFFFF";
 }
 
+static int hex_digit_value(char ch)
+{
+    if (ch >= '0' && ch <= '9')
+        return ch - '0';
+    if (ch >= 'a' && ch <= 'f')
+        return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F')
+        return ch - 'A' + 10;
+    return -1;
+}
+
+static std::array<uint8_t, 3> rgb_from_hex_string(const std::string &hex)
+{
+    if (hex.size() != 7 || hex[0] != '#')
+        return { 255, 255, 255 };
+    std::array<uint8_t, 3> out { 255, 255, 255 };
+    for (size_t channel = 0; channel < 3; ++channel) {
+        const int hi = hex_digit_value(hex[1 + channel * 2]);
+        const int lo = hex_digit_value(hex[2 + channel * 2]);
+        if (hi < 0 || lo < 0)
+            return { 255, 255, 255 };
+        out[channel] = uint8_t((hi << 4) | lo);
+    }
+    return out;
+}
+
+static std::array<uint8_t, 3> preview_rgb_for_filament_slot(const std::vector<ImageMapRawFilament> &filaments,
+                                                            unsigned int slot)
+{
+    for (const ImageMapRawFilament &filament : filaments) {
+        if (filament.slot != slot)
+            continue;
+        if (!filament.hex.empty())
+            return rgb_from_hex_string(filament.hex);
+        return rgb_from_hex_string(standard_hex_for_color_code(filament.color));
+    }
+    return { 255, 255, 255 };
+}
+
 static ImageMapRawExpectedLineWidth expected_line_width_from_json(const nlohmann::json &root)
 {
     ImageMapRawExpectedLineWidth expected;
@@ -139,15 +180,119 @@ static ImageMapRawExpectedLineWidth expected_line_width_from_metadata_json(const
     return {};
 }
 
+static bool top_surface_layer_valid(const ImageMapRawTopSurfaceLayer &layer, uint32_t width, uint32_t height)
+{
+    return layer.depth >= 0 &&
+           layer.filament_slots.size() >= size_t(width) * size_t(height);
+}
+
+static bool has_valid_offset_payload(const ImageMapRawFilamentOffsetAtlas &atlas)
+{
+    return atlas.channels > 0 &&
+           atlas.offsets.size() >= size_t(atlas.width) * size_t(atlas.height) * size_t(atlas.channels);
+}
+
+static bool has_valid_top_surface_payload(const ImageMapRawFilamentOffsetAtlas &atlas)
+{
+    if (atlas.top_surface_layers.empty())
+        return false;
+    for (const ImageMapRawTopSurfaceLayer &layer : atlas.top_surface_layers)
+        if (!top_surface_layer_valid(layer, atlas.width, atlas.height))
+            return false;
+    return true;
+}
+
+static std::vector<ImageMapRawTopSurfaceFilamentValue> top_surface_filament_values_from_metadata_json(
+    const std::string &metadata_json)
+{
+    std::vector<ImageMapRawTopSurfaceFilamentValue> out;
+    try {
+        const nlohmann::json root = nlohmann::json::parse(metadata_json);
+        const nlohmann::json top_surface = root.value("top_surface", nlohmann::json::object());
+        const nlohmann::json values = top_surface.value("filament_values", nlohmann::json::array());
+        if (!values.is_array())
+            return out;
+        for (const nlohmann::json &entry : values) {
+            if (!entry.is_object())
+                continue;
+            const int value = entry.value("value", -1);
+            const int slot = entry.value("slot", 0);
+            if (value < 0 || value > 255 || slot <= 0)
+                continue;
+            out.push_back({ uint8_t(value), unsigned(slot) });
+        }
+    } catch (...) {
+        out.clear();
+    }
+    return out;
+}
+
+static std::vector<ImageMapRawTopSurfaceFilamentValue> normalized_top_surface_filament_values(
+    const ImageMapRawFilamentOffsetAtlas &atlas)
+{
+    std::vector<ImageMapRawTopSurfaceFilamentValue> values = atlas.top_surface_filament_values;
+    if (values.empty())
+        values = top_surface_filament_values_from_metadata_json(atlas.metadata_json);
+
+    std::set<unsigned int> used_slots;
+    std::vector<ImageMapRawTopSurfaceFilamentValue> normalized;
+    for (const ImageMapRawTopSurfaceFilamentValue &entry : values) {
+        if (entry.slot == 0 || used_slots.find(entry.slot) != used_slots.end())
+            continue;
+        normalized.emplace_back(entry);
+        used_slots.insert(entry.slot);
+    }
+    if (!normalized.empty())
+        return normalized;
+
+    for (const ImageMapRawTopSurfaceLayer &layer : atlas.top_surface_layers) {
+        const size_t pixel_count = size_t(atlas.width) * size_t(atlas.height);
+        const size_t count = std::min(pixel_count, layer.filament_slots.size());
+        for (size_t idx = 0; idx < count; ++idx) {
+            const unsigned int slot = layer.filament_slots[idx];
+            if (slot > 0)
+                used_slots.insert(slot);
+        }
+    }
+    if (used_slots.empty()) {
+        for (const ImageMapRawFilament &filament : atlas.filaments)
+            if (filament.slot > 0)
+                used_slots.insert(filament.slot);
+    }
+    if (used_slots.empty())
+        return normalized;
+
+    const size_t count = used_slots.size();
+    size_t idx = 0;
+    for (unsigned int slot : used_slots) {
+        const uint8_t value =
+            count <= 1 ? uint8_t(0) : uint8_t(std::lround(double(idx) * 255.0 / double(count - 1)));
+        normalized.push_back({ value, slot });
+        ++idx;
+    }
+    return normalized;
+}
+
+static uint8_t top_surface_value_for_slot(unsigned int slot,
+                                          const std::vector<ImageMapRawTopSurfaceFilamentValue> &values)
+{
+    for (const ImageMapRawTopSurfaceFilamentValue &entry : values)
+        if (entry.slot == slot)
+            return entry.value;
+    return 0;
+}
+
 static nlohmann::json atlas_metadata_json(const ImageMapRawFilamentOffsetAtlas &atlas, uint32_t header_rows)
 {
     const uint32_t region_count = (atlas.channels + 2u) / 3u;
+    const uint32_t top_surface_region_count = uint32_t((atlas.top_surface_layers.size() + 2u) / 3u);
     nlohmann::json root;
     root["format"] = "raw_filament_offset_atlas";
     root["image"] = {
         { "width", atlas.width },
         { "height", atlas.height },
-        { "channels", atlas.channels }
+        { "channels", atlas.channels },
+        { "offset_channels", atlas.channels }
     };
     root["filaments"] = nlohmann::json::array();
     for (const ImageMapRawFilament &filament : atlas.filaments) {
@@ -183,10 +328,45 @@ static nlohmann::json atlas_metadata_json(const ImageMapRawFilamentOffsetAtlas &
         region["y"] = header_rows;
         region["width"] = atlas.width;
         region["height"] = atlas.height;
-        region["channels"] = std::move(channels);
+        region["offset_channels"] = std::move(channels);
         if (region_idx == 0)
             region["alpha"] = "projection_mask";
         root["regions"].push_back(std::move(region));
+    }
+    if (!atlas.top_surface_layers.empty()) {
+        nlohmann::json top_surface;
+        top_surface["encoding"] = "surface_infill_layer_labels";
+        top_surface["filament_values"] = nlohmann::json::array();
+        const std::vector<ImageMapRawTopSurfaceFilamentValue> filament_values =
+            normalized_top_surface_filament_values(atlas);
+        for (const ImageMapRawTopSurfaceFilamentValue &entry : filament_values)
+            top_surface["filament_values"].push_back({ { "value", int(entry.value) }, { "slot", entry.slot } });
+
+        for (uint32_t region_idx = 0; region_idx < top_surface_region_count; ++region_idx) {
+            nlohmann::json region;
+            const std::string id = "top_" + std::to_string(region_idx + 1u);
+            region["id"] = id;
+            region["x"] = (region_count + region_idx) * atlas.width;
+            region["y"] = header_rows;
+            region["width"] = atlas.width;
+            region["height"] = atlas.height;
+            if (region_count == 0 && region_idx == 0)
+                region["alpha"] = "projection_mask";
+            root["regions"].push_back(std::move(region));
+        }
+
+        top_surface["layers"] = nlohmann::json::array();
+        for (size_t layer_idx = 0; layer_idx < atlas.top_surface_layers.size(); ++layer_idx) {
+            const uint32_t region_idx = uint32_t(layer_idx / 3u);
+            const size_t channel_idx = layer_idx % 3u;
+            const char *channel = channel_idx == 0 ? "r" : (channel_idx == 1 ? "g" : "b");
+            top_surface["layers"].push_back({
+                { "depth", atlas.top_surface_layers[layer_idx].depth },
+                { "region", "top_" + std::to_string(region_idx + 1u) },
+                { "channel", channel }
+            });
+        }
+        root["top_surface"] = std::move(top_surface);
     }
     return root;
 }
@@ -197,8 +377,7 @@ bool ImageMapRawFilamentOffsetAtlas::valid() const
 {
     return width > 0 &&
            height > 0 &&
-           channels > 0 &&
-           offsets.size() >= size_t(width) * size_t(height) * size_t(channels);
+           (has_valid_offset_payload(*this) || has_valid_top_surface_payload(*this));
 }
 
 bool image_map_raw_filament_is_standard_color(const std::string &color)
@@ -259,8 +438,7 @@ std::vector<ImageMapRawFilament> image_map_raw_filaments_for_channels(const std:
     return normalized;
 }
 
-std::vector<ImageMapRawFilament> image_map_raw_filaments_from_metadata_json(const std::string &metadata_json,
-                                                                            uint32_t channels)
+std::vector<ImageMapRawFilament> image_map_raw_filaments_from_metadata_json(const std::string &metadata_json)
 {
     std::vector<ImageMapRawFilament> filaments;
     try {
@@ -274,12 +452,21 @@ std::vector<ImageMapRawFilament> image_map_raw_filaments_from_metadata_json(cons
                 filament.slot = unsigned(std::max(0, entry.value("slot", 0)));
                 filament.color = entry.value("color", std::string());
                 filament.hex = entry.value("hex", std::string());
+                if (filament.hex.empty() && image_map_raw_filament_is_standard_color(filament.color))
+                    filament.hex = standard_hex_for_color_code(filament.color);
                 filaments.emplace_back(std::move(filament));
             }
         }
     } catch (...) {
         filaments.clear();
     }
+    return filaments;
+}
+
+std::vector<ImageMapRawFilament> image_map_raw_filaments_from_metadata_json(const std::string &metadata_json,
+                                                                            uint32_t channels)
+{
+    std::vector<ImageMapRawFilament> filaments = image_map_raw_filaments_from_metadata_json(metadata_json);
     return image_map_raw_filaments_for_channels(filaments, channels);
 }
 
@@ -358,8 +545,8 @@ bool decode_image_map_raw_filament_offset_atlas(const std::vector<uint8_t> &rgba
     const nlohmann::json image = root.value("image", nlohmann::json::object());
     const int logical_width = image.value("width", 0);
     const int logical_height = image.value("height", 0);
-    const int logical_channels = image.value("channels", 0);
-    if (logical_width <= 0 || logical_height <= 0 || logical_channels <= 0) {
+    const int logical_channels = image.value("offset_channels", image.value("channels", 0));
+    if (logical_width <= 0 || logical_height <= 0 || logical_channels < 0) {
         set_error(error, "ImageMap raw filament offset metadata has invalid image dimensions.");
         return false;
     }
@@ -368,7 +555,8 @@ bool decode_image_map_raw_filament_offset_atlas(const std::vector<uint8_t> &rgba
     decoded.width = uint32_t(logical_width);
     decoded.height = uint32_t(logical_height);
     decoded.channels = uint32_t(logical_channels);
-    decoded.offsets.assign(size_t(decoded.width) * size_t(decoded.height) * size_t(decoded.channels), 0);
+    if (decoded.channels > 0)
+        decoded.offsets.assign(size_t(decoded.width) * size_t(decoded.height) * size_t(decoded.channels), 0);
     decoded.mask.assign(size_t(decoded.width) * size_t(decoded.height), 255);
     decoded.metadata_json = metadata;
     decoded.expected_line_width_mm = expected_line_width_from_json(root);
@@ -389,12 +577,37 @@ bool decode_image_map_raw_filament_offset_atlas(const std::vector<uint8_t> &rgba
     }
 
     const nlohmann::json regions = root.value("regions", nlohmann::json::array());
-    if (!regions.is_array() || regions.empty()) {
+    if (decoded.channels > 0 && (!regions.is_array() || regions.empty())) {
         set_error(error, "ImageMap raw filament offset metadata does not contain regions.");
         return false;
     }
 
-    for (const nlohmann::json &region : regions) {
+    struct TopRegion {
+        int x { 0 };
+        int y { 0 };
+        int width { 0 };
+        int height { 0 };
+        std::array<bool, 3> offset_channels { { false, false, false } };
+    };
+    std::map<std::string, TopRegion> top_regions_by_id;
+    bool decoded_offset_payload = false;
+    const std::array<std::pair<const char *, size_t>, 3> rgb_channels = {
+        std::make_pair("r", size_t(0)),
+        std::make_pair("g", size_t(1)),
+        std::make_pair("b", size_t(2))
+    };
+    auto copy_projection_mask = [&](int rx, int ry, int rw, int rh) {
+        const uint32_t copy_width = std::min<uint32_t>(decoded.width, uint32_t(rw));
+        const uint32_t copy_height = std::min<uint32_t>(decoded.height, uint32_t(rh));
+        for (uint32_t y = 0; y < copy_height; ++y) {
+            for (uint32_t x = 0; x < copy_width; ++x) {
+                const size_t src_idx = (size_t(ry + int(y)) * size_t(atlas_width) + size_t(rx + int(x))) * 4 + 3;
+                decoded.mask[size_t(y) * size_t(decoded.width) + size_t(x)] = rgba[src_idx];
+            }
+        }
+    };
+
+    if (regions.is_array()) for (const nlohmann::json &region : regions) {
         if (!region.is_object())
             continue;
         const int rx = region.value("x", -1);
@@ -408,17 +621,16 @@ bool decode_image_map_raw_filament_offset_atlas(const std::vector<uint8_t> &rgba
             return false;
         }
 
-        const nlohmann::json channels = region.value("channels", nlohmann::json::object());
-        if (channels.is_object()) {
-            const std::array<std::pair<const char *, size_t>, 3> rgb_channels = {
-                std::make_pair("r", size_t(0)),
-                std::make_pair("g", size_t(1)),
-                std::make_pair("b", size_t(2))
-            };
+        TopRegion top_region { rx, ry, rw, rh, { { false, false, false } } };
+        const nlohmann::json offset_channels =
+            region.value("offset_channels", region.value("channels", nlohmann::json::object()));
+        if (offset_channels.is_object()) {
             for (const auto &rgb_channel : rgb_channels) {
-                const int logical_channel = channels.value(rgb_channel.first, 0);
+                const int logical_channel = offset_channels.value(rgb_channel.first, 0);
                 if (logical_channel <= 0 || logical_channel > logical_channels)
                     continue;
+                decoded_offset_payload = true;
+                top_region.offset_channels[rgb_channel.second] = true;
                 const size_t dst_channel = size_t(logical_channel - 1);
                 const uint32_t copy_width = std::min<uint32_t>(decoded.width, uint32_t(rw));
                 const uint32_t copy_height = std::min<uint32_t>(decoded.height, uint32_t(rh));
@@ -432,16 +644,135 @@ bool decode_image_map_raw_filament_offset_atlas(const std::vector<uint8_t> &rgba
             }
         }
 
-        if (region.value("alpha", std::string()) == "projection_mask") {
-            const uint32_t copy_width = std::min<uint32_t>(decoded.width, uint32_t(rw));
-            const uint32_t copy_height = std::min<uint32_t>(decoded.height, uint32_t(rh));
+        if (region.value("alpha", std::string()) == "projection_mask")
+            copy_projection_mask(rx, ry, rw, rh);
+
+        const std::string id = region.value("id", std::string());
+        if (!id.empty() && !top_regions_by_id.emplace(id, top_region).second) {
+            set_error(error, "ImageMap raw filament offset metadata has duplicate region ids.");
+            return false;
+        }
+    }
+
+    const nlohmann::json top_surface = root.value("top_surface", nlohmann::json::object());
+    if (top_surface.is_object() && !top_surface.empty()) {
+        if (top_surface.value("encoding", std::string()) != "surface_infill_layer_labels") {
+            set_error(error, "ImageMap raw filament offset metadata has unsupported top-surface encoding.");
+            return false;
+        }
+
+        std::map<int, unsigned int> slot_by_value;
+        const nlohmann::json filament_values = top_surface.value("filament_values", nlohmann::json::array());
+        if (!filament_values.is_array() || filament_values.empty()) {
+            set_error(error, "ImageMap raw filament offset metadata has invalid top-surface filament values.");
+            return false;
+        }
+        for (const nlohmann::json &entry : filament_values) {
+            if (!entry.is_object())
+                continue;
+            const int value = entry.value("value", -1);
+            const int slot = entry.value("slot", 0);
+            if (value < 0 || value > 255 || slot <= 0 || slot > int(std::numeric_limits<uint16_t>::max())) {
+                set_error(error, "ImageMap raw filament offset metadata has invalid top-surface filament value.");
+                return false;
+            }
+            if (!slot_by_value.emplace(value, unsigned(slot)).second) {
+                set_error(error, "ImageMap raw filament offset metadata has duplicate top-surface filament values.");
+                return false;
+            }
+            decoded.top_surface_filament_values.push_back({ uint8_t(value), unsigned(slot) });
+        }
+        if (slot_by_value.empty()) {
+            set_error(error, "ImageMap raw filament offset metadata has no usable top-surface filament values.");
+            return false;
+        }
+
+        const nlohmann::json top_regions = top_surface.value("regions", nlohmann::json::array());
+        if (top_regions.is_array()) for (const nlohmann::json &region : top_regions) {
+            if (!region.is_object())
+                continue;
+            const std::string id = region.value("id", std::string());
+            const int rx = region.value("x", -1);
+            const int ry = region.value("y", -1);
+            const int rw = region.value("width", 0);
+            const int rh = region.value("height", 0);
+            if (id.empty() || rx < 0 || ry < 0 || rw <= 0 || rh <= 0 ||
+                uint64_t(rx) + uint64_t(rw) > atlas_width ||
+                uint64_t(ry) + uint64_t(rh) > atlas_height) {
+                set_error(error, "ImageMap raw filament offset top-surface region exceeds the atlas image.");
+                return false;
+            }
+            if (!top_regions_by_id.emplace(id, TopRegion{ rx, ry, rw, rh, { { false, false, false } } }).second) {
+                set_error(error, "ImageMap raw filament offset metadata has duplicate top-surface region ids.");
+                return false;
+            }
+            if (region.value("alpha", std::string()) == "projection_mask")
+                copy_projection_mask(rx, ry, rw, rh);
+        }
+
+        const nlohmann::json layers = top_surface.value("layers", nlohmann::json::array());
+        if (!layers.is_array() || layers.empty()) {
+            set_error(error, "ImageMap raw filament offset metadata has invalid top-surface layers.");
+            return false;
+        }
+        std::set<int> used_depths;
+        std::set<std::pair<std::string, std::string>> used_storage;
+        for (const nlohmann::json &layer : layers) {
+            if (!layer.is_object())
+                continue;
+            const int depth = layer.value("depth", -1);
+            const std::string region_id = layer.value("region", std::string());
+            const std::string channel = layer.value("channel", std::string());
+            const auto region_it = top_regions_by_id.find(region_id);
+            size_t channel_idx = size_t(-1);
+            if (channel == "r")
+                channel_idx = 0;
+            else if (channel == "g")
+                channel_idx = 1;
+            else if (channel == "b")
+                channel_idx = 2;
+            if (depth < 0 || region_it == top_regions_by_id.end() || channel_idx >= 3) {
+                set_error(error, "ImageMap raw filament offset metadata has invalid top-surface layer mapping.");
+                return false;
+            }
+            if (region_it->second.offset_channels[channel_idx]) {
+                set_error(error, "ImageMap raw filament offset metadata reuses a raw offset channel for a top-surface layer.");
+                return false;
+            }
+            if (!used_depths.insert(depth).second ||
+                !used_storage.insert(std::make_pair(region_id, channel)).second) {
+                set_error(error, "ImageMap raw filament offset metadata has duplicate top-surface layer mappings.");
+                return false;
+            }
+
+            const TopRegion &region = region_it->second;
+            ImageMapRawTopSurfaceLayer decoded_layer;
+            decoded_layer.depth = depth;
+            decoded_layer.filament_slots.assign(size_t(decoded.width) * size_t(decoded.height), 0);
+            const uint32_t copy_width = std::min<uint32_t>(decoded.width, uint32_t(region.width));
+            const uint32_t copy_height = std::min<uint32_t>(decoded.height, uint32_t(region.height));
             for (uint32_t y = 0; y < copy_height; ++y) {
                 for (uint32_t x = 0; x < copy_width; ++x) {
-                    const size_t src_idx = (size_t(ry + int(y)) * size_t(atlas_width) + size_t(rx + int(x))) * 4 + 3;
-                    decoded.mask[size_t(y) * size_t(decoded.width) + size_t(x)] = rgba[src_idx];
+                    const size_t src_idx = (size_t(region.y + int(y)) * size_t(atlas_width) + size_t(region.x + int(x))) * 4 + channel_idx;
+                    const auto value_it = slot_by_value.find(int(rgba[src_idx]));
+                    if (value_it == slot_by_value.end()) {
+                        set_error(error, "ImageMap raw filament offset top-surface layer has an unknown filament value.");
+                        return false;
+                    }
+                    decoded_layer.filament_slots[size_t(y) * size_t(decoded.width) + size_t(x)] = uint16_t(value_it->second);
                 }
             }
+            decoded.top_surface_layers.emplace_back(std::move(decoded_layer));
         }
+        std::sort(decoded.top_surface_layers.begin(), decoded.top_surface_layers.end(),
+                  [](const ImageMapRawTopSurfaceLayer &lhs, const ImageMapRawTopSurfaceLayer &rhs) {
+                      return lhs.depth < rhs.depth;
+                  });
+    }
+
+    if (!decoded_offset_payload && !has_valid_top_surface_payload(decoded)) {
+        set_error(error, "ImageMap raw filament offset metadata does not contain usable offset or top-surface data.");
+        return false;
     }
 
     out = std::move(decoded);
@@ -463,12 +794,14 @@ bool encode_image_map_raw_filament_offset_atlas(const ImageMapRawFilamentOffsetA
     }
 
     const uint32_t region_count = (atlas.channels + 2u) / 3u;
-    if (region_count == 0 || atlas.width > std::numeric_limits<uint32_t>::max() / region_count) {
+    const uint32_t top_surface_region_count = uint32_t((atlas.top_surface_layers.size() + 2u) / 3u);
+    const uint32_t total_region_count = region_count + top_surface_region_count;
+    if (total_region_count == 0 || atlas.width > std::numeric_limits<uint32_t>::max() / total_region_count) {
         set_error(error, "ImageMap raw filament offset atlas is too wide.");
         return false;
     }
 
-    atlas_width = atlas.width * region_count;
+    atlas_width = atlas.width * total_region_count;
     uint32_t header_rows = 1;
     std::string metadata;
     for (int iter = 0; iter < 8; ++iter) {
@@ -519,6 +852,34 @@ bool encode_image_map_raw_filament_offset_atlas(const ImageMapRawFilamentOffsetA
             }
         }
     }
+    if (top_surface_region_count > 0) {
+        const std::vector<ImageMapRawTopSurfaceFilamentValue> filament_values =
+            normalized_top_surface_filament_values(atlas);
+        for (uint32_t region_idx = 0; region_idx < top_surface_region_count; ++region_idx) {
+            const uint32_t region_x = (region_count + region_idx) * atlas.width;
+            const uint32_t first_layer = region_idx * 3u;
+            for (uint32_t y = 0; y < atlas.height; ++y) {
+                for (uint32_t x = 0; x < atlas.width; ++x) {
+                    const size_t dst = (size_t(header_rows + y) * size_t(atlas_width) + size_t(region_x + x)) * 4;
+                    for (uint32_t c = 0; c < 3; ++c) {
+                        const uint32_t layer_idx = first_layer + c;
+                        if (layer_idx < atlas.top_surface_layers.size()) {
+                            const ImageMapRawTopSurfaceLayer &layer = atlas.top_surface_layers[size_t(layer_idx)];
+                            const size_t src = size_t(y) * size_t(atlas.width) + size_t(x);
+                            const unsigned int slot = src < layer.filament_slots.size() ? layer.filament_slots[src] : 0;
+                            rgba[dst + c] = top_surface_value_for_slot(slot, filament_values);
+                        } else {
+                            rgba[dst + c] = 0;
+                        }
+                    }
+                    rgba[dst + 3] =
+                        region_count == 0 && region_idx == 0 && atlas.mask.size() >= size_t(atlas.width) * size_t(atlas.height) ?
+                        atlas.mask[size_t(y) * size_t(atlas.width) + size_t(x)] :
+                        255;
+                }
+            }
+        }
+    }
 
     std::vector<uint8_t> header;
     header.reserve(FixedHeaderSize + metadata.size());
@@ -539,20 +900,33 @@ std::vector<uint8_t> image_map_raw_filament_offset_preview_rgba(const ImageMapRa
         return preview;
 
     preview.assign(size_t(atlas.width) * size_t(atlas.height) * 4, 255);
+    const bool has_offsets = has_valid_offset_payload(atlas);
     const bool grayscale = atlas.channels == 1;
+    const ImageMapRawTopSurfaceLayer *top_surface_layer =
+        !has_offsets && !atlas.top_surface_layers.empty() ? &atlas.top_surface_layers.front() : nullptr;
     for (uint32_t y = 0; y < atlas.height; ++y) {
         for (uint32_t x = 0; x < atlas.width; ++x) {
             const size_t pixel = size_t(y) * size_t(atlas.width) + size_t(x);
             const size_t src = pixel * size_t(atlas.channels);
             const size_t dst = pixel * 4;
-            if (grayscale) {
+            if (has_offsets && grayscale) {
                 preview[dst + 0] = atlas.offsets[src];
                 preview[dst + 1] = atlas.offsets[src];
                 preview[dst + 2] = atlas.offsets[src];
-            } else {
+            } else if (has_offsets) {
                 preview[dst + 0] = atlas.channels > 0 ? atlas.offsets[src + 0] : 0;
                 preview[dst + 1] = atlas.channels > 1 ? atlas.offsets[src + 1] : 0;
                 preview[dst + 2] = atlas.channels > 2 ? atlas.offsets[src + 2] : 0;
+            } else if (top_surface_layer != nullptr && pixel < top_surface_layer->filament_slots.size()) {
+                const std::array<uint8_t, 3> rgb =
+                    preview_rgb_for_filament_slot(atlas.filaments, top_surface_layer->filament_slots[pixel]);
+                preview[dst + 0] = rgb[0];
+                preview[dst + 1] = rgb[1];
+                preview[dst + 2] = rgb[2];
+            } else {
+                preview[dst + 0] = 0;
+                preview[dst + 1] = 0;
+                preview[dst + 2] = 0;
             }
             preview[dst + 3] = atlas.mask.size() > pixel ? atlas.mask[pixel] : 255;
         }

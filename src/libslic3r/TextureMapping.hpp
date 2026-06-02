@@ -215,7 +215,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultTopSurfaceContoningRecolorSurroundingPerimeters = false;
     static constexpr int   DefaultTopSurfaceContoningPerimeterMode = int(ContoningPerimeterDividedLine);
     static constexpr int   DefaultTopSurfaceContoningFlatSurfaceInfillMode = int(ContoningFlatSurfaceInfillDefault);
-    static constexpr int   SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode = int(ContoningFlatSurfaceInfillBoundarySkinVariable);
+    static constexpr int   SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode = int(ContoningFlatSurfaceInfillRectilinear);
     static constexpr bool  DefaultTopSurfaceContoningLayerPhaseEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningVariedInfillAnglesEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled = false;
@@ -295,7 +295,8 @@ struct TextureMappingZone
                                             int(ContoningFlatSurfaceInfillRectilinearWithBoundary));
         if (ShowExperimentalTopSurfaceContoningOptions)
             return clamped_mode;
-        return clamped_mode == int(ContoningFlatSurfaceInfillRectilinear) ?
+        return clamped_mode == int(ContoningFlatSurfaceInfillRectilinear) ||
+               clamped_mode == int(ContoningFlatSurfaceInfillBoundarySkinVariable) ?
             clamped_mode :
             DefaultTopSurfaceContoningFlatSurfaceInfillMode;
     }

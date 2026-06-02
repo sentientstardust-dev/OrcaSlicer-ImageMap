@@ -365,6 +365,7 @@ struct SurfaceFillParams
     float texture_mapping_top_surface_max_width_mm = TextureMappingZone::DefaultTopSurfaceImageMaxLineWidthMm;
     bool texture_mapping_top_surface_same_layer_partition = false;
     bool texture_mapping_top_surface_contoning = false;
+    bool texture_mapping_top_surface_raw_labels = false;
     int texture_mapping_top_surface_component_index = 0;
     int texture_mapping_top_surface_component_count = 0;
     int texture_mapping_top_surface_contoning_flat_surface_infill_mode = TextureMappingZone::SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode;
@@ -411,6 +412,7 @@ struct SurfaceFillParams
         RETURN_COMPARE_NON_EQUAL(texture_mapping_top_surface_max_width_mm);
         RETURN_COMPARE_NON_EQUAL(texture_mapping_top_surface_same_layer_partition);
         RETURN_COMPARE_NON_EQUAL(texture_mapping_top_surface_contoning);
+        RETURN_COMPARE_NON_EQUAL(texture_mapping_top_surface_raw_labels);
         RETURN_COMPARE_NON_EQUAL(texture_mapping_top_surface_component_index);
         RETURN_COMPARE_NON_EQUAL(texture_mapping_top_surface_component_count);
         RETURN_COMPARE_NON_EQUAL(texture_mapping_top_surface_contoning_flat_surface_infill_mode);
@@ -452,6 +454,7 @@ struct SurfaceFillParams
                 this->texture_mapping_top_surface_max_width_mm == rhs.texture_mapping_top_surface_max_width_mm &&
                 this->texture_mapping_top_surface_same_layer_partition == rhs.texture_mapping_top_surface_same_layer_partition &&
                 this->texture_mapping_top_surface_contoning == rhs.texture_mapping_top_surface_contoning &&
+                this->texture_mapping_top_surface_raw_labels == rhs.texture_mapping_top_surface_raw_labels &&
                 this->texture_mapping_top_surface_component_index == rhs.texture_mapping_top_surface_component_index &&
                 this->texture_mapping_top_surface_component_count == rhs.texture_mapping_top_surface_component_count &&
                 this->texture_mapping_top_surface_contoning_flat_surface_infill_mode == rhs.texture_mapping_top_surface_contoning_flat_surface_infill_mode &&
@@ -478,6 +481,7 @@ struct TopSurfaceImageStackSlice {
     size_t component_count = 0;
     bool same_layer_partition = false;
     bool contoning = false;
+    bool raw_top_surface_labels = false;
     bool lower_surface = false;
     float angle_rad = float(PI / 4.0);
     ExPolygons area;
@@ -1797,7 +1801,10 @@ static ExPolygons top_surface_image_contoning_clean_area_impl(ExPolygons &&compo
         return {};
     check_canceled(throw_if_canceled);
     ExPolygons out = top_surface_clip_union_ex(component_area);
-    const float closing_radius = float(scale_(std::clamp(min_feature_mm * 0.18f, 0.05f, 0.45f)));
+    const bool preserve_small_features = min_feature_mm < 0.f;
+    const float effective_min_feature_mm = std::max(0.f, min_feature_mm);
+    const float closing_radius = preserve_small_features ? 0.f :
+        float(scale_(std::clamp(effective_min_feature_mm * 0.18f, 0.05f, 0.45f)));
     if (closing_radius > float(SCALED_EPSILON))
         out = top_surface_clip_closing_ex(out, closing_radius, ClipperLib::jtRound);
     if (out.empty())
@@ -1809,9 +1816,11 @@ static ExPolygons top_surface_image_contoning_clean_area_impl(ExPolygons &&compo
     if (out.empty())
         return {};
     check_canceled(throw_if_canceled);
+    if (preserve_small_features)
+        return top_surface_clip_union_ex(out);
 
     ExPolygons simplified;
-    const double tolerance = scale_(std::clamp(min_feature_mm * 0.12f, 0.03f, 0.25f));
+    const double tolerance = scale_(std::clamp(effective_min_feature_mm * 0.12f, 0.03f, 0.25f));
     for (const ExPolygon &expolygon : out) {
         check_canceled(throw_if_canceled);
         append(simplified, expolygon.simplify(tolerance));
@@ -1820,7 +1829,7 @@ static ExPolygons top_surface_image_contoning_clean_area_impl(ExPolygons &&compo
         return {};
 
     ExPolygons filtered;
-    const double min_area_mm2 = std::max(0.05, double(min_feature_mm) * double(min_feature_mm) * 0.08);
+    const double min_area_mm2 = std::max(0.05, double(effective_min_feature_mm) * double(effective_min_feature_mm) * 0.08);
     for (ExPolygon &expolygon : simplified)
         if (top_surface_image_scaled_area_mm2(expolygon.area()) >= min_area_mm2)
             filtered.emplace_back(std::move(expolygon));
@@ -1946,15 +1955,16 @@ static ExPolygons top_surface_image_contoning_clean_area(ExPolygons &&component_
                                                          bool cleanup_optimizations_enabled,
                                                          const ThrowIfCanceled *throw_if_canceled)
 {
-    if (!cleanup_optimizations_enabled || component_area.size() <= 1)
+    if (min_feature_mm < 0.f || !cleanup_optimizations_enabled || component_area.size() <= 1)
         return top_surface_image_contoning_clean_area_impl(std::move(component_area),
                                                            clip_area,
                                                            blocked_area,
                                                            min_feature_mm,
                                                            throw_if_canceled);
 
-    const float closing_radius = float(scale_(std::clamp(min_feature_mm * 0.18f, 0.05f, 0.45f)));
-    const double tolerance = scale_(std::clamp(min_feature_mm * 0.12f, 0.03f, 0.25f));
+    const float effective_min_feature_mm = std::max(0.f, min_feature_mm);
+    const float closing_radius = float(scale_(std::clamp(effective_min_feature_mm * 0.18f, 0.05f, 0.45f)));
+    const double tolerance = scale_(std::clamp(effective_min_feature_mm * 0.12f, 0.03f, 0.25f));
     const coord_t grouping_margin =
         std::max<coord_t>(0, coord_t(std::ceil(double(closing_radius) + tolerance + double(SCALED_EPSILON))));
     std::vector<ExPolygons> groups =
@@ -2376,6 +2386,7 @@ struct TopSurfaceImageContoningStackPlanKey {
     bool recolor_surrounding_perimeters { false };
     bool supersampled { false };
     bool blue_noise { false };
+    bool raw_top_surface_labels { false };
     bool polygonize { false };
     bool fast_mode { false };
     int polygonization_mode { TextureMappingZone::DefaultTopSurfaceContoningPolygonizationMode };
@@ -2415,6 +2426,7 @@ struct TopSurfaceImageContoningStackPlanKey {
                         recolor_surrounding_perimeters,
                         supersampled,
                         blue_noise,
+                        raw_top_surface_labels,
                         polygonize,
                         fast_mode,
                         polygonization_mode,
@@ -2451,6 +2463,7 @@ struct TopSurfaceImageContoningStackPlanKey {
                         rhs.recolor_surrounding_perimeters,
                         rhs.supersampled,
                         rhs.blue_noise,
+                        rhs.raw_top_surface_labels,
                         rhs.polygonize,
                         rhs.fast_mode,
                         rhs.polygonization_mode,
@@ -5559,7 +5572,8 @@ static std::optional<TopSurfaceImageContoningSourceContext> top_surface_image_co
     const TextureMappingContoningSolver  &solver,
     TopSurfaceImageSourceSurface          source_surface,
     const std::vector<ExPolygons>        *stack_area_extensions,
-    const ThrowIfCanceled                *throw_if_canceled)
+    const ThrowIfCanceled                *throw_if_canceled,
+    std::optional<int>                    raw_top_surface_depth_override = std::nullopt)
 {
     if (!solver.valid())
         return std::nullopt;
@@ -5582,7 +5596,8 @@ static std::optional<TopSurfaceImageContoningSourceContext> top_surface_image_co
                                                                                                 solver.component_ids(),
                                                                                                 zone.generic_solver_mix_model),
                                                        sample_z_mm,
-                                                       top_surface_image_contoning_texture_sample_pitch_mm(plan));
+                                                       top_surface_image_contoning_texture_sample_pitch_mm(plan),
+                                                       raw_top_surface_depth_override);
     if (!offset_context)
         return std::nullopt;
 
@@ -5616,6 +5631,33 @@ static std::optional<TopSurfaceImageContoningSourceContext> top_surface_image_co
             out.normal_filter_bypass_area = top_surface_clip_union_ex(out.normal_filter_bypass_area);
     }
     return out;
+}
+
+static bool top_surface_image_object_has_raw_top_surface_depth(const PrintObject &object, int depth)
+{
+    if (depth < 0)
+        return false;
+    const ModelObject *model_object = object.model_object();
+    if (model_object == nullptr)
+        return false;
+    for (const ModelVolume *volume : model_object->volumes) {
+        if (volume == nullptr ||
+            volume->imported_texture_width == 0 ||
+            volume->imported_texture_height == 0 ||
+            volume->imported_texture_raw_top_surface_depths.empty())
+            continue;
+        const size_t pixel_count =
+            size_t(volume->imported_texture_width) * size_t(volume->imported_texture_height);
+        if (pixel_count == 0 ||
+            volume->imported_texture_raw_top_surface_filament_slots.size() <
+                pixel_count * volume->imported_texture_raw_top_surface_depths.size())
+            continue;
+        if (std::find(volume->imported_texture_raw_top_surface_depths.begin(),
+                      volume->imported_texture_raw_top_surface_depths.end(),
+                      depth) != volume->imported_texture_raw_top_surface_depths.end())
+            return true;
+    }
+    return false;
 }
 
 static void top_surface_image_contoning_solve_anchored_region(
@@ -6082,6 +6124,585 @@ static void top_surface_image_contoning_solve_anchored_region(
     }
 }
 
+static std::array<float, 3> top_surface_image_contoning_raw_top_surface_component_rgb(
+    const std::vector<std::optional<TopSurfaceImageContoningSourceContext>> &source_contexts,
+    unsigned int                                                             component_id)
+{
+    for (const std::optional<TopSurfaceImageContoningSourceContext> &source_context : source_contexts) {
+        if (!source_context)
+            continue;
+        const TextureMappingOffsetContext &context = source_context->offset_context;
+        const auto component_it = std::find(context.component_ids.begin(), context.component_ids.end(), component_id);
+        if (component_it == context.component_ids.end())
+            continue;
+        const size_t component_idx = size_t(component_it - context.component_ids.begin());
+        if (component_idx < context.component_colors.size())
+            return context.component_colors[component_idx];
+    }
+    return { { 0.f, 0.f, 0.f } };
+}
+
+static void top_surface_image_contoning_convert_raw_top_surface_anchored_region(
+    TopSurfaceImageContoningAnchoredSurfaceRegion &anchored_region,
+    const TopSurfaceImageRegionPlan               &plan,
+    const PrintObject                             &object,
+    const Layer                                   &source_layer,
+    const std::vector<std::optional<TopSurfaceImageContoningSourceContext>> &source_contexts,
+    TopSurfaceImageContoningAnchoredSurfaceBuildState *build_state,
+    size_t                                         debug_region_idx,
+    const ThrowIfCanceled                         *throw_if_canceled)
+{
+    const bool debug_enabled = top_surface_image_debug_enabled();
+    const auto debug_total_start = top_surface_image_debug_now();
+    const auto debug_grid_start = debug_total_start;
+    TopSurfaceImageDebugAnchoredRegionTiming debug_timing;
+    if (anchored_region.union_area.empty() || source_contexts.empty())
+        return;
+    check_canceled(throw_if_canceled);
+
+    const int stack_layers = int(source_contexts.size());
+    std::vector<int> active_depths;
+    active_depths.reserve(size_t(stack_layers));
+    for (int depth = 0; depth < stack_layers; ++depth) {
+        if (source_contexts[size_t(depth)] &&
+            source_contexts[size_t(depth)]->offset_context.weight_field.raw_top_surface_labels_from_texture &&
+            !source_contexts[size_t(depth)]->offset_context.component_ids.empty() &&
+            depth < int(anchored_region.depth_areas.size()) &&
+            !anchored_region.depth_areas[size_t(depth)].empty())
+            active_depths.emplace_back(depth);
+    }
+    if (active_depths.empty())
+        return;
+
+    const BoundingBox bbox = get_extents(anchored_region.union_area);
+    if (!bbox.defined)
+        return;
+
+    const float pitch_mm = top_surface_image_contoning_sample_pitch_mm(plan, bbox);
+    const coord_t step = std::max<coord_t>(1, scale_(double(pitch_mm)));
+    const coord_t min_x = (bbox.min.x() / step) * step;
+    const coord_t min_y = (bbox.min.y() / step) * step;
+    const int cols = std::max(0, int(std::ceil(double(bbox.max.x() - min_x) / double(step))));
+    const int rows = std::max(0, int(std::ceil(double(bbox.max.y() - min_y) / double(step))));
+    if (cols <= 0 || rows <= 0)
+        return;
+    const size_t grid_cells = size_t(cols) * size_t(rows);
+    const int sampling_progress_total = int(std::min<size_t>(grid_cells, size_t(std::numeric_limits<int>::max())));
+
+    top_surface_image_contoning_report_anchored_progress(object,
+                                                         source_layer,
+                                                         TopSurfaceImageSourceSurface::Top,
+                                                         L("sampling"),
+                                                         0,
+                                                         sampling_progress_total);
+
+    std::vector<int> grid(grid_cells, -1);
+    std::vector<TopSurfaceImageContoningVectorLabel> labels;
+    std::map<std::pair<std::vector<unsigned int>, int>, int> label_by_stack;
+
+    const int debug_stride = debug_enabled ?
+        std::max(1, int(std::ceil(std::sqrt(double(grid_cells) / 100000.0)))) :
+        0;
+    if (debug_enabled) {
+        debug_timing.grid_cols = cols;
+        debug_timing.grid_rows = rows;
+        top_surface_image_debug_accumulate_timing_step(debug_timing.steps,
+                                                       "raw_grid_setup",
+                                                       top_surface_image_debug_elapsed_ms(debug_grid_start),
+                                                       grid_cells,
+                                                       true);
+    }
+
+    struct RawCellStack {
+        std::vector<unsigned int> bottom_to_top;
+        std::array<float, 3> rgb { { 0.f, 0.f, 0.f } };
+        int valid_depth { 0 };
+        int sample_count { 0 };
+    };
+
+    auto component_rgb = [&](unsigned int component_id) {
+        return top_surface_image_contoning_raw_top_surface_component_rgb(source_contexts, component_id);
+    };
+
+    auto stack_rgb = [&](const std::vector<unsigned int> &bottom_to_top) {
+        for (int depth = 0; depth < stack_layers; ++depth) {
+            const int stack_idx = stack_layers - 1 - depth;
+            if (stack_idx < 0 || stack_idx >= int(bottom_to_top.size()))
+                continue;
+            const unsigned int component_id = bottom_to_top[size_t(stack_idx)];
+            if (component_id != 0)
+                return component_rgb(component_id);
+        }
+        return std::array<float, 3>{ { 0.f, 0.f, 0.f } };
+    };
+
+    auto sample_cell = [&](int row, int col) {
+        const coord_t x0 = min_x + coord_t(col) * step;
+        const coord_t y0 = min_y + coord_t(row) * step;
+        const coord_t x1 = std::min<coord_t>(x0 + step, bbox.max.x());
+        const coord_t y1 = std::min<coord_t>(y0 + step, bbox.max.y());
+        if (x1 <= x0 || y1 <= y0)
+            return std::optional<RawCellStack>();
+
+        std::vector<std::vector<float>> depth_scores(static_cast<size_t>(stack_layers));
+        std::vector<int> depth_sample_counts(size_t(stack_layers), 0);
+        int available_depth = 0;
+
+        auto add_sample = [&](const Point &sample_point) {
+            if (!top_surface_image_expolygons_contain_point(anchored_region.union_area, sample_point))
+                return;
+            const int local_stack_layers =
+                top_surface_image_contoning_local_stack_layers_at_point(sample_point,
+                                                                        anchored_region.depth_areas,
+                                                                        stack_layers);
+            if (local_stack_layers <= 0)
+                return;
+            bool sample_has_label = false;
+            const float sample_x_mm = unscale<float>(sample_point.x());
+            const float sample_y_mm = unscale<float>(sample_point.y());
+            for (int depth : active_depths) {
+                if (depth >= local_stack_layers)
+                    break;
+                const std::optional<TopSurfaceImageContoningSourceContext> &source_context = source_contexts[size_t(depth)];
+                if (!source_context)
+                    continue;
+                if (depth >= int(anchored_region.depth_areas.size()) ||
+                    anchored_region.depth_areas[size_t(depth)].empty() ||
+                    !top_surface_image_expolygons_contain_point(anchored_region.depth_areas[size_t(depth)], sample_point))
+                    continue;
+                const TextureMappingOffsetContext &context = source_context->offset_context;
+                if (source_context->normal_filter_bypass_area.empty() ||
+                    !top_surface_image_expolygons_contain_point(source_context->normal_filter_bypass_area, sample_point)) {
+                    if (!top_surface_image_contoning_sample_eligible(context,
+                                                                     sample_x_mm,
+                                                                     sample_y_mm,
+                                                                     source_context->threshold_deg,
+                                                                     TopSurfaceImageSourceSurface::Top))
+                        continue;
+                }
+                const std::vector<float> weights =
+                    texture_mapping_offset_component_weights_at_point(context,
+                                                                      sample_x_mm,
+                                                                      sample_y_mm,
+                                                                      std::numeric_limits<float>::quiet_NaN());
+                if (weights.size() != context.component_ids.size())
+                    continue;
+                size_t best_idx = size_t(-1);
+                float best_weight = 0.f;
+                for (size_t component_idx = 0; component_idx < weights.size(); ++component_idx) {
+                    const float weight = weights[component_idx];
+                    if (std::isfinite(weight) && weight > best_weight) {
+                        best_weight = weight;
+                        best_idx = component_idx;
+                    }
+                }
+                if (best_idx == size_t(-1) || best_weight < 0.5f)
+                    continue;
+                std::vector<float> &scores = depth_scores[size_t(depth)];
+                if (scores.empty())
+                    scores.assign(context.component_ids.size(), 0.f);
+                if (best_idx >= scores.size())
+                    continue;
+                scores[best_idx] += best_weight;
+                ++depth_sample_counts[size_t(depth)];
+                sample_has_label = true;
+            }
+            if (sample_has_label)
+                available_depth = available_depth == 0 ? local_stack_layers : std::min(available_depth, local_stack_layers);
+        };
+
+        if (plan.contoning_supersampled_cells_enabled) {
+            static constexpr std::array<std::pair<double, double>, 5> offsets {
+                std::pair<double, double>{ 0.5, 0.5 },
+                std::pair<double, double>{ 0.25, 0.25 },
+                std::pair<double, double>{ 0.75, 0.25 },
+                std::pair<double, double>{ 0.25, 0.75 },
+                std::pair<double, double>{ 0.75, 0.75 }
+            };
+            for (const std::pair<double, double> &offset : offsets) {
+                const coord_t x = coord_t(std::llround(double(x0) + double(x1 - x0) * offset.first));
+                const coord_t y = coord_t(std::llround(double(y0) + double(y1 - y0) * offset.second));
+                add_sample(Point(x, y));
+            }
+        } else {
+            add_sample(Point((x0 + x1) / 2, (y0 + y1) / 2));
+        }
+
+        std::vector<unsigned int> bottom_to_top(size_t(stack_layers), 0);
+        int total_sample_count = 0;
+        int deepest_resolved_depth = -1;
+        for (int depth : active_depths) {
+            const int sample_count = depth_sample_counts[size_t(depth)];
+            if (sample_count <= 0 || depth_scores[size_t(depth)].empty())
+                continue;
+            const std::vector<float> &scores = depth_scores[size_t(depth)];
+            size_t best_idx = size_t(-1);
+            float best_score = 0.f;
+            for (size_t component_idx = 0; component_idx < scores.size(); ++component_idx) {
+                if (scores[component_idx] > best_score) {
+                    best_score = scores[component_idx];
+                    best_idx = component_idx;
+                }
+            }
+            const std::optional<TopSurfaceImageContoningSourceContext> &source_context = source_contexts[size_t(depth)];
+            if (!source_context ||
+                best_idx == size_t(-1) ||
+                best_score <= EPSILON ||
+                best_idx >= source_context->offset_context.component_ids.size())
+                continue;
+            const unsigned int component_id = source_context->offset_context.component_ids[best_idx];
+            if (component_id == 0)
+                continue;
+            bottom_to_top[size_t(stack_layers - 1 - depth)] = component_id;
+            total_sample_count += sample_count;
+            deepest_resolved_depth = std::max(deepest_resolved_depth, depth);
+        }
+        if (total_sample_count <= 0 || deepest_resolved_depth < 0)
+            return std::optional<RawCellStack>();
+        const int min_available_depth = deepest_resolved_depth + 1;
+        if (available_depth <= 0)
+            available_depth = min_available_depth;
+        available_depth = std::clamp(available_depth, min_available_depth, stack_layers);
+
+        RawCellStack out;
+        out.bottom_to_top = std::move(bottom_to_top);
+        out.rgb = stack_rgb(out.bottom_to_top);
+        out.valid_depth = available_depth;
+        out.sample_count = total_sample_count;
+        return std::optional<RawCellStack>(std::move(out));
+    };
+
+    std::vector<std::optional<RawCellStack>> cell_raw_stacks(grid.size());
+    std::vector<std::optional<TopSurfaceImageContoningCellSample>> cell_samples(grid.size());
+    std::vector<int> cell_available_depths(grid.size(), 0);
+    std::atomic<size_t> debug_sampled_cell_count { 0 };
+    std::mutex debug_sample_area_mutex;
+    const auto debug_sampling_start = top_surface_image_debug_now();
+    auto sample_raw_cell = [&](size_t grid_idx) {
+        const int row = int(grid_idx / size_t(cols));
+        const int col = int(grid_idx - size_t(row) * size_t(cols));
+        if ((row & 15) == 0 && col == 0)
+            check_canceled(throw_if_canceled);
+        std::optional<RawCellStack> raw_stack = sample_cell(row, col);
+        if (!raw_stack)
+            return;
+        TopSurfaceImageContoningCellSample sample;
+        sample.rgb = raw_stack->rgb;
+        sample.solve_layers = raw_stack->valid_depth;
+        sample.available_depth = raw_stack->valid_depth;
+        sample.sample_count = raw_stack->sample_count;
+        cell_available_depths[grid_idx] = raw_stack->valid_depth;
+        cell_samples[grid_idx] = sample;
+        cell_raw_stacks[grid_idx] = std::move(raw_stack);
+        ++debug_sampled_cell_count;
+        if (debug_stride > 0 &&
+            row % debug_stride == 0 &&
+            col % debug_stride == 0) {
+            const coord_t x0 = min_x + coord_t(col) * step;
+            const coord_t y0 = min_y + coord_t(row) * step;
+            const coord_t x1 = std::min<coord_t>(x0 + coord_t(debug_stride) * step, bbox.max.x());
+            const coord_t y1 = std::min<coord_t>(y0 + coord_t(debug_stride) * step, bbox.max.y());
+            if (x1 > x0 && y1 > y0) {
+                TopSurfaceImageContoningDebugSampleArea debug_area;
+                debug_area.rgb = sample.rgb;
+                debug_area.area.emplace_back(top_surface_image_cell_expolygon(x0, y0, x1, y1));
+                if (debug_enabled) {
+                    std::lock_guard<std::mutex> lock(debug_sample_area_mutex);
+                    anchored_region.debug_sample_areas.emplace_back(std::move(debug_area));
+                }
+            }
+        }
+    };
+
+    auto report_sampling_progress = [&](size_t completed) {
+        if (completed != grid_cells && (completed & 4095) != 0)
+            return;
+        const int current = int(std::min<size_t>(completed, size_t(sampling_progress_total)));
+        top_surface_image_contoning_report_anchored_progress(object,
+                                                             source_layer,
+                                                             TopSurfaceImageSourceSurface::Top,
+                                                             L("sampling"),
+                                                             current,
+                                                             sampling_progress_total);
+    };
+
+    std::shared_ptr<TopSurfaceImageContoningAnchoredIndexWork> sample_work =
+        std::make_shared<TopSurfaceImageContoningAnchoredIndexWork>(grid_cells,
+                                                                    sample_raw_cell,
+                                                                    report_sampling_progress);
+    if (build_state != nullptr)
+        build_state->set_work(sample_work);
+    try {
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, sample_work->task_count(), 1),
+            [&](const tbb::blocked_range<size_t> &range) {
+                for (size_t idx = range.begin(); idx != range.end(); ++idx)
+                    sample_work->run_one();
+            });
+        sample_work->wait();
+    } catch (...) {
+        if (build_state != nullptr)
+            build_state->clear_work(sample_work);
+        throw;
+    }
+    if (build_state != nullptr)
+        build_state->clear_work(sample_work);
+
+    auto label_for_raw_stack = [&](const RawCellStack &raw_stack) {
+        const auto label_key = std::make_pair(raw_stack.bottom_to_top, std::max(0, raw_stack.valid_depth));
+        auto label_it = label_by_stack.find(label_key);
+        if (label_it != label_by_stack.end())
+            return label_it->second;
+        TopSurfaceImageContoningVectorLabel label;
+        label.bottom_to_top = raw_stack.bottom_to_top;
+        label.rgb = raw_stack.rgb;
+        label.oklab = color_solver_oklab_from_srgb(label.rgb);
+        label.valid_depth = raw_stack.valid_depth;
+        label.repeat_allowed = false;
+        const int label_idx = int(labels.size());
+        labels.emplace_back(std::move(label));
+        label_by_stack.emplace(label_key, label_idx);
+        return label_idx;
+    };
+
+    for (int row = 0; row < rows; ++row) {
+        if ((row & 15) == 0)
+            check_canceled(throw_if_canceled);
+        for (int col = 0; col < cols; ++col) {
+            const size_t grid_idx = size_t(row * cols + col);
+            if (!cell_raw_stacks[grid_idx])
+                continue;
+            grid[grid_idx] = label_for_raw_stack(*cell_raw_stacks[grid_idx]);
+        }
+    }
+    if (debug_enabled) {
+        debug_timing.sampled_cell_count = debug_sampled_cell_count.load();
+        top_surface_image_debug_accumulate_timing_step(debug_timing.steps,
+                                                       "sample_raw_label_cells",
+                                                       top_surface_image_debug_elapsed_ms(debug_sampling_start),
+                                                       debug_sampled_cell_count.load(),
+                                                       true);
+    }
+
+    if (labels.empty())
+        return;
+    if (debug_enabled)
+        debug_timing.label_count = labels.size();
+
+    const float raw_label_min_feature_mm = -1.f;
+    auto debug_step_start = top_surface_image_debug_now();
+    if (debug_enabled) {
+        anchored_region.debug_regions =
+            top_surface_image_contoning_debug_regions_from_grid(grid,
+                                                                cols,
+                                                                rows,
+                                                                labels,
+                                                                cell_samples,
+                                                                min_x,
+                                                                min_y,
+                                                                step,
+                                                                bbox,
+                                                                throw_if_canceled);
+        top_surface_image_debug_accumulate_timing_step(debug_timing.steps,
+                                                       "raw_debug_region_metadata",
+                                                       top_surface_image_debug_elapsed_ms(debug_step_start),
+                                                       anchored_region.debug_regions.size(),
+                                                       true);
+        debug_step_start = top_surface_image_debug_now();
+        anchored_region.stack_regions =
+            top_surface_image_contoning_stack_regions_from_grid(grid,
+                                                                cols,
+                                                                rows,
+                                                                labels,
+                                                                min_x,
+                                                                min_y,
+                                                                step,
+                                                                bbox,
+                                                                anchored_region.union_area,
+                                                                raw_label_min_feature_mm,
+                                                                plan.contoning_polygonize_color_regions_enabled,
+                                                                plan.contoning_fast_mode_enabled,
+                                                                plan.contoning_polygonization_mode,
+                                                                false,
+                                                                throw_if_canceled);
+        top_surface_image_debug_accumulate_timing_step(debug_timing.steps,
+                                                       "raw_debug_stack_region_vectorization",
+                                                       top_surface_image_debug_elapsed_ms(debug_step_start),
+                                                       anchored_region.stack_regions.size(),
+                                                       true);
+    }
+
+    anchored_region.depth_regions.resize(size_t(stack_layers));
+    if (debug_enabled) {
+        debug_timing.active_depth_count = active_depths.size();
+        debug_timing.depth_parallel = active_depths.size() > 1;
+    }
+
+    std::vector<TopSurfaceImageDebugDepthTiming> debug_depth_timings(static_cast<size_t>(stack_layers));
+    std::vector<unsigned char> debug_depth_timing_present(size_t(stack_layers), 0);
+
+    auto build_depth_regions = [&](int depth) {
+        check_canceled(throw_if_canceled);
+        const auto debug_depth_start = top_surface_image_debug_now();
+        const ExPolygons &depth_area = anchored_region.depth_areas[size_t(depth)];
+        std::vector<TopSurfaceImageContoningVectorRegion> regions =
+            top_surface_image_contoning_component_regions_from_grid(grid,
+                                                                    cols,
+                                                                    rows,
+                                                                    labels,
+                                                                    &cell_available_depths,
+                                                                    depth,
+                                                                    min_x,
+                                                                    min_y,
+                                                                    step,
+                                                                    bbox,
+                                                                    depth_area,
+                                                                    raw_label_min_feature_mm,
+                                                                    plan.contoning_polygonize_color_regions_enabled,
+                                                                    plan.contoning_fast_mode_enabled,
+                                                                    plan.contoning_polygonization_mode,
+                                                                    false,
+                                                                    false,
+                                                                    throw_if_canceled);
+        if (debug_enabled && depth < int(debug_depth_timings.size())) {
+            TopSurfaceImageDebugDepthTiming timing;
+            timing.depth = depth;
+            if (depth < int(anchored_region.depth_layer_ids.size()))
+                timing.layer_id = anchored_region.depth_layer_ids[size_t(depth)];
+            if (depth < int(anchored_region.depth_zs.size()) && std::isfinite(anchored_region.depth_zs[size_t(depth)])) {
+                timing.z_mm = anchored_region.depth_zs[size_t(depth)];
+                timing.has_z = true;
+            }
+            timing.duration_ms = top_surface_image_debug_elapsed_ms(debug_depth_start);
+            timing.region_count = regions.size();
+            for (const TopSurfaceImageContoningVectorRegion &region : regions)
+                timing.cell_count += size_t(std::max(0, region.cell_count));
+            debug_depth_timings[size_t(depth)] = timing;
+            debug_depth_timing_present[size_t(depth)] = 1;
+        }
+        return regions;
+    };
+
+    top_surface_image_contoning_report_anchored_progress(object,
+                                                         source_layer,
+                                                         TopSurfaceImageSourceSurface::Top,
+                                                         L("processing"),
+                                                         0,
+                                                         int(active_depths.size()));
+    const auto debug_depth_regions_start = top_surface_image_debug_now();
+    if (active_depths.size() <= 1) {
+        const int depth = active_depths.front();
+        anchored_region.depth_regions[size_t(depth)] = build_depth_regions(depth);
+    } else if (build_state != nullptr) {
+        auto store_depth_regions = [&](int depth, std::vector<TopSurfaceImageContoningVectorRegion> &&regions) {
+            anchored_region.depth_regions[size_t(depth)] = std::move(regions);
+        };
+        auto report_progress = [&](int completed) {
+            if (completed == int(active_depths.size()) || (completed & 3) == 0)
+                top_surface_image_contoning_report_anchored_progress(object,
+                                                                     source_layer,
+                                                                     TopSurfaceImageSourceSurface::Top,
+                                                                     L("processing"),
+                                                                     completed,
+                                                                     int(active_depths.size()));
+        };
+        std::shared_ptr<TopSurfaceImageContoningAnchoredDepthWork> depth_work =
+            std::make_shared<TopSurfaceImageContoningAnchoredDepthWork>(active_depths,
+                                                                        build_depth_regions,
+                                                                        store_depth_regions,
+                                                                        report_progress);
+        build_state->set_work(depth_work);
+        try {
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, active_depths.size(), 1),
+                [&](const tbb::blocked_range<size_t> &range) {
+                    for (size_t idx = range.begin(); idx != range.end(); ++idx)
+                        depth_work->run_one();
+                });
+            depth_work->wait();
+        } catch (...) {
+            build_state->clear_work(depth_work);
+            throw;
+        }
+        build_state->clear_work(depth_work);
+    } else {
+        std::atomic<int> completed_depths { 0 };
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, active_depths.size(), 1),
+            [&](const tbb::blocked_range<size_t> &range) {
+                for (size_t idx = range.begin(); idx != range.end(); ++idx) {
+                    const int depth = active_depths[idx];
+                    anchored_region.depth_regions[size_t(depth)] = build_depth_regions(depth);
+                    const int completed = ++completed_depths;
+                    if (completed == int(active_depths.size()) || (completed & 3) == 0)
+                        top_surface_image_contoning_report_anchored_progress(object,
+                                                                             source_layer,
+                                                                             TopSurfaceImageSourceSurface::Top,
+                                                                             L("processing"),
+                                                                             completed,
+                                                                             int(active_depths.size()));
+                }
+            });
+    }
+    if (debug_enabled)
+        top_surface_image_debug_accumulate_timing_step(debug_timing.steps,
+                                                       "raw_depth_region_vectorization",
+                                                       top_surface_image_debug_elapsed_ms(debug_depth_regions_start),
+                                                       active_depths.size(),
+                                                       true);
+    top_surface_image_contoning_report_anchored_progress(object,
+                                                         source_layer,
+                                                         TopSurfaceImageSourceSurface::Top,
+                                                         L("processing"),
+                                                         int(active_depths.size()),
+                                                         int(active_depths.size()));
+
+    if (debug_enabled) {
+        const bool has_depth_regions =
+            std::any_of(anchored_region.depth_regions.begin(),
+                        anchored_region.depth_regions.end(),
+                        [](const std::vector<TopSurfaceImageContoningVectorRegion> &regions) {
+                            return !regions.empty();
+                        });
+        if (has_depth_regions) {
+            const std::string base =
+                top_surface_image_debug_anchored_base_filename(plan,
+                                                               source_layer,
+                                                               object,
+                                                               TopSurfaceImageSourceSurface::Top,
+                                                               debug_region_idx);
+            const double source_z_mm = source_layer.print_z;
+            debug_step_start = top_surface_image_debug_now();
+            top_surface_image_debug_export_anchored_rasters(base,
+                                                            grid,
+                                                            cols,
+                                                            rows,
+                                                            labels,
+                                                            cell_samples,
+                                                            cell_available_depths,
+                                                            active_depths,
+                                                            min_x,
+                                                            min_y,
+                                                            step,
+                                                            source_z_mm,
+                                                            anchored_region.depth_zs,
+                                                            false,
+                                                            anchored_region.debug_raster_files,
+                                                            throw_if_canceled);
+            top_surface_image_debug_accumulate_timing_step(debug_timing.steps,
+                                                           "raw_debug_raster_export",
+                                                           top_surface_image_debug_elapsed_ms(debug_step_start),
+                                                           anchored_region.debug_raster_files.size(),
+                                                           true);
+            for (int depth : active_depths)
+                if (depth >= 0 &&
+                    depth < int(debug_depth_timing_present.size()) &&
+                    debug_depth_timing_present[size_t(depth)])
+                    debug_timing.depth_timings.emplace_back(debug_depth_timings[size_t(depth)]);
+            debug_timing.total_ms = top_surface_image_debug_elapsed_ms(debug_total_start);
+            anchored_region.has_debug_timing = true;
+            anchored_region.debug_timing = std::move(debug_timing);
+        }
+    }
+}
+
 static std::shared_ptr<TopSurfaceImageContoningAnchoredSurfacePlan> top_surface_image_contoning_build_anchored_surface_plan(
     const TopSurfaceImageRegionPlan      &plan,
     const Layer                          &source_layer,
@@ -6308,6 +6929,256 @@ static std::shared_ptr<TopSurfaceImageContoningAnchoredSurfacePlan> top_surface_
     return out;
 }
 
+static std::shared_ptr<TopSurfaceImageContoningAnchoredSurfacePlan> top_surface_image_contoning_build_raw_top_surface_anchored_surface_plan(
+    const TopSurfaceImageRegionPlan      &plan,
+    const Layer                          &source_layer,
+    const PrintObject                    &object,
+    const TextureMappingZone             &zone,
+    const PrintConfig                    &print_config,
+    const TextureMappingContoningSolver  &solver,
+    const std::vector<ExPolygons>        *stack_area_extensions,
+    TopSurfaceImageContoningAnchoredSurfaceBuildState *build_state,
+    const ThrowIfCanceled                *throw_if_canceled)
+{
+    std::shared_ptr<TopSurfaceImageContoningAnchoredSurfacePlan> out =
+        std::make_shared<TopSurfaceImageContoningAnchoredSurfacePlan>();
+    const bool debug_enabled = top_surface_image_debug_enabled();
+    const auto debug_total_start = top_surface_image_debug_now();
+    TopSurfaceImageDebugAnchoredLayerTiming debug_timing;
+    if (debug_enabled) {
+        debug_timing.print_object_id = top_surface_image_debug_print_object_id(object);
+        debug_timing.model_object_id = top_surface_image_debug_model_object_id(object);
+        debug_timing.zone_id = plan.zone_id;
+        debug_timing.region_id = plan.region_id;
+        debug_timing.source_layer_id = source_layer.id();
+        debug_timing.source_z_mm = source_layer.print_z;
+        debug_timing.source_surface = top_surface_image_source_surface_debug_name(TopSurfaceImageSourceSurface::Top);
+    }
+    auto finish_debug_timing = [&]() {
+        if (!debug_enabled)
+            return;
+        debug_timing.exported_surface_count = out ? out->regions.size() : 0;
+        debug_timing.total_ms = top_surface_image_debug_elapsed_ms(debug_total_start);
+        top_surface_image_debug_register_anchored_layer_timing(debug_timing);
+    };
+    if (debug_enabled)
+        top_surface_image_debug_export_object_mesh(object);
+
+    if (!solver.valid()) {
+        finish_debug_timing();
+        return out;
+    }
+    check_canceled(throw_if_canceled);
+
+    const int stack_layers =
+        std::clamp(plan.contoning_stack_layers,
+                   TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                   TextureMappingZone::MaxTopSurfaceContoningStackLayers);
+    if (stack_layers <= 0) {
+        finish_debug_timing();
+        return out;
+    }
+    out->stack_layers = stack_layers;
+
+    std::vector<std::optional<TopSurfaceImageContoningSourceContext>> source_contexts(static_cast<size_t>(stack_layers));
+    auto debug_step_start = top_surface_image_debug_now();
+    size_t debug_source_context_attempts = 0;
+    size_t debug_source_context_count = 0;
+    for (int depth = 0; depth < stack_layers; ++depth) {
+        check_canceled(throw_if_canceled);
+        if (!top_surface_image_object_has_raw_top_surface_depth(object, depth))
+            continue;
+        ++debug_source_context_attempts;
+        std::optional<TopSurfaceImageContoningSourceContext> source_context =
+            top_surface_image_contoning_source_context(plan,
+                                                       source_layer,
+                                                       object,
+                                                       zone,
+                                                       print_config,
+                                                       solver,
+                                                       TopSurfaceImageSourceSurface::Top,
+                                                       stack_area_extensions,
+                                                       throw_if_canceled,
+                                                       depth);
+        if (!source_context ||
+            source_context->stack_layers <= 0 ||
+            !source_context->offset_context.weight_field.raw_top_surface_labels_from_texture ||
+            source_context->offset_context.component_ids.empty())
+            continue;
+        source_contexts[size_t(depth)] = std::move(source_context);
+        ++debug_source_context_count;
+    }
+    if (debug_enabled)
+        top_surface_image_debug_accumulate_timing_step(debug_timing.steps,
+                                                       "raw_source_contexts",
+                                                       top_surface_image_debug_elapsed_ms(debug_step_start),
+                                                       debug_source_context_attempts,
+                                                       debug_source_context_count > 0);
+    if (debug_source_context_count == 0) {
+        finish_debug_timing();
+        return out;
+    }
+
+    debug_step_start = top_surface_image_debug_now();
+    std::vector<ExPolygons> source_components =
+        top_surface_image_visible_surface_components(source_layer,
+                                                     plan.zone_id,
+                                                     TopSurfaceImageSourceSurface::Top);
+    if (debug_enabled) {
+        debug_timing.source_component_count = source_components.size();
+        top_surface_image_debug_accumulate_timing_step(debug_timing.steps,
+                                                       "source_components",
+                                                       top_surface_image_debug_elapsed_ms(debug_step_start),
+                                                       source_components.size(),
+                                                       true);
+    }
+    if (source_components.empty()) {
+        finish_debug_timing();
+        return out;
+    }
+
+    for (const ExPolygons &source_component : source_components) {
+        check_canceled(throw_if_canceled);
+        if (source_component.empty())
+            continue;
+        const BoundingBox source_bbox = get_extents(source_component);
+        if (!source_bbox.defined)
+            continue;
+
+        std::vector<ExPolygons> depth_areas(static_cast<size_t>(stack_layers));
+        std::vector<double> depth_zs(static_cast<size_t>(stack_layers), std::numeric_limits<double>::quiet_NaN());
+        std::vector<int> depth_layer_ids(static_cast<size_t>(stack_layers), -1);
+        ExPolygons combined_area;
+        ExPolygons previous_depth_area;
+        const Layer *target_layer = &source_layer;
+        debug_step_start = top_surface_image_debug_now();
+        size_t debug_project_depth_attempts = 0;
+        for (int depth = 0; depth < stack_layers && target_layer != nullptr; ++depth) {
+            check_canceled(throw_if_canceled);
+            ++debug_project_depth_attempts;
+            top_surface_image_contoning_report_anchored_progress(object,
+                                                                 source_layer,
+                                                                 TopSurfaceImageSourceSurface::Top,
+                                                                 L("projecting"),
+                                                                 depth + 1,
+                                                                 stack_layers);
+            if (plan.region_id >= target_layer->regions().size())
+                break;
+            const LayerRegion *target_layerm = target_layer->regions()[plan.region_id];
+            if (target_layerm == nullptr ||
+                unsigned(std::max(0, target_layerm->region().config().solid_infill_filament.value)) != plan.zone_id)
+                break;
+            if (!top_surface_image_contoning_depth_within_shell(*target_layer,
+                                                                 source_layer,
+                                                                 target_layerm->region().config(),
+                                                                 TopSurfaceImageSourceSurface::Top,
+                                                                 depth))
+                break;
+            ExPolygons target_surface_area =
+                top_surface_image_current_layer_surface_mask(*target_layerm, TopSurfaceImageSourceSurface::Top);
+            if (target_surface_area.empty())
+                break;
+            const BoundingBox target_bbox = get_extents(target_surface_area);
+            if (!target_bbox.defined || !source_bbox.overlap(target_bbox))
+                break;
+            ExPolygons current_depth_area =
+                top_surface_clip_intersection_ex(source_component, target_surface_area, ApplySafetyOffset::Yes);
+            if (!previous_depth_area.empty())
+                current_depth_area = top_surface_clip_intersection_ex(current_depth_area, previous_depth_area);
+            if (current_depth_area.empty())
+                break;
+            current_depth_area = top_surface_clip_union_ex(current_depth_area);
+            depth_areas[size_t(depth)] = current_depth_area;
+            depth_zs[size_t(depth)] = target_layer->print_z;
+            depth_layer_ids[size_t(depth)] = target_layer->id();
+            append(combined_area, current_depth_area);
+            previous_depth_area = std::move(current_depth_area);
+            target_layer = target_layer->lower_layer;
+        }
+        if (debug_enabled)
+            top_surface_image_debug_accumulate_timing_step(debug_timing.steps,
+                                                           "project_shell_depths",
+                                                           top_surface_image_debug_elapsed_ms(debug_step_start),
+                                                           debug_project_depth_attempts,
+                                                           true);
+        if (combined_area.empty())
+            continue;
+        combined_area = top_surface_clip_union_ex(combined_area);
+        if (combined_area.empty())
+            continue;
+
+        for (ExPolygon &combined_expolygon : combined_area) {
+            check_canceled(throw_if_canceled);
+            ExPolygons combined_component;
+            combined_component.emplace_back(std::move(combined_expolygon));
+            TopSurfaceImageContoningAnchoredSurfaceRegion anchored_region;
+            anchored_region.depth_areas.resize(size_t(stack_layers));
+            anchored_region.depth_zs.resize(size_t(stack_layers), std::numeric_limits<double>::quiet_NaN());
+            anchored_region.depth_layer_ids.resize(size_t(stack_layers), -1);
+            anchored_region.union_area = combined_component;
+            anchored_region.source_area =
+                top_surface_clip_intersection_ex(source_component, anchored_region.union_area, ApplySafetyOffset::Yes);
+            if (anchored_region.source_area.empty())
+                anchored_region.source_area = anchored_region.union_area;
+            for (int depth = 0; depth < stack_layers; ++depth) {
+                check_canceled(throw_if_canceled);
+                if (depth_areas[size_t(depth)].empty())
+                    continue;
+                anchored_region.depth_areas[size_t(depth)] =
+                    top_surface_clip_intersection_ex(depth_areas[size_t(depth)], anchored_region.union_area);
+                anchored_region.depth_zs[size_t(depth)] = depth_zs[size_t(depth)];
+                anchored_region.depth_layer_ids[size_t(depth)] = depth_layer_ids[size_t(depth)];
+            }
+            anchored_region.union_bbox = get_extents(anchored_region.union_area);
+            anchored_region.source_bbox = get_extents(anchored_region.source_area);
+            if (!anchored_region.union_bbox.defined)
+                continue;
+            if (debug_enabled)
+                ++debug_timing.candidate_surface_count;
+            const size_t debug_region_idx = out->regions.size();
+            debug_step_start = top_surface_image_debug_now();
+            top_surface_image_contoning_convert_raw_top_surface_anchored_region(anchored_region,
+                                                                                plan,
+                                                                                object,
+                                                                                source_layer,
+                                                                                source_contexts,
+                                                                                build_state,
+                                                                                debug_region_idx,
+                                                                                throw_if_canceled);
+            if (debug_enabled)
+                top_surface_image_debug_accumulate_timing_step(debug_timing.steps,
+                                                               "convert_raw_surface_regions",
+                                                               top_surface_image_debug_elapsed_ms(debug_step_start),
+                                                               1,
+                                                               true);
+            const bool has_depth_regions =
+                std::any_of(anchored_region.depth_regions.begin(),
+                            anchored_region.depth_regions.end(),
+                            [](const std::vector<TopSurfaceImageContoningVectorRegion> &regions) {
+                                return !regions.empty();
+                            });
+            if (has_depth_regions)
+                out->regions.emplace_back(std::move(anchored_region));
+        }
+    }
+
+    debug_step_start = top_surface_image_debug_now();
+    top_surface_image_debug_write_anchored_surface_plan(plan,
+                                                       source_layer,
+                                                       object,
+                                                       *out,
+                                                       TopSurfaceImageSourceSurface::Top,
+                                                       throw_if_canceled);
+    if (debug_enabled)
+        top_surface_image_debug_accumulate_timing_step(debug_timing.steps,
+                                                       "write_debug_exports",
+                                                       top_surface_image_debug_elapsed_ms(debug_step_start),
+                                                       out->regions.size(),
+                                                       true);
+    finish_debug_timing();
+    return out;
+}
+
 static TopSurfaceImageContoningStackPlanKey top_surface_image_contoning_anchored_surface_plan_key(
     const TopSurfaceImageRegionPlan      &plan,
     const Layer                          &source_layer,
@@ -6360,6 +7231,22 @@ static TopSurfaceImageContoningStackPlanKey top_surface_image_contoning_anchored
     return key;
 }
 
+static TopSurfaceImageContoningStackPlanKey top_surface_image_contoning_raw_top_surface_anchored_plan_key(
+    const TopSurfaceImageRegionPlan      &plan,
+    const Layer                          &source_layer,
+    const TextureMappingZone             &zone,
+    const TextureMappingContoningSolver  &solver)
+{
+    TopSurfaceImageContoningStackPlanKey key =
+        top_surface_image_contoning_anchored_surface_plan_key(plan,
+                                                              source_layer,
+                                                              zone,
+                                                              solver,
+                                                              TopSurfaceImageSourceSurface::Top);
+    key.raw_top_surface_labels = true;
+    return key;
+}
+
 static std::shared_ptr<const TopSurfaceImageContoningAnchoredSurfacePlan> top_surface_image_contoning_anchored_surface_plan(
     TopSurfaceImageContoningStackPlanCache *cache,
     const TopSurfaceImageRegionPlan        &plan,
@@ -6383,6 +7270,33 @@ static std::shared_ptr<const TopSurfaceImageContoningAnchoredSurfacePlan> top_su
                                                                        source_surface,
                                                                        build_state,
                                                                        throw_if_canceled);
+    };
+    return cache != nullptr ? cache->get_or_build_anchored_surface(key, builder) : builder(nullptr);
+}
+
+static std::shared_ptr<const TopSurfaceImageContoningAnchoredSurfacePlan> top_surface_image_contoning_raw_top_surface_anchored_plan(
+    TopSurfaceImageContoningStackPlanCache *cache,
+    const TopSurfaceImageRegionPlan        &plan,
+    const Layer                            &source_layer,
+    const PrintObject                      &object,
+    const TextureMappingZone               &zone,
+    const PrintConfig                      &print_config,
+    const TextureMappingContoningSolver    &solver,
+    const std::vector<ExPolygons>          *stack_area_extensions,
+    const ThrowIfCanceled                  *throw_if_canceled)
+{
+    const TopSurfaceImageContoningStackPlanKey key =
+        top_surface_image_contoning_raw_top_surface_anchored_plan_key(plan, source_layer, zone, solver);
+    auto builder = [&](TopSurfaceImageContoningAnchoredSurfaceBuildState *build_state) {
+        return top_surface_image_contoning_build_raw_top_surface_anchored_surface_plan(plan,
+                                                                                       source_layer,
+                                                                                       object,
+                                                                                       zone,
+                                                                                       print_config,
+                                                                                       solver,
+                                                                                       stack_area_extensions,
+                                                                                       build_state,
+                                                                                       throw_if_canceled);
     };
     return cache != nullptr ? cache->get_or_build_anchored_surface(key, builder) : builder(nullptr);
 }
@@ -7252,9 +8166,12 @@ static void top_surface_image_append_contoning_slices(TopSurfaceImageRegionPlan 
 
     std::vector<ExPolygons> by_component(print_config.filament_colour.values.size() + 1);
     std::vector<ExPolygons> perimeter_by_component(include_perimeter_regions ? print_config.filament_colour.values.size() + 1 : 0);
+    bool used_raw_top_surface_labels = false;
     auto append_regions = [&](const std::vector<TopSurfaceImageContoningVectorRegion> &regions,
                               bool for_fill,
                               bool for_perimeter) {
+        const ApplySafetyOffset clip_safety_offset =
+            used_raw_top_surface_labels ? ApplySafetyOffset::No : ApplySafetyOffset::Yes;
         for (const TopSurfaceImageContoningVectorRegion &region : regions) {
             check_canceled(throw_if_canceled);
             if (depth < 0 || region.bottom_to_top.empty() || region.area.empty())
@@ -7267,12 +8184,12 @@ static void top_surface_image_append_contoning_slices(TopSurfaceImageRegionPlan 
             if (for_perimeter &&
                 include_perimeter_regions &&
                 !perimeter_clip_area.empty()) {
-                ExPolygons component_perimeter_area = top_surface_clip_intersection_ex(region.area, perimeter_clip_area, ApplySafetyOffset::Yes);
+                ExPolygons component_perimeter_area = top_surface_clip_intersection_ex(region.area, perimeter_clip_area, clip_safety_offset);
                 if (!component_perimeter_area.empty())
                     append(perimeter_by_component[component_id], std::move(component_perimeter_area));
             }
             if (for_fill && !fill_area.empty()) {
-                ExPolygons component_area = top_surface_clip_intersection_ex(region.area, fill_area, ApplySafetyOffset::Yes);
+                ExPolygons component_area = top_surface_clip_intersection_ex(region.area, fill_area, clip_safety_offset);
                 if (!component_area.empty())
                     append(by_component[component_id], std::move(component_area));
             }
@@ -7296,7 +8213,34 @@ static void top_surface_image_append_contoning_slices(TopSurfaceImageRegionPlan 
         return source_context ? &*source_context : nullptr;
     };
 
-    if (plan.contoning_surface_anchored_stacks_enabled) {
+    if (source_surface == TopSurfaceImageSourceSurface::Top &&
+        top_surface_image_object_has_raw_top_surface_depth(object, depth)) {
+        used_raw_top_surface_labels = true;
+        std::shared_ptr<const TopSurfaceImageContoningAnchoredSurfacePlan> raw_anchored_plan =
+            top_surface_image_contoning_raw_top_surface_anchored_plan(stack_plan_cache,
+                                                                      plan,
+                                                                      source_layer,
+                                                                      object,
+                                                                      zone,
+                                                                      print_config,
+                                                                      solver,
+                                                                      stack_area_extensions_ptr,
+                                                                      throw_if_canceled);
+        const std::vector<TopSurfaceImageContoningVectorRegion> raw_regions =
+            top_surface_image_contoning_vector_regions_from_anchored_surface_plan(*raw_anchored_plan,
+                                                                                 depth,
+                                                                                 throw_if_canceled);
+        if (plan.contoning_replace_top_perimeters_with_infill) {
+            append_regions(raw_regions, true, true);
+        } else {
+            if (!fill_area.empty())
+                append_regions(raw_regions, true, false);
+            if (include_perimeter_regions)
+                append_regions(raw_regions, false, true);
+        }
+    }
+
+    if (!used_raw_top_surface_labels && plan.contoning_surface_anchored_stacks_enabled) {
         if (plan.contoning_blue_noise_error_diffusion_enabled || plan.contoning_layer_phase_enabled) {
             std::shared_ptr<const TopSurfaceImageContoningDepthRegionPlan> depth_region_plan =
                 top_surface_image_contoning_depth_region_plan(stack_plan_cache,
@@ -7353,7 +8297,7 @@ static void top_surface_image_append_contoning_slices(TopSurfaceImageRegionPlan 
                                                                            throw_if_canceled);
             append_regions(stack_regions, true, include_perimeter_regions);
         }
-    } else if (plan.contoning_blue_noise_error_diffusion_enabled) {
+    } else if (!used_raw_top_surface_labels && plan.contoning_blue_noise_error_diffusion_enabled) {
         if (plan.contoning_replace_top_perimeters_with_infill) {
             if (const TopSurfaceImageContoningSourceContext *ctx = get_source_context()) {
                 const std::vector<TopSurfaceImageContoningVectorRegion> stack_regions =
@@ -7407,7 +8351,7 @@ static void top_surface_image_append_contoning_slices(TopSurfaceImageRegionPlan 
                 append_regions(perimeter_regions, false, true);
             }
         }
-    } else {
+    } else if (!used_raw_top_surface_labels) {
         if (const TopSurfaceImageContoningSourceContext *ctx = get_source_context()) {
             const std::vector<TopSurfaceImageContoningVectorRegion> stack_regions =
                 top_surface_image_contoning_vector_regions(plan,
@@ -7451,9 +8395,13 @@ static void top_surface_image_append_contoning_slices(TopSurfaceImageRegionPlan 
         ExPolygons component_perimeter_area =
             component_perimeter_empty ? ExPolygons() : top_surface_clip_union_ex(perimeter_by_component[component_id]);
         if (!depth_taken.empty() && !component_area.empty())
-            component_area = top_surface_clip_diff_ex(component_area, depth_taken, ApplySafetyOffset::Yes);
+            component_area = top_surface_clip_diff_ex(component_area,
+                                                      depth_taken,
+                                                      used_raw_top_surface_labels ? ApplySafetyOffset::No : ApplySafetyOffset::Yes);
         if (!perimeter_depth_taken.empty() && !component_perimeter_area.empty())
-            component_perimeter_area = top_surface_clip_diff_ex(component_perimeter_area, perimeter_depth_taken, ApplySafetyOffset::Yes);
+            component_perimeter_area = top_surface_clip_diff_ex(component_perimeter_area,
+                                                                perimeter_depth_taken,
+                                                                used_raw_top_surface_labels ? ApplySafetyOffset::No : ApplySafetyOffset::Yes);
         if (component_area.empty() && component_perimeter_area.empty())
             continue;
         if (!component_area.empty())
@@ -7466,6 +8414,7 @@ static void top_surface_image_append_contoning_slices(TopSurfaceImageRegionPlan 
         slice.component_index = size_t(depth % pattern_filaments);
         slice.component_count = size_t(pattern_filaments);
         slice.contoning = true;
+        slice.raw_top_surface_labels = used_raw_top_surface_labels;
         slice.lower_surface = source_surface == TopSurfaceImageSourceSurface::Bottom;
         slice.angle_rad = top_surface_image_contoning_angle_rad(depth, plan.contoning_varied_infill_angles_enabled);
         slice.area = std::move(component_area);
@@ -7517,6 +8466,12 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
             zone->is_image_texture() ?
                 TextureMappingManager::effective_texture_component_ids(*zone, num_physical, filament_colours) :
                 TextureMappingManager::selected_component_ids(*zone, num_physical);
+        if (zone->top_surface_contoning_active())
+            append_texture_mapping_raw_top_surface_component_ids(*object,
+                                                                 *zone,
+                                                                 filament_colours,
+                                                                 components,
+                                                                 num_physical);
         components.erase(std::remove_if(components.begin(), components.end(), [num_physical](unsigned int id) {
             return id == 0 || id > num_physical;
         }), components.end());
@@ -7800,6 +8755,7 @@ struct TopSurfaceImagePerimeterMask {
     unsigned int zone_id = 0;
     int depth = 0;
     bool lower_surface = false;
+    bool raw_top_surface_labels = false;
     float angle_rad = float(PI / 4.0);
     ExPolygons area;
 };
@@ -7815,6 +8771,7 @@ static std::vector<TopSurfaceImagePerimeterMask> top_surface_image_contoning_per
         mask.zone_id = plan.zone_id;
         mask.depth = slice.depth;
         mask.lower_surface = slice.lower_surface;
+        mask.raw_top_surface_labels = slice.raw_top_surface_labels;
         mask.angle_rad = slice.angle_rad;
         mask.area = slice.perimeter_area;
         masks.emplace_back(std::move(mask));
@@ -7846,6 +8803,7 @@ static ExPolygons top_surface_image_contoning_matching_surface_fill_area(const s
             params.texture_mapping_top_surface_zone_id != mask.zone_id ||
             params.texture_mapping_top_surface_component_id != mask.component_id ||
             params.texture_mapping_top_surface_stack_depth != mask.depth ||
+            params.texture_mapping_top_surface_raw_labels != mask.raw_top_surface_labels ||
             fill.expolygons.empty())
             continue;
         append(area, fill.expolygons);
@@ -8223,6 +9181,7 @@ struct TopSurfaceImageRectilinearBoundaryKey {
     float flow_height = 0.f;
     float flow_nozzle = 0.f;
     float flow_spacing = 0.f;
+    bool raw_top_surface_labels = false;
 
     bool operator<(const TopSurfaceImageRectilinearBoundaryKey &rhs) const
     {
@@ -8234,7 +9193,8 @@ struct TopSurfaceImageRectilinearBoundaryKey {
                         flow_width,
                         flow_height,
                         flow_nozzle,
-                        flow_spacing) <
+                        flow_spacing,
+                        raw_top_surface_labels) <
                std::tie(rhs.region_id,
                         rhs.zone_id,
                         rhs.depth,
@@ -8243,7 +9203,8 @@ struct TopSurfaceImageRectilinearBoundaryKey {
                         rhs.flow_width,
                         rhs.flow_height,
                         rhs.flow_nozzle,
-                        rhs.flow_spacing);
+                        rhs.flow_spacing,
+                        rhs.raw_top_surface_labels);
     }
 };
 
@@ -8431,6 +9392,7 @@ top_surface_image_rectilinear_boundary_groups(const Layer &layer,
         key.flow_height = fill.params.flow.height();
         key.flow_nozzle = fill.params.flow.nozzle_diameter();
         key.flow_spacing = fill.params.spacing;
+        key.raw_top_surface_labels = fill.params.texture_mapping_top_surface_raw_labels;
         TopSurfaceImageRectilinearBoundaryGroup &group = groups[key];
         if (group.component_areas.empty()) {
             group.params = fill.params;
@@ -8663,6 +9625,7 @@ static double top_surface_image_perimeter_infill_adjacency_score(const SurfaceFi
         existing.texture_mapping_top_surface_zone_id != mask.zone_id ||
         existing.texture_mapping_top_surface_component_id != mask.component_id ||
         existing.texture_mapping_top_surface_stack_depth != mask.depth ||
+        existing.texture_mapping_top_surface_raw_labels != mask.raw_top_surface_labels ||
         fill.expolygons.empty() ||
         area.empty())
         return 0.;
@@ -8721,6 +9684,7 @@ static void top_surface_image_append_perimeter_infill_surface(std::vector<Surfac
             existing.texture_mapping_top_surface_zone_id != mask.zone_id ||
             existing.texture_mapping_top_surface_component_id != mask.component_id ||
             existing.texture_mapping_top_surface_stack_depth != mask.depth ||
+            existing.texture_mapping_top_surface_raw_labels != mask.raw_top_surface_labels ||
             existing.extrusion_role != extrusion_role)
             continue;
         append_surface_fill_expolygons(fill, region_id, surface, std::move(area), layerm);
@@ -8751,6 +9715,7 @@ static void top_surface_image_append_perimeter_infill_surface(std::vector<Surfac
     params.texture_mapping_top_surface_stack_depth = mask.depth;
     params.texture_mapping_top_surface_fixed_coloring = true;
     params.texture_mapping_top_surface_contoning = true;
+    params.texture_mapping_top_surface_raw_labels = mask.raw_top_surface_labels;
     params.texture_mapping_top_surface_min_width_mm = plan.min_width_mm;
     params.texture_mapping_top_surface_max_width_mm = plan.max_width_mm;
     const int pattern_filaments = top_surface_image_contoning_pattern_filaments(plan.contoning_stack_layers,
@@ -8778,9 +9743,11 @@ static void top_surface_image_append_contoning_replacement_surfaces(std::vector<
     ExPolygons taken;
     for (const TopSurfaceImagePerimeterMask &mask : masks) {
         check_canceled(throw_if_canceled);
+        const ApplySafetyOffset mask_safety_offset =
+            mask.raw_top_surface_labels ? ApplySafetyOffset::No : ApplySafetyOffset::Yes;
         ExPolygons area = mask.area;
         if (!taken.empty())
-            area = top_surface_clip_diff_ex(area, taken, ApplySafetyOffset::Yes);
+            area = top_surface_clip_diff_ex(area, taken, mask_safety_offset);
         if (!area.empty())
             area = top_surface_clip_union_ex(area);
         if (area.empty())
@@ -8822,7 +9789,9 @@ static void top_surface_image_apply_contoning_perimeter_options(const Layer &lay
 
         for (TopSurfaceImagePerimeterMask &mask : masks) {
             check_canceled(throw_if_canceled);
-            mask.area = top_surface_clip_intersection_ex(mask.area, wall_area, ApplySafetyOffset::Yes);
+            const ApplySafetyOffset mask_safety_offset =
+                mask.raw_top_surface_labels ? ApplySafetyOffset::No : ApplySafetyOffset::Yes;
+            mask.area = top_surface_clip_intersection_ex(mask.area, wall_area, mask_safety_offset);
             if (plan.contoning_replace_top_perimeters_with_infill && !mask.area.empty()) {
                 ExPolygons fill_area =
                     top_surface_image_contoning_matching_surface_fill_area(surface_fills,
@@ -8835,7 +9804,7 @@ static void top_surface_image_apply_contoning_perimeter_options(const Layer &lay
                     const double trim_radius_mm =
                         std::clamp(double(perimeter_flow.spacing()) * 0.25, 0.02, 0.20);
                     ExPolygons trim_area = top_surface_clip_offset_ex(fill_area, float(scale_(trim_radius_mm)));
-                    mask.area = top_surface_clip_intersection_ex(mask.area, trim_area, ApplySafetyOffset::Yes);
+                    mask.area = top_surface_clip_intersection_ex(mask.area, trim_area, mask_safety_offset);
                 }
             } else {
                 mask.area = top_surface_image_contoning_printable_area(std::move(mask.area), plan.contoning_min_feature_mm);
@@ -8863,9 +9832,11 @@ static void top_surface_image_apply_contoning_perimeter_options(const Layer &lay
         ExPolygons taken;
         for (const TopSurfaceImagePerimeterMask &mask : masks) {
             check_canceled(throw_if_canceled);
+            const ApplySafetyOffset mask_safety_offset =
+                mask.raw_top_surface_labels ? ApplySafetyOffset::No : ApplySafetyOffset::Yes;
             ExPolygons area = mask.area;
             if (!taken.empty())
-                area = top_surface_clip_diff_ex(area, taken, ApplySafetyOffset::Yes);
+                area = top_surface_clip_diff_ex(area, taken, mask_safety_offset);
             area = top_surface_image_contoning_printable_area(std::move(area), plan.contoning_min_feature_mm);
             if (area.empty())
                 continue;
@@ -8943,6 +9914,7 @@ static SurfaceFillParams top_surface_image_params_for_slice(const Layer &layer,
     params.texture_mapping_top_surface_max_width_mm = plan.max_width_mm;
     params.texture_mapping_top_surface_same_layer_partition = slice.same_layer_partition;
     params.texture_mapping_top_surface_contoning = slice.contoning;
+    params.texture_mapping_top_surface_raw_labels = slice.raw_top_surface_labels;
     params.texture_mapping_top_surface_component_index = int(slice.component_index);
     params.texture_mapping_top_surface_component_count = int(slice.component_count);
     params.texture_mapping_top_surface_contoning_flat_surface_infill_mode = plan.contoning_flat_surface_infill_mode;
@@ -9237,7 +10209,7 @@ static void top_surface_image_reorder_boundary_skin_entities(ExtrusionEntityColl
 
 static coord_t top_surface_image_boundary_skin_split_depth(const Flow &flow)
 {
-    return std::max<coord_t>(1, flow.scaled_spacing() - scaled<coord_t>(0.02));
+    return std::max<coord_t>(1, flow.scaled_spacing() + scaled<coord_t>(0.04));
 }
 
 static ExPolygons top_surface_image_boundary_skin_interior(const Surface &surface, const Flow &flow)
@@ -10474,7 +11446,9 @@ std::vector<SurfaceFill> group_fills(const Layer &layer,
                             }
                             if (remaining.empty())
                                 break;
-                            ExPolygons image_expolygons = top_surface_clip_intersection_ex(remaining, slice.area, ApplySafetyOffset::Yes);
+                            const ApplySafetyOffset slice_safety_offset =
+                                slice.raw_top_surface_labels ? ApplySafetyOffset::No : ApplySafetyOffset::Yes;
+                            ExPolygons image_expolygons = top_surface_clip_intersection_ex(remaining, slice.area, slice_safety_offset);
                             if (image_expolygons.empty() && !slice.contoning) {
                                 ++slice_idx;
                                 continue;
@@ -10485,6 +11459,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer,
                                 while (same_depth_end < plan.slices.size() &&
                                        plan.slices[same_depth_end].same_layer_partition == slice.same_layer_partition &&
                                        plan.slices[same_depth_end].contoning == slice.contoning &&
+                                       plan.slices[same_depth_end].raw_top_surface_labels == slice.raw_top_surface_labels &&
                                        plan.slices[same_depth_end].lower_surface == slice.lower_surface &&
                                        plan.slices[same_depth_end].depth == slice.depth)
                                     ++same_depth_end;
@@ -10495,7 +11470,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer,
                                         top_surface_image_params_for_slice(layer, surface, *params, plan, plan.slices[same_idx]);
                                     ExPolygons component_expolygons = slice.same_layer_partition ?
                                         image_expolygons :
-                                        top_surface_clip_intersection_ex(remaining, plan.slices[same_idx].area, ApplySafetyOffset::Yes);
+                                        top_surface_clip_intersection_ex(remaining, plan.slices[same_idx].area, slice_safety_offset);
                                     if (!component_expolygons.empty()) {
                                         append(depth_clip, component_expolygons);
                                         if (plan.slices[same_idx].contoning &&
@@ -10503,7 +11478,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer,
                                             !layerm.fill_no_overlap_expolygons.empty())
                                             component_expolygons = top_surface_clip_intersection_ex(component_expolygons,
                                                                                                     layerm.fill_no_overlap_expolygons,
-                                                                                                    ApplySafetyOffset::Yes);
+                                                                                                    slice_safety_offset);
                                         if (!component_expolygons.empty()) {
                                             SurfaceFill &image_fill = surface_fill_for_params(surface_fills, image_params);
                                             append_surface_fill_expolygons(image_fill, region_id, surface, std::move(component_expolygons), layerm);
@@ -10520,7 +11495,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer,
                                 append_surface_fill_expolygons(image_fill, region_id, surface, std::move(image_expolygons), layerm);
                                 ++slice_idx;
                             }
-                            remaining = top_surface_clip_diff_ex(remaining, image_clip, ApplySafetyOffset::Yes);
+                            remaining = top_surface_clip_diff_ex(remaining, image_clip, slice_safety_offset);
                         }
                     }
                     if (!remaining.empty()) {
@@ -10555,6 +11530,11 @@ std::vector<SurfaceFill> group_fills(const Layer &layer,
                 check_canceled(throw_if_canceled);
                 if (fill.params.texture_mapping_top_surface_same_layer_partition)
                     continue;
+                if (fill.params.texture_mapping_top_surface_raw_labels) {
+                    if (fill.expolygons.size() > 1)
+                        fill.expolygons = top_surface_clip_union_ex(fill.expolygons);
+                    continue;
+                }
 				if (fill.expolygons.size() > 1 || ! all_polygons.empty()) {
 					Polygons polys = to_polygons(std::move(fill.expolygons));
 		            // Make a union of polygons, use a safety offset, subtract the preceding polygons.

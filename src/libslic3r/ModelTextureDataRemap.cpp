@@ -1881,6 +1881,8 @@ static void clear_image_texture(ModelVolume &volume)
     volume.imported_texture_uv_valid.clear();
     volume.imported_texture_rgba.clear();
     volume.imported_texture_raw_filament_offsets.clear();
+    volume.imported_texture_raw_top_surface_filament_slots.clear();
+    volume.imported_texture_raw_top_surface_depths.clear();
     volume.imported_texture_width = 0;
     volume.imported_texture_height = 0;
     volume.imported_texture_raw_channels = 0;
@@ -1947,10 +1949,10 @@ SimplifyTextureDataSnapshot snapshot_simplify_texture_data(const ModelVolume &vo
             snapshot.texture_uvs_per_face.clear();
             snapshot.texture_uv_valid.clear();
             snapshot.texture_raw_filament_offsets.clear();
+            snapshot.texture_raw_metadata_json.clear();
             snapshot.texture_width = 0;
             snapshot.texture_height = 0;
             snapshot.texture_raw_channels = 0;
-            snapshot.texture_raw_metadata_json.clear();
             snapshot.uv_map_generator_version = 0;
         }
     }
@@ -2212,6 +2214,8 @@ void apply_simplify_texture_data_result(ModelVolume &volume, SimplifyTextureData
         volume.imported_texture_uv_valid = std::move(result.texture_uv_valid);
         volume.imported_texture_rgba = std::move(result.texture_rgba);
         volume.imported_texture_raw_filament_offsets = std::move(result.texture_raw_filament_offsets);
+        volume.imported_texture_raw_top_surface_filament_slots.clear();
+        volume.imported_texture_raw_top_surface_depths.clear();
         volume.imported_texture_width = result.texture_width;
         volume.imported_texture_height = result.texture_height;
         volume.imported_texture_raw_channels = result.texture_raw_channels;

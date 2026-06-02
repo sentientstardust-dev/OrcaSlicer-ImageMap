@@ -34,6 +34,7 @@ struct TextureSampleData {
     std::vector<float> raw_component_weights;
     bool raw_component_weights_from_texture { false };
     float normal_z { std::numeric_limits<float>::quiet_NaN() };
+    bool raw_top_surface_labels_from_texture { false };
 };
 
 struct WeightedTextureSample {
@@ -43,6 +44,7 @@ struct WeightedTextureSample {
     std::vector<float> raw_component_weights;
     bool raw_component_weights_from_texture { false };
     float normal_z { std::numeric_limits<float>::quiet_NaN() };
+    bool raw_top_surface_labels_from_texture { false };
     float weight { 0.f };
 };
 
@@ -466,6 +468,27 @@ std::vector<float> sample_texture_raw_offsets_bilinear(const std::vector<uint8_t
     return out;
 }
 
+uint16_t sample_texture_top_surface_slot_nearest(const std::vector<uint16_t> &slots,
+                                                 uint32_t width,
+                                                 uint32_t height,
+                                                 size_t layer_idx,
+                                                 size_t layer_count,
+                                                 float u,
+                                                 float v)
+{
+    if (width == 0 || height == 0 || layer_count == 0 ||
+        layer_idx >= layer_count ||
+        slots.size() < size_t(width) * size_t(height) * layer_count)
+        return 0;
+
+    const float uu = wrap_repeat01(u);
+    const float vv = wrap_repeat01(v);
+    const size_t x = std::min<size_t>(size_t(std::floor(uu * float(width > 1 ? width - 1 : 0) + 0.5f)), size_t(width - 1));
+    const size_t y = std::min<size_t>(size_t(std::floor(vv * float(height > 1 ? height - 1 : 0) + 0.5f)), size_t(height - 1));
+    const size_t pixel_count = size_t(width) * size_t(height);
+    return slots[layer_idx * pixel_count + y * size_t(width) + x];
+}
+
 std::array<float, 4> raw_offset_preview_rgba(const std::vector<float> &offsets)
 {
     if (offsets.empty())
@@ -646,6 +669,124 @@ std::vector<float> map_raw_sample_to_components(const std::vector<float> &raw_sa
             mapped[component_idx] = raw_sample[source_channel];
     }
     return mapped;
+}
+
+std::map<unsigned int, unsigned int> raw_top_surface_slot_component_id_map(
+    const std::string               &metadata_json,
+    const TextureMappingZone        &zone,
+    const std::vector<unsigned int> &component_ids,
+    const std::vector<std::string>  &filament_colours)
+{
+    std::map<unsigned int, unsigned int> out;
+    if (component_ids.empty())
+        return out;
+
+    const std::vector<ImageMapRawFilament> filaments =
+        image_map_raw_filaments_from_metadata_json(metadata_json);
+    if (filaments.empty())
+        return out;
+
+    const size_t sentinel = std::numeric_limits<size_t>::max();
+    std::vector<size_t> mapping(component_ids.size(), sentinel);
+    std::vector<std::string> source_keys(filaments.size());
+    std::vector<std::array<float, 3>> source_colors(filaments.size());
+    for (size_t source_idx = 0; source_idx < filaments.size(); ++source_idx) {
+        const std::string key = image_map_raw_filament_channel_key(filaments[source_idx], source_idx);
+        if (key.size() == 1 && image_map_raw_filament_is_standard_color(key))
+            source_keys[source_idx] = key;
+        source_colors[source_idx] = raw_filament_channel_color(filaments[source_idx], source_idx);
+    }
+
+    const int filament_color_mode = std::clamp(zone.filament_color_mode,
+                                               int(TextureMappingZone::FilamentColorAny),
+                                               int(TextureMappingZone::FilamentColorRGBKW));
+    const std::vector<std::string> target_keys =
+        raw_filament_color_mode_channel_keys(filament_color_mode, component_ids.size());
+    if (!target_keys.empty()) {
+        std::vector<uint8_t> used(filaments.size(), 0);
+        for (size_t component_idx = 0; component_idx < target_keys.size() && component_idx < mapping.size(); ++component_idx) {
+            for (size_t source_idx = 0; source_idx < source_keys.size(); ++source_idx) {
+                if (used[source_idx] == 0 && source_keys[source_idx] == target_keys[component_idx]) {
+                    mapping[component_idx] = source_idx;
+                    used[source_idx] = 1;
+                    break;
+                }
+            }
+        }
+
+        const float max_match_distance_sq =
+            TextureMappingManager::poor_color_match_distance() * TextureMappingManager::poor_color_match_distance();
+        for (size_t component_idx = 0; component_idx < target_keys.size() && component_idx < mapping.size(); ++component_idx) {
+            if (mapping[component_idx] != sentinel)
+                continue;
+            const std::array<float, 3> target_color =
+                raw_filament_channel_color({ 0, target_keys[component_idx], std::string() }, component_idx);
+            size_t best_source = filaments.size();
+            float best_distance_sq = std::numeric_limits<float>::max();
+            for (size_t source_idx = 0; source_idx < source_colors.size(); ++source_idx) {
+                if (used[source_idx] != 0)
+                    continue;
+                const float distance_sq = color_distance_sq(source_colors[source_idx], target_color);
+                if (distance_sq < best_distance_sq) {
+                    best_distance_sq = distance_sq;
+                    best_source = source_idx;
+                }
+            }
+            if (best_source < source_colors.size() && best_distance_sq <= max_match_distance_sq) {
+                mapping[component_idx] = best_source;
+                used[best_source] = 1;
+            }
+        }
+    } else {
+        std::vector<std::array<float, 3>> component_colors;
+        component_colors.reserve(component_ids.size());
+        for (const unsigned int component_id : component_ids) {
+            ColorRGB decoded;
+            if (component_id >= 1 &&
+                size_t(component_id - 1) < filament_colours.size() &&
+                decode_color(filament_colours[size_t(component_id - 1)], decoded)) {
+                component_colors.push_back({ decoded.r(), decoded.g(), decoded.b() });
+            } else {
+                component_colors.push_back({ 1.f, 1.f, 1.f });
+            }
+        }
+
+        struct Candidate {
+            float distance_sq { 0.f };
+            size_t component_idx { 0 };
+            size_t source_idx { 0 };
+        };
+        std::vector<Candidate> candidates;
+        candidates.reserve(component_ids.size() * filaments.size());
+        for (size_t source_idx = 0; source_idx < filaments.size(); ++source_idx)
+            for (size_t component_idx = 0; component_idx < component_colors.size(); ++component_idx)
+                candidates.push_back({ color_distance_sq(component_colors[component_idx], source_colors[source_idx]),
+                                       component_idx,
+                                       source_idx });
+        std::sort(candidates.begin(), candidates.end(), [](const Candidate &lhs, const Candidate &rhs) {
+            return lhs.distance_sq < rhs.distance_sq;
+        });
+        std::vector<uint8_t> used_components(component_ids.size(), 0);
+        std::vector<uint8_t> used_sources(filaments.size(), 0);
+        for (const Candidate &candidate : candidates) {
+            if (used_components[candidate.component_idx] != 0 || used_sources[candidate.source_idx] != 0)
+                continue;
+            mapping[candidate.component_idx] = candidate.source_idx;
+            used_components[candidate.component_idx] = 1;
+            used_sources[candidate.source_idx] = 1;
+        }
+    }
+
+    for (size_t component_idx = 0; component_idx < component_ids.size(); ++component_idx) {
+        const size_t source_idx = component_idx < mapping.size() ? mapping[component_idx] : sentinel;
+        if (source_idx == sentinel || source_idx >= filaments.size())
+            continue;
+        const unsigned int slot = filaments[source_idx].slot;
+        const unsigned int component_id = component_ids[component_idx];
+        if (slot > 0 && component_id > 0)
+            out.emplace(slot, component_id);
+    }
+    return out;
 }
 
 std::vector<std::array<float, 3>> fixed_color_generic_solver_component_colors(int filament_color_mode)
@@ -1473,7 +1614,8 @@ bool accumulate_layer_plane_triangle_samples(const Vec3d &p0,
                           sample_weight,
                           std::move(sample_data.raw_component_weights),
                           sample_data.raw_component_weights_from_texture,
-                          sample_data.normal_z);
+                          sample_data.normal_z,
+                          sample_data.raw_top_surface_labels_from_texture);
     }
 
     return true;
@@ -1551,30 +1693,33 @@ std::vector<float> component_weights_for_sample(const WeightedTextureSample &sam
     return desired;
 }
 
-TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
-    const PrintObject &print_object,
-    const std::vector<std::array<float, 3>> &component_colors,
-    bool raw_values_mode,
-    int filament_color_mode,
-    bool force_sequential_filaments,
-    int generic_solver_lookup_mode,
-    int generic_solver_mode,
-    int generic_solver_mix_model,
-    bool use_legacy_fixed_color_mode,
-    bool dithering_enabled,
-    int dithering_method,
-    float dither_pitch_mm,
-    float dither_cell_size_mm,
-    const std::vector<float> &component_strength_factors,
-    const std::vector<float> &component_minimum_offset_factors,
-    float texture_contrast_pct,
-    float texture_tone_gamma,
-    float layer_z_mm,
-    float layer_z_falloff_mm,
-    bool high_resolution_texture_sampling,
-    bool high_speed_image_texture_sampling,
-    std::optional<float> texture_sample_pitch_mm_override,
-    std::optional<std::array<float, 4>> image_background_rgba_override)
+TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const PrintObject&                       print_object,
+                                                                          const TextureMappingZone&                zone,
+                                                                          const std::vector<unsigned int>&         component_ids,
+                                                                          const std::vector<std::array<float, 3>>& component_colors,
+                                                                          const std::vector<std::string>&          filament_colours,
+                                                                          bool                                     raw_values_mode,
+                                                                          int                                      filament_color_mode,
+                                                                          bool                      force_sequential_filaments,
+                                                                          int                       generic_solver_lookup_mode,
+                                                                          int                       generic_solver_mode,
+                                                                          int                       generic_solver_mix_model,
+                                                                          bool                      use_legacy_fixed_color_mode,
+                                                                          bool                      dithering_enabled,
+                                                                          int                       dithering_method,
+                                                                          float                     dither_pitch_mm,
+                                                                          float                     dither_cell_size_mm,
+                                                                          const std::vector<float>& component_strength_factors,
+                                                                          const std::vector<float>& component_minimum_offset_factors,
+                                                                          float                     texture_contrast_pct,
+                                                                          float                     texture_tone_gamma,
+                                                                          float                     layer_z_mm,
+                                                                          float                     layer_z_falloff_mm,
+                                                                          bool                      high_resolution_texture_sampling,
+                                                                          bool                      high_speed_image_texture_sampling,
+                                                                          std::optional<float>      texture_sample_pitch_mm_override,
+                                                                          std::optional<std::array<float, 4>> image_background_rgba_override,
+                                                                          std::optional<int> raw_top_surface_depth_override)
 {
     TextureMappingOffsetWeightField weight_field;
     if (component_colors.empty())
@@ -1623,7 +1768,8 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
                                                          float sample_weight,
                                                          std::vector<float> raw_component_weights = {},
                                                          bool raw_component_weights_from_texture = false,
-                                                         float normal_z = std::numeric_limits<float>::quiet_NaN()) {
+                                                         float normal_z = std::numeric_limits<float>::quiet_NaN(),
+                                                         bool raw_top_surface_labels_from_texture = false) {
         if (!std::isfinite(x_mm) || !std::isfinite(y_mm) || sample_weight <= EPSILON)
             return;
         if (!std::isfinite(sample_weight) ||
@@ -1632,9 +1778,18 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
             !std::isfinite(rgba[2]) ||
             !std::isfinite(rgba[3]))
             return;
-        if (raw_component_weights.size() != component_count)
+        if (raw_component_weights.size() != component_count) {
             raw_component_weights_from_texture = false;
-        samples.push_back({ x_mm, y_mm, rgba, std::move(raw_component_weights), raw_component_weights_from_texture, normal_z, sample_weight });
+            raw_top_surface_labels_from_texture = false;
+        }
+        samples.push_back({ x_mm,
+                            y_mm,
+                            rgba,
+                            std::move(raw_component_weights),
+                            raw_component_weights_from_texture,
+                            normal_z,
+                            raw_top_surface_labels_from_texture,
+                            sample_weight });
     };
 
     auto accumulate_constant_surface_triangle_samples = [&](const Vec3d &p0,
@@ -1757,6 +1912,29 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
                     size_t(volume->imported_texture_width) *
                         size_t(volume->imported_texture_height) *
                         size_t(volume->imported_texture_raw_channels);
+            size_t raw_top_surface_layer_idx = size_t(-1);
+            if (raw_top_surface_depth_override) {
+                const auto depth_it = std::find(volume->imported_texture_raw_top_surface_depths.begin(),
+                                                volume->imported_texture_raw_top_surface_depths.end(),
+                                                *raw_top_surface_depth_override);
+                if (depth_it != volume->imported_texture_raw_top_surface_depths.end())
+                    raw_top_surface_layer_idx = size_t(depth_it - volume->imported_texture_raw_top_surface_depths.begin());
+            }
+            const size_t raw_top_surface_layer_count = volume->imported_texture_raw_top_surface_depths.size();
+            const size_t texture_pixel_count =
+                size_t(volume->imported_texture_width) * size_t(volume->imported_texture_height);
+            const bool use_raw_top_surface_uv_texture =
+                raw_top_surface_layer_idx < raw_top_surface_layer_count &&
+                texture_pixel_count > 0 &&
+                volume->imported_texture_raw_top_surface_filament_slots.size() >=
+                    texture_pixel_count * raw_top_surface_layer_count;
+            const std::map<unsigned int, unsigned int> raw_top_surface_slot_component_ids =
+                use_raw_top_surface_uv_texture ?
+                    raw_top_surface_slot_component_id_map(volume->imported_texture_raw_metadata_json,
+                                                          zone,
+                                                          component_ids,
+                                                          filament_colours) :
+                    std::map<unsigned int, unsigned int>{};
             auto sample_data_for_uv = [&](const Vec2f &uv) {
                 std::array<float, 4> rgba =
                     sample_texture_rgba_bilinear(volume->imported_texture_rgba,
@@ -1765,6 +1943,36 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
                                                  uv.x(),
                                                  uv.y());
                 std::vector<float> raw_component_weights;
+                if (use_raw_top_surface_uv_texture) {
+                    raw_component_weights.assign(component_count, 0.f);
+                    const uint16_t slot =
+                        sample_texture_top_surface_slot_nearest(volume->imported_texture_raw_top_surface_filament_slots,
+                                                                volume->imported_texture_width,
+                                                                volume->imported_texture_height,
+                                                                raw_top_surface_layer_idx,
+                                                                raw_top_surface_layer_count,
+                                                                uv.x(),
+                                                                uv.y());
+                    unsigned int component_id = unsigned(slot);
+                    const auto mapped_it = raw_top_surface_slot_component_ids.find(component_id);
+                    if (mapped_it != raw_top_surface_slot_component_ids.end())
+                        component_id = mapped_it->second;
+                    const auto component_it = std::find(component_ids.begin(), component_ids.end(), component_id);
+                    if (component_it != component_ids.end()) {
+                        const size_t component_idx = size_t(component_it - component_ids.begin());
+                        raw_component_weights[component_idx] = 1.f;
+                        if (component_idx < component_colors.size())
+                            rgba = { component_colors[component_idx][0], component_colors[component_idx][1], component_colors[component_idx][2], 1.f };
+                    } else {
+                        rgba = composite_rgba_over_background(rgba, background_color);
+                    }
+                    TextureSampleData sample;
+                    sample.rgba = rgba;
+                    sample.raw_component_weights = std::move(raw_component_weights);
+                    sample.raw_component_weights_from_texture = true;
+                    sample.raw_top_surface_labels_from_texture = true;
+                    return sample;
+                }
                 if (use_raw_uv_texture) {
                     const std::vector<float> raw_sample =
                         sample_texture_raw_offsets_bilinear(volume->imported_texture_raw_filament_offsets,
@@ -1860,7 +2068,8 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
                                           area_weight * z_weight,
                                           std::move(sample_data.raw_component_weights),
                                           sample_data.raw_component_weights_from_texture,
-                                          normal_z);
+                                          normal_z,
+                                          sample_data.raw_top_surface_labels_from_texture);
                     }
                 }
             }
@@ -2054,6 +2263,7 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
     weight_field.sample_normal_z.resize(sample_count);
     weight_field.sample_component_weights.assign(sample_count * component_count, 0.f);
     weight_field.raw_component_weights_from_texture = false;
+    weight_field.raw_top_surface_labels_from_texture = false;
     weight_field.binary_dithered = !binary_dither_masks.empty();
 
     std::vector<float> fallback_acc(component_count, 0.f);
@@ -2064,6 +2274,8 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
             continue;
         if (sample.raw_component_weights_from_texture)
             weight_field.raw_component_weights_from_texture = true;
+        if (sample.raw_top_surface_labels_from_texture)
+            weight_field.raw_top_surface_labels_from_texture = true;
         weight_field.sample_x_mm[sample_idx] = sample.x_mm;
         weight_field.sample_y_mm[sample_idx] = sample.y_mm;
         weight_field.sample_weight[sample_idx] = sample.weight;
@@ -2101,8 +2313,9 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(
         fallback_weight += sample.weight;
     }
 
-    weight_field.fallback_weights.assign(component_count, 1.f / float(component_count));
-    if (fallback_weight > EPSILON) {
+    weight_field.fallback_weights.assign(component_count,
+                                         weight_field.raw_top_surface_labels_from_texture ? 0.f : 1.f / float(component_count));
+    if (!weight_field.raw_top_surface_labels_from_texture && fallback_weight > EPSILON) {
         for (size_t component_idx = 0; component_idx < component_count; ++component_idx)
             weight_field.fallback_weights[component_idx] = clamp01f(fallback_acc[component_idx] / fallback_weight);
     }
@@ -2161,7 +2374,7 @@ std::vector<float> sample_weight_field_components_impl(const TextureMappingOffse
     const float gy = (y_mm - weight_field.min_y_mm) / std::max(weight_field.bucket_height_mm, 1e-6f);
     const int cx = std::clamp(int(std::floor(gx)), 0, weight_field.bucket_width - 1);
     const int cy = std::clamp(int(std::floor(gy)), 0, weight_field.bucket_height - 1);
-    if (weight_field.binary_dithered) {
+    if (weight_field.binary_dithered || weight_field.raw_top_surface_labels_from_texture) {
         float nearest_d2 = std::numeric_limits<float>::max();
         size_t nearest_sample_idx = size_t(-1);
         const int nearest_ring_limit = std::min(16, std::max(weight_field.bucket_width, weight_field.bucket_height));
@@ -3082,6 +3295,81 @@ std::vector<unsigned int> decode_texture_mapping_offset_component_ids(const Text
     return out;
 }
 
+void append_texture_mapping_raw_top_surface_component_ids(const PrintObject &print_object,
+                                                          const TextureMappingZone &zone,
+                                                          const std::vector<std::string> &filament_colours,
+                                                          std::vector<unsigned int> &component_ids,
+                                                          size_t num_physical,
+                                                          std::optional<int> depth)
+{
+    if (num_physical == 0)
+        return;
+
+    const ModelObject *model_object = print_object.model_object();
+    if (model_object == nullptr)
+        return;
+
+    std::vector<uint8_t> component_present(num_physical + 1, 0);
+    size_t present_count = 0;
+    for (unsigned int component_id : component_ids) {
+        if (component_id == 0 || component_id > num_physical || component_present[component_id] != 0)
+            continue;
+        component_present[component_id] = 1;
+        ++present_count;
+    }
+    if (present_count >= num_physical)
+        return;
+
+    auto append_component = [&component_ids, &component_present, &present_count, num_physical](unsigned int component_id) {
+        if (component_id == 0 || component_id > num_physical)
+            return;
+        if (component_present[component_id] != 0)
+            return;
+        component_present[component_id] = 1;
+        ++present_count;
+        component_ids.emplace_back(component_id);
+    };
+
+    for (const ModelVolume *volume : model_object->volumes) {
+        if (present_count >= num_physical)
+            break;
+        if (volume == nullptr ||
+            !volume->is_model_part() ||
+            volume->imported_texture_width == 0 ||
+            volume->imported_texture_height == 0 ||
+            volume->imported_texture_raw_top_surface_depths.empty())
+            continue;
+
+        const size_t pixel_count =
+            size_t(volume->imported_texture_width) * size_t(volume->imported_texture_height);
+        const size_t depth_count = volume->imported_texture_raw_top_surface_depths.size();
+        if (pixel_count == 0 ||
+            volume->imported_texture_raw_top_surface_filament_slots.size() < pixel_count * depth_count)
+            continue;
+
+        const std::map<unsigned int, unsigned int> slot_component_ids =
+            raw_top_surface_slot_component_id_map(volume->imported_texture_raw_metadata_json,
+                                                  zone,
+                                                  component_ids,
+                                                  filament_colours);
+        for (size_t depth_idx = 0; depth_idx < depth_count; ++depth_idx) {
+            if (present_count >= num_physical)
+                break;
+            if (depth && volume->imported_texture_raw_top_surface_depths[depth_idx] != *depth)
+                continue;
+            const size_t begin = depth_idx * pixel_count;
+            const size_t end = begin + pixel_count;
+            for (size_t slot_idx = begin; slot_idx < end; ++slot_idx) {
+                const unsigned int raw_slot = unsigned(volume->imported_texture_raw_top_surface_filament_slots[slot_idx]);
+                const auto mapped_it = slot_component_ids.find(raw_slot);
+                append_component(mapped_it != slot_component_ids.end() ? mapped_it->second : raw_slot);
+                if (present_count >= num_physical)
+                    break;
+            }
+        }
+    }
+}
+
 float normalize_texture_mapping_offset_angle_deg(float angle)
 {
     float normalized = std::fmod(angle, 360.f);
@@ -3141,7 +3429,8 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     std::optional<float>     min_outer_width_mm_override,
     std::optional<std::array<float, 4>> image_background_rgba_override,
     std::optional<float>     sample_z_mm_override,
-    std::optional<float>     texture_sample_pitch_mm_override)
+    std::optional<float>     texture_sample_pitch_mm_override,
+    std::optional<int>       raw_top_surface_depth_override)
 {
     const Print *print = print_object.print();
     if (print == nullptr)
@@ -3162,6 +3451,13 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
         if (!effective_component_ids.empty())
             component_ids = effective_component_ids;
     }
+    if (raw_top_surface_depth_override)
+        append_texture_mapping_raw_top_surface_component_ids(print_object,
+                                                             zone,
+                                                             print_config.filament_colour.values,
+                                                             component_ids,
+                                                             num_physical,
+                                                             raw_top_surface_depth_override);
     if (component_ids.empty())
         return std::nullopt;
 
@@ -3329,29 +3625,16 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
         const float layer_sample_falloff_mm = high_resolution_texture_sampling ?
             std::max(0.03f, layer_height_mm * 0.5f) :
             std::max(0.12f, layer_height_mm * 1.5f);
-        weight_field = build_texture_mapping_offset_weight_field(print_object,
-                                                           component_colors,
-                                                           raw_texture_mapping_mode,
-                                                           filament_color_mode,
-                                                           zone.force_sequential_filaments,
-                                                           generic_solver_lookup_mode,
-                                                           generic_solver_mode,
-                                                           generic_solver_mix_model,
-                                                           zone.use_legacy_fixed_color_mode,
-                                                           dithering_enabled,
-                                                           dithering_method,
-                                                           dither_pitch_mm,
-                                                           dither_cell_size_mm,
-                                                           component_strength_factors,
-                                                           component_minimum_offset_factors,
-                                                           texture_contrast_pct,
-                                                           texture_tone_gamma,
-                                                           sample_z_mm,
-                                                           layer_sample_falloff_mm,
-                                                           high_resolution_texture_sampling,
-                                                           zone.high_speed_image_texture_sampling,
-                                                           texture_sample_pitch_mm_override,
-                                                           image_background_rgba_override);
+        weight_field = build_texture_mapping_offset_weight_field(print_object, zone, component_ids, component_colors,
+                                                                 print_config.filament_colour.values, raw_texture_mapping_mode,
+                                                                 filament_color_mode, zone.force_sequential_filaments,
+                                                                 generic_solver_lookup_mode, generic_solver_mode, generic_solver_mix_model,
+                                                                 zone.use_legacy_fixed_color_mode, dithering_enabled, dithering_method,
+                                                                 dither_pitch_mm, dither_cell_size_mm, component_strength_factors,
+                                                                 component_minimum_offset_factors, texture_contrast_pct, texture_tone_gamma,
+                                                                 sample_z_mm, layer_sample_falloff_mm, high_resolution_texture_sampling,
+                                                                 zone.high_speed_image_texture_sampling, texture_sample_pitch_mm_override,
+                                                                 image_background_rgba_override, raw_top_surface_depth_override);
         if (weight_field.empty())
             return std::nullopt;
     }

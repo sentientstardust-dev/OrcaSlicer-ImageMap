@@ -790,13 +790,17 @@ static bool has_imported_obj_texture_payload(const ModelVolume &volume)
 
 static bool has_imported_raw_atlas_texture_payload(const ModelVolume &volume)
 {
-    return volume.imported_texture_width > 0 &&
-           volume.imported_texture_height > 0 &&
-           volume.imported_texture_raw_channels > 0 &&
-           volume.imported_texture_raw_filament_offsets.size() >=
-               size_t(volume.imported_texture_width) *
-                   size_t(volume.imported_texture_height) *
-                   size_t(volume.imported_texture_raw_channels);
+    if (volume.imported_texture_width == 0 || volume.imported_texture_height == 0)
+        return false;
+    const size_t pixel_count = size_t(volume.imported_texture_width) * size_t(volume.imported_texture_height);
+    const bool has_offsets =
+        volume.imported_texture_raw_channels > 0 &&
+        volume.imported_texture_raw_filament_offsets.size() >= pixel_count * size_t(volume.imported_texture_raw_channels);
+    const bool has_top_surface =
+        !volume.imported_texture_raw_top_surface_depths.empty() &&
+        volume.imported_texture_raw_top_surface_filament_slots.size() >=
+            pixel_count * volume.imported_texture_raw_top_surface_depths.size();
+    return has_offsets || has_top_surface;
 }
 
 static std::vector<ImageMapRawFilament> raw_atlas_filaments_from_metadata(const std::string &metadata_json, uint32_t channels)
@@ -843,6 +847,20 @@ static ImageMapRawFilamentOffsetAtlas raw_atlas_from_model_volume(const ModelVol
     atlas.mask.assign(size_t(atlas.width) * size_t(atlas.height), 255);
     atlas.metadata_json = volume.imported_texture_raw_metadata_json;
     atlas.filaments = raw_atlas_filaments_from_metadata(volume.imported_texture_raw_metadata_json, atlas.channels);
+    const size_t pixel_count = size_t(atlas.width) * size_t(atlas.height);
+    const size_t depth_count = volume.imported_texture_raw_top_surface_depths.size();
+    if (pixel_count > 0 &&
+        depth_count > 0 &&
+        volume.imported_texture_raw_top_surface_filament_slots.size() >= pixel_count * depth_count) {
+        atlas.top_surface_layers.reserve(depth_count);
+        for (size_t depth_idx = 0; depth_idx < depth_count; ++depth_idx) {
+            ImageMapRawTopSurfaceLayer layer;
+            layer.depth = volume.imported_texture_raw_top_surface_depths[depth_idx];
+            const auto begin = volume.imported_texture_raw_top_surface_filament_slots.begin() + depth_idx * pixel_count;
+            layer.filament_slots.assign(begin, begin + pixel_count);
+            atlas.top_surface_layers.emplace_back(std::move(layer));
+        }
+    }
     return atlas;
 }
 
@@ -6064,12 +6082,26 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
                 volume->imported_texture_height = raw_atlas.height;
                 volume->imported_texture_raw_channels = raw_atlas.channels;
                 volume->imported_texture_raw_filament_offsets = std::move(raw_atlas.offsets);
+                volume->imported_texture_raw_top_surface_filament_slots.clear();
+                volume->imported_texture_raw_top_surface_depths.clear();
+                const size_t pixel_count = size_t(raw_atlas.width) * size_t(raw_atlas.height);
+                for (const ImageMapRawTopSurfaceLayer &layer : raw_atlas.top_surface_layers) {
+                    if (layer.filament_slots.size() < pixel_count)
+                        continue;
+                    volume->imported_texture_raw_top_surface_depths.emplace_back(layer.depth);
+                    volume->imported_texture_raw_top_surface_filament_slots.insert(
+                        volume->imported_texture_raw_top_surface_filament_slots.end(),
+                        layer.filament_slots.begin(),
+                        layer.filament_slots.begin() + pixel_count);
+                }
                 volume->imported_texture_raw_metadata_json = std::move(raw_atlas.metadata_json);
             } else {
                 volume->imported_texture_rgba = std::move(imported_rgba);
                 volume->imported_texture_width = imported_width;
                 volume->imported_texture_height = imported_height;
                 volume->imported_texture_raw_filament_offsets.clear();
+                volume->imported_texture_raw_top_surface_filament_slots.clear();
+                volume->imported_texture_raw_top_surface_depths.clear();
                 volume->imported_texture_raw_channels = 0;
                 volume->imported_texture_raw_metadata_json.clear();
             }
@@ -8070,6 +8102,8 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
                                     && (shared_volume->imported_texture_uv_valid == volume->imported_texture_uv_valid)
                                     && (shared_volume->imported_texture_rgba == volume->imported_texture_rgba)
                                     && (shared_volume->imported_texture_raw_filament_offsets == volume->imported_texture_raw_filament_offsets)
+                                    && (shared_volume->imported_texture_raw_top_surface_filament_slots == volume->imported_texture_raw_top_surface_filament_slots)
+                                    && (shared_volume->imported_texture_raw_top_surface_depths == volume->imported_texture_raw_top_surface_depths)
                                     && (shared_volume->imported_texture_width == volume->imported_texture_width)
                                     && (shared_volume->imported_texture_height == volume->imported_texture_height)
                                     && (shared_volume->imported_texture_raw_channels == volume->imported_texture_raw_channels)

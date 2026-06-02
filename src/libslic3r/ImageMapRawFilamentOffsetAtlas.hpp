@@ -25,6 +25,18 @@ struct ImageMapRawExpectedLineWidth
     bool   valid { false };
 };
 
+struct ImageMapRawTopSurfaceFilamentValue
+{
+    uint8_t      value { 0 };
+    unsigned int slot { 0 };
+};
+
+struct ImageMapRawTopSurfaceLayer
+{
+    int depth { 0 };
+    std::vector<uint16_t> filament_slots;
+};
+
 struct ImageMapRawFilamentOffsetAtlas
 {
     uint32_t width { 0 };
@@ -32,6 +44,8 @@ struct ImageMapRawFilamentOffsetAtlas
     uint32_t channels { 0 };
     std::vector<ImageMapRawFilament> filaments;
     std::vector<uint8_t> offsets;
+    std::vector<ImageMapRawTopSurfaceFilamentValue> top_surface_filament_values;
+    std::vector<ImageMapRawTopSurfaceLayer> top_surface_layers;
     std::vector<uint8_t> mask;
     std::string metadata_json;
     ImageMapRawExpectedLineWidth expected_line_width_mm;
@@ -57,6 +71,8 @@ std::string image_map_raw_filament_channel_key(const ImageMapRawFilament &filame
 
 std::vector<ImageMapRawFilament> image_map_raw_filaments_for_channels(const std::vector<ImageMapRawFilament> &filaments,
                                                                       uint32_t channels);
+
+std::vector<ImageMapRawFilament> image_map_raw_filaments_from_metadata_json(const std::string &metadata_json);
 
 std::vector<ImageMapRawFilament> image_map_raw_filaments_from_metadata_json(const std::string &metadata_json,
                                                                             uint32_t channels);

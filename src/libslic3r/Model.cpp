@@ -821,6 +821,8 @@ Model Model::read_from_file(const std::string&                                  
                     volume->imported_texture_uv_valid.clear();
                     volume->imported_texture_rgba.clear();
                     volume->imported_texture_raw_filament_offsets.clear();
+                    volume->imported_texture_raw_top_surface_filament_slots.clear();
+                    volume->imported_texture_raw_top_surface_depths.clear();
                     volume->imported_texture_width = 0;
                     volume->imported_texture_height = 0;
                     volume->imported_texture_raw_channels = 0;
@@ -861,6 +863,8 @@ Model Model::read_from_file(const std::string&                                  
                                 volume->imported_texture_height = atlas_height;
                                 volume->imported_texture_rgba = std::move(atlas_rgba);
                                 volume->imported_texture_raw_filament_offsets.clear();
+                                volume->imported_texture_raw_top_surface_filament_slots.clear();
+                                volume->imported_texture_raw_top_surface_depths.clear();
                                 volume->imported_texture_raw_channels = 0;
                                 volume->imported_texture_raw_metadata_json.clear();
                                 volume->uv_map_generator_version = 0;
@@ -948,6 +952,8 @@ Model Model::read_from_file(const std::string&                                  
                     volume->imported_texture_uv_valid.clear();
                     volume->imported_texture_rgba.clear();
                     volume->imported_texture_raw_filament_offsets.clear();
+                    volume->imported_texture_raw_top_surface_filament_slots.clear();
+                    volume->imported_texture_raw_top_surface_depths.clear();
                     volume->imported_texture_width = 0;
                     volume->imported_texture_height = 0;
                     volume->imported_texture_raw_channels = 0;
@@ -995,6 +1001,8 @@ Model Model::read_from_file(const std::string&                                  
                                 volume->imported_texture_height = atlas_height;
                                 volume->imported_texture_rgba = std::move(atlas_rgba);
                                 volume->imported_texture_raw_filament_offsets.clear();
+                                volume->imported_texture_raw_top_surface_filament_slots.clear();
+                                volume->imported_texture_raw_top_surface_depths.clear();
                                 volume->imported_texture_raw_channels = 0;
                                 volume->imported_texture_raw_metadata_json.clear();
                                 volume->uv_map_generator_version = 0;
@@ -3535,6 +3543,8 @@ void ModelVolume::assign_new_unique_ids_recursive()
     imported_texture_uv_valid.set_new_unique_id();
     imported_texture_rgba.set_new_unique_id();
     imported_texture_raw_filament_offsets.set_new_unique_id();
+    imported_texture_raw_top_surface_filament_slots.set_new_unique_id();
+    imported_texture_raw_top_surface_depths.set_new_unique_id();
     fuzzy_skin_facets.set_new_unique_id();
 }
 
@@ -5181,6 +5191,8 @@ static bool model_volume_texture_mapping_data_matches(const ModelVolume &mv_old,
            model_volume_imported_vector_matches(mv_old.imported_texture_uv_valid, mv_new.imported_texture_uv_valid) &&
            model_volume_imported_vector_matches(mv_old.imported_texture_rgba, mv_new.imported_texture_rgba) &&
            model_volume_imported_vector_matches(mv_old.imported_texture_raw_filament_offsets, mv_new.imported_texture_raw_filament_offsets) &&
+           model_volume_imported_vector_matches(mv_old.imported_texture_raw_top_surface_filament_slots, mv_new.imported_texture_raw_top_surface_filament_slots) &&
+           model_volume_imported_vector_matches(mv_old.imported_texture_raw_top_surface_depths, mv_new.imported_texture_raw_top_surface_depths) &&
            mv_old.imported_texture_width == mv_new.imported_texture_width &&
            mv_old.imported_texture_height == mv_new.imported_texture_height &&
            mv_old.imported_texture_raw_channels == mv_new.imported_texture_raw_channels &&
