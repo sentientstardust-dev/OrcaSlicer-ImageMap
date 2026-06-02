@@ -2037,9 +2037,11 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     m_warned_texture_mapping_color_match_zone_ids.clear();
     m_generic_solver_mix_candidate_cache.clear();
     m_uv_texture_triangle_cache.clear();
+    m_top_surface_coloring_shell_infill_object_cache.clear();
     ScopeGuard clear_generic_solver_mix_candidate_cache([this]() {
         m_generic_solver_mix_candidate_cache.clear();
         m_uv_texture_triangle_cache.clear();
+        m_top_surface_coloring_shell_infill_object_cache.clear();
     });
 
     GCodeWriter::full_gcode_comment = print->config().gcode_comments;
@@ -12762,6 +12764,39 @@ LiftType GCode::to_lift_type(ZHopType z_hop_types) {
     }
 };
 
+bool GCode::object_has_top_surface_coloring_shell_infill(const PrintObject &object)
+{
+    auto cached = m_top_surface_coloring_shell_infill_object_cache.find(&object);
+    if (cached != m_top_surface_coloring_shell_infill_object_cache.end())
+        return cached->second;
+
+    bool result = false;
+    if (const Print *print = object.print()) {
+        const TextureMappingManager &texture_mgr = print->texture_mapping_manager();
+        for (const Layer *layer : object.layers()) {
+            if (layer == nullptr)
+                continue;
+            for (const LayerRegion *layerm : layer->regions()) {
+                if (layerm == nullptr)
+                    continue;
+                const int raw_zone_id = layerm->region().config().solid_infill_filament.value;
+                if (raw_zone_id <= 0)
+                    continue;
+                const TextureMappingZone *zone = texture_mgr.zone_from_id(unsigned(raw_zone_id));
+                if (zone != nullptr && zone->enabled && !zone->deleted && zone->top_surface_image_printing_active()) {
+                    result = true;
+                    break;
+                }
+            }
+            if (result)
+                break;
+        }
+    }
+
+    m_top_surface_coloring_shell_infill_object_cache.emplace(&object, result);
+    return result;
+}
+
 bool GCode::needs_retraction(const Polyline &travel, ExtrusionRole role, LiftType& lift_type)
 {
     if (travel.length() < scale_(FILAMENT_CONFIG(retraction_minimum_travel))) {
@@ -12869,7 +12904,14 @@ bool GCode::needs_retraction(const Polyline &travel, ExtrusionRole role, LiftTyp
                     return false;
     }
     //BBS: need retract when long moving to print perimeter to avoid dropping of material
-    if (!is_perimeter(role) && m_config.reduce_infill_retraction && m_layer != nullptr &&
+    const bool keep_shell_retraction_for_top_surface_coloring =
+        is_solid_infill(role) &&
+        m_layer != nullptr &&
+        m_layer->object() != nullptr &&
+        object_has_top_surface_coloring_shell_infill(*m_layer->object());
+    if (!is_perimeter(role) &&
+        !keep_shell_retraction_for_top_surface_coloring &&
+        m_config.reduce_infill_retraction && m_layer != nullptr &&
         m_config.sparse_infill_density.value > 0 && m_retract_when_crossing_perimeters.travel_inside_internal_regions(*m_layer, travel))
         // Skip retraction if travel is contained in an internal slice *and*
         // internal infill is enabled (so that stringing is entirely not visible).

@@ -547,6 +547,7 @@ private:
     std::string     extrude_support(const ExtrusionEntityCollection& support_fills, const ExtrusionRole support_extrusion_role);
 
     // BBS
+    bool object_has_top_surface_coloring_shell_infill(const PrintObject &object);
     LiftType to_lift_type(ZHopType z_hop_types);
 
     std::set<ObjectID>              m_objsWithBrim; // indicates the objs with brim
@@ -559,6 +560,7 @@ private:
     std::map<std::tuple<const PrintObject*, unsigned int, std::string>, VertexColorOverhangWeightField> m_vertex_color_overhang_weight_field_cache;
     std::map<const PrintObject*, GCodeUVTextureTriangleCache> m_uv_texture_triangle_cache;
     std::map<std::string, GCodeGenericMixCandidateSet> m_generic_solver_mix_candidate_cache;
+    std::map<const PrintObject*, bool> m_top_surface_coloring_shell_infill_object_cache;
     bool                                m_warned_texture_mapping_filament_count_mismatch { false };
     std::set<unsigned int>              m_warned_texture_mapping_color_match_zone_ids;
 
