@@ -2450,6 +2450,7 @@ public:
                                         bool top_surface_contoning_blue_noise_error_diffusion_enabled,
                                         bool top_surface_contoning_supersampled_cells_enabled,
                                         bool top_surface_contoning_polygonize_color_regions_enabled,
+                                        bool top_surface_contoning_partition_color_regions_enabled,
                                         bool top_surface_contoning_fast_mode_enabled,
                                         int top_surface_contoning_polygonization_mode,
                                         int top_surface_contoning_polygonize_resolution,
@@ -3119,12 +3120,15 @@ public:
             contoning_flat_infill_choices.Add(label);
             m_top_surface_contoning_flat_surface_infill_modes.push_back(mode);
         };
-        add_contoning_flat_infill_choice(_L("Default (Rectilinear)"),
+        add_contoning_flat_infill_choice(_L("Default (Boundary Skin - variable width)"),
                                          int(TextureMappingZone::ContoningFlatSurfaceInfillDefault));
-        add_contoning_flat_infill_choice(_L("Rectilinear"),
+        add_contoning_flat_infill_choice(_L("Rectilinear (faster to print, may leave small holes)"),
                                          int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinear));
+        if (TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
+            add_contoning_flat_infill_choice(_L("Rectilinear with repair"),
+                                             int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithRepair));
         if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
-            add_contoning_flat_infill_choice(_L("Boundary Skin (variable width) - not recommended"),
+            add_contoning_flat_infill_choice(_L("Boundary Skin (variable width)"),
                                              int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariable));
         if (TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions) {
             add_contoning_flat_infill_choice(_L("Concentric"),
@@ -3345,6 +3349,17 @@ public:
                                        0,
                                        wxEXPAND | wxTOP | wxBOTTOM,
                                        gap / 2);
+        if (TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions) {
+            m_top_surface_contoning_partition_color_regions_checkbox =
+                new wxCheckBox(m_top_surface_contoning_checkboxes_panel, wxID_ANY, _L("Partition color regions before fill"));
+            m_top_surface_contoning_partition_color_regions_checkbox->SetValue(top_surface_contoning_partition_color_regions_enabled);
+            m_top_surface_contoning_partition_color_regions_checkbox->SetMinSize(
+                wxSize(-1, std::max(m_top_surface_contoning_partition_color_regions_checkbox->GetBestSize().GetHeight(), FromDIP(24))));
+            contoning_checkboxes_root->Add(m_top_surface_contoning_partition_color_regions_checkbox,
+                                           0,
+                                           wxEXPAND | wxTOP | wxBOTTOM,
+                                           gap / 2);
+        }
         m_top_surface_contoning_polygonize_resolution_panel = new wxPanel(m_top_surface_contoning_checkboxes_panel, wxID_ANY);
         auto *contoning_polygonize_resolution_row = new wxBoxSizer(wxHORIZONTAL);
         m_top_surface_contoning_polygonize_resolution_panel->SetSizer(contoning_polygonize_resolution_row);
@@ -3353,17 +3368,9 @@ public:
                                                  wxALIGN_CENTER_VERTICAL | wxRIGHT,
                                                  gap);
         wxArrayString contoning_polygonize_resolution_choices;
-        contoning_polygonize_resolution_choices.Add(_L("1x"));
-        contoning_polygonize_resolution_choices.Add(_L("2x"));
-        contoning_polygonize_resolution_choices.Add(_L("3x"));
-        contoning_polygonize_resolution_choices.Add(_L("4x"));
-        contoning_polygonize_resolution_choices.Add(_L("8x (slow)"));
         m_top_surface_contoning_polygonize_resolution_choice =
             new wxChoice(m_top_surface_contoning_polygonize_resolution_panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, contoning_polygonize_resolution_choices);
-        const int polygonize_resolution = TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(top_surface_contoning_polygonize_resolution);
-        m_top_surface_contoning_polygonize_resolution_choice->SetSelection(
-            polygonize_resolution == 1 ? 0 :
-            (polygonize_resolution == 2 ? 1 : (polygonize_resolution == 3 ? 2 : (polygonize_resolution == 4 ? 3 : 4))));
+        update_top_surface_contoning_polygonize_resolution_choices(top_surface_contoning_polygonize_resolution);
         contoning_polygonize_resolution_row->Add(m_top_surface_contoning_polygonize_resolution_choice, 1, wxEXPAND);
         contoning_checkboxes_root->Add(m_top_surface_contoning_polygonize_resolution_panel,
                                        0,
@@ -3456,6 +3463,11 @@ public:
         }
         if (m_top_surface_contoning_polygonize_color_regions_checkbox != nullptr) {
             m_top_surface_contoning_polygonize_color_regions_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
+                update_top_surface_image_options_visibility(true);
+            });
+        }
+        if (m_top_surface_contoning_flat_surface_infill_choice != nullptr) {
+            m_top_surface_contoning_flat_surface_infill_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) {
                 update_top_surface_image_options_visibility(true);
             });
         }
@@ -3951,6 +3963,14 @@ public:
             m_top_surface_contoning_polygonize_color_regions_checkbox->GetValue() :
             TextureMappingZone::DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled;
     }
+    bool top_surface_contoning_partition_color_regions_enabled() const
+    {
+        if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
+            return false;
+        return m_top_surface_contoning_partition_color_regions_checkbox != nullptr ?
+            m_top_surface_contoning_partition_color_regions_checkbox->GetValue() :
+            TextureMappingZone::DefaultTopSurfaceContoningPartitionColorRegionsEnabled;
+    }
     bool top_surface_contoning_fast_mode_enabled() const
     {
         if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
@@ -3971,14 +3991,9 @@ public:
         if (m_top_surface_contoning_polygonize_resolution_choice == nullptr)
             return TextureMappingZone::DefaultTopSurfaceContoningPolygonizeResolution;
         const int selection = m_top_surface_contoning_polygonize_resolution_choice->GetSelection();
-        switch (selection) {
-        case 0: return 1;
-        case 1: return 2;
-        case 2: return 3;
-        case 3: return 4;
-        case 4: return 8;
-        default: return TextureMappingZone::DefaultTopSurfaceContoningPolygonizeResolution;
-        }
+        return selection >= 0 && size_t(selection) < m_top_surface_contoning_polygonize_resolution_values.size() ?
+            m_top_surface_contoning_polygonize_resolution_values[size_t(selection)] :
+            TextureMappingZone::DefaultTopSurfaceContoningPolygonizeResolution;
     }
     bool top_surface_contoning_surface_anchored_stacks_enabled() const
     {
@@ -4927,6 +4942,44 @@ private:
         }
     }
 
+    void update_top_surface_contoning_polygonize_resolution_choices(int preferred_resolution)
+    {
+        if (m_top_surface_contoning_polygonize_resolution_choice == nullptr)
+            return;
+
+        const bool allow_x8 = TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions ||
+                              TextureMappingZone::effective_top_surface_contoning_flat_surface_infill_mode(
+                                  top_surface_contoning_flat_surface_infill_mode()) ==
+                                  int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariable);
+        int resolution = TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(preferred_resolution);
+        if (!allow_x8 && resolution == 8)
+            resolution = 4;
+
+        m_top_surface_contoning_polygonize_resolution_choice->Clear();
+        m_top_surface_contoning_polygonize_resolution_values.clear();
+
+        auto append_resolution = [this](const wxString &label, int value) {
+            m_top_surface_contoning_polygonize_resolution_choice->Append(label);
+            m_top_surface_contoning_polygonize_resolution_values.push_back(value);
+        };
+
+        append_resolution(_L("1x"), 1);
+        append_resolution(_L("2x"), 2);
+        append_resolution(_L("3x"), 3);
+        append_resolution(_L("4x"), 4);
+        if (allow_x8)
+            append_resolution(_L("8x (slow)"), 8);
+
+        int selection = 0;
+        for (size_t idx = 0; idx < m_top_surface_contoning_polygonize_resolution_values.size(); ++idx) {
+            if (m_top_surface_contoning_polygonize_resolution_values[idx] == resolution) {
+                selection = int(idx);
+                break;
+            }
+        }
+        m_top_surface_contoning_polygonize_resolution_choice->SetSelection(selection);
+    }
+
     void update_top_surface_image_options_visibility(bool fit_dialog)
     {
         const bool enabled =
@@ -4968,6 +5021,7 @@ private:
             m_top_surface_contoning_pattern_filaments_spin->Enable(contoning);
         if (m_top_surface_contoning_flat_surface_infill_choice != nullptr)
             m_top_surface_contoning_flat_surface_infill_choice->Enable(contoning);
+        update_top_surface_contoning_polygonize_resolution_choices(top_surface_contoning_polygonize_resolution());
         if (m_top_surface_contoning_checkboxes_panel != nullptr)
             m_top_surface_contoning_checkboxes_panel->Show(contoning);
         if (m_top_surface_contoning_color_lower_surfaces_checkbox != nullptr) {
@@ -5051,6 +5105,10 @@ private:
         if (m_top_surface_contoning_polygonize_color_regions_checkbox != nullptr) {
             m_top_surface_contoning_polygonize_color_regions_checkbox->Show(contoning);
             m_top_surface_contoning_polygonize_color_regions_checkbox->Enable(contoning);
+        }
+        if (m_top_surface_contoning_partition_color_regions_checkbox != nullptr) {
+            m_top_surface_contoning_partition_color_regions_checkbox->Show(contoning);
+            m_top_surface_contoning_partition_color_regions_checkbox->Enable(contoning);
         }
         const bool polygonize_color_regions =
             contoning &&
@@ -5167,11 +5225,13 @@ private:
     wxCheckBox *m_top_surface_contoning_blue_noise_error_diffusion_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_supersampled_cells_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_polygonize_color_regions_checkbox {nullptr};
+    wxCheckBox *m_top_surface_contoning_partition_color_regions_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_fast_mode_checkbox {nullptr};
     wxPanel *m_top_surface_contoning_polygonization_mode_panel {nullptr};
     wxChoice *m_top_surface_contoning_polygonization_mode_choice {nullptr};
     wxPanel *m_top_surface_contoning_polygonize_resolution_panel {nullptr};
     wxChoice *m_top_surface_contoning_polygonize_resolution_choice {nullptr};
+    std::vector<int> m_top_surface_contoning_polygonize_resolution_values;
     wxCheckBox *m_top_surface_contoning_surface_anchored_stacks_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_surface_anchored_stack_optimizations_checkbox {nullptr};
     wxCheckBox *m_top_surface_contoning_beam_search_stack_expansion_checkbox {nullptr};
@@ -10235,6 +10295,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.top_surface_contoning_blue_noise_error_diffusion_enabled,
                                                     updated.top_surface_contoning_supersampled_cells_enabled,
                                                     updated.top_surface_contoning_polygonize_color_regions_enabled,
+                                                    updated.top_surface_contoning_partition_color_regions_enabled,
                                                     updated.top_surface_contoning_fast_mode_enabled,
                                                     updated.top_surface_contoning_polygonization_mode,
                                                     updated.top_surface_contoning_polygonize_resolution,
@@ -10321,6 +10382,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 dlg.top_surface_contoning_supersampled_cells_enabled();
             updated.top_surface_contoning_polygonize_color_regions_enabled =
                 dlg.top_surface_contoning_polygonize_color_regions_enabled();
+            updated.top_surface_contoning_partition_color_regions_enabled =
+                dlg.top_surface_contoning_partition_color_regions_enabled();
             updated.top_surface_contoning_fast_mode_enabled =
                 dlg.top_surface_contoning_fast_mode_enabled();
             updated.top_surface_contoning_polygonization_mode =

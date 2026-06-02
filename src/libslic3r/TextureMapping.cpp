@@ -765,11 +765,13 @@ static std::string top_surface_contoning_flat_surface_infill_mode_name(int mode)
 {
     switch (clamp_int(mode,
                       int(TextureMappingZone::ContoningFlatSurfaceInfillDefault),
-                      int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithBoundary))) {
+                      int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithRepair))) {
     case int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinear):
         return "rectilinear";
     case int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithBoundary):
         return "rectilinear_with_boundary";
+    case int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithRepair):
+        return "rectilinear_with_repair";
     case int(TextureMappingZone::ContoningFlatSurfaceInfillConcentric):
         return "concentric";
     case int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinFixed):
@@ -791,6 +793,8 @@ static int top_surface_contoning_flat_surface_infill_mode_from_name(const std::s
         return int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinear);
     if (name == "rectilinear_with_boundary" || name == "rectilinear_boundary")
         return int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithBoundary);
+    if (name == "rectilinear_with_repair" || name == "rectilinear_repair")
+        return int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithRepair);
     if (name == "concentric")
         return int(TextureMappingZone::ContoningFlatSurfaceInfillConcentric);
     if (name == "boundary_skin" || name == "boundary_skin_variable")
@@ -1802,6 +1806,8 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            effective_top_surface_contoning_supersampled_cells_enabled() ==
                rhs.effective_top_surface_contoning_supersampled_cells_enabled() &&
            top_surface_contoning_polygonize_color_regions_enabled == rhs.top_surface_contoning_polygonize_color_regions_enabled &&
+           effective_top_surface_contoning_partition_color_regions_enabled() ==
+               rhs.effective_top_surface_contoning_partition_color_regions_enabled() &&
            effective_top_surface_contoning_fast_mode_enabled() == rhs.effective_top_surface_contoning_fast_mode_enabled() &&
            effective_top_surface_contoning_polygonization_mode() == rhs.effective_top_surface_contoning_polygonization_mode() &&
            TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(top_surface_contoning_polygonize_resolution) ==
@@ -2216,6 +2222,8 @@ std::string TextureMappingManager::serialize_entries()
             zone.effective_top_surface_contoning_supersampled_cells_enabled();
         texture["top_surface_contoning_polygonize_color_regions_enabled"] =
             zone.top_surface_contoning_polygonize_color_regions_enabled;
+        texture["top_surface_contoning_partition_color_regions_enabled"] =
+            zone.effective_top_surface_contoning_partition_color_regions_enabled();
         texture["top_surface_contoning_fast_mode_enabled"] =
             zone.effective_top_surface_contoning_fast_mode_enabled();
         texture["top_surface_contoning_polygonization_mode"] =
@@ -2520,7 +2528,7 @@ void TextureMappingManager::load_entries(const std::string &serialized,
                               flat_surface_infill_mode_it->get<int>() :
                               TextureMappingZone::DefaultTopSurfaceContoningFlatSurfaceInfillMode,
                           int(TextureMappingZone::ContoningFlatSurfaceInfillDefault),
-                          int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithBoundary));
+                          int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithRepair));
         zone.top_surface_contoning_layer_phase_enabled =
             texture.value("top_surface_contoning_layer_phase_enabled",
                           TextureMappingZone::DefaultTopSurfaceContoningLayerPhaseEnabled);
@@ -2536,6 +2544,9 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.top_surface_contoning_polygonize_color_regions_enabled =
             texture.value("top_surface_contoning_polygonize_color_regions_enabled",
                           TextureMappingZone::DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled);
+        zone.top_surface_contoning_partition_color_regions_enabled =
+            texture.value("top_surface_contoning_partition_color_regions_enabled",
+                          TextureMappingZone::DefaultTopSurfaceContoningPartitionColorRegionsEnabled);
         zone.top_surface_contoning_fast_mode_enabled =
             texture.value("top_surface_contoning_fast_mode_enabled",
                           TextureMappingZone::DefaultTopSurfaceContoningFastModeEnabled);

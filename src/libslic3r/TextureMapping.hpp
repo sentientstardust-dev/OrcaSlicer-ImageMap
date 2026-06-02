@@ -89,7 +89,8 @@ struct TextureMappingZone
         ContoningFlatSurfaceInfillBoundarySkinVariable = 4,
         ContoningFlatSurfaceInfillSpiral = 5,
         ContoningFlatSurfaceInfillBoundarySkinHybrid = 6,
-        ContoningFlatSurfaceInfillRectilinearWithBoundary = 7
+        ContoningFlatSurfaceInfillRectilinearWithBoundary = 7,
+        ContoningFlatSurfaceInfillRectilinearWithRepair = 8
     };
 
     enum TopSurfaceContoningColorPredictionMode : uint8_t {
@@ -215,12 +216,13 @@ struct TextureMappingZone
     static constexpr bool  DefaultTopSurfaceContoningRecolorSurroundingPerimeters = false;
     static constexpr int   DefaultTopSurfaceContoningPerimeterMode = int(ContoningPerimeterDividedLine);
     static constexpr int   DefaultTopSurfaceContoningFlatSurfaceInfillMode = int(ContoningFlatSurfaceInfillDefault);
-    static constexpr int   SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode = int(ContoningFlatSurfaceInfillRectilinear);
+    static constexpr int   SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode = int(ContoningFlatSurfaceInfillBoundarySkinVariable);
     static constexpr bool  DefaultTopSurfaceContoningLayerPhaseEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningVariedInfillAnglesEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningSupersampledCellsEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled = true;
+    static constexpr bool  DefaultTopSurfaceContoningPartitionColorRegionsEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningFastModeEnabled = true;
     static constexpr int   DefaultTopSurfaceContoningPolygonizationMode =
         int(ContoningPolygonizationMidGaussianSharedChainFit);
@@ -292,7 +294,7 @@ struct TextureMappingZone
     {
         const int clamped_mode = std::clamp(mode,
                                             int(ContoningFlatSurfaceInfillDefault),
-                                            int(ContoningFlatSurfaceInfillRectilinearWithBoundary));
+                                            int(ContoningFlatSurfaceInfillRectilinearWithRepair));
         if (ShowExperimentalTopSurfaceContoningOptions)
             return clamped_mode;
         return clamped_mode == int(ContoningFlatSurfaceInfillRectilinear) ||
@@ -359,6 +361,11 @@ struct TextureMappingZone
     static bool effective_top_surface_contoning_fast_mode_enabled(bool value)
     {
         return ShowExperimentalTopSurfaceContoningOptions ? value : true;
+    }
+
+    static bool effective_top_surface_contoning_partition_color_regions_enabled(bool value)
+    {
+        return ShowExperimentalTopSurfaceContoningOptions ? value : false;
     }
 
     static constexpr int normalize_top_surface_contoning_polygonization_mode(int mode)
@@ -493,6 +500,7 @@ struct TextureMappingZone
     bool        top_surface_contoning_blue_noise_error_diffusion_enabled = DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled;
     bool        top_surface_contoning_supersampled_cells_enabled = DefaultTopSurfaceContoningSupersampledCellsEnabled;
     bool        top_surface_contoning_polygonize_color_regions_enabled = DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled;
+    bool        top_surface_contoning_partition_color_regions_enabled = DefaultTopSurfaceContoningPartitionColorRegionsEnabled;
     bool        top_surface_contoning_fast_mode_enabled = DefaultTopSurfaceContoningFastModeEnabled;
     int         top_surface_contoning_polygonization_mode = DefaultTopSurfaceContoningPolygonizationMode;
     int         top_surface_contoning_polygonize_resolution = DefaultTopSurfaceContoningPolygonizeResolution;
@@ -662,6 +670,12 @@ struct TextureMappingZone
             top_surface_contoning_fast_mode_enabled);
     }
 
+    bool effective_top_surface_contoning_partition_color_regions_enabled() const
+    {
+        return TextureMappingZone::effective_top_surface_contoning_partition_color_regions_enabled(
+            top_surface_contoning_partition_color_regions_enabled);
+    }
+
     int effective_top_surface_contoning_polygonization_mode() const
     {
         return TextureMappingZone::effective_top_surface_contoning_polygonization_mode(
@@ -718,6 +732,7 @@ struct TextureMappingZone
             top_surface_contoning_blue_noise_error_diffusion_enabled = false;
             top_surface_contoning_supersampled_cells_enabled = false;
             top_surface_contoning_fast_mode_enabled = true;
+            top_surface_contoning_partition_color_regions_enabled = true;
         } else if (top_surface_contoning_replace_top_perimeters_with_infill) {
             top_surface_contoning_recolor_surrounding_perimeters = false;
         }
@@ -790,6 +805,7 @@ struct TextureMappingZone
         top_surface_contoning_blue_noise_error_diffusion_enabled = DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled;
         top_surface_contoning_supersampled_cells_enabled = DefaultTopSurfaceContoningSupersampledCellsEnabled;
         top_surface_contoning_polygonize_color_regions_enabled = DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled;
+        top_surface_contoning_partition_color_regions_enabled = DefaultTopSurfaceContoningPartitionColorRegionsEnabled;
         top_surface_contoning_fast_mode_enabled = DefaultTopSurfaceContoningFastModeEnabled;
         top_surface_contoning_polygonization_mode = DefaultTopSurfaceContoningPolygonizationMode;
         top_surface_contoning_polygonize_resolution = DefaultTopSurfaceContoningPolygonizeResolution;
