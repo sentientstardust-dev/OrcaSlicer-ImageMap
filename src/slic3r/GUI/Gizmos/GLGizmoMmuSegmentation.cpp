@@ -86,6 +86,32 @@ constexpr int ProjectionTextRasterMaxDimension = 2048;
 constexpr int ProjectionTextRasterMinFontSize = 18;
 constexpr uint32_t ProjectionImageRasterMaxDimension = 2048;
 constexpr double ProjectionSliderDoubleClickMaxSeconds = 0.24;
+constexpr float ProjectionPanelBackgroundAlpha = 0.8f;
+constexpr float ProjectionFitToObjectMarginScale = 1.005f;
+
+static wxString fit_projection_image_name_label(const wxString &name, float max_width)
+{
+    if (name.empty() || max_width <= 0.f)
+        return wxString();
+
+    if (ImGuiWrapper::calc_text_size(name).x <= max_width)
+        return name;
+
+    const wxString ellipsis = wxString::FromUTF8("...");
+    if (ImGuiWrapper::calc_text_size(ellipsis).x > max_width)
+        return wxString();
+
+    const size_t length = name.length();
+    for (size_t keep = length - 1; keep > 0; --keep) {
+        const size_t prefix = (keep + 1) / 2;
+        const size_t suffix = keep / 2;
+        const wxString candidate = name.Left(prefix) + ellipsis + name.Right(suffix);
+        if (ImGuiWrapper::calc_text_size(candidate).x <= max_width)
+            return candidate;
+    }
+
+    return ellipsis;
+}
 
 static bool queue_color_data_crash_backup(ModelObject *object)
 {
@@ -4303,6 +4329,56 @@ static bool project_point_to_depth_clipped_screen(const ProjectionContext &conte
     if (ndc_z != nullptr)
         *ndc_z = float(ndc.z());
     return std::isfinite(screen.x()) && std::isfinite(screen.y());
+}
+
+static float projection_screen_axis_value(const Vec2f &point, int axis)
+{
+    return axis == 0 ? point.x() : point.y();
+}
+
+static std::vector<Vec2f> projection_clip_screen_polygon_axis(const std::vector<Vec2f> &polygon,
+                                                              int                       axis,
+                                                              float                     value,
+                                                              bool                      keep_greater)
+{
+    std::vector<Vec2f> clipped;
+    if (polygon.empty())
+        return clipped;
+
+    clipped.reserve(polygon.size() + 1);
+    Vec2f previous = polygon.back();
+    float previous_coord = projection_screen_axis_value(previous, axis);
+    bool previous_inside = keep_greater ? previous_coord >= value : previous_coord <= value;
+
+    for (const Vec2f &current : polygon) {
+        const float current_coord = projection_screen_axis_value(current, axis);
+        const bool current_inside = keep_greater ? current_coord >= value : current_coord <= value;
+        if (current_inside != previous_inside) {
+            const float denom = current_coord - previous_coord;
+            if (std::abs(denom) > EPSILON) {
+                const float t = std::clamp((value - previous_coord) / denom, 0.f, 1.f);
+                clipped.emplace_back(previous + (current - previous) * t);
+            }
+        }
+        if (current_inside)
+            clipped.emplace_back(current);
+        previous = current;
+        previous_coord = current_coord;
+        previous_inside = current_inside;
+    }
+
+    return clipped;
+}
+
+static std::vector<Vec2f> projection_clip_screen_polygon_to_canvas(std::vector<Vec2f> polygon,
+                                                                   int                canvas_width,
+                                                                   int                canvas_height)
+{
+    polygon = projection_clip_screen_polygon_axis(polygon, 0, 0.f, true);
+    polygon = projection_clip_screen_polygon_axis(polygon, 0, float(canvas_width), false);
+    polygon = projection_clip_screen_polygon_axis(polygon, 1, 0.f, true);
+    polygon = projection_clip_screen_polygon_axis(polygon, 1, float(canvas_height), false);
+    return polygon;
 }
 
 static std::optional<ColorRGBA> projected_image_color_at_point(const ProjectionContext &context,
@@ -17325,6 +17401,7 @@ bool GLGizmoImageProjection::load_projection_image()
             m_raw_atlas = {};
             m_overlay_texture.reset();
             m_overlay_texture_dirty = false;
+            m_projection_overlay_custom_rect = false;
             m_show_overlay = false;
             m_image_error = raw_atlas_error.empty() ?
                 _u8L("The selected raw filament offset atlas is not compatible with the selected object.") :
@@ -17362,6 +17439,7 @@ bool GLGizmoImageProjection::load_projection_image()
     m_image_width = width;
     m_image_height = height;
     m_overlay_texture_dirty = true;
+    m_projection_overlay_custom_rect = false;
     m_show_overlay = true;
     m_projection_panel_expanded = false;
     m_parent.set_as_dirty();
@@ -17380,6 +17458,7 @@ void GLGizmoImageProjection::clear_projection_image()
     m_convert_existing_colors_to_raw_offsets = true;
     m_overlay_texture.reset();
     m_overlay_texture_dirty = false;
+    m_projection_overlay_custom_rect = false;
     m_show_overlay = false;
     m_parent.set_as_dirty();
 }
@@ -17513,6 +17592,8 @@ bool GLGizmoImageProjection::ensure_text_projection_image()
         return !m_text_rgba.empty() && m_text_width != 0 && m_text_height != 0;
 
     m_text_dirty = false;
+    if (m_text_mode)
+        m_projection_overlay_custom_rect = false;
     m_text_projection_object_id = object_id;
     m_text_projection_raw_mode = raw_mode;
     std::vector<uint8_t> glyph_mask;
@@ -17681,6 +17762,9 @@ void GLGizmoImageProjection::show_projection_overlay()
 
 GLGizmoImageProjection::OverlayRect GLGizmoImageProjection::overlay_rect() const
 {
+    if (m_projection_overlay_custom_rect)
+        return m_projection_overlay_rect;
+
     OverlayRect rect;
     const uint32_t width = active_projection_width();
     const uint32_t height = active_projection_height();
@@ -17701,6 +17785,106 @@ GLGizmoImageProjection::OverlayRect GLGizmoImageProjection::overlay_rect() const
     rect.left = (canvas_w - rect.width) * 0.5f;
     rect.top = (canvas_h - rect.height) * 0.5f;
     return rect;
+}
+
+bool GLGizmoImageProjection::fit_projection_image_to_selected_object()
+{
+    ModelObject *object = selected_model_object();
+    const uint32_t image_width = active_projection_width();
+    const uint32_t image_height = active_projection_height();
+    if (object == nullptr || active_projection_empty() || image_width == 0 || image_height == 0)
+        return false;
+
+    const Camera &camera = wxGetApp().plater()->get_camera();
+    const std::array<int, 4> &viewport = camera.get_viewport();
+    const int canvas_width = std::max(1, viewport[2]);
+    const int canvas_height = std::max(1, viewport[3]);
+
+    ProjectionContext context;
+    context.view_projection = camera.get_projection_matrix().matrix() * camera.get_view_matrix().matrix();
+    context.camera_forward = camera.get_dir_forward();
+    context.camera_position = camera.get_position();
+    context.camera_perspective = camera.get_type() == Camera::EType::Perspective;
+    context.canvas_width = canvas_width;
+    context.canvas_height = canvas_height;
+    apply_projection_section_view(context, m_c != nullptr ? m_c->object_clipper() : nullptr);
+
+    const float image_aspect = float(image_width) / float(image_height);
+    if (!std::isfinite(image_aspect) || image_aspect <= EPSILON)
+        return false;
+
+    const float rotation = normalize_projection_rotation_deg(m_projection_rotation_deg);
+    float local_min_x = std::numeric_limits<float>::max();
+    float local_min_y = std::numeric_limits<float>::max();
+    float local_max_x = -std::numeric_limits<float>::max();
+    float local_max_y = -std::numeric_limits<float>::max();
+
+    const Selection &selection = m_parent.get_selection();
+    bool found_visible_point = false;
+    for (const ModelVolume *volume : object->volumes) {
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+
+        const indexed_triangle_set &its = volume->mesh().its;
+        if (its.vertices.empty() || its.indices.empty())
+            continue;
+
+        const Transform3d world_matrix = projection_world_matrix_for_volume(m_parent, object, volume, selection.get_instance_idx());
+        for (const stl_triangle_vertex_indices &tri : its.indices) {
+            if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0 ||
+                size_t(tri[0]) >= its.vertices.size() ||
+                size_t(tri[1]) >= its.vertices.size() ||
+                size_t(tri[2]) >= its.vertices.size())
+                continue;
+
+            const std::array<Vec3f, 3> vertices = {
+                its.vertices[size_t(tri[0])],
+                its.vertices[size_t(tri[1])],
+                its.vertices[size_t(tri[2])]
+            };
+            const std::vector<Vec3d> polygon = projection_visible_world_polygon(context, world_matrix, vertices);
+            std::vector<Vec2f> screen_polygon;
+            screen_polygon.reserve(polygon.size());
+            for (const Vec3d &world_point : polygon) {
+                Vec2f screen = Vec2f::Zero();
+                if (!project_point_to_depth_clipped_screen(context, world_point, screen))
+                    continue;
+                screen_polygon.emplace_back(screen);
+            }
+
+            screen_polygon = projection_clip_screen_polygon_to_canvas(std::move(screen_polygon), canvas_width, canvas_height);
+            for (const Vec2f &screen : screen_polygon) {
+                const Vec2f local = rotate_projection_screen_offset(screen, -rotation);
+
+                found_visible_point = true;
+                local_min_x = std::min(local_min_x, local.x());
+                local_min_y = std::min(local_min_y, local.y());
+                local_max_x = std::max(local_max_x, local.x());
+                local_max_y = std::max(local_max_y, local.y());
+            }
+        }
+    }
+
+    if (!found_visible_point)
+        return false;
+
+    float fitted_height = std::max((local_max_x - local_min_x) / image_aspect, local_max_y - local_min_y);
+    fitted_height *= ProjectionFitToObjectMarginScale;
+    const float fitted_width = fitted_height * image_aspect;
+    if (!std::isfinite(fitted_width) || !std::isfinite(fitted_height) || fitted_width <= EPSILON || fitted_height <= EPSILON)
+        return false;
+
+    const Vec2f local_center((local_min_x + local_max_x) * 0.5f, (local_min_y + local_max_y) * 0.5f);
+    const Vec2f screen_center = rotate_projection_screen_offset(local_center, rotation);
+    m_projection_overlay_rect.width = fitted_width;
+    m_projection_overlay_rect.height = fitted_height;
+    m_projection_overlay_rect.left = screen_center.x() - fitted_width * 0.5f;
+    m_projection_overlay_rect.top = screen_center.y() - fitted_height * 0.5f;
+    m_projection_overlay_custom_rect = true;
+    show_projection_overlay();
+    m_parent.set_as_dirty();
+    m_parent.request_extra_frame();
+    return true;
 }
 
 const std::vector<uint8_t> &GLGizmoImageProjection::active_projection_rgba() const
@@ -17873,6 +18057,11 @@ bool GLGizmoImageProjection::render_projection_action_controls()
         m_parent.request_extra_frame();
     }
 
+    m_imgui->disabled_begin(active_projection_empty());
+    if (m_imgui->button(_L("Fit to Object")))
+        fit_projection_image_to_selected_object();
+    m_imgui->disabled_end();
+
     m_imgui->disabled_begin(active_projection_empty() || !projection_mode_allowed(m_projection_mode));
     const wxString project_label = m_text_mode ? _L("Project text onto model") : _L("Project image onto model");
     if (m_imgui->button(project_label))
@@ -17918,6 +18107,7 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
     GizmoImguiSetNextWIndowPos(x, y, ImGuiCond_Always);
 
     ImGuiWrapper::push_toolbar_style(m_parent.get_scale());
+    m_imgui->set_next_window_bg_alpha(ProjectionPanelBackgroundAlpha);
     GizmoImguiBegin(get_name(), ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize |
                                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar);
     const float max_tooltip_width = ImGui::GetFontSize() * 20.f;
@@ -17926,7 +18116,7 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
     if (projection_job_active) {
         m_projection_panel_expanded = true;
     } else {
-        if (m_imgui->button(m_projection_panel_expanded ? _L("Hide Panel") : _L("Show Panel"))) {
+        if (m_imgui->button(m_projection_panel_expanded ? _L("Hide Options") : _L("Show Options"))) {
             m_projection_panel_expanded = !m_projection_panel_expanded;
             m_parent.set_as_dirty();
             m_parent.request_extra_frame();
@@ -17965,8 +18155,13 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
 
     if (!m_text_mode && !m_image_path.empty()) {
         const size_t slash = m_image_path.find_last_of("/\\");
-        ImGui::SameLine();
-        m_imgui->text(from_u8(slash == std::string::npos ? m_image_path : m_image_path.substr(slash + 1)));
+        const wxString image_name = from_u8(slash == std::string::npos ? m_image_path : m_image_path.substr(slash + 1));
+        const wxString fitted_image_name = fit_projection_image_name_label(image_name, ImGui::GetContentRegionAvail().x);
+        if (!fitted_image_name.empty()) {
+            m_imgui->text(fitted_image_name);
+            if (fitted_image_name != image_name && ImGui::IsItemHovered())
+                m_imgui->tooltip(image_name, max_tooltip_width);
+        }
     }
 
     if (ImGui::Checkbox("Text mode", &m_text_mode)) {
@@ -17975,6 +18170,7 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
         m_projection_mode_initialized = false;
         m_overlay_texture.reset();
         m_overlay_texture_dirty = !active_projection_empty() || m_text_mode;
+        m_projection_overlay_custom_rect = false;
         if (m_text_mode)
             ensure_text_projection_image();
         update_default_projection_mode();

@@ -549,6 +549,7 @@ private:
     void show_projection_overlay();
     bool ensure_overlay_texture();
     OverlayRect overlay_rect() const;
+    bool fit_projection_image_to_selected_object();
     const std::vector<uint8_t> &active_projection_rgba() const;
     uint32_t active_projection_width() const;
     uint32_t active_projection_height() const;
@@ -607,6 +608,8 @@ private:
     ImageMapRawFilamentOffsetAtlas m_raw_atlas;
     GLTexture            m_overlay_texture;
     bool                 m_overlay_texture_dirty = false;
+    bool                 m_projection_overlay_custom_rect = false;
+    OverlayRect          m_projection_overlay_rect;
     bool                 m_show_overlay = true;
     float                m_projection_opacity = 1.f;
     bool                 m_projection_opacity_reset_active = false;
