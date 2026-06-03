@@ -88,6 +88,8 @@ constexpr uint32_t ProjectionImageRasterMaxDimension = 2048;
 constexpr double ProjectionSliderDoubleClickMaxSeconds = 0.24;
 constexpr float ProjectionPanelBackgroundAlpha = 0.8f;
 constexpr float ProjectionFitToObjectMarginScale = 1.005f;
+constexpr float ProjectionScaleMin = 0.05f;
+constexpr float ProjectionScaleMax = 20.f;
 
 static wxString fit_projection_image_name_label(const wxString &name, float max_width)
 {
@@ -3189,6 +3191,7 @@ struct GLGizmoImageProjection::ProjectionInput
     bool                         project_regions = false;
     bool                         erase_region_painting = true;
     bool                         text_mode = false;
+    bool                         solid_color_mode = false;
     bool                         improve_projection_accuracy = false;
     int                          raw_projection_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
 };
@@ -17139,15 +17142,37 @@ void GLGizmoImageProjection::on_load(cereal::BinaryInputArchive& ar)
         raw_top_surface_values.clear();
         raw_top_surface_value_slots.clear();
     }
+    try {
+        ar(m_solid_color_mode,
+           m_solid_color[0],
+           m_solid_color[1],
+           m_solid_color[2],
+           m_solid_color_aspect);
+    } catch (...) {
+        m_solid_color_mode = false;
+        m_solid_color = { 91.f / 255.f, 102.f / 255.f, 1.f };
+        m_solid_color_aspect = 0.f;
+    }
+    try {
+        ar(m_projection_scale);
+    } catch (...) {
+        m_projection_scale = 1.f;
+    }
 
     m_projection_mode = ProjectionMode(std::clamp(mode, 0, 2));
     m_projection_mode_initialized = false;
     m_projection_rotation_deg = normalize_projection_rotation_deg(m_projection_rotation_deg);
+    m_projection_scale = std::clamp(m_projection_scale, ProjectionScaleMin, ProjectionScaleMax);
     m_text_font_size = ProjectionTextRasterBaseFontSize;
     for (float &channel : m_text_color)
         channel = std::clamp(channel, 0.f, 1.f);
     for (float &channel : m_text_background_color)
         channel = std::clamp(channel, 0.f, 1.f);
+    for (float &channel : m_solid_color)
+        channel = std::clamp(channel, 0.f, 1.f);
+    m_solid_color_aspect = std::clamp(m_solid_color_aspect, -1.f, 1.f);
+    if (m_solid_color_mode)
+        m_text_mode = false;
     m_text_rgba.clear();
     m_text_width = 0;
     m_text_height = 0;
@@ -17156,6 +17181,10 @@ void GLGizmoImageProjection::on_load(cereal::BinaryInputArchive& ar)
     m_text_projection_raw_mode = false;
     m_text_error.clear();
     m_text_dirty = true;
+    m_solid_color_rgba.clear();
+    m_solid_color_width = 0;
+    m_solid_color_height = 0;
+    m_solid_color_dirty = true;
     m_raw_atlas = {};
     m_raw_atlas.width = raw_width;
     m_raw_atlas.height = raw_height;
@@ -17208,7 +17237,7 @@ void GLGizmoImageProjection::on_load(cereal::BinaryInputArchive& ar)
         m_image_height = 0;
     }
     m_overlay_texture.reset();
-    m_overlay_texture_dirty = m_text_mode || !m_image_rgba.empty();
+    m_overlay_texture_dirty = m_text_mode || m_solid_color_mode || !m_image_rgba.empty();
 }
 
 void GLGizmoImageProjection::on_save(cereal::BinaryOutputArchive& ar) const
@@ -17292,6 +17321,12 @@ void GLGizmoImageProjection::on_save(cereal::BinaryOutputArchive& ar) const
        raw_top_surface_slots,
        raw_top_surface_values,
        raw_top_surface_value_slots);
+    ar(m_solid_color_mode,
+       m_solid_color[0],
+       m_solid_color[1],
+       m_solid_color[2],
+       m_solid_color_aspect);
+    ar(m_projection_scale);
 }
 
 void GLGizmoImageProjection::on_render()
@@ -17402,6 +17437,7 @@ bool GLGizmoImageProjection::load_projection_image()
             m_overlay_texture.reset();
             m_overlay_texture_dirty = false;
             m_projection_overlay_custom_rect = false;
+            m_projection_scale = 1.f;
             m_show_overlay = false;
             m_image_error = raw_atlas_error.empty() ?
                 _u8L("The selected raw filament offset atlas is not compatible with the selected object.") :
@@ -17440,6 +17476,7 @@ bool GLGizmoImageProjection::load_projection_image()
     m_image_height = height;
     m_overlay_texture_dirty = true;
     m_projection_overlay_custom_rect = false;
+    m_projection_scale = 1.f;
     m_show_overlay = true;
     m_projection_panel_expanded = false;
     m_parent.set_as_dirty();
@@ -17459,6 +17496,7 @@ void GLGizmoImageProjection::clear_projection_image()
     m_overlay_texture.reset();
     m_overlay_texture_dirty = false;
     m_projection_overlay_custom_rect = false;
+    m_projection_scale = 1.f;
     m_show_overlay = false;
     m_parent.set_as_dirty();
 }
@@ -17496,6 +17534,55 @@ void GLGizmoImageProjection::mark_text_projection_dirty()
     show_projection_overlay();
     m_parent.set_as_dirty();
     m_parent.request_extra_frame();
+}
+
+void GLGizmoImageProjection::mark_solid_color_projection_dirty()
+{
+    m_solid_color_dirty = true;
+    if (m_solid_color_mode)
+        m_overlay_texture_dirty = true;
+    show_projection_overlay();
+    m_parent.set_as_dirty();
+    m_parent.request_extra_frame();
+}
+
+bool GLGizmoImageProjection::ensure_solid_color_projection_image()
+{
+    if (!m_solid_color_dirty && !m_solid_color_rgba.empty() && m_solid_color_width != 0 && m_solid_color_height != 0)
+        return true;
+
+    m_solid_color_dirty = false;
+    for (float &channel : m_solid_color)
+        channel = std::clamp(channel, 0.f, 1.f);
+    m_solid_color_aspect = std::clamp(m_solid_color_aspect, -1.f, 1.f);
+
+    const float aspect = std::pow(4.f, m_solid_color_aspect);
+    const uint32_t base_size = 256;
+    if (aspect >= 1.f) {
+        m_solid_color_width = uint32_t(std::round(float(base_size) * aspect));
+        m_solid_color_height = base_size;
+    } else {
+        m_solid_color_width = base_size;
+        m_solid_color_height = uint32_t(std::round(float(base_size) / aspect));
+    }
+    m_solid_color_width = std::max<uint32_t>(1, m_solid_color_width);
+    m_solid_color_height = std::max<uint32_t>(1, m_solid_color_height);
+
+    const uint8_t r = uint8_t(std::round(m_solid_color[0] * 255.f));
+    const uint8_t g = uint8_t(std::round(m_solid_color[1] * 255.f));
+    const uint8_t b = uint8_t(std::round(m_solid_color[2] * 255.f));
+    m_solid_color_rgba.assign(size_t(m_solid_color_width) * size_t(m_solid_color_height) * 4, 255);
+    for (size_t idx = 0; idx < size_t(m_solid_color_width) * size_t(m_solid_color_height); ++idx) {
+        const size_t rgba_idx = idx * 4;
+        m_solid_color_rgba[rgba_idx + 0] = r;
+        m_solid_color_rgba[rgba_idx + 1] = g;
+        m_solid_color_rgba[rgba_idx + 2] = b;
+    }
+    if (m_solid_color_mode) {
+        m_overlay_texture.reset();
+        m_overlay_texture_dirty = true;
+    }
+    return true;
 }
 
 bool GLGizmoImageProjection::update_text_raw_atlas(const std::vector<uint8_t> &glyph_mask)
@@ -17592,8 +17679,8 @@ bool GLGizmoImageProjection::ensure_text_projection_image()
         return !m_text_rgba.empty() && m_text_width != 0 && m_text_height != 0;
 
     m_text_dirty = false;
-    if (m_text_mode)
-        m_projection_overlay_custom_rect = false;
+    const uint32_t previous_width = m_text_width;
+    const uint32_t previous_height = m_text_height;
     m_text_projection_object_id = object_id;
     m_text_projection_raw_mode = raw_mode;
     std::vector<uint8_t> glyph_mask;
@@ -17616,6 +17703,10 @@ bool GLGizmoImageProjection::ensure_text_projection_image()
         m_text_height = 0;
     }
     if (m_text_mode) {
+        if (previous_width != m_text_width || previous_height != m_text_height) {
+            m_projection_overlay_custom_rect = false;
+            m_projection_scale = 1.f;
+        }
         m_overlay_texture.reset();
         m_overlay_texture_dirty = rasterized;
     }
@@ -17688,11 +17779,49 @@ void GLGizmoImageProjection::render_text_projection_controls(float max_tooltip_w
     }
 }
 
+void GLGizmoImageProjection::render_solid_color_projection_controls(float max_tooltip_width)
+{
+    bool color_changed = false;
+    bool aspect_changed = false;
+    m_imgui->text(_L("Solid color:"));
+    ImGui::SameLine();
+    const ImGuiColorEditFlags flags = ImGuiColorEditFlags_DisplayRGB |
+                                      ImGuiColorEditFlags_InputRGB |
+                                      ImGuiColorEditFlags_NoAlpha;
+    const ImVec4 color = ImVec4(m_solid_color[0], m_solid_color[1], m_solid_color[2], 1.f);
+    if (ImGui::ColorButton("##image_projection_solid_color_button", color, flags, ImVec2(ImGui::GetFrameHeight(), ImGui::GetFrameHeight())))
+        ImGui::OpenPopup("##image_projection_solid_color_popup");
+    if (ImGui::IsItemHovered())
+        m_imgui->tooltip(_L("Solid color"), max_tooltip_width);
+    if (ImGui::BeginPopup("##image_projection_solid_color_popup")) {
+        color_changed |= ImGui::ColorPicker3("##image_projection_solid_color_picker", m_solid_color.data(), flags | ImGuiColorEditFlags_NoInputs);
+        ImGui::EndPopup();
+    }
+
+    m_imgui->text(_L("Aspect ratio"));
+    ImGui::PushItemWidth(m_imgui->scaled(8.f));
+    aspect_changed |= ImGui::SliderFloat("##image_projection_solid_aspect", &m_solid_color_aspect, -1.f, 1.f, "%.2f");
+    ImGui::PopItemWidth();
+    if (ImGui::IsItemHovered())
+        m_imgui->tooltip(_L("Aspect ratio"), max_tooltip_width);
+
+    if (color_changed || aspect_changed) {
+        if (aspect_changed) {
+            m_projection_overlay_custom_rect = false;
+            m_projection_scale = 1.f;
+        }
+        mark_solid_color_projection_dirty();
+        ensure_solid_color_projection_image();
+    }
+}
+
 bool GLGizmoImageProjection::ensure_overlay_texture()
 {
     if (m_overlay_texture.get_id() != 0 && !m_overlay_texture_dirty)
         return true;
     if (m_text_mode && !ensure_text_projection_image())
+        return false;
+    if (m_solid_color_mode && !ensure_solid_color_projection_image())
         return false;
 
     const std::vector<uint8_t> &rgba = active_projection_rgba();
@@ -17762,9 +17891,22 @@ void GLGizmoImageProjection::show_projection_overlay()
 
 GLGizmoImageProjection::OverlayRect GLGizmoImageProjection::overlay_rect() const
 {
-    if (m_projection_overlay_custom_rect)
-        return m_projection_overlay_rect;
+    OverlayRect rect = m_projection_overlay_custom_rect ? m_projection_overlay_rect : default_overlay_rect();
+    const float scale = std::clamp(m_projection_scale, ProjectionScaleMin, ProjectionScaleMax);
+    if (scale == 1.f || rect.width <= 0.f || rect.height <= 0.f)
+        return rect;
 
+    const float center_x = rect.left + rect.width * 0.5f;
+    const float center_y = rect.top + rect.height * 0.5f;
+    rect.width *= scale;
+    rect.height *= scale;
+    rect.left = center_x - rect.width * 0.5f;
+    rect.top = center_y - rect.height * 0.5f;
+    return rect;
+}
+
+GLGizmoImageProjection::OverlayRect GLGizmoImageProjection::default_overlay_rect() const
+{
     OverlayRect rect;
     const uint32_t width = active_projection_width();
     const uint32_t height = active_projection_height();
@@ -17789,6 +17931,11 @@ GLGizmoImageProjection::OverlayRect GLGizmoImageProjection::overlay_rect() const
 
 bool GLGizmoImageProjection::fit_projection_image_to_selected_object()
 {
+    if (m_text_mode && !ensure_text_projection_image())
+        return false;
+    if (m_solid_color_mode && !ensure_solid_color_projection_image())
+        return false;
+
     ModelObject *object = selected_model_object();
     const uint32_t image_width = active_projection_width();
     const uint32_t image_height = active_projection_height();
@@ -17874,12 +18021,17 @@ bool GLGizmoImageProjection::fit_projection_image_to_selected_object()
     if (!std::isfinite(fitted_width) || !std::isfinite(fitted_height) || fitted_width <= EPSILON || fitted_height <= EPSILON)
         return false;
 
+    const OverlayRect base_rect = default_overlay_rect();
+    if (base_rect.width <= EPSILON || base_rect.height <= EPSILON)
+        return false;
+
     const Vec2f local_center((local_min_x + local_max_x) * 0.5f, (local_min_y + local_max_y) * 0.5f);
     const Vec2f screen_center = rotate_projection_screen_offset(local_center, rotation);
-    m_projection_overlay_rect.width = fitted_width;
-    m_projection_overlay_rect.height = fitted_height;
-    m_projection_overlay_rect.left = screen_center.x() - fitted_width * 0.5f;
-    m_projection_overlay_rect.top = screen_center.y() - fitted_height * 0.5f;
+    m_projection_overlay_rect.width = base_rect.width;
+    m_projection_overlay_rect.height = base_rect.height;
+    m_projection_overlay_rect.left = screen_center.x() - base_rect.width * 0.5f;
+    m_projection_overlay_rect.top = screen_center.y() - base_rect.height * 0.5f;
+    m_projection_scale = std::clamp(fitted_width / base_rect.width, ProjectionScaleMin, ProjectionScaleMax);
     m_projection_overlay_custom_rect = true;
     show_projection_overlay();
     m_parent.set_as_dirty();
@@ -17889,17 +18041,17 @@ bool GLGizmoImageProjection::fit_projection_image_to_selected_object()
 
 const std::vector<uint8_t> &GLGizmoImageProjection::active_projection_rgba() const
 {
-    return m_text_mode ? m_text_rgba : m_image_rgba;
+    return m_text_mode ? m_text_rgba : (m_solid_color_mode ? m_solid_color_rgba : m_image_rgba);
 }
 
 uint32_t GLGizmoImageProjection::active_projection_width() const
 {
-    return m_text_mode ? m_text_width : m_image_width;
+    return m_text_mode ? m_text_width : (m_solid_color_mode ? m_solid_color_width : m_image_width);
 }
 
 uint32_t GLGizmoImageProjection::active_projection_height() const
 {
-    return m_text_mode ? m_text_height : m_image_height;
+    return m_text_mode ? m_text_height : (m_solid_color_mode ? m_solid_color_height : m_image_height);
 }
 
 bool GLGizmoImageProjection::active_projection_empty() const
@@ -17909,7 +18061,7 @@ bool GLGizmoImageProjection::active_projection_empty() const
 
 bool GLGizmoImageProjection::active_raw_atlas_valid() const
 {
-    return m_text_mode ? m_text_raw_atlas.valid() : m_raw_atlas.valid();
+    return m_text_mode ? m_text_raw_atlas.valid() : (!m_solid_color_mode && m_raw_atlas.valid());
 }
 
 const ImageMapRawFilamentOffsetAtlas &GLGizmoImageProjection::active_raw_atlas() const
@@ -17919,7 +18071,7 @@ const ImageMapRawFilamentOffsetAtlas &GLGizmoImageProjection::active_raw_atlas()
 
 bool GLGizmoImageProjection::effective_apply_transparency_as_background() const
 {
-    return !m_text_mode && m_apply_transparency_as_background;
+    return !m_text_mode && !m_solid_color_mode && m_apply_transparency_as_background;
 }
 
 ModelObject *GLGizmoImageProjection::selected_model_object() const
@@ -18050,9 +18202,9 @@ bool GLGizmoImageProjection::render_projection_action_controls()
     if (active_projection_empty()) {
         bool overlay = false;
         m_imgui->disabled_begin(true);
-        ImGui::Checkbox(m_text_mode ? "Show text overlay" : "Show image overlay", &overlay);
+        ImGui::Checkbox(m_text_mode ? "Show text overlay" : (m_solid_color_mode ? "Show solid color overlay" : "Show image overlay"), &overlay);
         m_imgui->disabled_end();
-    } else if (ImGui::Checkbox(m_text_mode ? "Show text overlay" : "Show image overlay", &m_show_overlay)) {
+    } else if (ImGui::Checkbox(m_text_mode ? "Show text overlay" : (m_solid_color_mode ? "Show solid color overlay" : "Show image overlay"), &m_show_overlay)) {
         m_parent.set_as_dirty();
         m_parent.request_extra_frame();
     }
@@ -18063,7 +18215,8 @@ bool GLGizmoImageProjection::render_projection_action_controls()
     m_imgui->disabled_end();
 
     m_imgui->disabled_begin(active_projection_empty() || !projection_mode_allowed(m_projection_mode));
-    const wxString project_label = m_text_mode ? _L("Project text onto model") : _L("Project image onto model");
+    const wxString project_label = m_text_mode ? _L("Project text onto model") :
+        (m_solid_color_mode ? _L("Project solid color onto model") : _L("Project image onto model"));
     if (m_imgui->button(project_label))
         start_projection_job();
     m_imgui->disabled_end();
@@ -18100,6 +18253,8 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
 {
     if (m_text_mode)
         ensure_text_projection_image();
+    if (m_solid_color_mode)
+        ensure_solid_color_projection_image();
     update_default_projection_mode();
 
     const float approx_height = m_imgui->scaled(12.0f);
@@ -18142,18 +18297,18 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
     if (m_imgui->button(_L("Manage Color Data for this object")))
         open_color_data_management_dialog();
 
-    m_imgui->disabled_begin(m_text_mode);
-    if (m_imgui->button(_L("Load image")))
-        load_projection_image();
-    m_imgui->disabled_end();
+    if (!m_text_mode && !m_solid_color_mode) {
+        if (m_imgui->button(_L("Load image")))
+            load_projection_image();
 
-    ImGui::SameLine();
-    m_imgui->disabled_begin(m_text_mode || m_image_rgba.empty());
-    if (m_imgui->button(_L("Clear image")))
-        clear_projection_image();
-    m_imgui->disabled_end();
+        ImGui::SameLine();
+        m_imgui->disabled_begin(m_image_rgba.empty());
+        if (m_imgui->button(_L("Clear image")))
+            clear_projection_image();
+        m_imgui->disabled_end();
+    }
 
-    if (!m_text_mode && !m_image_path.empty()) {
+    if (!m_text_mode && !m_solid_color_mode && !m_image_path.empty()) {
         const size_t slash = m_image_path.find_last_of("/\\");
         const wxString image_name = from_u8(slash == std::string::npos ? m_image_path : m_image_path.substr(slash + 1));
         const wxString fitted_image_name = fit_projection_image_name_label(image_name, ImGui::GetContentRegionAvail().x);
@@ -18164,15 +18319,36 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
         }
     }
 
-    if (ImGui::Checkbox("Text mode", &m_text_mode)) {
-        if (m_text_mode)
+    if (ImGui::Checkbox("Text Mode", &m_text_mode)) {
+        if (m_text_mode) {
+            m_solid_color_mode = false;
             m_text_dirty = true;
+        }
         m_projection_mode_initialized = false;
         m_overlay_texture.reset();
         m_overlay_texture_dirty = !active_projection_empty() || m_text_mode;
         m_projection_overlay_custom_rect = false;
+        m_projection_scale = 1.f;
         if (m_text_mode)
             ensure_text_projection_image();
+        update_default_projection_mode();
+        show_projection_overlay();
+        m_parent.set_as_dirty();
+        m_parent.request_extra_frame();
+    }
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Solid Color", &m_solid_color_mode)) {
+        if (m_solid_color_mode) {
+            m_text_mode = false;
+            m_solid_color_dirty = true;
+        }
+        m_projection_mode_initialized = false;
+        m_overlay_texture.reset();
+        m_overlay_texture_dirty = !active_projection_empty() || m_solid_color_mode;
+        m_projection_overlay_custom_rect = false;
+        m_projection_scale = 1.f;
+        if (m_solid_color_mode)
+            ensure_solid_color_projection_image();
         update_default_projection_mode();
         show_projection_overlay();
         m_parent.set_as_dirty();
@@ -18181,8 +18357,10 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
 
     if (m_text_mode)
         render_text_projection_controls(max_tooltip_width);
+    if (m_solid_color_mode)
+        render_solid_color_projection_controls(max_tooltip_width);
 
-    if (!m_text_mode && !m_image_error.empty())
+    if (!m_text_mode && !m_solid_color_mode && !m_image_error.empty())
         m_imgui->warning_text(from_u8(m_image_error));
     if (m_text_mode && !m_text_error.empty())
         m_imgui->warning_text(from_u8(m_text_error));
@@ -18257,6 +18435,25 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
         m_projection_rotation_reset_active = false;
     ImGui::PopItemWidth();
 
+    float projection_scale = std::clamp(m_projection_scale, ProjectionScaleMin, ProjectionScaleMax);
+    m_imgui->text(_L("Scale"));
+    ImGui::PushItemWidth(m_imgui->scaled(8.f));
+    const bool scale_changed =
+        ImGui::SliderFloat("##image_projection_scale", &projection_scale, ProjectionScaleMin, ProjectionScaleMax, "%.2fx", ImGuiSliderFlags_Logarithmic);
+    const bool scale_reset = projection_slider_short_double_clicked(m_projection_scale_last_click_time, scale_changed);
+    if (scale_reset)
+        m_projection_scale_reset_active = true;
+    const bool suppress_scale_slider = scale_reset || m_projection_scale_reset_active;
+    if (suppress_scale_slider || scale_changed) {
+        m_projection_scale = suppress_scale_slider ? 1.f : std::clamp(projection_scale, ProjectionScaleMin, ProjectionScaleMax);
+        show_projection_overlay();
+        m_parent.set_as_dirty();
+        m_parent.request_extra_frame();
+    }
+    if (m_projection_scale_reset_active && !ImGui::IsMouseDown(ImGuiMouseButton_Left))
+        m_projection_scale_reset_active = false;
+    ImGui::PopItemWidth();
+
     if (m_c != nullptr && m_c->object_clipper() != nullptr) {
         ImGui::Separator();
         if (m_c->object_clipper()->get_position() == 0.f) {
@@ -18292,7 +18489,7 @@ void GLGizmoImageProjection::on_render_input_window(float x, float y, float bott
             m_imgui->tooltip(_L("Section view"), max_tooltip_width);
     }
 
-    if (!m_text_mode && ImGui::Checkbox("Apply transparent regions as background color", &m_apply_transparency_as_background))
+    if (!m_text_mode && !m_solid_color_mode && ImGui::Checkbox("Apply transparent regions as background color", &m_apply_transparency_as_background))
         show_projection_overlay();
     if (ImGui::Checkbox("Pass through model", &m_pass_through_model))
         show_projection_overlay();
@@ -18325,6 +18522,7 @@ void GLGizmoImageProjection::fill_projection_input(ProjectionInput &input, const
     input = ProjectionInput();
     input.mode = m_projection_mode;
     input.text_mode = m_text_mode;
+    input.solid_color_mode = m_solid_color_mode;
     input.pass_through_model = m_pass_through_model;
     input.improve_projection_accuracy = m_improve_projection_accuracy;
     input.raw_atlas_valid = active_raw_atlas_valid();
@@ -18379,6 +18577,8 @@ bool GLGizmoImageProjection::start_projection_job()
 
     ModelObject *object = selected_model_object();
     if (m_text_mode && !ensure_text_projection_image())
+        return false;
+    if (m_solid_color_mode && !ensure_solid_color_projection_image())
         return false;
     if (object == nullptr || active_projection_empty())
         return false;
@@ -18461,7 +18661,8 @@ bool GLGizmoImageProjection::start_projection_job()
     m_parent.request_extra_frame();
 
     auto process = [this, result](Job::Ctl &ctl) {
-        const std::string status = result->input.text_mode ? _u8L("Projecting text") : _u8L("Projecting image");
+        const std::string status = result->input.text_mode ? _u8L("Projecting text") :
+            (result->input.solid_color_mode ? _u8L("Projecting solid color") : _u8L("Projecting image"));
         auto check_cancel = [this, &ctl]() {
             if (ctl.was_canceled() || m_projection_job_cancel_requested.load()) {
                 m_projection_job_cancel_requested.store(true);
@@ -18553,7 +18754,8 @@ bool GLGizmoImageProjection::start_projection_job()
         }
 
         Plater::TakeSnapshot snapshot(wxGetApp().plater(),
-                                      result->input.text_mode ? "Project text onto model" : "Project image onto model",
+                                      result->input.text_mode ? "Project text onto model" :
+                                          (result->input.solid_color_mode ? "Project solid color onto model" : "Project image onto model"),
                                       UndoRedo::SnapshotType::GizmoAction);
         if (result->input.erase_region_painting)
             image_projection_apply_extruder_config(object->config, copy_object->config);
@@ -18654,6 +18856,8 @@ bool GLGizmoImageProjection::project_image_to_selected_object()
     ModelObject *object = selected_model_object();
     if (m_text_mode && !ensure_text_projection_image())
         return false;
+    if (m_solid_color_mode && !ensure_solid_color_projection_image())
+        return false;
     if (object == nullptr || active_projection_empty())
         return false;
 
@@ -18714,7 +18918,8 @@ bool GLGizmoImageProjection::project_image_to_selected_object()
     }
 
     Plater::TakeSnapshot snapshot(wxGetApp().plater(),
-                                  m_text_mode ? "Project text onto model" : "Project image onto model",
+                                  m_text_mode ? "Project text onto model" :
+                                      (m_solid_color_mode ? "Project solid color onto model" : "Project image onto model"),
                                   UndoRedo::SnapshotType::GizmoAction);
     if (!project_image_to_object(object, texture_mapping_filament_id, input))
         return false;
