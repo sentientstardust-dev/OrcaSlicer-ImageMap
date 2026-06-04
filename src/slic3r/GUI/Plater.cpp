@@ -2340,6 +2340,8 @@ static int texture_mapping_generic_solver_mode_from_choice_selection(int selecti
 static wxString texture_mapping_contoning_color_prediction_mode_label(int mode)
 {
     switch (TextureMappingZone::effective_top_surface_contoning_color_prediction_mode(mode)) {
+    case int(TextureMappingZone::ContoningColorPredictionAdaptiveSpectral):
+        return _L("Adaptive Spectral");
     case int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb):
         return _L("RGB Beer-Lambert - not recommended");
     case int(TextureMappingZone::ContoningColorPredictionBasicReflectance):
@@ -4332,6 +4334,7 @@ private:
 
         m_top_surface_contoning_td_correction_choice->Clear();
         add_mode(int(TextureMappingZone::ContoningColorPredictionDefault));
+        add_mode(int(TextureMappingZone::ContoningColorPredictionAdaptiveSpectral));
         add_mode(int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha));
         add_mode(int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb));
         add_mode(int(TextureMappingZone::ContoningColorPredictionBasicReflectance));

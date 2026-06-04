@@ -410,6 +410,9 @@ TextureMappingContoningSolver::TextureMappingContoningSolver(const TextureMappin
     const int effective_color_prediction_mode =
         TextureMappingZone::effective_top_surface_contoning_color_prediction_mode(
             zone.top_surface_contoning_color_prediction_mode);
+    m_adaptive_spectral_correction_enabled =
+        m_td_adjustment_enabled &&
+        effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionAdaptiveSpectral);
     m_td_effective_alpha_correction_enabled =
         m_td_adjustment_enabled &&
         (effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha) ||
@@ -573,7 +576,8 @@ std::optional<std::array<float, 3>> TextureMappingContoningSolver::stack_rgb(
                                           m_td_effective_alpha_correction_enabled,
                                           m_component_roles,
                                           depth_layer_opacities,
-                                          m_calibrated_stack_model.valid() ? &m_calibrated_stack_model : nullptr);
+                                          m_calibrated_stack_model.valid() ? &m_calibrated_stack_model : nullptr,
+                                          m_adaptive_spectral_correction_enabled);
 }
 
 std::vector<float> TextureMappingContoningSolver::layer_opacities_by_depth(
@@ -739,7 +743,8 @@ TextureMappingContoningStack TextureMappingContoningSolver::solve_impl(
                                                        m_component_roles,
                                                        beam_search_stack_expansion_enabled,
                                                        depth_layer_opacities,
-                                                       m_calibrated_stack_model.valid() ? &m_calibrated_stack_model : nullptr);
+                                                       m_calibrated_stack_model.valid() ? &m_calibrated_stack_model : nullptr,
+                                                       m_adaptive_spectral_correction_enabled);
         }
         const ColorSolverOrderedStackResult solved =
             solve_color_solver_ordered_stack_result_for_target(*ordered_candidates, target_rgb, ColorSolverMode::OklabSoftCap4Dark4);

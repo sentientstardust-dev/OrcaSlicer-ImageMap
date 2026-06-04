@@ -714,8 +714,6 @@ std::map<unsigned int, unsigned int> raw_top_surface_slot_component_id_map(
             }
         }
 
-        const float max_match_distance_sq =
-            TextureMappingManager::poor_color_match_distance() * TextureMappingManager::poor_color_match_distance();
         for (size_t component_idx = 0; component_idx < target_keys.size() && component_idx < mapping.size(); ++component_idx) {
             if (mapping[component_idx] != sentinel)
                 continue;
@@ -732,7 +730,7 @@ std::map<unsigned int, unsigned int> raw_top_surface_slot_component_id_map(
                     best_source = source_idx;
                 }
             }
-            if (best_source < source_colors.size() && best_distance_sq <= max_match_distance_sq) {
+            if (best_source < source_colors.size()) {
                 mapping[component_idx] = best_source;
                 used[best_source] = 1;
             }

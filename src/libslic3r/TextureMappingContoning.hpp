@@ -87,6 +87,7 @@ private:
     float m_surface_scatter { 0.f };
     ColorSolverMixModel m_mix_model { ColorSolverMixModel::PigmentPainter };
     bool m_td_adjustment_enabled { false };
+    bool m_adaptive_spectral_correction_enabled { false };
     bool m_beer_lambert_rgb_correction_enabled { false };
     bool m_td_effective_alpha_correction_enabled { false };
     bool m_variable_layer_height_compensation_enabled { false };

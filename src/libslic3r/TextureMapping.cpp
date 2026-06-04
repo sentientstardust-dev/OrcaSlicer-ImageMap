@@ -816,6 +816,8 @@ static std::string top_surface_contoning_color_prediction_mode_name(int mode)
         return "rgb_beer_lambert";
     if (mode == int(TextureMappingZone::ContoningColorPredictionBasicReflectance))
         return "basic_reflectance";
+    if (mode == int(TextureMappingZone::ContoningColorPredictionAdaptiveSpectral))
+        return "adaptive_spectral";
     if (mode == int(TextureMappingZone::ContoningColorPredictionCalibratedCurrentLinearAffine))
         return "calibrated_current_linear_affine";
     if (mode == int(TextureMappingZone::ContoningColorPredictionCalibratedTdAlphaEffective))
@@ -841,6 +843,10 @@ static int top_surface_contoning_color_prediction_mode_from_name(std::string nam
         name == "basic_reflectance_no_td_correction" ||
         name == "no_td_correction")
         return int(TextureMappingZone::ContoningColorPredictionBasicReflectance);
+    if (name == "adaptive_spectral" ||
+        name == "adaptive_spectral_td" ||
+        name == "adaptive_spectral_td_effective")
+        return int(TextureMappingZone::ContoningColorPredictionAdaptiveSpectral);
     if (name == "calibrated_current_linear_affine" ||
         name == "calibrated_current_affine" ||
         name == "current_linear_affine" ||
@@ -2584,7 +2590,7 @@ void TextureMappingManager::load_entries(const std::string &serialized,
                               color_prediction_mode_it->get<int>() :
                           TextureMappingZone::DefaultTopSurfaceContoningColorPredictionMode,
                           int(TextureMappingZone::ContoningColorPredictionDefault),
-                          int(TextureMappingZone::ContoningColorPredictionCalibratedDepthKernelLinear));
+                          int(TextureMappingZone::ContoningColorPredictionAdaptiveSpectral));
         zone.top_surface_contoning_beer_lambert_rgb_correction_enabled =
             TextureMappingZone::DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled;
         zone.top_surface_contoning_td_effective_alpha_correction_enabled =

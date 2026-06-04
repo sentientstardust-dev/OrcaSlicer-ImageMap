@@ -101,7 +101,8 @@ struct TextureMappingZone
         ContoningColorPredictionCalibratedCurrentLinearAffine = 4,
         ContoningColorPredictionCalibratedTdAlphaEffective = 5,
         ContoningColorPredictionCalibratedFreeAlphaEffective = 6,
-        ContoningColorPredictionCalibratedDepthKernelLinear = 7
+        ContoningColorPredictionCalibratedDepthKernelLinear = 7,
+        ContoningColorPredictionAdaptiveSpectral = 8
     };
 
     enum TopSurfaceContoningPolygonizationMode : uint8_t {
@@ -232,7 +233,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultTopSurfaceContoningTdAdjustmentEnabled = true;
     static constexpr bool  DefaultTopSurfaceContoningSurfaceScatterEnabled = false;
     static constexpr int   DefaultTopSurfaceContoningColorPredictionMode = int(ContoningColorPredictionDefault);
-    static constexpr int   SlicerDefaultTopSurfaceContoningColorPredictionMode = int(ContoningColorPredictionTdEffectiveAlpha);
+    static constexpr int   SlicerDefaultTopSurfaceContoningColorPredictionMode = int(ContoningColorPredictionAdaptiveSpectral);
     static constexpr bool  DefaultTopSurfaceContoningVariableLayerHeightCompensationEnabled = true;
     static constexpr bool  DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled =
         SlicerDefaultTopSurfaceContoningColorPredictionMode == int(ContoningColorPredictionBeerLambertRgb);
@@ -396,7 +397,7 @@ struct TextureMappingZone
             return SlicerDefaultTopSurfaceContoningColorPredictionMode;
         return std::clamp(mode,
                           int(ContoningColorPredictionTdEffectiveAlpha),
-                          int(ContoningColorPredictionCalibratedDepthKernelLinear));
+                          int(ContoningColorPredictionAdaptiveSpectral));
     }
 
     static bool top_surface_contoning_color_prediction_mode_is_calibrated(int mode)

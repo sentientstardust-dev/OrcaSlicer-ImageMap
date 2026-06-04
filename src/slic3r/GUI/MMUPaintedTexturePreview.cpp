@@ -98,6 +98,7 @@ struct TexturePreviewSimulationSettings
     bool contoning_flat_surface_quantization = false;
     bool contoning_flat_surface_pattern_blend = false;
     bool contoning_flat_surface_td_adjustment = false;
+    bool contoning_flat_surface_adaptive_spectral_correction = false;
     bool contoning_flat_surface_beer_lambert_rgb_correction = false;
     bool contoning_flat_surface_td_effective_alpha_correction = false;
     bool contoning_flat_surface_beam_search_stack_expansion = false;
@@ -1197,8 +1198,6 @@ std::unordered_map<unsigned int, uint16_t> raw_top_surface_component_indices_for
             }
         }
 
-        const float max_match_distance_sq =
-            TextureMappingManager::poor_color_match_distance() * TextureMappingManager::poor_color_match_distance();
         for (size_t component_idx = 0; component_idx < target_keys.size() && component_idx < mapping.size(); ++component_idx) {
             if (mapping[component_idx] != sentinel)
                 continue;
@@ -1216,7 +1215,7 @@ std::unordered_map<unsigned int, uint16_t> raw_top_surface_component_indices_for
                     best_source = source_idx;
                 }
             }
-            if (best_source < source_colors.size() && best_distance_sq <= max_match_distance_sq) {
+            if (best_source < source_colors.size()) {
                 mapping[component_idx] = best_source;
                 used[best_source] = 1;
             }
@@ -1333,7 +1332,8 @@ std::optional<std::array<float, 3>> raw_top_surface_stack_rgb_for_texture_previe
                                              std::vector<float>{},
                                              settings.contoning_flat_surface_calibrated_stack_model.valid() ?
                                                  &settings.contoning_flat_surface_calibrated_stack_model :
-                                                 nullptr);
+                                                 nullptr,
+                                             settings.contoning_flat_surface_adaptive_spectral_correction);
     }
 
     std::vector<std::array<float, 3>> colors;
@@ -2949,7 +2949,8 @@ std::array<float, 3> contoning_flat_surface_rgb_for_texture_preview(
                                                  std::vector<float>{},
                                                  settings.contoning_flat_surface_calibrated_stack_model.valid() ?
                                                      &settings.contoning_flat_surface_calibrated_stack_model :
-                                                     nullptr);
+                                                     nullptr,
+                                                 settings.contoning_flat_surface_adaptive_spectral_correction);
         }
     }
     if (!candidates.empty()) {
@@ -3111,6 +3112,9 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
         settings.contoning_flat_surface_beer_lambert_rgb_correction =
             settings.contoning_flat_surface_td_adjustment &&
             effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb);
+        settings.contoning_flat_surface_adaptive_spectral_correction =
+            settings.contoning_flat_surface_td_adjustment &&
+            effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionAdaptiveSpectral);
         settings.contoning_flat_surface_td_effective_alpha_correction =
             settings.contoning_flat_surface_td_adjustment &&
             (effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha) ||
@@ -3179,6 +3183,7 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
             contoning_flat_surface_preview_layer_opacities(settings);
         if (settings.contoning_flat_surface_layer_opacities.size() != settings.component_colors.size()) {
             settings.contoning_flat_surface_td_adjustment = false;
+            settings.contoning_flat_surface_adaptive_spectral_correction = false;
             settings.contoning_flat_surface_beer_lambert_rgb_correction = false;
             settings.contoning_flat_surface_td_effective_alpha_correction = false;
         } else {
@@ -3233,6 +3238,7 @@ size_t texture_preview_simulation_signature(const ModelVolume &model_volume,
     mix(std::hash<int>{}(settings.contoning_flat_surface_quantization ? 1 : 0));
     mix(std::hash<int>{}(settings.contoning_flat_surface_pattern_blend ? 1 : 0));
     mix(std::hash<int>{}(settings.contoning_flat_surface_td_adjustment ? 1 : 0));
+    mix(std::hash<int>{}(settings.contoning_flat_surface_adaptive_spectral_correction ? 1 : 0));
     mix(std::hash<int>{}(settings.contoning_flat_surface_beer_lambert_rgb_correction ? 1 : 0));
     mix(std::hash<int>{}(settings.contoning_flat_surface_td_effective_alpha_correction ? 1 : 0));
     mix(std::hash<int>{}(settings.contoning_flat_surface_beam_search_stack_expansion ? 1 : 0));
@@ -3356,7 +3362,8 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                                                        std::vector<float>{},
                                                        settings.contoning_flat_surface_calibrated_stack_model.valid() ?
                                                            &settings.contoning_flat_surface_calibrated_stack_model :
-                                                           nullptr) :
+                                                           nullptr,
+                                                       settings.contoning_flat_surface_adaptive_spectral_correction) :
             ColorSolverOrderedStackCandidateSet{};
     const std::vector<TexturePreviewMixCandidate> contoning_flat_surface_candidates =
         use_contoning_flat_surface_quantization &&
