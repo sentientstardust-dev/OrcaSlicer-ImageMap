@@ -477,6 +477,22 @@ static std::vector<float> floats_from_json(const nlohmann::json &value)
     return out;
 }
 
+static std::vector<uint16_t> uint16s_from_json(const nlohmann::json &value)
+{
+    std::vector<uint16_t> out;
+    if (!value.is_array())
+        return out;
+    out.reserve(value.size());
+    for (const nlohmann::json &item : value) {
+        if (!item.is_number_integer())
+            continue;
+        const int parsed = item.get<int>();
+        if (parsed >= 0 && parsed <= int(std::numeric_limits<uint16_t>::max()))
+            out.emplace_back(uint16_t(parsed));
+    }
+    return out;
+}
+
 static nlohmann::json floats_to_json(const std::vector<float> &values)
 {
     nlohmann::json out = nlohmann::json::array();
@@ -557,6 +573,57 @@ static std::string lower_ascii(std::string value)
         return lowered == '-' || lowered == ' ' ? '_' : lowered;
     });
     return value;
+}
+
+static std::string semantic_role_key_from_label(const std::string &label)
+{
+    const std::string key = lower_ascii(label);
+    auto has_token = [&key](const std::string &token) {
+        size_t start = 0;
+        while (start < key.size()) {
+            while (start < key.size() && !std::isalnum(static_cast<unsigned char>(key[start])))
+                ++start;
+            const size_t end = start;
+            while (start < key.size() && std::isalnum(static_cast<unsigned char>(key[start])))
+                ++start;
+            if (start > end && key.compare(end, start - end, token) == 0)
+                return true;
+        }
+        return false;
+    };
+    if (has_token("c") || has_token("cyan"))
+        return "cyan";
+    if (has_token("m") || has_token("magenta"))
+        return "magenta";
+    if (has_token("y") || has_token("yellow"))
+        return "yellow";
+    if (has_token("k") || has_token("black") || has_token("grey") || has_token("gray"))
+        return "black";
+    if (has_token("w") || has_token("white"))
+        return "white";
+    if (has_token("r") || has_token("red"))
+        return "red";
+    if (has_token("g") || has_token("green"))
+        return "green";
+    if (has_token("b") || has_token("blue"))
+        return "blue";
+    return std::string();
+}
+
+static std::vector<std::string> semantic_role_keys(int filament_color_mode, size_t component_count)
+{
+    const std::vector<std::string> names = semantic_color_names(filament_color_mode);
+    if (names.size() != component_count)
+        return {};
+    std::vector<std::string> keys;
+    keys.reserve(names.size());
+    for (const std::string &name : names) {
+        std::string key = semantic_role_key_from_label(name);
+        if (key.empty())
+            return {};
+        keys.emplace_back(std::move(key));
+    }
+    return keys;
 }
 
 static nlohmann::json point3_to_json(const std::array<float, 3> &point)
@@ -826,6 +893,8 @@ static std::string top_surface_contoning_color_prediction_mode_name(int mode)
         return "calibrated_free_alpha_effective";
     if (mode == int(TextureMappingZone::ContoningColorPredictionCalibratedDepthKernelLinear))
         return "calibrated_depth_kernel_linear";
+    if (mode == int(TextureMappingZone::ContoningColorPredictionCalibratedNearestMeasuredSample))
+        return "calibrated_nearest_measured_sample";
     return "default";
 }
 
@@ -864,6 +933,12 @@ static int top_surface_contoning_color_prediction_mode_from_name(std::string nam
         name == "depth_kernel_linear" ||
         name == "depth_kernel_linear_global")
         return int(TextureMappingZone::ContoningColorPredictionCalibratedDepthKernelLinear);
+    if (name == "calibrated_nearest_measured_sample" ||
+        name == "nearest_measured_sample" ||
+        name == "nearest_measured_sample_global" ||
+        name == "measured_stack_samples" ||
+        name == "measured_stack_samples_global")
+        return int(TextureMappingZone::ContoningColorPredictionCalibratedNearestMeasuredSample);
     return TextureMappingZone::DefaultTopSurfaceContoningColorPredictionMode;
 }
 
@@ -1252,6 +1327,8 @@ bool TextureMappingColorCalibration::has_mode(int mode) const
         return free_alpha_effective.valid();
     case int(TextureMappingZone::ContoningColorPredictionCalibratedDepthKernelLinear):
         return depth_kernel_linear.valid();
+    case int(TextureMappingZone::ContoningColorPredictionCalibratedNearestMeasuredSample):
+        return nearest_measured_sample.valid();
     default:
         return false;
     }
@@ -1306,6 +1383,165 @@ static ColorSolverCalibratedStackModel calibration_depth_kernel_model(const nloh
     model.component_count = size_t(std::max(0, raw.value("component_count", int(fallback_component_count))));
     model.taus = calibration_taus_from_json(raw);
     model.coefficients_linear_rgb = json_float_vector_or_empty(raw, { "weights", "coefficients_linear_rgb" });
+    if (!model.valid())
+        model = {};
+    return model;
+}
+
+static std::vector<uint16_t> calibration_measured_sample_stack_from_json(const nlohmann::json &raw)
+{
+    if (!raw.is_object())
+        return {};
+    for (const char *key : { "stack", "stack_components", "surface_to_deep", "components_surface_to_deep" }) {
+        auto it = raw.find(key);
+        if (it != raw.end()) {
+            std::vector<uint16_t> stack = uint16s_from_json(*it);
+            if (!stack.empty())
+                return stack;
+        }
+    }
+    return {};
+}
+
+static std::optional<std::array<float, 3>> calibration_measured_sample_rgb_from_json(const nlohmann::json &raw)
+{
+    if (!raw.is_object())
+        return std::nullopt;
+    for (const char *key : { "rgb", "measured_rgb", "display_rgb", "display_color_srgb" }) {
+        auto it = raw.find(key);
+        if (it != raw.end() && it->is_array()) {
+            std::array<float, 3> rgb = point3_from_json(*it);
+            for (float &channel : rgb)
+                channel = std::clamp(std::isfinite(channel) ? channel : 0.f, 0.f, 1.f);
+            return rgb;
+        }
+    }
+    for (const char *key : { "actual_measured_color", "measured_color", "color" }) {
+        auto it = raw.find(key);
+        if (it != raw.end() && it->is_object()) {
+            if (auto rgb_it = it->find("rgb"); rgb_it != it->end() && rgb_it->is_array()) {
+                std::array<float, 3> rgb = point3_from_json(*rgb_it);
+                for (float &channel : rgb)
+                    channel = std::clamp(std::isfinite(channel) ? channel : 0.f, 0.f, 1.f);
+                return rgb;
+            }
+            const std::string hex = json_string_or_empty(*it, { "hex", "color" });
+            if (!hex.empty())
+                return color_array_from_hex(hex);
+        }
+    }
+    const std::string hex = json_string_or_empty(raw, { "hex", "color", "measured_hex" });
+    if (!hex.empty())
+        return color_array_from_hex(hex);
+    return std::nullopt;
+}
+
+static std::vector<float> calibration_measured_layer_heights_from_json(const nlohmann::json &raw, int stack_depth)
+{
+    if (!raw.is_object() || stack_depth <= 0)
+        return {};
+    std::vector<float> heights = json_float_vector_or_empty(raw, {
+        "layer_heights_mm",
+        "surface_to_deep_layer_heights_mm",
+        "measured_layer_heights_mm",
+        "measured_layer_heights_surface_to_deep_mm"
+    });
+    if (heights.empty()) {
+        for (const char *key : { "print_settings", "calibration_print_settings" }) {
+            auto it = raw.find(key);
+            if (it == raw.end() || !it->is_object())
+                continue;
+            heights = json_float_vector_or_empty(*it, {
+                "layer_heights_mm",
+                "surface_to_deep_layer_heights_mm",
+                "measured_layer_heights_mm",
+                "measured_layer_heights_surface_to_deep_mm"
+            });
+            if (!heights.empty())
+                break;
+        }
+    }
+    if (heights.empty())
+        return {};
+    if (int(heights.size()) < stack_depth)
+        return {};
+    heights.resize(size_t(stack_depth));
+    for (float &height : heights) {
+        if (!std::isfinite(height) || height <= 0.f)
+            return {};
+    }
+    return heights;
+}
+
+static ColorSolverCalibratedStackModel calibration_nearest_measured_sample_model(const nlohmann::json &raw, size_t fallback_component_count)
+{
+    ColorSolverCalibratedStackModel model;
+    model.kind = ColorSolverCalibratedStackModelKind::NearestMeasuredSample;
+    if (!raw.is_object() && !raw.is_array())
+        return {};
+
+    const nlohmann::json *samples = &raw;
+    if (raw.is_object()) {
+        auto samples_it = raw.find("samples");
+        if (samples_it == raw.end())
+            samples_it = raw.find("measured_samples");
+        if (samples_it == raw.end() || !samples_it->is_array())
+            return {};
+        samples = &*samples_it;
+        model.component_count = size_t(std::max(0, raw.value("component_count", int(fallback_component_count))));
+        model.measured_stack_depth = std::max(0, raw.value("stack_depth", 0));
+    } else {
+        model.component_count = fallback_component_count;
+    }
+
+    struct Sample {
+        std::vector<uint16_t> stack;
+        std::array<float, 3> rgb { { 0.f, 0.f, 0.f } };
+    };
+    std::vector<Sample> parsed;
+    parsed.reserve(samples->size());
+    uint16_t max_component = 0;
+    bool has_component = false;
+    for (const nlohmann::json &sample : *samples) {
+        std::vector<uint16_t> stack = calibration_measured_sample_stack_from_json(sample);
+        std::optional<std::array<float, 3>> rgb = calibration_measured_sample_rgb_from_json(sample);
+        if (stack.empty() || !rgb)
+            continue;
+        if (model.measured_stack_depth <= 0)
+            model.measured_stack_depth = int(stack.size());
+        if (int(stack.size()) < model.measured_stack_depth)
+            continue;
+        if (int(stack.size()) > model.measured_stack_depth)
+            stack.resize(size_t(model.measured_stack_depth));
+        for (uint16_t component : stack) {
+            max_component = std::max(max_component, component);
+            has_component = true;
+        }
+        parsed.push_back({ std::move(stack), *rgb });
+    }
+
+    if (model.component_count == 0 && has_component)
+        model.component_count = size_t(max_component) + 1;
+    if (model.component_count == 0 || model.measured_stack_depth <= 0)
+        return {};
+    model.measured_layer_heights_mm = calibration_measured_layer_heights_from_json(raw, model.measured_stack_depth);
+
+    for (const Sample &sample : parsed) {
+        bool stack_valid = true;
+        for (uint16_t component : sample.stack) {
+            if (size_t(component) >= model.component_count) {
+                stack_valid = false;
+                break;
+            }
+        }
+        if (!stack_valid)
+            continue;
+        model.measured_sample_stacks.insert(model.measured_sample_stacks.end(), sample.stack.begin(), sample.stack.end());
+        model.measured_sample_rgbs.emplace_back(sample.rgb[0]);
+        model.measured_sample_rgbs.emplace_back(sample.rgb[1]);
+        model.measured_sample_rgbs.emplace_back(sample.rgb[2]);
+    }
+
     if (!model.valid())
         model = {};
     return model;
@@ -1391,6 +1627,8 @@ static const ColorSolverCalibratedStackModel &calibration_model_for_mode(const T
         return calibration.td_alpha_effective;
     case int(TextureMappingZone::ContoningColorPredictionCalibratedFreeAlphaEffective):
         return calibration.free_alpha_effective;
+    case int(TextureMappingZone::ContoningColorPredictionCalibratedNearestMeasuredSample):
+        return calibration.nearest_measured_sample;
     default:
         return calibration.depth_kernel_linear;
     }
@@ -1398,6 +1636,7 @@ static const ColorSolverCalibratedStackModel &calibration_model_for_mode(const T
 
 struct TextureMappingCalibrationMatch {
     std::vector<size_t> calibration_index_by_component;
+    std::vector<bool> semantic_role_match_by_component;
     std::string warning;
     bool complete { false };
 };
@@ -1414,10 +1653,12 @@ static float calibration_color_distance(const std::array<float, 3> &lhs, const s
 
 static TextureMappingCalibrationMatch match_calibration_filaments(const TextureMappingColorCalibration      &calibration,
                                                                   const std::vector<std::array<float, 3>> &component_colors,
-                                                                  const std::vector<float>                &component_tds_mm)
+                                                                  const std::vector<float>                &component_tds_mm,
+                                                                  int                                      filament_color_mode)
 {
     TextureMappingCalibrationMatch match;
     match.calibration_index_by_component.assign(component_colors.size(), size_t(-1));
+    match.semantic_role_match_by_component.assign(component_colors.size(), false);
     if (component_colors.empty()) {
         match.complete = true;
         return match;
@@ -1429,34 +1670,61 @@ static TextureMappingCalibrationMatch match_calibration_filaments(const TextureM
 
     std::vector<bool> used(calibration.filaments.size(), false);
     std::vector<std::string> notes;
+    const std::vector<std::string> component_role_keys = semantic_role_keys(filament_color_mode, component_colors.size());
+    if (!component_role_keys.empty()) {
+        std::map<std::string, size_t> role_index;
+        std::unordered_set<std::string> duplicate_roles;
+        for (size_t calibration_idx = 0; calibration_idx < calibration.filaments.size(); ++calibration_idx) {
+            const std::string role_key = semantic_role_key_from_label(calibration.filaments[calibration_idx].name);
+            if (role_key.empty())
+                continue;
+            auto inserted = role_index.emplace(role_key, calibration_idx);
+            if (!inserted.second)
+                duplicate_roles.insert(role_key);
+        }
+        for (const std::string &role_key : duplicate_roles)
+            role_index.erase(role_key);
+        for (size_t component_idx = 0; component_idx < component_role_keys.size(); ++component_idx) {
+            auto it = role_index.find(component_role_keys[component_idx]);
+            if (it == role_index.end() || it->second >= used.size() || used[it->second])
+                continue;
+            match.calibration_index_by_component[component_idx] = it->second;
+            match.semantic_role_match_by_component[component_idx] = true;
+            used[it->second] = true;
+        }
+    }
     for (size_t component_idx = 0; component_idx < component_colors.size(); ++component_idx) {
         size_t best_idx = size_t(-1);
         float best_score = std::numeric_limits<float>::max();
         float best_color_distance = std::numeric_limits<float>::max();
-        for (size_t calibration_idx = 0; calibration_idx < calibration.filaments.size(); ++calibration_idx) {
-            if (used[calibration_idx])
-                continue;
-            const TextureMappingColorCalibrationFilament &filament = calibration.filaments[calibration_idx];
-            const float color_distance = calibration_color_distance(component_colors[component_idx], filament.color);
-            float td_score = 0.f;
-            const float component_td = component_idx < component_tds_mm.size() ? component_tds_mm[component_idx] : 0.f;
-            if (component_td > 0.f && filament.td_mm > 0.f)
-                td_score = std::min(0.12f, std::abs(component_td - filament.td_mm) / std::max({ component_td, filament.td_mm, 1.f }) * 0.12f);
-            const float score = color_distance + td_score;
-            if (score < best_score) {
-                best_score = score;
-                best_idx = calibration_idx;
-                best_color_distance = color_distance;
+        if (match.calibration_index_by_component[component_idx] == size_t(-1)) {
+            for (size_t calibration_idx = 0; calibration_idx < calibration.filaments.size(); ++calibration_idx) {
+                if (used[calibration_idx])
+                    continue;
+                const TextureMappingColorCalibrationFilament &filament = calibration.filaments[calibration_idx];
+                const float color_distance = calibration_color_distance(component_colors[component_idx], filament.color);
+                float td_score = 0.f;
+                const float component_td = component_idx < component_tds_mm.size() ? component_tds_mm[component_idx] : 0.f;
+                if (component_td > 0.f && filament.td_mm > 0.f)
+                    td_score = std::min(0.12f, std::abs(component_td - filament.td_mm) / std::max({ component_td, filament.td_mm, 1.f }) * 0.12f);
+                const float score = color_distance + td_score;
+                if (score < best_score) {
+                    best_score = score;
+                    best_idx = calibration_idx;
+                    best_color_distance = color_distance;
+                }
             }
+            if (best_idx == size_t(-1))
+                continue;
+            used[best_idx] = true;
+            match.calibration_index_by_component[component_idx] = best_idx;
+        } else {
+            best_idx = match.calibration_index_by_component[component_idx];
         }
-        if (best_idx == size_t(-1))
-            continue;
-        used[best_idx] = true;
-        match.calibration_index_by_component[component_idx] = best_idx;
 
         const TextureMappingColorCalibrationFilament &filament = calibration.filaments[best_idx];
         const float component_td = component_idx < component_tds_mm.size() ? component_tds_mm[component_idx] : 0.f;
-        if (best_color_distance > 0.16f) {
+        if (!match.semantic_role_match_by_component[component_idx] && best_color_distance > 0.16f) {
             notes.emplace_back("component " + std::to_string(component_idx + 1) +
                                " color does not closely match calibrated " + filament.name);
         }
@@ -1556,6 +1824,53 @@ static std::optional<ColorSolverCalibratedStackModel> remap_calibration_model(
         return out.valid() ? std::optional<ColorSolverCalibratedStackModel>(out) : std::nullopt;
     }
 
+    if (source.kind == ColorSolverCalibratedStackModelKind::NearestMeasuredSample) {
+        ColorSolverCalibratedStackModel out;
+        out.kind = ColorSolverCalibratedStackModelKind::NearestMeasuredSample;
+        out.component_count = target_component_count;
+        out.measured_stack_depth = source.measured_stack_depth;
+        out.measured_layer_heights_mm = source.measured_layer_heights_mm;
+        const size_t source_component_count = source.component_count;
+        const size_t stack_depth = size_t(std::max(0, source.measured_stack_depth));
+        const size_t sample_count = source.measured_sample_rgbs.size() / 3;
+        if (source_component_count == 0 || stack_depth == 0 ||
+            source.measured_sample_stacks.size() != sample_count * stack_depth)
+            return std::nullopt;
+
+        std::vector<size_t> target_index_by_source(source_component_count, size_t(-1));
+        for (size_t component_idx = 0; component_idx < target_component_count; ++component_idx) {
+            const size_t source_idx = match.calibration_index_by_component[component_idx];
+            if (source_idx >= source_component_count)
+                return std::nullopt;
+            target_index_by_source[source_idx] = component_idx;
+        }
+
+        for (size_t sample_idx = 0; sample_idx < sample_count; ++sample_idx) {
+            const size_t stack_begin = sample_idx * stack_depth;
+            std::vector<uint16_t> mapped_stack;
+            mapped_stack.reserve(stack_depth);
+            bool valid_stack = true;
+            for (size_t depth_idx = 0; depth_idx < stack_depth; ++depth_idx) {
+                const size_t source_idx = source.measured_sample_stacks[stack_begin + depth_idx];
+                if (source_idx >= target_index_by_source.size() ||
+                    target_index_by_source[source_idx] == size_t(-1) ||
+                    target_index_by_source[source_idx] > size_t(std::numeric_limits<uint16_t>::max())) {
+                    valid_stack = false;
+                    break;
+                }
+                mapped_stack.emplace_back(uint16_t(target_index_by_source[source_idx]));
+            }
+            if (!valid_stack)
+                continue;
+            out.measured_sample_stacks.insert(out.measured_sample_stacks.end(), mapped_stack.begin(), mapped_stack.end());
+            const size_t rgb_begin = sample_idx * 3;
+            out.measured_sample_rgbs.insert(out.measured_sample_rgbs.end(),
+                                            source.measured_sample_rgbs.begin() + rgb_begin,
+                                            source.measured_sample_rgbs.begin() + rgb_begin + 3);
+        }
+        return out.valid() ? std::optional<ColorSolverCalibratedStackModel>(out) : std::nullopt;
+    }
+
     return std::nullopt;
 }
 
@@ -1592,11 +1907,18 @@ std::optional<TextureMappingColorCalibration> texture_mapping_parse_top_surface_
         calibration.free_alpha_effective = calibration_alpha_model(*raw);
     if (const nlohmann::json *raw = calibration_model_json(models, "depth_kernel_linear"))
         calibration.depth_kernel_linear = calibration_depth_kernel_model(*raw, calibration.filaments.size());
+    if (const nlohmann::json *raw = calibration_model_json(models, "nearest_measured_sample"))
+        calibration.nearest_measured_sample = calibration_nearest_measured_sample_model(*raw, calibration.filaments.size());
+    if (!calibration.nearest_measured_sample.valid()) {
+        if (const nlohmann::json *raw = calibration_model_json(models, "measured_stack_samples"))
+            calibration.nearest_measured_sample = calibration_nearest_measured_sample_model(*raw, calibration.filaments.size());
+    }
 
     if (!calibration.current_linear_affine.valid() &&
         !calibration.td_alpha_effective.valid() &&
         !calibration.free_alpha_effective.valid() &&
-        !calibration.depth_kernel_linear.valid()) {
+        !calibration.depth_kernel_linear.valid() &&
+        !calibration.nearest_measured_sample.valid()) {
         if (error != nullptr)
             *error = "The calibration file does not contain any supported color prediction weights.";
         return std::nullopt;
@@ -1612,11 +1934,12 @@ std::vector<int> texture_mapping_top_surface_color_calibration_supported_modes(c
         texture_mapping_parse_top_surface_color_calibration(json_text);
     if (!calibration)
         return out;
-    const std::array<int, 4> modes = {
+    const std::array<int, 5> modes = {
         int(TextureMappingZone::ContoningColorPredictionCalibratedCurrentLinearAffine),
         int(TextureMappingZone::ContoningColorPredictionCalibratedTdAlphaEffective),
         int(TextureMappingZone::ContoningColorPredictionCalibratedFreeAlphaEffective),
-        int(TextureMappingZone::ContoningColorPredictionCalibratedDepthKernelLinear)
+        int(TextureMappingZone::ContoningColorPredictionCalibratedDepthKernelLinear),
+        int(TextureMappingZone::ContoningColorPredictionCalibratedNearestMeasuredSample)
     };
     for (int mode : modes)
         if (calibration->has_mode(mode))
@@ -1631,11 +1954,12 @@ int texture_mapping_top_surface_color_calibration_first_supported_mode(const std
     if (!calibration)
         return TextureMappingZone::DefaultTopSurfaceContoningColorPredictionMode;
 
-    const std::array<std::pair<int, const char *>, 4> modes = {
+    const std::array<std::pair<int, const char *>, 5> modes = {
         std::pair<int, const char *>(int(TextureMappingZone::ContoningColorPredictionCalibratedCurrentLinearAffine), "current_linear_affine"),
         std::pair<int, const char *>(int(TextureMappingZone::ContoningColorPredictionCalibratedTdAlphaEffective), "td_alpha_effective"),
         std::pair<int, const char *>(int(TextureMappingZone::ContoningColorPredictionCalibratedFreeAlphaEffective), "free_alpha_effective"),
-        std::pair<int, const char *>(int(TextureMappingZone::ContoningColorPredictionCalibratedDepthKernelLinear), "depth_kernel_linear")
+        std::pair<int, const char *>(int(TextureMappingZone::ContoningColorPredictionCalibratedDepthKernelLinear), "depth_kernel_linear"),
+        std::pair<int, const char *>(int(TextureMappingZone::ContoningColorPredictionCalibratedNearestMeasuredSample), "nearest_measured_sample")
     };
     size_t best_pos = std::numeric_limits<size_t>::max();
     int best_mode = TextureMappingZone::DefaultTopSurfaceContoningColorPredictionMode;
@@ -1672,7 +1996,7 @@ std::string texture_mapping_top_surface_color_calibration_warning(const TextureM
         return error.empty() ? "Top-surface color calibration could not be loaded." : error;
 
     const TextureMappingCalibrationMatch match =
-        match_calibration_filaments(*calibration, component_colors, component_tds_mm);
+        match_calibration_filaments(*calibration, component_colors, component_tds_mm, zone.filament_color_mode);
     if (!match.warning.empty())
         return match.warning;
 
@@ -1705,7 +2029,7 @@ std::optional<ColorSolverCalibratedStackModel> texture_mapping_top_surface_color
         return std::nullopt;
 
     const TextureMappingCalibrationMatch match =
-        match_calibration_filaments(*calibration, component_colors, component_tds_mm);
+        match_calibration_filaments(*calibration, component_colors, component_tds_mm, zone.filament_color_mode);
     if (warning != nullptr)
         *warning = match.warning;
     return remap_calibration_model(source, mode, match, component_colors.size());
@@ -2590,7 +2914,7 @@ void TextureMappingManager::load_entries(const std::string &serialized,
                               color_prediction_mode_it->get<int>() :
                           TextureMappingZone::DefaultTopSurfaceContoningColorPredictionMode,
                           int(TextureMappingZone::ContoningColorPredictionDefault),
-                          int(TextureMappingZone::ContoningColorPredictionAdaptiveSpectral));
+                          int(TextureMappingZone::ContoningColorPredictionCalibratedNearestMeasuredSample));
         zone.top_surface_contoning_beer_lambert_rgb_correction_enabled =
             TextureMappingZone::DefaultTopSurfaceContoningBeerLambertRgbCorrectionEnabled;
         zone.top_surface_contoning_td_effective_alpha_correction_enabled =

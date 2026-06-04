@@ -29,6 +29,14 @@ float clamp01(float value)
     return std::clamp(value, 0.f, 1.f);
 }
 
+bool layer_height_matches(float actual_mm, float expected_mm)
+{
+    if (!std::isfinite(actual_mm) || !std::isfinite(expected_mm) || actual_mm <= 0.f || expected_mm <= 0.f)
+        return false;
+    const float tolerance = std::max(0.001f, std::abs(expected_mm) * 0.01f);
+    return std::abs(actual_mm - expected_mm) <= tolerance;
+}
+
 float filament_luminance(const PrintConfig &config, unsigned int component_id)
 {
     ColorRGB color;
@@ -407,20 +415,20 @@ TextureMappingContoningSolver::TextureMappingContoningSolver(const TextureMappin
 {
     m_mix_model = color_solver_mix_model_from_index(zone.generic_solver_mix_model);
     m_td_adjustment_enabled = zone.top_surface_contoning_td_adjustment_enabled;
-    const int effective_color_prediction_mode =
+    m_effective_color_prediction_mode =
         TextureMappingZone::effective_top_surface_contoning_color_prediction_mode(
             zone.top_surface_contoning_color_prediction_mode);
     m_adaptive_spectral_correction_enabled =
         m_td_adjustment_enabled &&
-        effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionAdaptiveSpectral);
+        m_effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionAdaptiveSpectral);
     m_td_effective_alpha_correction_enabled =
         m_td_adjustment_enabled &&
-        (effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha) ||
-         effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionCalibratedCurrentLinearAffine));
+        (m_effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha) ||
+         m_effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionCalibratedCurrentLinearAffine));
     m_beer_lambert_rgb_correction_enabled =
         m_td_adjustment_enabled &&
         !m_td_effective_alpha_correction_enabled &&
-        effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb);
+        m_effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb);
     m_variable_layer_height_compensation_enabled =
         m_td_adjustment_enabled && zone.top_surface_contoning_variable_layer_height_compensation_enabled;
     m_beam_search_stack_expansion_enabled = zone.effective_top_surface_contoning_beam_search_stack_expansion_enabled();
@@ -447,21 +455,108 @@ TextureMappingContoningSolver::TextureMappingContoningSolver(const TextureMappin
     m_background_rgb = mix_color_solver_components(m_component_colors, background_weights, m_mix_model);
     m_effective_transmission_distances_mm =
         effective_transmission_distances_mm(zone, config, m_component_ids, m_td_adjustment_enabled);
-    if (TextureMappingZone::top_surface_contoning_color_prediction_mode_is_calibrated(effective_color_prediction_mode)) {
+    if (TextureMappingZone::top_surface_contoning_color_prediction_mode_is_calibrated(m_effective_color_prediction_mode)) {
         std::string warning;
         std::optional<ColorSolverCalibratedStackModel> calibrated_model =
             texture_mapping_top_surface_color_calibrated_model(zone,
-                                                               effective_color_prediction_mode,
+                                                               m_effective_color_prediction_mode,
                                                                m_component_colors,
                                                                m_effective_transmission_distances_mm,
                                                                &warning);
         if (calibrated_model && calibrated_model->valid())
             m_calibrated_stack_model = *calibrated_model;
+        if (m_effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionCalibratedNearestMeasuredSample)) {
+            for (int fallback_mode : {
+                     int(TextureMappingZone::ContoningColorPredictionCalibratedFreeAlphaEffective),
+                     int(TextureMappingZone::ContoningColorPredictionCalibratedDepthKernelLinear) }) {
+                std::optional<ColorSolverCalibratedStackModel> fallback_model =
+                    texture_mapping_top_surface_color_calibrated_model(zone,
+                                                                       fallback_mode,
+                                                                       m_component_colors,
+                                                                       m_effective_transmission_distances_mm,
+                                                                       nullptr);
+                if (fallback_model && fallback_model->valid()) {
+                    m_nearest_measured_sample_fallback_model = *fallback_model;
+                    m_nearest_measured_sample_fallback_mode = fallback_mode;
+                    break;
+                }
+            }
+        }
     }
     m_component_layer_opacity.reserve(m_effective_transmission_distances_mm.size());
     for (float td_mm : m_effective_transmission_distances_mm)
         m_component_layer_opacity.emplace_back(layer_opacity_from_td(td_mm > 0.f ? td_mm : 3.f, m_layer_height_mm));
     m_components_bottom_to_top = texture_mapping_contoning_components_bottom_to_top(zone, config, m_component_ids);
+    if (m_calibrated_stack_model.valid())
+        m_calibrated_stack_model.cache_key();
+    if (m_nearest_measured_sample_fallback_model.valid())
+        m_nearest_measured_sample_fallback_model.cache_key();
+}
+
+std::string TextureMappingContoningSolver::calibrated_stack_model_key() const
+{
+    std::string key = m_calibrated_stack_model.valid() ? m_calibrated_stack_model.cache_key() : std::string();
+    if (nearest_measured_sample_mode()) {
+        key += "|nearest_fallback_mode=" + std::to_string(m_nearest_measured_sample_fallback_mode);
+        key += "|nearest_fallback_model=" +
+               (m_nearest_measured_sample_fallback_model.valid() ?
+                    m_nearest_measured_sample_fallback_model.cache_key() :
+                    std::string());
+    }
+    return key;
+}
+
+bool TextureMappingContoningSolver::nearest_measured_sample_mode() const
+{
+    return m_effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionCalibratedNearestMeasuredSample);
+}
+
+int TextureMappingContoningSolver::nearest_measured_sample_stack_depth() const
+{
+    if (!nearest_measured_sample_mode() ||
+        m_calibrated_stack_model.kind != ColorSolverCalibratedStackModelKind::NearestMeasuredSample ||
+        !m_calibrated_stack_model.valid())
+        return 0;
+    return std::max(0, m_calibrated_stack_model.measured_stack_depth);
+}
+
+bool TextureMappingContoningSolver::nearest_measured_sample_fallback_used() const
+{
+    return nearest_measured_sample_fallback_used(false) ||
+           nearest_measured_sample_fallback_used(true);
+}
+
+bool TextureMappingContoningSolver::nearest_measured_sample_fallback_used(bool lower_surface) const
+{
+    const std::shared_ptr<std::atomic<bool>> &fallback_used =
+        lower_surface ?
+            m_nearest_measured_sample_lower_fallback_used :
+            m_nearest_measured_sample_upper_fallback_used;
+    return fallback_used && fallback_used->load(std::memory_order_relaxed);
+}
+
+std::vector<TextureMappingContoningNearestMeasuredSampleFallbackIssue>
+TextureMappingContoningSolver::nearest_measured_sample_fallback_issues(bool lower_surface) const
+{
+    if (!m_nearest_measured_sample_fallback_issue_mutex || !m_nearest_measured_sample_fallback_issues)
+        return {};
+    std::lock_guard<std::mutex> lock(*m_nearest_measured_sample_fallback_issue_mutex);
+    std::vector<TextureMappingContoningNearestMeasuredSampleFallbackIssue> out;
+    for (const TextureMappingContoningNearestMeasuredSampleFallbackIssue &issue : *m_nearest_measured_sample_fallback_issues)
+        if (issue.lower_surface == lower_surface)
+            out.emplace_back(issue);
+    return out;
+}
+
+std::string TextureMappingContoningSolver::nearest_measured_sample_fallback_name() const
+{
+    if (m_nearest_measured_sample_fallback_model.valid()) {
+        if (m_nearest_measured_sample_fallback_mode == int(TextureMappingZone::ContoningColorPredictionCalibratedFreeAlphaEffective))
+            return "calibrated free alpha effective";
+        if (m_nearest_measured_sample_fallback_mode == int(TextureMappingZone::ContoningColorPredictionCalibratedDepthKernelLinear))
+            return "calibrated depth kernel linear";
+    }
+    return "default uncalibrated";
 }
 
 const std::vector<TextureMappingContoningSolver::Candidate>&
@@ -512,7 +607,9 @@ std::optional<std::array<float, 3>> TextureMappingContoningSolver::stack_rgb(
     const std::vector<unsigned int> &bottom_to_top,
     bool lower_surface,
     int visible_stack_layers,
-    const std::vector<float> &surface_to_deep_layer_heights_mm) const
+    const std::vector<float> &surface_to_deep_layer_heights_mm,
+    const std::vector<int> &surface_to_deep_layer_ids,
+    bool record_nearest_measured_sample_fallback) const
 {
     if (bottom_to_top.empty() || !valid())
         return std::nullopt;
@@ -566,18 +663,25 @@ std::optional<std::array<float, 3>> TextureMappingContoningSolver::stack_rgb(
 
     const std::vector<float> depth_layer_opacities =
         layer_opacities_by_depth(surface_to_deep_layer_heights_mm, visible_depth);
+    const PredictionOptions prediction_options =
+        prediction_options_for_layers(int(bottom_to_top.size()),
+                                      visible_depth,
+                                      surface_to_deep_layer_heights_mm,
+                                      surface_to_deep_layer_ids,
+                                      lower_surface,
+                                      record_nearest_measured_sample_fallback);
     return mix_color_solver_ordered_stack(m_component_colors,
                                           surface_to_deep,
                                           m_component_layer_opacity,
                                           m_background_rgb,
                                           m_mix_model,
                                           m_surface_scatter,
-                                          m_beer_lambert_rgb_correction_enabled,
-                                          m_td_effective_alpha_correction_enabled,
+                                          prediction_options.beer_lambert_rgb_correction_enabled,
+                                          prediction_options.td_effective_alpha_correction_enabled,
                                           m_component_roles,
                                           depth_layer_opacities,
-                                          m_calibrated_stack_model.valid() ? &m_calibrated_stack_model : nullptr,
-                                          m_adaptive_spectral_correction_enabled);
+                                          prediction_options.calibrated_stack_model,
+                                          prediction_options.adaptive_spectral_correction_enabled);
 }
 
 std::vector<float> TextureMappingContoningSolver::layer_opacities_by_depth(
@@ -603,6 +707,138 @@ std::vector<float> TextureMappingContoningSolver::layer_opacities_by_depth(
         for (float td_mm : m_effective_transmission_distances_mm)
             out.emplace_back(layer_opacity_from_td(td_mm > 0.f ? td_mm : 3.f, layer_height_mm));
     }
+    return out;
+}
+
+bool TextureMappingContoningSolver::nearest_measured_sample_compatible(
+    int stack_layers,
+    int visible_depth,
+    const std::vector<float> &surface_to_deep_layer_heights_mm,
+    const std::vector<int> &surface_to_deep_layer_ids,
+    bool lower_surface,
+    bool record_fallback_issue) const
+{
+    if (!nearest_measured_sample_mode() ||
+        m_calibrated_stack_model.kind != ColorSolverCalibratedStackModelKind::NearestMeasuredSample ||
+        !m_calibrated_stack_model.valid())
+        return false;
+
+    const int measured_depth = m_calibrated_stack_model.measured_stack_depth;
+    if (measured_depth <= 0 || stack_layers != measured_depth || visible_depth < measured_depth) {
+        if (record_fallback_issue) {
+            TextureMappingContoningNearestMeasuredSampleFallbackIssue issue;
+            issue.lower_surface = lower_surface;
+            issue.stack_depth_mismatch = true;
+            issue.actual_stack_layers = stack_layers;
+            issue.visible_stack_layers = visible_depth;
+            issue.expected_stack_layers = measured_depth;
+            record_nearest_measured_sample_fallback_issue(issue);
+        }
+        return false;
+    }
+    if (int(m_calibrated_stack_model.measured_layer_heights_mm.size()) < measured_depth)
+        return false;
+
+    for (int depth_idx = 0; depth_idx < measured_depth; ++depth_idx) {
+        float actual_height = depth_idx < int(surface_to_deep_layer_heights_mm.size()) ?
+            surface_to_deep_layer_heights_mm[size_t(depth_idx)] :
+            m_layer_height_mm;
+        if (!std::isfinite(actual_height) || actual_height <= 0.f)
+            actual_height = m_layer_height_mm;
+        const float expected_height = m_calibrated_stack_model.measured_layer_heights_mm[size_t(depth_idx)];
+        if (!layer_height_matches(actual_height, expected_height)) {
+            if (record_fallback_issue) {
+                TextureMappingContoningNearestMeasuredSampleFallbackIssue issue;
+                issue.lower_surface = lower_surface;
+                issue.layer_height_mismatch = true;
+                issue.shell_depth_from_surface = depth_idx + 1;
+                issue.physical_layer = depth_idx < int(surface_to_deep_layer_ids.size()) ?
+                    surface_to_deep_layer_ids[size_t(depth_idx)] :
+                    -1;
+                issue.actual_stack_layers = stack_layers;
+                issue.visible_stack_layers = visible_depth;
+                issue.expected_stack_layers = measured_depth;
+                issue.actual_layer_height_mm = actual_height;
+                issue.expected_layer_height_mm = expected_height;
+                record_nearest_measured_sample_fallback_issue(issue);
+            }
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void TextureMappingContoningSolver::record_nearest_measured_sample_fallback_issue(
+    const TextureMappingContoningNearestMeasuredSampleFallbackIssue &issue) const
+{
+    if (!m_nearest_measured_sample_fallback_issue_mutex || !m_nearest_measured_sample_fallback_issues)
+        return;
+    std::lock_guard<std::mutex> lock(*m_nearest_measured_sample_fallback_issue_mutex);
+    for (const TextureMappingContoningNearestMeasuredSampleFallbackIssue &existing : *m_nearest_measured_sample_fallback_issues)
+        if (existing.lower_surface == issue.lower_surface &&
+            existing.stack_depth_mismatch == issue.stack_depth_mismatch &&
+            existing.layer_height_mismatch == issue.layer_height_mismatch &&
+            existing.shell_depth_from_surface == issue.shell_depth_from_surface &&
+            existing.physical_layer == issue.physical_layer &&
+            existing.actual_stack_layers == issue.actual_stack_layers &&
+            existing.visible_stack_layers == issue.visible_stack_layers &&
+            existing.expected_stack_layers == issue.expected_stack_layers)
+            return;
+    if (m_nearest_measured_sample_fallback_issues->size() < 16)
+        m_nearest_measured_sample_fallback_issues->emplace_back(issue);
+}
+
+TextureMappingContoningSolver::PredictionOptions TextureMappingContoningSolver::prediction_options_for_layers(
+    int stack_layers,
+    int visible_depth,
+    const std::vector<float> &surface_to_deep_layer_heights_mm,
+    const std::vector<int> &surface_to_deep_layer_ids,
+    bool lower_surface,
+    bool record_fallback_issue) const
+{
+    PredictionOptions out;
+    out.calibrated_stack_model = m_calibrated_stack_model.valid() ? &m_calibrated_stack_model : nullptr;
+    out.beer_lambert_rgb_correction_enabled = m_beer_lambert_rgb_correction_enabled;
+    out.td_effective_alpha_correction_enabled = m_td_effective_alpha_correction_enabled;
+    out.adaptive_spectral_correction_enabled = m_adaptive_spectral_correction_enabled;
+
+    if (!nearest_measured_sample_mode())
+        return out;
+    if (nearest_measured_sample_compatible(stack_layers,
+                                           visible_depth,
+                                           surface_to_deep_layer_heights_mm,
+                                           surface_to_deep_layer_ids,
+                                           lower_surface,
+                                           record_fallback_issue))
+        return out;
+
+    if (record_fallback_issue) {
+        std::shared_ptr<std::atomic<bool>> fallback_used =
+            lower_surface ?
+                m_nearest_measured_sample_lower_fallback_used :
+                m_nearest_measured_sample_upper_fallback_used;
+        if (fallback_used)
+            fallback_used->store(true, std::memory_order_relaxed);
+    }
+
+    out = PredictionOptions();
+    if (m_nearest_measured_sample_fallback_model.valid()) {
+        out.calibrated_stack_model = &m_nearest_measured_sample_fallback_model;
+        return out;
+    }
+
+    const int default_mode = TextureMappingZone::SlicerDefaultTopSurfaceContoningColorPredictionMode;
+    out.td_effective_alpha_correction_enabled =
+        m_td_adjustment_enabled &&
+        default_mode == int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha);
+    out.beer_lambert_rgb_correction_enabled =
+        m_td_adjustment_enabled &&
+        !out.td_effective_alpha_correction_enabled &&
+        default_mode == int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb);
+    out.adaptive_spectral_correction_enabled =
+        m_td_adjustment_enabled &&
+        default_mode == int(TextureMappingZone::ContoningColorPredictionAdaptiveSpectral);
     return out;
 }
 
@@ -675,14 +911,18 @@ TextureMappingContoningStack TextureMappingContoningSolver::solve(const std::arr
                                                                   int stack_layers,
                                                                   bool lower_surface,
                                                                   int visible_stack_layers,
-                                                                  const std::vector<float> &surface_to_deep_layer_heights_mm) const
+                                                                  const std::vector<float> &surface_to_deep_layer_heights_mm,
+                                                                  const std::vector<int> &surface_to_deep_layer_ids,
+                                                                  bool record_nearest_measured_sample_fallback) const
 {
     return solve_impl(target_rgb,
                       stack_layers,
                       lower_surface,
                       visible_stack_layers,
                       surface_to_deep_layer_heights_mm,
-                      m_beam_search_stack_expansion_enabled);
+                      surface_to_deep_layer_ids,
+                      m_beam_search_stack_expansion_enabled,
+                      record_nearest_measured_sample_fallback);
 }
 
 TextureMappingContoningStack TextureMappingContoningSolver::solve_without_beam_search_stack_expansion(
@@ -690,14 +930,18 @@ TextureMappingContoningStack TextureMappingContoningSolver::solve_without_beam_s
     int stack_layers,
     bool lower_surface,
     int visible_stack_layers,
-    const std::vector<float> &surface_to_deep_layer_heights_mm) const
+    const std::vector<float> &surface_to_deep_layer_heights_mm,
+    const std::vector<int> &surface_to_deep_layer_ids,
+    bool record_nearest_measured_sample_fallback) const
 {
     return solve_impl(target_rgb,
                       stack_layers,
                       lower_surface,
                       visible_stack_layers,
                       surface_to_deep_layer_heights_mm,
-                      false);
+                      surface_to_deep_layer_ids,
+                      false,
+                      record_nearest_measured_sample_fallback);
 }
 
 TextureMappingContoningStack TextureMappingContoningSolver::solve_impl(
@@ -706,7 +950,9 @@ TextureMappingContoningStack TextureMappingContoningSolver::solve_impl(
     bool lower_surface,
     int visible_stack_layers,
     const std::vector<float> &surface_to_deep_layer_heights_mm,
-    bool beam_search_stack_expansion_enabled) const
+    const std::vector<int> &surface_to_deep_layer_ids,
+    bool beam_search_stack_expansion_enabled,
+    bool record_nearest_measured_sample_fallback) const
 {
     TextureMappingContoningStack out;
     if (!valid())
@@ -724,6 +970,13 @@ TextureMappingContoningStack TextureMappingContoningSolver::solve_impl(
     if (m_td_adjustment_enabled) {
         const std::vector<float> depth_layer_opacities =
             layer_opacities_by_depth(surface_to_deep_layer_heights_mm, visible_depth);
+        const PredictionOptions prediction_options =
+            prediction_options_for_layers(depth,
+                                          visible_depth,
+                                          surface_to_deep_layer_heights_mm,
+                                          surface_to_deep_layer_ids,
+                                          lower_surface,
+                                          record_nearest_measured_sample_fallback);
         const ColorSolverOrderedStackCandidateSet *ordered_candidates = nullptr;
         {
             std::lock_guard<std::mutex> lock(*m_ordered_candidate_cache_mutex);
@@ -738,13 +991,13 @@ TextureMappingContoningStack TextureMappingContoningSolver::solve_impl(
                                                        MAX_TD_ORDERED_CONTONING_CANDIDATES,
                                                        MAX_TD_ORDERED_CONTONING_STACK_ITEMS,
                                                        m_surface_scatter,
-                                                       m_beer_lambert_rgb_correction_enabled,
-                                                       m_td_effective_alpha_correction_enabled,
+                                                       prediction_options.beer_lambert_rgb_correction_enabled,
+                                                       prediction_options.td_effective_alpha_correction_enabled,
                                                        m_component_roles,
                                                        beam_search_stack_expansion_enabled,
                                                        depth_layer_opacities,
-                                                       m_calibrated_stack_model.valid() ? &m_calibrated_stack_model : nullptr,
-                                                       m_adaptive_spectral_correction_enabled);
+                                                       prediction_options.calibrated_stack_model,
+                                                       prediction_options.adaptive_spectral_correction_enabled);
         }
         const ColorSolverOrderedStackResult solved =
             solve_color_solver_ordered_stack_result_for_target(*ordered_candidates, target_rgb, ColorSolverMode::OklabSoftCap4Dark4);

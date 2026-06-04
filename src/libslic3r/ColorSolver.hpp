@@ -60,15 +60,21 @@ enum class ColorSolverCalibratedStackModelKind : uint8_t
     None = 0,
     CurrentLinearAffine = 1,
     AlphaEffective = 2,
-    DepthKernelLinear = 3
+    DepthKernelLinear = 3,
+    NearestMeasuredSample = 4
 };
 
 struct ColorSolverCalibratedStackModel {
     ColorSolverCalibratedStackModelKind kind { ColorSolverCalibratedStackModelKind::None };
     size_t component_count { 0 };
+    int measured_stack_depth { 0 };
+    std::vector<float> measured_layer_heights_mm;
     std::vector<float> alphas;
     std::vector<float> taus;
     std::vector<float> coefficients_linear_rgb;
+    std::vector<float> measured_sample_rgbs;
+    std::vector<uint16_t> measured_sample_stacks;
+    mutable std::string cached_key;
 
     bool valid() const;
     std::string cache_key() const;

@@ -102,7 +102,8 @@ struct TextureMappingZone
         ContoningColorPredictionCalibratedTdAlphaEffective = 5,
         ContoningColorPredictionCalibratedFreeAlphaEffective = 6,
         ContoningColorPredictionCalibratedDepthKernelLinear = 7,
-        ContoningColorPredictionAdaptiveSpectral = 8
+        ContoningColorPredictionAdaptiveSpectral = 8,
+        ContoningColorPredictionCalibratedNearestMeasuredSample = 9
     };
 
     enum TopSurfaceContoningPolygonizationMode : uint8_t {
@@ -397,14 +398,15 @@ struct TextureMappingZone
             return SlicerDefaultTopSurfaceContoningColorPredictionMode;
         return std::clamp(mode,
                           int(ContoningColorPredictionTdEffectiveAlpha),
-                          int(ContoningColorPredictionAdaptiveSpectral));
+                          int(ContoningColorPredictionCalibratedNearestMeasuredSample));
     }
 
     static bool top_surface_contoning_color_prediction_mode_is_calibrated(int mode)
     {
         const int effective_mode = effective_top_surface_contoning_color_prediction_mode(mode);
-        return effective_mode >= int(ContoningColorPredictionCalibratedCurrentLinearAffine) &&
-               effective_mode <= int(ContoningColorPredictionCalibratedDepthKernelLinear);
+        return (effective_mode >= int(ContoningColorPredictionCalibratedCurrentLinearAffine) &&
+                effective_mode <= int(ContoningColorPredictionCalibratedDepthKernelLinear)) ||
+               effective_mode == int(ContoningColorPredictionCalibratedNearestMeasuredSample);
     }
 
     static bool effective_top_surface_contoning_layer_phase_enabled(bool value, bool surface_anchored_stacks)
@@ -886,6 +888,7 @@ struct TextureMappingColorCalibration {
     ColorSolverCalibratedStackModel td_alpha_effective;
     ColorSolverCalibratedStackModel free_alpha_effective;
     ColorSolverCalibratedStackModel depth_kernel_linear;
+    ColorSolverCalibratedStackModel nearest_measured_sample;
 
     bool has_mode(int mode) const;
 };

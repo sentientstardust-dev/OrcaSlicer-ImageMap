@@ -1725,6 +1725,23 @@ static std::vector<float> top_surface_image_contoning_surface_to_deep_layer_heig
     return out;
 }
 
+static std::vector<int> top_surface_image_contoning_surface_to_deep_layer_ids(
+    const Layer                   &source_layer,
+    int                            stack_layers,
+    TopSurfaceImageSourceSurface   source_surface)
+{
+    std::vector<int> out;
+    out.reserve(size_t(std::max(0, stack_layers)));
+    const Layer *stack_layer = &source_layer;
+    for (int depth = 0; depth < stack_layers && stack_layer != nullptr; ++depth) {
+        out.emplace_back(int(stack_layer->id()) + 1);
+        stack_layer = source_surface == TopSurfaceImageSourceSurface::Top ?
+            stack_layer->lower_layer :
+            stack_layer->upper_layer;
+    }
+    return out;
+}
+
 static double top_surface_image_scaled_area_mm2(double scaled_area)
 {
     return std::abs(scaled_area) * SCALING_FACTOR * SCALING_FACTOR;
@@ -2020,6 +2037,9 @@ struct TopSurfaceImageContoningSolvedLabel {
     int label { -1 };
     std::array<float, 3> rgb { { 0.f, 0.f, 0.f } };
 };
+
+using TopSurfaceImageContoningStackLabelKey = std::tuple<std::vector<unsigned int>, int, bool>;
+using TopSurfaceImageContoningStackLabelMap = std::map<TopSurfaceImageContoningStackLabelKey, int>;
 
 struct TopSurfaceImageContoningStackPlanCell {
     int label { -1 };
@@ -2354,6 +2374,7 @@ struct TopSurfaceImageContoningSourceContext {
     TextureMappingOffsetContext offset_context;
     std::vector<ExPolygons> stack_areas;
     std::vector<float> surface_to_deep_layer_heights_mm;
+    std::vector<int> surface_to_deep_layer_ids;
     ExPolygons normal_filter_bypass_area;
     float threshold_deg { 0.f };
     int stack_layers { 0 };
@@ -5469,12 +5490,14 @@ static std::optional<TopSurfaceImageContoningSolvedLabel> top_surface_image_cont
     bool                                                lower_surface,
     int                                                 visible_layers,
     const std::vector<float>                           &surface_to_deep_layer_heights_mm,
+    const std::vector<int>                             &surface_to_deep_layer_ids,
     std::vector<TopSurfaceImageContoningVectorLabel>   &labels,
-    std::map<std::pair<std::vector<unsigned int>, int>, int> &label_by_stack)
+    TopSurfaceImageContoningStackLabelMap              &label_by_stack,
+    bool                                                record_nearest_measured_sample_fallback)
 {
     if (stack.bottom_to_top.empty())
         return std::nullopt;
-    const auto label_key = std::make_pair(stack.bottom_to_top, std::max(0, visible_layers));
+    const auto label_key = std::make_tuple(stack.bottom_to_top, std::max(0, visible_layers), lower_surface);
     auto label_it = label_by_stack.find(label_key);
     int label = -1;
     std::optional<std::array<float, 3>> stack_rgb;
@@ -5494,7 +5517,9 @@ static std::optional<TopSurfaceImageContoningSolvedLabel> top_surface_image_cont
             stack_rgb = solver.stack_rgb(stack.bottom_to_top,
                                          lower_surface,
                                          visible_layers,
-                                         surface_to_deep_layer_heights_mm);
+                                         surface_to_deep_layer_heights_mm,
+                                         surface_to_deep_layer_ids,
+                                         record_nearest_measured_sample_fallback);
         if (!stack_rgb)
             return std::nullopt;
 
@@ -5521,21 +5546,25 @@ static std::optional<TopSurfaceImageContoningSolvedLabel> top_surface_image_cont
     const TextureMappingContoningSolver                &solver,
     bool                                                lower_surface,
     const std::vector<float>                           &surface_to_deep_layer_heights_mm,
+    const std::vector<int>                             &surface_to_deep_layer_ids,
     std::vector<TopSurfaceImageContoningVectorLabel>   &labels,
-    std::map<std::pair<std::vector<unsigned int>, int>, int> &label_by_stack)
+    TopSurfaceImageContoningStackLabelMap              &label_by_stack)
 {
     TextureMappingContoningStack stack = solver.solve(rgb,
                                                       solve_layers,
                                                       lower_surface,
                                                       visible_layers,
-                                                      surface_to_deep_layer_heights_mm);
+                                                      surface_to_deep_layer_heights_mm,
+                                                      surface_to_deep_layer_ids);
     return top_surface_image_contoning_label_for_stack(stack,
                                                        solver,
                                                        lower_surface,
                                                        visible_layers,
                                                        surface_to_deep_layer_heights_mm,
+                                                       surface_to_deep_layer_ids,
                                                        labels,
-                                                       label_by_stack);
+                                                       label_by_stack,
+                                                       true);
 }
 
 static std::optional<TopSurfaceImageContoningSolvedLabel> top_surface_image_contoning_solve_provisional_label(
@@ -5544,8 +5573,9 @@ static std::optional<TopSurfaceImageContoningSolvedLabel> top_surface_image_cont
     const TextureMappingContoningSolver                &solver,
     bool                                                lower_surface,
     const std::vector<float>                           &surface_to_deep_layer_heights_mm,
+    const std::vector<int>                             &surface_to_deep_layer_ids,
     std::vector<TopSurfaceImageContoningVectorLabel>   &labels,
-    std::map<std::pair<std::vector<unsigned int>, int>, int> &label_by_stack)
+    TopSurfaceImageContoningStackLabelMap              &label_by_stack)
 {
     const int visible_layers = solve_layers;
     TextureMappingContoningStack stack =
@@ -5553,14 +5583,18 @@ static std::optional<TopSurfaceImageContoningSolvedLabel> top_surface_image_cont
                                                          solve_layers,
                                                          lower_surface,
                                                          visible_layers,
-                                                         surface_to_deep_layer_heights_mm);
+                                                         surface_to_deep_layer_heights_mm,
+                                                         surface_to_deep_layer_ids,
+                                                         false);
     return top_surface_image_contoning_label_for_stack(stack,
                                                        solver,
                                                        lower_surface,
                                                        visible_layers,
                                                        surface_to_deep_layer_heights_mm,
+                                                       surface_to_deep_layer_ids,
                                                        labels,
-                                                       label_by_stack);
+                                                       label_by_stack,
+                                                       false);
 }
 
 static void top_surface_image_contoning_resolve_merged_grid_regions(
@@ -5575,6 +5609,7 @@ static void top_surface_image_contoning_resolve_merged_grid_regions(
     int                                                                pattern_filaments,
     bool                                                               lower_surface,
     const std::vector<float>                                           &surface_to_deep_layer_heights_mm,
+    const std::vector<int>                                             &surface_to_deep_layer_ids,
     const ThrowIfCanceled                                             *throw_if_canceled)
 {
     if (grid.empty() || labels.empty() || cols <= 0 || rows <= 0 ||
@@ -5586,7 +5621,7 @@ static void top_surface_image_contoning_resolve_merged_grid_regions(
 
     std::vector<int> resolved_grid(grid.size(), -1);
     std::vector<TopSurfaceImageContoningVectorLabel> resolved_labels;
-    std::map<std::pair<std::vector<unsigned int>, int>, int> label_by_stack;
+    TopSurfaceImageContoningStackLabelMap label_by_stack;
     std::vector<unsigned char> visited(grid.size(), 0);
 
     auto append_fallback_label = [&](int source_label) {
@@ -5674,6 +5709,7 @@ static void top_surface_image_contoning_resolve_merged_grid_regions(
                                                                 solver,
                                                                 lower_surface,
                                                                 surface_to_deep_layer_heights_mm,
+                                                                surface_to_deep_layer_ids,
                                                                 resolved_labels,
                                                                 label_by_stack);
                     if (solved)
@@ -5744,11 +5780,18 @@ static std::optional<TopSurfaceImageContoningSourceContext> top_surface_image_co
                                   TextureMappingZone::MaxTopSurfaceContoningStackLayers);
     out.pattern_filaments =
         top_surface_image_contoning_pattern_filaments(out.stack_layers, plan.contoning_pattern_filaments);
+    if (const int measured_depth = solver.nearest_measured_sample_stack_depth(); measured_depth > 0)
+        out.pattern_filaments = std::clamp(measured_depth,
+                                           TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
+                                           out.stack_layers);
     out.stack_areas =
         top_surface_image_contoning_stack_areas(source_layer, plan.zone_id, out.stack_layers, source_surface, throw_if_canceled);
-    if (plan.contoning_variable_layer_height_compensation_enabled)
+    if (plan.contoning_variable_layer_height_compensation_enabled || solver.nearest_measured_sample_mode()) {
         out.surface_to_deep_layer_heights_mm =
             top_surface_image_contoning_surface_to_deep_layer_heights(source_layer, out.stack_layers, source_surface);
+        out.surface_to_deep_layer_ids =
+            top_surface_image_contoning_surface_to_deep_layer_ids(source_layer, out.stack_layers, source_surface);
+    }
     if (stack_area_extensions != nullptr) {
         const size_t count = std::min(out.stack_areas.size(), stack_area_extensions->size());
         for (size_t idx = 0; idx < count; ++idx) {
@@ -5839,7 +5882,7 @@ static void top_surface_image_contoning_solve_anchored_region(
 
     std::vector<int> grid(size_t(cols) * size_t(rows), -1);
     std::vector<TopSurfaceImageContoningVectorLabel> labels;
-    std::map<std::pair<std::vector<unsigned int>, int>, int> label_by_stack;
+    TopSurfaceImageContoningStackLabelMap label_by_stack;
 
     const int debug_stride = debug_enabled ?
         std::max(1, int(std::ceil(std::sqrt(double(grid_cells) / 100000.0)))) :
@@ -5865,8 +5908,10 @@ static void top_surface_image_contoning_solve_anchored_region(
                                                         lower_surface,
                                                         available_depth,
                                                         source_context.surface_to_deep_layer_heights_mm,
+                                                        source_context.surface_to_deep_layer_ids,
                                                         labels,
-                                                        label_by_stack);
+                                                        label_by_stack,
+                                                        false);
         if (!solved)
             return;
         grid[size_t(row * cols + col)] = solved->label;
@@ -5917,7 +5962,9 @@ static void top_surface_image_contoning_solve_anchored_region(
                                                              sample->solve_layers,
                                                              lower_surface,
                                                              sample->solve_layers,
-                                                             source_context.surface_to_deep_layer_heights_mm);
+                                                             source_context.surface_to_deep_layer_heights_mm,
+                                                             source_context.surface_to_deep_layer_ids,
+                                                             false);
         if (debug_stride > 0 &&
             row % debug_stride == 0 &&
             col % debug_stride == 0) {
@@ -6020,6 +6067,7 @@ static void top_surface_image_contoning_solve_anchored_region(
                                                                 source_context.pattern_filaments,
                                                                 source_surface == TopSurfaceImageSourceSurface::Bottom,
                                                                 source_context.surface_to_deep_layer_heights_mm,
+                                                                source_context.surface_to_deep_layer_ids,
                                                                 throw_if_canceled);
         if (debug_enabled)
             top_surface_image_debug_accumulate_timing_step(debug_timing.steps,
@@ -6330,7 +6378,7 @@ static void top_surface_image_contoning_convert_raw_top_surface_anchored_region(
 
     std::vector<int> grid(grid_cells, -1);
     std::vector<TopSurfaceImageContoningVectorLabel> labels;
-    std::map<std::pair<std::vector<unsigned int>, int>, int> label_by_stack;
+    TopSurfaceImageContoningStackLabelMap label_by_stack;
 
     const int debug_stride = debug_enabled ?
         std::max(1, int(std::ceil(std::sqrt(double(grid_cells) / 100000.0)))) :
@@ -6580,7 +6628,7 @@ static void top_surface_image_contoning_convert_raw_top_surface_anchored_region(
         build_state->clear_work(sample_work);
 
     auto label_for_raw_stack = [&](const RawCellStack &raw_stack) {
-        const auto label_key = std::make_pair(raw_stack.bottom_to_top, std::max(0, raw_stack.valid_depth));
+        const auto label_key = std::make_tuple(raw_stack.bottom_to_top, std::max(0, raw_stack.valid_depth), false);
         auto label_it = label_by_stack.find(label_key);
         if (label_it != label_by_stack.end())
             return label_it->second;
@@ -7526,7 +7574,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
 
     std::vector<int> grid(size_t(cols) * size_t(rows), -1);
     std::vector<TopSurfaceImageContoningVectorLabel> labels;
-    std::map<std::pair<std::vector<unsigned int>, int>, int> label_by_stack;
+    TopSurfaceImageContoningStackLabelMap label_by_stack;
 
     auto solve_cell = [&](int row, int col, const std::array<float, 3> &target_rgb, int solve_layers, int) {
         std::optional<TopSurfaceImageContoningSolvedLabel> solved =
@@ -7536,6 +7584,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                                 source_surface == TopSurfaceImageSourceSurface::Bottom &&
                                                                     plan.contoning_td_adjustment_enabled,
                                                                 source->surface_to_deep_layer_heights_mm,
+                                                                source->surface_to_deep_layer_ids,
                                                                 labels,
                                                                 label_by_stack);
         if (!solved)
@@ -7663,6 +7712,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                                 source->pattern_filaments,
                                                                 source_surface == TopSurfaceImageSourceSurface::Bottom,
                                                                 source->surface_to_deep_layer_heights_mm,
+                                                                source->surface_to_deep_layer_ids,
                                                                 throw_if_canceled);
     }
     check_canceled(throw_if_canceled);
@@ -7740,7 +7790,7 @@ static std::shared_ptr<const TopSurfaceImageContoningStackPlan> top_surface_imag
     out->rows = rows;
     out->cells.assign(size_t(cols) * size_t(rows), TopSurfaceImageContoningStackPlanCell());
 
-    std::map<std::pair<std::vector<unsigned int>, int>, int> label_by_stack;
+    TopSurfaceImageContoningStackLabelMap label_by_stack;
 
     auto solve_cell = [&](int row, int col, const std::array<float, 3> &target_rgb, int solve_layers, int available_depth) {
         std::optional<TopSurfaceImageContoningSolvedLabel> solved =
@@ -7750,6 +7800,7 @@ static std::shared_ptr<const TopSurfaceImageContoningStackPlan> top_surface_imag
                                                                 source_surface == TopSurfaceImageSourceSurface::Bottom &&
                                                                     plan.contoning_td_adjustment_enabled,
                                                                 source_context->surface_to_deep_layer_heights_mm,
+                                                                source_context->surface_to_deep_layer_ids,
                                                                 out->labels,
                                                                 label_by_stack);
         if (!solved)
@@ -7882,6 +7933,7 @@ static std::shared_ptr<const TopSurfaceImageContoningStackPlan> top_surface_imag
                                                                 source_context->pattern_filaments,
                                                                 source_surface == TopSurfaceImageSourceSurface::Bottom,
                                                                 source_context->surface_to_deep_layer_heights_mm,
+                                                                source_context->surface_to_deep_layer_ids,
                                                                 throw_if_canceled);
     }
     for (size_t idx = 0; idx < out->cells.size(); ++idx)
@@ -8258,6 +8310,42 @@ static std::shared_ptr<const TopSurfaceImageContoningDepthRegionPlan> top_surfac
                                                                   throw_if_canceled);
     };
     return cache != nullptr ? cache->get_or_build_depth_regions(key, builder) : builder();
+}
+
+static std::string top_surface_image_contoning_nearest_measured_sample_fallback_details(
+    const std::vector<TextureMappingContoningNearestMeasuredSampleFallbackIssue> &issues)
+{
+    if (issues.empty())
+        return {};
+    std::ostringstream ss;
+    ss << "Details: ";
+    size_t emitted = 0;
+    for (const TextureMappingContoningNearestMeasuredSampleFallbackIssue &issue : issues) {
+        if (emitted >= 6)
+            break;
+        if (emitted > 0)
+            ss << "; ";
+        ss << (issue.lower_surface ? "lower surfaces" : "upper surfaces") << ": ";
+        if (issue.layer_height_mismatch) {
+            ss << "shell surface layer " << issue.shell_depth_from_surface;
+            if (issue.physical_layer > 0)
+                ss << " (physical layer " << issue.physical_layer << ")";
+            ss << " is " << std::fixed << std::setprecision(3) << issue.actual_layer_height_mm
+               << " mm, calibration expects " << std::fixed << std::setprecision(3)
+               << issue.expected_layer_height_mm << " mm";
+        } else if (issue.stack_depth_mismatch) {
+            ss << "solved stack depth " << issue.actual_stack_layers
+               << " with visible shell depth " << issue.visible_stack_layers
+               << " does not match calibration depth " << issue.expected_stack_layers;
+        } else {
+            ss << "nearest measured sample compatibility failed";
+        }
+        ++emitted;
+    }
+    if (issues.size() > emitted)
+        ss << "; plus " << (issues.size() - emitted) << " more mismatch records";
+    ss << ".";
+    return ss.str();
 }
 
 static void top_surface_image_append_contoning_slices(TopSurfaceImageRegionPlan          &plan,
@@ -8800,6 +8888,36 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
             append_contoning_surface(TopSurfaceImageSourceSurface::Top);
             if (plan.color_lower_surfaces)
                 append_contoning_surface(TopSurfaceImageSourceSurface::Bottom);
+            const bool upper_nearest_sample_fallback = contoning_solver.nearest_measured_sample_fallback_used(false);
+            const bool lower_nearest_sample_fallback = contoning_solver.nearest_measured_sample_fallback_used(true);
+            if ((upper_nearest_sample_fallback || lower_nearest_sample_fallback) && object != nullptr) {
+                const char *surface_name =
+                    upper_nearest_sample_fallback && lower_nearest_sample_fallback ?
+                        "upper and lower surfaces" :
+                        (upper_nearest_sample_fallback ? "upper surfaces" : "lower surfaces");
+                std::vector<TextureMappingContoningNearestMeasuredSampleFallbackIssue> fallback_issues;
+                if (upper_nearest_sample_fallback) {
+                    std::vector<TextureMappingContoningNearestMeasuredSampleFallbackIssue> upper_issues =
+                        contoning_solver.nearest_measured_sample_fallback_issues(false);
+                    fallback_issues.insert(fallback_issues.end(), upper_issues.begin(), upper_issues.end());
+                }
+                if (lower_nearest_sample_fallback) {
+                    std::vector<TextureMappingContoningNearestMeasuredSampleFallbackIssue> lower_issues =
+                        contoning_solver.nearest_measured_sample_fallback_issues(true);
+                    fallback_issues.insert(fallback_issues.end(), lower_issues.begin(), lower_issues.end());
+                }
+                std::string warning = Slic3r::format(
+                    L("Top-surface color prediction fell back from calibrated nearest measured sample to %1% for %2% because the current layer heights or stack depth do not match the calibration sheet."),
+                    contoning_solver.nearest_measured_sample_fallback_name(),
+                    surface_name);
+                const std::string details =
+                    top_surface_image_contoning_nearest_measured_sample_fallback_details(fallback_issues);
+                if (!details.empty())
+                    warning += " " + details;
+                object->add_slicing_warning(
+                    PrintStateBase::WarningLevel::NON_CRITICAL,
+                    warning);
+            }
         } else {
             for (int depth = 0; depth < stack_depth; ++depth) {
                 check_canceled(throw_if_canceled);

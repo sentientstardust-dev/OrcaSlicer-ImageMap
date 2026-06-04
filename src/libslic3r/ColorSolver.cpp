@@ -177,6 +177,41 @@ std::array<float, 3> eval_depth_kernel_linear_model(const std::vector<uint16_t> 
     return eval_linear_rgb_model(features, model.coefficients_linear_rgb);
 }
 
+bool eval_nearest_measured_sample_model(const std::vector<uint16_t>           &surface_to_deep,
+                                        const ColorSolverCalibratedStackModel &model,
+                                        std::array<float, 3>                 &out)
+{
+    const size_t stack_depth = size_t(std::max(0, model.measured_stack_depth));
+    const size_t sample_count = model.measured_sample_rgbs.size() / 3;
+    if (stack_depth == 0 || surface_to_deep.size() < stack_depth ||
+        model.measured_sample_rgbs.size() != sample_count * 3 ||
+        model.measured_sample_stacks.size() != sample_count * stack_depth)
+        return false;
+
+    for (size_t sample_idx = 0; sample_idx < sample_count; ++sample_idx) {
+        const size_t stack_begin = sample_idx * stack_depth;
+        bool equal = true;
+        for (size_t depth_idx = 0; depth_idx < stack_depth; ++depth_idx) {
+            if (model.measured_sample_stacks[stack_begin + depth_idx] != surface_to_deep[depth_idx]) {
+                equal = false;
+                break;
+            }
+        }
+        if (!equal)
+            continue;
+
+        const size_t rgb_begin = sample_idx * 3;
+        out = { {
+            clamp01(model.measured_sample_rgbs[rgb_begin + 0]),
+            clamp01(model.measured_sample_rgbs[rgb_begin + 1]),
+            clamp01(model.measured_sample_rgbs[rgb_begin + 2])
+        } };
+        return true;
+    }
+
+    return false;
+}
+
 bool calibrated_stack_model_valid_for_mix(const ColorSolverCalibratedStackModel *model,
                                           size_t                                component_count)
 {
@@ -907,6 +942,12 @@ std::array<float, 3> mix_ordered_stack_with_buffers(const std::vector<std::array
             return eval_alpha_effective_model(surface_to_deep, *calibrated_stack_model);
         case ColorSolverCalibratedStackModelKind::DepthKernelLinear:
             return eval_depth_kernel_linear_model(surface_to_deep, *calibrated_stack_model);
+        case ColorSolverCalibratedStackModelKind::NearestMeasuredSample: {
+            std::array<float, 3> measured { { 0.f, 0.f, 0.f } };
+            if (eval_nearest_measured_sample_model(surface_to_deep, *calibrated_stack_model, measured))
+                return measured;
+            break;
+        }
         default:
             break;
         }
@@ -1294,6 +1335,60 @@ void append_ordered_stack_candidate(ColorSolverOrderedStackCandidateSet       &c
     candidates.stacks.insert(candidates.stacks.end(), surface_to_deep.begin(), surface_to_deep.end());
 }
 
+ColorSolverOrderedStackCandidateSet build_nearest_measured_sample_candidates(
+    const ColorSolverCalibratedStackModel &model,
+    int                                    stack_depth,
+    int                                    simulated_stack_depth)
+{
+    ColorSolverOrderedStackCandidateSet candidates;
+    const int source_depth = model.measured_stack_depth;
+    const size_t sample_count = model.measured_sample_rgbs.size() / 3;
+    if (!model.valid() || stack_depth <= 0 || simulated_stack_depth <= 0 ||
+        source_depth != stack_depth ||
+        model.measured_sample_stacks.size() != sample_count * size_t(source_depth))
+        return candidates;
+
+    candidates.component_count = model.component_count;
+    candidates.stack_depth = stack_depth;
+    candidates.simulated_stack_depth = simulated_stack_depth;
+    candidates.rgbs.reserve(sample_count * 3);
+    candidates.perceptual_coords.reserve(sample_count * 3);
+    candidates.stacks.reserve(sample_count * size_t(stack_depth));
+
+    for (size_t sample_idx = 0; sample_idx < sample_count; ++sample_idx) {
+        const size_t source_stack_begin = sample_idx * size_t(source_depth);
+        bool valid_stack = true;
+        for (int depth_idx = 0; depth_idx < stack_depth; ++depth_idx) {
+            if (model.measured_sample_stacks[source_stack_begin + size_t(depth_idx)] >= model.component_count) {
+                valid_stack = false;
+                break;
+            }
+        }
+        if (!valid_stack)
+            continue;
+
+        const size_t rgb_begin = sample_idx * 3;
+        const std::array<float, 3> rgb { {
+            clamp01(model.measured_sample_rgbs[rgb_begin + 0]),
+            clamp01(model.measured_sample_rgbs[rgb_begin + 1]),
+            clamp01(model.measured_sample_rgbs[rgb_begin + 2])
+        } };
+        const std::array<float, 3> perceptual = oklab_from_srgb(rgb);
+        candidates.rgbs.emplace_back(rgb[0]);
+        candidates.rgbs.emplace_back(rgb[1]);
+        candidates.rgbs.emplace_back(rgb[2]);
+        candidates.perceptual_coords.emplace_back(perceptual[0]);
+        candidates.perceptual_coords.emplace_back(perceptual[1]);
+        candidates.perceptual_coords.emplace_back(perceptual[2]);
+        candidates.stacks.insert(candidates.stacks.end(),
+                                 model.measured_sample_stacks.begin() + source_stack_begin,
+                                 model.measured_sample_stacks.begin() + source_stack_begin + size_t(stack_depth));
+    }
+
+    build_color_solver_kd_trees(candidates);
+    return candidates;
+}
+
 } // namespace
 
 ColorSolverMixModel color_solver_mix_model_from_index(int model)
@@ -1324,6 +1419,16 @@ bool ColorSolverCalibratedStackModel::valid() const
         return component_count > 0 &&
                !taus.empty() &&
                coefficients_linear_rgb.size() == (1 + component_count + component_count * taus.size()) * 3;
+    case ColorSolverCalibratedStackModelKind::NearestMeasuredSample: {
+        const size_t stack_depth = size_t(std::max(0, measured_stack_depth));
+        const size_t sample_count = measured_sample_rgbs.size() / 3;
+        return component_count > 0 &&
+               stack_depth > 0 &&
+               sample_count > 0 &&
+               measured_layer_heights_mm.size() >= stack_depth &&
+               measured_sample_rgbs.size() == sample_count * 3 &&
+               measured_sample_stacks.size() == sample_count * stack_depth;
+    }
     default:
         return false;
     }
@@ -1333,6 +1438,8 @@ std::string ColorSolverCalibratedStackModel::cache_key() const
 {
     if (!valid())
         return std::string();
+    if (!cached_key.empty())
+        return cached_key;
     std::ostringstream key;
     key << "cal" << int(kind) << "n" << component_count;
     auto append_values = [&key](const char *label, const std::vector<float> &values) {
@@ -1342,10 +1449,44 @@ std::string ColorSolverCalibratedStackModel::cache_key() const
             key << ',' << int(std::lround(safe * 1000000.f));
         }
     };
+    auto mix_hash = [](uint64_t &hash, uint64_t value) {
+        hash ^= value;
+        hash *= 1099511628211ull;
+    };
+    auto vector_signature = [&mix_hash](const std::vector<float> &float_values, const std::vector<uint16_t> &stack_values) {
+        uint64_t hash = 1469598103934665603ull;
+        for (float value : float_values) {
+            const float safe = std::isfinite(value) ? std::clamp(value, -1000.f, 1000.f) : 0.f;
+            mix_hash(hash, uint64_t(int64_t(std::lround(safe * 1000000.f))));
+        }
+        for (uint16_t value : stack_values)
+            mix_hash(hash, uint64_t(value));
+        return hash;
+    };
+    if (kind == ColorSolverCalibratedStackModelKind::NearestMeasuredSample) {
+        std::vector<float> signature_values;
+        signature_values.reserve(measured_layer_heights_mm.size() + measured_sample_rgbs.size());
+        signature_values.insert(signature_values.end(), measured_layer_heights_mm.begin(), measured_layer_heights_mm.end());
+        signature_values.insert(signature_values.end(), measured_sample_rgbs.begin(), measured_sample_rgbs.end());
+        key << "|msd" << measured_stack_depth;
+        key << "|samples" << (measured_sample_rgbs.size() / 3);
+        key << "|sig" << vector_signature(signature_values, measured_sample_stacks);
+        cached_key = key.str();
+        return cached_key;
+    }
     append_values("a", alphas);
     append_values("t", taus);
     append_values("w", coefficients_linear_rgb);
-    return key.str();
+    append_values("mlh", measured_layer_heights_mm);
+    append_values("mrgb", measured_sample_rgbs);
+    key << "|msd" << measured_stack_depth;
+    if (!measured_sample_stacks.empty()) {
+        key << "|mst";
+        for (uint16_t component_idx : measured_sample_stacks)
+            key << ',' << int(component_idx);
+    }
+    cached_key = key.str();
+    return cached_key;
 }
 
 int color_solver_total_units_for_component_count(size_t component_count)
@@ -1563,6 +1704,17 @@ std::string color_solver_ordered_stack_candidate_cache_key(const std::vector<std
                                                            const ColorSolverCalibratedStackModel     *calibrated_stack_model,
                                                            bool                                      adaptive_spectral_correction)
 {
+    if (calibrated_stack_model != nullptr &&
+        calibrated_stack_model->valid() &&
+        calibrated_stack_model->kind == ColorSolverCalibratedStackModelKind::NearestMeasuredSample) {
+        std::ostringstream key;
+        key << "nearest_measured_sample";
+        key << "|sd" << stack_depth;
+        key << "|vd" << simulated_stack_depth;
+        key << '|' << calibrated_stack_model->cache_key();
+        return key.str();
+    }
+
     std::ostringstream key;
     key << component_colors.size();
     key << "|mx" << mix_model_index(mix_model);
@@ -1639,6 +1791,11 @@ ColorSolverOrderedStackCandidateSet build_color_solver_ordered_stack_candidates(
 {
     ColorSolverOrderedStackCandidateSet candidates;
     int simulated_depth = simulated_stack_depth > 0 ? simulated_stack_depth : stack_depth;
+    if (calibrated_stack_model != nullptr &&
+        calibrated_stack_model->valid() &&
+        calibrated_stack_model->kind == ColorSolverCalibratedStackModelKind::NearestMeasuredSample)
+        return build_nearest_measured_sample_candidates(*calibrated_stack_model, stack_depth, simulated_depth);
+
     if (component_colors.empty() || stack_depth <= 0 || simulated_depth <= 0 ||
         component_colors.size() > size_t(std::numeric_limits<uint16_t>::max()))
         return candidates;
