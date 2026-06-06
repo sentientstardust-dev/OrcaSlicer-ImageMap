@@ -14,7 +14,7 @@
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/TextureMapping.hpp"
 #include "libslic3r/TextureMappingContoning.hpp"
-#include "libslic3r/ColorSolver.hpp"
+#include "ColorSolver.hpp"
 
 #include <algorithm>
 #include <cmath>

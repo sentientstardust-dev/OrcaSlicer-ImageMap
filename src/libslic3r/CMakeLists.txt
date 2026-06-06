@@ -148,8 +148,6 @@ set(lisbslic3r_sources
     Feature/Interlocking/VoxelUtils.cpp
     Feature/Interlocking/VoxelUtils.hpp
     FileParserError.hpp
-    ColorSolver.cpp
-    ColorSolver.hpp
     Fill/Fill3DHoneycomb.cpp
     Fill/Fill3DHoneycomb.hpp
     Fill/FillAdaptive.cpp
@@ -608,8 +606,7 @@ target_link_libraries(libslic3r
         libnest2d
         miniz
         opencv_world
-        pigment_painter
-        prusa_fdm_mixer
+        colorsolver
     PRIVATE
         ${CMAKE_DL_LIBS}
         ${EXPAT_LIBRARIES}

@@ -15,7 +15,7 @@
 
 #include "libslic3r/Point.hpp"
 #include "libslic3r/Polygon.hpp"
-#include "libslic3r/ColorSolver.hpp"
+#include "ColorSolver.hpp"
 #include "libslic3r/TextureMapping.hpp"
 #include "libslic3r/Polyline.hpp"
 #include "libslic3r/TriangleMesh.hpp"

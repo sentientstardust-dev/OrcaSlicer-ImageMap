@@ -1630,11 +1630,14 @@ std::vector<float> component_weights_for_sample(const WeightedTextureSample &sam
                                                 float contrast_factor,
                                                 float tone_gamma,
                                                 const std::vector<std::array<float, 3>> &component_colors,
-                                                const ColorSolverCandidateSet *generic_mix_candidates)
+                                                const ColorSolverCandidateSet *generic_mix_candidates,
+                                                const ColorSolverCandidateSet *calibrated_side_candidates)
 {
     std::vector<float> desired(component_count, 0.f);
     size_t mapped_component_count = component_count;
     const bool has_raw_component_weights = sample.raw_component_weights.size() == component_count;
+    const bool has_calibrated_side_candidates =
+        calibrated_side_candidates != nullptr && !calibrated_side_candidates->empty();
     const int effective_solver_mode = TextureMappingZone::effective_generic_solver_mode(generic_solver_mode);
     if (has_raw_component_weights) {
         float raw_activity = 0.f;
@@ -1662,6 +1665,14 @@ std::vector<float> component_weights_for_sample(const WeightedTextureSample &sam
             for (size_t channel_idx = 0; channel_idx < channel_count; ++channel_idx)
                 desired[channel_idx] = clamp01f(channels[channel_idx]);
             mapped_component_count = channel_count;
+        } else if (has_calibrated_side_candidates) {
+            std::vector<float> calibrated =
+                solve_color_solver_weights_for_target(*calibrated_side_candidates,
+                                                      target,
+                                                      ColorSolverLookupMode::ClosestMix,
+                                                      color_solver_mode_from_index(effective_solver_mode));
+            if (calibrated.size() == component_count)
+                desired = std::move(calibrated);
         } else {
             std::vector<float> optimized;
             if (!use_fixed_color_generic_solver)
@@ -1684,7 +1695,7 @@ std::vector<float> component_weights_for_sample(const WeightedTextureSample &sam
         }
     }
 
-    if (!has_raw_component_weights && std::abs(contrast_factor - 1.f) > 1e-5f)
+    if (!has_raw_component_weights && !has_calibrated_side_candidates && std::abs(contrast_factor - 1.f) > 1e-5f)
         apply_texture_contrast_to_components(desired, contrast_factor, mapped_component_count);
     for (float &v : desired)
         v = clamp01f(v);
@@ -1717,6 +1728,7 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
                                                                           bool                      high_speed_image_texture_sampling,
                                                                           std::optional<float>      texture_sample_pitch_mm_override,
                                                                           std::optional<std::array<float, 4>> image_background_rgba_override,
+                                                                          const ColorSolverCandidateSet *calibrated_side_candidates,
                                                                           std::optional<int> raw_top_surface_depth_override)
 {
     TextureMappingOffsetWeightField weight_field;
@@ -2099,8 +2111,11 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
                    int(TextureMappingZone::DitheringClosest),
                    int(TextureMappingZone::DitheringHalftoneV2));
     std::vector<uint32_t> binary_dither_masks;
+    const bool has_calibrated_side_candidates =
+        calibrated_side_candidates != nullptr && !calibrated_side_candidates->empty();
     const bool can_binary_dither =
         dithering_enabled &&
+        !has_calibrated_side_candidates &&
         !raw_values_mode &&
         !is_halftone_dithering_method(clamped_binary_dither_method) &&
         component_count > 0 &&
@@ -2245,7 +2260,7 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
         use_fixed_color_generic_solver ? fixed_colors : component_colors;
     ColorSolverCandidateSet candidates;
     const ColorSolverCandidateSet *candidate_ptr = nullptr;
-    if (!raw_values_mode) {
+    if (!raw_values_mode && !has_calibrated_side_candidates) {
         candidates = build_color_solver_candidates(solver_colors, color_solver_mix_model_from_index(generic_solver_mix_model));
         candidate_ptr = candidates.empty() ? nullptr : &candidates;
     }
@@ -2301,7 +2316,8 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
                                                    contrast_factor,
                                                    tone_gamma,
                                                    component_colors,
-                                                   candidate_ptr);
+                                                   candidate_ptr,
+                                                   calibrated_side_candidates);
         }
         for (size_t component_idx = 0; component_idx < component_count; ++component_idx) {
             const float v = component_idx < desired.size() ? clamp01f(desired[component_idx]) : 0.f;
@@ -2669,8 +2685,10 @@ TransmissionDistanceCalibrationContext transmission_distance_calibration_context
     TransmissionDistanceCalibrationContext context;
     context.mode = std::clamp(zone.transmission_distance_calibration_mode,
                               int(TextureMappingZone::TDCalibrationNone),
-                              int(TextureMappingZone::TDCalibrationNeighbor));
-    if (context.mode == int(TextureMappingZone::TDCalibrationNone) || component_ids.empty())
+                              int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample));
+    if (context.mode == int(TextureMappingZone::TDCalibrationNone) ||
+        context.mode == int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample) ||
+        component_ids.empty())
         return context;
 
     std::vector<float> explicit_tds(component_ids.size(), 0.f);
@@ -3609,13 +3627,36 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
                                                   TextureMappingZone::MaxHalftoneDotSizeMm);
     const bool high_resolution_texture_sampling = zone.high_resolution_sampling || dithering_enabled;
     const bool compact_offset_mode = halftone_dithering_enabled ? false : zone.compact_offset_mode || dithering_enabled;
+    const bool calibrated_side_mode =
+        vertex_color_match_mode &&
+        !raw_texture_mapping_mode &&
+        zone.transmission_distance_calibration_mode == int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample);
     std::vector<float> component_strength_factors;
     component_strength_factors.reserve(component_ids.size());
     std::vector<float> component_minimum_offset_factors;
     component_minimum_offset_factors.reserve(component_ids.size());
     for (const unsigned int id : component_ids) {
-        component_strength_factors.emplace_back(texture_mapping_offset_filament_strength_factor(zone, id));
-        component_minimum_offset_factors.emplace_back(texture_mapping_offset_filament_minimum_offset_factor(zone, id));
+        component_strength_factors.emplace_back(calibrated_side_mode ? 1.f : texture_mapping_offset_filament_strength_factor(zone, id));
+        component_minimum_offset_factors.emplace_back(calibrated_side_mode ? 0.f : texture_mapping_offset_filament_minimum_offset_factor(zone, id));
+    }
+    std::vector<float> component_transmission_distances_mm;
+    component_transmission_distances_mm.reserve(component_ids.size());
+    for (const unsigned int id : component_ids) {
+        const size_t idx = id > 0 ? size_t(id - 1) : size_t(-1);
+        const float value = idx < zone.filament_transmission_distances_mm.size() ?
+            zone.filament_transmission_distances_mm[idx] :
+            0.f;
+        component_transmission_distances_mm.emplace_back(std::isfinite(value) && value > 0.f ? std::clamp(value, 0.01f, 50.f) : 0.f);
+    }
+    std::optional<ColorSolverCandidateSet> calibrated_side_candidates;
+    const ColorSolverCandidateSet *calibrated_side_candidates_ptr = nullptr;
+    if (calibrated_side_mode) {
+        calibrated_side_candidates =
+            texture_mapping_side_surface_color_calibrated_candidates(zone,
+                                                                     component_colors,
+                                                                     component_transmission_distances_mm);
+        if (calibrated_side_candidates && !calibrated_side_candidates->empty())
+            calibrated_side_candidates_ptr = &*calibrated_side_candidates;
     }
 
     TextureMappingOffsetWeightField weight_field;
@@ -3632,7 +3673,8 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
                                                                  component_minimum_offset_factors, texture_contrast_pct, texture_tone_gamma,
                                                                  sample_z_mm, layer_sample_falloff_mm, high_resolution_texture_sampling,
                                                                  zone.high_speed_image_texture_sampling, texture_sample_pitch_mm_override,
-                                                                 image_background_rgba_override, raw_top_surface_depth_override);
+                                                                 image_background_rgba_override, calibrated_side_candidates_ptr,
+                                                                 raw_top_surface_depth_override);
         if (weight_field.empty())
             return std::nullopt;
     }
@@ -3734,11 +3776,11 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     context.active_halftone_angle_deg = halftone_screen_angle_deg(filament_color_mode, active_component_idx);
     context.active_component_strength_factor = linear_gradient_mode ?
         1.f :
-        texture_mapping_offset_filament_strength_factor(zone, active_component_id);
+        (calibrated_side_mode ? 1.f : texture_mapping_offset_filament_strength_factor(zone, active_component_id));
     context.active_component_minimum_offset_factor = linear_gradient_mode ?
         0.f :
-        texture_mapping_offset_filament_minimum_offset_factor(zone, active_component_id);
-    context.active_component_td_width_factor = linear_gradient_mode ?
+        (calibrated_side_mode ? 0.f : texture_mapping_offset_filament_minimum_offset_factor(zone, active_component_id));
+    context.active_component_td_width_factor = linear_gradient_mode || calibrated_side_mode ?
         1.f :
         transmission_distance_width_factor(td_calibration_context, active_component_idx, previous_component_idx);
     context.base_outer_width_mm = base_outer_width_mm;

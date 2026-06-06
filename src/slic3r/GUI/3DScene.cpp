@@ -11,7 +11,7 @@
 
 #include "libslic3r/BuildVolume.hpp"
 #include "libslic3r/Color.hpp"
-#include "libslic3r/ColorSolver.hpp"
+#include "ColorSolver.hpp"
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/ExtrusionEntityCollection.hpp"
 #include "libslic3r/Geometry.hpp"

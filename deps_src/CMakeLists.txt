@@ -31,6 +31,7 @@ add_subdirectory(miniz)
 add_subdirectory(minilzo)
 add_subdirectory(pigment-painter)
 add_subdirectory(prusa-fdm-mixer)
+add_subdirectory(colorsolver)
 add_subdirectory(qhull)
 add_subdirectory(qoi)
 add_subdirectory(semver)      # Semver static library

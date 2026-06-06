@@ -16,7 +16,7 @@
 #endif
 #include "../ClipperUtils.hpp"
 #include "../Color.hpp"
-#include "../ColorSolver.hpp"
+#include "ColorSolver.hpp"
 #include "../Geometry.hpp"
 #include "../Layer.hpp"
 #include "../MarchingSquares.hpp"
@@ -12418,8 +12418,8 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree,
                 FillParams fallback_params = params;
                 fallback_params.flow = fallback_flow;
                 fallback_params.pattern = ipRectilinear;
-                fallback_params.no_edge_overlap =
-                    !surface_fill.params.texture_mapping_top_surface_contoning_partition_color_regions;
+                fallback_params.no_edge_overlap = true;
+                fallback_params.edge_overlap_width_factor = 0.5f;
                 ExtrusionEntitiesPtr hybrid_interior_entities;
                 if (!hybrid_boundary_skin && collection && !collection->empty()) {
                     apply_top_surface_image_collection_metadata(*collection, surface_fill.params, std::nullopt, throw_if_canceled_ptr);

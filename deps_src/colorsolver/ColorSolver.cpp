@@ -1637,6 +1637,11 @@ ColorSolverCandidateSet build_color_solver_candidates(const std::vector<std::arr
     return candidates;
 }
 
+void build_color_solver_candidate_kd_trees(ColorSolverCandidateSet &candidates)
+{
+    build_color_solver_kd_trees(candidates);
+}
+
 const ColorSolverCandidateSet &color_solver_candidates(ColorSolverCandidateCache                &cache,
                                                        const std::vector<std::array<float, 3>> &component_colors,
                                                        ColorSolverMixModel                       mix_model,

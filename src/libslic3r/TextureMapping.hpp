@@ -154,7 +154,8 @@ struct TextureMappingZone
     enum TransmissionDistanceCalibrationMode : uint8_t {
         TDCalibrationNone = 0,
         TDCalibrationAbsolute = 1,
-        TDCalibrationNeighbor = 2
+        TDCalibrationNeighbor = 2,
+        TDCalibrationCalibratedNearestMeasuredSample = 3
     };
 
     static constexpr int   DefaultSurfacePattern = int(ImageTexture);
@@ -518,6 +519,8 @@ struct TextureMappingZone
     bool        top_surface_contoning_beam_search_stack_expansion_enabled = DefaultTopSurfaceContoningBeamSearchStackExpansionEnabled;
     std::string top_surface_color_calibration_name;
     std::string top_surface_color_calibration_json;
+    std::string side_surface_color_calibration_name;
+    std::string side_surface_color_calibration_json;
     bool        compact_offset_mode = DefaultCompactOffsetMode;
     bool        use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
     bool        high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;
@@ -823,6 +826,8 @@ struct TextureMappingZone
         top_surface_contoning_beam_search_stack_expansion_enabled = DefaultTopSurfaceContoningBeamSearchStackExpansionEnabled;
         top_surface_color_calibration_name.clear();
         top_surface_color_calibration_json.clear();
+        side_surface_color_calibration_name.clear();
+        side_surface_color_calibration_json.clear();
         compact_offset_mode = DefaultCompactOffsetMode;
         use_legacy_fixed_color_mode = DefaultUseLegacyFixedColorMode;
         high_speed_image_texture_sampling = DefaultHighSpeedImageTextureSampling;
@@ -893,21 +898,46 @@ struct TextureMappingColorCalibration {
     bool has_mode(int mode) const;
 };
 
+struct TextureMappingSideSurfaceColorCalibration {
+    std::string display_name;
+    std::vector<TextureMappingColorCalibrationFilament> filaments;
+    ColorSolverCandidateSet nearest_measured_sample;
+
+    bool has_nearest_measured_sample() const;
+};
+
 std::optional<TextureMappingColorCalibration> texture_mapping_parse_top_surface_color_calibration(
+    const std::string &json_text,
+    std::string       *error = nullptr);
+std::optional<TextureMappingSideSurfaceColorCalibration> texture_mapping_parse_side_surface_color_calibration(
     const std::string &json_text,
     std::string       *error = nullptr);
 std::vector<int> texture_mapping_top_surface_color_calibration_supported_modes(const std::string &json_text);
 int texture_mapping_top_surface_color_calibration_first_supported_mode(const std::string &json_text);
 std::string texture_mapping_top_surface_color_calibration_display_name(const std::string &json_text);
+std::string texture_mapping_side_surface_color_calibration_display_name(const std::string &json_text);
 std::string texture_mapping_top_surface_color_calibration_warning(const TextureMappingZone                  &zone,
                                                                   const std::vector<std::array<float, 3>> &component_colors,
                                                                   const std::vector<float>                &component_tds_mm);
+std::string texture_mapping_side_surface_color_calibration_warning(const TextureMappingZone                  &zone,
+                                                                   const std::vector<std::array<float, 3>> &component_colors,
+                                                                   const std::vector<float>                &component_tds_mm);
 std::optional<ColorSolverCalibratedStackModel> texture_mapping_top_surface_color_calibrated_model(
     const TextureMappingZone                  &zone,
     int                                        mode,
     const std::vector<std::array<float, 3>>   &component_colors,
     const std::vector<float>                  &component_tds_mm,
     std::string                               *warning = nullptr);
+std::optional<ColorSolverCandidateSet> texture_mapping_side_surface_color_calibrated_candidates(
+    const TextureMappingZone                  &zone,
+    const std::vector<std::array<float, 3>>   &component_colors,
+    const std::vector<float>                  &component_tds_mm,
+    std::string                               *warning = nullptr);
+std::vector<float> texture_mapping_calibration_component_transmission_distances(
+    const std::vector<TextureMappingColorCalibrationFilament> &filaments,
+    const std::vector<std::array<float, 3>>                   &component_colors,
+    const std::vector<float>                                  &component_tds_mm,
+    int                                                        filament_color_mode);
 
 struct TextureMappingPrimeTowerImage
 {

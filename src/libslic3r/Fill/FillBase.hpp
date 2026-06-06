@@ -98,6 +98,7 @@ struct FillParams
     bool            dont_sort{ false }; // do not sort the lines, just simply connect them
     bool            can_reverse{true};
     bool            no_edge_overlap{false};
+    float           edge_overlap_width_factor{1.0f};
 
     float           horiz_move{0.0}; //move infill to get cross zag pattern
     bool            symmetric_infill_y_axis{false};

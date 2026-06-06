@@ -6122,8 +6122,10 @@ static TransmissionDistanceCalibrationContextForGCode transmission_distance_cali
     TransmissionDistanceCalibrationContextForGCode context;
     context.mode = std::clamp(zone.transmission_distance_calibration_mode,
                               int(TextureMappingZone::TDCalibrationNone),
-                              int(TextureMappingZone::TDCalibrationNeighbor));
-    if (context.mode == int(TextureMappingZone::TDCalibrationNone) || component_ids.empty())
+                              int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample));
+    if (context.mode == int(TextureMappingZone::TDCalibrationNone) ||
+        context.mode == int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample) ||
+        component_ids.empty())
         return context;
 
     std::vector<float> explicit_tds(component_ids.size(), 0.f);
@@ -8272,6 +8274,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                                                                                 float                                     halftone_dot_size_mm,
                                                                                 const std::vector<float>                 &component_strength_factors,
                                                                                 const std::vector<float>                 &component_minimum_offset_factors,
+                                                                                const GCodeGenericMixCandidateSet        *calibrated_side_candidates,
                                                                                 std::map<std::string, GCodeGenericMixCandidateSet> *generic_mix_candidate_cache,
                                                                                 std::map<const PrintObject*, GCodeUVTextureTriangleCache> *uv_texture_triangle_cache,
                                                                                 float                                     texture_contrast_pct,
@@ -8800,8 +8803,11 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                    int(TextureMappingZone::DitheringClosest),
                    int(TextureMappingZone::DitheringHalftoneV2));
     std::vector<uint32_t> binary_dither_masks;
+    const bool has_calibrated_side_candidates =
+        calibrated_side_candidates != nullptr && !calibrated_side_candidates->empty();
     const bool can_binary_dither =
         dithering_enabled &&
+        !has_calibrated_side_candidates &&
         !raw_values_mode &&
         !is_halftone_dithering_method_for_gcode(clamped_binary_dither_method) &&
         component_count > 0 &&
@@ -8958,7 +8964,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
     const size_t sample_count = samples.size();
     GCodeGenericMixCandidateSet local_generic_mix_candidates;
     const GCodeGenericMixCandidateSet *generic_mix_candidates = nullptr;
-    if (!raw_values_mode) {
+    if (!raw_values_mode && !has_calibrated_side_candidates) {
         std::vector<float> optimized_probe;
         if (!use_fixed_color_generic_solver) {
             const std::array<float, 3> probe_target { 0.f, 0.f, 0.f };
@@ -9038,6 +9044,14 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                 for (size_t channel_idx = 0; channel_idx < channel_count; ++channel_idx)
                     desired[channel_idx] = clamp01f_for_gcode(channels[channel_idx]);
                 mapped_component_count = channel_count;
+            } else if (has_calibrated_side_candidates) {
+                std::vector<float> calibrated =
+                    best_component_mix_weights_for_target_for_gcode(*calibrated_side_candidates,
+                                                                    target,
+                                                                    int(TextureMappingZone::GenericSolverClosestMix),
+                                                                    effective_solver_mode);
+                if (calibrated.size() == component_count)
+                    desired = std::move(calibrated);
             } else {
                 std::vector<float> optimized;
                 if (!use_fixed_color_generic_solver)
@@ -9061,7 +9075,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
             }
         }
 
-        if (!has_binary_dither && !has_raw_component_weights && std::abs(contrast_factor - 1.f) > 1e-5f)
+        if (!has_binary_dither && !has_raw_component_weights && !has_calibrated_side_candidates && std::abs(contrast_factor - 1.f) > 1e-5f)
             apply_texture_contrast_to_mapped_components_for_gcode(desired, contrast_factor, mapped_component_count);
 
         for (size_t component_idx = 0; component_idx < component_count; ++component_idx) {
@@ -9550,9 +9564,18 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
             std::clamp(zone->tone_gamma, 0.5f, 3.f);
     const bool high_resolution_texture_sampling = zone->high_resolution_sampling || dithering_enabled;
     const bool high_speed_image_texture_sampling = zone->high_speed_image_texture_sampling;
-    const std::vector<float> component_strength_factors = overhang_component_strength_factors_for_gcode(*zone, component_ids);
-    const std::vector<float> component_minimum_offset_factors =
-        overhang_component_minimum_offset_factors_for_gcode(*zone, component_ids);
+    const bool calibrated_side_mode =
+        vertex_color_match_mode &&
+        !raw_texture_mapping_mode &&
+        zone->transmission_distance_calibration_mode == int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample);
+    std::vector<float> component_strength_factors;
+    component_strength_factors.reserve(component_ids.size());
+    std::vector<float> component_minimum_offset_factors;
+    component_minimum_offset_factors.reserve(component_ids.size());
+    for (const unsigned int id : component_ids) {
+        component_strength_factors.emplace_back(calibrated_side_mode ? 1.f : overhang_filament_strength_factor_for_gcode(*zone, id));
+        component_minimum_offset_factors.emplace_back(calibrated_side_mode ? 0.f : overhang_filament_minimum_offset_factor_for_gcode(*zone, id));
+    }
 
     std::vector<std::array<float, 3>> component_colors;
     component_colors.reserve(component_ids.size());
@@ -9578,6 +9601,26 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
     if (vertex_color_match_mode &&
         (missing_component_color || component_colors.size() != component_ids.size() || component_colors.empty()))
         return std::nullopt;
+
+    std::vector<float> component_transmission_distances_mm;
+    component_transmission_distances_mm.reserve(component_ids.size());
+    for (const unsigned int id : component_ids) {
+        const size_t idx = id > 0 ? size_t(id - 1) : size_t(-1);
+        const float value = idx < zone->filament_transmission_distances_mm.size() ?
+            zone->filament_transmission_distances_mm[idx] :
+            0.f;
+        component_transmission_distances_mm.emplace_back(std::isfinite(value) && value > 0.f ? std::clamp(value, 0.01f, 50.f) : 0.f);
+    }
+    std::optional<GCodeGenericMixCandidateSet> calibrated_side_candidates;
+    const GCodeGenericMixCandidateSet *calibrated_side_candidates_ptr = nullptr;
+    if (calibrated_side_mode) {
+        calibrated_side_candidates =
+            texture_mapping_side_surface_color_calibrated_candidates(*zone,
+                                                                     component_colors,
+                                                                     component_transmission_distances_mm);
+        if (calibrated_side_candidates && !calibrated_side_candidates->empty())
+            calibrated_side_candidates_ptr = &*calibrated_side_candidates;
+    }
 
     const TransmissionDistanceCalibrationContextForGCode td_calibration_context =
         transmission_distance_calibration_context_for_gcode(*zone,
@@ -9613,6 +9656,8 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
     component_key_stream << "|tg" << int(std::lround(texture_tone_gamma * 100.f));
     component_key_stream << "|hr" << (high_resolution_texture_sampling ? 1 : 0);
     component_key_stream << "|hs" << (high_speed_image_texture_sampling ? 1 : 0);
+    if (calibrated_side_mode)
+        component_key_stream << "|sc" << std::hash<std::string>{}(zone->side_surface_color_calibration_json);
     const std::string component_key_prefix = component_key_stream.str();
 
     struct SeamLayerTextureState {
@@ -9683,6 +9728,7 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
                                                                                   halftone_dot_size_mm,
                                                                                   component_strength_factors,
                                                                                   component_minimum_offset_factors,
+                                                                                  calibrated_side_candidates_ptr,
                                                                                   &m_generic_solver_mix_candidate_cache,
                                                                                   &m_uv_texture_triangle_cache,
                                                                                   texture_contrast_pct,
@@ -9712,9 +9758,9 @@ std::optional<PreferredSeamPoint> GCode::texture_mapping_seam_hiding_hint(const 
             active_component_id,
             active_component_idx,
             weight_field,
-            texture_mapping_offset_filament_strength_factor(*zone, active_component_id),
-            texture_mapping_offset_filament_minimum_offset_factor(*zone, active_component_id),
-            transmission_distance_width_factor_for_gcode(td_calibration_context, active_component_idx, previous_component_idx),
+            calibrated_side_mode ? 1.f : texture_mapping_offset_filament_strength_factor(*zone, active_component_id),
+            calibrated_side_mode ? 0.f : texture_mapping_offset_filament_minimum_offset_factor(*zone, active_component_id),
+            calibrated_side_mode ? 1.f : transmission_distance_width_factor_for_gcode(td_calibration_context, active_component_idx, previous_component_idx),
             signed_fade_factor,
             fade_factor
         };

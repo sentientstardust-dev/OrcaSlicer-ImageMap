@@ -73,7 +73,7 @@
 #include "libslic3r/Format/STL.hpp"
 #include "libslic3r/Format/DRC.hpp"
 #include "libslic3r/Format/STEP.hpp"
-#include "libslic3r/ColorSolver.hpp"
+#include "ColorSolver.hpp"
 #include "libslic3r/Format/AMF.hpp"
 //#include "libslic3r/Format/3mf.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
@@ -2550,6 +2550,8 @@ public:
                                         bool top_surface_contoning_variable_layer_height_compensation_enabled,
                                         const std::string &top_surface_color_calibration_name,
                                         const std::string &top_surface_color_calibration_json,
+                                        const std::string &side_surface_color_calibration_name,
+                                        const std::string &side_surface_color_calibration_json,
                                         std::function<bool(const std::vector<std::string>&)> apply_filament_colors,
                                         const TextureMappingZoneShellUsageSummary &top_surface_contoning_shell_usage,
                                         const TextureMappingManager &texture_mapping_zones,
@@ -2569,6 +2571,8 @@ public:
         , m_apply_filament_colors(std::move(apply_filament_colors))
         , m_top_surface_color_calibration_name(top_surface_color_calibration_name)
         , m_top_surface_color_calibration_json(top_surface_color_calibration_json)
+        , m_side_surface_color_calibration_name(side_surface_color_calibration_name)
+        , m_side_surface_color_calibration_json(side_surface_color_calibration_json)
     {
         (void) reduce_outer_surface_texture;
         (void) top_surface_contoning_min_feature_mm;
@@ -2671,20 +2675,24 @@ public:
 
         auto *td_box = new wxStaticBoxSizer(wxVERTICAL, filament_page, _L("Transmission distance"));
         auto *td_mode_row = new wxBoxSizer(wxHORIZONTAL);
-        td_mode_row->Add(new wxStaticText(filament_page, wxID_ANY, _L("TD calibration mode")),
+        td_mode_row->Add(new wxStaticText(filament_page, wxID_ANY, _L("Side calibration mode")),
                          0,
                          wxALIGN_CENTER_VERTICAL | wxRIGHT,
                          gap);
         wxArrayString td_mode_choices;
         td_mode_choices.Add(_L("None"));
-        td_mode_choices.Add(_L("Absolute"));
-        td_mode_choices.Add(_L("Neighbor"));
+        td_mode_choices.Add(_L("Absolute TD"));
+        td_mode_choices.Add(_L("Neighbour TD"));
+        td_mode_choices.Add(_L("Calibrated: nearest measured sample"));
         m_transmission_distance_calibration_mode_choice =
             new wxChoice(filament_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, td_mode_choices);
         m_transmission_distance_calibration_mode_choice->SetSelection(
             std::clamp(transmission_distance_calibration_mode,
                        int(TextureMappingZone::TDCalibrationNone),
-                       int(TextureMappingZone::TDCalibrationNeighbor)));
+                       int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample)));
+        m_transmission_distance_calibration_mode_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) {
+            update_strength_offsets_visibility(true);
+        });
         td_mode_row->Add(m_transmission_distance_calibration_mode_choice, 1, wxALIGN_CENTER_VERTICAL);
         td_box->Add(td_mode_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
         for (size_t i = 0; i < component_ids.size(); ++i) {
@@ -2710,6 +2718,36 @@ public:
             td_box->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
         }
         filament_root->Add(td_box, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+
+        auto add_filament_calibration_row = [this, filament_page, filament_root, gap](const wxString &title,
+                                                                                      wxStaticText **label_out,
+                                                                                      std::function<void()> load_fn,
+                                                                                      std::function<void()> clear_fn) {
+            auto *row = new wxBoxSizer(wxHORIZONTAL);
+            row->Add(new wxStaticText(filament_page, wxID_ANY, title),
+                     0,
+                     wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                     gap);
+            auto *label = new wxStaticText(filament_page, wxID_ANY, wxEmptyString);
+            row->Add(label, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
+            auto *load_button = new wxButton(filament_page, wxID_ANY, _L("Load..."));
+            auto *clear_button = new wxButton(filament_page, wxID_ANY, _L("Clear"));
+            row->Add(load_button, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, std::max(FromDIP(2), gap / 2));
+            row->Add(clear_button, 0, wxALIGN_CENTER_VERTICAL);
+            load_button->Bind(wxEVT_BUTTON, [load_fn](wxCommandEvent &) { load_fn(); });
+            clear_button->Bind(wxEVT_BUTTON, [clear_fn](wxCommandEvent &) { clear_fn(); });
+            if (label_out != nullptr)
+                *label_out = label;
+            filament_root->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        };
+        add_filament_calibration_row(_L("Top Calibration"),
+                                     &m_filament_top_surface_color_calibration_label,
+                                     [this]() { load_top_surface_color_calibration(); },
+                                     [this]() { clear_top_surface_color_calibration(); });
+        add_filament_calibration_row(_L("Side Calibration"),
+                                     &m_side_surface_color_calibration_label,
+                                     [this]() { load_side_surface_color_calibration(); },
+                                     [this]() { clear_side_surface_color_calibration(); });
 
         m_strength_offsets_toggle_button = new wxButton(filament_page, wxID_ANY, wxEmptyString);
         m_strength_offsets_toggle_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
@@ -2763,9 +2801,9 @@ public:
         }
         strength_offsets_root->Add(minimum_offsets_box, 0, wxEXPAND | wxBOTTOM, gap);
         strength_offsets_root->Add(strengths_box, 0, wxEXPAND | wxBOTTOM, gap);
-        auto *reset_btn = new wxButton(m_strength_offsets_panel, wxID_ANY, _L("Reset strengths and offsets"));
-        reset_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { reset_strengths_and_offsets(); });
-        strength_offsets_root->Add(reset_btn, 0, wxALIGN_RIGHT | wxBOTTOM, gap);
+        m_strength_offsets_reset_button = new wxButton(m_strength_offsets_panel, wxID_ANY, _L("Reset strengths and offsets"));
+        m_strength_offsets_reset_button->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { reset_strengths_and_offsets(); });
+        strength_offsets_root->Add(m_strength_offsets_reset_button, 0, wxALIGN_RIGHT | wxBOTTOM, gap);
         filament_root->Add(m_strength_offsets_panel, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
         update_strength_offsets_visibility(false);
 
@@ -3324,6 +3362,7 @@ public:
             new wxChoice(m_top_surface_contoning_checkboxes_panel, wxID_ANY);
         rebuild_top_surface_contoning_color_prediction_choices(top_surface_contoning_color_prediction_mode);
         update_top_surface_color_calibration_label();
+        update_side_surface_color_calibration_label();
         contoning_td_correction_row->Add(m_top_surface_contoning_td_correction_choice, 1, wxALIGN_CENTER_VERTICAL);
         contoning_checkboxes_root->Add(contoning_td_correction_row, 0, wxEXPAND | wxTOP | wxBOTTOM, gap / 2);
         m_top_surface_contoning_variable_layer_height_compensation_checkbox =
@@ -3809,7 +3848,7 @@ public:
         return m_transmission_distance_calibration_mode_choice ?
             std::clamp(m_transmission_distance_calibration_mode_choice->GetSelection(),
                        int(TextureMappingZone::TDCalibrationNone),
-                       int(TextureMappingZone::TDCalibrationNeighbor)) :
+                       int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample)) :
             TextureMappingZone::DefaultTransmissionDistanceCalibrationMode;
     }
 
@@ -4156,6 +4195,14 @@ public:
     {
         return m_top_surface_color_calibration_json;
     }
+    std::string side_surface_color_calibration_name() const
+    {
+        return m_side_surface_color_calibration_name;
+    }
+    std::string side_surface_color_calibration_json() const
+    {
+        return m_side_surface_color_calibration_json;
+    }
     bool top_surface_contoning_td_effective_alpha_correction_selected() const
     {
         const int effective_mode = TextureMappingZone::effective_top_surface_contoning_color_prediction_mode(
@@ -4305,6 +4352,11 @@ public:
     }
 
 private:
+    enum class CalibrationSurface {
+        Top,
+        Side
+    };
+
     static std::string prime_tower_color_mode_name(int selection)
     {
         switch (selection) {
@@ -4482,7 +4534,9 @@ private:
 
     void update_top_surface_color_calibration_label()
     {
-        if (m_top_surface_color_calibration_label != nullptr) {
+        auto update_label = [this](wxStaticText *label_widget) {
+            if (label_widget == nullptr)
+                return;
             wxString label = _L("No calibration loaded");
             wxString tooltip;
             if (!m_top_surface_color_calibration_json.empty()) {
@@ -4497,9 +4551,11 @@ private:
                     display = display.Left(19) + "..." + display.Right(20);
                 label = display;
             }
-            m_top_surface_color_calibration_label->SetLabel(label);
-            m_top_surface_color_calibration_label->SetToolTip(tooltip);
-        }
+            label_widget->SetLabel(label);
+            label_widget->SetToolTip(tooltip);
+        };
+        update_label(m_top_surface_color_calibration_label);
+        update_label(m_filament_top_surface_color_calibration_label);
 
         if (m_top_surface_color_calibration_warning_text != nullptr) {
             TextureMappingZone tmp;
@@ -4518,6 +4574,59 @@ private:
                 m_set_filament_colors_from_calibration_button->Show(should_show_set_filament_colors_from_calibration_button());
         }
         Layout();
+    }
+
+    void update_side_surface_color_calibration_label()
+    {
+        if (m_side_surface_color_calibration_label != nullptr) {
+            wxString label = _L("No calibration loaded");
+            wxString tooltip;
+            if (!m_side_surface_color_calibration_json.empty()) {
+                std::string name = m_side_surface_color_calibration_name;
+                if (name.empty())
+                    name = texture_mapping_side_surface_color_calibration_display_name(m_side_surface_color_calibration_json);
+                if (name.empty())
+                    name = "Loaded calibration";
+                tooltip = from_u8(name);
+                wxString display = from_u8(name);
+                if (display.length() > 42)
+                    display = display.Left(19) + "..." + display.Right(20);
+                label = display;
+            }
+            m_side_surface_color_calibration_label->SetLabel(label);
+            m_side_surface_color_calibration_label->SetToolTip(tooltip);
+        }
+        Layout();
+    }
+
+    int preferred_top_surface_color_calibration_mode() const
+    {
+        const std::vector<int> modes =
+            texture_mapping_top_surface_color_calibration_supported_modes(m_top_surface_color_calibration_json);
+        const int nearest_mode = int(TextureMappingZone::ContoningColorPredictionCalibratedNearestMeasuredSample);
+        if (std::find(modes.begin(), modes.end(), nearest_mode) != modes.end())
+            return nearest_mode;
+        return texture_mapping_top_surface_color_calibration_first_supported_mode(m_top_surface_color_calibration_json);
+    }
+
+    bool apply_transmission_distances_from_calibration_filaments(
+        const std::vector<TextureMappingColorCalibrationFilament> &filaments)
+    {
+        if (filaments.empty())
+            return false;
+        const std::vector<float> tds =
+            texture_mapping_calibration_component_transmission_distances(filaments,
+                                                                         top_surface_color_calibration_component_colors(),
+                                                                         component_transmission_distances_mm(),
+                                                                         m_filament_color_mode);
+        bool applied = false;
+        for (size_t idx = 0; idx < tds.size() && idx < m_transmission_distance_spins.size(); ++idx) {
+            if (tds[idx] > 0.f && m_transmission_distance_spins[idx] != nullptr) {
+                m_transmission_distance_spins[idx]->SetValue(double(tds[idx]));
+                applied = true;
+            }
+        }
+        return applied;
     }
 
     bool filament_color_lists_differ(const std::vector<std::string> &lhs,
@@ -4677,10 +4786,11 @@ private:
         return true;
     }
 
-    void load_top_surface_color_calibration()
+    void load_surface_color_calibration(CalibrationSurface target_surface)
     {
+        const bool target_top = target_surface == CalibrationSurface::Top;
         wxFileDialog dlg(this,
-                         _L("Load top-surface color calibration"),
+                         target_top ? _L("Load top-surface color calibration") : _L("Load side-surface color calibration"),
                          wxEmptyString,
                          wxEmptyString,
                          _L("JSON files (*.json)|*.json"),
@@ -4697,23 +4807,78 @@ private:
         std::ostringstream ss;
         ss << file.rdbuf();
         const std::string json_text = ss.str();
-        std::string error;
-        if (!texture_mapping_parse_top_surface_color_calibration(json_text, &error)) {
+        std::string top_error;
+        std::string side_error;
+        std::optional<TextureMappingColorCalibration> top_calibration =
+            texture_mapping_parse_top_surface_color_calibration(json_text, &top_error);
+        std::optional<TextureMappingSideSurfaceColorCalibration> side_calibration =
+            texture_mapping_parse_side_surface_color_calibration(json_text, &side_error);
+        if ((target_top && !top_calibration) || (!target_top && !side_calibration)) {
+            const std::string &error = target_top ? top_error : side_error;
             MessageDialog msg(this,
-                              error.empty() ? _L("The selected file is not a supported top-surface color calibration.") : from_u8(error),
+                              error.empty() ?
+                                  (target_top ?
+                                       _L("The selected file is not a supported top-surface color calibration.") :
+                                       _L("The selected file is not a supported side-surface color calibration.")) :
+                                  from_u8(error),
                               _L("Invalid calibration"),
                               wxOK | wxICON_WARNING);
             msg.ShowModal();
             return;
         }
 
-        m_top_surface_color_calibration_json = json_text;
-        m_top_surface_color_calibration_name =
-            boost::filesystem::path(into_u8(dlg.GetPath())).filename().string();
-        const int mode = texture_mapping_top_surface_color_calibration_first_supported_mode(m_top_surface_color_calibration_json);
-        rebuild_top_surface_contoning_color_prediction_choices(mode);
+        const std::string filename = boost::filesystem::path(into_u8(dlg.GetPath())).filename().string();
+        bool top_changed = false;
+        bool side_changed = false;
+        if (target_top) {
+            m_top_surface_color_calibration_json = json_text;
+            m_top_surface_color_calibration_name = filename;
+            rebuild_top_surface_contoning_color_prediction_choices(preferred_top_surface_color_calibration_mode());
+            bool td_applied = apply_transmission_distances_from_calibration_filaments(top_calibration->filaments);
+            top_changed = true;
+            if (side_calibration && m_side_surface_color_calibration_json.empty()) {
+                m_side_surface_color_calibration_json = json_text;
+                m_side_surface_color_calibration_name = filename;
+                if (m_transmission_distance_calibration_mode_choice != nullptr)
+                    m_transmission_distance_calibration_mode_choice->SetSelection(
+                        int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample));
+                if (!td_applied)
+                    td_applied = apply_transmission_distances_from_calibration_filaments(side_calibration->filaments);
+                side_changed = true;
+            }
+        } else {
+            m_side_surface_color_calibration_json = json_text;
+            m_side_surface_color_calibration_name = filename;
+            if (m_transmission_distance_calibration_mode_choice != nullptr)
+                m_transmission_distance_calibration_mode_choice->SetSelection(
+                    int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample));
+            bool td_applied = apply_transmission_distances_from_calibration_filaments(side_calibration->filaments);
+            side_changed = true;
+            if (top_calibration && m_top_surface_color_calibration_json.empty()) {
+                m_top_surface_color_calibration_json = json_text;
+                m_top_surface_color_calibration_name = filename;
+                rebuild_top_surface_contoning_color_prediction_choices(preferred_top_surface_color_calibration_mode());
+                if (!td_applied)
+                    td_applied = apply_transmission_distances_from_calibration_filaments(top_calibration->filaments);
+                top_changed = true;
+            }
+        }
         update_top_surface_color_calibration_label();
-        update_top_surface_image_options_visibility(true);
+        update_side_surface_color_calibration_label();
+        if (top_changed)
+            update_top_surface_image_options_visibility(true);
+        if (side_changed)
+            update_strength_offsets_visibility(true);
+    }
+
+    void load_top_surface_color_calibration()
+    {
+        load_surface_color_calibration(CalibrationSurface::Top);
+    }
+
+    void load_side_surface_color_calibration()
+    {
+        load_surface_color_calibration(CalibrationSurface::Side);
     }
 
     void clear_top_surface_color_calibration()
@@ -4723,6 +4888,19 @@ private:
         rebuild_top_surface_contoning_color_prediction_choices(TextureMappingZone::DefaultTopSurfaceContoningColorPredictionMode);
         update_top_surface_color_calibration_label();
         update_top_surface_image_options_visibility(true);
+    }
+
+    void clear_side_surface_color_calibration()
+    {
+        m_side_surface_color_calibration_name.clear();
+        m_side_surface_color_calibration_json.clear();
+        if (m_transmission_distance_calibration_mode_choice != nullptr &&
+            transmission_distance_calibration_mode() == int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample)) {
+            m_transmission_distance_calibration_mode_choice->SetSelection(
+                TextureMappingZone::DefaultTransmissionDistanceCalibrationMode);
+        }
+        update_side_surface_color_calibration_label();
+        update_strength_offsets_visibility(true);
     }
 
     void reset_strengths_and_offsets()
@@ -4773,6 +4951,22 @@ private:
             m_strength_offsets_toggle_button->SetLabel(m_strength_offsets_expanded ?
                                                         _L("Hide Filament Strengths and Offsets") :
                                                         _L("Show Filament Strengths and Offsets"));
+        const bool manual_controls_enabled =
+            transmission_distance_calibration_mode() != int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample);
+        for (wxSlider *slider : m_minimum_offset_sliders)
+            if (slider)
+                slider->Enable(manual_controls_enabled);
+        for (wxSpinCtrl *spin : m_minimum_offset_spins)
+            if (spin)
+                spin->Enable(manual_controls_enabled);
+        for (wxSlider *slider : m_strength_sliders)
+            if (slider)
+                slider->Enable(manual_controls_enabled);
+        for (wxSpinCtrl *spin : m_strength_spins)
+            if (spin)
+                spin->Enable(manual_controls_enabled);
+        if (m_strength_offsets_reset_button != nullptr)
+            m_strength_offsets_reset_button->Enable(manual_controls_enabled);
         if (m_strength_offsets_panel != nullptr)
             m_strength_offsets_panel->Show(m_strength_offsets_expanded);
         if (!fit_dialog)
@@ -5531,6 +5725,8 @@ private:
     wxCheckBox *m_top_surface_contoning_surface_scatter_checkbox {nullptr};
     wxChoice *m_top_surface_contoning_td_correction_choice {nullptr};
     std::vector<int> m_top_surface_contoning_color_prediction_modes;
+    wxStaticText *m_filament_top_surface_color_calibration_label {nullptr};
+    wxStaticText *m_side_surface_color_calibration_label {nullptr};
     wxStaticText *m_top_surface_color_calibration_label {nullptr};
     wxStaticText *m_top_surface_color_calibration_warning_text {nullptr};
     wxButton *m_set_filament_colors_from_calibration_button {nullptr};
@@ -5560,11 +5756,14 @@ private:
     std::function<bool(const std::vector<std::string>&)> m_apply_filament_colors;
     std::string m_top_surface_color_calibration_name;
     std::string m_top_surface_color_calibration_json;
+    std::string m_side_surface_color_calibration_name;
+    std::string m_side_surface_color_calibration_json;
     std::vector<wxSlider*> m_minimum_offset_sliders;
     std::vector<wxSpinCtrl*> m_minimum_offset_spins;
     std::vector<wxSlider*> m_strength_sliders;
     std::vector<wxSpinCtrl*> m_strength_spins;
     std::vector<wxSpinCtrlDouble*> m_transmission_distance_spins;
+    wxButton *m_strength_offsets_reset_button {nullptr};
     bool m_strength_offsets_expanded {false};
 };
 
@@ -10650,6 +10849,8 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.top_surface_contoning_variable_layer_height_compensation_enabled,
                                                     updated.top_surface_color_calibration_name,
                                                     updated.top_surface_color_calibration_json,
+                                                    updated.side_surface_color_calibration_name,
+                                                    updated.side_surface_color_calibration_json,
                                                     apply_filament_colors_from_calibration,
                                                     shell_usage,
                                                     bundle->texture_mapping_zones,
@@ -10762,6 +10963,10 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 dlg.top_surface_color_calibration_name();
             updated.top_surface_color_calibration_json =
                 dlg.top_surface_color_calibration_json();
+            updated.side_surface_color_calibration_name =
+                dlg.side_surface_color_calibration_name();
+            updated.side_surface_color_calibration_json =
+                dlg.side_surface_color_calibration_json();
             if (updated.top_surface_image_printing_enabled &&
                 updated.top_surface_image_printing_method == int(TextureMappingZone::TopSurfaceImageContoning)) {
                 updated.modulation_mode = int(TextureMappingZone::ModulationPerimeterPathV2);

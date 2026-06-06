@@ -169,6 +169,7 @@ std::string color_solver_candidate_cache_key(const std::vector<std::array<float,
 ColorSolverCandidateSet build_color_solver_candidates(const std::vector<std::array<float, 3>> &component_colors,
                                                       ColorSolverMixModel                       mix_model,
                                                       int                                       total_units = 0);
+void build_color_solver_candidate_kd_trees(ColorSolverCandidateSet &candidates);
 const ColorSolverCandidateSet &color_solver_candidates(ColorSolverCandidateCache                &cache,
                                                        const std::vector<std::array<float, 3>> &component_colors,
                                                        ColorSolverMixModel                       mix_model,
