@@ -2451,6 +2451,12 @@ static wxString texture_mapping_contoning_color_prediction_default_label()
     return label;
 }
 
+static bool texture_mapping_contoning_color_prediction_mode_selectable(int mode)
+{
+    return TextureMappingZone::effective_top_surface_contoning_color_prediction_mode(mode) !=
+           int(TextureMappingZone::ContoningColorPredictionCalibratedCurrentLinearAffine);
+}
+
 static int texture_mapping_contoning_polygonization_mode_choice_selection(int mode)
 {
     switch (TextureMappingZone::effective_top_surface_contoning_polygonization_mode(mode)) {
@@ -2679,17 +2685,9 @@ public:
                          0,
                          wxALIGN_CENTER_VERTICAL | wxRIGHT,
                          gap);
-        wxArrayString td_mode_choices;
-        td_mode_choices.Add(_L("None"));
-        td_mode_choices.Add(_L("Absolute TD"));
-        td_mode_choices.Add(_L("Neighbour TD"));
-        td_mode_choices.Add(_L("Calibrated: nearest measured sample"));
         m_transmission_distance_calibration_mode_choice =
-            new wxChoice(filament_page, wxID_ANY, wxDefaultPosition, wxDefaultSize, td_mode_choices);
-        m_transmission_distance_calibration_mode_choice->SetSelection(
-            std::clamp(transmission_distance_calibration_mode,
-                       int(TextureMappingZone::TDCalibrationNone),
-                       int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample)));
+            new wxChoice(filament_page, wxID_ANY);
+        rebuild_transmission_distance_calibration_mode_choices(transmission_distance_calibration_mode);
         m_transmission_distance_calibration_mode_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) {
             update_strength_offsets_visibility(true);
         });
@@ -3845,10 +3843,11 @@ public:
     float tone_gamma() const { return float(std::clamp(m_tone_gamma_spin ? m_tone_gamma_spin->GetValue() : 1.0, 0.5, 3.0)); }
     int transmission_distance_calibration_mode() const
     {
-        return m_transmission_distance_calibration_mode_choice ?
-            std::clamp(m_transmission_distance_calibration_mode_choice->GetSelection(),
-                       int(TextureMappingZone::TDCalibrationNone),
-                       int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample)) :
+        if (m_transmission_distance_calibration_mode_choice == nullptr)
+            return TextureMappingZone::DefaultTransmissionDistanceCalibrationMode;
+        const int selection = m_transmission_distance_calibration_mode_choice->GetSelection();
+        return selection >= 0 && size_t(selection) < m_transmission_distance_calibration_mode_values.size() ?
+            m_transmission_distance_calibration_mode_values[size_t(selection)] :
             TextureMappingZone::DefaultTransmissionDistanceCalibrationMode;
     }
 
@@ -4484,6 +4483,57 @@ private:
         return colors;
     }
 
+    bool side_surface_color_calibration_loaded() const
+    {
+        return texture_mapping_parse_side_surface_color_calibration(m_side_surface_color_calibration_json).has_value();
+    }
+
+    wxString transmission_distance_calibration_mode_label(int mode) const
+    {
+        switch (mode) {
+        case int(TextureMappingZone::TDCalibrationNone):
+            return _L("None");
+        case int(TextureMappingZone::TDCalibrationNeighbor):
+            return _L("Neighbour TD");
+        case int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample):
+            return _L("Calibrated: nearest measured sample");
+        default:
+            return _L("Absolute TD");
+        }
+    }
+
+    void rebuild_transmission_distance_calibration_mode_choices(int selected_mode)
+    {
+        if (m_transmission_distance_calibration_mode_choice == nullptr)
+            return;
+
+        m_transmission_distance_calibration_mode_values.clear();
+        auto add_mode = [this](int mode) {
+            m_transmission_distance_calibration_mode_values.emplace_back(mode);
+            m_transmission_distance_calibration_mode_choice->Append(
+                transmission_distance_calibration_mode_label(mode));
+        };
+
+        m_transmission_distance_calibration_mode_choice->Clear();
+        add_mode(int(TextureMappingZone::TDCalibrationNone));
+        add_mode(int(TextureMappingZone::TDCalibrationAbsolute));
+        add_mode(int(TextureMappingZone::TDCalibrationNeighbor));
+        if (side_surface_color_calibration_loaded())
+            add_mode(int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample));
+
+        auto it = std::find(m_transmission_distance_calibration_mode_values.begin(),
+                            m_transmission_distance_calibration_mode_values.end(),
+                            selected_mode);
+        if (it == m_transmission_distance_calibration_mode_values.end())
+            it = std::find(m_transmission_distance_calibration_mode_values.begin(),
+                           m_transmission_distance_calibration_mode_values.end(),
+                           TextureMappingZone::DefaultTransmissionDistanceCalibrationMode);
+        m_transmission_distance_calibration_mode_choice->SetSelection(
+            it != m_transmission_distance_calibration_mode_values.end() ?
+                int(it - m_transmission_distance_calibration_mode_values.begin()) :
+                0);
+    }
+
     void rebuild_top_surface_contoning_color_prediction_choices(int selected_mode)
     {
         if (m_top_surface_contoning_td_correction_choice == nullptr)
@@ -4505,7 +4555,8 @@ private:
         add_mode(int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb));
         add_mode(int(TextureMappingZone::ContoningColorPredictionBasicReflectance));
         for (int mode : texture_mapping_top_surface_color_calibration_supported_modes(m_top_surface_color_calibration_json))
-            add_mode(mode);
+            if (texture_mapping_contoning_color_prediction_mode_selectable(mode))
+                add_mode(mode);
 
         auto it = std::find(m_top_surface_contoning_color_prediction_modes.begin(),
                             m_top_surface_contoning_color_prediction_modes.end(),
@@ -4606,7 +4657,12 @@ private:
         const int nearest_mode = int(TextureMappingZone::ContoningColorPredictionCalibratedNearestMeasuredSample);
         if (std::find(modes.begin(), modes.end(), nearest_mode) != modes.end())
             return nearest_mode;
-        return texture_mapping_top_surface_color_calibration_first_supported_mode(m_top_surface_color_calibration_json);
+        const int first_mode =
+            texture_mapping_top_surface_color_calibration_first_supported_mode(m_top_surface_color_calibration_json);
+        if (texture_mapping_contoning_color_prediction_mode_selectable(first_mode))
+            return first_mode;
+        auto it = std::find_if(modes.begin(), modes.end(), texture_mapping_contoning_color_prediction_mode_selectable);
+        return it != modes.end() ? *it : TextureMappingZone::DefaultTopSurfaceContoningColorPredictionMode;
     }
 
     bool apply_transmission_distances_from_calibration_filaments(
@@ -4839,9 +4895,8 @@ private:
             if (side_calibration && m_side_surface_color_calibration_json.empty()) {
                 m_side_surface_color_calibration_json = json_text;
                 m_side_surface_color_calibration_name = filename;
-                if (m_transmission_distance_calibration_mode_choice != nullptr)
-                    m_transmission_distance_calibration_mode_choice->SetSelection(
-                        int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample));
+                rebuild_transmission_distance_calibration_mode_choices(
+                    int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample));
                 if (!td_applied)
                     td_applied = apply_transmission_distances_from_calibration_filaments(side_calibration->filaments);
                 side_changed = true;
@@ -4849,9 +4904,8 @@ private:
         } else {
             m_side_surface_color_calibration_json = json_text;
             m_side_surface_color_calibration_name = filename;
-            if (m_transmission_distance_calibration_mode_choice != nullptr)
-                m_transmission_distance_calibration_mode_choice->SetSelection(
-                    int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample));
+            rebuild_transmission_distance_calibration_mode_choices(
+                int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample));
             bool td_applied = apply_transmission_distances_from_calibration_filaments(side_calibration->filaments);
             side_changed = true;
             if (top_calibration && m_top_surface_color_calibration_json.empty()) {
@@ -4892,13 +4946,10 @@ private:
 
     void clear_side_surface_color_calibration()
     {
+        const int selected_mode = transmission_distance_calibration_mode();
         m_side_surface_color_calibration_name.clear();
         m_side_surface_color_calibration_json.clear();
-        if (m_transmission_distance_calibration_mode_choice != nullptr &&
-            transmission_distance_calibration_mode() == int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample)) {
-            m_transmission_distance_calibration_mode_choice->SetSelection(
-                TextureMappingZone::DefaultTransmissionDistanceCalibrationMode);
-        }
+        rebuild_transmission_distance_calibration_mode_choices(selected_mode);
         update_side_surface_color_calibration_label();
         update_strength_offsets_visibility(true);
     }
@@ -5645,6 +5696,7 @@ private:
     wxChoice *m_texture_mapping_mode_choice {nullptr};
     wxSpinCtrlDouble *m_tone_gamma_spin {nullptr};
     wxChoice *m_transmission_distance_calibration_mode_choice {nullptr};
+    std::vector<int> m_transmission_distance_calibration_mode_values;
     wxButton *m_strength_offsets_toggle_button {nullptr};
     wxPanel *m_strength_offsets_panel {nullptr};
     wxSlider *m_preview_opacity_slider {nullptr};

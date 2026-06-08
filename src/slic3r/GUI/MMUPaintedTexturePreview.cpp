@@ -122,6 +122,7 @@ struct TexturePreviewSimulationSettings
     std::vector<float> component_minimum_offset_factors;
     std::vector<size_t> semantic_component_indices;
     std::shared_ptr<TexturePreviewGenericMixCandidateCache> generic_mix_candidate_cache;
+    ColorSolverCandidateSet side_surface_calibrated_candidates;
     float raw_offset_base_visibility_factor = 1.f;
     float raw_offset_visibility_range_factor = 0.f;
 };
@@ -724,6 +725,116 @@ std::array<float, 3> generic_solver_perceptual_axis_weights(const std::array<flo
 bool generic_solver_mode_is_perceptual(int generic_solver_mode)
 {
     return TextureMappingZone::effective_generic_solver_mode(generic_solver_mode) != int(TextureMappingZone::GenericSolverRGB);
+}
+
+float apply_texture_tone_gamma(float channel, float tone_gamma);
+
+std::array<float, 3> texture_preview_target_rgb_without_contrast(const TexturePreviewSimulationSettings &settings,
+                                                                 const std::array<float, 4>            &sample_rgba)
+{
+    std::array<float, 3> target = {
+        clamp01(sample_rgba[0]),
+        clamp01(sample_rgba[1]),
+        clamp01(sample_rgba[2])
+    };
+    if (std::abs(settings.tone_gamma - 1.f) > 1e-5f) {
+        target[0] = apply_texture_tone_gamma(target[0], settings.tone_gamma);
+        target[1] = apply_texture_tone_gamma(target[1], settings.tone_gamma);
+        target[2] = apply_texture_tone_gamma(target[2], settings.tone_gamma);
+    }
+    return target;
+}
+
+bool texture_preview_has_side_surface_calibrated_candidates(const TexturePreviewSimulationSettings &settings)
+{
+    return settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
+           !settings.contoning_flat_surface_quantization &&
+           !settings.contoning_flat_surface_pattern_blend &&
+           !settings.contoning_flat_surface_raw_top_stack_preview &&
+           !settings.side_surface_calibrated_candidates.empty() &&
+           settings.side_surface_calibrated_candidates.component_count == settings.component_colors.size();
+}
+
+size_t nearest_side_surface_calibrated_candidate_for_texture_preview(
+    const TexturePreviewSimulationSettings &settings,
+    const std::array<float, 3>             &target_rgb)
+{
+    const ColorSolverCandidateSet &candidates = settings.side_surface_calibrated_candidates;
+    const size_t candidate_count = candidates.rgbs.size() / 3;
+    if (candidate_count == 0)
+        return size_t(-1);
+
+    const int solver_mode = TextureMappingZone::effective_generic_solver_mode(settings.generic_solver_mode);
+    const bool perceptual = generic_solver_mode_is_perceptual(solver_mode) &&
+                            candidates.perceptual_coords.size() == candidates.rgbs.size();
+    const std::array<float, 3> target_oklab = perceptual ? oklab_from_srgb(target_rgb) : std::array<float, 3>{ 0.f, 0.f, 0.f };
+    const std::array<float, 3> axis_weights = perceptual ? generic_solver_perceptual_axis_weights(target_oklab, solver_mode) :
+                                                           std::array<float, 3>{ 1.f, 1.f, 1.f };
+
+    size_t best_idx = size_t(-1);
+    float best_error = std::numeric_limits<float>::max();
+    for (size_t candidate_idx = 0; candidate_idx < candidate_count; ++candidate_idx) {
+        float error = 0.f;
+        if (perceptual) {
+            const size_t coord_idx = candidate_idx * 3;
+            const float dl = candidates.perceptual_coords[coord_idx + 0] - target_oklab[0];
+            const float da = candidates.perceptual_coords[coord_idx + 1] - target_oklab[1];
+            const float db = candidates.perceptual_coords[coord_idx + 2] - target_oklab[2];
+            error = axis_weights[0] * dl * dl + axis_weights[1] * da * da + axis_weights[2] * db * db;
+            if (solver_mode == int(TextureMappingZone::GenericSolverOklabSoftCap4Dark4)) {
+                const float under_l = std::max(0.f, target_oklab[0] - candidates.perceptual_coords[coord_idx + 0] - 0.04f);
+                error += 4.f * generic_solver_oklab_chroma_factor(target_oklab) * under_l * under_l;
+            }
+        } else {
+            const size_t rgb_idx = candidate_idx * 3;
+            const float dr = candidates.rgbs[rgb_idx + 0] - target_rgb[0];
+            const float dg = candidates.rgbs[rgb_idx + 1] - target_rgb[1];
+            const float db = candidates.rgbs[rgb_idx + 2] - target_rgb[2];
+            error = dr * dr + dg * dg + db * db;
+        }
+        if (error < best_error) {
+            best_error = error;
+            best_idx = candidate_idx;
+        }
+    }
+    return best_idx;
+}
+
+std::optional<std::array<float, 3>> side_surface_calibrated_rgb_for_texture_preview(
+    const TexturePreviewSimulationSettings &settings,
+    const std::array<float, 4>             &sample_rgba)
+{
+    if (!texture_preview_has_side_surface_calibrated_candidates(settings))
+        return std::nullopt;
+    const std::array<float, 3> target_rgb = texture_preview_target_rgb_without_contrast(settings, sample_rgba);
+    const size_t candidate_idx = nearest_side_surface_calibrated_candidate_for_texture_preview(settings, target_rgb);
+    if (candidate_idx >= settings.side_surface_calibrated_candidates.rgbs.size() / 3)
+        return std::nullopt;
+    const size_t rgb_idx = candidate_idx * 3;
+    return std::array<float, 3>{
+        settings.side_surface_calibrated_candidates.rgbs[rgb_idx + 0],
+        settings.side_surface_calibrated_candidates.rgbs[rgb_idx + 1],
+        settings.side_surface_calibrated_candidates.rgbs[rgb_idx + 2]
+    };
+}
+
+std::vector<float> side_surface_calibrated_weights_for_texture_preview(
+    const TexturePreviewSimulationSettings &settings,
+    const std::array<float, 4>             &sample_rgba)
+{
+    if (!texture_preview_has_side_surface_calibrated_candidates(settings))
+        return {};
+    const std::array<float, 3> target_rgb = texture_preview_target_rgb_without_contrast(settings, sample_rgba);
+    const size_t candidate_idx = nearest_side_surface_calibrated_candidate_for_texture_preview(settings, target_rgb);
+    const ColorSolverCandidateSet &candidates = settings.side_surface_calibrated_candidates;
+    const size_t candidate_count = candidates.rgbs.size() / 3;
+    if (candidate_idx >= candidate_count)
+        return {};
+    const size_t weight_idx = candidate_idx * candidates.component_count;
+    if (weight_idx + candidates.component_count > candidates.weights.size())
+        return {};
+    return std::vector<float>(candidates.weights.begin() + weight_idx,
+                              candidates.weights.begin() + weight_idx + candidates.component_count);
 }
 
 unsigned char to_u8(float value)
@@ -1775,6 +1886,8 @@ bool texture_preview_uses_generic_solver(const TexturePreviewSimulationSettings 
 {
     if (settings.mapping_mode == int(TextureMappingZone::TextureMappingRawValues))
         return false;
+    if (texture_preview_has_side_surface_calibrated_candidates(settings))
+        return false;
     if (settings.use_fixed_color_generic_solver)
         return true;
 
@@ -2765,6 +2878,7 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
 
     if (settings.dithering_enabled &&
         settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
+        !texture_preview_has_side_surface_calibrated_candidates(settings) &&
         !is_halftone_dithering_method_for_texture_preview(settings.dithering_method)) {
         const std::vector<TexturePreviewBinaryDitherCandidate> candidates = binary_dither_candidates_for_texture_preview(settings);
         const std::array<float, 3> target_color = texture_preview_target_color(settings, sample_rgba);
@@ -2793,6 +2907,10 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
         for (size_t channel_idx = 0; channel_idx < channel_count; ++channel_idx)
             desired[channel_idx] = clamp01(channels[channel_idx]);
         mapped_component_count = channel_count;
+    } else if (texture_preview_has_side_surface_calibrated_candidates(settings)) {
+        std::vector<float> calibrated = side_surface_calibrated_weights_for_texture_preview(settings, sample_rgba);
+        if (calibrated.size() == component_count)
+            desired = std::move(calibrated);
     } else {
         std::vector<float> optimized;
         if (!settings.use_fixed_color_generic_solver)
@@ -2819,10 +2937,12 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
     }
 
     const float contrast_factor = std::clamp(settings.contrast_pct, 25.f, 300.f) / 100.f;
-    if (std::abs(contrast_factor - 1.f) > 1e-5f)
+    if (!texture_preview_has_side_surface_calibrated_candidates(settings) &&
+        std::abs(contrast_factor - 1.f) > 1e-5f)
         apply_texture_contrast_to_mapped_components(desired, contrast_factor, mapped_component_count);
 
-    if (settings.compact_offset_mode) {
+    if (!texture_preview_has_side_surface_calibrated_candidates(settings) &&
+        settings.compact_offset_mode) {
         float max_weight = 0.f;
         for (const float value : desired)
             max_weight = std::max(max_weight, clamp01(value));
@@ -3028,6 +3148,10 @@ ColorRGBA simulated_texture_preview_color_for_vertex_color(const ColorRGBA *sour
         source_color->b(),
         source_color->a()
     };
+    if (std::optional<std::array<float, 3>> calibrated_rgb =
+            side_surface_calibrated_rgb_for_texture_preview(*settings, sample_rgba))
+        return { (*calibrated_rgb)[0], (*calibrated_rgb)[1], (*calibrated_rgb)[2], source_color->a() };
+
     const std::vector<float> component_weights = component_weights_for_texture_preview(*settings, sample_rgba);
     float activity = 0.f;
     for (const float weight : component_weights)
@@ -3171,6 +3295,28 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
         settings.component_minimum_offset_factors.emplace_back(std::clamp(safe_minimum_offset_pct / 100.f, 0.f, 1.f));
     }
 
+    if (!raw_values_mode &&
+        zone->transmission_distance_calibration_mode == int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample)) {
+        std::vector<float> component_transmission_distances_mm;
+        component_transmission_distances_mm.reserve(settings.component_ids.size());
+        for (const unsigned int component_id : settings.component_ids) {
+            const size_t idx = component_id > 0 ? size_t(component_id - 1) : size_t(-1);
+            const float value = idx < zone->filament_transmission_distances_mm.size() ?
+                zone->filament_transmission_distances_mm[idx] :
+                0.f;
+            component_transmission_distances_mm.emplace_back(std::isfinite(value) && value > 0.f ? std::clamp(value, 0.01f, 50.f) : 0.f);
+        }
+        std::optional<ColorSolverCandidateSet> calibrated_candidates =
+            texture_mapping_side_surface_color_calibrated_candidates(*zone,
+                                                                     settings.component_colors,
+                                                                     component_transmission_distances_mm);
+        if (calibrated_candidates && !calibrated_candidates->empty()) {
+            settings.side_surface_calibrated_candidates = std::move(*calibrated_candidates);
+            std::fill(settings.component_strength_factors.begin(), settings.component_strength_factors.end(), 1.f);
+            std::fill(settings.component_minimum_offset_factors.begin(), settings.component_minimum_offset_factors.end(), 0.f);
+        }
+    }
+
     if (settings.contoning_flat_surface_td_adjustment && !settings.component_colors.empty()) {
         std::vector<float> background_weights(settings.component_colors.size(), 1.f / float(settings.component_colors.size()));
         settings.contoning_flat_surface_background_rgb =
@@ -3271,6 +3417,13 @@ size_t texture_preview_simulation_signature(const ModelVolume &model_volume,
         mix(std::hash<int>{}(int(std::lround(color[0] * 255.f))));
         mix(std::hash<int>{}(int(std::lround(color[1] * 255.f))));
         mix(std::hash<int>{}(int(std::lround(color[2] * 255.f))));
+    }
+    if (!settings.side_surface_calibrated_candidates.empty()) {
+        mix(std::hash<size_t>{}(settings.side_surface_calibrated_candidates.component_count));
+        for (const float value : settings.side_surface_calibrated_candidates.rgbs)
+            mix(std::hash<int>{}(int(std::lround(value * 255.f))));
+        for (const float value : settings.side_surface_calibrated_candidates.weights)
+            mix(std::hash<int>{}(int(std::lround(value * 1000000.f))));
     }
     for (const float strength_factor : settings.component_strength_factors)
         mix(std::hash<int>{}(int(std::lround(strength_factor * 1000.f))));
@@ -3385,12 +3538,14 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
         !use_contoning_flat_surface_quantization &&
         settings.dithering_enabled &&
         settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
+        !texture_preview_has_side_surface_calibrated_candidates(settings) &&
         !is_halftone_dithering_method_for_texture_preview(settings.dithering_method) &&
         !use_raw_offsets;
     const bool use_halftone_dithering =
         !use_contoning_flat_surface_quantization &&
         settings.dithering_enabled &&
         settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
+        !texture_preview_has_side_surface_calibrated_candidates(settings) &&
         is_halftone_dithering_method_for_texture_preview(settings.dithering_method) &&
         !use_raw_offsets;
     const bool halftone_increased_detail =
@@ -3629,6 +3784,9 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
             }
             std::vector<float> component_weights;
             std::optional<std::array<float, 3>> forced_simulated_rgb;
+            if (std::optional<std::array<float, 3>> calibrated_rgb =
+                    side_surface_calibrated_rgb_for_texture_preview(settings, sample_rgba))
+                forced_simulated_rgb = *calibrated_rgb;
             if (use_raw_offsets) {
                 const std::vector<float> raw_sample =
                     sample_texture_preview_raw_offsets_bilinear(source_raw_offsets,

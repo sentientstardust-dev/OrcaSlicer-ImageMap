@@ -2076,7 +2076,7 @@ std::optional<TextureMappingColorCalibration> texture_mapping_parse_top_surface_
         !calibration.depth_kernel_linear.valid() &&
         !calibration.nearest_measured_sample.valid()) {
         if (error != nullptr)
-            *error = "The calibration file does not contain any supported color prediction weights.";
+            *error = "The loaded file does not contain any top-surface calibration data.";
         return std::nullopt;
     }
 
