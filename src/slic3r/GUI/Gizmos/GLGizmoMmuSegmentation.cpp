@@ -17391,7 +17391,6 @@ CommonGizmosDataID GLGizmoImageProjection::on_get_requirements() const
 bool GLGizmoImageProjection::load_projection_image()
 {
     m_image_error.clear();
-    m_raw_atlas = {};
     wxFileDialog dialog(wxGetApp().mainframe,
                         _L("Load projection image"),
                         "",
@@ -17400,6 +17399,14 @@ bool GLGizmoImageProjection::load_projection_image()
                         wxFD_OPEN | wxFD_FILE_MUST_EXIST);
     if (dialog.ShowModal() != wxID_OK)
         return false;
+
+    const wxString selected_filename_lower = dialog.GetFilename().Lower();
+    if (selected_filename_lower.Contains("do_not_print") || selected_filename_lower.Contains("do-not-print")) {
+        const wxString message = _L("The file you selected has \"do not print\" in the filename.\nRename the file if you are sure you want to project it.");
+        MessageDialog(wxGetApp().mainframe, message, _L("Error"), wxOK | wxICON_ERROR).ShowModal();
+        m_image_error = into_u8(message);
+        return false;
+    }
 
     wxImage image(dialog.GetPath(), wxBITMAP_TYPE_ANY);
     if (!image.IsOk()) {
@@ -17469,6 +17476,9 @@ bool GLGizmoImageProjection::load_projection_image()
         m_image_error = _u8L("Unable to resize the selected image.");
         return false;
     }
+
+    if (!loaded_raw_atlas)
+        m_raw_atlas = {};
 
     m_image_path = into_u8(dialog.GetPath());
     m_image_rgba = std::move(rgba);
