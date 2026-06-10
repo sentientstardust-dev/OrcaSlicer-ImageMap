@@ -1013,7 +1013,7 @@ float apply_texture_tone_gamma(float channel, float tone_gamma)
     return clamp01f(std::pow(safe_channel, 1.f / safe_gamma));
 }
 
-void apply_texture_contrast_to_components(std::vector<float> &component_weights,
+void apply_filament_overhang_contrast_to_components(std::vector<float> &component_weights,
                                           float contrast_factor,
                                           size_t mapped_component_count)
 {
@@ -1032,7 +1032,7 @@ void apply_texture_contrast_to_components(std::vector<float> &component_weights,
     }
 }
 
-std::array<float, 3> apply_texture_contrast_to_rgb(const std::array<float, 3> &rgb, float contrast_factor)
+std::array<float, 3> apply_filament_overhang_contrast_to_rgb(const std::array<float, 3> &rgb, float contrast_factor)
 {
     const float clamped_contrast = std::clamp(contrast_factor, 0.25f, 3.f);
     if (std::abs(clamped_contrast - 1.f) <= 1e-5f)
@@ -1058,7 +1058,7 @@ std::array<float, 3> texture_sample_target_rgb(const WeightedTextureSample &samp
         target[1] = apply_texture_tone_gamma(target[1], tone_gamma);
         target[2] = apply_texture_tone_gamma(target[2], tone_gamma);
     }
-    return apply_texture_contrast_to_rgb(target, contrast_factor);
+    return apply_filament_overhang_contrast_to_rgb(target, contrast_factor);
 }
 
 std::array<float, 3> generic_solver_oklab_axis_weights(const std::array<float, 3> &target_oklab)
@@ -1696,7 +1696,7 @@ std::vector<float> component_weights_for_sample(const WeightedTextureSample &sam
     }
 
     if (!has_raw_component_weights && !has_calibrated_side_candidates && std::abs(contrast_factor - 1.f) > 1e-5f)
-        apply_texture_contrast_to_components(desired, contrast_factor, mapped_component_count);
+        apply_filament_overhang_contrast_to_components(desired, contrast_factor, mapped_component_count);
     for (float &v : desired)
         v = clamp01f(v);
     return desired;
@@ -1720,7 +1720,7 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
                                                                           float                     dither_cell_size_mm,
                                                                           const std::vector<float>& component_strength_factors,
                                                                           const std::vector<float>& component_minimum_offset_factors,
-                                                                          float                     texture_contrast_pct,
+                                                                          float                     texture_filament_overhang_contrast_pct,
                                                                           float                     texture_tone_gamma,
                                                                           float                     layer_z_mm,
                                                                           float                     layer_z_falloff_mm,
@@ -1754,7 +1754,7 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
         return {};
 
     const float safe_layer_z_falloff_mm = std::max(layer_z_falloff_mm, 1e-3f);
-    const float contrast_factor = std::clamp(texture_contrast_pct, 25.f, 300.f) / 100.f;
+    const float contrast_factor = std::clamp(texture_filament_overhang_contrast_pct, 25.f, 300.f) / 100.f;
     const float tone_gamma =
         (!std::isfinite(texture_tone_gamma) || texture_tone_gamma <= 0.f) ? 1.f : std::clamp(texture_tone_gamma, 0.5f, 3.f);
     const float default_physical_sample_pitch_mm =
@@ -3446,7 +3446,8 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     std::optional<std::array<float, 4>> image_background_rgba_override,
     std::optional<float>     sample_z_mm_override,
     std::optional<float>     texture_sample_pitch_mm_override,
-    std::optional<int>       raw_top_surface_depth_override)
+    std::optional<int>       raw_top_surface_depth_override,
+    std::optional<float>     filament_overhang_contrast_pct_override)
 {
     const Print *print = print_object.print();
     if (print == nullptr)
@@ -3502,7 +3503,10 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     const int generic_solver_mix_model = std::clamp(zone.generic_solver_mix_model,
                                                     int(TextureMappingZone::GenericSolverPigmentPainter),
                                                     int(TextureMappingZone::GenericSolverPrusaFdmMixer));
-    const float texture_contrast_pct = std::clamp(zone.contrast_pct, 25.f, 300.f);
+    const float requested_filament_overhang_contrast_pct =
+        filament_overhang_contrast_pct_override ?
+            *filament_overhang_contrast_pct_override :
+            zone.filament_overhang_contrast_pct;
     const float texture_tone_gamma =
         (!std::isfinite(zone.tone_gamma) || zone.tone_gamma <= 0.f) ?
             1.f :
@@ -3631,6 +3635,10 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
         vertex_color_match_mode &&
         !raw_texture_mapping_mode &&
         zone.transmission_distance_calibration_mode == int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample);
+    const float texture_filament_overhang_contrast_pct =
+        calibrated_side_mode ?
+            TextureMappingZone::DefaultFilamentOverhangContrastPct :
+            std::clamp(requested_filament_overhang_contrast_pct, 25.f, 300.f);
     std::vector<float> component_strength_factors;
     component_strength_factors.reserve(component_ids.size());
     std::vector<float> component_minimum_offset_factors;
@@ -3670,7 +3678,7 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
                                                                  generic_solver_lookup_mode, generic_solver_mode, generic_solver_mix_model,
                                                                  zone.use_legacy_fixed_color_mode, dithering_enabled, dithering_method,
                                                                  dither_pitch_mm, dither_cell_size_mm, component_strength_factors,
-                                                                 component_minimum_offset_factors, texture_contrast_pct, texture_tone_gamma,
+                                                                 component_minimum_offset_factors, texture_filament_overhang_contrast_pct, texture_tone_gamma,
                                                                  sample_z_mm, layer_sample_falloff_mm, high_resolution_texture_sampling,
                                                                  zone.high_speed_image_texture_sampling, texture_sample_pitch_mm_override,
                                                                  image_background_rgba_override, calibrated_side_candidates_ptr,

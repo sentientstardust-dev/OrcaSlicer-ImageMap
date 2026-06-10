@@ -90,7 +90,7 @@ struct TexturePreviewSimulationSettings
     float dithering_resolution_mm = TextureMappingZone::DefaultDitheringResolutionMm;
     float halftone_dot_size_mm = TextureMappingZone::DefaultHalftoneDotSizeMm;
     float texture_preview_mm_per_pixel = TextureMappingZone::DefaultDitheringResolutionMm;
-    float contrast_pct = 100.f;
+    float filament_overhang_contrast_pct = TextureMappingZone::DefaultFilamentOverhangContrastPct;
     float tone_gamma = 1.f;
     int generic_solver_lookup_mode = int(TextureMappingZone::GenericSolverClosestMix);
     int generic_solver_mode = TextureMappingZone::DefaultGenericSolverMode;
@@ -2311,7 +2311,7 @@ float apply_texture_tone_gamma(float channel, float tone_gamma)
     return clamp01(std::pow(safe_channel, 1.f / safe_gamma));
 }
 
-void apply_texture_contrast_to_mapped_components(std::vector<float> &component_weights,
+void apply_filament_overhang_contrast_to_mapped_components(std::vector<float> &component_weights,
                                                  float contrast_factor,
                                                  size_t mapped_component_count)
 {
@@ -2330,7 +2330,7 @@ void apply_texture_contrast_to_mapped_components(std::vector<float> &component_w
     }
 }
 
-std::array<float, 3> apply_texture_contrast_to_rgb(const std::array<float, 3> &rgb, float contrast_factor)
+std::array<float, 3> apply_filament_overhang_contrast_to_rgb(const std::array<float, 3> &rgb, float contrast_factor)
 {
     const float clamped_contrast = std::clamp(contrast_factor, 0.25f, 3.f);
     if (std::abs(clamped_contrast - 1.f) <= 1e-5f)
@@ -2482,7 +2482,7 @@ std::array<float, 3> texture_preview_target_rgb(const TexturePreviewSimulationSe
         target[1] = apply_texture_tone_gamma(target[1], settings.tone_gamma);
         target[2] = apply_texture_tone_gamma(target[2], settings.tone_gamma);
     }
-    return apply_texture_contrast_to_rgb(target, std::clamp(settings.contrast_pct, 25.f, 300.f) / 100.f);
+    return apply_filament_overhang_contrast_to_rgb(target, std::clamp(settings.filament_overhang_contrast_pct, 25.f, 300.f) / 100.f);
 }
 
 std::array<float, 3> texture_preview_target_color(const TexturePreviewSimulationSettings &settings,
@@ -2936,10 +2936,10 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
         }
     }
 
-    const float contrast_factor = std::clamp(settings.contrast_pct, 25.f, 300.f) / 100.f;
+    const float contrast_factor = std::clamp(settings.filament_overhang_contrast_pct, 25.f, 300.f) / 100.f;
     if (!texture_preview_has_side_surface_calibrated_candidates(settings) &&
         std::abs(contrast_factor - 1.f) > 1e-5f)
-        apply_texture_contrast_to_mapped_components(desired, contrast_factor, mapped_component_count);
+        apply_filament_overhang_contrast_to_mapped_components(desired, contrast_factor, mapped_component_count);
 
     if (!texture_preview_has_side_surface_calibrated_candidates(settings) &&
         settings.compact_offset_mode) {
@@ -2972,6 +2972,7 @@ std::array<float, 3> fallback_contoning_flat_surface_rgb_for_texture_preview(
     local_settings.dithering_enabled = false;
     local_settings.compact_offset_mode = false;
     local_settings.contoning_flat_surface_quantization = false;
+    local_settings.filament_overhang_contrast_pct = TextureMappingZone::DefaultFilamentOverhangContrastPct;
     std::vector<float> continuous_weights = component_weights_for_texture_preview(local_settings, sample_rgba, false);
     continuous_weights.resize(component_count, 0.f);
 
@@ -2982,7 +2983,7 @@ std::array<float, 3> fallback_contoning_flat_surface_rgb_for_texture_preview(
     }
 
     if (total_weight <= k_epsilon) {
-        const std::array<float, 3> target_rgb = texture_preview_target_rgb(settings, sample_rgba);
+        const std::array<float, 3> target_rgb = texture_preview_target_rgb(local_settings, sample_rgba);
         const std::array<float, 3> target_oklab = oklab_from_srgb(target_rgb);
         const std::array<float, 3> axis_weights = { 1.f, 4.f, 4.f };
         size_t best_idx = 0;
@@ -3044,7 +3045,9 @@ std::array<float, 3> contoning_flat_surface_rgb_for_texture_preview(
     int                                                      root,
     int                                                      total_units)
 {
-    const std::array<float, 3> target_rgb = texture_preview_target_rgb(settings, sample_rgba);
+    TexturePreviewSimulationSettings local_settings = settings;
+    local_settings.filament_overhang_contrast_pct = TextureMappingZone::DefaultFilamentOverhangContrastPct;
+    const std::array<float, 3> target_rgb = texture_preview_target_rgb(local_settings, sample_rgba);
     if (settings.contoning_flat_surface_td_adjustment && !ordered_candidates.empty()) {
         const std::vector<uint16_t> surface_to_deep =
             solve_color_solver_ordered_stack_for_target(ordered_candidates, target_rgb, ColorSolverMode::OklabSoftCap4Dark4);
@@ -3079,7 +3082,7 @@ std::array<float, 3> contoning_flat_surface_rgb_for_texture_preview(
         if (nearest.best_idx < candidates.size())
             return candidates[nearest.best_idx].rgb;
     }
-    return fallback_contoning_flat_surface_rgb_for_texture_preview(settings, sample_rgba, total_units);
+    return fallback_contoning_flat_surface_rgb_for_texture_preview(local_settings, sample_rgba, total_units);
 }
 
 std::vector<float> raw_offset_print_width_weights_for_texture_preview(const TexturePreviewSimulationSettings &settings,
@@ -3203,7 +3206,10 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
     settings.compact_offset_mode =
         halftone_dithering_enabled ? false : zone->compact_offset_mode || settings.dithering_enabled;
     settings.use_legacy_fixed_color_mode = zone->use_legacy_fixed_color_mode;
-    settings.contrast_pct = std::clamp(zone->contrast_pct, 25.f, 300.f);
+    settings.filament_overhang_contrast_pct =
+        zone->transmission_distance_calibration_mode == int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample) ?
+            TextureMappingZone::DefaultFilamentOverhangContrastPct :
+            std::clamp(zone->filament_overhang_contrast_pct, 25.f, 300.f);
     settings.tone_gamma = (!std::isfinite(zone->tone_gamma) || zone->tone_gamma <= 0.f) ?
         1.f :
         std::clamp(zone->tone_gamma, 0.5f, 3.f);
@@ -3408,7 +3414,7 @@ size_t texture_preview_simulation_signature(const ModelVolume &model_volume,
         if (settings.contoning_flat_surface_calibrated_stack_model.valid())
             mix(std::hash<std::string>{}(settings.contoning_flat_surface_calibrated_stack_model.cache_key()));
     }
-    mix(std::hash<int>{}(int(std::lround(settings.contrast_pct * 100.f))));
+    mix(std::hash<int>{}(int(std::lround(settings.filament_overhang_contrast_pct * 100.f))));
     mix(std::hash<int>{}(int(std::lround(settings.tone_gamma * 1000.f))));
     mix(std::hash<int>{}(int(std::lround(settings.minimum_visibility_offset_factor * 100000.f))));
     for (const unsigned int id : settings.component_ids)
@@ -4279,6 +4285,8 @@ const GUI::GLTexture *simulated_texture_preview_texture_for_filament(const Model
         contoning_flat_surface_raw_top_stack_preview &&
         contoning_flat_surface_quantization &&
         model_volume_has_raw_top_surface_stack_preview_data_for_zone_impl(model_volume, *zone);
+    if (settings->contoning_flat_surface_quantization || settings->contoning_flat_surface_pattern_blend)
+        settings->filament_overhang_contrast_pct = TextureMappingZone::DefaultFilamentOverhangContrastPct;
     if ((contoning_flat_surface_quantization || contoning_flat_surface_pattern_blend) &&
         zone->texture_mapping_mode == int(TextureMappingZone::TextureMappingRawValues) &&
         !settings->contoning_flat_surface_raw_top_stack_preview)
@@ -6456,7 +6464,10 @@ static size_t texture_preview_settings_signature_impl(size_t num_physical,
         signature_mix(std::hash<int>{}(zone.generic_solver_lookup_mode));
         signature_mix(std::hash<int>{}(zone.generic_solver_mode));
         signature_mix(std::hash<int>{}(TextureMappingZone::DefaultGenericSolverMixModel));
-        signature_mix_float(zone.contrast_pct, 100.f);
+        signature_mix_float(zone.transmission_distance_calibration_mode == int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample) ?
+                                TextureMappingZone::DefaultFilamentOverhangContrastPct :
+                                zone.filament_overhang_contrast_pct,
+                            100.f);
         signature_mix_float(zone.tone_gamma);
         for (const float strength_pct : zone.filament_strengths_pct)
             signature_mix_float(strength_pct, 100.f);
@@ -6618,7 +6629,10 @@ static void texture_preview_mix_zone_baked_model_settings(size_t &signature,
     signature_mix(std::hash<int>{}(zone.generic_solver_lookup_mode));
     signature_mix(std::hash<int>{}(zone.generic_solver_mode));
     signature_mix(std::hash<int>{}(TextureMappingZone::DefaultGenericSolverMixModel));
-    signature_mix_float(zone.contrast_pct, 100.f);
+    signature_mix_float(zone.transmission_distance_calibration_mode == int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample) ?
+                            TextureMappingZone::DefaultFilamentOverhangContrastPct :
+                            zone.filament_overhang_contrast_pct,
+                        100.f);
     signature_mix_float(zone.tone_gamma);
     signature_mix(std::hash<int>{}(zone.linear_gradient_mode));
     signature_mix_float(zone.linear_gradient_radius_mm, 1000.f);

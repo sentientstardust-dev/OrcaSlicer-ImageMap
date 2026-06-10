@@ -2495,6 +2495,7 @@ public:
                                         const std::vector<float> &component_transmission_distances_mm,
                                         int transmission_distance_calibration_mode,
                                         float tone_gamma,
+                                        float filament_overhang_contrast_pct,
                                         bool force_sequential_filaments,
                                         bool auto_adjust_filament_selection,
                                         bool reduce_outer_surface_texture,
@@ -2955,6 +2956,25 @@ public:
         m_nonlinear_offset_adjustment_checkbox->SetToolTip(
             _L("Adjusts line-width offsets using a surface-visibility model derived from Kuipers et al. 2018."));
         experimental_box->Add(m_nonlinear_offset_adjustment_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        auto *filament_overhang_contrast_row = new wxBoxSizer(wxHORIZONTAL);
+        filament_overhang_contrast_row->Add(new wxStaticText(experimental_page, wxID_ANY, _L("Filament overhang contrast")),
+                                            0,
+                                            wxALIGN_CENTER_VERTICAL | wxRIGHT,
+                                            gap);
+        m_filament_overhang_contrast_spin = new wxSpinCtrl(experimental_page,
+                                                           wxID_ANY,
+                                                           wxEmptyString,
+                                                           wxDefaultPosition,
+                                                           wxSize(FromDIP(70), -1),
+                                                           wxSP_ARROW_KEYS | wxALIGN_RIGHT,
+                                                           25,
+                                                           300,
+                                                           std::clamp(int(std::lround(filament_overhang_contrast_pct)), 25, 300));
+        m_filament_overhang_contrast_spin->Enable(
+            transmission_distance_calibration_mode != int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample));
+        filament_overhang_contrast_row->Add(m_filament_overhang_contrast_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
+        filament_overhang_contrast_row->Add(new wxStaticText(experimental_page, wxID_ANY, _L("%")), 0, wxALIGN_CENTER_VERTICAL);
+        experimental_box->Add(filament_overhang_contrast_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
         m_compact_offset_mode_checkbox = new wxCheckBox(experimental_page, wxID_ANY, _L("Compact Offset Mode"));
         m_compact_offset_mode_checkbox->SetValue(compact_offset_mode);
         m_compact_offset_mode_checkbox->SetToolTip(
@@ -3841,6 +3861,13 @@ public:
     }
 
     float tone_gamma() const { return float(std::clamp(m_tone_gamma_spin ? m_tone_gamma_spin->GetValue() : 1.0, 0.5, 3.0)); }
+    float filament_overhang_contrast_pct() const
+    {
+        const int value = m_filament_overhang_contrast_spin != nullptr ?
+            m_filament_overhang_contrast_spin->GetValue() :
+            int(TextureMappingZone::DefaultFilamentOverhangContrastPct);
+        return float(std::clamp(value, 25, 300));
+    }
     int transmission_distance_calibration_mode() const
     {
         if (m_transmission_distance_calibration_mode_choice == nullptr)
@@ -5016,6 +5043,8 @@ private:
         for (wxSpinCtrl *spin : m_strength_spins)
             if (spin)
                 spin->Enable(manual_controls_enabled);
+        if (m_filament_overhang_contrast_spin != nullptr)
+            m_filament_overhang_contrast_spin->Enable(manual_controls_enabled);
         if (m_strength_offsets_reset_button != nullptr)
             m_strength_offsets_reset_button->Enable(manual_controls_enabled);
         if (m_strength_offsets_panel != nullptr)
@@ -5708,6 +5737,7 @@ private:
     wxCheckBox *m_reduce_outer_surface_texture_checkbox {nullptr};
     wxCheckBox *m_seam_hiding_checkbox {nullptr};
     wxCheckBox *m_nonlinear_offset_adjustment_checkbox {nullptr};
+    wxSpinCtrl *m_filament_overhang_contrast_spin {nullptr};
     wxCheckBox *m_use_modulated_overhang_geometry_for_support_checkbox {nullptr};
     wxChoice *m_modulation_mode_choice {nullptr};
     std::vector<int> m_modulation_mode_choice_values;
@@ -10128,22 +10158,6 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
         mode_row->Add(mode_choice, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         editor_sizer->Add(mode_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
 
-        auto *contrast_row = new wxWrapSizer(wxHORIZONTAL, wxWRAPSIZER_DEFAULT_FLAGS);
-        contrast_row->Add(new wxStaticText(editor, wxID_ANY, _L("Texture contrast")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-        auto *contrast_spin = new ::SpinInput(editor,
-                                              wxEmptyString,
-                                              wxEmptyString,
-                                              wxDefaultPosition,
-                                              wxSize(FromDIP(86), -1),
-                                              wxSP_ARROW_KEYS,
-                                              25,
-                                              300,
-                                              std::clamp(int(std::lround(entry.contrast_pct)), 25, 300),
-                                              5);
-        contrast_row->Add(contrast_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
-        contrast_row->Add(new wxStaticText(editor, wxID_ANY, _L("%")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
-        editor_sizer->Add(contrast_row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, gap);
-
         ::CheckBox *preview_colors_chk = nullptr;
         auto *preview_colors_row = make_sidebar_checkbox_row(editor,
                                                              preview_colors_chk,
@@ -10178,7 +10192,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                linear_gradient_stops_bar, linear_gradient_mode_choice, linear_gradient_radius_spin,
                                linear_gradient_radius_percent_chk,
                                surface_pattern_from_selection, linear_gradient_mode_from_selection, mode_choice,
-                               show_direction_arrow_chk, contrast_spin, apply_zone, update_color_calibration_warning_text]() {
+                               show_direction_arrow_chk, apply_zone, update_color_calibration_warning_text]() {
             if (mgr_ptr == nullptr)
                 return;
             auto &rows = mgr_ptr->zones();
@@ -10228,7 +10242,6 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 texture_mapping_color_mode_from_selection(mode_choice->GetSelection(), updated.filament_color_mode) :
                 updated.filament_color_mode;
             updated.show_linear_gradient_direction_arrow = show_direction_arrow_chk != nullptr && show_direction_arrow_chk->GetValue();
-            updated.contrast_pct = contrast_spin != nullptr ? std::clamp(float(contrast_spin->GetValue()), 25.f, 300.f) : updated.contrast_pct;
             updated.high_resolution_sampling = true;
             update_color_calibration_warning_text(updated);
             apply_zone(std::move(updated));
@@ -10244,17 +10257,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             });
         }
 
-        contrast_spin->Bind(wxEVT_CHAR_HOOK, [contrast_spin, apply_controls](wxKeyEvent &evt) {
-            const int key = evt.GetKeyCode();
-            if (key == WXK_UP || key == WXK_NUMPAD_UP || key == WXK_DOWN || key == WXK_NUMPAD_DOWN) {
-                const int direction = (key == WXK_UP || key == WXK_NUMPAD_UP) ? 1 : -1;
-                contrast_spin->SetValue(std::clamp(contrast_spin->GetValue() + direction * 5, 25, 300));
-                apply_controls();
-                return;
-            }
-            evt.Skip();
-        });
-        auto update_pattern_visibility = [this, editor_sizer, filaments_row, linear_gradient_mode_row, linear_gradient_mode_choice, linear_gradient_stops_bar, linear_gradient_row, linear_gradient_point_row, linear_gradient_buttons_row, linear_gradient_radius_row, show_direction_arrow_row, mode_row, contrast_row, preview_colors_row, color_calibration_warning_text, offset_btn, advanced_btn, surface_choice, row, editor, update_texture_mapping_area_height, set_linear_gradient_picker_button_labels, sync_linear_gradient_stop_controls]() {
+        auto update_pattern_visibility = [this, editor_sizer, filaments_row, linear_gradient_mode_row, linear_gradient_mode_choice, linear_gradient_stops_bar, linear_gradient_row, linear_gradient_point_row, linear_gradient_buttons_row, linear_gradient_radius_row, show_direction_arrow_row, mode_row, preview_colors_row, color_calibration_warning_text, offset_btn, advanced_btn, surface_choice, row, editor, update_texture_mapping_area_height, set_linear_gradient_picker_button_labels, sync_linear_gradient_stop_controls]() {
             const int selection = surface_choice == nullptr ? 0 : surface_choice->GetSelection();
             const bool image_texture = selection == 0;
             const bool linear_gradient = selection == 1;
@@ -10269,7 +10272,6 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             editor_sizer->Show(linear_gradient_radius_row, radial_gradient, true);
             editor_sizer->Show(show_direction_arrow_row, linear_gradient, true);
             editor_sizer->Show(mode_row, image_texture, true);
-            editor_sizer->Show(contrast_row, image_texture, true);
             editor_sizer->Show(preview_colors_row, image_texture, true);
             if (color_calibration_warning_text != nullptr)
                 editor_sizer->Show(color_calibration_warning_text, !color_calibration_warning_text->GetLabel().empty(), true);
@@ -10344,7 +10346,6 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                linear_gradient_mode_from_selection,
                                mode_choice,
                                surface_choice,
-                               contrast_spin,
                                set_sidebar_checkbox_value,
                                update_color_calibration_warning_text,
                                surface_pattern_from_selection,
@@ -10405,7 +10406,6 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.filament_color_mode = mode_choice != nullptr ?
                 texture_mapping_color_mode_from_selection(mode_choice->GetSelection(), updated.filament_color_mode) :
                 updated.filament_color_mode;
-            updated.contrast_pct = contrast_spin != nullptr ? std::clamp(float(contrast_spin->GetValue()), 25.f, 300.f) : updated.contrast_pct;
             updated.high_resolution_sampling = true;
 
             if (updated.is_image_texture() && updated.auto_adjust_filament_selection) {
@@ -10484,12 +10484,6 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 evt.Skip();
             });
         }
-        contrast_spin->Bind(wxEVT_SPINCTRL, [apply_controls](wxCommandEvent &) { apply_controls(); });
-        contrast_spin->Bind(wxEVT_TEXT_ENTER, [apply_controls](wxCommandEvent &) { apply_controls(); });
-        contrast_spin->Bind(wxEVT_KILL_FOCUS, [apply_controls](wxFocusEvent &evt) {
-            apply_controls();
-            evt.Skip();
-        });
         auto make_linear_gradient_anchor = [this](const GLGizmoTextureGradientPointPicker::Pick &pick) {
             TextureMappingZone::LinearGradientAnchor anchor;
             anchor.valid = true;
@@ -10840,6 +10834,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     transmission_distances,
                                                     updated.transmission_distance_calibration_mode,
                                                     updated.tone_gamma,
+                                                    updated.filament_overhang_contrast_pct,
                                                     updated.force_sequential_filaments,
                                                     updated.auto_adjust_filament_selection,
                                                     updated.reduce_outer_surface_texture,
@@ -10927,6 +10922,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             }
             updated.texture_mapping_mode = dlg.texture_mapping_mode();
             updated.tone_gamma = dlg.tone_gamma();
+            updated.filament_overhang_contrast_pct = dlg.filament_overhang_contrast_pct();
             updated.transmission_distance_calibration_mode = dlg.transmission_distance_calibration_mode();
             updated.force_sequential_filaments = dlg.force_sequential_filaments();
             if (updated.force_sequential_filaments && ids.size() >= 2) {

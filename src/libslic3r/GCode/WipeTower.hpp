@@ -56,7 +56,7 @@ struct PrimeTowerTextureRenderSettings
     int generic_solver_lookup_mode = TextureMappingZone::DefaultGenericSolverLookupMode;
     int generic_solver_mode = TextureMappingZone::DefaultGenericSolverMode;
     int generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
-    float contrast_pct = 100.f;
+    float filament_overhang_contrast_pct = TextureMappingZone::DefaultFilamentOverhangContrastPct;
     float tone_gamma = 1.f;
     float global_strength = 1.f;
     float max_line_width = 0.95f;
@@ -573,7 +573,7 @@ private:
         return {};
     }
 
-    static void apply_contrast(std::vector<float> &weights, float contrast_factor, size_t mapped_count)
+    static void apply_filament_overhang_contrast(std::vector<float> &weights, float contrast_factor, size_t mapped_count)
     {
         const size_t count = std::min(mapped_count, weights.size());
         if (count == 0)
@@ -638,7 +638,7 @@ private:
         if (weights.size() != component_ids.size() || component_idx >= weights.size())
             return sample_image_tool_visibility(tool, u, v, back, solver_tools);
 
-        apply_contrast(weights, std::clamp(contrast_pct, 25.f, 300.f) / 100.f, mapped_count);
+        apply_filament_overhang_contrast(weights, std::clamp(filament_overhang_contrast_pct, 25.f, 300.f) / 100.f, mapped_count);
         return std::clamp(weights[component_idx], 0.f, 1.f);
     }
 

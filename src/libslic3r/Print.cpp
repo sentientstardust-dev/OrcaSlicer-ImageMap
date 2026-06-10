@@ -3510,7 +3510,10 @@ void Print::_make_wipe_tower()
             texture.generic_solver_lookup_mode = settings_zone->generic_solver_lookup_mode;
             texture.generic_solver_mode = settings_zone->generic_solver_mode;
             texture.generic_solver_mix_model = settings_zone->generic_solver_mix_model;
-            texture.contrast_pct = settings_zone->contrast_pct;
+            texture.filament_overhang_contrast_pct =
+                settings_zone->transmission_distance_calibration_mode == int(TextureMappingZone::TDCalibrationCalibratedNearestMeasuredSample) ?
+                    TextureMappingZone::DefaultFilamentOverhangContrastPct :
+                    settings_zone->filament_overhang_contrast_pct;
             texture.tone_gamma = settings_zone->tone_gamma;
             texture.filament_strengths_pct = settings_zone->filament_strengths_pct;
             texture.filament_minimum_offsets_pct = settings_zone->filament_minimum_offsets_pct;

@@ -505,8 +505,25 @@ static std::optional<PerimeterTextureRecolorSampler> perimeter_texture_make_reco
     if (num_physical == 0)
         return std::nullopt;
 
+    const std::optional<float> filament_overhang_contrast_override =
+        zone.top_surface_contoning_perimeters_active() ?
+            std::optional<float>(TextureMappingZone::DefaultFilamentOverhangContrastPct) :
+            std::nullopt;
     std::optional<TextureMappingOffsetContext> context =
-        build_texture_mapping_offset_context_for_layer(*print_object, *layer, zone, texture_zone_id, 0, base_outer_width_mm);
+        build_texture_mapping_offset_context_for_layer(*print_object,
+                                                       *layer,
+                                                       zone,
+                                                       texture_zone_id,
+                                                       0,
+                                                       base_outer_width_mm,
+                                                       std::nullopt,
+                                                       std::nullopt,
+                                                       std::nullopt,
+                                                       std::nullopt,
+                                                       std::nullopt,
+                                                       std::nullopt,
+                                                       std::nullopt,
+                                                       filament_overhang_contrast_override);
     if (!context || print->canceled() || context->component_ids.empty())
         return std::nullopt;
 
@@ -2598,7 +2615,17 @@ static SurfaceCollection perimeter_path_modulated_surfaces(const LayerRegion    
                                                            zone,
                                                            texture_zone_id,
                                                            0,
-                                                           base_outer_width_mm);
+                                                           base_outer_width_mm,
+                                                           std::nullopt,
+                                                           std::nullopt,
+                                                           std::nullopt,
+                                                           std::nullopt,
+                                                           std::nullopt,
+                                                           std::nullopt,
+                                                           std::nullopt,
+                                                           zone.top_surface_contoning_perimeters_active() ?
+                                                               std::optional<float>(TextureMappingZone::DefaultFilamentOverhangContrastPct) :
+                                                               std::nullopt);
         if (!built_context)
             return slices;
         context = &*built_context;

@@ -5765,7 +5765,8 @@ static std::optional<TopSurfaceImageContoningSourceContext> top_surface_image_co
                                                                                                 zone.generic_solver_mix_model),
                                                        sample_z_mm,
                                                        top_surface_image_contoning_texture_sample_pitch_mm(plan),
-                                                       raw_top_surface_depth_override);
+                                                       raw_top_surface_depth_override,
+                                                       TextureMappingZone::DefaultFilamentOverhangContrastPct);
     if (!offset_context)
         return std::nullopt;
 
@@ -12305,7 +12306,11 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree,
                                                                    float(this->height),
                                                                    std::nullopt,
                                                                    surface_fill.params.texture_mapping_top_surface_min_width_mm,
-                                                                   background);
+                                                                   background,
+                                                                   std::nullopt,
+                                                                   std::nullopt,
+                                                                   std::nullopt,
+                                                                   TextureMappingZone::DefaultFilamentOverhangContrastPct);
             }
         }
 

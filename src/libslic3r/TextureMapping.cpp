@@ -2451,7 +2451,7 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            dithering_method == rhs.dithering_method &&
            std::abs(dithering_resolution_mm - rhs.dithering_resolution_mm) <= eps &&
            std::abs(halftone_dot_size_mm - rhs.halftone_dot_size_mm) <= eps &&
-           std::abs(contrast_pct - rhs.contrast_pct) <= eps &&
+           std::abs(filament_overhang_contrast_pct - rhs.filament_overhang_contrast_pct) <= eps &&
            high_resolution_sampling == rhs.high_resolution_sampling &&
            std::abs(tone_gamma - rhs.tone_gamma) <= eps &&
            transmission_distance_calibration_mode == rhs.transmission_distance_calibration_mode &&
@@ -2894,7 +2894,11 @@ std::string TextureMappingManager::serialize_entries()
             std::clamp(finite_or(zone.halftone_dot_size_mm, TextureMappingZone::DefaultHalftoneDotSizeMm),
                        TextureMappingZone::MinHalftoneDotSizeMm,
                        TextureMappingZone::MaxHalftoneDotSizeMm);
-        texture["contrast_pct"] = std::clamp(finite_or(zone.contrast_pct, 100.f), 25.f, 300.f);
+        texture["filament_overhang_contrast_pct"] =
+            std::clamp(finite_or(zone.filament_overhang_contrast_pct,
+                                 TextureMappingZone::DefaultFilamentOverhangContrastPct),
+                       25.f,
+                       300.f);
         texture["high_resolution_sampling"] = true;
         texture["tone_gamma"] = normalize_tone_gamma(zone.tone_gamma);
         texture["transmission_distance_calibration"] =
@@ -3284,7 +3288,12 @@ void TextureMappingManager::load_entries(const std::string &serialized,
                        TextureMappingZone::MaxHalftoneDotSizeMm);
         if (zone.dithering_enabled)
             zone.compact_offset_mode = true;
-        zone.contrast_pct = std::clamp(texture.value("contrast_pct", 100.f), 25.f, 300.f);
+        zone.filament_overhang_contrast_pct =
+            std::clamp(texture.value("filament_overhang_contrast_pct",
+                                     texture.value("contrast_pct",
+                                                   TextureMappingZone::DefaultFilamentOverhangContrastPct)),
+                       25.f,
+                       300.f);
         zone.high_resolution_sampling = true;
         zone.tone_gamma = normalize_tone_gamma(texture.value("tone_gamma", 1.f));
         zone.transmission_distance_calibration_mode = transmission_distance_calibration_mode_from_json(texture);

@@ -259,7 +259,7 @@ struct TextureMappingZone
     static constexpr float MinHalftoneDotSizeMm = 0.08f;
     static constexpr float MaxHalftoneDotSizeMm = 50.f;
     static constexpr float DefaultHalftoneDotSizeMm = 2.f;
-    static constexpr float DefaultContrastPct = 100.f;
+    static constexpr float DefaultFilamentOverhangContrastPct = 100.f;
     static constexpr bool  DefaultHighResolutionSampling = true;
     static constexpr float DefaultToneGamma = 1.f;
     static constexpr int   DefaultTransmissionDistanceCalibrationMode = int(TDCalibrationAbsolute);
@@ -533,7 +533,7 @@ struct TextureMappingZone
     int         dithering_method = DefaultDitheringMethod;
     float       dithering_resolution_mm = DefaultDitheringResolutionMm;
     float       halftone_dot_size_mm = DefaultHalftoneDotSizeMm;
-    float       contrast_pct = DefaultContrastPct;
+    float       filament_overhang_contrast_pct = DefaultFilamentOverhangContrastPct;
     bool        high_resolution_sampling = DefaultHighResolutionSampling;
     float       tone_gamma = DefaultToneGamma;
     int         transmission_distance_calibration_mode = DefaultTransmissionDistanceCalibrationMode;
@@ -840,7 +840,7 @@ struct TextureMappingZone
         dithering_method = DefaultDitheringMethod;
         dithering_resolution_mm = DefaultDitheringResolutionMm;
         halftone_dot_size_mm = DefaultHalftoneDotSizeMm;
-        contrast_pct = DefaultContrastPct;
+        filament_overhang_contrast_pct = DefaultFilamentOverhangContrastPct;
         high_resolution_sampling = DefaultHighResolutionSampling;
         tone_gamma = DefaultToneGamma;
         transmission_distance_calibration_mode = DefaultTransmissionDistanceCalibrationMode;
