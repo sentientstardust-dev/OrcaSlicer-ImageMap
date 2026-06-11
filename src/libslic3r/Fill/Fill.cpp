@@ -10640,19 +10640,6 @@ static void top_surface_image_reorder_boundary_skin_entities(ExtrusionEntityColl
     reorder_extrusion_entities(collection.entities, chain_extrusion_entities(collection.entities, &start_near));
 }
 
-static coord_t top_surface_image_boundary_skin_split_depth(const Flow &flow)
-{
-    return std::max<coord_t>(1, flow.scaled_spacing() + scaled<coord_t>(0.04));
-}
-
-static ExPolygons top_surface_image_boundary_skin_interior(const Surface &surface, const Flow &flow)
-{
-    return top_surface_clip_offset_ex(surface.expolygon,
-                                      -float(top_surface_image_boundary_skin_split_depth(flow)),
-                                      DefaultJoinType,
-                                      DefaultMiterLimit);
-}
-
 static void top_surface_image_append_boundary_skin_path_coverage(const ExtrusionPath &path,
                                                                  ExPolygons &out,
                                                                  const float scaled_epsilon)
@@ -10711,20 +10698,22 @@ static void top_surface_image_append_boundary_skin_coverage(const ExtrusionEntit
 }
 
 static ExPolygons top_surface_image_boundary_skin_leftover(const Surface &surface,
-                                                           const ExtrusionEntityCollection &collection)
+                                                           const ExtrusionEntityCollection &collection,
+                                                           const float scaled_epsilon,
+                                                           ApplySafetyOffset do_safety_offset)
 {
     ExPolygons target { surface.expolygon };
     if (collection.empty())
         return target;
     ExPolygons covered_paths;
-    top_surface_image_append_boundary_skin_coverage(collection, covered_paths, float(scale_(0.02)));
+    top_surface_image_append_boundary_skin_coverage(collection, covered_paths, scaled_epsilon);
     if (covered_paths.empty())
         return target;
     ExPolygons covered_area = top_surface_clip_union_ex(covered_paths);
-    ExPolygons covered = top_surface_clip_intersection_ex(covered_area, target, ApplySafetyOffset::Yes);
+    ExPolygons covered = top_surface_clip_intersection_ex(covered_area, target, do_safety_offset);
     if (covered.empty())
         return target;
-    return top_surface_clip_diff_ex(target, covered, ApplySafetyOffset::Yes);
+    return top_surface_clip_diff_ex(target, covered, do_safety_offset);
 }
 
 static bool top_surface_image_contoning_connector_printable(const ExPolygon &area,
@@ -10878,7 +10867,10 @@ static std::unique_ptr<ExtrusionEntityCollection> top_surface_image_spiral_colle
         collection->entities.emplace_back(path);
     }
     if (leftover != nullptr)
-        *leftover = top_surface_image_boundary_skin_leftover(surface, *collection);
+        *leftover = top_surface_image_boundary_skin_leftover(surface,
+                                                             *collection,
+                                                             float(scale_(0.02)),
+                                                             ApplySafetyOffset::Yes);
     return collection;
 }
 
@@ -10919,18 +10911,8 @@ static std::unique_ptr<ExtrusionEntityCollection> top_surface_image_boundary_ski
     const coordf_t min_spacing = std::max<coordf_t>(1.0, min_flow.scaled_spacing());
     const coordf_t max_spacing = std::max<coordf_t>(min_spacing, max_flow.scaled_spacing());
     const coordf_t output_spacing = std::max<coordf_t>(1.0, output_flow.scaled_spacing());
-    ExPolygons fallback_interior = top_surface_image_boundary_skin_interior(surface, output_flow);
-    ExPolygons boundary_area { surface.expolygon };
-    if (!variable && !fallback_interior.empty()) {
-        ExPolygons split_boundary_area =
-            top_surface_clip_diff_ex(boundary_area, fallback_interior, ApplySafetyOffset::Yes);
-        if (!split_boundary_area.empty())
-            boundary_area = std::move(split_boundary_area);
-        else
-            fallback_interior.clear();
-    }
-
-    Polygons outline = variable ? to_polygons(surface.expolygon) : to_polygons(boundary_area);
+    ExPolygons target_area { surface.expolygon };
+    Polygons outline = to_polygons(target_area);
     if (!outline.empty()) {
         Arachne::WallToolPathsParams input_params =
             Arachne::make_paths_params(layer_id, object_config, print_config);
@@ -10943,7 +10925,7 @@ static std::unique_ptr<ExtrusionEntityCollection> top_surface_image_boundary_ski
             (!std::isfinite(input_params.min_length_factor) || input_params.min_length_factor <= 0.f) ?
                 0.5f :
                 std::min(input_params.min_length_factor, 0.5f);
-        input_params.wall_distribution_count = std::max(1, input_params.wall_distribution_count);
+        input_params.wall_distribution_count = 1;
         input_params.is_top_or_bottom_layer = true;
 
         Arachne::WallToolPaths wall_tool_paths(outline,
@@ -10959,6 +10941,8 @@ static std::unique_ptr<ExtrusionEntityCollection> top_surface_image_boundary_ski
         for (Arachne::VariableWidthLines &loop : loops) {
             check_canceled(throw_if_canceled);
             for (const Arachne::ExtrusionLine &wall : loop) {
+                if (wall.inset_idx != 0)
+                    continue;
                 if (wall.size() < 2)
                     continue;
                 ThickPolyline thick_polyline = Arachne::to_thick_polyline(wall);
@@ -11013,10 +10997,11 @@ static std::unique_ptr<ExtrusionEntityCollection> top_surface_image_boundary_ski
     if (leftover != nullptr) {
         if (collection->empty())
             *leftover = ExPolygons { surface.expolygon };
-        else if (!fallback_interior.empty())
-            *leftover = std::move(fallback_interior);
         else
-            *leftover = top_surface_image_boundary_skin_leftover(surface, *collection);
+            *leftover = top_surface_image_boundary_skin_leftover(surface,
+                                                                 *collection,
+                                                                 0.f,
+                                                                 ApplySafetyOffset::No);
     }
     return collection;
 }
@@ -13092,7 +13077,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree,
                 fallback_params.flow = fallback_flow;
                 fallback_params.pattern = ipRectilinear;
                 fallback_params.no_edge_overlap = true;
-                fallback_params.edge_overlap_width_factor = 0.5f;
+                fallback_params.edge_overlap_width_factor = 0.0f;
                 ExtrusionEntitiesPtr hybrid_interior_entities;
                 if (!hybrid_boundary_skin && collection && !collection->empty()) {
                     apply_top_surface_image_collection_metadata(*collection, surface_fill.params, std::nullopt, throw_if_canceled_ptr);
