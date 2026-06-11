@@ -3640,7 +3640,7 @@ public:
         }
         if (m_top_surface_contoning_td_correction_choice != nullptr) {
             m_top_surface_contoning_td_correction_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) {
-                sync_top_surface_contoning_nearest_measured_sample_pattern_length();
+                sync_top_surface_contoning_calibrated_pattern_length();
                 update_top_surface_color_calibration_label();
                 update_top_surface_image_options_visibility(false);
                 queue_top_surface_contoning_message_update(true);
@@ -4037,7 +4037,7 @@ public:
     }
     int top_surface_contoning_pattern_filaments() const
     {
-        if (const int fixed_pattern_filaments = top_surface_contoning_nearest_measured_sample_pattern_filaments(); fixed_pattern_filaments > 0)
+        if (const int fixed_pattern_filaments = top_surface_contoning_calibrated_pattern_filaments(); fixed_pattern_filaments > 0)
             return fixed_pattern_filaments;
         return m_top_surface_contoning_pattern_filaments_spin ?
             std::clamp(m_top_surface_contoning_pattern_filaments_spin->GetValue(),
@@ -4219,21 +4219,12 @@ public:
             m_top_surface_contoning_color_prediction_modes[size_t(selection)] :
             TextureMappingZone::DefaultTopSurfaceContoningColorPredictionMode;
     }
-    int top_surface_contoning_nearest_measured_sample_pattern_filaments() const
+    int top_surface_contoning_calibrated_pattern_filaments() const
     {
-        if (TextureMappingZone::effective_top_surface_contoning_color_prediction_mode(
-                top_surface_contoning_color_prediction_mode()) !=
-            int(TextureMappingZone::ContoningColorPredictionCalibratedNearestMeasuredSample))
-            return 0;
-        std::optional<TextureMappingColorCalibration> calibration =
-            texture_mapping_parse_top_surface_color_calibration(m_top_surface_color_calibration_json);
-        if (!calibration ||
-            !calibration->nearest_measured_sample.valid() ||
-            calibration->nearest_measured_sample.measured_stack_depth <= 0)
-            return 0;
-        return std::clamp(calibration->nearest_measured_sample.measured_stack_depth,
-                          TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
-                          TextureMappingZone::MaxTopSurfaceContoningPatternFilaments);
+        TextureMappingZone zone;
+        zone.top_surface_contoning_color_prediction_mode = top_surface_contoning_color_prediction_mode();
+        zone.top_surface_color_calibration_json = m_top_surface_color_calibration_json;
+        return texture_mapping_top_surface_contoning_calibrated_pattern_filaments(zone);
     }
     std::string top_surface_color_calibration_name() const
     {
@@ -4618,14 +4609,14 @@ private:
             it != m_top_surface_contoning_color_prediction_modes.end() ?
                 int(it - m_top_surface_contoning_color_prediction_modes.begin()) :
                 0);
-        sync_top_surface_contoning_nearest_measured_sample_pattern_length();
+        sync_top_surface_contoning_calibrated_pattern_length();
     }
 
-    void sync_top_surface_contoning_nearest_measured_sample_pattern_length()
+    void sync_top_surface_contoning_calibrated_pattern_length()
     {
         if (m_top_surface_contoning_pattern_filaments_spin == nullptr)
             return;
-        const int fixed_pattern_filaments = top_surface_contoning_nearest_measured_sample_pattern_filaments();
+        const int fixed_pattern_filaments = top_surface_contoning_calibrated_pattern_filaments();
         if (fixed_pattern_filaments > 0) {
             m_top_surface_contoning_pattern_filaments_spin->SetValue(fixed_pattern_filaments);
             enforce_top_surface_contoning_stack_depth_at_least_pattern();
@@ -5604,11 +5595,11 @@ private:
             m_top_surface_contoning_angle_threshold_spin->Enable(contoning);
         if (m_top_surface_contoning_stack_layers_spin != nullptr)
             m_top_surface_contoning_stack_layers_spin->Enable(contoning);
-        const bool nearest_measured_sample_fixed_pattern =
-            top_surface_contoning_nearest_measured_sample_pattern_filaments() > 0;
+        const bool calibrated_fixed_pattern =
+            top_surface_contoning_calibrated_pattern_filaments() > 0;
         if (m_top_surface_contoning_pattern_filaments_spin != nullptr) {
-            sync_top_surface_contoning_nearest_measured_sample_pattern_length();
-            m_top_surface_contoning_pattern_filaments_spin->Enable(contoning && !nearest_measured_sample_fixed_pattern);
+            sync_top_surface_contoning_calibrated_pattern_length();
+            m_top_surface_contoning_pattern_filaments_spin->Enable(contoning && !calibrated_fixed_pattern);
         }
         if (m_top_surface_contoning_flat_surface_infill_choice != nullptr)
             m_top_surface_contoning_flat_surface_infill_choice->Enable(contoning);

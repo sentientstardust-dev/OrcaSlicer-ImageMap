@@ -946,6 +946,7 @@ std::optional<TextureMappingSideSurfaceColorCalibration> texture_mapping_parse_s
     std::string       *error = nullptr);
 std::vector<int> texture_mapping_top_surface_color_calibration_supported_modes(const std::string &json_text);
 int texture_mapping_top_surface_color_calibration_first_supported_mode(const std::string &json_text);
+int texture_mapping_top_surface_contoning_calibrated_pattern_filaments(const TextureMappingZone &zone);
 std::string texture_mapping_top_surface_color_calibration_display_name(const std::string &json_text);
 std::string texture_mapping_side_surface_color_calibration_display_name(const std::string &json_text);
 std::string texture_mapping_top_surface_color_calibration_warning(const TextureMappingZone                  &zone,

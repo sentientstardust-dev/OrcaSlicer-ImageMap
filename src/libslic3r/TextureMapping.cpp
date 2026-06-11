@@ -2193,6 +2193,26 @@ int texture_mapping_top_surface_color_calibration_first_supported_mode(const std
     return best_mode;
 }
 
+int texture_mapping_top_surface_contoning_calibrated_pattern_filaments(const TextureMappingZone &zone)
+{
+    const int mode = TextureMappingZone::effective_top_surface_contoning_color_prediction_mode(
+        zone.top_surface_contoning_color_prediction_mode);
+    if (!TextureMappingZone::top_surface_contoning_color_prediction_mode_is_calibrated(mode))
+        return 0;
+
+    std::optional<TextureMappingColorCalibration> calibration =
+        texture_mapping_parse_top_surface_color_calibration(zone.top_surface_color_calibration_json);
+    if (!calibration ||
+        !calibration->has_mode(mode) ||
+        !calibration->nearest_measured_sample.valid() ||
+        calibration->nearest_measured_sample.measured_stack_depth <= 0)
+        return 0;
+
+    return std::clamp(calibration->nearest_measured_sample.measured_stack_depth,
+                      TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
+                      TextureMappingZone::MaxTopSurfaceContoningPatternFilaments);
+}
+
 std::string texture_mapping_top_surface_color_calibration_display_name(const std::string &json_text)
 {
     std::optional<TextureMappingColorCalibration> calibration =
@@ -2820,10 +2840,14 @@ std::string TextureMappingManager::serialize_entries()
                                  TextureMappingZone::DefaultTopSurfaceContoningAngleThresholdDeg),
                        TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg,
                        TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg);
+        const int calibrated_pattern_filaments =
+            texture_mapping_top_surface_contoning_calibrated_pattern_filaments(zone);
         const int top_surface_contoning_pattern_filaments =
-            clamp_int(zone.top_surface_contoning_pattern_filaments,
-                      TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
-                      TextureMappingZone::MaxTopSurfaceContoningPatternFilaments);
+            calibrated_pattern_filaments > 0 ?
+                calibrated_pattern_filaments :
+                clamp_int(zone.top_surface_contoning_pattern_filaments,
+                          TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
+                          TextureMappingZone::MaxTopSurfaceContoningPatternFilaments);
         texture["top_surface_contoning_stack_layers"] =
             std::max(top_surface_contoning_pattern_filaments,
                      clamp_int(zone.top_surface_contoning_stack_layers,
@@ -3280,6 +3304,14 @@ void TextureMappingManager::load_entries(const std::string &serialized,
             if (std::find(modes.begin(), modes.end(), zone.top_surface_contoning_color_prediction_mode) == modes.end())
                 zone.top_surface_contoning_color_prediction_mode =
                     texture_mapping_top_surface_color_calibration_first_supported_mode(zone.top_surface_color_calibration_json);
+        }
+        if (const int calibrated_pattern_filaments =
+                texture_mapping_top_surface_contoning_calibrated_pattern_filaments(zone);
+            calibrated_pattern_filaments > 0) {
+            zone.top_surface_contoning_pattern_filaments = calibrated_pattern_filaments;
+            zone.top_surface_contoning_stack_layers =
+                std::max(zone.top_surface_contoning_stack_layers,
+                         zone.top_surface_contoning_pattern_filaments);
         }
         zone.side_surface_color_calibration_name =
             texture.value("side_surface_color_calibration_name", std::string());

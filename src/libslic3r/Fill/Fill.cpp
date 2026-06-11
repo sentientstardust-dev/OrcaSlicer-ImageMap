@@ -8852,12 +8852,19 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
         plan.colored_top_layers = std::clamp(zone->top_surface_image_colored_top_layers,
                                              TextureMappingZone::MinTopSurfaceImageColoredTopLayers,
                                              TextureMappingZone::MaxTopSurfaceImageColoredTopLayers);
-        plan.contoning_stack_layers = std::clamp(zone->top_surface_contoning_stack_layers,
-                                                 TextureMappingZone::MinTopSurfaceContoningStackLayers,
-                                                 TextureMappingZone::MaxTopSurfaceContoningStackLayers);
-        plan.contoning_pattern_filaments = std::clamp(zone->top_surface_contoning_pattern_filaments,
-                                                      TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
-                                                      TextureMappingZone::MaxTopSurfaceContoningPatternFilaments);
+        const int calibrated_pattern_filaments =
+            texture_mapping_top_surface_contoning_calibrated_pattern_filaments(*zone);
+        plan.contoning_pattern_filaments =
+            calibrated_pattern_filaments > 0 ?
+                calibrated_pattern_filaments :
+                std::clamp(zone->top_surface_contoning_pattern_filaments,
+                           TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
+                           TextureMappingZone::MaxTopSurfaceContoningPatternFilaments);
+        plan.contoning_stack_layers =
+            std::max(plan.contoning_pattern_filaments,
+                     std::clamp(zone->top_surface_contoning_stack_layers,
+                                TextureMappingZone::MinTopSurfaceContoningStackLayers,
+                                TextureMappingZone::MaxTopSurfaceContoningStackLayers));
         plan.contoning_external_width_mm = float(layerm->flow(frExternalPerimeter).width());
         plan.contoning_min_feature_mm =
             texture_mapping_contoning_min_feature_mm(*zone, print_config, components, plan.contoning_external_width_mm);
