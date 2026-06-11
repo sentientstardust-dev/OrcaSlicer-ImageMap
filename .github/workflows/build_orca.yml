@@ -21,6 +21,10 @@ on:
           required: false
           type: string
           default: ''
+        build_windows_installer:
+          required: false
+          type: boolean
+          default: false
         build_without_pch_windows:
           required: false
           type: boolean
@@ -376,7 +380,7 @@ jobs:
         run: sccache --show-stats
 
       - name: Create installer Win
-        if: runner.os == 'Windows' && !vars.SELF_HOSTED
+        if: runner.os == 'Windows' && !vars.SELF_HOSTED && inputs.build_windows_installer
         working-directory: ${{ github.workspace }}/build
         run: |
           cpack -G NSIS
@@ -398,7 +402,7 @@ jobs:
           path: ${{ github.workspace }}/build/OrcaSlicer-ImageMap_Windows_${{ env.ver }}_portable.zip
 
       - name: Upload artifacts Win installer
-        if: runner.os == 'Windows' && !vars.SELF_HOSTED
+        if: runner.os == 'Windows' && !vars.SELF_HOSTED && inputs.build_windows_installer
         uses: actions/upload-artifact@v7
         with:
           name: OrcaSlicer-ImageMap_Windows_${{ env.ver }}
@@ -423,7 +427,7 @@ jobs:
           max_releases: 1
 
       - name: Deploy Windows release installer
-        if: github.repository == 'OrcaSlicer/OrcaSlicer' && github.ref == 'refs/heads/main' && runner.os == 'Windows' && !vars.SELF_HOSTED
+        if: github.repository == 'OrcaSlicer/OrcaSlicer' && github.ref == 'refs/heads/main' && runner.os == 'Windows' && !vars.SELF_HOSTED && inputs.build_windows_installer
         uses: WebFreak001/deploy-nightly@v3.2.0
         with:
           upload_url: https://uploads.github.com/repos/OrcaSlicer/OrcaSlicer/releases/137995723/assets{?name,label}

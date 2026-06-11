@@ -26,6 +26,10 @@ on:
         required: false
         type: string
         default: ''
+      build_windows_installer:
+        required: false
+        type: boolean
+        default: false
       build_without_pch_windows:
         required: false
         type: boolean
@@ -146,5 +150,6 @@ jobs:
       os: ${{ inputs.os }}
       arch: ${{ inputs.arch }}
       release-version: ${{ inputs.release-version }}
+      build_windows_installer: ${{ inputs.build_windows_installer }}
       build_without_pch_windows: ${{ inputs.build_without_pch_windows }}
     secrets: inherit

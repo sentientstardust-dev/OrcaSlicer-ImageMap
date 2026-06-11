@@ -21,6 +21,10 @@ on:
         description: 'Build Windows artifacts'
         type: boolean
         default: true
+      build_windows_installer:
+        description: 'Build Windows installer'
+        type: boolean
+        default: false
       build_without_pch_windows:
         description: 'Build without PCH (windows)'
         type: boolean
@@ -71,6 +75,7 @@ jobs:
       build-deps-only: ${{ inputs.build-deps-only || false }}
       force-build: false
       release-version: ${{ inputs.release_version || '' }}
+      build_windows_installer: ${{ inputs.build_windows_installer || false }}
       build_without_pch_windows: ${{ inputs.build_without_pch_windows || false }}
     secrets: inherit
   build_macos_arch:
