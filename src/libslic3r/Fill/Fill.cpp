@@ -1247,21 +1247,33 @@ static void top_surface_image_debug_write_manifest_locked(const TopSurfaceImageD
     out << root.dump(2) << '\n';
 }
 
+static void top_surface_image_debug_register_layer_file_export(int layer_id,
+                                                               double z_mm,
+                                                               const std::string &phase,
+                                                               TopSurfaceImageDebugFileExport file)
+{
+    TopSurfaceImageDebugLayerExport entry;
+    entry.layer_id = layer_id;
+    entry.z_mm = z_mm;
+    entry.phase = phase;
+    entry.files.push_back(std::move(file));
+    TopSurfaceImageDebugManifest &manifest = top_surface_image_debug_manifest();
+    std::lock_guard<std::mutex> lock(manifest.mutex);
+    manifest.layers.emplace_back(std::move(entry));
+    top_surface_image_debug_write_manifest_locked(manifest);
+}
+
 static void top_surface_image_debug_register_layer_export(int layer_id,
                                                           double z_mm,
                                                           const std::string &phase,
                                                           const std::string &path,
                                                           const BoundingBox &bbox)
 {
-    TopSurfaceImageDebugLayerExport entry;
-    entry.layer_id = layer_id;
-    entry.z_mm = z_mm;
-    entry.phase = phase;
-    entry.files.push_back(top_surface_image_debug_file_export("layer_svg", path, bbox));
-    TopSurfaceImageDebugManifest &manifest = top_surface_image_debug_manifest();
-    std::lock_guard<std::mutex> lock(manifest.mutex);
-    manifest.layers.emplace_back(std::move(entry));
-    top_surface_image_debug_write_manifest_locked(manifest);
+    top_surface_image_debug_register_layer_file_export(
+        layer_id,
+        z_mm,
+        phase,
+        top_surface_image_debug_file_export("layer_svg", path, bbox));
 }
 
 static void top_surface_image_debug_export_object_mesh(const PrintObject &object)
@@ -4046,6 +4058,37 @@ static std::vector<ExPolygons> top_surface_image_contoning_vector_border_shared_
     return areas;
 }
 
+static bool top_surface_image_contoning_areas_exceed_target_partition(const std::vector<ExPolygons> &areas,
+                                                                      const std::vector<int>        &ids,
+                                                                      const std::vector<int>        &cell_counts,
+                                                                      const ExPolygons             &target_area,
+                                                                      const ThrowIfCanceled        *throw_if_canceled)
+{
+    const double target_area_abs = top_surface_image_abs_area(target_area);
+    if (target_area_abs <= 0.)
+        return false;
+
+    int total_cells = 0;
+    for (int id : ids)
+        if (id >= 0 && size_t(id) < cell_counts.size())
+            total_cells += cell_counts[size_t(id)];
+
+    double summed_area = 0.;
+    for (int id : ids) {
+        check_canceled(throw_if_canceled);
+        if (id < 0 || size_t(id) >= areas.size())
+            continue;
+        const double area_abs = top_surface_image_abs_area(areas[size_t(id)]);
+        summed_area += area_abs;
+        if (total_cells > 0 && size_t(id) < cell_counts.size() && cell_counts[size_t(id)] > 0) {
+            const double cell_fraction = double(cell_counts[size_t(id)]) / double(total_cells);
+            if (area_abs > target_area_abs * 0.90 && cell_fraction < 0.80)
+                return true;
+        }
+    }
+    return summed_area > target_area_abs * 1.10;
+}
+
 static std::vector<ExPolygons> top_surface_image_contoning_mid_gaussian_shared_chain_fit_areas(
     const std::vector<int> &grid,
     int                     cols,
@@ -4278,21 +4321,28 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
         effective_polygonization_mode == int(TextureMappingZone::ContoningPolygonizationMarchingSquares);
     const ExPolygons empty_blocked_area;
     ExPolygons valid_area;
+    bool valid_area_initialized = false;
+    auto ensure_valid_area = [&]() -> bool {
+        if (!valid_area_initialized) {
+            valid_area = top_surface_image_contoning_area_from_grid_label(valid_grid,
+                                                                          cols,
+                                                                          rows,
+                                                                          1,
+                                                                          min_x,
+                                                                          min_y,
+                                                                          step,
+                                                                          bbox,
+                                                                          area,
+                                                                          empty_blocked_area,
+                                                                          min_feature_mm,
+                                                                          cleanup_optimizations_enabled,
+                                                                          throw_if_canceled);
+            valid_area_initialized = true;
+        }
+        return !valid_area.empty();
+    };
     if (!raw_partition_hierarchy_convert && !mid_gaussian_shared_chain_fit) {
-        valid_area = top_surface_image_contoning_area_from_grid_label(valid_grid,
-                                                                      cols,
-                                                                      rows,
-                                                                      1,
-                                                                      min_x,
-                                                                      min_y,
-                                                                      step,
-                                                                      bbox,
-                                                                      area,
-                                                                      empty_blocked_area,
-                                                                      min_feature_mm,
-                                                                      cleanup_optimizations_enabled,
-                                                                      throw_if_canceled);
-        if (valid_area.empty())
+        if (!ensure_valid_area())
             return regions;
     }
 
@@ -4337,6 +4387,29 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                                             step,
                                                                             bbox,
                                                                             throw_if_canceled);
+        const bool has_valid_area = ensure_valid_area();
+        const ExPolygons &partition_target_area = has_valid_area ? valid_area : area;
+        if (has_valid_area &&
+            top_surface_image_contoning_areas_exceed_target_partition(component_areas,
+                                                                      component_order,
+                                                                      cell_counts,
+                                                                      partition_target_area,
+                                                                      throw_if_canceled)) {
+            component_areas =
+                top_surface_image_contoning_vector_border_shared_gaussian_partition_areas(component_grid,
+                                                                                          cols,
+                                                                                          rows,
+                                                                                          component_order,
+                                                                                          size_t(max_component_id) + 1,
+                                                                                          min_x,
+                                                                                          min_y,
+                                                                                          step,
+                                                                                          bbox,
+                                                                                          valid_area,
+                                                                                          min_feature_mm,
+                                                                                          cleanup_optimizations_enabled,
+                                                                                          throw_if_canceled);
+        }
         for (int component_id : component_order) {
             check_canceled(throw_if_canceled);
             if (component_id <= 0 || size_t(component_id) >= component_areas.size() ||
@@ -4508,6 +4581,26 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                                             step,
                                                                             bbox,
                                                                             throw_if_canceled);
+        if (top_surface_image_contoning_areas_exceed_target_partition(label_areas,
+                                                                      label_order,
+                                                                      cell_counts,
+                                                                      area,
+                                                                      throw_if_canceled)) {
+            label_areas =
+                top_surface_image_contoning_vector_border_shared_gaussian_partition_areas(label_grid,
+                                                                                          cols,
+                                                                                          rows,
+                                                                                          label_order,
+                                                                                          labels.size(),
+                                                                                          min_x,
+                                                                                          min_y,
+                                                                                          step,
+                                                                                          bbox,
+                                                                                          area,
+                                                                                          min_feature_mm,
+                                                                                          cleanup_optimizations_enabled,
+                                                                                          throw_if_canceled);
+        }
         for (int label : label_order) {
             check_canceled(throw_if_canceled);
             if (label < 0 || size_t(label) >= label_areas.size() || label_areas[size_t(label)].empty())
@@ -5414,6 +5507,7 @@ static std::optional<TopSurfaceImageContoningCellSample> top_surface_image_conto
     const ExPolygons                   &normal_filter_bypass_area,
     int                                 stack_layers,
     int                                 pattern_filaments,
+    int                                 minimum_solve_layers,
     int                                 depth,
     coord_t                             x0,
     coord_t                             y0,
@@ -5432,7 +5526,9 @@ static std::optional<TopSurfaceImageContoningCellSample> top_surface_image_conto
             top_surface_image_contoning_local_stack_layers_at_point(sample_point, source_stack_areas, stack_layers);
         if (local_stack_layers <= 0 || (depth >= 0 && depth >= local_stack_layers))
             return;
-        const int solve_layers = std::min({ local_stack_layers, stack_layers, pattern_filaments });
+        int solve_layers = std::min({ local_stack_layers, stack_layers, pattern_filaments });
+        if (minimum_solve_layers > 0)
+            solve_layers = std::max(solve_layers, std::min({ minimum_solve_layers, stack_layers, pattern_filaments }));
         if (solve_layers <= 0)
             return;
         const float sample_x_mm = unscale<float>(sample_point.x());
@@ -5623,6 +5719,10 @@ static void top_surface_image_contoning_resolve_merged_grid_regions(
     std::vector<TopSurfaceImageContoningVectorLabel> resolved_labels;
     TopSurfaceImageContoningStackLabelMap label_by_stack;
     std::vector<unsigned char> visited(grid.size(), 0);
+    const int minimum_solve_layers =
+        lower_surface && solver.nearest_measured_sample_mode() ?
+            std::min(stack_layers, pattern_filaments) :
+            0;
 
     auto append_fallback_label = [&](int source_label) {
         if (source_label < 0 || source_label >= int(labels.size()))
@@ -5700,7 +5800,11 @@ static void top_surface_image_contoning_resolve_merged_grid_regions(
                     float(oklab_sum[2] / sample_weight)
                 };
                 const std::array<float, 3> average_rgb = color_solver_srgb_from_oklab(average_oklab);
-                const int solve_layers = std::min({ visible_layers, stack_layers, pattern_filaments });
+                int solve_layers = std::min({ visible_layers, stack_layers, pattern_filaments });
+                if (minimum_solve_layers > 0) {
+                    solve_layers = std::max(solve_layers, minimum_solve_layers);
+                    visible_layers = std::max(visible_layers, solve_layers);
+                }
                 if (solve_layers > 0) {
                     std::optional<TopSurfaceImageContoningSolvedLabel> solved =
                         top_surface_image_contoning_solve_label(average_rgb,
@@ -5901,6 +6005,10 @@ static void top_surface_image_contoning_solve_anchored_region(
     const bool lower_surface =
         source_surface == TopSurfaceImageSourceSurface::Bottom &&
         plan.contoning_td_adjustment_enabled;
+    const int minimum_solve_layers =
+        lower_surface && solver.nearest_measured_sample_mode() ?
+            std::min(source_context.stack_layers, source_context.pattern_filaments) :
+            0;
 
     auto label_cell = [&](int row, int col, const TextureMappingContoningStack &stack, int available_depth) {
         std::optional<TopSurfaceImageContoningSolvedLabel> solved =
@@ -5931,6 +6039,7 @@ static void top_surface_image_contoning_solve_anchored_region(
                                                        source_context.normal_filter_bypass_area,
                                                        source_context.stack_layers,
                                                        source_context.pattern_filaments,
+                                                       minimum_solve_layers,
                                                        -1,
                                                        x0,
                                                        y0,
@@ -7576,6 +7685,12 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
     std::vector<int> grid(size_t(cols) * size_t(rows), -1);
     std::vector<TopSurfaceImageContoningVectorLabel> labels;
     TopSurfaceImageContoningStackLabelMap label_by_stack;
+    const int minimum_solve_layers =
+        source_surface == TopSurfaceImageSourceSurface::Bottom &&
+        plan.contoning_td_adjustment_enabled &&
+        solver.nearest_measured_sample_mode() ?
+            std::min(source->stack_layers, source->pattern_filaments) :
+            0;
 
     auto solve_cell = [&](int row, int col, const std::array<float, 3> &target_rgb, int solve_layers, int) {
         std::optional<TopSurfaceImageContoningSolvedLabel> solved =
@@ -7607,6 +7722,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                        source->normal_filter_bypass_area,
                                                        source->stack_layers,
                                                        source->pattern_filaments,
+                                                       minimum_solve_layers,
                                                        depth,
                                                        x0,
                                                        y0,
@@ -7792,6 +7908,12 @@ static std::shared_ptr<const TopSurfaceImageContoningStackPlan> top_surface_imag
     out->cells.assign(size_t(cols) * size_t(rows), TopSurfaceImageContoningStackPlanCell());
 
     TopSurfaceImageContoningStackLabelMap label_by_stack;
+    const int minimum_solve_layers =
+        source_surface == TopSurfaceImageSourceSurface::Bottom &&
+        plan.contoning_td_adjustment_enabled &&
+        solver.nearest_measured_sample_mode() ?
+            std::min(source_context->stack_layers, source_context->pattern_filaments) :
+            0;
 
     auto solve_cell = [&](int row, int col, const std::array<float, 3> &target_rgb, int solve_layers, int available_depth) {
         std::optional<TopSurfaceImageContoningSolvedLabel> solved =
@@ -7825,6 +7947,7 @@ static std::shared_ptr<const TopSurfaceImageContoningStackPlan> top_surface_imag
                                                        source_context->normal_filter_bypass_area,
                                                        source_context->stack_layers,
                                                        source_context->pattern_filaments,
+                                                       minimum_solve_layers,
                                                        -1,
                                                        x0,
                                                        y0,
@@ -8391,15 +8514,16 @@ static void top_surface_image_append_contoning_slices(TopSurfaceImageRegionPlan 
     auto append_regions = [&](const std::vector<TopSurfaceImageContoningVectorRegion> &regions,
                               bool for_fill,
                               bool for_perimeter) {
-        const ApplySafetyOffset clip_safety_offset =
-            used_raw_top_surface_labels ? ApplySafetyOffset::No : ApplySafetyOffset::Yes;
+        const ApplySafetyOffset clip_safety_offset = ApplySafetyOffset::No;
         for (const TopSurfaceImageContoningVectorRegion &region : regions) {
             check_canceled(throw_if_canceled);
             if (depth < 0 || region.bottom_to_top.empty() || region.area.empty())
                 continue;
             const int pattern_depth = depth % int(region.bottom_to_top.size());
             const unsigned int component_id =
-                region.bottom_to_top[size_t(int(region.bottom_to_top.size()) - 1 - pattern_depth)];
+                source_surface == TopSurfaceImageSourceSurface::Bottom ?
+                    region.bottom_to_top[size_t(pattern_depth)] :
+                    region.bottom_to_top[size_t(int(region.bottom_to_top.size()) - 1 - pattern_depth)];
             if (component_id == 0 || component_id >= by_component.size())
                 continue;
             if (for_perimeter &&
@@ -8618,11 +8742,11 @@ static void top_surface_image_append_contoning_slices(TopSurfaceImageRegionPlan 
         if (!depth_taken.empty() && !component_area.empty())
             component_area = top_surface_clip_diff_ex(component_area,
                                                       depth_taken,
-                                                      used_raw_top_surface_labels ? ApplySafetyOffset::No : ApplySafetyOffset::Yes);
+                                                      ApplySafetyOffset::No);
         if (!perimeter_depth_taken.empty() && !component_perimeter_area.empty())
             component_perimeter_area = top_surface_clip_diff_ex(component_perimeter_area,
                                                                 perimeter_depth_taken,
-                                                                used_raw_top_surface_labels ? ApplySafetyOffset::No : ApplySafetyOffset::Yes);
+                                                                ApplySafetyOffset::No);
         if (component_area.empty() && component_perimeter_area.empty())
             continue;
         if (!component_area.empty())
@@ -11613,6 +11737,201 @@ struct GroupFillsOptions
     TopSurfaceImageContoningStackPlanCache *contoning_stack_plan_cache { nullptr };
 };
 
+static const char* top_surface_image_debug_surface_type_label(SurfaceType type)
+{
+    switch (type) {
+    case stTop: return "top";
+    case stBottom: return "bottom";
+    case stBottomBridge: return "bottom_bridge";
+    case stInternalAfterExternalBridge: return "internal_after_external_bridge";
+    case stInternal: return "internal";
+    case stInternalSolid: return "internal_solid";
+    case stInternalBridge: return "internal_bridge";
+    case stSecondInternalBridge: return "second_internal_bridge";
+    case stInternalVoid: return "internal_void";
+    case stPerimeter: return "perimeter";
+    case stCount: return "count";
+    }
+    return "unknown";
+}
+
+static const char* top_surface_image_debug_extrusion_role_label(ExtrusionRole role)
+{
+    switch (role) {
+    case erNone: return "none";
+    case erPerimeter: return "perimeter";
+    case erExternalPerimeter: return "external_perimeter";
+    case erOverhangPerimeter: return "overhang_perimeter";
+    case erInternalInfill: return "internal_infill";
+    case erSolidInfill: return "solid_infill";
+    case erTopSolidInfill: return "top_solid_infill";
+    case erBottomSurface: return "bottom_surface";
+    case erIroning: return "ironing";
+    case erBridgeInfill: return "bridge_infill";
+    case erInternalBridgeInfill: return "internal_bridge_infill";
+    case erGapFill: return "gap_fill";
+    case erSkirt: return "skirt";
+    case erBrim: return "brim";
+    case erSupportMaterial: return "support_material";
+    case erSupportMaterialInterface: return "support_material_interface";
+    case erSupportTransition: return "support_transition";
+    case erWipeTower: return "wipe_tower";
+    case erCustom: return "custom";
+    case erMixed: return "mixed";
+    case erCount: return "count";
+    }
+    return "unknown";
+}
+
+static double top_surface_image_debug_area_mm2(const ExPolygons &area)
+{
+    return top_surface_image_scaled_area_mm2(top_surface_image_abs_area(area));
+}
+
+static long long top_surface_image_debug_optional_index(size_t idx)
+{
+    return idx == size_t(-1) ? -1 : static_cast<long long>(idx);
+}
+
+struct TopSurfaceImageReplacementTrace
+{
+    bool enabled { false };
+    bool has_rows { false };
+    std::ostringstream csv;
+    std::vector<std::pair<ExPolygons, SVG::ExPolygonAttributes>> svg_items;
+
+    explicit TopSurfaceImageReplacementTrace(bool enabled)
+        : enabled(enabled)
+    {
+        if (!enabled)
+            return;
+        csv << std::fixed << std::setprecision(6);
+        csv << "event,layer_id,z_mm,region_id,surface_index,surface_type,extrusion_role,zone_id,"
+               "slice_begin,slice_end,slice_index,depth,lower_surface,contoning,raw_labels,same_layer_partition,"
+               "component_id,component_index,component_count,slice_area_mm2,slice_perimeter_area_mm2,"
+               "remaining_before_mm2,image_expolygons_mm2,component_intersection_mm2,component_printed_mm2,"
+               "component_intersection_sum_mm2,depth_clip_union_mm2,image_clip_mm2,remaining_after_mm2,"
+               "reservation_overlap_mm2,original_appended_mm2\n";
+    }
+
+    void add_row(const char *event,
+                 const Layer &layer,
+                 size_t region_id,
+                 size_t surface_index,
+                 SurfaceType surface_type,
+                 ExtrusionRole extrusion_role,
+                 unsigned int zone_id,
+                 size_t slice_begin,
+                 size_t slice_end,
+                 size_t slice_index,
+                 int depth,
+                 bool lower_surface,
+                 bool contoning,
+                 bool raw_labels,
+                 bool same_layer_partition,
+                 unsigned int component_id,
+                 size_t component_index,
+                 size_t component_count,
+                 double slice_area_mm2,
+                 double slice_perimeter_area_mm2,
+                 double remaining_before_mm2,
+                 double image_expolygons_mm2,
+                 double component_intersection_mm2,
+                 double component_printed_mm2,
+                 double component_intersection_sum_mm2,
+                 double depth_clip_union_mm2,
+                 double image_clip_mm2,
+                 double remaining_after_mm2,
+                 double reservation_overlap_mm2,
+                 double original_appended_mm2)
+    {
+        if (!enabled)
+            return;
+        has_rows = true;
+        csv << event << ','
+            << layer.id() << ','
+            << layer.print_z << ','
+            << region_id << ','
+            << surface_index << ','
+            << top_surface_image_debug_surface_type_label(surface_type) << ','
+            << top_surface_image_debug_extrusion_role_label(extrusion_role) << ','
+            << zone_id << ','
+            << top_surface_image_debug_optional_index(slice_begin) << ','
+            << top_surface_image_debug_optional_index(slice_end) << ','
+            << top_surface_image_debug_optional_index(slice_index) << ','
+            << depth << ','
+            << (lower_surface ? 1 : 0) << ','
+            << (contoning ? 1 : 0) << ','
+            << (raw_labels ? 1 : 0) << ','
+            << (same_layer_partition ? 1 : 0) << ','
+            << component_id << ','
+            << top_surface_image_debug_optional_index(component_index) << ','
+            << top_surface_image_debug_optional_index(component_count) << ','
+            << slice_area_mm2 << ','
+            << slice_perimeter_area_mm2 << ','
+            << remaining_before_mm2 << ','
+            << image_expolygons_mm2 << ','
+            << component_intersection_mm2 << ','
+            << component_printed_mm2 << ','
+            << component_intersection_sum_mm2 << ','
+            << depth_clip_union_mm2 << ','
+            << image_clip_mm2 << ','
+            << remaining_after_mm2 << ','
+            << reservation_overlap_mm2 << ','
+            << original_appended_mm2 << '\n';
+    }
+
+    void add_svg(ExPolygons area,
+                 const std::string &legend,
+                 const std::string &fill,
+                 float opacity,
+                 const std::string &outline)
+    {
+        if (!enabled)
+            return;
+        top_surface_image_debug_add_svg_item(svg_items, std::move(area), legend, fill, opacity, outline);
+    }
+
+    void write(const Layer &layer)
+    {
+        if (!enabled || !has_rows)
+            return;
+
+        std::ostringstream stem;
+        stem << "layer_"
+             << std::setw(5) << std::setfill('0') << layer.id()
+             << "_z_" << top_surface_image_debug_z_string(layer.print_z)
+             << "_replacement_trace";
+
+        const std::string csv_filename = stem.str() + ".csv";
+        {
+            const std::filesystem::path path = top_surface_image_debug_output_dir() / csv_filename;
+            std::ofstream out(path.string());
+            if (out) {
+                out << csv.str();
+                top_surface_image_debug_register_layer_file_export(
+                    layer.id(),
+                    layer.print_z,
+                    "replacement_trace",
+                    top_surface_image_debug_file_export("replacement_trace_csv", csv_filename));
+            }
+        }
+
+        if (svg_items.empty())
+            return;
+
+        const std::string svg_filename = stem.str() + ".svg";
+        const std::filesystem::path svg_path = top_surface_image_debug_output_dir() / svg_filename;
+        const BoundingBox svg_bbox = top_surface_image_debug_svg_bbox(svg_items);
+        SVG::export_expolygons(svg_path.string(), svg_items);
+        top_surface_image_debug_register_layer_file_export(
+            layer.id(),
+            layer.print_z,
+            "replacement_trace",
+            top_surface_image_debug_file_export("replacement_trace_svg", svg_filename, svg_bbox));
+    }
+};
+
 std::vector<SurfaceFill> group_fills(const Layer &layer,
                                      LockRegionParam &lock_param,
                                      const GroupFillsOptions &options)
@@ -11638,6 +11957,16 @@ std::vector<SurfaceFill> group_fills(const Layer &layer,
         top_surface_replacement_reservations[region_id] =
             top_surface_image_contoning_replacement_reservation_area(top_surface_plans[region_id]);
     }
+    TopSurfaceImageReplacementTrace replacement_trace(top_surface_image_debug_enabled() && build_top_surface_plans);
+    auto replacement_trace_legend = [](const char *label, size_t region_id, size_t surface_index, int depth, unsigned int component_id) {
+        std::ostringstream out;
+        out << label << " r" << region_id << " s" << surface_index;
+        if (depth >= 0)
+            out << " d" << depth;
+        if (component_id != 0)
+            out << " c" << component_id;
+        return out.str();
+    };
 
 	auto append_flow_param = [](std::map<Flow, ExPolygons> &flow_params, Flow flow, const ExPolygon &exp) {
         auto it = flow_params.find(flow);
@@ -11817,12 +12146,52 @@ std::vector<SurfaceFill> group_fills(const Layer &layer,
 	        if (surface.surface_type != stInternalVoid) {
 	        	const SurfaceFillParams *params = region_to_surface_params[region_id][&surface - &layerm.fill_surfaces.surfaces.front()];
 				if (params != nullptr) {
+                    const size_t surface_index = size_t(&surface - &layerm.fill_surfaces.surfaces.front());
                     ExPolygons remaining = { surface.expolygon };
-                    if (region_id < top_surface_plans.size() &&
+                    const bool replacement_candidate =
+                        region_id < top_surface_plans.size() &&
                         top_surface_plans[region_id].zone != nullptr &&
                         (surface.is_top() || surface.surface_type == stInternalSolid || surface.surface_type == stBottom) &&
-                        !surface.is_bridge()) {
+                        !surface.is_bridge();
+                    if (replacement_candidate) {
                         const TopSurfaceImageRegionPlan &plan = top_surface_plans[region_id];
+                        if (replacement_trace.enabled) {
+                            replacement_trace.add_row("surface_start",
+                                                      layer,
+                                                      region_id,
+                                                      surface_index,
+                                                      surface.surface_type,
+                                                      params->extrusion_role,
+                                                      plan.zone_id,
+                                                      size_t(-1),
+                                                      size_t(-1),
+                                                      size_t(-1),
+                                                      -1,
+                                                      false,
+                                                      false,
+                                                      false,
+                                                      false,
+                                                      0,
+                                                      size_t(-1),
+                                                      size_t(-1),
+                                                      0.,
+                                                      0.,
+                                                      top_surface_image_debug_area_mm2(remaining),
+                                                      0.,
+                                                      0.,
+                                                      0.,
+                                                      0.,
+                                                      0.,
+                                                      0.,
+                                                      top_surface_image_debug_area_mm2(remaining),
+                                                      0.,
+                                                      0.);
+                            replacement_trace.add_svg(ExPolygons { surface.expolygon },
+                                                      replacement_trace_legend("source surface", region_id, surface_index, -1, 0),
+                                                      "#bdbdbd",
+                                                      0.12f,
+                                                      "#636363");
+                        }
                         for (size_t slice_idx = 0; slice_idx < plan.slices.size();) {
                             check_canceled(throw_if_canceled);
                             const TopSurfaceImageStackSlice &slice = plan.slices[slice_idx];
@@ -11833,13 +12202,54 @@ std::vector<SurfaceFill> group_fills(const Layer &layer,
                             if (remaining.empty())
                                 break;
                             const ApplySafetyOffset slice_safety_offset =
-                                slice.raw_top_surface_labels ? ApplySafetyOffset::No : ApplySafetyOffset::Yes;
+                                (slice.raw_top_surface_labels || slice.contoning || slice.same_layer_partition) ?
+                                    ApplySafetyOffset::No :
+                                    ApplySafetyOffset::Yes;
+                            const double remaining_before_mm2 = replacement_trace.enabled ?
+                                top_surface_image_debug_area_mm2(remaining) :
+                                0.;
                             ExPolygons image_expolygons = top_surface_clip_intersection_ex(remaining, slice.area, slice_safety_offset);
                             if (image_expolygons.empty() && !slice.contoning) {
+                                if (replacement_trace.enabled)
+                                    replacement_trace.add_row("slice_empty_skip",
+                                                              layer,
+                                                              region_id,
+                                                              surface_index,
+                                                              surface.surface_type,
+                                                              params->extrusion_role,
+                                                              plan.zone_id,
+                                                              slice_idx,
+                                                              slice_idx + 1,
+                                                              slice_idx,
+                                                              slice.depth,
+                                                              slice.lower_surface,
+                                                              slice.contoning,
+                                                              slice.raw_top_surface_labels,
+                                                              slice.same_layer_partition,
+                                                              slice.component_id,
+                                                              slice.component_index,
+                                                              slice.component_count,
+                                                              top_surface_image_debug_area_mm2(slice.area),
+                                                              top_surface_image_debug_area_mm2(slice.perimeter_area),
+                                                              remaining_before_mm2,
+                                                              0.,
+                                                              0.,
+                                                              0.,
+                                                              0.,
+                                                              0.,
+                                                              0.,
+                                                              remaining_before_mm2,
+                                                              0.,
+                                                              0.);
                                 ++slice_idx;
                                 continue;
                             }
                             ExPolygons image_clip = image_expolygons;
+                            const double image_expolygons_mm2 = replacement_trace.enabled ?
+                                top_surface_image_debug_area_mm2(image_expolygons) :
+                                0.;
+                            double component_intersection_sum_mm2 = 0.;
+                            double depth_clip_union_mm2 = 0.;
                             if (slice.same_layer_partition || slice.contoning) {
                                 size_t same_depth_end = slice_idx;
                                 while (same_depth_end < plan.slices.size() &&
@@ -11852,11 +12262,19 @@ std::vector<SurfaceFill> group_fills(const Layer &layer,
                                 ExPolygons depth_clip;
                                 for (size_t same_idx = slice_idx; same_idx < same_depth_end; ++same_idx) {
                                     check_canceled(throw_if_canceled);
+                                    const TopSurfaceImageStackSlice &same_slice = plan.slices[same_idx];
                                     SurfaceFillParams image_params =
-                                        top_surface_image_params_for_slice(layer, surface, *params, plan, plan.slices[same_idx]);
+                                        top_surface_image_params_for_slice(layer, surface, *params, plan, same_slice);
                                     ExPolygons component_expolygons = slice.same_layer_partition ?
                                         image_expolygons :
-                                        top_surface_clip_intersection_ex(remaining, plan.slices[same_idx].area, slice_safety_offset);
+                                        top_surface_clip_intersection_ex(remaining, same_slice.area, slice_safety_offset);
+                                    const double component_intersection_mm2 = replacement_trace.enabled ?
+                                        top_surface_image_debug_area_mm2(component_expolygons) :
+                                        0.;
+                                    component_intersection_sum_mm2 += component_intersection_mm2;
+                                    ExPolygons debug_component_expolygons =
+                                        replacement_trace.enabled ? component_expolygons : ExPolygons();
+                                    double component_printed_mm2 = 0.;
                                     if (!component_expolygons.empty()) {
                                         append(depth_clip, component_expolygons);
                                         if (plan.slices[same_idx].contoning &&
@@ -11865,23 +12283,173 @@ std::vector<SurfaceFill> group_fills(const Layer &layer,
                                             component_expolygons = top_surface_clip_intersection_ex(component_expolygons,
                                                                                                     layerm.fill_no_overlap_expolygons,
                                                                                                     slice_safety_offset);
+                                        component_printed_mm2 = replacement_trace.enabled ?
+                                            top_surface_image_debug_area_mm2(component_expolygons) :
+                                            0.;
+                                        if (replacement_trace.enabled) {
+                                            const std::string color = top_surface_image_debug_palette_color(same_slice.component_id);
+                                            replacement_trace.add_svg(std::move(debug_component_expolygons),
+                                                                      replacement_trace_legend("component intersection",
+                                                                                               region_id,
+                                                                                               surface_index,
+                                                                                               same_slice.depth,
+                                                                                               same_slice.component_id),
+                                                                      color,
+                                                                      0.22f,
+                                                                      color);
+                                        }
                                         if (!component_expolygons.empty()) {
                                             SurfaceFill &image_fill = surface_fill_for_params(surface_fills, image_params);
                                             append_surface_fill_expolygons(image_fill, region_id, surface, std::move(component_expolygons), layerm);
                                         }
                                     }
+                                    if (replacement_trace.enabled)
+                                        replacement_trace.add_row("component",
+                                                                  layer,
+                                                                  region_id,
+                                                                  surface_index,
+                                                                  surface.surface_type,
+                                                                  image_params.extrusion_role,
+                                                                  plan.zone_id,
+                                                                  slice_idx,
+                                                                  same_depth_end,
+                                                                  same_idx,
+                                                                  same_slice.depth,
+                                                                  same_slice.lower_surface,
+                                                                  same_slice.contoning,
+                                                                  same_slice.raw_top_surface_labels,
+                                                                  same_slice.same_layer_partition,
+                                                                  same_slice.component_id,
+                                                                  same_slice.component_index,
+                                                                  same_slice.component_count,
+                                                                  top_surface_image_debug_area_mm2(same_slice.area),
+                                                                  top_surface_image_debug_area_mm2(same_slice.perimeter_area),
+                                                                  remaining_before_mm2,
+                                                                  image_expolygons_mm2,
+                                                                  component_intersection_mm2,
+                                                                  component_printed_mm2,
+                                                                  0.,
+                                                                  0.,
+                                                                  0.,
+                                                                  0.,
+                                                                  0.,
+                                                                  0.);
                                 }
-                                if (!depth_clip.empty())
+                                if (!depth_clip.empty()) {
                                     image_clip = top_surface_clip_union_ex(depth_clip);
+                                    depth_clip_union_mm2 = replacement_trace.enabled ?
+                                        top_surface_image_debug_area_mm2(image_clip) :
+                                        0.;
+                                }
+                                const double image_clip_mm2 = replacement_trace.enabled ?
+                                    top_surface_image_debug_area_mm2(image_clip) :
+                                    0.;
+                                ExPolygons remaining_after = top_surface_clip_diff_ex(remaining, image_clip, slice_safety_offset);
+                                const double remaining_after_mm2 = replacement_trace.enabled ?
+                                    top_surface_image_debug_area_mm2(remaining_after) :
+                                    0.;
+                                if (replacement_trace.enabled) {
+                                    replacement_trace.add_row("slice_group",
+                                                              layer,
+                                                              region_id,
+                                                              surface_index,
+                                                              surface.surface_type,
+                                                              params->extrusion_role,
+                                                              plan.zone_id,
+                                                              slice_idx,
+                                                              same_depth_end,
+                                                              size_t(-1),
+                                                              slice.depth,
+                                                              slice.lower_surface,
+                                                              slice.contoning,
+                                                              slice.raw_top_surface_labels,
+                                                              slice.same_layer_partition,
+                                                              0,
+                                                              size_t(-1),
+                                                              size_t(-1),
+                                                              top_surface_image_debug_area_mm2(slice.area),
+                                                              top_surface_image_debug_area_mm2(slice.perimeter_area),
+                                                              remaining_before_mm2,
+                                                              image_expolygons_mm2,
+                                                              0.,
+                                                              0.,
+                                                              component_intersection_sum_mm2,
+                                                              depth_clip_union_mm2,
+                                                              image_clip_mm2,
+                                                              remaining_after_mm2,
+                                                              0.,
+                                                              0.);
+                                    replacement_trace.add_svg(image_clip,
+                                                              replacement_trace_legend("image clip", region_id, surface_index, slice.depth, 0),
+                                                              "#00a65a",
+                                                              0.18f,
+                                                              "#006d2c");
+                                    replacement_trace.add_svg(remaining_after,
+                                                              replacement_trace_legend("remaining after image", region_id, surface_index, slice.depth, 0),
+                                                              "#fb6a4a",
+                                                              0.26f,
+                                                              "#cb181d");
+                                }
+                                remaining = std::move(remaining_after);
                                 slice_idx = same_depth_end;
                             } else {
                                 SurfaceFillParams image_params =
                                     top_surface_image_params_for_slice(layer, surface, *params, plan, slice);
                                 SurfaceFill &image_fill = surface_fill_for_params(surface_fills, image_params);
                                 append_surface_fill_expolygons(image_fill, region_id, surface, std::move(image_expolygons), layerm);
+                                const double image_clip_mm2 = replacement_trace.enabled ?
+                                    top_surface_image_debug_area_mm2(image_clip) :
+                                    0.;
+                                ExPolygons remaining_after = top_surface_clip_diff_ex(remaining, image_clip, slice_safety_offset);
+                                const double remaining_after_mm2 = replacement_trace.enabled ?
+                                    top_surface_image_debug_area_mm2(remaining_after) :
+                                    0.;
+                                if (replacement_trace.enabled) {
+                                    replacement_trace.add_row("single_slice",
+                                                              layer,
+                                                              region_id,
+                                                              surface_index,
+                                                              surface.surface_type,
+                                                              image_params.extrusion_role,
+                                                              plan.zone_id,
+                                                              slice_idx,
+                                                              slice_idx + 1,
+                                                              slice_idx,
+                                                              slice.depth,
+                                                              slice.lower_surface,
+                                                              slice.contoning,
+                                                              slice.raw_top_surface_labels,
+                                                              slice.same_layer_partition,
+                                                              slice.component_id,
+                                                              slice.component_index,
+                                                              slice.component_count,
+                                                              top_surface_image_debug_area_mm2(slice.area),
+                                                              top_surface_image_debug_area_mm2(slice.perimeter_area),
+                                                              remaining_before_mm2,
+                                                              image_expolygons_mm2,
+                                                              image_clip_mm2,
+                                                              image_clip_mm2,
+                                                              image_clip_mm2,
+                                                              image_clip_mm2,
+                                                              image_clip_mm2,
+                                                              remaining_after_mm2,
+                                                              0.,
+                                                              0.);
+                                    const std::string color = top_surface_image_debug_palette_color(slice.component_id);
+                                    replacement_trace.add_svg(image_clip,
+                                                              replacement_trace_legend("image clip", region_id, surface_index, slice.depth, slice.component_id),
+                                                              color,
+                                                              0.22f,
+                                                              color);
+                                    replacement_trace.add_svg(remaining_after,
+                                                              replacement_trace_legend("remaining after image", region_id, surface_index, slice.depth, 0),
+                                                              "#fb6a4a",
+                                                              0.26f,
+                                                              "#cb181d");
+                                }
+                                remaining = std::move(remaining_after);
                                 ++slice_idx;
                             }
-                            remaining = top_surface_clip_diff_ex(remaining, image_clip, slice_safety_offset);
                         }
                     }
                     if (!remaining.empty()) {
@@ -11889,12 +12457,109 @@ std::vector<SurfaceFill> group_fills(const Layer &layer,
                             !top_surface_replacement_reservations[region_id].empty() &&
                             (surface.is_top() || surface.surface_type == stInternalSolid || surface.surface_type == stBottom) &&
                             !surface.is_bridge()) {
-                            remaining = top_surface_clip_diff_ex(remaining,
-                                                                  top_surface_replacement_reservations[region_id],
-                                                                  ApplySafetyOffset::Yes);
+                            ExPolygons reservation_overlap;
+                            const double remaining_before_mm2 = replacement_trace.enabled ?
+                                top_surface_image_debug_area_mm2(remaining) :
+                                0.;
+                            if (replacement_trace.enabled)
+                                reservation_overlap = top_surface_clip_intersection_ex(remaining,
+                                                                                       top_surface_replacement_reservations[region_id],
+                                                                                       ApplySafetyOffset::Yes);
+                            ExPolygons remaining_after = top_surface_clip_diff_ex(remaining,
+                                                                                  top_surface_replacement_reservations[region_id],
+                                                                                  ApplySafetyOffset::Yes);
+                            const double reservation_overlap_mm2 = replacement_trace.enabled ?
+                                top_surface_image_debug_area_mm2(reservation_overlap) :
+                                0.;
+                            const double remaining_after_mm2 = replacement_trace.enabled ?
+                                top_surface_image_debug_area_mm2(remaining_after) :
+                                0.;
+                            if (replacement_trace.enabled && replacement_candidate) {
+                                const TopSurfaceImageRegionPlan &plan = top_surface_plans[region_id];
+                                replacement_trace.add_row("reservation",
+                                                          layer,
+                                                          region_id,
+                                                          surface_index,
+                                                          surface.surface_type,
+                                                          params->extrusion_role,
+                                                          plan.zone_id,
+                                                          size_t(-1),
+                                                          size_t(-1),
+                                                          size_t(-1),
+                                                          -1,
+                                                          false,
+                                                          false,
+                                                          false,
+                                                          false,
+                                                          0,
+                                                          size_t(-1),
+                                                          size_t(-1),
+                                                          0.,
+                                                          0.,
+                                                          remaining_before_mm2,
+                                                          0.,
+                                                          0.,
+                                                          0.,
+                                                          0.,
+                                                          0.,
+                                                          0.,
+                                                          remaining_after_mm2,
+                                                          reservation_overlap_mm2,
+                                                          0.);
+                                replacement_trace.add_svg(std::move(reservation_overlap),
+                                                          replacement_trace_legend("reservation overlap", region_id, surface_index, -1, 0),
+                                                          "#756bb1",
+                                                          0.30f,
+                                                          "#54278f");
+                                replacement_trace.add_svg(remaining_after,
+                                                          replacement_trace_legend("remaining after reservation", region_id, surface_index, -1, 0),
+                                                          "#de2d26",
+                                                          0.32f,
+                                                          "#a50f15");
+                            }
+                            remaining = std::move(remaining_after);
                         }
                     }
                     if (!remaining.empty()) {
+                        if (replacement_trace.enabled && replacement_candidate) {
+                            const TopSurfaceImageRegionPlan &plan = top_surface_plans[region_id];
+                            const double original_appended_mm2 = top_surface_image_debug_area_mm2(remaining);
+                            replacement_trace.add_row("original_appended",
+                                                      layer,
+                                                      region_id,
+                                                      surface_index,
+                                                      surface.surface_type,
+                                                      params->extrusion_role,
+                                                      plan.zone_id,
+                                                      size_t(-1),
+                                                      size_t(-1),
+                                                      size_t(-1),
+                                                      -1,
+                                                      false,
+                                                      false,
+                                                      false,
+                                                      false,
+                                                      0,
+                                                      size_t(-1),
+                                                      size_t(-1),
+                                                      0.,
+                                                      0.,
+                                                      original_appended_mm2,
+                                                      0.,
+                                                      0.,
+                                                      0.,
+                                                      0.,
+                                                      0.,
+                                                      0.,
+                                                      original_appended_mm2,
+                                                      0.,
+                                                      original_appended_mm2);
+                            replacement_trace.add_svg(remaining,
+                                                      replacement_trace_legend("ordinary fill appended", region_id, surface_index, -1, 0),
+                                                      "#ffffff",
+                                                      0.72f,
+                                                      "#000000");
+                        }
                         SurfaceFill &fill = surface_fills[params->idx];
                         append_surface_fill_expolygons(fill, region_id, surface, std::move(remaining), layerm);
                     }
@@ -11909,6 +12574,8 @@ std::vector<SurfaceFill> group_fills(const Layer &layer,
                                                                     throw_if_canceled);
 	}
 
+    replacement_trace.write(layer);
+
 	{
 		Polygons all_polygons;
 		for (SurfaceFill &fill : surface_fills)
@@ -11916,7 +12583,8 @@ std::vector<SurfaceFill> group_fills(const Layer &layer,
                 check_canceled(throw_if_canceled);
                 if (fill.params.texture_mapping_top_surface_same_layer_partition)
                     continue;
-                if (fill.params.texture_mapping_top_surface_raw_labels) {
+                if (fill.params.texture_mapping_top_surface_contoning ||
+                    fill.params.texture_mapping_top_surface_raw_labels) {
                     if (fill.expolygons.size() > 1)
                         fill.expolygons = top_surface_clip_union_ex(fill.expolygons);
                     continue;
