@@ -81,6 +81,12 @@ struct TextureMappingZone
         ContoningPerimeterSegmentInfill = 2
     };
 
+    enum TopSurfaceContoningColoredSurfaces : uint8_t {
+        ContoningColoredUpperSurfaces = 0,
+        ContoningColoredLowerSurfaces = 1,
+        ContoningColoredUpperAndLowerSurfaces = 2
+    };
+
     enum TopSurfaceContoningFlatSurfaceInfillMode : uint8_t {
         ContoningFlatSurfaceInfillDefault = 0,
         ContoningFlatSurfaceInfillRectilinear = 1,
@@ -212,7 +218,8 @@ struct TextureMappingZone
     static constexpr float MinTopSurfaceContoningMinFeatureMm = 0.f;
     static constexpr float MaxTopSurfaceContoningMinFeatureMm = 20.f;
     static constexpr float DefaultTopSurfaceContoningMinFeatureMm = 0.f;
-    static constexpr bool  DefaultTopSurfaceContoningColorLowerSurfaces = true;
+    static constexpr int   DefaultTopSurfaceContoningColoredSurfaces = int(ContoningColoredUpperSurfaces);
+    static constexpr bool  DefaultTopSurfaceContoningColorLowerSurfaces = false;
     static constexpr bool  DefaultTopSurfaceContoningOnlyColorSurfaceInfill = true;
     static constexpr bool  DefaultTopSurfaceContoningOnlyOnePerimeterAroundShellInfill = true;
     static constexpr bool  DefaultTopSurfaceContoningReplaceTopPerimetersWithInfill = false;
@@ -492,6 +499,7 @@ struct TextureMappingZone
     int         top_surface_contoning_stack_layers = DefaultTopSurfaceContoningStackLayers;
     int         top_surface_contoning_pattern_filaments = DefaultTopSurfaceContoningPatternFilaments;
     float       top_surface_contoning_min_feature_mm = DefaultTopSurfaceContoningMinFeatureMm;
+    int         top_surface_contoning_colored_surfaces = DefaultTopSurfaceContoningColoredSurfaces;
     bool        top_surface_contoning_color_lower_surfaces = DefaultTopSurfaceContoningColorLowerSurfaces;
     bool        top_surface_contoning_only_color_surface_infill = DefaultTopSurfaceContoningOnlyColorSurfaceInfill;
     bool        top_surface_contoning_only_one_perimeter_around_shell_infill = DefaultTopSurfaceContoningOnlyOnePerimeterAroundShellInfill;
@@ -588,9 +596,32 @@ struct TextureMappingZone
     {
         return is_image_texture() &&
                top_surface_contoning_active() &&
+               top_surface_contoning_colors_upper_surfaces() &&
                !effective_top_surface_contoning_only_color_surface_infill() &&
                !effective_top_surface_contoning_replace_top_perimeters_with_infill() &&
                !effective_top_surface_contoning_recolor_surrounding_perimeters();
+    }
+
+    static int normalize_top_surface_contoning_colored_surfaces(int mode)
+    {
+        return mode == int(ContoningColoredLowerSurfaces) ||
+               mode == int(ContoningColoredUpperAndLowerSurfaces) ?
+            mode :
+            int(ContoningColoredUpperSurfaces);
+    }
+
+    bool top_surface_contoning_colors_upper_surfaces() const
+    {
+        const int mode = normalize_top_surface_contoning_colored_surfaces(top_surface_contoning_colored_surfaces);
+        return mode == int(ContoningColoredUpperSurfaces) ||
+               mode == int(ContoningColoredUpperAndLowerSurfaces);
+    }
+
+    bool top_surface_contoning_colors_lower_surfaces() const
+    {
+        const int mode = normalize_top_surface_contoning_colored_surfaces(top_surface_contoning_colored_surfaces);
+        return mode == int(ContoningColoredLowerSurfaces) ||
+               mode == int(ContoningColoredUpperAndLowerSurfaces);
     }
 
     float effective_top_surface_contoning_angle_threshold_deg() const
@@ -799,6 +830,7 @@ struct TextureMappingZone
         top_surface_contoning_stack_layers = DefaultTopSurfaceContoningStackLayers;
         top_surface_contoning_pattern_filaments = DefaultTopSurfaceContoningPatternFilaments;
         top_surface_contoning_min_feature_mm = DefaultTopSurfaceContoningMinFeatureMm;
+        top_surface_contoning_colored_surfaces = DefaultTopSurfaceContoningColoredSurfaces;
         top_surface_contoning_color_lower_surfaces = DefaultTopSurfaceContoningColorLowerSurfaces;
         top_surface_contoning_only_color_surface_infill = DefaultTopSurfaceContoningOnlyColorSurfaceInfill;
         top_surface_contoning_only_one_perimeter_around_shell_infill = DefaultTopSurfaceContoningOnlyOnePerimeterAroundShellInfill;

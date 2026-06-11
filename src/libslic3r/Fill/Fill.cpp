@@ -503,6 +503,7 @@ struct TopSurfaceImageRegionPlan {
     bool fixed_coloring = true;
     bool same_layer_partition = false;
     bool contoning = false;
+    bool color_upper_surfaces = true;
     bool color_lower_surfaces = true;
     int colored_top_layers = TextureMappingZone::DefaultTopSurfaceImageColoredTopLayers;
     int contoning_stack_layers = TextureMappingZone::DefaultTopSurfaceContoningStackLayers;
@@ -8846,7 +8847,8 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
                                        TextureMappingZone::MinTopSurfaceImageLineWidthMm,
                                        plan.max_width_mm);
         plan.fixed_coloring = zone->top_surface_image_fixed_coloring_filaments_active();
-        plan.color_lower_surfaces = zone->top_surface_contoning_color_lower_surfaces;
+        plan.color_upper_surfaces = zone->top_surface_contoning_colors_upper_surfaces();
+        plan.color_lower_surfaces = zone->top_surface_contoning_colors_lower_surfaces();
         plan.colored_top_layers = std::clamp(zone->top_surface_image_colored_top_layers,
                                              TextureMappingZone::MinTopSurfaceImageColoredTopLayers,
                                              TextureMappingZone::MaxTopSurfaceImageColoredTopLayers);
@@ -9010,7 +9012,8 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
                                                               throw_if_canceled);
                 }
             };
-            append_contoning_surface(TopSurfaceImageSourceSurface::Top);
+            if (plan.color_upper_surfaces)
+                append_contoning_surface(TopSurfaceImageSourceSurface::Top);
             if (plan.color_lower_surfaces)
                 append_contoning_surface(TopSurfaceImageSourceSurface::Bottom);
             const bool upper_nearest_sample_fallback = contoning_solver.nearest_measured_sample_fallback_used(false);

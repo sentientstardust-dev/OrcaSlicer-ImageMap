@@ -6443,7 +6443,8 @@ static size_t texture_preview_settings_signature_impl(size_t num_physical,
         signature_mix(std::hash<int>{}(zone.top_surface_image_printing_method));
         signature_mix(std::hash<int>{}(zone.top_surface_contoning_stack_layers));
         signature_mix(std::hash<int>{}(zone.top_surface_contoning_pattern_filaments));
-        signature_mix(std::hash<int>{}(zone.top_surface_contoning_color_lower_surfaces ? 1 : 0));
+        signature_mix(std::hash<int>{}(TextureMappingZone::normalize_top_surface_contoning_colored_surfaces(
+            zone.top_surface_contoning_colored_surfaces)));
         signature_mix(std::hash<int>{}(zone.top_surface_contoning_td_adjustment_enabled ? 1 : 0));
         signature_mix(std::hash<int>{}(zone.effective_top_surface_contoning_color_prediction_mode()));
         signature_mix(std::hash<int>{}(zone.effective_top_surface_contoning_surface_scatter_enabled() ? 1 : 0));
@@ -6550,9 +6551,16 @@ static bool texture_preview_flat_surface_texture_for_filament(unsigned int filam
         return false;
 
     if (zone->top_surface_image_printing_enabled) {
-        top_quantization = true;
+        const bool contoning = zone->top_surface_contoning_active() &&
+            zone->texture_mapping_mode != int(TextureMappingZone::TextureMappingRawValues);
+        const bool color_upper = !contoning || zone->top_surface_contoning_colors_upper_surfaces();
+        const bool color_lower = contoning && zone->top_surface_contoning_colors_lower_surfaces();
+        if (color_upper)
+            top_quantization = true;
+        else
+            top_pattern_blend = true;
         if (zone->texture_mapping_mode != int(TextureMappingZone::TextureMappingRawValues)) {
-            if (zone->top_surface_contoning_active() && zone->top_surface_contoning_color_lower_surfaces)
+            if (color_lower)
                 bottom_quantization = true;
             else
                 bottom_pattern_blend = true;
@@ -6608,7 +6616,8 @@ static void texture_preview_mix_zone_baked_model_settings(size_t &signature,
     signature_mix(std::hash<int>{}(zone.top_surface_image_printing_method));
     signature_mix(std::hash<int>{}(zone.top_surface_contoning_stack_layers));
     signature_mix(std::hash<int>{}(zone.top_surface_contoning_pattern_filaments));
-    signature_mix(std::hash<int>{}(zone.top_surface_contoning_color_lower_surfaces ? 1 : 0));
+    signature_mix(std::hash<int>{}(TextureMappingZone::normalize_top_surface_contoning_colored_surfaces(
+        zone.top_surface_contoning_colored_surfaces)));
     signature_mix(std::hash<int>{}(zone.top_surface_contoning_td_adjustment_enabled ? 1 : 0));
     signature_mix(std::hash<int>{}(zone.effective_top_surface_contoning_color_prediction_mode()));
     signature_mix(std::hash<int>{}(zone.effective_top_surface_contoning_surface_scatter_enabled() ? 1 : 0));

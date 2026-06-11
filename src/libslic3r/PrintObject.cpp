@@ -586,7 +586,9 @@ void PrintObject::prepare_contoning_one_wall_shell_infill_masks()
                 continue;
 
             auto append_source_surface = [&](bool top_surface) {
-                if (!top_surface && !zone->top_surface_contoning_color_lower_surfaces)
+                if (top_surface && !zone->top_surface_contoning_colors_upper_surfaces())
+                    return;
+                if (!top_surface && !zone->top_surface_contoning_colors_lower_surfaces())
                     return;
                 for (int depth = 0; depth < stack_layers; ++depth) {
                     const int source_layer_idx = top_surface ?

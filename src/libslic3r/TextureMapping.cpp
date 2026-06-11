@@ -828,6 +828,27 @@ static int top_surface_image_printing_method_from_name(const std::string &name)
     return int(TextureMappingZone::TopSurfaceImageSameAngle45Width);
 }
 
+static std::string top_surface_contoning_colored_surfaces_name(int mode)
+{
+    switch (TextureMappingZone::normalize_top_surface_contoning_colored_surfaces(mode)) {
+    case int(TextureMappingZone::ContoningColoredLowerSurfaces):
+        return "lower";
+    case int(TextureMappingZone::ContoningColoredUpperAndLowerSurfaces):
+        return "both";
+    default:
+        return "upper";
+    }
+}
+
+static int top_surface_contoning_colored_surfaces_from_name(const std::string &name)
+{
+    if (name == "lower" || name == "lower_surfaces")
+        return int(TextureMappingZone::ContoningColoredLowerSurfaces);
+    if (name == "both" || name == "upper_and_lower_surfaces")
+        return int(TextureMappingZone::ContoningColoredUpperAndLowerSurfaces);
+    return int(TextureMappingZone::ContoningColoredUpperSurfaces);
+}
+
 static std::string top_surface_contoning_flat_surface_infill_mode_name(int mode)
 {
     switch (clamp_int(mode,
@@ -2405,7 +2426,8 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            top_surface_contoning_stack_layers == rhs.top_surface_contoning_stack_layers &&
            top_surface_contoning_pattern_filaments == rhs.top_surface_contoning_pattern_filaments &&
            std::abs(top_surface_contoning_min_feature_mm - rhs.top_surface_contoning_min_feature_mm) <= eps &&
-           top_surface_contoning_color_lower_surfaces == rhs.top_surface_contoning_color_lower_surfaces &&
+           TextureMappingZone::normalize_top_surface_contoning_colored_surfaces(top_surface_contoning_colored_surfaces) ==
+               TextureMappingZone::normalize_top_surface_contoning_colored_surfaces(rhs.top_surface_contoning_colored_surfaces) &&
            effective_top_surface_contoning_only_color_surface_infill() == rhs.effective_top_surface_contoning_only_color_surface_infill() &&
            top_surface_contoning_only_one_perimeter_around_shell_infill == rhs.top_surface_contoning_only_one_perimeter_around_shell_infill &&
            effective_top_surface_contoning_replace_top_perimeters_with_infill() == rhs.effective_top_surface_contoning_replace_top_perimeters_with_infill() &&
@@ -2813,7 +2835,9 @@ std::string TextureMappingManager::serialize_entries()
                                  TextureMappingZone::DefaultTopSurfaceContoningMinFeatureMm),
                        TextureMappingZone::MinTopSurfaceContoningMinFeatureMm,
                        TextureMappingZone::MaxTopSurfaceContoningMinFeatureMm);
-        texture["top_surface_contoning_color_lower_surfaces"] = zone.top_surface_contoning_color_lower_surfaces;
+        texture["top_surface_contoning_colored_surfaces"] =
+            top_surface_contoning_colored_surfaces_name(zone.top_surface_contoning_colored_surfaces);
+        texture["top_surface_contoning_color_lower_surfaces"] = zone.top_surface_contoning_colors_lower_surfaces();
         texture["top_surface_contoning_only_color_surface_infill"] =
             zone.effective_top_surface_contoning_only_color_surface_infill();
         texture["top_surface_contoning_only_one_perimeter_around_shell_infill"] =
@@ -3125,9 +3149,22 @@ void TextureMappingManager::load_entries(const std::string &serialized,
                                  TextureMappingZone::DefaultTopSurfaceContoningMinFeatureMm),
                        TextureMappingZone::MinTopSurfaceContoningMinFeatureMm,
                        TextureMappingZone::MaxTopSurfaceContoningMinFeatureMm);
+        auto colored_surfaces_it = texture.find("top_surface_contoning_colored_surfaces");
+        if (colored_surfaces_it != texture.end() && colored_surfaces_it->is_string()) {
+            zone.top_surface_contoning_colored_surfaces =
+                top_surface_contoning_colored_surfaces_from_name(colored_surfaces_it->get<std::string>());
+        } else if (colored_surfaces_it != texture.end() && colored_surfaces_it->is_number_integer()) {
+            zone.top_surface_contoning_colored_surfaces =
+                TextureMappingZone::normalize_top_surface_contoning_colored_surfaces(colored_surfaces_it->get<int>());
+        } else if (texture.value("top_surface_contoning_color_lower_surfaces", false)) {
+            zone.top_surface_contoning_colored_surfaces =
+                int(TextureMappingZone::ContoningColoredUpperAndLowerSurfaces);
+        } else {
+            zone.top_surface_contoning_colored_surfaces =
+                TextureMappingZone::DefaultTopSurfaceContoningColoredSurfaces;
+        }
         zone.top_surface_contoning_color_lower_surfaces =
-            texture.value("top_surface_contoning_color_lower_surfaces",
-                          TextureMappingZone::DefaultTopSurfaceContoningColorLowerSurfaces);
+            zone.top_surface_contoning_colors_lower_surfaces();
         zone.top_surface_contoning_only_color_surface_infill =
             texture.value("top_surface_contoning_only_color_surface_infill",
                           TextureMappingZone::DefaultTopSurfaceContoningOnlyColorSurfaceInfill);
