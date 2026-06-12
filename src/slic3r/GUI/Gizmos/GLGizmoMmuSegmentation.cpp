@@ -600,21 +600,40 @@ struct RawAtlasProjectionLayout
     ImageMapRawExpectedLineWidth     expected_line_width_mm;
 };
 
+static bool model_volume_has_raw_atlas_side_data(const ModelVolume *volume);
+static bool model_volume_has_raw_atlas_top_surface_data(const ModelVolume *volume);
+
 static bool model_volume_has_raw_atlas_texture_data(const ModelVolume *volume)
 {
     if (volume == nullptr ||
         volume->imported_texture_width == 0 ||
         volume->imported_texture_height == 0)
         return false;
+    return model_volume_has_raw_atlas_side_data(volume) ||
+           model_volume_has_raw_atlas_top_surface_data(volume);
+}
+
+static bool model_volume_has_raw_atlas_side_data(const ModelVolume *volume)
+{
+    if (volume == nullptr ||
+        volume->imported_texture_width == 0 ||
+        volume->imported_texture_height == 0)
+        return false;
     const size_t pixel_count = size_t(volume->imported_texture_width) * size_t(volume->imported_texture_height);
-    const bool has_offsets =
-        volume->imported_texture_raw_channels > 0 &&
-        volume->imported_texture_raw_filament_offsets.size() >= pixel_count * size_t(volume->imported_texture_raw_channels);
-    const bool has_top_surface =
-        !volume->imported_texture_raw_top_surface_depths.empty() &&
-        volume->imported_texture_raw_top_surface_filament_slots.size() >=
-            pixel_count * volume->imported_texture_raw_top_surface_depths.size();
-    return has_offsets || has_top_surface;
+    return volume->imported_texture_raw_channels > 0 &&
+           volume->imported_texture_raw_filament_offsets.size() >= pixel_count * size_t(volume->imported_texture_raw_channels);
+}
+
+static bool model_volume_has_raw_atlas_top_surface_data(const ModelVolume *volume)
+{
+    if (volume == nullptr ||
+        volume->imported_texture_width == 0 ||
+        volume->imported_texture_height == 0)
+        return false;
+    const size_t pixel_count = size_t(volume->imported_texture_width) * size_t(volume->imported_texture_height);
+    return !volume->imported_texture_raw_top_surface_depths.empty() &&
+           volume->imported_texture_raw_top_surface_filament_slots.size() >=
+               pixel_count * volume->imported_texture_raw_top_surface_depths.size();
 }
 
 static wxString raw_offset_data_rgba_conversion_warning_text()
@@ -7512,6 +7531,8 @@ struct ManagedColorDataSummary
     bool     has_vertex_colors = false;
     bool     has_image_texture = false;
     bool     has_raw_offset_image_texture = false;
+    bool     has_raw_offset_side_data = false;
+    bool     has_raw_offset_top_surface_data = false;
     bool     has_rgba_data = false;
     size_t   color_region_triangle_count = 0;
     size_t   vertex_color_count = 0;
@@ -7853,6 +7874,8 @@ static ManagedColorDataSummary summarize_managed_color_data(const ModelObject *o
 
         if (model_volume_has_raw_atlas_texture_data(volume)) {
             summary.has_raw_offset_image_texture = true;
+            summary.has_raw_offset_side_data |= model_volume_has_raw_atlas_side_data(volume);
+            summary.has_raw_offset_top_surface_data |= model_volume_has_raw_atlas_top_surface_data(volume);
             ++summary.raw_offset_image_texture_count;
             const std::string mode = raw_atlas_color_mode_name_for_volume(*volume);
             if (std::find(summary.raw_offset_color_modes.begin(), summary.raw_offset_color_modes.end(), mode) ==
@@ -7892,6 +7915,19 @@ static wxString managed_color_data_size_text(const ManagedColorDataSummary &summ
     return wxString();
 }
 
+static wxString managed_color_data_raw_offset_payload_text(const ManagedColorDataSummary &summary)
+{
+    wxString text;
+    if (summary.has_raw_offset_side_data)
+        text = _L("Side-surface data");
+    if (summary.has_raw_offset_top_surface_data) {
+        if (!text.empty())
+            text += ", ";
+        text += _L("Top-surface data");
+    }
+    return text;
+}
+
 static wxString managed_color_data_raw_offset_mode_text(const ManagedColorDataSummary &summary)
 {
     if (!summary.has_raw_offset_image_texture)
@@ -7905,6 +7941,11 @@ static wxString managed_color_data_raw_offset_mode_text(const ManagedColorDataSu
     }
     if (text.empty())
         text = _L("Unknown");
+    const wxString payload_text = managed_color_data_raw_offset_payload_text(summary);
+    if (!payload_text.empty()) {
+        text += "; ";
+        text += payload_text;
+    }
     if (summary.raw_offset_image_texture_count > 1)
         text += wxString::Format(_L(" (%llu textures)"),
                                  static_cast<unsigned long long>(summary.raw_offset_image_texture_count));

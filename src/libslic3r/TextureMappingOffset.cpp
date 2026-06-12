@@ -48,6 +48,15 @@ struct WeightedTextureSample {
     float weight { 0.f };
 };
 
+bool model_volume_has_raw_texture_payload(const ModelVolume &volume)
+{
+    return volume.imported_texture_raw_channels != 0 ||
+           !volume.imported_texture_raw_filament_offsets.empty() ||
+           !volume.imported_texture_raw_metadata_json.empty() ||
+           !volume.imported_texture_raw_top_surface_depths.empty() ||
+           !volume.imported_texture_raw_top_surface_filament_slots.empty();
+}
+
 struct LayerPlaneSamplePoint {
     Vec3d p;
     Vec3f barycentric;
@@ -1729,7 +1738,8 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
                                                                           std::optional<float>      texture_sample_pitch_mm_override,
                                                                           std::optional<std::array<float, 4>> image_background_rgba_override,
                                                                           const ColorSolverCandidateSet *calibrated_side_candidates,
-                                                                          std::optional<int> raw_top_surface_depth_override)
+                                                                          std::optional<int> raw_top_surface_depth_override,
+                                                                          TextureMappingRawSurfaceUsage raw_surface_usage)
 {
     TextureMappingOffsetWeightField weight_field;
     if (component_colors.empty())
@@ -1902,6 +1912,7 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
             continue;
         }
 
+        const bool raw_texture_payload = model_volume_has_raw_texture_payload(*volume);
         const bool has_uv_texture =
             !volume->imported_texture_rgba.empty() &&
             volume->imported_texture_width > 0 &&
@@ -1938,8 +1949,20 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
                 texture_pixel_count > 0 &&
                 volume->imported_texture_raw_top_surface_filament_slots.size() >=
                     texture_pixel_count * raw_top_surface_layer_count;
+            const bool sample_raw_top_surface_uv_texture =
+                raw_surface_usage == TextureMappingRawSurfaceUsage::Flat && use_raw_top_surface_uv_texture;
+            const bool sample_raw_uv_texture =
+                raw_surface_usage == TextureMappingRawSurfaceUsage::Side && use_raw_uv_texture;
+            if (raw_texture_payload) {
+                if (raw_surface_usage == TextureMappingRawSurfaceUsage::Flat) {
+                    if (!sample_raw_top_surface_uv_texture)
+                        continue;
+                } else if (!sample_raw_uv_texture) {
+                    continue;
+                }
+            }
             const std::map<unsigned int, unsigned int> raw_top_surface_slot_component_ids =
-                use_raw_top_surface_uv_texture ?
+                sample_raw_top_surface_uv_texture ?
                     raw_top_surface_slot_component_id_map(volume->imported_texture_raw_metadata_json,
                                                           zone,
                                                           component_ids,
@@ -1953,7 +1976,7 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
                                                  uv.x(),
                                                  uv.y());
                 std::vector<float> raw_component_weights;
-                if (use_raw_top_surface_uv_texture) {
+                if (sample_raw_top_surface_uv_texture) {
                     raw_component_weights.assign(component_count, 0.f);
                     const uint16_t slot =
                         sample_texture_top_surface_slot_nearest(volume->imported_texture_raw_top_surface_filament_slots,
@@ -1983,7 +2006,7 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
                     sample.raw_top_surface_labels_from_texture = true;
                     return sample;
                 }
-                if (use_raw_uv_texture) {
+                if (sample_raw_uv_texture) {
                     const std::vector<float> raw_sample =
                         sample_texture_raw_offsets_bilinear(volume->imported_texture_raw_filament_offsets,
                                                             volume->imported_texture_width,
@@ -1997,7 +2020,7 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
                 }
                 if (raw_component_weights.size() != component_count)
                     rgba = composite_rgba_over_background(rgba, background_color);
-                return TextureSampleData{ rgba, std::move(raw_component_weights), use_raw_uv_texture };
+                return TextureSampleData{ rgba, std::move(raw_component_weights), sample_raw_uv_texture };
             };
 
             for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
@@ -2085,6 +2108,9 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
             }
             continue;
         }
+
+        if (raw_texture_payload)
+            continue;
 
         if (volume->imported_vertex_colors_rgba.empty() || its.vertices.size() != volume->imported_vertex_colors_rgba.size())
             continue;
@@ -3447,7 +3473,8 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     std::optional<float>     sample_z_mm_override,
     std::optional<float>     texture_sample_pitch_mm_override,
     std::optional<int>       raw_top_surface_depth_override,
-    std::optional<float>     filament_overhang_contrast_pct_override)
+    std::optional<float>     filament_overhang_contrast_pct_override,
+    TextureMappingRawSurfaceUsage raw_surface_usage)
 {
     const Print *print = print_object.print();
     if (print == nullptr)
@@ -3682,7 +3709,8 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
                                                                  sample_z_mm, layer_sample_falloff_mm, high_resolution_texture_sampling,
                                                                  zone.high_speed_image_texture_sampling, texture_sample_pitch_mm_override,
                                                                  image_background_rgba_override, calibrated_side_candidates_ptr,
-                                                                 raw_top_surface_depth_override);
+                                                                 raw_top_surface_depth_override,
+                                                                 raw_surface_usage);
         if (weight_field.empty())
             return std::nullopt;
     }

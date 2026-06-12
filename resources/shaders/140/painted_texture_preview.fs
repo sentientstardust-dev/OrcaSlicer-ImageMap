@@ -20,6 +20,9 @@ uniform float texture_preview_mix;
 uniform bool invalid_texture_mapping;
 uniform bool contoning_flat_surface_texture_enabled;
 uniform bool contoning_flat_surface_bottom_texture_enabled;
+uniform bool raw_atlas_surface_filter_enabled;
+uniform bool raw_atlas_side_texture_enabled;
+uniform bool raw_atlas_flat_texture_enabled;
 uniform bool color_match_preview_active;
 uniform vec3 color_match_target_oklab;
 uniform float color_match_tolerance_sq;
@@ -86,6 +89,15 @@ void main()
     vec4 color = uniform_color;
     vec4 texture_color = texture(uniform_texture, texture_preview_coord(tex_coord));
     float normal_z = normalize(world_normal).z;
+    bool flat_surface = abs(normal_z) >= CONTONING_FLAT_SURFACE_NORMAL_Z;
+    if (raw_atlas_surface_filter_enabled) {
+        bool raw_atlas_surface_allowed = flat_surface ? raw_atlas_flat_texture_enabled : raw_atlas_side_texture_enabled;
+        if (!raw_atlas_surface_allowed) {
+            if (color_match_preview_active)
+                discard;
+            texture_color = color;
+        }
+    }
     if (normal_z >= CONTONING_FLAT_SURFACE_NORMAL_Z) {
         if (contoning_flat_surface_texture_enabled)
             texture_color = texture(contoning_flat_surface_texture, texture_preview_coord(tex_coord));

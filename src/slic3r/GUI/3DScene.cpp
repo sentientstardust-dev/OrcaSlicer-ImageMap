@@ -2592,6 +2592,9 @@ void GLWipeTowerVolume::render_prime_tower_image_preview(const Transform3d& view
     shader->set_uniform("uniform_texture", 0);
     shader->set_uniform("texture_preview_mix", 1.f);
     shader->set_uniform("invalid_texture_mapping", false);
+    shader->set_uniform("raw_atlas_surface_filter_enabled", false);
+    shader->set_uniform("raw_atlas_side_texture_enabled", false);
+    shader->set_uniform("raw_atlas_flat_texture_enabled", false);
 
     auto render_image = [](PrimeTowerPreviewImage &image) {
         if (!image.model.is_initialized())

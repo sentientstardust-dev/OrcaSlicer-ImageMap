@@ -7462,6 +7462,16 @@ static bool model_volume_has_raw_offset_texture_data_for_gcode(const ModelVolume
                size_t(volume->imported_texture_raw_channels);
 }
 
+static bool model_volume_has_raw_texture_payload_for_gcode(const ModelVolume *volume)
+{
+    return volume != nullptr &&
+           (volume->imported_texture_raw_channels != 0 ||
+            !volume->imported_texture_raw_filament_offsets.empty() ||
+            !volume->imported_texture_raw_metadata_json.empty() ||
+            !volume->imported_texture_raw_top_surface_depths.empty() ||
+            !volume->imported_texture_raw_top_surface_filament_slots.empty());
+}
+
 static bool print_has_raw_offset_texture_zone_without_raw_data_for_gcode(const Print &print)
 {
     const TextureMappingManager &texture_mgr = print.texture_mapping_manager();
@@ -8606,6 +8616,7 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
             }
         }
 
+        const bool raw_texture_payload = model_volume_has_raw_texture_payload_for_gcode(volume);
         if (volume_uv_cache != nullptr && !volume_uv_cache->triangles.empty()) {
             const std::vector<size_t> raw_component_source_channels =
                 raw_component_source_channels_for_gcode(volume->imported_texture_raw_metadata_json,
@@ -8619,6 +8630,8 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
                     size_t(volume->imported_texture_width) *
                         size_t(volume->imported_texture_height) *
                         size_t(volume->imported_texture_raw_channels);
+            if (raw_texture_payload && !use_raw_uv_texture)
+                continue;
 
             auto sample_data_for_uv = [&](const Vec2f &uv) {
                 std::array<float, 4> rgba = sample_texture_rgba_bilinear_for_gcode(volume->imported_texture_rgba,
@@ -8769,6 +8782,9 @@ static VertexColorOverhangWeightField build_vertex_color_weight_field_for_gcode(
         }
 
         if (sampled_from_uv_texture)
+            continue;
+
+        if (raw_texture_payload)
             continue;
 
         if (volume->imported_vertex_colors_rgba.empty())

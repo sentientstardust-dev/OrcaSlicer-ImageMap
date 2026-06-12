@@ -20,6 +20,11 @@ namespace Slic3r {
 class Layer;
 class PrintObject;
 
+enum class TextureMappingRawSurfaceUsage {
+    Side,
+    Flat
+};
+
 struct TextureMappingOffsetWeightField {
     float min_x_mm { 0.f };
     float min_y_mm { 0.f };
@@ -122,7 +127,8 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     std::optional<float>     sample_z_mm_override = std::nullopt,
     std::optional<float>     texture_sample_pitch_mm_override = std::nullopt,
     std::optional<int>       raw_top_surface_depth_override = std::nullopt,
-    std::optional<float>     filament_overhang_contrast_pct_override = std::nullopt);
+    std::optional<float>     filament_overhang_contrast_pct_override = std::nullopt,
+    TextureMappingRawSurfaceUsage raw_surface_usage = TextureMappingRawSurfaceUsage::Side);
 
 std::vector<float> sample_weight_field_components(const TextureMappingOffsetWeightField &weight_field,
                                                   float                                  x_mm,

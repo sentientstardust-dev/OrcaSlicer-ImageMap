@@ -97,6 +97,7 @@ struct TexturePreviewSimulationSettings
     int generic_solver_mix_model = TextureMappingZone::DefaultGenericSolverMixModel;
     bool contoning_flat_surface_quantization = false;
     bool contoning_flat_surface_pattern_blend = false;
+    bool raw_top_surface_source_preview = false;
     bool contoning_flat_surface_td_adjustment = false;
     bool contoning_flat_surface_adaptive_spectral_correction = false;
     bool contoning_flat_surface_beer_lambert_rgb_correction = false;
@@ -223,6 +224,25 @@ bool model_volume_has_raw_top_surface_stack_preview_data_impl(const ModelVolume 
            !model_volume.imported_texture_raw_top_surface_depths.empty() &&
            model_volume.imported_texture_raw_top_surface_filament_slots.size() >=
                pixel_count * model_volume.imported_texture_raw_top_surface_depths.size();
+}
+
+bool model_volume_has_raw_texture_payload_preview_data_impl(const ModelVolume &model_volume)
+{
+    return model_volume.imported_texture_raw_channels != 0 ||
+           !model_volume.imported_texture_raw_filament_offsets.empty() ||
+           !model_volume.imported_texture_raw_metadata_json.empty() ||
+           !model_volume.imported_texture_raw_top_surface_depths.empty() ||
+           !model_volume.imported_texture_raw_top_surface_filament_slots.empty();
+}
+
+bool model_volume_has_raw_side_offset_preview_data_impl(const ModelVolume &model_volume)
+{
+    const size_t pixel_count =
+        size_t(model_volume.imported_texture_width) * size_t(model_volume.imported_texture_height);
+    return pixel_count > 0 &&
+           model_volume.imported_texture_raw_channels > 0 &&
+           model_volume.imported_texture_raw_filament_offsets.size() >=
+               pixel_count * size_t(model_volume.imported_texture_raw_channels);
 }
 
 bool model_volume_has_complete_texture_preview_data_impl(const ModelVolume &model_volume)
@@ -3173,10 +3193,12 @@ ColorRGBA simulated_texture_preview_color_for_vertex_color(const ColorRGBA *sour
 std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_settings_for_filament(unsigned int filament_id,
                                                                                                  size_t num_physical,
                                                                                                  const TextureMappingManager *texture_mgr,
-                                                                                                 const std::vector<std::string> &physical_colors)
+                                                                                                 const std::vector<std::string> &physical_colors,
+                                                                                                 bool allow_raw_top_surface_source_preview = false)
 {
     const TextureMappingZone *zone = zone_for_filament(filament_id, num_physical, texture_mgr);
-    if (zone == nullptr || !is_image_zone(*zone) || !texture_preview_simulate_colors())
+    if (zone == nullptr || !is_image_zone(*zone) ||
+        (!texture_preview_simulate_colors() && !allow_raw_top_surface_source_preview))
         return std::nullopt;
 
     TexturePreviewSimulationSettings settings;
@@ -3389,6 +3411,7 @@ size_t texture_preview_simulation_signature(const ModelVolume &model_volume,
     mix(std::hash<int>{}(settings.generic_solver_mix_model));
     mix(std::hash<int>{}(settings.contoning_flat_surface_quantization ? 1 : 0));
     mix(std::hash<int>{}(settings.contoning_flat_surface_pattern_blend ? 1 : 0));
+    mix(std::hash<int>{}(settings.raw_top_surface_source_preview ? 1 : 0));
     mix(std::hash<int>{}(settings.contoning_flat_surface_td_adjustment ? 1 : 0));
     mix(std::hash<int>{}(settings.contoning_flat_surface_adaptive_spectral_correction ? 1 : 0));
     mix(std::hash<int>{}(settings.contoning_flat_surface_beer_lambert_rgb_correction ? 1 : 0));
@@ -3468,7 +3491,10 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
     if (result.width == 0 || result.height == 0)
         return result;
 
+    const bool use_raw_top_surface_source_preview =
+        settings.raw_top_surface_source_preview;
     const bool use_contoning_flat_surface_pattern_blend =
+        !use_raw_top_surface_source_preview &&
         settings.contoning_flat_surface_pattern_blend &&
         settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
         !settings.component_colors.empty();
@@ -3493,6 +3519,7 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                    TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
                    TextureMappingZone::MaxTopSurfaceContoningPatternFilaments);
     const bool use_contoning_flat_surface_quantization =
+        !use_raw_top_surface_source_preview &&
         settings.contoning_flat_surface_quantization &&
         (settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues) ||
          settings.contoning_flat_surface_raw_top_stack_preview) &&
@@ -3562,7 +3589,8 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
         use_binary_dithering ? binary_dither_candidates_for_texture_preview(settings) :
                                std::vector<TexturePreviewBinaryDitherCandidate>{};
     const std::vector<TexturePreviewRawTopSurfaceLayer> raw_top_surface_layers =
-        use_contoning_flat_surface_quantization && settings.contoning_flat_surface_raw_top_stack_preview ?
+        (use_contoning_flat_surface_quantization && settings.contoning_flat_surface_raw_top_stack_preview) ||
+            use_raw_top_surface_source_preview ?
             raw_top_surface_layers_for_texture_preview(source_raw_top_surface_depths,
                                                        settings.contoning_flat_surface_stack_layers) :
             std::vector<TexturePreviewRawTopSurfaceLayer>{};
@@ -3729,6 +3757,7 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
             const size_t idx = (size_t(y) * size_t(result.width) + size_t(x)) * 4;
 
             const bool use_simulated_color_cache =
+                !use_raw_top_surface_source_preview &&
                 !use_raw_top_surface_stack_preview &&
                 !use_raw_offsets &&
                 !use_binary_dithering &&
@@ -3750,9 +3779,11 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                 blended_source_color.b(),
                 1.f
             };
-            if (use_raw_top_surface_stack_preview) {
+            if (use_raw_top_surface_stack_preview || use_raw_top_surface_source_preview) {
                 std::vector<uint16_t> surface_to_deep;
-                if (raw_top_surface_stack_at_source_for_texture_preview(source_raw_top_surface_slots,
+                const bool has_raw_top_surface_stack =
+                    use_raw_top_surface_stack_preview &&
+                    raw_top_surface_stack_at_source_for_texture_preview(source_raw_top_surface_slots,
                                                                         width,
                                                                         height,
                                                                         raw_top_surface_layers,
@@ -3760,7 +3791,19 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                                                                         raw_top_surface_component_indices,
                                                                         src_x,
                                                                         src_y,
-                                                                        surface_to_deep)) {
+                                                                        surface_to_deep);
+                if (has_raw_top_surface_stack && use_raw_top_surface_source_preview) {
+                    if (!surface_to_deep.empty()) {
+                        const size_t component_idx = size_t(surface_to_deep.front());
+                        if (component_idx < settings.component_colors.size()) {
+                            result.rgba[idx + 0] = to_u8(settings.component_colors[component_idx][0]);
+                            result.rgba[idx + 1] = to_u8(settings.component_colors[component_idx][1]);
+                            result.rgba[idx + 2] = to_u8(settings.component_colors[component_idx][2]);
+                            result.rgba[idx + 3] = 255;
+                            continue;
+                        }
+                    }
+                } else if (has_raw_top_surface_stack) {
                     const uint64_t raw_stack_cache_key = raw_top_surface_stack_cache_key_for_texture_preview(surface_to_deep);
                     const auto raw_stack_cached = raw_top_surface_stack_color_cache.find(raw_stack_cache_key);
                     if (raw_stack_cached != raw_top_surface_stack_color_cache.end()) {
@@ -3786,6 +3829,13 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                         result.rgba[idx + 3] = out_rgba[3];
                         continue;
                     }
+                }
+                if (use_raw_top_surface_source_preview) {
+                    result.rgba[idx + 0] = to_u8(background_color.r());
+                    result.rgba[idx + 1] = to_u8(background_color.g());
+                    result.rgba[idx + 2] = to_u8(background_color.b());
+                    result.rgba[idx + 3] = 255;
+                    continue;
                 }
             }
             std::vector<float> component_weights;
@@ -4261,35 +4311,54 @@ const GUI::GLTexture *simulated_texture_preview_texture_for_filament(const Model
                                                                     bool contoning_flat_surface_quantization = false,
                                                                     bool contoning_flat_surface_pattern_blend = false,
                                                                     bool contoning_flat_surface_raw_top_stack_preview = false,
-                                                                    bool *simulated_ready = nullptr)
+                                                                    bool *simulated_ready = nullptr,
+                                                                    bool raw_top_surface_source_preview = false)
 {
     if (simulated_ready != nullptr)
         *simulated_ready = false;
     const TextureMappingZone *zone = zone_for_filament(filament_id, num_physical, texture_mgr);
-    if ((contoning_flat_surface_quantization || contoning_flat_surface_pattern_blend) &&
+    const bool flat_surface_preview =
+        contoning_flat_surface_quantization ||
+        contoning_flat_surface_pattern_blend ||
+        raw_top_surface_source_preview;
+    if (flat_surface_preview &&
         (zone == nullptr ||
          !is_image_zone(*zone) ||
-         !texture_preview_simulate_colors() ||
+         (!texture_preview_simulate_colors() && !raw_top_surface_source_preview) ||
          (zone->texture_mapping_mode == int(TextureMappingZone::TextureMappingRawValues) &&
-          !contoning_flat_surface_raw_top_stack_preview)))
+          !contoning_flat_surface_raw_top_stack_preview &&
+          !raw_top_surface_source_preview)))
         return nullptr;
 
     const std::vector<std::string> physical_colors = physical_filament_colors_for_texture_preview(num_physical);
     std::optional<TexturePreviewSimulationSettings> settings =
-        texture_preview_simulation_settings_for_filament(filament_id, num_physical, texture_mgr, physical_colors);
+        texture_preview_simulation_settings_for_filament(filament_id,
+                                                         num_physical,
+                                                         texture_mgr,
+                                                         physical_colors,
+                                                         raw_top_surface_source_preview);
     if (!settings.has_value())
-        return (contoning_flat_surface_quantization || contoning_flat_surface_pattern_blend) ? nullptr : &fallback_texture;
+        return flat_surface_preview ? nullptr : &fallback_texture;
     settings->contoning_flat_surface_quantization = contoning_flat_surface_quantization;
     settings->contoning_flat_surface_pattern_blend = contoning_flat_surface_pattern_blend;
+    settings->raw_top_surface_source_preview =
+        raw_top_surface_source_preview &&
+        model_volume_has_raw_top_surface_stack_preview_data_for_zone_impl(model_volume, *zone);
     settings->contoning_flat_surface_raw_top_stack_preview =
         contoning_flat_surface_raw_top_stack_preview &&
+        !settings->raw_top_surface_source_preview &&
         contoning_flat_surface_quantization &&
         model_volume_has_raw_top_surface_stack_preview_data_for_zone_impl(model_volume, *zone);
-    if (settings->contoning_flat_surface_quantization || settings->contoning_flat_surface_pattern_blend)
+    if (settings->raw_top_surface_source_preview)
+        settings->contoning_flat_surface_quantization = false;
+    if (settings->contoning_flat_surface_quantization ||
+        settings->contoning_flat_surface_pattern_blend ||
+        settings->raw_top_surface_source_preview)
         settings->filament_overhang_contrast_pct = TextureMappingZone::DefaultFilamentOverhangContrastPct;
-    if ((contoning_flat_surface_quantization || contoning_flat_surface_pattern_blend) &&
+    if (flat_surface_preview &&
         zone->texture_mapping_mode == int(TextureMappingZone::TextureMappingRawValues) &&
-        !settings->contoning_flat_surface_raw_top_stack_preview)
+        !settings->contoning_flat_surface_raw_top_stack_preview &&
+        !settings->raw_top_surface_source_preview)
         return nullptr;
     settings->texture_preview_mm_per_pixel = estimated_texture_preview_mm_per_pixel(model_volume, &world_matrix);
     if (settings->contoning_flat_surface_quantization && settings->simulate_top_surface_lod)
@@ -4301,6 +4370,7 @@ const GUI::GLTexture *simulated_texture_preview_texture_for_filament(const Model
     auto &cache = texture_preview_simulation_cache();
     const size_t cache_key = texture_preview_simulation_cache_key(model_volume,
                                                                   filament_id,
+                                                                  settings->raw_top_surface_source_preview ? 4u :
                                                                   settings->contoning_flat_surface_raw_top_stack_preview ? 3u :
                                                                       contoning_flat_surface_quantization ? 1u :
                                                                       contoning_flat_surface_pattern_blend ? 2u : 0u,
@@ -4347,12 +4417,14 @@ const GUI::GLTexture *simulated_texture_preview_texture_for_filament(const Model
         auto source_raw_metadata_json =
             std::make_shared<std::string>(model_volume.imported_texture_raw_metadata_json);
         auto source_raw_top_surface_slots =
-            settings->contoning_flat_surface_raw_top_stack_preview ?
+            settings->contoning_flat_surface_raw_top_stack_preview ||
+                settings->raw_top_surface_source_preview ?
                 std::make_shared<std::vector<uint16_t>>(model_volume.imported_texture_raw_top_surface_filament_slots.begin(),
                                                         model_volume.imported_texture_raw_top_surface_filament_slots.end()) :
                 std::make_shared<std::vector<uint16_t>>();
         auto source_raw_top_surface_depths =
-            settings->contoning_flat_surface_raw_top_stack_preview ?
+            settings->contoning_flat_surface_raw_top_stack_preview ||
+                settings->raw_top_surface_source_preview ?
                 std::make_shared<std::vector<int>>(model_volume.imported_texture_raw_top_surface_depths.begin(),
                                                    model_volume.imported_texture_raw_top_surface_depths.end()) :
                 std::make_shared<std::vector<int>>();
@@ -4425,7 +4497,7 @@ const GUI::GLTexture *simulated_texture_preview_texture_for_filament(const Model
         return entry.texture.get();
     }
 
-    return (contoning_flat_surface_quantization || contoning_flat_surface_pattern_blend) ? nullptr : &fallback_texture;
+    return flat_surface_preview ? nullptr : &fallback_texture;
 }
 
 } // namespace
@@ -6524,9 +6596,14 @@ static bool texture_preview_zone_uses_halftone_model(const TextureMappingZone &z
 }
 
 static bool texture_preview_zone_uses_flat_surface_texture(const TextureMappingZone &zone,
+                                                           bool has_raw_texture_payload,
                                                            bool has_raw_top_surface_stack)
 {
-    if (!zone.enabled || zone.deleted || !zone.is_image_texture() || !texture_preview_simulate_colors())
+    if (!zone.enabled || zone.deleted || !zone.is_image_texture())
+        return false;
+    if (has_raw_texture_payload)
+        return zone.top_surface_image_printing_enabled && has_raw_top_surface_stack;
+    if (!texture_preview_simulate_colors())
         return false;
     if (zone.texture_mapping_mode != int(TextureMappingZone::TextureMappingRawValues))
         return true;
@@ -6536,6 +6613,7 @@ static bool texture_preview_zone_uses_flat_surface_texture(const TextureMappingZ
 static bool texture_preview_flat_surface_texture_for_filament(unsigned int filament_id,
                                                               size_t num_physical,
                                                               const TextureMappingManager *texture_mgr,
+                                                              bool has_raw_texture_payload,
                                                               bool has_raw_top_surface_stack,
                                                               bool &top_quantization,
                                                               bool &top_pattern_blend,
@@ -6547,7 +6625,7 @@ static bool texture_preview_flat_surface_texture_for_filament(unsigned int filam
     bottom_quantization = false;
     bottom_pattern_blend = false;
     const TextureMappingZone *zone = zone_for_filament(filament_id, num_physical, texture_mgr);
-    if (zone == nullptr || !texture_preview_zone_uses_flat_surface_texture(*zone, has_raw_top_surface_stack))
+    if (zone == nullptr || !texture_preview_zone_uses_flat_surface_texture(*zone, has_raw_texture_payload, has_raw_top_surface_stack))
         return false;
 
     if (zone->top_surface_image_printing_enabled) {
@@ -6794,6 +6872,17 @@ void render_model_texture_preview_models(
     shader->set_uniform("contoning_flat_surface_bottom_texture", 2);
     shader->set_uniform("contoning_flat_surface_texture_enabled", false);
     shader->set_uniform("contoning_flat_surface_bottom_texture_enabled", false);
+    const bool raw_atlas_surface_filter_enabled =
+        model_volume_has_raw_texture_payload_preview_data_impl(model_volume);
+    const bool raw_atlas_side_texture_enabled =
+        raw_atlas_surface_filter_enabled && model_volume_has_raw_side_offset_preview_data_impl(model_volume);
+    const bool raw_atlas_flat_texture_enabled =
+        raw_atlas_surface_filter_enabled &&
+        !raw_atlas_side_texture_enabled &&
+        model_volume_has_raw_top_surface_stack_preview_data_impl(model_volume);
+    shader->set_uniform("raw_atlas_surface_filter_enabled", raw_atlas_surface_filter_enabled);
+    shader->set_uniform("raw_atlas_side_texture_enabled", raw_atlas_side_texture_enabled);
+    shader->set_uniform("raw_atlas_flat_texture_enabled", raw_atlas_flat_texture_enabled);
 
     const size_t texture_signature = model_volume_texture_preview_signature(model_volume);
     GLuint bound_texture_id = 0;
@@ -6838,19 +6927,30 @@ void render_model_texture_preview_models(
         const bool has_raw_top_surface_stack =
             flat_zone != nullptr &&
             model_volume_has_raw_top_surface_stack_preview_data_for_zone_impl(model_volume, *flat_zone);
+        const bool has_raw_texture_payload =
+            model_volume_has_raw_texture_payload_preview_data_impl(model_volume);
         const bool use_contoning_flat_texture =
             !color_match_active &&
             !force_original_texture &&
             texture_preview_flat_surface_texture_for_filament(filament_ids[idx],
                                                               num_physical,
                                                               texture_mgr,
+                                                              has_raw_texture_payload,
                                                               has_raw_top_surface_stack,
                                                               contoning_flat_top_quantization,
                                                               contoning_flat_top_pattern_blend,
                                                               contoning_flat_bottom_quantization,
                                                               contoning_flat_bottom_pattern_blend);
+        const bool contoning_flat_top_raw_source =
+            use_contoning_flat_texture &&
+            has_raw_texture_payload &&
+            has_raw_top_surface_stack &&
+            !texture_preview_simulate_colors();
         const bool contoning_flat_top_raw_stack =
-            use_contoning_flat_texture && contoning_flat_top_quantization && has_raw_top_surface_stack;
+            use_contoning_flat_texture &&
+            !contoning_flat_top_raw_source &&
+            contoning_flat_top_quantization &&
+            has_raw_top_surface_stack;
         const GUI::GLTexture *contoning_flat_texture = use_contoning_flat_texture ?
             simulated_texture_preview_texture_for_filament(model_volume,
                                                            model_matrix,
@@ -6862,11 +6962,13 @@ void render_model_texture_preview_models(
                                                            contoning_flat_top_quantization,
                                                            contoning_flat_top_pattern_blend,
                                                            contoning_flat_top_raw_stack,
-                                                           &contoning_flat_top_ready) :
+                                                           &contoning_flat_top_ready,
+                                                           contoning_flat_top_raw_source) :
             nullptr;
         bool reuse_top_for_bottom =
             use_contoning_flat_texture &&
             !contoning_flat_top_raw_stack &&
+            !contoning_flat_top_raw_source &&
             contoning_flat_bottom_quantization == contoning_flat_top_quantization &&
             contoning_flat_bottom_pattern_blend == contoning_flat_top_pattern_blend;
         const GUI::GLTexture *contoning_flat_bottom_texture = reuse_top_for_bottom ?
@@ -7000,6 +7102,17 @@ void render_model_texture_preview_model(
     shader->set_uniform("uniform_texture", 0);
     shader->set_uniform("contoning_flat_surface_texture", 1);
     shader->set_uniform("contoning_flat_surface_bottom_texture", 2);
+    const bool raw_atlas_surface_filter_enabled =
+        model_volume_has_raw_texture_payload_preview_data_impl(model_volume);
+    const bool raw_atlas_side_texture_enabled =
+        raw_atlas_surface_filter_enabled && model_volume_has_raw_side_offset_preview_data_impl(model_volume);
+    const bool raw_atlas_flat_texture_enabled =
+        raw_atlas_surface_filter_enabled &&
+        !raw_atlas_side_texture_enabled &&
+        model_volume_has_raw_top_surface_stack_preview_data_impl(model_volume);
+    shader->set_uniform("raw_atlas_surface_filter_enabled", raw_atlas_surface_filter_enabled);
+    shader->set_uniform("raw_atlas_side_texture_enabled", raw_atlas_side_texture_enabled);
+    shader->set_uniform("raw_atlas_flat_texture_enabled", raw_atlas_flat_texture_enabled);
     bool contoning_flat_top_ready = false;
     bool contoning_flat_bottom_ready = false;
     bool contoning_flat_top_quantization = false;
@@ -7011,19 +7124,30 @@ void render_model_texture_preview_model(
     const bool has_raw_top_surface_stack =
         flat_zone != nullptr &&
         model_volume_has_raw_top_surface_stack_preview_data_for_zone_impl(model_volume, *flat_zone);
+    const bool has_raw_texture_payload =
+        model_volume_has_raw_texture_payload_preview_data_impl(model_volume);
     const bool use_contoning_flat_texture =
         !color_match_active &&
         !force_original_texture &&
         texture_preview_flat_surface_texture_for_filament(filament_id,
                                                           num_physical,
                                                           texture_mgr,
+                                                          has_raw_texture_payload,
                                                           has_raw_top_surface_stack,
                                                           contoning_flat_top_quantization,
                                                           contoning_flat_top_pattern_blend,
                                                           contoning_flat_bottom_quantization,
                                                           contoning_flat_bottom_pattern_blend);
+    const bool contoning_flat_top_raw_source =
+        use_contoning_flat_texture &&
+        has_raw_texture_payload &&
+        has_raw_top_surface_stack &&
+        !texture_preview_simulate_colors();
     const bool contoning_flat_top_raw_stack =
-        use_contoning_flat_texture && contoning_flat_top_quantization && has_raw_top_surface_stack;
+        use_contoning_flat_texture &&
+        !contoning_flat_top_raw_source &&
+        contoning_flat_top_quantization &&
+        has_raw_top_surface_stack;
     const GUI::GLTexture *contoning_flat_texture = use_contoning_flat_texture ?
         simulated_texture_preview_texture_for_filament(model_volume,
                                                        model_matrix,
@@ -7035,11 +7159,13 @@ void render_model_texture_preview_model(
                                                        contoning_flat_top_quantization,
                                                        contoning_flat_top_pattern_blend,
                                                        contoning_flat_top_raw_stack,
-                                                       &contoning_flat_top_ready) :
+                                                       &contoning_flat_top_ready,
+                                                       contoning_flat_top_raw_source) :
         nullptr;
     bool reuse_top_for_bottom =
         use_contoning_flat_texture &&
         !contoning_flat_top_raw_stack &&
+        !contoning_flat_top_raw_source &&
         contoning_flat_bottom_quantization == contoning_flat_top_quantization &&
         contoning_flat_bottom_pattern_blend == contoning_flat_top_pattern_blend;
     const GUI::GLTexture *contoning_flat_bottom_texture = reuse_top_for_bottom ?
