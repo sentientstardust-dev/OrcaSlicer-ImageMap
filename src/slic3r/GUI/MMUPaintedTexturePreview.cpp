@@ -3266,11 +3266,11 @@ std::optional<TexturePreviewSimulationSettings> texture_preview_simulation_setti
             effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb);
         settings.contoning_flat_surface_adaptive_spectral_correction =
             settings.contoning_flat_surface_td_adjustment &&
-            effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionAdaptiveSpectral);
+            (effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionAdaptiveSpectral) ||
+             effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionCalibratedCurrentLinearAffine));
         settings.contoning_flat_surface_td_effective_alpha_correction =
             settings.contoning_flat_surface_td_adjustment &&
-            (effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha) ||
-             effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionCalibratedCurrentLinearAffine));
+            effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha);
         settings.contoning_flat_surface_beam_search_stack_expansion =
             zone->effective_top_surface_contoning_beam_search_stack_expansion_enabled();
         settings.contoning_flat_surface_force_low_resolution =

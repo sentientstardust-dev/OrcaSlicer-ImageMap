@@ -2425,9 +2425,9 @@ static wxString texture_mapping_contoning_color_prediction_mode_label(int mode)
     case int(TextureMappingZone::ContoningColorPredictionBeerLambertRgb):
         return _L("RGB Beer-Lambert - not recommended");
     case int(TextureMappingZone::ContoningColorPredictionBasicReflectance):
-        return _L("Basic Reflectance");
+        return _L("Basic Reflectance - not recommended");
     case int(TextureMappingZone::ContoningColorPredictionCalibratedCurrentLinearAffine):
-        return _L("Calibrated: current linear affine");
+        return _L("Calibrated: linear affine - not recommended");
     case int(TextureMappingZone::ContoningColorPredictionCalibratedTdAlphaEffective):
         return _L("Calibrated: TD alpha effective");
     case int(TextureMappingZone::ContoningColorPredictionCalibratedFreeAlphaEffective):
@@ -2437,7 +2437,7 @@ static wxString texture_mapping_contoning_color_prediction_mode_label(int mode)
     case int(TextureMappingZone::ContoningColorPredictionCalibratedNearestMeasuredSample):
         return _L("Calibrated: nearest measured sample");
     default:
-        return _L("TD Effective Alpha");
+        return _L("TD Effective Alpha - not recommended");
     }
 }
 
@@ -4246,8 +4246,7 @@ public:
     {
         const int effective_mode = TextureMappingZone::effective_top_surface_contoning_color_prediction_mode(
             top_surface_contoning_color_prediction_mode());
-        return effective_mode == int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha) ||
-               effective_mode == int(TextureMappingZone::ContoningColorPredictionCalibratedCurrentLinearAffine);
+        return effective_mode == int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha);
     }
     bool top_surface_contoning_surface_scatter_enabled() const
     {

@@ -228,7 +228,7 @@ struct TextureMappingZone
     static constexpr int   DefaultTopSurfaceContoningFlatSurfaceInfillMode = int(ContoningFlatSurfaceInfillDefault);
     static constexpr int   SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode = int(ContoningFlatSurfaceInfillBoundarySkinVariable);
     static constexpr bool  DefaultTopSurfaceContoningLayerPhaseEnabled = false;
-    static constexpr bool  DefaultTopSurfaceContoningVariedInfillAnglesEnabled = false;
+    static constexpr bool  DefaultTopSurfaceContoningVariedInfillAnglesEnabled = true;
     static constexpr bool  DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningSupersampledCellsEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningPolygonizeColorRegionsEnabled = true;
@@ -742,8 +742,7 @@ struct TextureMappingZone
             mode == int(ContoningColorPredictionBeerLambertRgb);
         top_surface_contoning_beer_lambert_rgb_correction_enabled = beer_lambert_rgb;
         top_surface_contoning_td_effective_alpha_correction_enabled =
-            mode == int(ContoningColorPredictionTdEffectiveAlpha) ||
-            mode == int(ContoningColorPredictionCalibratedCurrentLinearAffine);
+            mode == int(ContoningColorPredictionTdEffectiveAlpha);
     }
 
     void apply_top_surface_contoning_experimental_defaults()

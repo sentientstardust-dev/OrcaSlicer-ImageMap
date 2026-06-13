@@ -420,11 +420,11 @@ TextureMappingContoningSolver::TextureMappingContoningSolver(const TextureMappin
             zone.top_surface_contoning_color_prediction_mode);
     m_adaptive_spectral_correction_enabled =
         m_td_adjustment_enabled &&
-        m_effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionAdaptiveSpectral);
+        (m_effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionAdaptiveSpectral) ||
+         m_effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionCalibratedCurrentLinearAffine));
     m_td_effective_alpha_correction_enabled =
         m_td_adjustment_enabled &&
-        (m_effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha) ||
-         m_effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionCalibratedCurrentLinearAffine));
+        m_effective_color_prediction_mode == int(TextureMappingZone::ContoningColorPredictionTdEffectiveAlpha);
     m_beer_lambert_rgb_correction_enabled =
         m_td_adjustment_enabled &&
         !m_td_effective_alpha_correction_enabled &&

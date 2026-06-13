@@ -6531,7 +6531,8 @@ struct ProjectionPaintableImageMask
 };
 
 static ProjectionPaintableImageMask build_projection_paintable_image_mask(const ProjectionContext &context,
-                                                                          bool                     transparent_bg_paintable = false)
+                                                                          bool                     transparent_bg_paintable = false,
+                                                                          float                    paintable_alpha_threshold = 0.5f)
 {
     ProjectionPaintableImageMask mask;
     mask.width = context.image_width;
@@ -6554,7 +6555,7 @@ static ProjectionPaintableImageMask build_projection_paintable_image_mask(const 
         uint32_t row_sum = 0;
         for (uint32_t x = 0; x < mask.width; ++x) {
             const size_t pixel_idx = (size_t(y) * size_t(mask.width) + size_t(x)) * 4 + 3;
-            const bool paintable = float((*context.image_rgba)[pixel_idx]) * opacity > 0.5f;
+            const bool paintable = float((*context.image_rgba)[pixel_idx]) * opacity > paintable_alpha_threshold;
             row_sum += paintable ? 1u : 0u;
             mask.prefix[(size_t(y) + 1) * stride + size_t(x) + 1] =
                 mask.prefix[size_t(y) * stride + size_t(x) + 1] + row_sum;
@@ -8273,6 +8274,220 @@ static unsigned int texture_mapping_zone_id_for_erasing_region_projection(ModelO
     if (const unsigned int painted_id = painted_image_texture_zone_id_for_projection(object); painted_id != 0)
         return painted_id;
     return ensure_texture_mapping_zone();
+}
+
+static void append_unique_texture_mapping_zone_id(std::vector<unsigned int> &ids, unsigned int zone_id)
+{
+    if (zone_id != 0 && std::find(ids.begin(), ids.end(), zone_id) == ids.end())
+        ids.emplace_back(zone_id);
+}
+
+static void append_assigned_image_texture_zone_id(const TextureMappingManager &texture_mgr,
+                                                  std::vector<unsigned int>   &ids,
+                                                  int                          filament_id)
+{
+    if (filament_id > 0 && image_texture_zone_is_usable(texture_mgr, unsigned(filament_id)))
+        append_unique_texture_mapping_zone_id(ids, unsigned(filament_id));
+}
+
+static bool image_projection_volume_has_projected_image(const ModelObject                  &object,
+                                                        const ModelVolume                  &volume,
+                                                        size_t                              volume_idx,
+                                                        const GLCanvas3D                   &parent,
+                                                        const ProjectionContext            &context,
+                                                        int                                 instance_idx,
+                                                        bool                                pass_through_model,
+                                                        const ProjectionVisibility         &visibility,
+                                                        const ProjectionPaintableImageMask &paintable_mask)
+{
+    if (!volume.is_model_part())
+        return false;
+
+    const indexed_triangle_set &its = volume.mesh().its;
+    if (its.vertices.empty() || its.indices.empty())
+        return false;
+
+    const Transform3d world_matrix =
+        projection_world_matrix_for_context(context, parent, &object, &volume, volume_idx, instance_idx);
+
+    for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+        const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
+        if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
+            continue;
+        if (size_t(tri[0]) >= its.vertices.size() ||
+            size_t(tri[1]) >= its.vertices.size() ||
+            size_t(tri[2]) >= its.vertices.size())
+            continue;
+
+        const std::array<Vec3f, 3> vertices = {
+            its.vertices[size_t(tri[0])].cast<float>(),
+            its.vertices[size_t(tri[1])].cast<float>(),
+            its.vertices[size_t(tri[2])].cast<float>()
+        };
+        if (projection_triangle_should_project(context,
+                                               visibility,
+                                               paintable_mask,
+                                               world_matrix,
+                                               vertices,
+                                               projection_visibility_triangle_key(volume_idx, tri_idx),
+                                               !pass_through_model))
+            return true;
+    }
+
+    return false;
+}
+
+static std::vector<unsigned int> raw_top_surface_projection_affected_zone_ids(const ModelObject       &object,
+                                                                              const GLCanvas3D      &parent,
+                                                                              const ImageMapRawFilamentOffsetAtlas &raw_atlas,
+                                                                              bool                   raw_atlas_valid,
+                                                                              const ProjectionContext &context,
+                                                                              int                    instance_idx,
+                                                                              bool                   pass_through_model,
+                                                                              bool                   improve_projection_accuracy,
+                                                                              bool                   project_regions,
+                                                                              unsigned int           texture_mapping_filament_id)
+{
+    std::vector<unsigned int> ids;
+    if (!raw_atlas_valid || raw_atlas.top_surface_layers.empty() || wxGetApp().preset_bundle == nullptr)
+        return ids;
+
+    ProjectionContext raw_projection_context = context;
+    raw_projection_context.image_opacity = 1.f;
+
+    ProjectionVisibility visibility;
+    if (!pass_through_model)
+        visibility = build_projection_visibility(raw_projection_context,
+                                                 parent,
+                                                 &object,
+                                                 instance_idx,
+                                                 ImageProjectionCancelCheckFn(),
+                                                 improve_projection_accuracy);
+    const ProjectionPaintableImageMask paintable_mask = build_projection_paintable_image_mask(raw_projection_context, false, 127.49f);
+
+    for (size_t volume_idx = 0; volume_idx < object.volumes.size(); ++volume_idx) {
+        const ModelVolume *volume = object.volumes[volume_idx];
+        if (volume == nullptr)
+            continue;
+        if (!image_projection_volume_has_projected_image(object,
+                                                         *volume,
+                                                         volume_idx,
+                                                         parent,
+                                                         raw_projection_context,
+                                                         instance_idx,
+                                                         pass_through_model,
+                                                         visibility,
+                                                         paintable_mask))
+            continue;
+
+        const TextureMappingManager &texture_mgr = wxGetApp().preset_bundle->texture_mapping_zones;
+        if (project_regions && texture_mapping_filament_id != 0) {
+            if (image_texture_zone_is_usable(texture_mgr, texture_mapping_filament_id))
+                append_unique_texture_mapping_zone_id(ids, texture_mapping_filament_id);
+            return ids;
+        }
+        append_assigned_image_texture_zone_id(texture_mgr, ids, volume->extruder_id());
+    }
+
+    return ids;
+}
+
+static wxString texture_mapping_zone_id_list_text(const std::vector<unsigned int> &ids)
+{
+    wxString text;
+    for (size_t idx = 0; idx < ids.size(); ++idx) {
+        if (idx > 0)
+            text += ", ";
+        text += wxString::Format("%u", ids[idx]);
+    }
+    return text;
+}
+
+static std::vector<unsigned int> auto_enable_raw_top_surface_projection_zones(const ModelObject       &object,
+                                                                              const GLCanvas3D      &parent,
+                                                                              const ImageMapRawFilamentOffsetAtlas &raw_atlas,
+                                                                              bool                   raw_atlas_valid,
+                                                                              const ProjectionContext &context,
+                                                                              int                    instance_idx,
+                                                                              bool                   pass_through_model,
+                                                                              bool                   improve_projection_accuracy,
+                                                                              bool                   project_regions,
+                                                                              unsigned int           texture_mapping_filament_id)
+{
+    std::vector<unsigned int> newly_enabled_ids;
+    if (wxGetApp().preset_bundle == nullptr)
+        return newly_enabled_ids;
+
+    const std::vector<unsigned int> affected_ids =
+        raw_top_surface_projection_affected_zone_ids(object,
+                                                     parent,
+                                                     raw_atlas,
+                                                     raw_atlas_valid,
+                                                     context,
+                                                     instance_idx,
+                                                     pass_through_model,
+                                                     improve_projection_accuracy,
+                                                     project_regions,
+                                                     texture_mapping_filament_id);
+    if (affected_ids.empty())
+        return newly_enabled_ids;
+
+    TextureMappingManager &texture_mgr = wxGetApp().preset_bundle->texture_mapping_zones;
+    bool changed = false;
+    for (const unsigned int zone_id : affected_ids) {
+        TextureMappingZone *zone = texture_mgr.zone_from_id(zone_id);
+        if (zone == nullptr || !zone->enabled || zone->deleted || !zone->is_image_texture())
+            continue;
+
+        if (!zone->top_surface_image_printing_enabled)
+            newly_enabled_ids.emplace_back(zone_id);
+
+        if (!zone->top_surface_image_printing_enabled) {
+            zone->top_surface_image_printing_enabled = true;
+            changed = true;
+        }
+        if (zone->top_surface_image_printing_method != int(TextureMappingZone::TopSurfaceImageContoning)) {
+            zone->top_surface_image_printing_method = int(TextureMappingZone::TopSurfaceImageContoning);
+            changed = true;
+        }
+        if (zone->top_surface_image_fixed_coloring_filaments != true) {
+            zone->top_surface_image_fixed_coloring_filaments = true;
+            changed = true;
+        }
+        if (zone->top_surface_contoning_colored_surfaces != int(TextureMappingZone::ContoningColoredUpperAndLowerSurfaces)) {
+            zone->top_surface_contoning_colored_surfaces = int(TextureMappingZone::ContoningColoredUpperAndLowerSurfaces);
+            changed = true;
+        }
+        if (!zone->top_surface_contoning_color_lower_surfaces) {
+            zone->top_surface_contoning_color_lower_surfaces = true;
+            changed = true;
+        }
+        if (zone->modulation_mode != int(TextureMappingZone::ModulationPerimeterPathV2)) {
+            zone->modulation_mode = int(TextureMappingZone::ModulationPerimeterPathV2);
+            changed = true;
+        }
+        if (!zone->modulation_mode_manually_changed) {
+            zone->modulation_mode_manually_changed = true;
+            changed = true;
+        }
+    }
+
+    if (changed)
+        persist_texture_mapping_zone_definitions(texture_mgr);
+
+    std::sort(newly_enabled_ids.begin(), newly_enabled_ids.end());
+    return newly_enabled_ids;
+}
+
+static void show_auto_enabled_raw_top_surface_projection_message(const std::vector<unsigned int> &zone_ids)
+{
+    if (zone_ids.empty())
+        return;
+
+    show_info(wxGetApp().mainframe,
+              _L("Top-surface coloring has been automatically enabled for affected texture mapping zones: ") +
+                  texture_mapping_zone_id_list_text(zone_ids),
+              _L("Top-Surface Coloring Enabled"));
 }
 
 struct ManagedColorSourceFlags
@@ -18822,6 +19037,17 @@ bool GLGizmoImageProjection::start_projection_job()
             image_projection_apply_volume_result(*dst, *src);
         }
 
+        const std::vector<unsigned int> auto_enabled_top_surface_zone_ids =
+            auto_enable_raw_top_surface_projection_zones(*object,
+                                                         m_parent,
+                                                         result->input.raw_atlas,
+                                                         result->input.raw_atlas_valid,
+                                                         result->input.context,
+                                                         result->input.instance_idx,
+                                                         result->input.pass_through_model,
+                                                         result->input.improve_projection_accuracy,
+                                                         result->input.project_regions,
+                                                         result->texture_mapping_filament_id);
         refresh_projected_object(object);
         remember_projected_object(object);
         m_projection_mode_initialized = true;
@@ -18830,6 +19056,7 @@ bool GLGizmoImageProjection::start_projection_job()
             show_raw_offset_data_converted_to_rgba_image_message();
         if (result->creating_rgba_data_from_raw && object_has_rgba_data(*object))
             show_raw_offset_data_converted_to_rgba_message();
+        show_auto_enabled_raw_top_surface_projection_message(auto_enabled_top_surface_zone_ids);
         m_show_overlay = false;
         finish();
     };
@@ -18886,16 +19113,20 @@ bool GLGizmoImageProjection::project_image_to_object(ModelObject *object,
     if (check_cancel)
         check_cancel();
 
-    if (input.project_regions && texture_mapping_filament_id != 0)
+    if (input.project_regions && texture_mapping_filament_id != 0) {
+        ProjectionContext region_projection_context = input.context;
+        if (input.raw_atlas_valid)
+            region_projection_context.image_opacity = 1.f;
         project_texture_mapping_zone_to_regions(*object,
                                                 m_parent,
-                                                input.context,
+                                                region_projection_context,
                                                 input.instance_idx,
                                                 input.pass_through_model,
                                                 texture_mapping_filament_id,
                                                 stage_progress(80, 98),
                                                 check_cancel,
                                                 input.improve_projection_accuracy);
+    }
 
     if (progress_fn)
         progress_fn(100);
@@ -18975,6 +19206,17 @@ bool GLGizmoImageProjection::project_image_to_selected_object()
     if (!project_image_to_object(object, texture_mapping_filament_id, input))
         return false;
 
+    const std::vector<unsigned int> auto_enabled_top_surface_zone_ids =
+        auto_enable_raw_top_surface_projection_zones(*object,
+                                                     m_parent,
+                                                     input.raw_atlas,
+                                                     input.raw_atlas_valid,
+                                                     input.context,
+                                                     input.instance_idx,
+                                                     input.pass_through_model,
+                                                     input.improve_projection_accuracy,
+                                                     input.project_regions,
+                                                     texture_mapping_filament_id);
     refresh_projected_object(object);
     remember_projected_object(object);
     m_projection_mode_initialized = true;
@@ -18983,6 +19225,7 @@ bool GLGizmoImageProjection::project_image_to_selected_object()
         show_raw_offset_data_converted_to_rgba_image_message();
     if (creating_rgba_data_from_raw && object_has_rgba_data(*object))
         show_raw_offset_data_converted_to_rgba_message();
+    show_auto_enabled_raw_top_surface_projection_message(auto_enabled_top_surface_zone_ids);
     return true;
 }
 
@@ -19154,6 +19397,10 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object,
         visibility = build_projection_visibility(context, m_parent, object, instance_idx, check_cancel, input.improve_projection_accuracy);
     const bool raw_atlas_projection = input.raw_atlas_valid;
     const ImageMapRawFilamentOffsetAtlas &raw_projection_atlas = input.raw_atlas;
+    ProjectionContext raw_projection_context = context;
+    if (raw_atlas_projection)
+        raw_projection_context.image_opacity = 1.f;
+    const ProjectionContext &projection_alpha_context = raw_atlas_projection ? raw_projection_context : context;
     RawAtlasProjectionLayout raw_layout;
     if (raw_atlas_projection) {
         std::string raw_atlas_error;
@@ -19247,7 +19494,7 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object,
         if (projection_visibility_exact(visibility)) {
             exact_projected_triangles.assign(its.indices.size(), 0);
             const ProjectionPaintableImageMask paintable_mask =
-                build_projection_paintable_image_mask(context, context.apply_transparency_as_background);
+                build_projection_paintable_image_mask(projection_alpha_context, projection_alpha_context.apply_transparency_as_background);
             tbb::parallel_for(tbb::blocked_range<size_t>(0, its.indices.size(), 512),
                               [&](const tbb::blocked_range<size_t> &range) {
                 for (size_t tri_idx = range.begin(); tri_idx < range.end(); ++tri_idx) {
@@ -19425,7 +19672,7 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object,
                                     projected_image_color_at_point(context, world_matrix, projection_point)) {
                                 const bool transparent_sample =
                                     !context.apply_transparency_as_background &&
-                                    !projection_overlay_has_paintable_alpha(*projected, context);
+                                    !projection_overlay_has_paintable_alpha(*projected, projection_alpha_context);
                                 if (transparent_sample) {
                                     if (!rewrite_texture_base) {
                                         continue;
@@ -19442,7 +19689,7 @@ bool GLGizmoImageProjection::project_to_image_texture(ModelObject *object,
                                                 std::vector<uint16_t>();
                                         if (atlas_raw_values.empty() && atlas_top_surface_slots.empty())
                                             continue;
-                                        const float alpha = projection_overlay_alpha(*projected, context);
+                                        const float alpha = projection_overlay_alpha(*projected, projection_alpha_context);
                                         if (!atlas_raw_values.empty()) {
                                             std::vector<uint8_t> raw_values = raw_offset_pixel_values(*volume, wrapped_x, wrapped_y);
                                             if (raw_values.size() != size_t(volume->imported_texture_raw_channels))
