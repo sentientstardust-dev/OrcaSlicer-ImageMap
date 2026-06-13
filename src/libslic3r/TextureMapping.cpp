@@ -853,7 +853,7 @@ static std::string top_surface_contoning_flat_surface_infill_mode_name(int mode)
 {
     switch (clamp_int(mode,
                       int(TextureMappingZone::ContoningFlatSurfaceInfillDefault),
-                      int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithRepair))) {
+                      int(TextureMappingZone::ContoningFlatSurfaceInfillAdaptiveLines))) {
     case int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinear):
         return "rectilinear";
     case int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithBoundary):
@@ -870,6 +870,8 @@ static std::string top_surface_contoning_flat_surface_infill_mode_name(int mode)
         return "spiral";
     case int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinHybrid):
         return "boundary_skin_hybrid";
+    case int(TextureMappingZone::ContoningFlatSurfaceInfillAdaptiveLines):
+        return "adaptive_lines";
     default:
         return "default";
     }
@@ -893,6 +895,10 @@ static int top_surface_contoning_flat_surface_infill_mode_from_name(const std::s
         return int(TextureMappingZone::ContoningFlatSurfaceInfillSpiral);
     if (name == "boundary_skin_hybrid")
         return int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinHybrid);
+    if (name == "adaptive_lines" ||
+        name == "arachne_gap_fill" ||
+        name == "arachne_blob_exact_printability_selective_gap_bias_cluster_line_merge")
+        return int(TextureMappingZone::ContoningFlatSurfaceInfillAdaptiveLines);
     return int(TextureMappingZone::ContoningFlatSurfaceInfillDefault);
 }
 
@@ -3214,7 +3220,7 @@ void TextureMappingManager::load_entries(const std::string &serialized,
                               flat_surface_infill_mode_it->get<int>() :
                               TextureMappingZone::DefaultTopSurfaceContoningFlatSurfaceInfillMode,
                           int(TextureMappingZone::ContoningFlatSurfaceInfillDefault),
-                          int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithRepair));
+                          int(TextureMappingZone::ContoningFlatSurfaceInfillAdaptiveLines));
         zone.top_surface_contoning_layer_phase_enabled =
             texture.value("top_surface_contoning_layer_phase_enabled",
                           TextureMappingZone::DefaultTopSurfaceContoningLayerPhaseEnabled);

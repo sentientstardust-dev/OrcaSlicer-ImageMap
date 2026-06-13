@@ -96,7 +96,8 @@ struct TextureMappingZone
         ContoningFlatSurfaceInfillSpiral = 5,
         ContoningFlatSurfaceInfillBoundarySkinHybrid = 6,
         ContoningFlatSurfaceInfillRectilinearWithBoundary = 7,
-        ContoningFlatSurfaceInfillRectilinearWithRepair = 8
+        ContoningFlatSurfaceInfillRectilinearWithRepair = 8,
+        ContoningFlatSurfaceInfillAdaptiveLines = 9
     };
 
     enum TopSurfaceContoningColorPredictionMode : uint8_t {
@@ -304,11 +305,12 @@ struct TextureMappingZone
     {
         const int clamped_mode = std::clamp(mode,
                                             int(ContoningFlatSurfaceInfillDefault),
-                                            int(ContoningFlatSurfaceInfillRectilinearWithRepair));
+                                            int(ContoningFlatSurfaceInfillAdaptiveLines));
         if (ShowExperimentalTopSurfaceContoningOptions)
             return clamped_mode;
         return clamped_mode == int(ContoningFlatSurfaceInfillRectilinear) ||
-               clamped_mode == int(ContoningFlatSurfaceInfillBoundarySkinVariable) ?
+               clamped_mode == int(ContoningFlatSurfaceInfillBoundarySkinVariable) ||
+               clamped_mode == int(ContoningFlatSurfaceInfillAdaptiveLines) ?
             clamped_mode :
             DefaultTopSurfaceContoningFlatSurfaceInfillMode;
     }

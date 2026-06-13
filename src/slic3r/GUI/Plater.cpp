@@ -3290,6 +3290,8 @@ public:
         if (TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
             add_contoning_flat_infill_choice(_L("Rectilinear with repair"),
                                              int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithRepair));
+        add_contoning_flat_infill_choice(_L("Adaptive Lines"),
+                                         int(TextureMappingZone::ContoningFlatSurfaceInfillAdaptiveLines));
         if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
             add_contoning_flat_infill_choice(_L("Boundary Skin (variable width)"),
                                              int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariable));
@@ -5527,7 +5529,10 @@ private:
         const bool allow_x8 = TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions ||
                               TextureMappingZone::effective_top_surface_contoning_flat_surface_infill_mode(
                                   top_surface_contoning_flat_surface_infill_mode()) ==
-                                  int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariable);
+                                  int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariable) ||
+                              TextureMappingZone::effective_top_surface_contoning_flat_surface_infill_mode(
+                                  top_surface_contoning_flat_surface_infill_mode()) ==
+                                  int(TextureMappingZone::ContoningFlatSurfaceInfillAdaptiveLines);
         int resolution = TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(preferred_resolution);
         if (!allow_x8 && resolution == 8)
             resolution = 4;
@@ -12023,6 +12028,7 @@ struct Plater::priv
 
     // BBS
     bool init_collapse_toolbar();
+    void invalidate_texture_mapping_color_cache();
 
     // BBS
     void hide_select_machine_dlg()
@@ -12385,6 +12391,79 @@ const std::regex Plater::priv::pattern_3mf(".*3mf", std::regex::icase);
 const std::regex Plater::priv::pattern_zip_amf(".*[.]zip[.]amf", std::regex::icase);
 const std::regex Plater::priv::pattern_any_amf(".*[.](amf|amf[.]xml|zip[.]amf)", std::regex::icase);
 const std::regex Plater::priv::pattern_prusa(".*bbl", std::regex::icase);
+
+struct TextureMappingDisplayColorCache
+{
+    bool valid { false };
+    const PresetBundle *bundle { nullptr };
+    std::string definitions;
+    std::vector<std::string> physical_colors;
+    std::vector<std::string> display_colors;
+    std::vector<ColorRGBA> rgba_colors;
+};
+
+static TextureMappingDisplayColorCache s_texture_mapping_display_color_cache;
+
+static void invalidate_texture_mapping_display_color_cache()
+{
+    s_texture_mapping_display_color_cache.valid = false;
+}
+
+static const std::vector<std::string>& texture_mapping_display_colors(PresetBundle *bundle, const DynamicPrintConfig *config, const std::vector<std::string> &filament_colors)
+{
+    static const std::vector<std::string> empty_colors;
+    if (bundle == nullptr || config == nullptr)
+        return empty_colors;
+
+    const std::string definitions = config->has("texture_mapping_definitions") ?
+        config->opt_string("texture_mapping_definitions") :
+        std::string();
+
+    if (s_texture_mapping_display_color_cache.valid &&
+        s_texture_mapping_display_color_cache.bundle == bundle &&
+        s_texture_mapping_display_color_cache.definitions == definitions &&
+        s_texture_mapping_display_color_cache.physical_colors == filament_colors)
+        return s_texture_mapping_display_color_cache.display_colors;
+
+    bundle->texture_mapping_zones.load_entries(definitions, filament_colors);
+    std::vector<std::string> colors = filament_colors;
+    const std::vector<std::string> zone_colors = bundle->texture_mapping_zones.display_colors(filament_colors.size());
+    colors.insert(colors.end(), zone_colors.begin(), zone_colors.end());
+
+    std::vector<ColorRGBA> rgba_colors(colors.size());
+    unsigned char rgba_color[4] = {};
+    for (size_t idx = 0; idx < colors.size(); ++idx) {
+        Slic3r::GUI::BitmapCache::parse_color4(colors[idx], rgba_color);
+        rgba_colors[idx] = {
+            float(rgba_color[0]) / 255.f,
+            float(rgba_color[1]) / 255.f,
+            float(rgba_color[2]) / 255.f,
+            float(rgba_color[3]) / 255.f,
+        };
+    }
+
+    s_texture_mapping_display_color_cache.bundle = bundle;
+    s_texture_mapping_display_color_cache.definitions = definitions;
+    s_texture_mapping_display_color_cache.physical_colors = filament_colors;
+    s_texture_mapping_display_color_cache.display_colors = std::move(colors);
+    s_texture_mapping_display_color_cache.rgba_colors = std::move(rgba_colors);
+    s_texture_mapping_display_color_cache.valid = true;
+    return s_texture_mapping_display_color_cache.display_colors;
+}
+
+static const std::vector<ColorRGBA>& texture_mapping_rgba_colors(PresetBundle *bundle, const DynamicPrintConfig *config, const std::vector<std::string> &filament_colors)
+{
+    static const std::vector<ColorRGBA> empty_colors;
+    if (bundle == nullptr || config == nullptr)
+        return empty_colors;
+    texture_mapping_display_colors(bundle, config, filament_colors);
+    return s_texture_mapping_display_color_cache.rgba_colors;
+}
+
+void Plater::priv::invalidate_texture_mapping_color_cache()
+{
+    invalidate_texture_mapping_display_color_cache();
+}
 
 bool PlaterDropTarget::OnDropFiles(wxCoord x, wxCoord y, const wxArrayString &filenames)
 {
@@ -23997,6 +24076,7 @@ void Plater::on_filament_count_change(size_t num_filaments)
 {
     // only update elements in plater
     update_filament_colors_in_full_config();
+    p->invalidate_texture_mapping_color_cache();
     sidebar().on_filament_count_change(num_filaments);
     sidebar().obj_list()->update_objects_list_filament_column(num_filaments);
 
@@ -24070,6 +24150,7 @@ void Plater::on_filaments_delete(size_t num_filaments, size_t filament_id, int r
                 opt->value = remapped;
             else
                 print_config.set_key_value("texture_mapping_definitions", new ConfigOptionString(remapped));
+            p->invalidate_texture_mapping_color_cache();
         }
     }
 
@@ -24126,20 +24207,12 @@ void Plater::on_filaments_delete(size_t num_filaments, size_t filament_id, int r
 
 std::vector<Slic3r::ColorRGBA> Plater::get_extruders_colors()
 {
-    unsigned char                     rgba_color[4] = {};
-    std::vector<std::string>          colors        = get_extruder_colors_from_plater_config();
-    std::vector<Slic3r::ColorRGBA> colors_out(colors.size());
-    for (const std::string &color : colors) {
-        Slic3r::GUI::BitmapCache::parse_color4(color, rgba_color);
-        size_t color_idx      = &color - &colors.front();
-        colors_out[color_idx] = {
-            float(rgba_color[0]) / 255.f,
-            float(rgba_color[1]) / 255.f,
-            float(rgba_color[2]) / 255.f,
-            float(rgba_color[3]) / 255.f,
-        };
-    }
-    return colors_out;
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    const Slic3r::DynamicPrintConfig *config = bundle != nullptr ? &bundle->project_config : nullptr;
+    if (config == nullptr || !config->has("filament_colour"))
+        return {};
+    const std::vector<std::string> filament_colors = config->option<ConfigOptionStrings>("filament_colour")->values;
+    return texture_mapping_rgba_colors(bundle, config, filament_colors);
 }
 
 void Plater::on_bed_type_change(BedType bed_type)
@@ -24156,6 +24229,7 @@ bool Plater::update_filament_colors_in_full_config()
 
     p->config->option<ConfigOptionStrings>("filament_colour")->values = color_opt->values;
     p->config->option<ConfigOptionStrings>("filament_type")->values = type_opt->values;
+    p->invalidate_texture_mapping_color_cache();
     return true;
 }
 
@@ -24196,6 +24270,7 @@ void Plater::on_config_change(const DynamicPrintConfig &config)
     for (auto opt_key : diff_keys) {
         if (opt_key == "filament_colour") {
             update_scheduled = true; // update should be scheduled (for update 3DScene) #2738
+            p->invalidate_texture_mapping_color_cache();
 
             if (update_filament_colors_in_full_config()) {
                 p->sidebar->obj_list()->update_filament_colors();
@@ -24207,6 +24282,10 @@ void Plater::on_config_change(const DynamicPrintConfig &config)
         if (opt_key == "filament_type") {
             update_filament_colors_in_full_config();
             continue;
+        }
+        if (opt_key == "texture_mapping_definitions") {
+            p->invalidate_texture_mapping_color_cache();
+            update_texture_mapping_colors = true;
         }
         if (opt_key == "material_colour") {
             update_scheduled = true; // update should be scheduled (for update 3DScene)
@@ -24416,22 +24495,16 @@ std::vector<std::string> Plater::get_extruder_colors_from_plater_config(const GC
     if (wxGetApp().is_gcode_viewer() && result != nullptr)
         return result->extruder_colors;
     else {
-        const Slic3r::DynamicPrintConfig* config = &wxGetApp().preset_bundle->project_config;
+        PresetBundle *bundle = wxGetApp().preset_bundle;
+        const Slic3r::DynamicPrintConfig* config = bundle != nullptr ? &bundle->project_config : nullptr;
         std::vector<std::string> filament_colors;
-        if (!config->has("filament_colour")) // in case of a SLA print
+        if (config == nullptr || !config->has("filament_colour")) // in case of a SLA print
             return filament_colors;
 
         filament_colors = (config->option<ConfigOptionStrings>("filament_colour"))->values;
         if (!include_texture_mapping_zones)
             return filament_colors;
-        const size_t num_physical = filament_colors.size();
-        if (PresetBundle *bundle = wxGetApp().preset_bundle; bundle != nullptr) {
-            const std::string texture_mapping_definitions = config->has("texture_mapping_definitions") ? config->opt_string("texture_mapping_definitions") : std::string();
-            bundle->texture_mapping_zones.load_entries(texture_mapping_definitions, filament_colors);
-            const std::vector<std::string> zone_colors = bundle->texture_mapping_zones.display_colors(num_physical);
-            filament_colors.insert(filament_colors.end(), zone_colors.begin(), zone_colors.end());
-        }
-        return filament_colors;
+        return texture_mapping_display_colors(bundle, config, filament_colors);
     }
 }
 

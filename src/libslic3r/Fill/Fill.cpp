@@ -58,6 +58,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <queue>
 #include <sstream>
 #include <system_error>
 #include <tuple>
@@ -465,6 +466,13 @@ struct SurfaceFillParams
 	}
 };
 
+struct TopSurfaceImageAdaptiveLinesGrid;
+
+struct TopSurfaceImageAdaptiveLinesArea {
+    std::shared_ptr<const TopSurfaceImageAdaptiveLinesGrid> grid;
+    ExPolygons area;
+};
+
 struct SurfaceFill {
 	SurfaceFill(const SurfaceFillParams& params) : region_id(size_t(-1)), surface(stCount, ExPolygon()), params(params) {}
 
@@ -475,6 +483,7 @@ struct SurfaceFill {
     // BBS
     std::vector<size_t> region_id_group;
     ExPolygons          no_overlap_expolygons;
+    std::vector<TopSurfaceImageAdaptiveLinesArea> adaptive_lines_areas;
 };
 
 struct TopSurfaceImageStackSlice {
@@ -489,6 +498,7 @@ struct TopSurfaceImageStackSlice {
     float angle_rad = float(PI / 4.0);
     ExPolygons area;
     ExPolygons perimeter_area;
+    std::shared_ptr<const TopSurfaceImageAdaptiveLinesGrid> adaptive_lines_grid;
 };
 
 struct TopSurfaceImageRegionPlan {
@@ -2037,6 +2047,19 @@ struct TopSurfaceImageContoningVectorRegion {
     std::vector<unsigned int> bottom_to_top;
     ExPolygons area;
     int cell_count { 0 };
+    std::shared_ptr<const TopSurfaceImageAdaptiveLinesGrid> adaptive_lines_grid;
+};
+
+struct TopSurfaceImageAdaptiveLinesGrid {
+    int cols { 0 };
+    int rows { 0 };
+    coord_t min_x { 0 };
+    coord_t min_y { 0 };
+    coord_t step { 1 };
+    BoundingBox bbox;
+    std::vector<int> geometry_grid;
+    std::vector<std::array<float, 3>> geometry_oklab;
+    std::vector<int> component_grid;
 };
 
 struct TopSurfaceImageContoningCellSample {
@@ -2419,6 +2442,7 @@ struct TopSurfaceImageContoningStackPlanKey {
     long long max_width_mm { 0 };
     long long external_width_mm { 0 };
     long long angle_threshold_deg { 0 };
+    int flat_surface_infill_mode { TextureMappingZone::SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode };
     bool layer_phase { false };
     bool replace_top_perimeters { false };
     bool recolor_surrounding_perimeters { false };
@@ -2459,6 +2483,7 @@ struct TopSurfaceImageContoningStackPlanKey {
                         max_width_mm,
                         external_width_mm,
                         angle_threshold_deg,
+                        flat_surface_infill_mode,
                         layer_phase,
                         replace_top_perimeters,
                         recolor_surrounding_perimeters,
@@ -2496,6 +2521,7 @@ struct TopSurfaceImageContoningStackPlanKey {
                         rhs.max_width_mm,
                         rhs.external_width_mm,
                         rhs.angle_threshold_deg,
+                        rhs.flat_surface_infill_mode,
                         rhs.layer_phase,
                         rhs.replace_top_perimeters,
                         rhs.recolor_surrounding_perimeters,
@@ -2970,6 +2996,7 @@ static void top_surface_image_contoning_merge_small_grid_regions(
     float                                                  pitch_mm,
     float                                                  min_feature_mm,
     float                                                  line_width_mm,
+    bool                                                   adaptive_lines_merge,
     const ThrowIfCanceled                                  *throw_if_canceled)
 {
     if (grid.empty() || cols <= 0 || rows <= 0 || labels.empty())
@@ -2991,6 +3018,7 @@ static void top_surface_image_contoning_merge_small_grid_regions(
                 std::vector<int> queue;
                 std::vector<int> cells;
                 std::map<int, int> neighbor_counts;
+                std::map<int, std::vector<int>> neighbor_seeds;
                 queue.push_back(start_idx);
                 visited[size_t(start_idx)] = 1;
                 int min_col = col;
@@ -3028,6 +3056,7 @@ static void top_surface_image_contoning_merge_small_grid_regions(
                             }
                         } else if (nlabel >= 0) {
                             ++neighbor_counts[nlabel];
+                            neighbor_seeds[nlabel].emplace_back(nidx);
                         }
                     }
                 }
@@ -3047,20 +3076,81 @@ static void top_surface_image_contoning_merge_small_grid_regions(
                 int best_label = -1;
                 float best_error = std::numeric_limits<float>::max();
                 int best_contact = -1;
+                bool best_printable_merge = false;
                 for (const auto &entry : neighbor_counts) {
                     const int neighbor_label = entry.first;
                     if (neighbor_label < 0 ||
                         neighbor_label >= int(labels.size()) ||
                         source_label >= int(labels.size()))
                         continue;
+                    bool printable_merge = false;
+                    if (adaptive_lines_merge) {
+                        std::vector<int> merged_cells = cells;
+                        std::vector<unsigned char> neighbor_visited(grid.size(), 0);
+                        std::vector<int> neighbor_queue;
+                        const auto seed_it = neighbor_seeds.find(neighbor_label);
+                        if (seed_it != neighbor_seeds.end()) {
+                            for (int seed : seed_it->second) {
+                                if (seed < 0 || seed >= int(grid.size()) || neighbor_visited[size_t(seed)] || grid[size_t(seed)] != neighbor_label)
+                                    continue;
+                                neighbor_visited[size_t(seed)] = 1;
+                                neighbor_queue.emplace_back(seed);
+                            }
+                        }
+                        int merged_min_col = min_col;
+                        int merged_max_col = max_col;
+                        int merged_min_row = min_row;
+                        int merged_max_row = max_row;
+                        for (size_t neighbor_idx = 0; neighbor_idx < neighbor_queue.size(); ++neighbor_idx) {
+                            const int idx = neighbor_queue[neighbor_idx];
+                            merged_cells.emplace_back(idx);
+                            const int r = idx / cols;
+                            const int c = idx - r * cols;
+                            merged_min_col = std::min(merged_min_col, c);
+                            merged_max_col = std::max(merged_max_col, c);
+                            merged_min_row = std::min(merged_min_row, r);
+                            merged_max_row = std::max(merged_max_row, r);
+                            const std::array<std::pair<int, int>, 4> neighbors{
+                                std::pair<int, int>{ c - 1, r },
+                                std::pair<int, int>{ c + 1, r },
+                                std::pair<int, int>{ c, r - 1 },
+                                std::pair<int, int>{ c, r + 1 }
+                            };
+                            for (const std::pair<int, int> &neighbor : neighbors) {
+                                const int nc = neighbor.first;
+                                const int nr = neighbor.second;
+                                if (nc < 0 || nc >= cols || nr < 0 || nr >= rows)
+                                    continue;
+                                const int nidx = nr * cols + nc;
+                                if (neighbor_visited[size_t(nidx)] || grid[size_t(nidx)] != neighbor_label)
+                                    continue;
+                                neighbor_visited[size_t(nidx)] = 1;
+                                neighbor_queue.emplace_back(nidx);
+                            }
+                        }
+                        printable_merge =
+                            top_surface_image_contoning_grid_component_printable(merged_cells,
+                                                                                 cols,
+                                                                                 merged_min_col,
+                                                                                 merged_max_col,
+                                                                                 merged_min_row,
+                                                                                 merged_max_row,
+                                                                                 pitch_mm,
+                                                                                 min_feature_mm,
+                                                                                 line_width_mm,
+                                                                                 throw_if_canceled);
+                    }
                     const float error =
                         top_surface_image_contoning_oklab_error(labels[size_t(source_label)].oklab,
                                                                 labels[size_t(neighbor_label)].oklab);
-                    if (error < best_error - 1e-6f ||
-                        (std::abs(error - best_error) <= 1e-6f && entry.second > best_contact)) {
+                    if ((printable_merge && !best_printable_merge) ||
+                        (printable_merge == best_printable_merge &&
+                         (error < best_error - 1e-6f ||
+                          (std::abs(error - best_error) <= 1e-6f && entry.second > best_contact)))) {
                         best_label = neighbor_label;
                         best_error = error;
                         best_contact = entry.second;
+                        best_printable_merge = printable_merge;
                     }
                 }
                 if (best_label < 0)
@@ -4249,6 +4339,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
     int                                                          polygonization_mode,
     bool                                                         cleanup_optimizations_enabled,
     bool                                                         lower_surface,
+    bool                                                         preserve_connected_components,
     const ThrowIfCanceled                                       *throw_if_canceled)
 {
     std::vector<TopSurfaceImageContoningVectorRegion> regions;
@@ -4345,6 +4436,90 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
     if (!raw_partition_hierarchy_convert && !mid_gaussian_shared_chain_fit) {
         if (!ensure_valid_area())
             return regions;
+    }
+
+    if (preserve_connected_components) {
+        std::shared_ptr<TopSurfaceImageAdaptiveLinesGrid> adaptive_lines_grid(new TopSurfaceImageAdaptiveLinesGrid());
+        adaptive_lines_grid->cols = cols;
+        adaptive_lines_grid->rows = rows;
+        adaptive_lines_grid->min_x = min_x;
+        adaptive_lines_grid->min_y = min_y;
+        adaptive_lines_grid->step = step;
+        adaptive_lines_grid->bbox = bbox;
+        adaptive_lines_grid->geometry_grid = label_grid;
+        adaptive_lines_grid->geometry_oklab.reserve(labels.size());
+        for (const TopSurfaceImageContoningVectorLabel &label : labels)
+            adaptive_lines_grid->geometry_oklab.emplace_back(label.oklab);
+        adaptive_lines_grid->component_grid = component_grid;
+        std::vector<unsigned char> visited(component_grid.size(), 0);
+        const ExPolygons adaptive_clip_area = ensure_valid_area() ? valid_area : area;
+        for (int component_id : component_order) {
+            check_canceled(throw_if_canceled);
+            for (int row = 0; row < rows; ++row) {
+                if ((row & 15) == 0)
+                    check_canceled(throw_if_canceled);
+                for (int col = 0; col < cols; ++col) {
+                    const int start_idx = row * cols + col;
+                    if (visited[size_t(start_idx)] || component_grid[size_t(start_idx)] != component_id)
+                        continue;
+                    std::vector<int> queue;
+                    std::vector<int> cells;
+                    queue.emplace_back(start_idx);
+                    visited[size_t(start_idx)] = 1;
+                    for (size_t queue_idx = 0; queue_idx < queue.size(); ++queue_idx) {
+                        if ((queue_idx & 255) == 0)
+                            check_canceled(throw_if_canceled);
+                        const int idx = queue[queue_idx];
+                        cells.emplace_back(idx);
+                        const int r = idx / cols;
+                        const int c = idx - r * cols;
+                        const std::array<std::pair<int, int>, 4> neighbors{
+                            std::pair<int, int>{ c - 1, r },
+                            std::pair<int, int>{ c + 1, r },
+                            std::pair<int, int>{ c, r - 1 },
+                            std::pair<int, int>{ c, r + 1 }
+                        };
+                        for (const std::pair<int, int> &neighbor : neighbors) {
+                            const int nc = neighbor.first;
+                            const int nr = neighbor.second;
+                            if (nc < 0 || nc >= cols || nr < 0 || nr >= rows)
+                                continue;
+                            const int nidx = nr * cols + nc;
+                            if (visited[size_t(nidx)] || component_grid[size_t(nidx)] != component_id)
+                                continue;
+                            visited[size_t(nidx)] = 1;
+                            queue.emplace_back(nidx);
+                        }
+                    }
+                    std::vector<int> component_mask(component_grid.size(), -1);
+                    for (int idx : cells)
+                        component_mask[size_t(idx)] = component_id;
+                    ExPolygons component_area =
+                        top_surface_image_contoning_area_from_grid_label(component_mask,
+                                                                         cols,
+                                                                         rows,
+                                                                         component_id,
+                                                                         min_x,
+                                                                         min_y,
+                                                                         step,
+                                                                         bbox,
+                                                                         adaptive_clip_area,
+                                                                         empty_blocked_area,
+                                                                         -1.f,
+                                                                         cleanup_optimizations_enabled,
+                                                                         throw_if_canceled);
+                    if (component_area.empty())
+                        continue;
+                    TopSurfaceImageContoningVectorRegion region;
+                    region.bottom_to_top.emplace_back(static_cast<unsigned int>(component_id));
+                    region.cell_count = int(cells.size());
+                    region.area = std::move(component_area);
+                    region.adaptive_lines_grid = adaptive_lines_grid;
+                    regions.emplace_back(std::move(region));
+                }
+            }
+        }
+        return regions;
     }
 
     if (vector_border_shared_gaussian_partition) {
@@ -6159,6 +6334,7 @@ static void top_surface_image_contoning_solve_anchored_region(
                                                          pitch_mm,
                                                          plan.contoning_min_feature_mm,
                                                          plan.contoning_external_width_mm,
+                                                         plan.contoning_flat_surface_infill_mode == int(TextureMappingZone::ContoningFlatSurfaceInfillAdaptiveLines),
                                                          throw_if_canceled);
     if (debug_enabled)
         top_surface_image_debug_accumulate_timing_step(debug_timing.steps,
@@ -6276,6 +6452,8 @@ static void top_surface_image_contoning_solve_anchored_region(
                                                                     plan.contoning_surface_anchored_stack_optimizations_enabled,
                                                                     source_surface == TopSurfaceImageSourceSurface::Bottom &&
                                                                         plan.contoning_td_adjustment_enabled,
+                                                                    plan.contoning_flat_surface_infill_mode ==
+                                                                        int(TextureMappingZone::ContoningFlatSurfaceInfillAdaptiveLines),
                                                                     throw_if_canceled);
         if (debug_enabled && depth < int(debug_depth_timings.size())) {
             TopSurfaceImageDebugDepthTiming timing;
@@ -6854,6 +7032,8 @@ static void top_surface_image_contoning_convert_raw_top_surface_anchored_region(
                                                                     plan.contoning_polygonization_mode,
                                                                     false,
                                                                     false,
+                                                                    plan.contoning_flat_surface_infill_mode ==
+                                                                        int(TextureMappingZone::ContoningFlatSurfaceInfillAdaptiveLines),
                                                                     throw_if_canceled);
         if (debug_enabled && depth < int(debug_depth_timings.size())) {
             TopSurfaceImageDebugDepthTiming timing;
@@ -7497,6 +7677,7 @@ static TopSurfaceImageContoningStackPlanKey top_surface_image_contoning_anchored
     key.external_width_mm = top_surface_image_contoning_float_key(plan.contoning_external_width_mm);
     key.angle_threshold_deg =
         top_surface_image_contoning_float_key(zone.effective_top_surface_contoning_angle_threshold_deg());
+    key.flat_surface_infill_mode = plan.contoning_flat_surface_infill_mode;
     key.layer_phase = plan.contoning_layer_phase_enabled;
     key.replace_top_perimeters = plan.contoning_replace_top_perimeters_with_infill;
     key.recolor_surrounding_perimeters = plan.contoning_recolor_surrounding_perimeters;
@@ -7621,6 +7802,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
             region.bottom_to_top = depth_region.bottom_to_top;
             region.cell_count = depth_region.cell_count;
             region.area = std::move(depth_area);
+            region.adaptive_lines_grid = depth_region.adaptive_lines_grid;
             regions.emplace_back(std::move(region));
         }
     }
@@ -7818,6 +8000,7 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                          pitch_mm,
                                                          plan.contoning_min_feature_mm,
                                                          plan.contoning_external_width_mm,
+                                                         plan.contoning_flat_surface_infill_mode == int(TextureMappingZone::ContoningFlatSurfaceInfillAdaptiveLines),
                                                          throw_if_canceled);
     if (plan.contoning_td_adjustment_enabled) {
         top_surface_image_contoning_resolve_merged_grid_regions(grid,
@@ -7854,6 +8037,8 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                                   plan.contoning_surface_anchored_stack_optimizations_enabled,
                                                                   source_surface == TopSurfaceImageSourceSurface::Bottom &&
                                                                       plan.contoning_td_adjustment_enabled,
+                                                                  plan.contoning_flat_surface_infill_mode ==
+                                                                      int(TextureMappingZone::ContoningFlatSurfaceInfillAdaptiveLines),
                                                                   throw_if_canceled);
 }
 
@@ -8046,6 +8231,7 @@ static std::shared_ptr<const TopSurfaceImageContoningStackPlan> top_surface_imag
                                                          pitch_mm,
                                                          plan.contoning_min_feature_mm,
                                                          plan.contoning_external_width_mm,
+                                                         plan.contoning_flat_surface_infill_mode == int(TextureMappingZone::ContoningFlatSurfaceInfillAdaptiveLines),
                                                          throw_if_canceled);
     if (plan.contoning_td_adjustment_enabled) {
         top_surface_image_contoning_resolve_merged_grid_regions(grid,
@@ -8104,6 +8290,7 @@ static TopSurfaceImageContoningStackPlanKey top_surface_image_contoning_stack_pl
     key.external_width_mm = top_surface_image_contoning_float_key(plan.contoning_external_width_mm);
     key.angle_threshold_deg =
         top_surface_image_contoning_float_key(zone.effective_top_surface_contoning_angle_threshold_deg());
+    key.flat_surface_infill_mode = plan.contoning_flat_surface_infill_mode;
     key.layer_phase = plan.contoning_layer_phase_enabled;
     key.replace_top_perimeters = plan.contoning_replace_top_perimeters_with_infill;
     key.recolor_surrounding_perimeters = plan.contoning_recolor_surrounding_perimeters;
@@ -8216,6 +8403,8 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                                   plan.contoning_surface_anchored_stack_optimizations_enabled,
                                                                   source_surface == TopSurfaceImageSourceSurface::Bottom &&
                                                                       plan.contoning_td_adjustment_enabled,
+                                                                  plan.contoning_flat_surface_infill_mode ==
+                                                                      int(TextureMappingZone::ContoningFlatSurfaceInfillAdaptiveLines),
                                                                   throw_if_canceled);
 }
 
@@ -8474,6 +8663,13 @@ static std::string top_surface_image_contoning_nearest_measured_sample_fallback_
     return ss.str();
 }
 
+struct TopSurfaceImageContoningComponentArea {
+    unsigned int component_id = 0;
+    ExPolygons area;
+    ExPolygons perimeter_area;
+    std::shared_ptr<const TopSurfaceImageAdaptiveLinesGrid> adaptive_lines_grid;
+};
+
 static void top_surface_image_append_contoning_slices(TopSurfaceImageRegionPlan          &plan,
                                                       const Layer                        &source_layer,
                                                       const ExPolygons                   &fill_area,
@@ -8512,6 +8708,10 @@ static void top_surface_image_append_contoning_slices(TopSurfaceImageRegionPlan 
 
     std::vector<ExPolygons> by_component(print_config.filament_colour.values.size() + 1);
     std::vector<ExPolygons> perimeter_by_component(include_perimeter_regions ? print_config.filament_colour.values.size() + 1 : 0);
+    const bool preserve_adaptive_line_regions =
+        plan.contoning_flat_surface_infill_mode == int(TextureMappingZone::ContoningFlatSurfaceInfillAdaptiveLines) &&
+        !plan.contoning_replace_top_perimeters_with_infill;
+    std::vector<TopSurfaceImageContoningComponentArea> adaptive_line_regions;
     bool used_raw_top_surface_labels = false;
     auto append_regions = [&](const std::vector<TopSurfaceImageContoningVectorRegion> &regions,
                               bool for_fill,
@@ -8528,6 +8728,20 @@ static void top_surface_image_append_contoning_slices(TopSurfaceImageRegionPlan 
                     region.bottom_to_top[size_t(int(region.bottom_to_top.size()) - 1 - pattern_depth)];
             if (component_id == 0 || component_id >= by_component.size())
                 continue;
+            if (preserve_adaptive_line_regions) {
+                TopSurfaceImageContoningComponentArea item;
+                item.component_id = component_id;
+                item.adaptive_lines_grid = region.adaptive_lines_grid;
+                if (for_perimeter &&
+                    include_perimeter_regions &&
+                    !perimeter_clip_area.empty())
+                    item.perimeter_area = top_surface_clip_intersection_ex(region.area, perimeter_clip_area, clip_safety_offset);
+                if (for_fill && !fill_area.empty())
+                    item.area = top_surface_clip_intersection_ex(region.area, fill_area, clip_safety_offset);
+                if (!item.area.empty() || !item.perimeter_area.empty())
+                    adaptive_line_regions.emplace_back(std::move(item));
+                continue;
+            }
             if (for_perimeter &&
                 include_perimeter_regions &&
                 !perimeter_clip_area.empty()) {
@@ -8730,6 +8944,44 @@ static void top_surface_image_append_contoning_slices(TopSurfaceImageRegionPlan 
                                                             throw_if_canceled);
     }
 
+    if (preserve_adaptive_line_regions) {
+        ExPolygons depth_taken;
+        ExPolygons perimeter_depth_taken;
+        for (TopSurfaceImageContoningComponentArea &component : adaptive_line_regions) {
+            check_canceled(throw_if_canceled);
+            ExPolygons component_area = std::move(component.area);
+            ExPolygons component_perimeter_area = std::move(component.perimeter_area);
+            if (!depth_taken.empty() && !component_area.empty())
+                component_area = top_surface_clip_diff_ex(component_area,
+                                                          depth_taken,
+                                                          ApplySafetyOffset::No);
+            if (!perimeter_depth_taken.empty() && !component_perimeter_area.empty())
+                component_perimeter_area = top_surface_clip_diff_ex(component_perimeter_area,
+                                                                    perimeter_depth_taken,
+                                                                    ApplySafetyOffset::No);
+            if (component_area.empty() && component_perimeter_area.empty())
+                continue;
+            if (!component_area.empty())
+                append(depth_taken, component_area);
+            if (!component_perimeter_area.empty())
+                append(perimeter_depth_taken, component_perimeter_area);
+            TopSurfaceImageStackSlice slice;
+            slice.component_id = component.component_id;
+            slice.depth = depth;
+            slice.component_index = size_t(depth % pattern_filaments);
+            slice.component_count = size_t(pattern_filaments);
+            slice.contoning = true;
+            slice.raw_top_surface_labels = used_raw_top_surface_labels;
+            slice.lower_surface = source_surface == TopSurfaceImageSourceSurface::Bottom;
+            slice.angle_rad = top_surface_image_contoning_angle_rad(depth, plan.contoning_varied_infill_angles_enabled);
+            slice.area = std::move(component_area);
+            slice.perimeter_area = std::move(component_perimeter_area);
+            slice.adaptive_lines_grid = component.adaptive_lines_grid;
+            plan.slices.emplace_back(std::move(slice));
+        }
+        return;
+    }
+
     ExPolygons depth_taken;
     ExPolygons perimeter_depth_taken;
     for (unsigned int component_id = 1; component_id < by_component.size(); ++component_id) {
@@ -8883,7 +9135,7 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
         plan.contoning_flat_surface_infill_mode =
             std::clamp(zone->effective_top_surface_contoning_flat_surface_infill_mode(),
                        int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinear),
-                       int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithRepair));
+                       int(TextureMappingZone::ContoningFlatSurfaceInfillAdaptiveLines));
         plan.contoning_layer_phase_enabled = zone->effective_top_surface_contoning_layer_phase_enabled();
         plan.contoning_varied_infill_angles_enabled = zone->top_surface_contoning_varied_infill_angles_enabled;
         plan.contoning_blue_noise_error_diffusion_enabled =
@@ -9570,6 +9822,11 @@ static bool top_surface_image_contoning_rectilinear_repair_mode(int mode)
            top_surface_image_contoning_rectilinear_with_repair_mode(mode);
 }
 
+static bool top_surface_image_contoning_adaptive_lines_mode(int mode)
+{
+    return mode == int(TextureMappingZone::ContoningFlatSurfaceInfillAdaptiveLines);
+}
+
 struct TopSurfaceImageRectilinearBoundaryKey {
     size_t region_id = size_t(-1);
     unsigned int zone_id = 0;
@@ -9934,6 +10191,7 @@ static std::unique_ptr<ExtrusionEntityCollection> top_surface_image_rectilinear_
     const PrintConfig         &print_config,
     const PrintObjectConfig   &object_config,
     int                        layer_id,
+    float                      width_bias_mm,
     const ThrowIfCanceled     *throw_if_canceled);
 
 static ExtrusionEntitiesPtr top_surface_image_rectilinear_repair_collections(
@@ -9982,6 +10240,7 @@ static ExtrusionEntitiesPtr top_surface_image_rectilinear_repair_collections(
                                                                         layer.object()->print()->config(),
                                                                         layer.object()->config(),
                                                                         int(layer.id()),
+                                                                        0.f,
                                                                         throw_if_canceled);
             if (arachne_collection != nullptr) {
                 collection->entities.insert(collection->entities.end(),
@@ -11023,6 +11282,7 @@ static std::unique_ptr<ExtrusionEntityCollection> top_surface_image_rectilinear_
     const PrintConfig         &print_config,
     const PrintObjectConfig   &object_config,
     int                        layer_id,
+    float                      width_bias_mm,
     const ThrowIfCanceled     *throw_if_canceled)
 {
     check_canceled(throw_if_canceled);
@@ -11042,6 +11302,7 @@ static std::unique_ptr<ExtrusionEntityCollection> top_surface_image_rectilinear_
     const coord_t preferred_spacing = std::max<coord_t>(1, max_flow.scaled_spacing());
     const coordf_t min_spacing = std::max<coordf_t>(1.0, min_flow.scaled_spacing());
     const coordf_t max_spacing = std::max<coordf_t>(min_spacing, max_flow.scaled_spacing());
+    const coordf_t width_bias = std::max<coordf_t>(0.0, scale_(std::max(0.f, width_bias_mm)));
     Polygons outline = to_polygons(area);
     if (outline.empty())
         return collection;
@@ -11078,7 +11339,7 @@ static std::unique_ptr<ExtrusionEntityCollection> top_surface_image_rectilinear_
             if (thick_polyline.points.size() < 2 || thick_polyline.width.empty())
                 continue;
             for (coordf_t &width : thick_polyline.width)
-                width = std::clamp(width, min_spacing, max_spacing);
+                width = std::clamp(width + width_bias, min_spacing, max_spacing);
             if (thick_polyline.is_valid())
                 thick_polylines.emplace_back(std::move(thick_polyline));
         }
@@ -11092,6 +11353,1250 @@ static std::unique_ptr<ExtrusionEntityCollection> top_surface_image_rectilinear_
     top_surface_image_filter_short_boundary_skin_entities(*collection, min_length_mm);
     top_surface_image_reorder_boundary_skin_entities(*collection);
     return collection;
+}
+
+struct TopSurfaceImageAdaptiveLinesVec2 {
+    double x { 0.0 };
+    double y { 0.0 };
+};
+
+struct TopSurfaceImageAdaptiveLinesSegment {
+    TopSurfaceImageAdaptiveLinesVec2 a;
+    TopSurfaceImageAdaptiveLinesVec2 b;
+    double width { 0.0 };
+    double width_start { 0.0 };
+    double width_end { 0.0 };
+    int label { -1 };
+};
+
+struct TopSurfaceImageAdaptiveLinesRuntimeGrid {
+    int cols { 0 };
+    int rows { 0 };
+    double pitch_mm { 0.0 };
+    std::vector<int> labels;
+    std::vector<unsigned int> cell_components;
+    std::vector<std::array<float, 3>> label_oklab;
+};
+
+struct TopSurfaceImageAdaptiveLinesBlobQuality {
+    bool connected { false };
+    bool hole_free { false };
+    bool area_ok { false };
+    bool printable { false };
+    double area_mm2 { 0.0 };
+    double max_depth_mm { 0.0 };
+    double required_width_mm { 0.0 };
+};
+
+struct TopSurfaceImageAdaptiveLinesBlobRegion {
+    int id { -1 };
+    int label { -1 };
+    std::vector<int> cells;
+    std::vector<int> label_counts;
+    TopSurfaceImageAdaptiveLinesBlobQuality quality;
+    bool active { true };
+};
+
+struct TopSurfaceImageAdaptiveLinesBlobStats {
+    int blob_count { 0 };
+    int invalid_blob_count { 0 };
+    int arachne_empty_blob_count { 0 };
+    int arachne_multi_line_blob_count { 0 };
+    double max_required_width_mm { 0.0 };
+    double average_area_mm2 { 0.0 };
+    double average_arachne_lines_per_blob { 0.0 };
+};
+
+struct TopSurfaceImageAdaptiveLinesBlobBuildResult {
+    std::vector<TopSurfaceImageAdaptiveLinesBlobRegion> blobs;
+    std::vector<int> blob_at_cell;
+    TopSurfaceImageAdaptiveLinesBlobStats stats;
+};
+
+static TopSurfaceImageAdaptiveLinesVec2 operator+(const TopSurfaceImageAdaptiveLinesVec2 &lhs,
+                                                  const TopSurfaceImageAdaptiveLinesVec2 &rhs)
+{
+    return { lhs.x + rhs.x, lhs.y + rhs.y };
+}
+
+static TopSurfaceImageAdaptiveLinesVec2 operator-(const TopSurfaceImageAdaptiveLinesVec2 &lhs,
+                                                  const TopSurfaceImageAdaptiveLinesVec2 &rhs)
+{
+    return { lhs.x - rhs.x, lhs.y - rhs.y };
+}
+
+static TopSurfaceImageAdaptiveLinesVec2 operator*(const TopSurfaceImageAdaptiveLinesVec2 &lhs, double rhs)
+{
+    return { lhs.x * rhs, lhs.y * rhs };
+}
+
+static double top_surface_image_adaptive_lines_dot(const TopSurfaceImageAdaptiveLinesVec2 &lhs,
+                                                   const TopSurfaceImageAdaptiveLinesVec2 &rhs)
+{
+    return lhs.x * rhs.x + lhs.y * rhs.y;
+}
+
+static double top_surface_image_adaptive_lines_length(const TopSurfaceImageAdaptiveLinesVec2 &value)
+{
+    return std::sqrt(top_surface_image_adaptive_lines_dot(value, value));
+}
+
+static double top_surface_image_adaptive_lines_projection_t(const TopSurfaceImageAdaptiveLinesVec2 &point,
+                                                            const TopSurfaceImageAdaptiveLinesVec2 &a,
+                                                            const TopSurfaceImageAdaptiveLinesVec2 &b)
+{
+    const TopSurfaceImageAdaptiveLinesVec2 delta = b - a;
+    const double denom = top_surface_image_adaptive_lines_dot(delta, delta);
+    if (denom <= 1e-12)
+        return 0.0;
+    return std::clamp(top_surface_image_adaptive_lines_dot(point - a, delta) / denom, 0.0, 1.0);
+}
+
+static double top_surface_image_adaptive_lines_segment_start_width(const TopSurfaceImageAdaptiveLinesSegment &segment)
+{
+    return segment.width_start > 0.0 ? segment.width_start : segment.width;
+}
+
+static double top_surface_image_adaptive_lines_segment_end_width(const TopSurfaceImageAdaptiveLinesSegment &segment)
+{
+    return segment.width_end > 0.0 ? segment.width_end : segment.width;
+}
+
+static double top_surface_image_adaptive_lines_segment_width_at(const TopSurfaceImageAdaptiveLinesSegment &segment, double t)
+{
+    return top_surface_image_adaptive_lines_segment_start_width(segment) * (1.0 - t) +
+           top_surface_image_adaptive_lines_segment_end_width(segment) * t;
+}
+
+static double top_surface_image_adaptive_lines_segment_max_radius(const TopSurfaceImageAdaptiveLinesSegment &segment)
+{
+    return 0.5 * std::max(top_surface_image_adaptive_lines_segment_start_width(segment),
+                          top_surface_image_adaptive_lines_segment_end_width(segment));
+}
+
+static bool top_surface_image_adaptive_lines_point_inside_segment(
+    const TopSurfaceImageAdaptiveLinesVec2 &point,
+    const TopSurfaceImageAdaptiveLinesSegment &segment)
+{
+    const double t = top_surface_image_adaptive_lines_projection_t(point, segment.a, segment.b);
+    const TopSurfaceImageAdaptiveLinesVec2 closest = segment.a + (segment.b - segment.a) * t;
+    return top_surface_image_adaptive_lines_length(point - closest) <=
+           0.5 * top_surface_image_adaptive_lines_segment_width_at(segment, t) + 1e-9;
+}
+
+static int top_surface_image_adaptive_lines_majority_label(const std::vector<int> &counts)
+{
+    int best = 0;
+    for (int i = 1; i < int(counts.size()); ++i)
+        if (counts[size_t(i)] > counts[size_t(best)])
+            best = i;
+    return best;
+}
+
+static double top_surface_image_adaptive_lines_oklab_error(const std::array<float, 3> &lhs,
+                                                           const std::array<float, 3> &rhs)
+{
+    const double dl = double(lhs[0] - rhs[0]);
+    const double da = double(lhs[1] - rhs[1]);
+    const double db = double(lhs[2] - rhs[2]);
+    return dl * dl + da * da + db * db;
+}
+
+static double top_surface_image_adaptive_lines_blob_color_error(
+    const std::vector<int> &counts,
+    int label,
+    const std::vector<std::array<float, 3>> &palette)
+{
+    double error = 0.0;
+    int total = 0;
+    for (int i = 0; i < int(counts.size()); ++i) {
+        total += counts[size_t(i)];
+        error += double(counts[size_t(i)]) *
+                 top_surface_image_adaptive_lines_oklab_error(palette[size_t(i)], palette[size_t(label)]);
+    }
+    return total > 0 ? error / double(total) : 0.0;
+}
+
+static TopSurfaceImageAdaptiveLinesBlobQuality top_surface_image_adaptive_lines_blob_quality(
+    const std::vector<int> &cells,
+    const TopSurfaceImageAdaptiveLinesRuntimeGrid &grid,
+    double min_width_mm,
+    double max_width_mm)
+{
+    TopSurfaceImageAdaptiveLinesBlobQuality quality;
+    if (cells.empty())
+        return quality;
+    int min_col = grid.cols;
+    int max_col = -1;
+    int min_row = grid.rows;
+    int max_row = -1;
+    for (int idx : cells) {
+        const int row = idx / grid.cols;
+        const int col = idx - row * grid.cols;
+        min_col = std::min(min_col, col);
+        max_col = std::max(max_col, col);
+        min_row = std::min(min_row, row);
+        max_row = std::max(max_row, row);
+    }
+    const int local_w = max_col - min_col + 3;
+    const int local_h = max_row - min_row + 3;
+    auto local_idx = [local_w](int x, int y) { return y * local_w + x; };
+    std::vector<unsigned char> present(size_t(local_w * local_h), 0);
+    std::vector<int> local_cells;
+    local_cells.reserve(cells.size());
+    for (int idx : cells) {
+        const int row = idx / grid.cols;
+        const int col = idx - row * grid.cols;
+        const int lx = col - min_col + 1;
+        const int ly = row - min_row + 1;
+        const int lidx = local_idx(lx, ly);
+        present[size_t(lidx)] = 1;
+        local_cells.emplace_back(lidx);
+    }
+
+    const std::array<std::pair<int, int>, 4> dirs4 {
+        std::pair<int, int>{ -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 }
+    };
+    std::vector<unsigned char> visited(present.size(), 0);
+    std::vector<int> stack { local_cells.front() };
+    visited[size_t(local_cells.front())] = 1;
+    int visited_count = 0;
+    while (!stack.empty()) {
+        const int idx = stack.back();
+        stack.pop_back();
+        ++visited_count;
+        const int x = idx % local_w;
+        const int y = idx / local_w;
+        for (const auto &[dx, dy] : dirs4) {
+            const int nx = x + dx;
+            const int ny = y + dy;
+            if (nx < 0 || nx >= local_w || ny < 0 || ny >= local_h)
+                continue;
+            const int nidx = local_idx(nx, ny);
+            if (present[size_t(nidx)] && !visited[size_t(nidx)]) {
+                visited[size_t(nidx)] = 1;
+                stack.emplace_back(nidx);
+            }
+        }
+    }
+    quality.connected = visited_count == int(cells.size());
+
+    std::vector<unsigned char> outside(present.size(), 0);
+    std::queue<int> outside_queue;
+    for (int y = 0; y < local_h; ++y) {
+        for (int x = 0; x < local_w; ++x) {
+            if (x != 0 && x != local_w - 1 && y != 0 && y != local_h - 1)
+                continue;
+            const int idx = local_idx(x, y);
+            if (!present[size_t(idx)] && !outside[size_t(idx)]) {
+                outside[size_t(idx)] = 1;
+                outside_queue.push(idx);
+            }
+        }
+    }
+    while (!outside_queue.empty()) {
+        const int idx = outside_queue.front();
+        outside_queue.pop();
+        const int x = idx % local_w;
+        const int y = idx / local_w;
+        for (const auto &[dx, dy] : dirs4) {
+            const int nx = x + dx;
+            const int ny = y + dy;
+            if (nx < 0 || nx >= local_w || ny < 0 || ny >= local_h)
+                continue;
+            const int nidx = local_idx(nx, ny);
+            if (!present[size_t(nidx)] && !outside[size_t(nidx)]) {
+                outside[size_t(nidx)] = 1;
+                outside_queue.push(nidx);
+            }
+        }
+    }
+    quality.hole_free = true;
+    for (size_t idx = 0; idx < present.size(); ++idx) {
+        if (!present[idx] && !outside[idx]) {
+            quality.hole_free = false;
+            break;
+        }
+    }
+
+    quality.area_mm2 = double(cells.size()) * grid.pitch_mm * grid.pitch_mm;
+    quality.area_ok =
+        quality.area_mm2 >= std::max(min_width_mm * min_width_mm * 2.25,
+                                     grid.pitch_mm * grid.pitch_mm * 4.0);
+
+    std::vector<double> dist(present.size(), std::numeric_limits<double>::infinity());
+    using QueueEntry = std::pair<double, int>;
+    std::priority_queue<QueueEntry, std::vector<QueueEntry>, std::greater<QueueEntry>> queue;
+    for (int idx : local_cells) {
+        const int x = idx % local_w;
+        const int y = idx / local_w;
+        bool boundary = false;
+        for (const auto &[dx, dy] : dirs4) {
+            const int nx = x + dx;
+            const int ny = y + dy;
+            const int nidx = local_idx(nx, ny);
+            if (nx < 0 || nx >= local_w || ny < 0 || ny >= local_h || !present[size_t(nidx)]) {
+                boundary = true;
+                break;
+            }
+        }
+        if (boundary) {
+            dist[size_t(idx)] = 0.5 * grid.pitch_mm;
+            queue.emplace(dist[size_t(idx)], idx);
+        }
+    }
+    const std::array<std::pair<int, int>, 8> dirs8 {
+        std::pair<int, int>{ -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 },
+        { -1, -1 }, { 1, -1 }, { -1, 1 }, { 1, 1 }
+    };
+    while (!queue.empty()) {
+        const auto [d, idx] = queue.top();
+        queue.pop();
+        if (d != dist[size_t(idx)])
+            continue;
+        const int x = idx % local_w;
+        const int y = idx / local_w;
+        for (const auto &[dx, dy] : dirs8) {
+            const int nx = x + dx;
+            const int ny = y + dy;
+            if (nx < 0 || nx >= local_w || ny < 0 || ny >= local_h)
+                continue;
+            const int nidx = local_idx(nx, ny);
+            if (!present[size_t(nidx)])
+                continue;
+            const double step = (dx != 0 && dy != 0) ? 1.41421356237 * grid.pitch_mm : grid.pitch_mm;
+            const double nd = d + step;
+            if (nd < dist[size_t(nidx)]) {
+                dist[size_t(nidx)] = nd;
+                queue.emplace(nd, nidx);
+            }
+        }
+    }
+    for (int idx : local_cells)
+        if (std::isfinite(dist[size_t(idx)]))
+            quality.max_depth_mm = std::max(quality.max_depth_mm, dist[size_t(idx)]);
+    quality.required_width_mm = std::max(min_width_mm, quality.max_depth_mm * 1.05);
+    quality.printable =
+        quality.connected && quality.hole_free && quality.area_ok && quality.required_width_mm <= max_width_mm;
+    return quality;
+}
+
+static std::map<int, int> top_surface_image_adaptive_lines_blob_neighbor_contacts(
+    const TopSurfaceImageAdaptiveLinesBlobRegion &blob,
+    const std::vector<int> &blob_at_cell,
+    const std::vector<TopSurfaceImageAdaptiveLinesBlobRegion> &blobs,
+    const TopSurfaceImageAdaptiveLinesRuntimeGrid &grid)
+{
+    std::map<int, int> contacts;
+    for (int idx : blob.cells) {
+        const int row = idx / grid.cols;
+        const int col = idx - row * grid.cols;
+        const std::array<std::pair<int, int>, 4> dirs {
+            std::pair<int, int>{ col - 1, row }, { col + 1, row }, { col, row - 1 }, { col, row + 1 }
+        };
+        for (const auto &[nc, nr] : dirs) {
+            if (nc < 0 || nc >= grid.cols || nr < 0 || nr >= grid.rows)
+                continue;
+            const int nidx = nr * grid.cols + nc;
+            const int neighbor = blob_at_cell[size_t(nidx)];
+            if (neighbor >= 0 && neighbor != blob.id && blobs[size_t(neighbor)].active)
+                ++contacts[neighbor];
+        }
+    }
+    return contacts;
+}
+
+static std::array<double, 5> top_surface_image_adaptive_lines_blob_merge_score(
+    const TopSurfaceImageAdaptiveLinesBlobQuality &quality,
+    double color_error,
+    int contact,
+    int cell_count,
+    double max_width_mm)
+{
+    const double feasible = quality.printable ? 0.0 : 1.0;
+    const double invalid =
+        (quality.connected ? 0.0 : 6.0) +
+        (quality.hole_free ? 0.0 : 6.0) +
+        (quality.area_ok ? 0.0 : 2.0) +
+        std::max(0.0, quality.required_width_mm - max_width_mm) * 12.0 +
+        quality.required_width_mm / std::max(0.001, max_width_mm);
+    return { feasible, invalid, color_error, -double(contact), double(cell_count) };
+}
+
+static TopSurfaceImageAdaptiveLinesBlobStats top_surface_image_adaptive_lines_collect_blob_stats(
+    const std::vector<TopSurfaceImageAdaptiveLinesBlobRegion> &blobs)
+{
+    TopSurfaceImageAdaptiveLinesBlobStats stats;
+    double area_sum = 0.0;
+    for (const TopSurfaceImageAdaptiveLinesBlobRegion &blob : blobs) {
+        if (!blob.active)
+            continue;
+        ++stats.blob_count;
+        if (!blob.quality.printable)
+            ++stats.invalid_blob_count;
+        stats.max_required_width_mm = std::max(stats.max_required_width_mm, blob.quality.required_width_mm);
+        area_sum += blob.quality.area_mm2;
+    }
+    if (stats.blob_count > 0)
+        stats.average_area_mm2 = area_sum / double(stats.blob_count);
+    return stats;
+}
+
+static TopSurfaceImageAdaptiveLinesBlobBuildResult top_surface_image_adaptive_lines_build_blobs(
+    const TopSurfaceImageAdaptiveLinesRuntimeGrid &grid,
+    double min_width_mm,
+    double max_width_mm,
+    const ThrowIfCanceled *throw_if_canceled)
+{
+    TopSurfaceImageAdaptiveLinesBlobBuildResult result;
+    std::vector<TopSurfaceImageAdaptiveLinesBlobRegion> blobs;
+    std::vector<int> blob_at_cell(grid.labels.size(), -1);
+    blobs.reserve(grid.labels.size());
+    const int label_count = int(grid.label_oklab.size());
+    for (int seed = 0; seed < int(grid.labels.size()); ++seed) {
+        if ((seed & 255) == 0)
+            check_canceled(throw_if_canceled);
+        const int seed_label = grid.labels[size_t(seed)];
+        if (seed_label < 0 || blob_at_cell[size_t(seed)] >= 0)
+            continue;
+
+        TopSurfaceImageAdaptiveLinesBlobRegion blob;
+        blob.id = int(blobs.size());
+        blob.label = seed_label;
+        blob.label_counts.assign(size_t(label_count), 0);
+        ++blob.label_counts[size_t(seed_label)];
+        blob.cells.emplace_back(seed);
+        blob.quality = top_surface_image_adaptive_lines_blob_quality(blob.cells, grid, min_width_mm, max_width_mm);
+        blob_at_cell[size_t(seed)] = blob.id;
+
+        for (int guard = 0; guard < 80; ++guard) {
+            const bool already_printable = blob.quality.printable;
+            if (already_printable)
+                break;
+            std::map<int, int> candidates;
+            for (int idx : blob.cells) {
+                const int row = idx / grid.cols;
+                const int col = idx - row * grid.cols;
+                const std::array<std::pair<int, int>, 4> dirs {
+                    std::pair<int, int>{ col - 1, row }, { col + 1, row }, { col, row - 1 }, { col, row + 1 }
+                };
+                for (const auto &[nc, nr] : dirs) {
+                    if (nc < 0 || nc >= grid.cols || nr < 0 || nr >= grid.rows)
+                        continue;
+                    const int nidx = nr * grid.cols + nc;
+                    if (grid.labels[size_t(nidx)] >= 0 && blob_at_cell[size_t(nidx)] < 0)
+                        ++candidates[nidx];
+                }
+            }
+            if (candidates.empty())
+                break;
+
+            int best_cell = -1;
+            std::array<double, 5> best_score {
+                std::numeric_limits<double>::infinity(),
+                std::numeric_limits<double>::infinity(),
+                std::numeric_limits<double>::infinity(),
+                std::numeric_limits<double>::infinity(),
+                std::numeric_limits<double>::infinity()
+            };
+            TopSurfaceImageAdaptiveLinesBlobQuality best_quality;
+            std::vector<int> best_counts;
+            int best_label = -1;
+
+            for (const auto &[candidate, contact] : candidates) {
+                std::vector<int> merged_cells = blob.cells;
+                merged_cells.emplace_back(candidate);
+                std::vector<int> counts = blob.label_counts;
+                ++counts[size_t(grid.labels[size_t(candidate)])];
+                const int label = top_surface_image_adaptive_lines_majority_label(counts);
+                const TopSurfaceImageAdaptiveLinesBlobQuality quality =
+                    top_surface_image_adaptive_lines_blob_quality(merged_cells, grid, min_width_mm, max_width_mm);
+                const double color_error =
+                    top_surface_image_adaptive_lines_blob_color_error(counts, label, grid.label_oklab);
+                const std::array<double, 5> score =
+                    top_surface_image_adaptive_lines_blob_merge_score(quality,
+                                                                      color_error,
+                                                                      contact,
+                                                                      int(merged_cells.size()),
+                                                                      max_width_mm);
+                if (score < best_score) {
+                    best_score = score;
+                    best_cell = candidate;
+                    best_quality = quality;
+                    best_counts = std::move(counts);
+                    best_label = label;
+                }
+            }
+
+            if (best_cell < 0)
+                break;
+            blob.cells.emplace_back(best_cell);
+            blob.label_counts = std::move(best_counts);
+            blob.label = best_label;
+            blob.quality = best_quality;
+            blob_at_cell[size_t(best_cell)] = blob.id;
+        }
+        blobs.emplace_back(std::move(blob));
+    }
+
+    for (TopSurfaceImageAdaptiveLinesBlobRegion &blob : blobs) {
+        check_canceled(throw_if_canceled);
+        if (!blob.active || blob.quality.printable)
+            continue;
+        const std::map<int, int> contacts =
+            top_surface_image_adaptive_lines_blob_neighbor_contacts(blob, blob_at_cell, blobs, grid);
+        int best_neighbor = -1;
+        std::array<double, 5> best_score {
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity()
+        };
+        TopSurfaceImageAdaptiveLinesBlobQuality best_quality;
+        std::vector<int> best_counts;
+        int best_label = -1;
+        for (const auto &[neighbor, contact] : contacts) {
+            if (!blobs[size_t(neighbor)].active)
+                continue;
+            std::vector<int> merged_cells = blob.cells;
+            merged_cells.insert(merged_cells.end(), blobs[size_t(neighbor)].cells.begin(), blobs[size_t(neighbor)].cells.end());
+            std::vector<int> counts = blob.label_counts;
+            for (int i = 0; i < int(counts.size()); ++i)
+                counts[size_t(i)] += blobs[size_t(neighbor)].label_counts[size_t(i)];
+            const int label = top_surface_image_adaptive_lines_majority_label(counts);
+            const TopSurfaceImageAdaptiveLinesBlobQuality quality =
+                top_surface_image_adaptive_lines_blob_quality(merged_cells, grid, min_width_mm, max_width_mm);
+            if (!quality.printable)
+                continue;
+            const double color_error =
+                top_surface_image_adaptive_lines_blob_color_error(counts, label, grid.label_oklab);
+            const std::array<double, 5> score =
+                top_surface_image_adaptive_lines_blob_merge_score(quality,
+                                                                  color_error,
+                                                                  contact,
+                                                                  int(merged_cells.size()),
+                                                                  max_width_mm);
+            if (score < best_score) {
+                best_score = score;
+                best_neighbor = neighbor;
+                best_quality = quality;
+                best_counts = std::move(counts);
+                best_label = label;
+            }
+        }
+        if (best_neighbor < 0)
+            continue;
+        TopSurfaceImageAdaptiveLinesBlobRegion &dst = blobs[size_t(best_neighbor)];
+        dst.cells.insert(dst.cells.end(), blob.cells.begin(), blob.cells.end());
+        dst.label_counts = std::move(best_counts);
+        dst.label = best_label;
+        dst.quality = best_quality;
+        for (int idx : blob.cells)
+            blob_at_cell[size_t(idx)] = dst.id;
+        blob.active = false;
+    }
+
+    result.blobs = std::move(blobs);
+    result.blob_at_cell = std::move(blob_at_cell);
+    result.stats = top_surface_image_adaptive_lines_collect_blob_stats(result.blobs);
+    return result;
+}
+
+static Polygons top_surface_image_adaptive_lines_blob_polygons(
+    const TopSurfaceImageAdaptiveLinesRuntimeGrid &grid,
+    const TopSurfaceImageAdaptiveLinesBlobRegion &blob)
+{
+    Polygons rectangles;
+    rectangles.reserve(blob.cells.size());
+    for (int idx : blob.cells) {
+        const int row = idx / grid.cols;
+        const int col = idx - row * grid.cols;
+        const double x0 = double(col) * grid.pitch_mm;
+        const double y0 = double(row) * grid.pitch_mm;
+        const double x1 = x0 + grid.pitch_mm;
+        const double y1 = y0 + grid.pitch_mm;
+        Polygon rectangle;
+        rectangle.points.emplace_back(Point::new_scale(x0, y0));
+        rectangle.points.emplace_back(Point::new_scale(x1, y0));
+        rectangle.points.emplace_back(Point::new_scale(x1, y1));
+        rectangle.points.emplace_back(Point::new_scale(x0, y1));
+        rectangles.emplace_back(std::move(rectangle));
+    }
+    Polygons outline = union_(rectangles);
+    remove_degenerate(outline);
+    remove_collinear(outline);
+    return outline;
+}
+
+static void top_surface_image_adaptive_lines_append_exact_segment(
+    std::vector<TopSurfaceImageAdaptiveLinesSegment> &segments,
+    const TopSurfaceImageAdaptiveLinesBlobRegion &blob,
+    const Arachne::ExtrusionJunction &prev,
+    const Arachne::ExtrusionJunction &curr,
+    coord_t min_spacing,
+    coord_t max_spacing)
+{
+    const coord_t prev_width = std::clamp(prev.w, min_spacing, max_spacing);
+    const coord_t curr_width = std::clamp(curr.w, min_spacing, max_spacing);
+    const double width_start = unscale<double>(prev_width);
+    const double width_end = unscale<double>(curr_width);
+    const TopSurfaceImageAdaptiveLinesVec2 a { unscale<double>(prev.p.x()), unscale<double>(prev.p.y()) };
+    const TopSurfaceImageAdaptiveLinesVec2 b { unscale<double>(curr.p.x()), unscale<double>(curr.p.y()) };
+    if (top_surface_image_adaptive_lines_length(b - a) < 0.005)
+        return;
+    TopSurfaceImageAdaptiveLinesSegment segment;
+    segment.a = a;
+    segment.b = b;
+    segment.width = 0.5 * (width_start + width_end);
+    segment.width_start = width_start;
+    segment.width_end = width_end;
+    segment.label = blob.label;
+    segments.emplace_back(std::move(segment));
+}
+
+static void top_surface_image_adaptive_lines_append_exact_blob_segments(
+    std::vector<TopSurfaceImageAdaptiveLinesSegment> &segments,
+    const TopSurfaceImageAdaptiveLinesRuntimeGrid &grid,
+    const TopSurfaceImageAdaptiveLinesBlobRegion &blob,
+    TopSurfaceImageAdaptiveLinesBlobStats &stats,
+    double min_width_mm,
+    coord_t min_spacing,
+    coord_t max_spacing,
+    coord_t preferred_spacing,
+    const ThrowIfCanceled *throw_if_canceled)
+{
+    check_canceled(throw_if_canceled);
+    Polygons outline = top_surface_image_adaptive_lines_blob_polygons(grid, blob);
+    if (outline.empty()) {
+        ++stats.arachne_empty_blob_count;
+        return;
+    }
+
+    Arachne::WallToolPathsParams input_params;
+    const double layer_height_mm = 0.20;
+    const double nozzle_mm = 0.40;
+    input_params.min_bead_width = float(min_width_mm);
+    input_params.min_feature_size = float(min_width_mm * 0.5);
+    input_params.min_length_factor = 0.5f;
+    input_params.wall_transition_length = float(nozzle_mm);
+    input_params.wall_transition_angle = 10.0f;
+    input_params.wall_transition_filter_deviation = float(nozzle_mm * 0.25);
+    input_params.wall_distribution_count = 1;
+    input_params.is_top_or_bottom_layer = true;
+
+    int lines_for_blob = 0;
+    try {
+        Arachne::WallToolPaths wall_tool_paths(outline,
+                                               preferred_spacing,
+                                               preferred_spacing,
+                                               1,
+                                               0,
+                                               layer_height_mm,
+                                               input_params);
+        const std::vector<Arachne::VariableWidthLines> &loops = wall_tool_paths.getToolPaths();
+        for (const Arachne::VariableWidthLines &loop : loops) {
+            check_canceled(throw_if_canceled);
+            for (const Arachne::ExtrusionLine &wall : loop) {
+                if (wall.size() < 2)
+                    continue;
+                ++lines_for_blob;
+                for (size_t i = 1; i < wall.size(); ++i)
+                    top_surface_image_adaptive_lines_append_exact_segment(segments,
+                                                                         blob,
+                                                                         wall.junctions[i - 1],
+                                                                         wall.junctions[i],
+                                                                         min_spacing,
+                                                                         max_spacing);
+                if (wall.is_closed && wall.size() >= 3 && wall.front().p != wall.back().p)
+                    top_surface_image_adaptive_lines_append_exact_segment(segments,
+                                                                         blob,
+                                                                         wall.back(),
+                                                                         wall.front(),
+                                                                         min_spacing,
+                                                                         max_spacing);
+            }
+        }
+    } catch (...) {
+        lines_for_blob = 0;
+    }
+    if (lines_for_blob == 0)
+        ++stats.arachne_empty_blob_count;
+    else
+        stats.average_arachne_lines_per_blob += double(lines_for_blob);
+    if (lines_for_blob > 1)
+        ++stats.arachne_multi_line_blob_count;
+}
+
+static int top_surface_image_adaptive_lines_label_at_point(
+    const TopSurfaceImageAdaptiveLinesRuntimeGrid &grid,
+    double x,
+    double y)
+{
+    const int col = int(std::floor(x / grid.pitch_mm));
+    const int row = int(std::floor(y / grid.pitch_mm));
+    if (col < 0 || col >= grid.cols || row < 0 || row >= grid.rows)
+        return -1;
+    return grid.labels[size_t(row * grid.cols + col)];
+}
+
+static unsigned int top_surface_image_adaptive_lines_component_at_point(
+    const TopSurfaceImageAdaptiveLinesRuntimeGrid &grid,
+    double x,
+    double y)
+{
+    const int col = int(std::floor(x / grid.pitch_mm));
+    const int row = int(std::floor(y / grid.pitch_mm));
+    if (col < 0 || col >= grid.cols || row < 0 || row >= grid.rows)
+        return 0;
+    const size_t idx = size_t(row * grid.cols + col);
+    return idx < grid.cell_components.size() ? grid.cell_components[idx] : 0;
+}
+
+static unsigned int top_surface_image_adaptive_lines_component_for_segment(
+    const TopSurfaceImageAdaptiveLinesRuntimeGrid &grid,
+    const TopSurfaceImageAdaptiveLinesSegment &segment)
+{
+    std::map<unsigned int, int> counts;
+    for (int sample = 1; sample < 10; ++sample) {
+        const double t = double(sample) * 0.1;
+        const TopSurfaceImageAdaptiveLinesVec2 p = segment.a + (segment.b - segment.a) * t;
+        const unsigned int component_id = top_surface_image_adaptive_lines_component_at_point(grid, p.x, p.y);
+        if (component_id > 0)
+            ++counts[component_id];
+    }
+    unsigned int best_component_id = 0;
+    int best_count = 0;
+    for (const auto &[component_id, count] : counts) {
+        if (count > best_count) {
+            best_component_id = component_id;
+            best_count = count;
+        }
+    }
+    return best_component_id;
+}
+
+static std::vector<unsigned int> top_surface_image_adaptive_lines_coverage_bits(
+    const TopSurfaceImageAdaptiveLinesRuntimeGrid &grid,
+    const std::vector<TopSurfaceImageAdaptiveLinesSegment> &segments,
+    int supersample)
+{
+    const int sample_w = grid.cols * supersample;
+    const int sample_h = grid.rows * supersample;
+    const double sample_pitch = grid.pitch_mm / double(supersample);
+    std::vector<unsigned int> bits(size_t(sample_w * sample_h), 0);
+    for (const TopSurfaceImageAdaptiveLinesSegment &segment : segments) {
+        const double radius = top_surface_image_adaptive_lines_segment_max_radius(segment);
+        const int min_x = std::max(0, int(std::floor((std::min(segment.a.x, segment.b.x) - radius) / sample_pitch)));
+        const int max_x = std::min(sample_w - 1, int(std::ceil((std::max(segment.a.x, segment.b.x) + radius) / sample_pitch)));
+        const int min_y = std::max(0, int(std::floor((std::min(segment.a.y, segment.b.y) - radius) / sample_pitch)));
+        const int max_y = std::min(sample_h - 1, int(std::ceil((std::max(segment.a.y, segment.b.y) + radius) / sample_pitch)));
+        for (int sy = min_y; sy <= max_y; ++sy) {
+            for (int sx = min_x; sx <= max_x; ++sx) {
+                const TopSurfaceImageAdaptiveLinesVec2 p { (double(sx) + 0.5) * sample_pitch,
+                                                           (double(sy) + 0.5) * sample_pitch };
+                if (top_surface_image_adaptive_lines_point_inside_segment(p, segment)) {
+                    const unsigned int bit =
+                        segment.label >= 0 && segment.label < 32 ? 1u << unsigned(segment.label) : 1u;
+                    bits[size_t(sy * sample_w + sx)] |= bit;
+                }
+            }
+        }
+    }
+    return bits;
+}
+
+static void top_surface_image_adaptive_lines_apply_selective_gap_width_bias(
+    std::vector<TopSurfaceImageAdaptiveLinesSegment> &segments,
+    const TopSurfaceImageAdaptiveLinesRuntimeGrid &grid,
+    double max_width_bias_mm,
+    int supersample)
+{
+    std::vector<double> applied_bias(segments.size(), 0.0);
+    const double sample_pitch = grid.pitch_mm / double(supersample);
+    for (int pass = 0; pass < 3; ++pass) {
+        const std::vector<unsigned int> bits =
+            top_surface_image_adaptive_lines_coverage_bits(grid, segments, supersample);
+        std::vector<double> requested_bias(segments.size(), 0.0);
+        bool found_gap = false;
+        for (int sy = 0; sy < grid.rows * supersample; ++sy) {
+            for (int sx = 0; sx < grid.cols * supersample; ++sx) {
+                const size_t sample_idx = size_t(sy * grid.cols * supersample + sx);
+                if (bits[sample_idx] != 0)
+                    continue;
+                const TopSurfaceImageAdaptiveLinesVec2 p { (double(sx) + 0.5) * sample_pitch,
+                                                           (double(sy) + 0.5) * sample_pitch };
+                const int target_label = top_surface_image_adaptive_lines_label_at_point(grid, p.x, p.y);
+                if (target_label < 0)
+                    continue;
+                found_gap = true;
+                int best_segment = -1;
+                double best_required_bias = std::numeric_limits<double>::infinity();
+                for (size_t segment_idx = 0; segment_idx < segments.size(); ++segment_idx) {
+                    const TopSurfaceImageAdaptiveLinesSegment &segment = segments[segment_idx];
+                    if (segment.label != target_label)
+                        continue;
+                    const double remaining_bias = max_width_bias_mm - applied_bias[segment_idx];
+                    if (remaining_bias <= 1e-6)
+                        continue;
+                    const double search_radius =
+                        top_surface_image_adaptive_lines_segment_max_radius(segment) + 0.5 * remaining_bias + sample_pitch * 0.35;
+                    if (p.x < std::min(segment.a.x, segment.b.x) - search_radius ||
+                        p.x > std::max(segment.a.x, segment.b.x) + search_radius ||
+                        p.y < std::min(segment.a.y, segment.b.y) - search_radius ||
+                        p.y > std::max(segment.a.y, segment.b.y) + search_radius)
+                        continue;
+                    const double t = top_surface_image_adaptive_lines_projection_t(p, segment.a, segment.b);
+                    const TopSurfaceImageAdaptiveLinesVec2 closest = segment.a + (segment.b - segment.a) * t;
+                    const double current_radius = 0.5 * top_surface_image_adaptive_lines_segment_width_at(segment, t);
+                    const double required_bias =
+                        2.0 * std::max(0.0,
+                                       top_surface_image_adaptive_lines_length(p - closest) - current_radius + sample_pitch * 0.12);
+                    if (required_bias <= remaining_bias + 1e-9 && required_bias < best_required_bias) {
+                        best_required_bias = required_bias;
+                        best_segment = int(segment_idx);
+                    }
+                }
+                if (best_segment >= 0)
+                    requested_bias[size_t(best_segment)] =
+                        std::max(requested_bias[size_t(best_segment)], std::max(best_required_bias, max_width_bias_mm * 0.25));
+            }
+        }
+        bool changed = false;
+        for (size_t segment_idx = 0; segment_idx < segments.size(); ++segment_idx) {
+            const double remaining_bias = max_width_bias_mm - applied_bias[segment_idx];
+            const double bias = std::min(remaining_bias, requested_bias[segment_idx]);
+            if (bias <= 1e-6)
+                continue;
+            TopSurfaceImageAdaptiveLinesSegment &segment = segments[segment_idx];
+            segment.width += bias;
+            segment.width_start = top_surface_image_adaptive_lines_segment_start_width(segment) + bias;
+            segment.width_end = top_surface_image_adaptive_lines_segment_end_width(segment) + bias;
+            applied_bias[segment_idx] += bias;
+            changed = true;
+        }
+        if (!found_gap || !changed)
+            break;
+    }
+}
+
+static void top_surface_image_adaptive_lines_append_residual_gap_stitches(
+    std::vector<TopSurfaceImageAdaptiveLinesSegment> &segments,
+    const TopSurfaceImageAdaptiveLinesRuntimeGrid &grid,
+    double stitch_width_mm,
+    int supersample)
+{
+    const std::vector<unsigned int> bits =
+        top_surface_image_adaptive_lines_coverage_bits(grid, segments, supersample);
+    const double sample_pitch = grid.pitch_mm / double(supersample);
+    for (int row = 0; row < grid.rows; ++row) {
+        for (int col = 0; col < grid.cols; ++col) {
+            const int label = grid.labels[size_t(row * grid.cols + col)];
+            if (label < 0)
+                continue;
+            int min_sx = grid.cols * supersample;
+            int max_sx = -1;
+            int min_sy = grid.rows * supersample;
+            int max_sy = -1;
+            int gap_samples = 0;
+            for (int sy = row * supersample; sy < (row + 1) * supersample; ++sy) {
+                for (int sx = col * supersample; sx < (col + 1) * supersample; ++sx) {
+                    const size_t sample_idx = size_t(sy * grid.cols * supersample + sx);
+                    if (bits[sample_idx] != 0)
+                        continue;
+                    ++gap_samples;
+                    min_sx = std::min(min_sx, sx);
+                    max_sx = std::max(max_sx, sx);
+                    min_sy = std::min(min_sy, sy);
+                    max_sy = std::max(max_sy, sy);
+                }
+            }
+            if (gap_samples == 0)
+                continue;
+            const double cell_x0 = double(col) * grid.pitch_mm;
+            const double cell_y0 = double(row) * grid.pitch_mm;
+            const double cell_x1 = cell_x0 + grid.pitch_mm;
+            const double cell_y1 = cell_y0 + grid.pitch_mm;
+            const double gap_x0 = (double(min_sx) + 0.5) * sample_pitch;
+            const double gap_x1 = (double(max_sx) + 0.5) * sample_pitch;
+            const double gap_y0 = (double(min_sy) + 0.5) * sample_pitch;
+            const double gap_y1 = (double(max_sy) + 0.5) * sample_pitch;
+            const double cx = 0.5 * (gap_x0 + gap_x1);
+            const double cy = 0.5 * (gap_y0 + gap_y1);
+            const double half_cap = stitch_width_mm * 0.5;
+            TopSurfaceImageAdaptiveLinesVec2 a;
+            TopSurfaceImageAdaptiveLinesVec2 b;
+            if ((gap_x1 - gap_x0) >= (gap_y1 - gap_y0)) {
+                const double span = std::max(sample_pitch * 0.65, gap_x1 - gap_x0 + sample_pitch * 0.35);
+                const double x0 = std::clamp(cx - 0.5 * span, cell_x0 + half_cap, cell_x1 - half_cap);
+                const double x1 = std::clamp(cx + 0.5 * span, cell_x0 + half_cap, cell_x1 - half_cap);
+                a = { x0, std::clamp(cy, cell_y0 + half_cap, cell_y1 - half_cap) };
+                b = { x1, a.y };
+            } else {
+                const double span = std::max(sample_pitch * 0.65, gap_y1 - gap_y0 + sample_pitch * 0.35);
+                const double y0 = std::clamp(cy - 0.5 * span, cell_y0 + half_cap, cell_y1 - half_cap);
+                const double y1 = std::clamp(cy + 0.5 * span, cell_y0 + half_cap, cell_y1 - half_cap);
+                a = { std::clamp(cx, cell_x0 + half_cap, cell_x1 - half_cap), y0 };
+                b = { a.x, y1 };
+            }
+            if (top_surface_image_adaptive_lines_length(b - a) < 0.01)
+                continue;
+            segments.push_back({ a, b, stitch_width_mm, stitch_width_mm, stitch_width_mm, label });
+        }
+    }
+}
+
+static void top_surface_image_adaptive_lines_append_residual_gap_cluster_lines(
+    std::vector<TopSurfaceImageAdaptiveLinesSegment> &segments,
+    const TopSurfaceImageAdaptiveLinesRuntimeGrid &grid,
+    double line_width_mm,
+    double min_line_length_mm,
+    int supersample)
+{
+    const std::vector<unsigned int> bits =
+        top_surface_image_adaptive_lines_coverage_bits(grid, segments, supersample);
+    const double sample_pitch = grid.pitch_mm / double(supersample);
+    const int sample_w = grid.cols * supersample;
+    const int sample_h = grid.rows * supersample;
+    std::vector<unsigned char> visited(bits.size(), 0);
+    const double half_cap = line_width_mm * 0.5;
+    const std::array<std::pair<int, int>, 4> dirs {
+        std::pair<int, int>{ -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 }
+    };
+    for (int sy = 0; sy < sample_h; ++sy) {
+        for (int sx = 0; sx < sample_w; ++sx) {
+            const size_t sample_idx = size_t(sy * sample_w + sx);
+            if (bits[sample_idx] != 0 || visited[sample_idx])
+                continue;
+            const TopSurfaceImageAdaptiveLinesVec2 p { (double(sx) + 0.5) * sample_pitch,
+                                                       (double(sy) + 0.5) * sample_pitch };
+            const int label = top_surface_image_adaptive_lines_label_at_point(grid, p.x, p.y);
+            if (label < 0)
+                continue;
+            std::vector<int> queue { sy * sample_w + sx };
+            visited[sample_idx] = 1;
+            int min_sx = sx;
+            int max_sx = sx;
+            int min_sy = sy;
+            int max_sy = sy;
+            for (size_t qi = 0; qi < queue.size(); ++qi) {
+                const int idx = queue[qi];
+                const int qx = idx % sample_w;
+                const int qy = idx / sample_w;
+                min_sx = std::min(min_sx, qx);
+                max_sx = std::max(max_sx, qx);
+                min_sy = std::min(min_sy, qy);
+                max_sy = std::max(max_sy, qy);
+                for (const auto &[dx, dy] : dirs) {
+                    const int nx = qx + dx;
+                    const int ny = qy + dy;
+                    if (nx < 0 || nx >= sample_w || ny < 0 || ny >= sample_h)
+                        continue;
+                    const size_t nidx = size_t(ny * sample_w + nx);
+                    if (visited[nidx] || bits[nidx] != 0)
+                        continue;
+                    const TopSurfaceImageAdaptiveLinesVec2 np { (double(nx) + 0.5) * sample_pitch,
+                                                                (double(ny) + 0.5) * sample_pitch };
+                    if (top_surface_image_adaptive_lines_label_at_point(grid, np.x, np.y) != label)
+                        continue;
+                    visited[nidx] = 1;
+                    queue.emplace_back(ny * sample_w + nx);
+                }
+            }
+            const double gap_x0 = (double(min_sx) + 0.5) * sample_pitch;
+            const double gap_x1 = (double(max_sx) + 0.5) * sample_pitch;
+            const double gap_y0 = (double(min_sy) + 0.5) * sample_pitch;
+            const double gap_y1 = (double(max_sy) + 0.5) * sample_pitch;
+            const double cx = 0.5 * (gap_x0 + gap_x1);
+            const double cy = 0.5 * (gap_y0 + gap_y1);
+            const bool horizontal = (gap_x1 - gap_x0) >= (gap_y1 - gap_y0);
+            if (horizontal) {
+                const int row = int(std::floor(cy / grid.pitch_mm));
+                if (row < 0 || row >= grid.rows)
+                    continue;
+                int min_col = int(std::floor(gap_x0 / grid.pitch_mm));
+                int max_col = int(std::floor(gap_x1 / grid.pitch_mm));
+                min_col = std::clamp(min_col, 0, grid.cols - 1);
+                max_col = std::clamp(max_col, 0, grid.cols - 1);
+                while (min_col > 0 &&
+                       grid.labels[size_t(row * grid.cols + min_col - 1)] == label &&
+                       cx - double(min_col) * grid.pitch_mm < min_line_length_mm * 0.5)
+                    --min_col;
+                while (max_col + 1 < grid.cols &&
+                       grid.labels[size_t(row * grid.cols + max_col + 1)] == label &&
+                       double(max_col + 2) * grid.pitch_mm - cx < min_line_length_mm * 0.5)
+                    ++max_col;
+                const double x0 = std::max(double(min_col) * grid.pitch_mm + half_cap, cx - min_line_length_mm * 0.5);
+                const double x1 = std::min(double(max_col + 1) * grid.pitch_mm - half_cap, cx + min_line_length_mm * 0.5);
+                const double y = std::clamp(cy, double(row) * grid.pitch_mm + half_cap, double(row + 1) * grid.pitch_mm - half_cap);
+                if (x1 - x0 >= 0.05)
+                    segments.push_back({ { x0, y }, { x1, y }, line_width_mm, line_width_mm, line_width_mm, label });
+            } else {
+                const int col = int(std::floor(cx / grid.pitch_mm));
+                if (col < 0 || col >= grid.cols)
+                    continue;
+                int min_row = int(std::floor(gap_y0 / grid.pitch_mm));
+                int max_row = int(std::floor(gap_y1 / grid.pitch_mm));
+                min_row = std::clamp(min_row, 0, grid.rows - 1);
+                max_row = std::clamp(max_row, 0, grid.rows - 1);
+                while (min_row > 0 &&
+                       grid.labels[size_t((min_row - 1) * grid.cols + col)] == label &&
+                       cy - double(min_row) * grid.pitch_mm < min_line_length_mm * 0.5)
+                    --min_row;
+                while (max_row + 1 < grid.rows &&
+                       grid.labels[size_t((max_row + 1) * grid.cols + col)] == label &&
+                       double(max_row + 2) * grid.pitch_mm - cy < min_line_length_mm * 0.5)
+                    ++max_row;
+                const double y0 = std::max(double(min_row) * grid.pitch_mm + half_cap, cy - min_line_length_mm * 0.5);
+                const double y1 = std::min(double(max_row + 1) * grid.pitch_mm - half_cap, cy + min_line_length_mm * 0.5);
+                const double x = std::clamp(cx, double(col) * grid.pitch_mm + half_cap, double(col + 1) * grid.pitch_mm - half_cap);
+                if (y1 - y0 >= 0.05)
+                    segments.push_back({ { x, y0 }, { x, y1 }, line_width_mm, line_width_mm, line_width_mm, label });
+            }
+        }
+    }
+}
+
+static TopSurfaceImageAdaptiveLinesRuntimeGrid top_surface_image_adaptive_lines_runtime_grid(
+    const TopSurfaceImageAdaptiveLinesGrid &source_grid,
+    const PrintConfig &print_config)
+{
+    TopSurfaceImageAdaptiveLinesRuntimeGrid grid;
+    grid.cols = source_grid.cols;
+    grid.rows = source_grid.rows;
+    grid.pitch_mm = unscale<double>(source_grid.step);
+    grid.labels.assign(source_grid.component_grid.size(), -1);
+    grid.cell_components.assign(source_grid.component_grid.size(), 0);
+    const bool stable_geometry_grid =
+        source_grid.geometry_grid.size() == source_grid.component_grid.size();
+    const std::vector<int> &geometry_grid =
+        stable_geometry_grid ?
+            source_grid.geometry_grid :
+            source_grid.component_grid;
+    std::map<int, int> geometry_to_label;
+    for (size_t idx = 0; idx < source_grid.component_grid.size(); ++idx) {
+        const int component_id = source_grid.component_grid[idx];
+        const int geometry_id = geometry_grid[idx];
+        if (geometry_id < 0 || (!stable_geometry_grid && geometry_id <= 0))
+            continue;
+        auto it = geometry_to_label.find(geometry_id);
+        if (it == geometry_to_label.end()) {
+            const int label = int(geometry_to_label.size());
+            it = geometry_to_label.emplace(geometry_id, label).first;
+            ColorRGB color = ColorRGB::WHITE();
+            if (geometry_id >= 0 && geometry_id < int(source_grid.geometry_oklab.size())) {
+                grid.label_oklab.emplace_back(source_grid.geometry_oklab[size_t(geometry_id)]);
+            } else {
+                if (component_id > 0 && component_id <= int(print_config.filament_colour.values.size()))
+                    decode_color(print_config.filament_colour.get_at(size_t(component_id - 1)), color);
+                grid.label_oklab.emplace_back(color_solver_oklab_from_srgb({ color.r(), color.g(), color.b() }));
+            }
+        }
+        grid.labels[idx] = it->second;
+        if (component_id > 0)
+            grid.cell_components[idx] = unsigned(component_id);
+    }
+    if (grid.pitch_mm <= 0.0) {
+        grid.cols = 0;
+        grid.rows = 0;
+        grid.labels.clear();
+        grid.cell_components.clear();
+        grid.label_oklab.clear();
+    }
+    return grid;
+}
+
+static std::vector<TopSurfaceImageAdaptiveLinesSegment> top_surface_image_adaptive_lines_segments(
+    const TopSurfaceImageAdaptiveLinesRuntimeGrid &grid,
+    const ThrowIfCanceled *throw_if_canceled)
+{
+    const double min_width_mm = 0.32;
+    const double max_width_mm = 0.64;
+    const double layer_height_mm = 0.20;
+    const double rounded_rect_delta = layer_height_mm * (1.0 - 0.25 * PI);
+    const coord_t preferred_spacing = std::max<coord_t>(1, scale_(std::max(0.01, max_width_mm - rounded_rect_delta)));
+    const coord_t min_spacing = std::max<coord_t>(1, scale_(std::max(0.01, min_width_mm - rounded_rect_delta)));
+    const coord_t max_spacing = std::max<coord_t>(min_spacing, scale_(std::max(0.01, max_width_mm - rounded_rect_delta)));
+    TopSurfaceImageAdaptiveLinesBlobBuildResult result =
+        top_surface_image_adaptive_lines_build_blobs(grid, min_width_mm, max_width_mm, throw_if_canceled);
+    std::vector<TopSurfaceImageAdaptiveLinesSegment> segments;
+    for (const TopSurfaceImageAdaptiveLinesBlobRegion &blob : result.blobs) {
+        if (!blob.active)
+            continue;
+        top_surface_image_adaptive_lines_append_exact_blob_segments(segments,
+                                                                    grid,
+                                                                    blob,
+                                                                    result.stats,
+                                                                    min_width_mm,
+                                                                    min_spacing,
+                                                                    max_spacing,
+                                                                    preferred_spacing,
+                                                                    throw_if_canceled);
+    }
+    const int printable_blob_count = std::max(1, result.stats.blob_count - result.stats.arachne_empty_blob_count);
+    result.stats.average_arachne_lines_per_blob /= double(printable_blob_count);
+    top_surface_image_adaptive_lines_apply_selective_gap_width_bias(segments, grid, 0.03, 5);
+    for (int pass = 0; pass < 3; ++pass)
+        top_surface_image_adaptive_lines_append_residual_gap_stitches(segments, grid, 0.16, 5);
+    top_surface_image_adaptive_lines_append_residual_gap_cluster_lines(segments, grid, 0.14, 0.18, 5);
+    return segments;
+}
+
+static void top_surface_image_adaptive_lines_apply_metadata(ExtrusionEntityCollection &collection,
+                                                            const SurfaceFillParams &params,
+                                                            unsigned int component_id)
+{
+    collection.no_sort = true;
+    collection.texture_mapping_top_surface_image = true;
+    collection.texture_mapping_top_surface_zone_id = params.texture_mapping_top_surface_zone_id;
+    collection.texture_mapping_top_surface_desired_component_id = component_id;
+    collection.texture_mapping_top_surface_stack_depth = params.texture_mapping_top_surface_stack_depth;
+    collection.texture_mapping_top_surface_fixed_coloring = params.texture_mapping_top_surface_fixed_coloring;
+    collection.texture_mapping_extruder_override =
+        params.texture_mapping_top_surface_fixed_coloring && component_id > 0 ? int(component_id - 1) : -1;
+}
+
+static void top_surface_image_adaptive_lines_append_entity_intersection(ExtrusionEntityCollection &out,
+                                                                        const ExtrusionEntity &entity,
+                                                                        const ExPolygons &clip)
+{
+    if (const ExtrusionPath *path = dynamic_cast<const ExtrusionPath *>(&entity)) {
+        path->intersect_expolygons(clip, &out);
+        return;
+    }
+    if (const ExtrusionMultiPath *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
+        for (const ExtrusionPath &path : multipath->paths)
+            path.intersect_expolygons(clip, &out);
+        return;
+    }
+    if (const ExtrusionLoop *loop = dynamic_cast<const ExtrusionLoop *>(&entity)) {
+        for (const ExtrusionPath &path : loop->paths)
+            path.intersect_expolygons(clip, &out);
+        return;
+    }
+    if (const ExtrusionEntityCollection *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
+        for (const ExtrusionEntity *child : collection->entities)
+            if (child != nullptr)
+                top_surface_image_adaptive_lines_append_entity_intersection(out, *child, clip);
+    }
+}
+
+static std::unique_ptr<ExtrusionEntityCollection> top_surface_image_adaptive_lines_collection(
+    const TopSurfaceImageAdaptiveLinesGrid &source_grid,
+    const ExPolygons &clip_area,
+    const SurfaceFillParams &params,
+    const PrintConfig &print_config,
+    const ThrowIfCanceled *throw_if_canceled)
+{
+    std::unique_ptr<ExtrusionEntityCollection> collection(new ExtrusionEntityCollection());
+    top_surface_image_adaptive_lines_apply_metadata(*collection, params, 0);
+    collection->no_sort = false;
+    if (clip_area.empty() || source_grid.component_grid.empty())
+        return collection;
+    TopSurfaceImageAdaptiveLinesRuntimeGrid grid =
+        top_surface_image_adaptive_lines_runtime_grid(source_grid, print_config);
+    if (grid.cols <= 0 || grid.rows <= 0 || grid.labels.empty() || grid.label_oklab.empty())
+        return collection;
+    std::vector<TopSurfaceImageAdaptiveLinesSegment> segments =
+        top_surface_image_adaptive_lines_segments(grid, throw_if_canceled);
+    if (segments.empty())
+        return collection;
+
+    std::map<unsigned int, ThickPolylines> thick_by_component;
+    const double offset_x = unscale<double>(source_grid.min_x);
+    const double offset_y = unscale<double>(source_grid.min_y);
+    for (const TopSurfaceImageAdaptiveLinesSegment &segment : segments) {
+        check_canceled(throw_if_canceled);
+        const unsigned int component_id = top_surface_image_adaptive_lines_component_for_segment(grid, segment);
+        if (component_id == 0)
+            continue;
+        ThickPolyline thick;
+        thick.points.emplace_back(Point::new_scale(offset_x + segment.a.x, offset_y + segment.a.y));
+        thick.points.emplace_back(Point::new_scale(offset_x + segment.b.x, offset_y + segment.b.y));
+        if (thick.points.front() == thick.points.back())
+            continue;
+        thick.width.emplace_back(scale_(top_surface_image_adaptive_lines_segment_start_width(segment)));
+        thick.width.emplace_back(scale_(top_surface_image_adaptive_lines_segment_end_width(segment)));
+        thick_by_component[component_id].emplace_back(std::move(thick));
+    }
+
+    const double max_width_mm = 0.64;
+    const Flow max_flow(float(max_width_mm), params.flow.height(), params.flow.nozzle_diameter());
+    for (auto &[component_id, thick_polylines] : thick_by_component) {
+        check_canceled(throw_if_canceled);
+        if (thick_polylines.empty())
+            continue;
+        ExtrusionEntityCollection generated;
+        variable_width(thick_polylines, params.extrusion_role, max_flow, generated.entities);
+        if (generated.empty())
+            continue;
+        std::unique_ptr<ExtrusionEntityCollection> child(new ExtrusionEntityCollection());
+        top_surface_image_adaptive_lines_apply_metadata(*child, params, component_id);
+        for (const ExtrusionEntity *entity : generated.entities)
+            if (entity != nullptr)
+                top_surface_image_adaptive_lines_append_entity_intersection(*child, *entity, clip_area);
+        if (!child->empty())
+            collection->entities.emplace_back(child.release());
+    }
+    return collection;
+}
+
+static void top_surface_image_append_adaptive_lines_collections(Layer &layer,
+                                                                const std::vector<SurfaceFill> &surface_fills,
+                                                                const ThrowIfCanceled *throw_if_canceled)
+{
+    const PrintObject *object = layer.object();
+    if (object == nullptr || object->print() == nullptr)
+        return;
+    const PrintConfig &print_config = object->print()->config();
+    std::vector<const TopSurfaceImageAdaptiveLinesGrid *> processed;
+    for (const SurfaceFill &fill : surface_fills) {
+        check_canceled(throw_if_canceled);
+        if (fill.region_id >= layer.regions().size() ||
+            layer.regions()[fill.region_id] == nullptr ||
+            fill.adaptive_lines_areas.empty() ||
+            !fill.params.texture_mapping_top_surface_contoning ||
+            !top_surface_image_contoning_adaptive_lines_mode(
+                fill.params.texture_mapping_top_surface_contoning_flat_surface_infill_mode))
+            continue;
+        const TopSurfaceImageAdaptiveLinesGrid *grid = fill.adaptive_lines_areas.front().grid.get();
+        if (grid == nullptr ||
+            std::find(processed.begin(), processed.end(), grid) != processed.end())
+            continue;
+        processed.emplace_back(grid);
+        ExPolygons clip_area;
+        for (const SurfaceFill &candidate : surface_fills) {
+            check_canceled(throw_if_canceled);
+            if (candidate.region_id != fill.region_id ||
+                !candidate.params.texture_mapping_top_surface_contoning ||
+                !top_surface_image_contoning_adaptive_lines_mode(
+                    candidate.params.texture_mapping_top_surface_contoning_flat_surface_infill_mode))
+                continue;
+            for (const TopSurfaceImageAdaptiveLinesArea &area : candidate.adaptive_lines_areas) {
+                if (area.grid.get() == grid && !area.area.empty())
+                    append(clip_area, area.area);
+            }
+        }
+        if (clip_area.empty())
+            continue;
+        clip_area = top_surface_clip_union_ex(clip_area);
+        if (clip_area.empty())
+            continue;
+        SurfaceFillParams params = fill.params;
+        params.texture_mapping_top_surface_component_id = 0;
+        std::unique_ptr<ExtrusionEntityCollection> collection =
+            top_surface_image_adaptive_lines_collection(*grid,
+                                                       clip_area,
+                                                       params,
+                                                       print_config,
+                                                       throw_if_canceled);
+        if (collection && !collection->empty()) {
+            ExtrusionEntitiesPtr &fill_entities = layer.regions()[fill.region_id]->fills.entities;
+            for (ExtrusionEntity *entity : collection->entities)
+                fill_entities.emplace_back(entity);
+            collection->entities.clear();
+        }
+    }
 }
 
 static void apply_top_surface_image_collection_metadata(ExtrusionEntityCollection &collection,
@@ -12279,6 +13784,11 @@ std::vector<SurfaceFill> group_fills(const Layer &layer,
                                             component_expolygons = top_surface_clip_intersection_ex(component_expolygons,
                                                                                                     layerm.fill_no_overlap_expolygons,
                                                                                                     slice_safety_offset);
+                                        ExPolygons adaptive_lines_area;
+                                        if (same_slice.adaptive_lines_grid != nullptr &&
+                                            top_surface_image_contoning_adaptive_lines_mode(
+                                                image_params.texture_mapping_top_surface_contoning_flat_surface_infill_mode))
+                                            adaptive_lines_area = component_expolygons;
                                         component_printed_mm2 = replacement_trace.enabled ?
                                             top_surface_image_debug_area_mm2(component_expolygons) :
                                             0.;
@@ -12296,6 +13806,8 @@ std::vector<SurfaceFill> group_fills(const Layer &layer,
                                         }
                                         if (!component_expolygons.empty()) {
                                             SurfaceFill &image_fill = surface_fill_for_params(surface_fills, image_params);
+                                            if (!adaptive_lines_area.empty())
+                                                image_fill.adaptive_lines_areas.push_back({ same_slice.adaptive_lines_grid, std::move(adaptive_lines_area) });
                                             append_surface_fill_expolygons(image_fill, region_id, surface, std::move(component_expolygons), layerm);
                                         }
                                     }
@@ -12581,7 +14093,11 @@ std::vector<SurfaceFill> group_fills(const Layer &layer,
                     continue;
                 if (fill.params.texture_mapping_top_surface_contoning ||
                     fill.params.texture_mapping_top_surface_raw_labels) {
-                    if (fill.expolygons.size() > 1)
+                    const bool preserve_adaptive_lines =
+                        fill.params.texture_mapping_top_surface_contoning &&
+                        top_surface_image_contoning_adaptive_lines_mode(
+                            fill.params.texture_mapping_top_surface_contoning_flat_surface_infill_mode);
+                    if (fill.expolygons.size() > 1 && !preserve_adaptive_lines)
                         fill.expolygons = top_surface_clip_union_ex(fill.expolygons);
                     continue;
                 }
@@ -12839,12 +14355,18 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree,
     const std::map<TopSurfaceImageRectilinearBoundaryKey, TopSurfaceImageRectilinearBoundaryGroup> rectilinear_repair_groups =
         top_surface_image_rectilinear_boundary_groups(*this, surface_fills, true, throw_if_canceled_ptr);
     top_surface_image_append_rectilinear_boundary_collections(*this, rectilinear_boundary_groups, throw_if_canceled_ptr);
+    top_surface_image_append_adaptive_lines_collections(*this, surface_fills, throw_if_canceled_ptr);
 
     for (SurfaceFill &surface_fill : surface_fills) {
         check_canceled(throw_if_canceled_ptr);
         if (surface_fill.expolygons.empty() ||
             surface_fill.region_id >= this->m_regions.size() ||
             this->m_regions[surface_fill.region_id] == nullptr)
+            continue;
+        if (!surface_fill.adaptive_lines_areas.empty() &&
+            surface_fill.params.texture_mapping_top_surface_contoning &&
+            top_surface_image_contoning_adaptive_lines_mode(
+                surface_fill.params.texture_mapping_top_surface_contoning_flat_surface_infill_mode))
             continue;
         // Create the filler object.
         std::unique_ptr<Fill> f = std::unique_ptr<Fill>(Fill::new_from_type(surface_fill.params.pattern));
@@ -13018,6 +14540,21 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree,
                                                             top_surface_image_context,
                                                             throw_if_canceled_ptr);
                 if (!collection->empty()) {
+                    apply_top_surface_image_collection_metadata(*collection, surface_fill.params, std::nullopt, throw_if_canceled_ptr);
+                    fill_entities.push_back(collection.release());
+                }
+            } else if (surface_fill.params.texture_mapping_top_surface_contoning &&
+                       top_surface_image_contoning_adaptive_lines_mode(
+                           surface_fill.params.texture_mapping_top_surface_contoning_flat_surface_infill_mode)) {
+                std::unique_ptr<ExtrusionEntityCollection> collection =
+                    top_surface_image_rectilinear_arachne_repair_collection(ExPolygons { surface_fill.surface.expolygon },
+                                                                            surface_fill.params,
+                                                                            this->object()->print()->config(),
+                                                                            this->object()->config(),
+                                                                            int(this->id()),
+                                                                            0.03f,
+                                                                            throw_if_canceled_ptr);
+                if (collection && !collection->empty()) {
                     apply_top_surface_image_collection_metadata(*collection, surface_fill.params, std::nullopt, throw_if_canceled_ptr);
                     fill_entities.push_back(collection.release());
                 }
