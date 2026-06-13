@@ -2429,6 +2429,7 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            nonlinear_offset_adjustment == rhs.nonlinear_offset_adjustment &&
            modulation_mode == rhs.modulation_mode &&
            use_modulated_overhang_geometry_for_support == rhs.use_modulated_overhang_geometry_for_support &&
+           join_extrusion_path_at_corners == rhs.join_extrusion_path_at_corners &&
            modulation_mode_manually_changed == rhs.modulation_mode_manually_changed &&
            recolor_small_perimeter_loops == rhs.recolor_small_perimeter_loops &&
            recolor_top_visible_perimeter_sections == rhs.recolor_top_visible_perimeter_sections &&
@@ -2806,6 +2807,7 @@ std::string TextureMappingManager::serialize_entries()
         texture["nonlinear_offset_adjustment"] = zone.nonlinear_offset_adjustment;
         texture["modulation_mode"] = modulation_mode_name(zone.modulation_mode);
         texture["use_modulated_overhang_geometry_for_support"] = zone.use_modulated_overhang_geometry_for_support;
+        texture["join_extrusion_path_at_corners"] = zone.join_extrusion_path_at_corners;
         texture["modulation_mode_manually_changed"] = zone.modulation_mode_manually_changed;
         texture["recolor_small_perimeter_loops"] = zone.recolor_small_perimeter_loops || zone.recolor_top_visible_perimeter_sections;
         texture["recolor_top_visible_perimeter_sections"] = zone.recolor_top_visible_perimeter_sections;
@@ -3093,6 +3095,9 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.use_modulated_overhang_geometry_for_support =
             texture.value("use_modulated_overhang_geometry_for_support",
                           TextureMappingZone::DefaultUseModulatedOverhangGeometryForSupport);
+        zone.join_extrusion_path_at_corners =
+            texture.value("join_extrusion_path_at_corners",
+                          TextureMappingZone::DefaultJoinExtrusionPathAtCorners);
         const auto modulation_mode_it = texture.find("modulation_mode");
         const bool has_modulation_mode =
             modulation_mode_it != texture.end() && modulation_mode_it->is_string();

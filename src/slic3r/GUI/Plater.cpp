@@ -2503,6 +2503,7 @@ public:
                                         bool nonlinear_offset_adjustment,
                                         int modulation_mode,
                                         bool use_modulated_overhang_geometry_for_support,
+                                        bool join_extrusion_path_at_corners,
                                         bool modulation_mode_manually_changed,
                                         bool recolor_small_perimeter_loops,
                                         bool recolor_top_visible_perimeter_sections,
@@ -2882,7 +2883,7 @@ public:
         auto *modulation_mode_row = new wxBoxSizer(wxHORIZONTAL);
         modulation_mode_row->Add(new wxStaticText(print_settings_page, wxID_ANY, _L("Modulation mode:")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         m_modulation_mode_choice = new wxChoice(print_settings_page, wxID_ANY);
-        update_modulation_mode_choices(false, modulation_mode);
+        update_modulation_mode_choices(modulation_mode);
         modulation_mode_row->Add(m_modulation_mode_choice, 1, wxALIGN_CENTER_VERTICAL);
         print_settings_root->Add(modulation_mode_row, 0, wxEXPAND | wxALL, gap);
         m_modulation_mode_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) {
@@ -2984,6 +2985,10 @@ public:
             new wxCheckBox(experimental_page, wxID_ANY, _L("Use modulated overhang geometry in support generation"));
         m_use_modulated_overhang_geometry_for_support_checkbox->SetValue(use_modulated_overhang_geometry_for_support);
         experimental_box->Add(m_use_modulated_overhang_geometry_for_support_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        m_join_extrusion_path_at_corners_checkbox =
+            new wxCheckBox(experimental_page, wxID_ANY, _L("Join extrusion path at corners"));
+        m_join_extrusion_path_at_corners_checkbox->SetValue(join_extrusion_path_at_corners);
+        experimental_box->Add(m_join_extrusion_path_at_corners_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
         m_top_visible_perimeter_recolor_point_sampling_checkbox =
             new wxCheckBox(experimental_page, wxID_ANY, _L("Point-sample visible layer-line recolor"));
         m_top_visible_perimeter_recolor_point_sampling_checkbox->SetValue(top_visible_perimeter_recolor_point_sampling);
@@ -3898,6 +3903,11 @@ public:
     {
         return m_use_modulated_overhang_geometry_for_support_checkbox != nullptr &&
                m_use_modulated_overhang_geometry_for_support_checkbox->GetValue();
+    }
+    bool join_extrusion_path_at_corners() const
+    {
+        return m_join_extrusion_path_at_corners_checkbox != nullptr &&
+               m_join_extrusion_path_at_corners_checkbox->GetValue();
     }
     int modulation_mode() const
     {
@@ -5433,6 +5443,8 @@ private:
             m_recolor_top_visible_perimeter_sections_checkbox->Enable(perimeter_path_mode);
         if (m_use_modulated_overhang_geometry_for_support_checkbox != nullptr)
             m_use_modulated_overhang_geometry_for_support_checkbox->Enable(perimeter_path_v2_mode);
+        if (m_join_extrusion_path_at_corners_checkbox != nullptr)
+            m_join_extrusion_path_at_corners_checkbox->Enable(modulation_mode() == int(TextureMappingZone::ModulationLineWidth));
         if (m_top_visible_perimeter_recolor_point_sampling_checkbox != nullptr)
             m_top_visible_perimeter_recolor_point_sampling_checkbox->Enable(perimeter_path_v2_mode);
         const bool top_visible_enabled =
@@ -5456,20 +5468,16 @@ private:
         }
     }
 
-    void update_modulation_mode_choices(bool force_perimeter_path_v2, int preferred_mode)
+    void update_modulation_mode_choices(int preferred_mode)
     {
         if (m_modulation_mode_choice == nullptr)
             return;
-        const int mode = force_perimeter_path_v2 ?
-            int(TextureMappingZone::ModulationPerimeterPathV2) :
-            std::clamp(preferred_mode,
-                       int(TextureMappingZone::ModulationLineWidth),
-                       int(TextureMappingZone::ModulationPerimeterPathV2));
+        const int mode = std::clamp(preferred_mode,
+                                    int(TextureMappingZone::ModulationLineWidth),
+                                    int(TextureMappingZone::ModulationPerimeterPathV2));
         m_modulation_mode_choice->Clear();
         m_modulation_mode_choice_values.clear();
-        auto append_mode = [this, force_perimeter_path_v2](int value, const wxString &label) {
-            if (force_perimeter_path_v2 && value != int(TextureMappingZone::ModulationPerimeterPathV2))
-                return;
+        auto append_mode = [this](int value, const wxString &label) {
             m_modulation_mode_choice->Append(label);
             m_modulation_mode_choice_values.emplace_back(value);
         };
@@ -5574,10 +5582,7 @@ private:
         const bool contoning = enabled && contoning_selected;
         if (m_modulation_mode_choice != nullptr) {
             const int preferred_mode = modulation_mode();
-            update_modulation_mode_choices(contoning, preferred_mode);
-        }
-        if (contoning) {
-            m_modulation_mode_manually_changed = true;
+            update_modulation_mode_choices(preferred_mode);
             update_modulation_mode_options_visibility(false);
         }
         const bool same_layer =
@@ -5753,6 +5758,7 @@ private:
     wxCheckBox *m_nonlinear_offset_adjustment_checkbox {nullptr};
     wxSpinCtrl *m_filament_overhang_contrast_spin {nullptr};
     wxCheckBox *m_use_modulated_overhang_geometry_for_support_checkbox {nullptr};
+    wxCheckBox *m_join_extrusion_path_at_corners_checkbox {nullptr};
     wxChoice *m_modulation_mode_choice {nullptr};
     std::vector<int> m_modulation_mode_choice_values;
     bool m_modulation_mode_manually_changed {false};
@@ -10857,6 +10863,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.nonlinear_offset_adjustment,
                                                     updated.modulation_mode,
                                                     updated.use_modulated_overhang_geometry_for_support,
+                                                    updated.join_extrusion_path_at_corners,
                                                     updated.modulation_mode_manually_changed,
                                                     updated.recolor_small_perimeter_loops,
                                                     updated.recolor_top_visible_perimeter_sections,
@@ -10951,6 +10958,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.nonlinear_offset_adjustment = dlg.nonlinear_offset_adjustment();
             updated.modulation_mode = dlg.modulation_mode();
             updated.use_modulated_overhang_geometry_for_support = dlg.use_modulated_overhang_geometry_for_support();
+            updated.join_extrusion_path_at_corners = dlg.join_extrusion_path_at_corners();
             updated.modulation_mode_manually_changed = dlg.modulation_mode_manually_changed();
             updated.apply_default_modulation_mode();
             updated.recolor_small_perimeter_loops = dlg.recolor_small_perimeter_loops();
@@ -11032,11 +11040,6 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 dlg.side_surface_color_calibration_name();
             updated.side_surface_color_calibration_json =
                 dlg.side_surface_color_calibration_json();
-            if (updated.top_surface_image_printing_enabled &&
-                updated.top_surface_image_printing_method == int(TextureMappingZone::TopSurfaceImageContoning)) {
-                updated.modulation_mode = int(TextureMappingZone::ModulationPerimeterPathV2);
-                updated.modulation_mode_manually_changed = true;
-            }
             if (updated.dithering_enabled)
                 updated.compact_offset_mode = true;
             updated.minimum_visibility_offset_enabled = dlg.minimum_visibility_offset_enabled();

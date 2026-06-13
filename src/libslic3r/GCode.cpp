@@ -10902,6 +10902,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         double length_mm { 0.0 };
         float  centerline_shift_mm { 0.f };
         float  balance_weight { 0.f };
+        float  target_width_mm { 0.f };
     };
 
     struct OuterWallGradientSurfaceCoord {
@@ -10931,7 +10932,29 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         float                     centerline_shift_balance_mm { 0.f };
         float                     centerline_shift_balance_weight_scale { 0.f };
         float                     layer_height_mm { 0.2f };
+        bool                      join_extrusion_path_at_corners { false };
         TextureMappingOffsetContext offset_context;
+    };
+
+    struct OuterWallGradientJoinedSpan {
+        Point                       source_a;
+        Point                       source_b;
+        OuterWallGradientSegmentMod mod;
+        Vec2d                       source_a_xy;
+        Vec2d                       source_b_xy;
+        Vec2d                       shifted_a_xy;
+        Vec2d                       shifted_b_xy;
+        Vec2d                       start_xy;
+        Vec2d                       end_xy;
+        Point                       start_point;
+        Point                       end_point;
+        double                      source_length_mm { 0.0 };
+        size_t                      parent_idx { 0 };
+        double                      speed_mm_s { 0.0 };
+        float                       overlap { 0.f };
+        float                       width_mm { 0.f };
+        bool                        emit { true };
+        bool                        starts_new_chain { false };
     };
 
     if (is_bridge(path.role()))
@@ -11167,6 +11190,9 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                 outer_wall_gradient_dynamic_ctx.flow_reference_width_mm = flow_reference_width_mm;
                                 outer_wall_gradient_dynamic_ctx.base_centerline_shift_mm = base_centerline_shift_mm;
                                 outer_wall_gradient_dynamic_ctx.layer_height_mm = layer_height_mm;
+                                outer_wall_gradient_dynamic_ctx.join_extrusion_path_at_corners =
+                                    zone->join_extrusion_path_at_corners &&
+                                    zone->modulation_mode == int(TextureMappingZone::ModulationLineWidth);
                                 outer_wall_gradient_dynamic_ctx.offset_context = std::move(*offset_context);
 
                                 outer_wall_gradient_segment_mods.reserve(path.polyline.points.size() - 1);
@@ -11251,6 +11277,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                         outer_wall_gradient_segment_mods.emplace_back(OuterWallGradientSegmentMod{});
                                         continue;
                                     }
+                                    mod.target_width_mm = target_width_mm;
 
                                     const float centerline_shift_mm = base_centerline_shift_mm + 0.5f * width_delta_mm;
                                     mod.shift_unit_x = -outward_x;
@@ -11325,7 +11352,1327 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         }
     }
 
-    const Point extrusion_start_point = outer_wall_gradient_modulated_path ? outer_wall_gradient_start_point : path.first_point();
+    auto segment_modulation_at = [&outer_wall_gradient_segment_mods, outer_wall_gradient_modulated_path](size_t idx) {
+        if (!outer_wall_gradient_modulated_path || idx >= outer_wall_gradient_segment_mods.size())
+            return OuterWallGradientSegmentMod{};
+        return outer_wall_gradient_segment_mods[idx];
+    };
+
+    const Layer *surface_layer = m_layer;
+
+    auto dynamic_modulation_for_line =
+        [&outer_wall_gradient_dynamic_ctx, surface_layer](
+            const Line &line, const OuterWallGradientSurfaceCoord &surface_coord) {
+        OuterWallGradientSegmentMod mod;
+        if (!outer_wall_gradient_dynamic_ctx.enabled)
+            return mod;
+
+        const double ax = double(line.a.x());
+        const double ay = double(line.a.y());
+        const double bx = double(line.b.x());
+        const double by = double(line.b.y());
+        const double dx = bx - ax;
+        const double dy = by - ay;
+        const double len = std::hypot(dx, dy);
+        if (len <= EPSILON)
+            return mod;
+
+        const double mid_x = 0.5 * (ax + bx);
+        const double mid_y = 0.5 * (ay + by);
+        const double radial_x = mid_x - double(outer_wall_gradient_dynamic_ctx.object_center.x());
+        const double radial_y = mid_y - double(outer_wall_gradient_dynamic_ctx.object_center.y());
+
+        const Point mid_point(coord_t(std::llround(mid_x)), coord_t(std::llround(mid_y)));
+        double outward_x = 0.0;
+        double outward_y = 0.0;
+        resolve_segment_shift_outward_normal_for_gcode(surface_layer,
+                                                       mid_point,
+                                                       dx,
+                                                       dy,
+                                                       len,
+                                                       radial_x,
+                                                       radial_y,
+                                                       outward_x,
+                                                       outward_y);
+
+        float max_width_delta_limit_mm = std::min(
+            outer_wall_gradient_dynamic_ctx.max_width_delta_mm,
+            2.f * outer_wall_gradient_dynamic_ctx.inset_strength_reference_mm);
+        if (!std::isfinite(max_width_delta_limit_mm) || max_width_delta_limit_mm <= EPSILON)
+            return OuterWallGradientSegmentMod{};
+        const float width_delta_mm = std::clamp(
+            texture_mapping_offset_surface_inset_mm(outer_wall_gradient_dynamic_ctx.offset_context,
+                                                   mid_point,
+                                                   -outward_x,
+                                                   -outward_y,
+                                                   surface_coord.u_mm,
+                                                   surface_coord.v_mm),
+            0.f,
+            max_width_delta_limit_mm);
+        if (!std::isfinite(width_delta_mm) ||
+            !std::isfinite(outer_wall_gradient_dynamic_ctx.base_outer_width_mm) ||
+            !std::isfinite(outer_wall_gradient_dynamic_ctx.layer_height_mm))
+            return OuterWallGradientSegmentMod{};
+
+        const float target_width_mm = outer_wall_gradient_dynamic_ctx.base_outer_width_mm - width_delta_mm;
+        if (!std::isfinite(target_width_mm) || target_width_mm <= 0.f)
+            return OuterWallGradientSegmentMod{};
+
+        mod.flow_scale = flow_scale_for_target_width_for_gcode(outer_wall_gradient_dynamic_ctx.flow_reference_width_mm,
+                                                               target_width_mm,
+                                                               outer_wall_gradient_dynamic_ctx.layer_height_mm);
+        if (!std::isfinite(mod.flow_scale) || mod.flow_scale <= 0.)
+            return OuterWallGradientSegmentMod{};
+        mod.target_width_mm = target_width_mm;
+
+        const float balance_weight =
+            max_width_delta_limit_mm > EPSILON ? std::clamp(width_delta_mm / max_width_delta_limit_mm, 0.f, 1.f) : 0.f;
+        const float raw_centerline_shift_mm =
+            outer_wall_gradient_dynamic_ctx.base_centerline_shift_mm +
+            0.5f * width_delta_mm +
+            outer_wall_gradient_dynamic_ctx.centerline_shift_balance_mm *
+                balance_weight *
+                outer_wall_gradient_dynamic_ctx.centerline_shift_balance_weight_scale;
+        const float centerline_shift_mm =
+            outer_wall_gradient_dynamic_ctx.centerline_shift_balance_mm == 0.f ?
+                raw_centerline_shift_mm :
+                std::clamp(raw_centerline_shift_mm,
+                           0.f,
+                           outer_wall_gradient_dynamic_ctx.base_centerline_shift_mm + 0.5f * max_width_delta_limit_mm);
+        mod.length_mm = unscale<double>(len);
+        mod.centerline_shift_mm = centerline_shift_mm;
+        mod.shift_unit_x = -outward_x;
+        mod.shift_unit_y = -outward_y;
+        mod.balance_weight = balance_weight;
+        if (std::abs(centerline_shift_mm) > EPSILON) {
+            const double inward_x = -outward_x;
+            const double inward_y = -outward_y;
+            const bool reverse_shift = centerline_shift_mm < 0.f;
+            const double shift_x = reverse_shift ? -inward_x : inward_x;
+            const double shift_y = reverse_shift ? -inward_y : inward_y;
+            const double shift_scaled = scale_(double(std::abs(centerline_shift_mm)));
+            if (!std::isfinite(shift_x) || !std::isfinite(shift_y) || !std::isfinite(shift_scaled))
+                return OuterWallGradientSegmentMod{};
+            const coord_t max_shift_coord = scale_(std::max(0.5f, outer_wall_gradient_dynamic_ctx.base_outer_width_mm));
+            if (!clamped_shift_coord_for_gcode(shift_x, shift_scaled, max_shift_coord, mod.shift_dx) ||
+                !clamped_shift_coord_for_gcode(shift_y, shift_scaled, max_shift_coord, mod.shift_dy))
+                return OuterWallGradientSegmentMod{};
+        }
+
+        return mod;
+    };
+
+    auto outer_wall_gradient_output_xy = [this](const Point &point, bool quantized) {
+        return quantized ? this->point_to_gcode_quantized(point) : this->point_to_gcode(point);
+    };
+
+    auto outer_wall_gradient_refresh_joined_points = [this](OuterWallGradientJoinedSpan &span) {
+        span.start_point = this->gcode_to_point(span.start_xy);
+        span.end_point = this->gcode_to_point(span.end_xy);
+    };
+
+    auto outer_wall_gradient_width_for_mod = [&](const OuterWallGradientSegmentMod &mod) {
+        if (std::isfinite(mod.target_width_mm) && mod.target_width_mm > EPSILON)
+            return double(mod.target_width_mm);
+
+        const double height_mm = std::max(0.01, double(outer_wall_gradient_dynamic_ctx.layer_height_mm));
+        const double base_width_mm = std::max(0.01, double(outer_wall_gradient_dynamic_ctx.flow_reference_width_mm));
+        const double base_area = extrusion_area_for_width_height_for_gcode(float(base_width_mm), float(height_mm));
+        const double target_area = base_area * std::clamp(mod.flow_scale, 0.01, 10.0);
+        const double width_mm = target_area / height_mm + height_mm * (1.0 - 0.25 * PI);
+        if (!std::isfinite(width_mm) || width_mm <= 0.0)
+            return std::max(0.01, double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm));
+        return std::clamp(width_mm,
+                          0.01,
+                          std::max(0.01, 4.0 * double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm)));
+    };
+
+    auto outer_wall_gradient_add_joined_span =
+        [&](std::vector<OuterWallGradientJoinedSpan> &spans,
+            const Line &line,
+            const OuterWallGradientSegmentMod &mod,
+            bool quantized,
+            size_t parent_idx,
+            double speed_mm_s,
+            float overlap) {
+        const double source_length_mm = line.length() * SCALING_FACTOR;
+        if (!std::isfinite(source_length_mm) || source_length_mm < EPSILON)
+            return;
+
+        const Vec2d source_a_xy = outer_wall_gradient_output_xy(line.a, quantized);
+        const Vec2d source_b_xy = outer_wall_gradient_output_xy(line.b, quantized);
+        const Point shifted_a = make_shifted_point(line.a, mod.shift_dx, mod.shift_dy);
+        const Point shifted_b = make_shifted_point(line.b, mod.shift_dx, mod.shift_dy);
+        const Vec2d shifted_a_xy = outer_wall_gradient_output_xy(shifted_a, quantized);
+        const Vec2d shifted_b_xy = outer_wall_gradient_output_xy(shifted_b, quantized);
+        if (!is_reasonable_quantized_gcode_point_for_gcode(source_a_xy) ||
+            !is_reasonable_quantized_gcode_point_for_gcode(source_b_xy) ||
+            !is_reasonable_quantized_gcode_point_for_gcode(shifted_a_xy) ||
+            !is_reasonable_quantized_gcode_point_for_gcode(shifted_b_xy))
+            return;
+
+        OuterWallGradientJoinedSpan span;
+        span.source_a = line.a;
+        span.source_b = line.b;
+        span.mod = mod;
+        span.source_a_xy = source_a_xy;
+        span.source_b_xy = source_b_xy;
+        span.shifted_a_xy = shifted_a_xy;
+        span.shifted_b_xy = shifted_b_xy;
+        span.start_xy = shifted_a_xy;
+        span.end_xy = shifted_b_xy;
+        span.source_length_mm = source_length_mm;
+        span.parent_idx = parent_idx;
+        span.speed_mm_s = speed_mm_s;
+        span.overlap = overlap;
+        span.width_mm = float(outer_wall_gradient_width_for_mod(mod));
+        outer_wall_gradient_refresh_joined_points(span);
+        spans.emplace_back(span);
+    };
+
+    auto outer_wall_gradient_vec_cross = [](const Vec2d &a, const Vec2d &b) {
+        return a.x() * b.y() - a.y() * b.x();
+    };
+
+    auto outer_wall_gradient_normalized = [](const Vec2d &v) -> Vec2d {
+        const double len = v.norm();
+        if (!std::isfinite(len) || len <= EPSILON)
+            return Vec2d(0.0, 0.0);
+        return v / len;
+    };
+
+    auto outer_wall_gradient_join_candidate =
+        [&](const OuterWallGradientJoinedSpan &prev,
+            const OuterWallGradientJoinedSpan &next,
+            bool allow_prev_extension) -> std::optional<Vec2d> {
+        const Vec2d p = prev.shifted_a_xy;
+        const Vec2d r = prev.shifted_b_xy - prev.shifted_a_xy;
+        const Vec2d q = next.shifted_a_xy;
+        const Vec2d s = next.shifted_b_xy - next.shifted_a_xy;
+        const double r_len = r.norm();
+        const double s_len = s.norm();
+        if (!std::isfinite(r_len) || !std::isfinite(s_len) || r_len <= EPSILON || s_len <= EPSILON)
+            return std::nullopt;
+
+        const double den = outer_wall_gradient_vec_cross(r, s);
+        const double endpoint_gap = (prev.shifted_b_xy - next.shifted_a_xy).norm();
+        const double shift_limit = std::max(double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm),
+                                            4.0 * std::max(std::abs(double(prev.mod.centerline_shift_mm)),
+                                                           std::abs(double(next.mod.centerline_shift_mm))));
+        if (std::abs(den) <= 1e-9) {
+            if (std::isfinite(endpoint_gap) && endpoint_gap <= std::max(0.02, 0.25 * double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm))) {
+                const Vec2d midpoint = 0.5 * (prev.shifted_b_xy + next.shifted_a_xy);
+                if (is_reasonable_quantized_gcode_point_for_gcode(midpoint))
+                    return midpoint;
+            }
+            return std::nullopt;
+        }
+
+        const Vec2d qp = q - p;
+        const double t = outer_wall_gradient_vec_cross(qp, s) / den;
+        const double u = outer_wall_gradient_vec_cross(qp, r) / den;
+        if (!std::isfinite(t) || !std::isfinite(u) ||
+            (!allow_prev_extension && t <= 1e-6) ||
+            t > 1.0 + 1e-6 ||
+            u <= 1e-6)
+            return std::nullopt;
+
+        const Vec2d intersection = p + t * r;
+        if (!is_reasonable_quantized_gcode_point_for_gcode(intersection))
+            return std::nullopt;
+
+        const double prev_dist = (intersection - prev.shifted_b_xy).norm();
+        const double next_dist = (intersection - next.shifted_a_xy).norm();
+        const double max_join_distance = std::max({ 0.05, 2.0 * double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm), shift_limit });
+        if (!std::isfinite(prev_dist) || !std::isfinite(next_dist) ||
+            prev_dist > max_join_distance || next_dist > max_join_distance)
+            return std::nullopt;
+
+        return intersection;
+    };
+
+    auto outer_wall_gradient_point_segment_distance =
+        [](const Vec2d &p, const Vec2d &a, const Vec2d &b) {
+        const Vec2d ab = b - a;
+        const double len_sq = ab.squaredNorm();
+        if (!std::isfinite(len_sq) || len_sq <= EPSILON * EPSILON)
+            return (p - a).norm();
+        const double t = std::clamp((p - a).dot(ab) / len_sq, 0.0, 1.0);
+        return (p - (a + t * ab)).norm();
+    };
+
+    auto outer_wall_gradient_on_segment =
+        [&](const Vec2d &a, const Vec2d &b, const Vec2d &p) {
+        return std::abs(outer_wall_gradient_vec_cross(b - a, p - a)) <= 1e-8 &&
+               p.x() >= std::min(a.x(), b.x()) - 1e-8 &&
+               p.x() <= std::max(a.x(), b.x()) + 1e-8 &&
+               p.y() >= std::min(a.y(), b.y()) - 1e-8 &&
+               p.y() <= std::max(a.y(), b.y()) + 1e-8;
+    };
+
+    auto outer_wall_gradient_segments_intersect =
+        [&](const Vec2d &a, const Vec2d &b, const Vec2d &c, const Vec2d &d) {
+        const double o1 = outer_wall_gradient_vec_cross(b - a, c - a);
+        const double o2 = outer_wall_gradient_vec_cross(b - a, d - a);
+        const double o3 = outer_wall_gradient_vec_cross(d - c, a - c);
+        const double o4 = outer_wall_gradient_vec_cross(d - c, b - c);
+        if (((o1 > 1e-8 && o2 < -1e-8) || (o1 < -1e-8 && o2 > 1e-8)) &&
+            ((o3 > 1e-8 && o4 < -1e-8) || (o3 < -1e-8 && o4 > 1e-8)))
+            return true;
+        return outer_wall_gradient_on_segment(a, b, c) ||
+               outer_wall_gradient_on_segment(a, b, d) ||
+               outer_wall_gradient_on_segment(c, d, a) ||
+               outer_wall_gradient_on_segment(c, d, b);
+    };
+
+    auto outer_wall_gradient_segment_distance =
+        [&](const Vec2d &a, const Vec2d &b, const Vec2d &c, const Vec2d &d) {
+        if (outer_wall_gradient_segments_intersect(a, b, c, d))
+            return 0.0;
+        return std::min({
+            outer_wall_gradient_point_segment_distance(a, c, d),
+            outer_wall_gradient_point_segment_distance(b, c, d),
+            outer_wall_gradient_point_segment_distance(c, a, b),
+            outer_wall_gradient_point_segment_distance(d, a, b)
+        });
+    };
+
+    auto outer_wall_gradient_overlap_prone_turn =
+        [&](const OuterWallGradientJoinedSpan &prev, const OuterWallGradientJoinedSpan &next) {
+        const Vec2d incoming_dir = outer_wall_gradient_normalized(prev.end_xy - prev.start_xy);
+        const Vec2d outgoing_dir = outer_wall_gradient_normalized(next.end_xy - next.start_xy);
+        if (incoming_dir.squaredNorm() <= EPSILON * EPSILON || outgoing_dir.squaredNorm() <= EPSILON * EPSILON)
+            return false;
+        if (incoming_dir.dot(outgoing_dir) > -0.75)
+            return false;
+
+        const double original_distance =
+            outer_wall_gradient_segment_distance(prev.start_xy,
+                                                 prev.end_xy,
+                                                 next.start_xy,
+                                                 next.end_xy);
+        const double original_required = 0.5 * (std::max(0.01, double(prev.width_mm)) +
+                                               std::max(0.01, double(next.width_mm)));
+        return std::isfinite(original_distance) &&
+               std::isfinite(original_required) &&
+               original_distance < original_required - 1e-6;
+    };
+
+    auto outer_wall_gradient_same_direction =
+        [&](const OuterWallGradientJoinedSpan &span, const Vec2d &dir) {
+        const Vec2d span_dir = outer_wall_gradient_normalized(span.shifted_b_xy - span.shifted_a_xy);
+        return span_dir.dot(dir) > 0.999;
+    };
+
+    auto outer_wall_gradient_emitted_same_direction =
+        [&](const OuterWallGradientJoinedSpan &span, const Vec2d &dir) {
+        const Vec2d span_dir = outer_wall_gradient_normalized(span.end_xy - span.start_xy);
+        return span_dir.dot(dir) > 0.999;
+    };
+
+    auto outer_wall_gradient_inside_offset_corner =
+        [&](const OuterWallGradientJoinedSpan &prev, const OuterWallGradientJoinedSpan &next) {
+        const Vec2d prev_dir = outer_wall_gradient_normalized(prev.source_b_xy - prev.source_a_xy);
+        const Vec2d next_dir = outer_wall_gradient_normalized(next.source_b_xy - next.source_a_xy);
+        if (prev_dir.squaredNorm() <= EPSILON * EPSILON || next_dir.squaredNorm() <= EPSILON * EPSILON)
+            return false;
+
+        const double turn = outer_wall_gradient_vec_cross(prev_dir, next_dir);
+        if (std::abs(turn) <= 1e-6)
+            return false;
+
+        double side = outer_wall_gradient_vec_cross(prev_dir, prev.shifted_b_xy - prev.source_b_xy);
+        if (std::abs(side) <= 1e-6)
+            side = outer_wall_gradient_vec_cross(next_dir, next.shifted_a_xy - next.source_a_xy);
+        return std::abs(side) > 1e-6 && turn * side > 0.0;
+    };
+
+    auto outer_wall_gradient_joinable_inside_corner =
+        [&](const OuterWallGradientJoinedSpan &prev, const OuterWallGradientJoinedSpan &next) {
+        if (prev.parent_idx == next.parent_idx)
+            return false;
+
+        const Vec2d prev_dir = outer_wall_gradient_normalized(prev.source_b_xy - prev.source_a_xy);
+        const Vec2d next_dir = outer_wall_gradient_normalized(next.source_b_xy - next.source_a_xy);
+        if (prev_dir.squaredNorm() <= EPSILON * EPSILON || next_dir.squaredNorm() <= EPSILON * EPSILON)
+            return false;
+
+        const double turn = outer_wall_gradient_vec_cross(prev_dir, next_dir);
+        if (std::abs(turn) < std::sin(5.0 * PI / 180.0) && prev_dir.dot(next_dir) > 0.0)
+            return false;
+
+        return outer_wall_gradient_inside_offset_corner(prev, next);
+    };
+
+    struct OuterWallGradientTrimLocation {
+        size_t idx { 0 };
+        Vec2d  point = Vec2d::Zero();
+        Vec2d  other = Vec2d::Zero();
+        double width_mm { 0.0 };
+        bool   valid { false };
+    };
+
+    auto outer_wall_gradient_backward_available =
+        [&](const std::vector<OuterWallGradientJoinedSpan> &spans, size_t prev_idx, const Vec2d &dir, double cap_mm) {
+        double available = 0.0;
+        size_t idx = prev_idx + 1;
+        while (idx > 0 && available < cap_mm) {
+            --idx;
+            const OuterWallGradientJoinedSpan &span = spans[idx];
+            if (!span.emit || !outer_wall_gradient_same_direction(span, dir))
+                break;
+            const double len = (span.shifted_b_xy - span.shifted_a_xy).norm();
+            if (!std::isfinite(len) || len <= EPSILON)
+                break;
+            available += len;
+            if (span.starts_new_chain)
+                break;
+        }
+        return std::min(available, cap_mm);
+    };
+
+    auto outer_wall_gradient_forward_available =
+        [&](const std::vector<OuterWallGradientJoinedSpan> &spans, size_t next_idx, const Vec2d &dir, double cap_mm) {
+        double available = 0.0;
+        for (size_t idx = next_idx; idx < spans.size() && available < cap_mm; ++idx) {
+            const OuterWallGradientJoinedSpan &span = spans[idx];
+            if (!span.emit || (idx != next_idx && span.starts_new_chain) || !outer_wall_gradient_same_direction(span, dir))
+                break;
+            const double len = (span.shifted_b_xy - span.shifted_a_xy).norm();
+            if (!std::isfinite(len) || len <= EPSILON)
+                break;
+            available += len;
+        }
+        return std::min(available, cap_mm);
+    };
+
+    auto outer_wall_gradient_backward_emitted_available =
+        [&](const std::vector<OuterWallGradientJoinedSpan> &spans, size_t prev_idx, const Vec2d &dir, double cap_mm) {
+        double available = 0.0;
+        size_t idx = prev_idx + 1;
+        while (idx > 0 && available < cap_mm) {
+            --idx;
+            const OuterWallGradientJoinedSpan &span = spans[idx];
+            if (!span.emit || !outer_wall_gradient_emitted_same_direction(span, dir))
+                break;
+            const double len = (span.end_xy - span.start_xy).norm();
+            if (!std::isfinite(len) || len <= EPSILON)
+                break;
+            available += len;
+            if (span.starts_new_chain)
+                break;
+        }
+        return std::min(available, cap_mm);
+    };
+
+    auto outer_wall_gradient_forward_emitted_available =
+        [&](const std::vector<OuterWallGradientJoinedSpan> &spans, size_t next_idx, const Vec2d &dir, double cap_mm) {
+        double available = 0.0;
+        for (size_t idx = next_idx; idx < spans.size() && available < cap_mm; ++idx) {
+            const OuterWallGradientJoinedSpan &span = spans[idx];
+            if (!span.emit || (idx != next_idx && span.starts_new_chain) || !outer_wall_gradient_emitted_same_direction(span, dir))
+                break;
+            const double len = (span.end_xy - span.start_xy).norm();
+            if (!std::isfinite(len) || len <= EPSILON)
+                break;
+            available += len;
+        }
+        return std::min(available, cap_mm);
+    };
+
+    auto outer_wall_gradient_backward_emitted_path_available =
+        [&](const std::vector<OuterWallGradientJoinedSpan> &spans, size_t prev_idx, double cap_mm) {
+        double available = 0.0;
+        size_t idx = prev_idx + 1;
+        while (idx > 0 && available < cap_mm) {
+            --idx;
+            const OuterWallGradientJoinedSpan &span = spans[idx];
+            if (!span.emit)
+                break;
+            const double len = (span.end_xy - span.start_xy).norm();
+            if (!std::isfinite(len) || len <= EPSILON)
+                break;
+            available += len;
+            if (span.starts_new_chain)
+                break;
+        }
+        return std::min(available, cap_mm);
+    };
+
+    auto outer_wall_gradient_forward_emitted_path_available =
+        [&](const std::vector<OuterWallGradientJoinedSpan> &spans, size_t next_idx, double cap_mm) {
+        double available = 0.0;
+        for (size_t idx = next_idx; idx < spans.size() && available < cap_mm; ++idx) {
+            const OuterWallGradientJoinedSpan &span = spans[idx];
+            if (!span.emit || (idx != next_idx && span.starts_new_chain))
+                break;
+            const double len = (span.end_xy - span.start_xy).norm();
+            if (!std::isfinite(len) || len <= EPSILON)
+                break;
+            available += len;
+        }
+        return std::min(available, cap_mm);
+    };
+
+    auto outer_wall_gradient_incoming_trim_location =
+        [&](const std::vector<OuterWallGradientJoinedSpan> &spans, size_t prev_idx, const Vec2d &dir, double trim_mm) {
+        OuterWallGradientTrimLocation location;
+        double remaining = std::max(0.0, trim_mm);
+        size_t idx = prev_idx + 1;
+        while (idx > 0) {
+            --idx;
+            const OuterWallGradientJoinedSpan &span = spans[idx];
+            if (!span.emit || !outer_wall_gradient_same_direction(span, dir))
+                break;
+            const double len = (span.shifted_b_xy - span.shifted_a_xy).norm();
+            if (!std::isfinite(len) || len <= EPSILON)
+                break;
+            if (remaining < len - EPSILON) {
+                location.idx = idx;
+                location.point = span.shifted_b_xy - dir * remaining;
+                location.other = span.start_xy;
+                location.width_mm = std::max(0.01, double(span.width_mm));
+                location.valid = is_reasonable_quantized_gcode_point_for_gcode(location.point);
+                return location;
+            }
+            remaining -= len;
+            if (span.starts_new_chain)
+                break;
+        }
+        return location;
+    };
+
+    auto outer_wall_gradient_outgoing_trim_location =
+        [&](const std::vector<OuterWallGradientJoinedSpan> &spans, size_t next_idx, const Vec2d &dir, double trim_mm) {
+        OuterWallGradientTrimLocation location;
+        double remaining = std::max(0.0, trim_mm);
+        for (size_t idx = next_idx; idx < spans.size(); ++idx) {
+            const OuterWallGradientJoinedSpan &span = spans[idx];
+            if (!span.emit || (idx != next_idx && span.starts_new_chain) || !outer_wall_gradient_same_direction(span, dir))
+                break;
+            const double len = (span.shifted_b_xy - span.shifted_a_xy).norm();
+            if (!std::isfinite(len) || len <= EPSILON)
+                break;
+            if (remaining < len - EPSILON) {
+                location.idx = idx;
+                location.point = span.shifted_a_xy + dir * remaining;
+                location.other = span.end_xy;
+                location.width_mm = std::max(0.01, double(span.width_mm));
+                location.valid = is_reasonable_quantized_gcode_point_for_gcode(location.point);
+                return location;
+            }
+            remaining -= len;
+            if (span.starts_new_chain)
+                break;
+        }
+        return location;
+    };
+
+    auto outer_wall_gradient_incoming_emitted_trim_location =
+        [&](const std::vector<OuterWallGradientJoinedSpan> &spans, size_t prev_idx, const Vec2d &dir, double trim_mm) {
+        OuterWallGradientTrimLocation location;
+        double remaining = std::max(0.0, trim_mm);
+        size_t idx = prev_idx + 1;
+        while (idx > 0) {
+            --idx;
+            const OuterWallGradientJoinedSpan &span = spans[idx];
+            if (!span.emit || !outer_wall_gradient_emitted_same_direction(span, dir))
+                break;
+            const double len = (span.end_xy - span.start_xy).norm();
+            if (!std::isfinite(len) || len <= EPSILON)
+                break;
+            if (remaining < len - EPSILON) {
+                location.idx = idx;
+                location.point = span.end_xy - dir * remaining;
+                location.other = span.start_xy;
+                location.width_mm = std::max(0.01, double(span.width_mm));
+                location.valid = is_reasonable_quantized_gcode_point_for_gcode(location.point);
+                return location;
+            }
+            remaining -= len;
+            if (span.starts_new_chain)
+                break;
+        }
+        return location;
+    };
+
+    auto outer_wall_gradient_outgoing_emitted_trim_location =
+        [&](const std::vector<OuterWallGradientJoinedSpan> &spans, size_t next_idx, const Vec2d &dir, double trim_mm) {
+        OuterWallGradientTrimLocation location;
+        double remaining = std::max(0.0, trim_mm);
+        for (size_t idx = next_idx; idx < spans.size(); ++idx) {
+            const OuterWallGradientJoinedSpan &span = spans[idx];
+            if (!span.emit || (idx != next_idx && span.starts_new_chain) || !outer_wall_gradient_emitted_same_direction(span, dir))
+                break;
+            const double len = (span.end_xy - span.start_xy).norm();
+            if (!std::isfinite(len) || len <= EPSILON)
+                break;
+            if (remaining < len - EPSILON) {
+                location.idx = idx;
+                location.point = span.start_xy + dir * remaining;
+                location.other = span.end_xy;
+                location.width_mm = std::max(0.01, double(span.width_mm));
+                location.valid = is_reasonable_quantized_gcode_point_for_gcode(location.point);
+                return location;
+            }
+            remaining -= len;
+            if (span.starts_new_chain)
+                break;
+        }
+        return location;
+    };
+
+    auto outer_wall_gradient_incoming_emitted_path_trim_location =
+        [&](const std::vector<OuterWallGradientJoinedSpan> &spans, size_t prev_idx, double trim_mm) {
+        OuterWallGradientTrimLocation location;
+        double remaining = std::max(0.0, trim_mm);
+        size_t idx = prev_idx + 1;
+        while (idx > 0) {
+            --idx;
+            const OuterWallGradientJoinedSpan &span = spans[idx];
+            if (!span.emit)
+                break;
+            const Vec2d span_vec = span.end_xy - span.start_xy;
+            const double len = span_vec.norm();
+            if (!std::isfinite(len) || len <= EPSILON)
+                break;
+            if (remaining < len - EPSILON) {
+                const Vec2d dir = span_vec / len;
+                location.idx = idx;
+                location.point = span.end_xy - dir * remaining;
+                location.other = span.start_xy;
+                location.width_mm = std::max(0.01, double(span.width_mm));
+                location.valid = is_reasonable_quantized_gcode_point_for_gcode(location.point);
+                return location;
+            }
+            remaining -= len;
+            if (span.starts_new_chain)
+                break;
+        }
+        return location;
+    };
+
+    auto outer_wall_gradient_outgoing_emitted_path_trim_location =
+        [&](const std::vector<OuterWallGradientJoinedSpan> &spans, size_t next_idx, double trim_mm) {
+        OuterWallGradientTrimLocation location;
+        double remaining = std::max(0.0, trim_mm);
+        for (size_t idx = next_idx; idx < spans.size(); ++idx) {
+            const OuterWallGradientJoinedSpan &span = spans[idx];
+            if (!span.emit || (idx != next_idx && span.starts_new_chain))
+                break;
+            const Vec2d span_vec = span.end_xy - span.start_xy;
+            const double len = span_vec.norm();
+            if (!std::isfinite(len) || len <= EPSILON)
+                break;
+            if (remaining < len - EPSILON) {
+                const Vec2d dir = span_vec / len;
+                location.idx = idx;
+                location.point = span.start_xy + dir * remaining;
+                location.other = span.end_xy;
+                location.width_mm = std::max(0.01, double(span.width_mm));
+                location.valid = is_reasonable_quantized_gcode_point_for_gcode(location.point);
+                return location;
+            }
+            remaining -= len;
+        }
+        return location;
+    };
+
+    auto outer_wall_gradient_trim_gap_distance =
+        [&](const std::vector<OuterWallGradientJoinedSpan> &spans,
+            size_t prev_idx,
+            size_t next_idx,
+            const Vec2d &incoming_dir,
+            const Vec2d &outgoing_dir,
+            double trim_mm,
+            double &distance,
+            double &required) {
+        const OuterWallGradientTrimLocation incoming =
+            outer_wall_gradient_incoming_trim_location(spans, prev_idx, incoming_dir, trim_mm);
+        const OuterWallGradientTrimLocation outgoing =
+            outer_wall_gradient_outgoing_trim_location(spans, next_idx, outgoing_dir, trim_mm);
+        if (!incoming.valid || !outgoing.valid)
+            return false;
+        distance = outer_wall_gradient_segment_distance(incoming.other, incoming.point, outgoing.point, outgoing.other);
+        required = 0.5 * (incoming.width_mm + outgoing.width_mm);
+        return std::isfinite(distance) && std::isfinite(required) && required > 0.0;
+    };
+
+    auto outer_wall_gradient_apply_trim_gap =
+        [&](std::vector<OuterWallGradientJoinedSpan> &spans,
+            size_t prev_idx,
+            size_t next_idx,
+            const Vec2d &incoming_dir,
+            const Vec2d &outgoing_dir,
+            double trim_mm) -> std::optional<size_t> {
+        const OuterWallGradientTrimLocation incoming =
+            outer_wall_gradient_incoming_trim_location(spans, prev_idx, incoming_dir, trim_mm);
+        const OuterWallGradientTrimLocation outgoing =
+            outer_wall_gradient_outgoing_trim_location(spans, next_idx, outgoing_dir, trim_mm);
+        if (!incoming.valid || !outgoing.valid)
+            return std::nullopt;
+
+        for (size_t idx = incoming.idx + 1; idx <= prev_idx && idx < spans.size(); ++idx)
+            spans[idx].emit = false;
+        spans[incoming.idx].end_xy = incoming.point;
+        outer_wall_gradient_refresh_joined_points(spans[incoming.idx]);
+
+        for (size_t idx = next_idx; idx < outgoing.idx && idx < spans.size(); ++idx)
+            spans[idx].emit = false;
+        spans[outgoing.idx].start_xy = outgoing.point;
+        spans[outgoing.idx].starts_new_chain = true;
+        outer_wall_gradient_refresh_joined_points(spans[outgoing.idx]);
+        return outgoing.idx;
+    };
+
+    auto outer_wall_gradient_emitted_trim_gap_distance =
+        [&](const std::vector<OuterWallGradientJoinedSpan> &spans,
+            size_t prev_idx,
+            size_t next_idx,
+            const Vec2d &incoming_dir,
+            const Vec2d &outgoing_dir,
+            double trim_mm,
+            double &distance,
+            double &required) {
+        const OuterWallGradientTrimLocation incoming =
+            outer_wall_gradient_incoming_emitted_trim_location(spans, prev_idx, incoming_dir, trim_mm);
+        const OuterWallGradientTrimLocation outgoing =
+            outer_wall_gradient_outgoing_emitted_trim_location(spans, next_idx, outgoing_dir, trim_mm);
+        if (!incoming.valid || !outgoing.valid)
+            return false;
+        distance = outer_wall_gradient_segment_distance(incoming.other, incoming.point, outgoing.point, outgoing.other);
+        required = 0.5 * (incoming.width_mm + outgoing.width_mm);
+        return std::isfinite(distance) && std::isfinite(required) && required > 0.0;
+    };
+
+    auto outer_wall_gradient_apply_emitted_trim_gap =
+        [&](std::vector<OuterWallGradientJoinedSpan> &spans,
+            size_t prev_idx,
+            size_t next_idx,
+            const Vec2d &incoming_dir,
+            const Vec2d &outgoing_dir,
+            double trim_mm) -> std::optional<size_t> {
+        const OuterWallGradientTrimLocation incoming =
+            outer_wall_gradient_incoming_emitted_trim_location(spans, prev_idx, incoming_dir, trim_mm);
+        const OuterWallGradientTrimLocation outgoing =
+            outer_wall_gradient_outgoing_emitted_trim_location(spans, next_idx, outgoing_dir, trim_mm);
+        if (!incoming.valid || !outgoing.valid)
+            return std::nullopt;
+
+        for (size_t idx = incoming.idx + 1; idx <= prev_idx && idx < spans.size(); ++idx)
+            spans[idx].emit = false;
+        spans[incoming.idx].end_xy = incoming.point;
+        outer_wall_gradient_refresh_joined_points(spans[incoming.idx]);
+
+        for (size_t idx = next_idx; idx < outgoing.idx && idx < spans.size(); ++idx)
+            spans[idx].emit = false;
+        spans[outgoing.idx].start_xy = outgoing.point;
+        spans[outgoing.idx].starts_new_chain = true;
+        outer_wall_gradient_refresh_joined_points(spans[outgoing.idx]);
+        return outgoing.idx;
+    };
+
+    auto outer_wall_gradient_emitted_path_trim_gap_distance =
+        [&](const std::vector<OuterWallGradientJoinedSpan> &spans,
+            size_t prev_idx,
+            size_t next_idx,
+            double trim_mm,
+            double &distance,
+            double &required) {
+        const OuterWallGradientTrimLocation incoming =
+            outer_wall_gradient_incoming_emitted_path_trim_location(spans, prev_idx, trim_mm);
+        const OuterWallGradientTrimLocation outgoing =
+            outer_wall_gradient_outgoing_emitted_path_trim_location(spans, next_idx, trim_mm);
+        if (!incoming.valid || !outgoing.valid)
+            return false;
+        distance = outer_wall_gradient_segment_distance(incoming.other, incoming.point, outgoing.point, outgoing.other);
+        required = 0.5 * (incoming.width_mm + outgoing.width_mm);
+        return std::isfinite(distance) && std::isfinite(required) && required > 0.0;
+    };
+
+    auto outer_wall_gradient_apply_emitted_path_trim_gap =
+        [&](std::vector<OuterWallGradientJoinedSpan> &spans,
+            size_t prev_idx,
+            size_t next_idx,
+            double trim_mm) -> std::optional<size_t> {
+        const OuterWallGradientTrimLocation incoming =
+            outer_wall_gradient_incoming_emitted_path_trim_location(spans, prev_idx, trim_mm);
+        const OuterWallGradientTrimLocation outgoing =
+            outer_wall_gradient_outgoing_emitted_path_trim_location(spans, next_idx, trim_mm);
+        if (!incoming.valid || !outgoing.valid)
+            return std::nullopt;
+
+        for (size_t idx = incoming.idx + 1; idx <= prev_idx && idx < spans.size(); ++idx)
+            spans[idx].emit = false;
+        spans[incoming.idx].end_xy = incoming.point;
+        outer_wall_gradient_refresh_joined_points(spans[incoming.idx]);
+
+        for (size_t idx = next_idx; idx < outgoing.idx && idx < spans.size(); ++idx)
+            spans[idx].emit = false;
+        spans[outgoing.idx].start_xy = outgoing.point;
+        spans[outgoing.idx].starts_new_chain = true;
+        outer_wall_gradient_refresh_joined_points(spans[outgoing.idx]);
+        return outgoing.idx;
+    };
+
+    auto outer_wall_gradient_try_trim_gap =
+        [&](std::vector<OuterWallGradientJoinedSpan> &spans,
+            size_t prev_idx,
+            size_t next_idx) -> std::optional<size_t> {
+        const Vec2d incoming_dir = outer_wall_gradient_normalized(spans[prev_idx].shifted_b_xy - spans[prev_idx].shifted_a_xy);
+        const Vec2d outgoing_dir = outer_wall_gradient_normalized(spans[next_idx].shifted_b_xy - spans[next_idx].shifted_a_xy);
+        if (incoming_dir.squaredNorm() <= EPSILON * EPSILON || outgoing_dir.squaredNorm() <= EPSILON * EPSILON)
+            return std::nullopt;
+
+        const double original_distance =
+            outer_wall_gradient_segment_distance(spans[prev_idx].start_xy,
+                                                 spans[prev_idx].end_xy,
+                                                 spans[next_idx].start_xy,
+                                                 spans[next_idx].end_xy);
+        const double original_required = 0.5 * (std::max(0.01, double(spans[prev_idx].width_mm)) +
+                                               std::max(0.01, double(spans[next_idx].width_mm)));
+        if (!std::isfinite(original_distance) ||
+            !std::isfinite(original_required) ||
+            original_distance >= original_required - 1e-6)
+            return std::nullopt;
+
+        const double max_width_mm = std::max(std::max(0.01, double(spans[prev_idx].width_mm)),
+                                             std::max(0.01, double(spans[next_idx].width_mm)));
+        const double cap_mm = std::max(2.0 * double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm), 10.0 * max_width_mm);
+        const double hi_limit = std::min(outer_wall_gradient_backward_available(spans, prev_idx, incoming_dir, cap_mm),
+                                         outer_wall_gradient_forward_available(spans, next_idx, outgoing_dir, cap_mm));
+        const double hi = std::max(0.0, hi_limit - 1e-6);
+        if (!std::isfinite(hi) || hi <= EPSILON)
+            return std::nullopt;
+
+        double hi_distance = 0.0;
+        double hi_required = 0.0;
+        if (!outer_wall_gradient_trim_gap_distance(spans,
+                                                   prev_idx,
+                                                   next_idx,
+                                                   incoming_dir,
+                                                   outgoing_dir,
+                                                   hi,
+                                                   hi_distance,
+                                                   hi_required) ||
+            hi_distance < hi_required - 1e-6)
+            return std::nullopt;
+
+        double low = 0.0;
+        double high = hi;
+        for (int iter = 0; iter < 28; ++iter) {
+            const double mid = 0.5 * (low + high);
+            double distance = 0.0;
+            double required = 0.0;
+            if (outer_wall_gradient_trim_gap_distance(spans,
+                                                      prev_idx,
+                                                      next_idx,
+                                                      incoming_dir,
+                                                      outgoing_dir,
+                                                      mid,
+                                                      distance,
+                                                      required) &&
+                distance >= required - 1e-6) {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+
+        return outer_wall_gradient_apply_trim_gap(spans, prev_idx, next_idx, incoming_dir, outgoing_dir, high);
+    };
+
+    auto outer_wall_gradient_try_trim_emitted_gap =
+        [&](std::vector<OuterWallGradientJoinedSpan> &spans,
+            size_t prev_idx,
+            size_t next_idx) -> std::optional<size_t> {
+        const Vec2d incoming_dir = outer_wall_gradient_normalized(spans[prev_idx].end_xy - spans[prev_idx].start_xy);
+        const Vec2d outgoing_dir = outer_wall_gradient_normalized(spans[next_idx].end_xy - spans[next_idx].start_xy);
+        if (incoming_dir.squaredNorm() <= EPSILON * EPSILON || outgoing_dir.squaredNorm() <= EPSILON * EPSILON)
+            return std::nullopt;
+
+        const double original_distance =
+            outer_wall_gradient_segment_distance(spans[prev_idx].start_xy,
+                                                 spans[prev_idx].end_xy,
+                                                 spans[next_idx].start_xy,
+                                                 spans[next_idx].end_xy);
+        const double original_required = 0.5 * (std::max(0.01, double(spans[prev_idx].width_mm)) +
+                                               std::max(0.01, double(spans[next_idx].width_mm)));
+        if (!std::isfinite(original_distance) ||
+            !std::isfinite(original_required) ||
+            original_distance >= original_required - 1e-6)
+            return std::nullopt;
+
+        const double max_width_mm = std::max(std::max(0.01, double(spans[prev_idx].width_mm)),
+                                             std::max(0.01, double(spans[next_idx].width_mm)));
+        const double cap_mm = std::max(2.0 * double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm), 10.0 * max_width_mm);
+        const double hi_limit = std::min(outer_wall_gradient_backward_emitted_available(spans, prev_idx, incoming_dir, cap_mm),
+                                         outer_wall_gradient_forward_emitted_available(spans, next_idx, outgoing_dir, cap_mm));
+        const double hi = std::max(0.0, hi_limit - 1e-6);
+        if (!std::isfinite(hi) || hi <= EPSILON)
+            return std::nullopt;
+
+        double hi_distance = 0.0;
+        double hi_required = 0.0;
+        if (!outer_wall_gradient_emitted_trim_gap_distance(spans,
+                                                           prev_idx,
+                                                           next_idx,
+                                                           incoming_dir,
+                                                           outgoing_dir,
+                                                           hi,
+                                                           hi_distance,
+                                                           hi_required) ||
+            hi_distance < hi_required - 1e-6)
+            return std::nullopt;
+
+        double low = 0.0;
+        double high = hi;
+        for (int iter = 0; iter < 28; ++iter) {
+            const double mid = 0.5 * (low + high);
+            double distance = 0.0;
+            double required = 0.0;
+            if (outer_wall_gradient_emitted_trim_gap_distance(spans,
+                                                              prev_idx,
+                                                              next_idx,
+                                                              incoming_dir,
+                                                              outgoing_dir,
+                                                              mid,
+                                                              distance,
+                                                              required) &&
+                distance >= required - 1e-6) {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+
+        return outer_wall_gradient_apply_emitted_trim_gap(spans, prev_idx, next_idx, incoming_dir, outgoing_dir, high);
+    };
+
+    auto outer_wall_gradient_try_trim_emitted_path_gap =
+        [&](std::vector<OuterWallGradientJoinedSpan> &spans,
+            size_t prev_idx,
+            size_t next_idx) -> std::optional<size_t> {
+        const double original_distance =
+            outer_wall_gradient_segment_distance(spans[prev_idx].start_xy,
+                                                 spans[prev_idx].end_xy,
+                                                 spans[next_idx].start_xy,
+                                                 spans[next_idx].end_xy);
+        const double original_required = 0.5 * (std::max(0.01, double(spans[prev_idx].width_mm)) +
+                                               std::max(0.01, double(spans[next_idx].width_mm)));
+        if (!std::isfinite(original_distance) ||
+            !std::isfinite(original_required) ||
+            original_distance >= original_required - 1e-6)
+            return std::nullopt;
+
+        const double max_width_mm = std::max(std::max(0.01, double(spans[prev_idx].width_mm)),
+                                             std::max(0.01, double(spans[next_idx].width_mm)));
+        const double cap_mm = std::max(2.0 * double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm), 10.0 * max_width_mm);
+        const double hi_limit = std::min(outer_wall_gradient_backward_emitted_path_available(spans, prev_idx, cap_mm),
+                                         outer_wall_gradient_forward_emitted_path_available(spans, next_idx, cap_mm));
+        const double hi = std::max(0.0, hi_limit - 1e-6);
+        if (!std::isfinite(hi) || hi <= EPSILON)
+            return std::nullopt;
+
+        double low = 0.0;
+        double high = 0.0;
+        bool found_high = false;
+        constexpr int sample_count = 64;
+        for (int sample_idx = 1; sample_idx <= sample_count; ++sample_idx) {
+            const double sample_trim = hi * double(sample_idx) / double(sample_count);
+            double distance = 0.0;
+            double required = 0.0;
+            if (outer_wall_gradient_emitted_path_trim_gap_distance(spans,
+                                                                   prev_idx,
+                                                                   next_idx,
+                                                                   sample_trim,
+                                                                   distance,
+                                                                   required) &&
+                distance >= required - 1e-6) {
+                high = sample_trim;
+                found_high = true;
+                break;
+            }
+            low = sample_trim;
+        }
+        if (!found_high)
+            return std::nullopt;
+
+        for (int iter = 0; iter < 28; ++iter) {
+            const double mid = 0.5 * (low + high);
+            double distance = 0.0;
+            double required = 0.0;
+            if (outer_wall_gradient_emitted_path_trim_gap_distance(spans,
+                                                                   prev_idx,
+                                                                   next_idx,
+                                                                   mid,
+                                                                   distance,
+                                                                   required) &&
+                distance >= required - 1e-6) {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+
+        return outer_wall_gradient_apply_emitted_path_trim_gap(spans, prev_idx, next_idx, high);
+    };
+
+    auto outer_wall_gradient_try_trim_seam_caps =
+        [&](std::vector<OuterWallGradientJoinedSpan> &spans,
+            size_t prev_idx,
+            size_t next_idx) -> std::optional<size_t> {
+        const Vec2d incoming_dir = outer_wall_gradient_normalized(spans[prev_idx].shifted_b_xy - spans[prev_idx].shifted_a_xy);
+        const Vec2d outgoing_dir = outer_wall_gradient_normalized(spans[next_idx].shifted_b_xy - spans[next_idx].shifted_a_xy);
+        if (incoming_dir.squaredNorm() <= EPSILON * EPSILON || outgoing_dir.squaredNorm() <= EPSILON * EPSILON)
+            return std::nullopt;
+
+        const double endpoint_gap = (spans[prev_idx].end_xy - spans[next_idx].start_xy).norm();
+        const double base_width = std::max(0.01, double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm));
+        const double prev_width = std::max(0.01, double(spans[prev_idx].width_mm));
+        const double next_width = std::max(0.01, double(spans[next_idx].width_mm));
+        if (!std::isfinite(endpoint_gap) || endpoint_gap <= 0.25 * base_width || incoming_dir.dot(outgoing_dir) > 0.5)
+            return std::nullopt;
+
+        const double reverse_dot = std::clamp((-incoming_dir).dot(outgoing_dir), -1.0, 1.0);
+        const double sin_half_angle = std::sqrt(std::max(0.0, 0.5 * (1.0 - reverse_dot)));
+        const double base_trim_mm = std::clamp(0.5 * endpoint_gap, 0.25 * base_width, 0.5 * base_width);
+        double trim_mm = base_trim_mm;
+        if (reverse_dot > 0.75 && sin_half_angle > 1e-3) {
+            const double required_spacing = 0.5 * (prev_width + next_width);
+            const double angle_trim_mm = required_spacing / (2.0 * sin_half_angle);
+            const double max_trim_mm = std::max(0.5 * base_width, 8.0 * std::max(prev_width, next_width));
+            trim_mm = std::clamp(std::max(base_trim_mm, angle_trim_mm),
+                                  base_trim_mm,
+                                  max_trim_mm);
+        }
+        return outer_wall_gradient_apply_trim_gap(spans, prev_idx, next_idx, incoming_dir, outgoing_dir, trim_mm);
+    };
+
+    auto outer_wall_gradient_apply_span_aware_miter =
+        [&](std::vector<OuterWallGradientJoinedSpan> &spans,
+            size_t prev_idx,
+            size_t next_idx,
+            const Vec2d &candidate) -> std::optional<size_t> {
+        OuterWallGradientJoinedSpan &prev = spans[prev_idx];
+        OuterWallGradientJoinedSpan &next = spans[next_idx];
+        const Vec2d incoming_dir = outer_wall_gradient_normalized(prev.shifted_b_xy - prev.shifted_a_xy);
+        const Vec2d outgoing_dir = outer_wall_gradient_normalized(next.shifted_b_xy - next.shifted_a_xy);
+        if (incoming_dir.squaredNorm() <= EPSILON * EPSILON || outgoing_dir.squaredNorm() <= EPSILON * EPSILON)
+            return std::nullopt;
+
+        const double incoming_distance = (prev.shifted_b_xy - candidate).dot(incoming_dir);
+        const double miter_distance = (candidate - next.shifted_a_xy).dot(outgoing_dir);
+        const double projection_epsilon = std::max(1e-6, 1e-4 * double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm));
+        if (!std::isfinite(incoming_distance) ||
+            !std::isfinite(miter_distance) ||
+            incoming_distance < -projection_epsilon ||
+            miter_distance <= projection_epsilon)
+            return std::nullopt;
+
+        size_t last_keep = prev_idx;
+        bool found_incoming_keep = false;
+        double incoming_remaining = std::max(0.0, incoming_distance);
+        size_t incoming_idx = prev_idx + 1;
+        while (incoming_idx > 0) {
+            --incoming_idx;
+            OuterWallGradientJoinedSpan &span = spans[incoming_idx];
+            if (!span.emit || !outer_wall_gradient_same_direction(span, incoming_dir))
+                break;
+            const double len = (span.shifted_b_xy - span.shifted_a_xy).norm();
+            if (!std::isfinite(len) || len <= EPSILON)
+                break;
+            if (incoming_remaining < len - projection_epsilon) {
+                last_keep = incoming_idx;
+                found_incoming_keep = true;
+                break;
+            }
+            incoming_remaining -= len;
+            if (span.starts_new_chain)
+                break;
+        }
+        if (!found_incoming_keep)
+            return std::nullopt;
+
+        size_t first_keep = next_idx;
+        bool found_keep = false;
+        double outgoing_remaining = miter_distance;
+        for (size_t idx = next_idx; idx < spans.size(); ++idx) {
+            if (!spans[idx].emit || (idx != next_idx && spans[idx].starts_new_chain) ||
+                !outer_wall_gradient_same_direction(spans[idx], outgoing_dir))
+                break;
+            const double len = (spans[idx].shifted_b_xy - spans[idx].shifted_a_xy).norm();
+            if (!std::isfinite(len) || len <= EPSILON)
+                break;
+            if (outgoing_remaining < len - projection_epsilon) {
+                first_keep = idx;
+                found_keep = true;
+                break;
+            }
+            outgoing_remaining -= len;
+        }
+        if (!found_keep)
+            return std::nullopt;
+
+        spans[last_keep].end_xy = candidate;
+        outer_wall_gradient_refresh_joined_points(spans[last_keep]);
+        for (size_t idx = last_keep + 1; idx <= prev_idx && idx < spans.size(); ++idx)
+            spans[idx].emit = false;
+        for (size_t idx = next_idx; idx < first_keep; ++idx)
+            spans[idx].emit = false;
+        spans[first_keep].start_xy = candidate;
+        outer_wall_gradient_refresh_joined_points(spans[first_keep]);
+        return first_keep;
+    };
+
+    auto outer_wall_gradient_should_repair_seam =
+        [&](const std::vector<OuterWallGradientJoinedSpan> &spans,
+            size_t last_idx,
+            size_t first_idx,
+            bool closed) {
+        if (closed)
+            return true;
+        const OuterWallGradientJoinedSpan &last = spans[last_idx];
+        const OuterWallGradientJoinedSpan &first = spans[first_idx];
+        const double source_gap = (last.source_b_xy - first.source_a_xy).norm();
+        const double endpoint_gap = (last.end_xy - first.start_xy).norm();
+        const double max_shift = std::max(std::abs(double(last.mod.centerline_shift_mm)),
+                                          std::abs(double(first.mod.centerline_shift_mm)));
+        const double max_gap = std::max({ 0.05, 2.0 * double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm), 4.0 * max_shift });
+        return std::isfinite(source_gap) &&
+               std::isfinite(endpoint_gap) &&
+               source_gap <= max_gap &&
+               endpoint_gap > EPSILON &&
+               endpoint_gap <= max_gap;
+    };
+
+    auto outer_wall_gradient_finalize_joined_spans =
+        [&](std::vector<OuterWallGradientJoinedSpan> &spans, bool closed) {
+        if (spans.empty())
+            return;
+        size_t prev_idx = 0;
+        while (prev_idx < spans.size() && !spans[prev_idx].emit)
+            ++prev_idx;
+        if (prev_idx >= spans.size())
+            return;
+
+        size_t idx = prev_idx + 1;
+        while (idx < spans.size()) {
+            if (!spans[idx].emit) {
+                ++idx;
+                continue;
+            }
+
+            const bool inside_corner = outer_wall_gradient_joinable_inside_corner(spans[prev_idx], spans[idx]);
+            const bool overlap_prone_turn = outer_wall_gradient_overlap_prone_turn(spans[prev_idx], spans[idx]);
+            const std::optional<Vec2d> candidate = outer_wall_gradient_join_candidate(spans[prev_idx], spans[idx], inside_corner);
+            if (candidate) {
+                if (inside_corner) {
+                    const std::optional<size_t> miter_resume_idx =
+                        outer_wall_gradient_apply_span_aware_miter(spans, prev_idx, idx, *candidate);
+                    if (miter_resume_idx) {
+                        prev_idx = *miter_resume_idx;
+                        idx = prev_idx + 1;
+                        continue;
+                    }
+                } else {
+                    if (!overlap_prone_turn) {
+                        prev_idx = idx;
+                        ++idx;
+                        continue;
+                    }
+                }
+            }
+
+            if (inside_corner) {
+                const std::optional<size_t> trim_resume_idx = outer_wall_gradient_try_trim_gap(spans, prev_idx, idx);
+                if (trim_resume_idx) {
+                    prev_idx = *trim_resume_idx;
+                    idx = prev_idx + 1;
+                    continue;
+                }
+            }
+
+            if (overlap_prone_turn) {
+                std::optional<size_t> trim_resume_idx = outer_wall_gradient_try_trim_emitted_gap(spans, prev_idx, idx);
+                if (!trim_resume_idx)
+                    trim_resume_idx = outer_wall_gradient_try_trim_emitted_path_gap(spans, prev_idx, idx);
+                if (trim_resume_idx) {
+                    prev_idx = *trim_resume_idx;
+                    idx = prev_idx + 1;
+                    continue;
+                }
+            }
+
+            prev_idx = idx;
+            ++idx;
+        }
+
+        auto repair_emitted_overlap_turns =
+            [&]() {
+            for (size_t pass_idx = 0; pass_idx < spans.size(); ++pass_idx) {
+                bool changed = false;
+                size_t prev_emitted_idx = 0;
+                while (prev_emitted_idx < spans.size() && !spans[prev_emitted_idx].emit)
+                    ++prev_emitted_idx;
+                if (prev_emitted_idx >= spans.size())
+                    return;
+
+                size_t emitted_idx = prev_emitted_idx + 1;
+                while (emitted_idx < spans.size()) {
+                    if (!spans[emitted_idx].emit) {
+                        ++emitted_idx;
+                        continue;
+                    }
+                    if (spans[emitted_idx].starts_new_chain) {
+                        prev_emitted_idx = emitted_idx;
+                        ++emitted_idx;
+                        continue;
+                    }
+                    if (outer_wall_gradient_overlap_prone_turn(spans[prev_emitted_idx], spans[emitted_idx])) {
+                        std::optional<size_t> trim_resume_idx =
+                            outer_wall_gradient_try_trim_emitted_gap(spans, prev_emitted_idx, emitted_idx);
+                        if (!trim_resume_idx)
+                            trim_resume_idx = outer_wall_gradient_try_trim_emitted_path_gap(spans, prev_emitted_idx, emitted_idx);
+                        if (trim_resume_idx) {
+                            prev_emitted_idx = *trim_resume_idx;
+                            emitted_idx = prev_emitted_idx + 1;
+                            changed = true;
+                            continue;
+                        }
+                    }
+                    prev_emitted_idx = emitted_idx;
+                    ++emitted_idx;
+                }
+                if (!changed)
+                    return;
+            }
+        };
+
+        if (spans.size() > 1) {
+            size_t first_idx = 0;
+            while (first_idx < spans.size() && !spans[first_idx].emit)
+                ++first_idx;
+            if (first_idx >= spans.size())
+                return;
+            size_t last_idx = spans.size() - 1;
+            while (last_idx > first_idx && !spans[last_idx].emit)
+                --last_idx;
+            if (last_idx != first_idx && outer_wall_gradient_should_repair_seam(spans, last_idx, first_idx, closed)) {
+                bool closed_join_applied = false;
+                const bool inside_corner = outer_wall_gradient_joinable_inside_corner(spans[last_idx], spans[first_idx]);
+                if (inside_corner) {
+                    const std::optional<Vec2d> candidate =
+                        outer_wall_gradient_join_candidate(spans[last_idx], spans[first_idx], true);
+                    if (candidate) {
+                        const std::optional<size_t> miter_resume_idx =
+                            outer_wall_gradient_apply_span_aware_miter(spans, last_idx, first_idx, *candidate);
+                        closed_join_applied = bool(miter_resume_idx);
+                    }
+                }
+                if (!closed_join_applied)
+                    closed_join_applied = bool(outer_wall_gradient_try_trim_gap(spans, last_idx, first_idx));
+                if (!closed_join_applied && !closed)
+                    outer_wall_gradient_try_trim_seam_caps(spans, last_idx, first_idx);
+            }
+        }
+        repair_emitted_overlap_turns();
+    };
+
+    auto outer_wall_gradient_build_joined_spans_for_polyline =
+        [&](bool quantized) {
+        std::vector<OuterWallGradientJoinedSpan> spans;
+        if (!outer_wall_gradient_modulated_path ||
+            !outer_wall_gradient_dynamic_ctx.join_extrusion_path_at_corners)
+            return spans;
+
+        const bool dynamic_line_modulation =
+            outer_wall_gradient_dynamic_ctx.enabled &&
+            (outer_wall_gradient_dynamic_ctx.object_center_mode ||
+             outer_wall_gradient_dynamic_ctx.vertex_color_match_mode);
+        size_t line_idx = 0;
+        for (const Line &line : path.polyline.lines()) {
+            const size_t segment_idx = line_idx++;
+            const double line_length = line.length() * SCALING_FACTOR;
+            if (!std::isfinite(line_length) || line_length < EPSILON)
+                continue;
+
+            if (dynamic_line_modulation) {
+                const double high_res_modulation_step_mm =
+                    outer_wall_gradient_dynamic_ctx.dithering_enabled ?
+                        std::clamp(double(outer_wall_gradient_dynamic_ctx.dither_pitch_mm), 0.04, 0.12) :
+                        std::clamp(double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm) * 0.20, 0.04, 0.12);
+                const double modulation_step_mm = outer_wall_gradient_dynamic_ctx.vertex_color_match_mode ?
+                    (outer_wall_gradient_dynamic_ctx.high_resolution_texture_sampling ?
+                        high_res_modulation_step_mm :
+                        std::clamp(double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm) * 0.35, 0.05, 0.25)) :
+                    std::clamp(double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm) * 2.0, 0.40, 1.20);
+                const double modulation_step_scaled = scale_(modulation_step_mm);
+                const int subsegment_count = std::clamp(
+                    int(std::ceil(line.length() / std::max(modulation_step_scaled, EPSILON))),
+                    1,
+                    10000);
+
+                Point sub_a = line.a;
+                for (int sub_idx = 1; sub_idx <= subsegment_count; ++sub_idx) {
+                    const double t = double(sub_idx) / double(subsegment_count);
+                    const Point sub_b = (sub_idx == subsegment_count) ?
+                        line.b :
+                        Point(coord_t(std::llround(double(line.a.x()) + (double(line.b.x()) - double(line.a.x())) * t)),
+                              coord_t(std::llround(double(line.a.y()) + (double(line.b.y()) - double(line.a.y())) * t)));
+                    const Line sub_line(sub_a, sub_b);
+                    const OuterWallGradientSurfaceCoord surface_coord =
+                        halftone_surface_coord_for_source_distance(
+                            halftone_source_distance_for_segment_fraction(
+                                segment_idx,
+                                (double(sub_idx) - 0.5) / double(subsegment_count)));
+                    outer_wall_gradient_add_joined_span(
+                        spans,
+                        sub_line,
+                        dynamic_modulation_for_line(sub_line, surface_coord),
+                        quantized,
+                        segment_idx,
+                        0.0,
+                        0.f);
+                    sub_a = sub_b;
+                }
+            } else {
+                outer_wall_gradient_add_joined_span(
+                    spans,
+                    line,
+                    segment_modulation_at(segment_idx),
+                    quantized,
+                    segment_idx,
+                    0.0,
+                    0.f);
+            }
+        }
+        outer_wall_gradient_finalize_joined_spans(spans, halftone_path_closed);
+        return spans;
+    };
+
+    auto outer_wall_gradient_joined_start_point_for_polyline =
+        [&]() -> std::optional<Point> {
+        if (!outer_wall_gradient_modulated_path ||
+            !outer_wall_gradient_dynamic_ctx.join_extrusion_path_at_corners)
+            return std::nullopt;
+
+        const std::vector<OuterWallGradientJoinedSpan> spans =
+            outer_wall_gradient_build_joined_spans_for_polyline(false);
+        for (const OuterWallGradientJoinedSpan &span : spans)
+            if (span.emit)
+                return span.start_point;
+        return std::nullopt;
+    };
+
+    const std::optional<Point> outer_wall_gradient_joined_start_point =
+        outer_wall_gradient_joined_start_point_for_polyline();
+    if (outer_wall_gradient_joined_start_point)
+        outer_wall_gradient_start_point = *outer_wall_gradient_joined_start_point;
+
+    const Point extrusion_start_point = outer_wall_gradient_joined_start_point ?
+        *outer_wall_gradient_joined_start_point :
+        (outer_wall_gradient_modulated_path ? outer_wall_gradient_start_point : path.first_point());
 
     bool slope_need_z_travel = false;
     if (sloped != nullptr && !sloped->is_flat()) {
@@ -11871,110 +13218,6 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                      ironing_fan_speed >= 0 && path.role() == erIroning);
     };
 
-    auto segment_modulation_at = [&outer_wall_gradient_segment_mods, outer_wall_gradient_modulated_path](size_t idx) {
-        if (!outer_wall_gradient_modulated_path || idx >= outer_wall_gradient_segment_mods.size())
-            return OuterWallGradientSegmentMod{};
-        return outer_wall_gradient_segment_mods[idx];
-    };
-
-    const Layer *surface_layer = m_layer;
-
-    auto dynamic_modulation_for_line =
-        [&outer_wall_gradient_dynamic_ctx, surface_layer](
-            const Line &line, const OuterWallGradientSurfaceCoord &surface_coord) {
-        OuterWallGradientSegmentMod mod;
-        if (!outer_wall_gradient_dynamic_ctx.enabled)
-            return mod;
-
-        const double ax = double(line.a.x());
-        const double ay = double(line.a.y());
-        const double bx = double(line.b.x());
-        const double by = double(line.b.y());
-        const double dx = bx - ax;
-        const double dy = by - ay;
-        const double len = std::hypot(dx, dy);
-        if (len <= EPSILON)
-            return mod;
-
-        const double mid_x = 0.5 * (ax + bx);
-        const double mid_y = 0.5 * (ay + by);
-        const double radial_x = mid_x - double(outer_wall_gradient_dynamic_ctx.object_center.x());
-        const double radial_y = mid_y - double(outer_wall_gradient_dynamic_ctx.object_center.y());
-
-        const Point mid_point(coord_t(std::llround(mid_x)), coord_t(std::llround(mid_y)));
-        double outward_x = 0.0;
-        double outward_y = 0.0;
-        resolve_segment_shift_outward_normal_for_gcode(surface_layer,
-                                                       mid_point,
-                                                       dx,
-                                                       dy,
-                                                       len,
-                                                       radial_x,
-                                                       radial_y,
-                                                       outward_x,
-                                                       outward_y);
-
-        float max_width_delta_limit_mm = std::min(
-            outer_wall_gradient_dynamic_ctx.max_width_delta_mm,
-            2.f * outer_wall_gradient_dynamic_ctx.inset_strength_reference_mm);
-        if (!std::isfinite(max_width_delta_limit_mm) || max_width_delta_limit_mm <= EPSILON)
-            return OuterWallGradientSegmentMod{};
-        const float width_delta_mm = std::clamp(
-            texture_mapping_offset_surface_inset_mm(outer_wall_gradient_dynamic_ctx.offset_context,
-                                                   mid_point,
-                                                   -outward_x,
-                                                   -outward_y,
-                                                   surface_coord.u_mm,
-                                                   surface_coord.v_mm),
-            0.f,
-            max_width_delta_limit_mm);
-        if (!std::isfinite(width_delta_mm) ||
-            !std::isfinite(outer_wall_gradient_dynamic_ctx.base_outer_width_mm) ||
-            !std::isfinite(outer_wall_gradient_dynamic_ctx.layer_height_mm))
-            return OuterWallGradientSegmentMod{};
-
-        const float target_width_mm = outer_wall_gradient_dynamic_ctx.base_outer_width_mm - width_delta_mm;
-        if (!std::isfinite(target_width_mm) || target_width_mm <= 0.f)
-            return OuterWallGradientSegmentMod{};
-
-        mod.flow_scale = flow_scale_for_target_width_for_gcode(outer_wall_gradient_dynamic_ctx.flow_reference_width_mm,
-                                                               target_width_mm,
-                                                               outer_wall_gradient_dynamic_ctx.layer_height_mm);
-        if (!std::isfinite(mod.flow_scale) || mod.flow_scale <= 0.)
-            return OuterWallGradientSegmentMod{};
-
-        const float balance_weight =
-            max_width_delta_limit_mm > EPSILON ? std::clamp(width_delta_mm / max_width_delta_limit_mm, 0.f, 1.f) : 0.f;
-        const float raw_centerline_shift_mm =
-            outer_wall_gradient_dynamic_ctx.base_centerline_shift_mm +
-            0.5f * width_delta_mm +
-            outer_wall_gradient_dynamic_ctx.centerline_shift_balance_mm *
-                balance_weight *
-                outer_wall_gradient_dynamic_ctx.centerline_shift_balance_weight_scale;
-        const float centerline_shift_mm =
-            outer_wall_gradient_dynamic_ctx.centerline_shift_balance_mm == 0.f ?
-                raw_centerline_shift_mm :
-                std::clamp(raw_centerline_shift_mm,
-                           0.f,
-                           outer_wall_gradient_dynamic_ctx.base_centerline_shift_mm + 0.5f * max_width_delta_limit_mm);
-        if (std::abs(centerline_shift_mm) > EPSILON) {
-            const double inward_x = -outward_x;
-            const double inward_y = -outward_y;
-            const bool reverse_shift = centerline_shift_mm < 0.f;
-            const double shift_x = reverse_shift ? -inward_x : inward_x;
-            const double shift_y = reverse_shift ? -inward_y : inward_y;
-            const double shift_scaled = scale_(double(std::abs(centerline_shift_mm)));
-            if (!std::isfinite(shift_x) || !std::isfinite(shift_y) || !std::isfinite(shift_scaled))
-                return OuterWallGradientSegmentMod{};
-            const coord_t max_shift_coord = scale_(std::max(0.5f, outer_wall_gradient_dynamic_ctx.base_outer_width_mm));
-            if (!clamped_shift_coord_for_gcode(shift_x, shift_scaled, max_shift_coord, mod.shift_dx) ||
-                !clamped_shift_coord_for_gcode(shift_y, shift_scaled, max_shift_coord, mod.shift_dy))
-                return OuterWallGradientSegmentMod{};
-        }
-
-        return mod;
-    };
-
     Point emitted_last_point = extrusion_start_point;
 
     if (!variable_speed) {
@@ -12070,6 +13313,84 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                     previous_texture_target_xy = target_xy;
                     has_previous_texture_target_xy = true;
                 };
+                std::vector<OuterWallGradientJoinedSpan> outer_wall_gradient_joined_path_spans =
+                    outer_wall_gradient_build_joined_spans_for_polyline(false);
+                if (!outer_wall_gradient_joined_path_spans.empty()) {
+                    const auto first_emitted_span_it = std::find_if(
+                        outer_wall_gradient_joined_path_spans.begin(),
+                        outer_wall_gradient_joined_path_spans.end(),
+                        [](const OuterWallGradientJoinedSpan &span) { return span.emit; });
+                    if (first_emitted_span_it != outer_wall_gradient_joined_path_spans.end()) {
+                        previous_texture_target_xy = first_emitted_span_it->start_xy;
+                        has_previous_texture_target_xy = is_reasonable_quantized_gcode_point_for_gcode(previous_texture_target_xy);
+                        for (const OuterWallGradientJoinedSpan &span : outer_wall_gradient_joined_path_spans) {
+                            if (!span.emit)
+                                continue;
+                            std::string tempDescription = description;
+                            if (span.starts_new_chain) {
+                                if (!is_reasonable_quantized_gcode_point_for_gcode(span.start_xy))
+                                    continue;
+                                if (sloped == nullptr) {
+                                    gcode += m_writer.travel_to_xy(span.start_xy);
+                                } else {
+                                    if (!std::isfinite(total_length) || total_length <= EPSILON)
+                                        continue;
+                                    const auto [z_ratio, e_ratio] = sloped->interpolate(std::clamp(path_length / total_length, 0.0, 1.0));
+                                    (void) e_ratio;
+                                    const Vec3d dest3d(span.start_xy(0), span.start_xy(1), get_sloped_z(z_ratio));
+                                    if (!dest3d.allFinite())
+                                        continue;
+                                    gcode += m_writer.travel_to_xyz(dest3d);
+                                }
+                                gcode += m_writer.set_speed(F, "", comment);
+                                emitted_last_point = span.start_point;
+                                update_previous_texture_target(span.start_xy);
+                            }
+                            const Vec2d target_xy = span.end_xy;
+                            if (!is_reasonable_quantized_gcode_point_for_gcode(target_xy))
+                                continue;
+                            const double emitted_line_length = emitted_texture_line_length(target_xy, span.source_length_mm);
+                            if (!std::isfinite(emitted_line_length) || emitted_line_length > k_max_reasonable_segment_mm)
+                                continue;
+                            if (emitted_line_length < EPSILON)
+                                continue;
+                            auto dE = e_per_mm * emitted_line_length * span.mod.flow_scale;
+                            if (_needSAFC(path)) {
+                                auto oldE = dE;
+                                dE = m_small_area_infill_flow_compensator->modify_flow(emitted_line_length, dE, path.role());
+                                if (m_config.gcode_comments && oldE > 0 && oldE != dE) {
+                                    tempDescription += Slic3r::format(" | Old Flow Value: %0.5f Length: %0.5f", oldE, emitted_line_length);
+                                }
+                            }
+                            if (!can_emit_extrusion_delta(dE))
+                                continue;
+                            const double next_path_length = path_length + emitted_line_length;
+                            if (sloped == nullptr) {
+                                gcode += m_writer.extrude_to_xy(
+                                    target_xy,
+                                    dE,
+                                    GCodeWriter::full_gcode_comment ? tempDescription : "",
+                                    path.is_force_no_extrusion());
+                            } else {
+                                if (!std::isfinite(total_length) || total_length <= EPSILON)
+                                    continue;
+                                const auto [z_ratio, e_ratio] = sloped->interpolate(next_path_length / total_length);
+                                Vec3d dest3d(target_xy(0), target_xy(1), get_sloped_z(z_ratio));
+                                if (!can_emit_sloped_extrusion(dest3d, dE * e_ratio))
+                                    continue;
+                                gcode += m_writer.extrude_to_xyz(
+                                    dest3d,
+                                    dE * e_ratio,
+                                    GCodeWriter::full_gcode_comment ? tempDescription : "",
+                                    path.is_force_no_extrusion());
+                            }
+
+                            path_length = next_path_length;
+                            emitted_last_point = span.end_point;
+                            update_previous_texture_target(target_xy);
+                        }
+                    }
+                } else {
                 size_t line_idx = 0;
                 for (const Line& line : path.polyline.lines()) {
                     const size_t segment_idx = line_idx++;
@@ -12224,6 +13545,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                         update_previous_texture_target(target_xy);
                     }
                 }
+                }
             } else {
                 // BBS: start to generate gcode from arc fitting data which includes line and arc
                 const std::vector<PathFittingData>& fitting_result = path.polyline.fitting_result;
@@ -12326,6 +13648,227 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         if(path.role() == erInternalBridgeInfill) // ORCA: Add support for separate internal bridge fan speed control
             pre_fan_enabled = true;
 
+        auto outer_wall_gradient_build_joined_spans_for_processed_points =
+            [&]() {
+            std::vector<OuterWallGradientJoinedSpan> spans;
+            if (!outer_wall_gradient_modulated_path ||
+                !outer_wall_gradient_dynamic_ctx.join_extrusion_path_at_corners ||
+                new_points.size() < 2)
+                return spans;
+
+            double source_path_length_mm = 0.0;
+            const bool dynamic_line_modulation =
+                outer_wall_gradient_dynamic_ctx.enabled &&
+                (outer_wall_gradient_dynamic_ctx.object_center_mode ||
+                 outer_wall_gradient_dynamic_ctx.vertex_color_match_mode);
+            for (size_t i = 1; i < new_points.size(); ++i) {
+                const ProcessedPoint &processed_point = new_points[i];
+                const ProcessedPoint &pre_processed_point = new_points[i - 1];
+                const Line parent_source_line(pre_processed_point.p, processed_point.p);
+                const double parent_source_length_mm = parent_source_line.length() * SCALING_FACTOR;
+                const double safe_parent_source_length_mm =
+                    std::isfinite(parent_source_length_mm) ? std::max(0.0, parent_source_length_mm) : 0.0;
+                const double segment_source_start_mm = source_path_length_mm;
+                if (std::isfinite(parent_source_length_mm))
+                    source_path_length_mm += parent_source_length_mm;
+                if (!std::isfinite(parent_source_length_mm) || parent_source_length_mm < EPSILON)
+                    continue;
+
+                const OuterWallGradientSurfaceCoord segment_surface_coord =
+                    halftone_surface_coord_for_source_distance(segment_source_start_mm + safe_parent_source_length_mm * 0.5);
+                const OuterWallGradientSegmentMod segment_mod =
+                    dynamic_line_modulation ?
+                        dynamic_modulation_for_line(parent_source_line, segment_surface_coord) :
+                        segment_modulation_at(i - 1);
+                const bool high_res_dynamic_subsegments =
+                    dynamic_line_modulation &&
+                    outer_wall_gradient_dynamic_ctx.vertex_color_match_mode &&
+                    outer_wall_gradient_dynamic_ctx.high_resolution_texture_sampling;
+                if (high_res_dynamic_subsegments) {
+                    const double modulation_step_mm =
+                        outer_wall_gradient_dynamic_ctx.dithering_enabled ?
+                            std::clamp(double(outer_wall_gradient_dynamic_ctx.dither_pitch_mm), 0.04, 0.12) :
+                            std::clamp(double(outer_wall_gradient_dynamic_ctx.base_outer_width_mm) * 0.20, 0.04, 0.12);
+                    const double modulation_step_scaled = scale_(modulation_step_mm);
+                    const int subsegment_count =
+                        std::clamp(int(std::ceil(parent_source_line.length() / std::max(modulation_step_scaled, EPSILON))), 1, 10000);
+
+                    Point sub_a = parent_source_line.a;
+                    for (int sub_idx = 1; sub_idx <= subsegment_count; ++sub_idx) {
+                        const double t = double(sub_idx) / double(subsegment_count);
+                        const Point sub_b = (sub_idx == subsegment_count) ?
+                            parent_source_line.b :
+                            Point(coord_t(std::llround(double(parent_source_line.a.x()) + (double(parent_source_line.b.x()) - double(parent_source_line.a.x())) * t)),
+                                  coord_t(std::llround(double(parent_source_line.a.y()) + (double(parent_source_line.b.y()) - double(parent_source_line.a.y())) * t)));
+                        const Line sub_line(sub_a, sub_b);
+                        const OuterWallGradientSurfaceCoord sub_surface_coord =
+                            halftone_surface_coord_for_source_distance(
+                                segment_source_start_mm + safe_parent_source_length_mm *
+                                    ((double(sub_idx) - 0.5) / double(subsegment_count)));
+                        outer_wall_gradient_add_joined_span(
+                            spans,
+                            sub_line,
+                            dynamic_modulation_for_line(sub_line, sub_surface_coord),
+                            true,
+                            i,
+                            pre_processed_point.speed,
+                            processed_point.overlap);
+                        sub_a = sub_b;
+                    }
+                } else {
+                    outer_wall_gradient_add_joined_span(
+                        spans,
+                        parent_source_line,
+                        segment_mod,
+                        true,
+                        i,
+                        pre_processed_point.speed,
+                        processed_point.overlap);
+                }
+            }
+            outer_wall_gradient_finalize_joined_spans(spans, halftone_path_closed);
+            return spans;
+        };
+
+        std::vector<OuterWallGradientJoinedSpan> variable_joined_spans =
+            outer_wall_gradient_build_joined_spans_for_processed_points();
+        if (!variable_joined_spans.empty()) {
+            Vec2d prev = this->point_to_gcode_quantized(extrusion_start_point);
+            bool has_valid_prev = is_reasonable_quantized_gcode_point_for_gcode(prev);
+            emitted_last_point = has_valid_prev ? extrusion_start_point : path.first_point();
+            double path_length = 0.;
+            size_t active_parent_idx = std::numeric_limits<size_t>::max();
+            for (const OuterWallGradientJoinedSpan &span : variable_joined_spans) {
+                if (!span.emit)
+                    continue;
+                std::string tempDescription = description;
+                if (!has_valid_prev) {
+                    prev = span.start_xy;
+                    emitted_last_point = span.start_point;
+                    has_valid_prev = is_reasonable_quantized_gcode_point_for_gcode(prev);
+                    if (!has_valid_prev)
+                        continue;
+                }
+                if (span.parent_idx != active_parent_idx) {
+                    active_parent_idx = span.parent_idx;
+                    if (m_enable_cooling_markers) {
+                        if (enable_overhang_bridge_fan) {
+                            cur_fan_enabled = check_overhang_fan(span.overlap, path.role());
+                            append_role_based_fan_marker(erOverhangPerimeter, "_OVERHANG"sv, pre_fan_enabled && cur_fan_enabled);
+                            pre_fan_enabled = cur_fan_enabled;
+                            append_role_based_fan_marker(erInternalBridgeInfill, "_INTERNAL_BRIDGE"sv, path.role() == erInternalBridgeInfill);
+                        }
+
+                        apply_role_based_fan_speed();
+                    }
+
+                    const double new_speed = span.speed_mm_s * 60.0;
+                    if ((std::abs(last_set_speed - new_speed) > EPSILON) || (std::abs(_mm3_per_mm - m_last_mm3_mm) > EPSILON)) {
+                        if(_mm3_per_mm >0   &&
+                           EXTRUDER_CONFIG(adaptive_pressure_advance) &&
+                           EXTRUDER_CONFIG(enable_pressure_advance) &&
+                           EXTRUDER_CONFIG(adaptive_pressure_advance_overhangs) ){
+                            if(last_set_speed > new_speed){
+                                if(m_config.gcode_comments) {
+                                    sprintf(buf, "; Ramp up-variable\n");
+                                    gcode += buf;
+                                }
+                                sprintf(buf, ";%sT%u MM3MM:%g ACCEL:%u BR:%d RC:%d OV:%d\n",
+                                        GCodeProcessor::reserved_tag(GCodeProcessor::ETags::PA_Change).c_str(),
+                                        m_writer.filament()->id(),
+                                        _mm3_per_mm,
+                                        acceleration_i,
+                                        ((path.role() == erBridgeInfill) ||(path.role() == erOverhangPerimeter)),
+                                        1,
+                                        1);
+                            }else{
+                                if(m_config.gcode_comments) {
+                                    sprintf(buf, "; Ramp down-variable\n");
+                                    gcode += buf;
+                                }
+                                sprintf(buf, ";%sT%u MM3MM:%g ACCEL:%u BR:%d RC:%d OV:%d\n",
+                                        GCodeProcessor::reserved_tag(GCodeProcessor::ETags::PA_Change).c_str(),
+                                        m_writer.filament()->id(),
+                                        _mm3_per_mm,
+                                        acceleration_i,
+                                        ((path.role() == erBridgeInfill) ||(path.role() == erOverhangPerimeter)),
+                                        1,
+                                        0);
+                            }
+                            gcode += buf;
+                            m_last_mm3_mm = _mm3_per_mm;
+                        }
+                    }
+                    if ((std::abs(last_set_speed - new_speed) > 60)) {
+                        gcode += m_writer.set_speed(new_speed, "", comment);
+                        last_set_speed = new_speed;
+                    } else if ((std::abs(F - new_speed) <= 60)) {
+                        gcode += m_writer.set_speed(F, "", comment);
+                        last_set_speed = F;
+                    }
+                }
+
+                if (span.starts_new_chain) {
+                    if (!is_reasonable_quantized_gcode_point_for_gcode(span.start_xy))
+                        continue;
+                    if ((span.start_xy - prev).norm() > EPSILON) {
+                        if (sloped == nullptr) {
+                            gcode += m_writer.travel_to_xy(span.start_xy);
+                        } else {
+                            if (!std::isfinite(total_length) || total_length <= EPSILON)
+                                continue;
+                            const auto [z_ratio, e_ratio] = sloped->interpolate(std::clamp(path_length / total_length, 0.0, 1.0));
+                            (void) e_ratio;
+                            const Vec3d dest3d(span.start_xy(0), span.start_xy(1), get_sloped_z(z_ratio));
+                            if (!dest3d.allFinite())
+                                continue;
+                            gcode += m_writer.travel_to_xyz(dest3d);
+                        }
+                        gcode += m_writer.set_speed(last_set_speed, "", comment);
+                    }
+                    prev = span.start_xy;
+                    emitted_last_point = span.start_point;
+                    has_valid_prev = true;
+                }
+
+                const Vec2d p = span.end_xy;
+                if (!is_reasonable_quantized_gcode_point_for_gcode(p))
+                    continue;
+                const double line_length = (p - prev).norm();
+                constexpr double k_max_reasonable_segment_mm = 2000.0;
+                if (!std::isfinite(line_length) || line_length > k_max_reasonable_segment_mm)
+                    continue;
+                if(line_length < EPSILON)
+                    continue;
+                path_length += line_length;
+
+                auto dE = e_per_mm * line_length * span.mod.flow_scale;
+                if (_needSAFC(path)) {
+                    auto oldE = dE;
+                    dE = m_small_area_infill_flow_compensator->modify_flow(line_length, dE, path.role());
+
+                    if (m_config.gcode_comments && oldE > 0 && oldE != dE) {
+                        tempDescription += Slic3r::format(" | Old Flow Value: %0.5f Length: %0.5f",oldE, line_length);
+                    }
+                }
+                if (!can_emit_extrusion_delta(dE))
+                    continue;
+                if (sloped == nullptr) {
+                    gcode += m_writer.extrude_to_xy(p, dE, GCodeWriter::full_gcode_comment ? tempDescription : "");
+                } else {
+                    if (!std::isfinite(total_length) || total_length <= EPSILON)
+                        continue;
+                    const auto [z_ratio, e_ratio] = sloped->interpolate(path_length / total_length);
+                    Vec3d dest3d(p(0), p(1), get_sloped_z(z_ratio));
+                    if (!can_emit_sloped_extrusion(dest3d, dE * e_ratio))
+                        continue;
+                    gcode += m_writer.extrude_to_xyz(dest3d, dE * e_ratio, GCodeWriter::full_gcode_comment ? tempDescription : "");
+                }
+
+                emitted_last_point = span.end_point;
+                prev = p;
+            }
+        } else {
         double path_length = 0.;
         double source_path_length_mm = 0.;
         for (size_t i = 1; i < new_points.size(); i++) {
@@ -12550,6 +14093,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                 prev = p;
             }
 
+        }
         }
     }
     if (m_enable_cooling_markers) {

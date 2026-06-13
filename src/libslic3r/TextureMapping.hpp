@@ -189,6 +189,7 @@ struct TextureMappingZone
     static constexpr int   DefaultModulationMode = DefaultImageTextureModulationMode;
     static constexpr bool  DefaultModulationModeManuallyChanged = false;
     static constexpr bool  DefaultUseModulatedOverhangGeometryForSupport = false;
+    static constexpr bool  DefaultJoinExtrusionPathAtCorners = false;
     static constexpr bool  DefaultRecolorSmallPerimeterLoops = false;
     static constexpr bool  DefaultRecolorTopVisiblePerimeterSections = false;
     static constexpr int   DefaultTopVisiblePerimeterRecolorAggressiveness = int(TopVisibleRecolorAggressive);
@@ -483,6 +484,7 @@ struct TextureMappingZone
     bool        nonlinear_offset_adjustment = DefaultNonlinearOffsetAdjustment;
     int         modulation_mode = DefaultModulationMode;
     bool        use_modulated_overhang_geometry_for_support = DefaultUseModulatedOverhangGeometryForSupport;
+    bool        join_extrusion_path_at_corners = DefaultJoinExtrusionPathAtCorners;
     bool        modulation_mode_manually_changed = DefaultModulationModeManuallyChanged;
     bool        recolor_small_perimeter_loops = DefaultRecolorSmallPerimeterLoops;
     bool        recolor_top_visible_perimeter_sections = DefaultRecolorTopVisiblePerimeterSections;
@@ -576,15 +578,13 @@ struct TextureMappingZone
                (is_image_texture() || is_surface_gradient()) &&
                (top_surface_image_printing_method == int(TopSurfaceImageSameAngle45Width) ||
                 top_surface_image_printing_method == int(TopSurfaceImageSameLayer45Partition) ||
-                (top_surface_image_printing_method == int(TopSurfaceImageContoning) &&
-                 uses_perimeter_path_modulation_v2()));
+                top_surface_image_printing_method == int(TopSurfaceImageContoning));
     }
     bool top_surface_contoning_active() const
     {
         return top_surface_image_printing_enabled &&
                (is_image_texture() || is_surface_gradient()) &&
-               top_surface_image_printing_method == int(TopSurfaceImageContoning) &&
-               uses_perimeter_path_modulation_v2();
+               top_surface_image_printing_method == int(TopSurfaceImageContoning);
     }
 
     bool top_surface_image_fixed_coloring_filaments_active() const
@@ -596,6 +596,7 @@ struct TextureMappingZone
     {
         return is_image_texture() &&
                top_surface_contoning_active() &&
+               uses_perimeter_path_modulation_v2() &&
                top_surface_contoning_colors_upper_surfaces() &&
                !effective_top_surface_contoning_only_color_surface_infill() &&
                !effective_top_surface_contoning_replace_top_perimeters_with_infill() &&
@@ -749,8 +750,6 @@ struct TextureMappingZone
     {
         if (top_surface_image_printing_enabled &&
             top_surface_image_printing_method == int(TopSurfaceImageContoning)) {
-            modulation_mode = int(ModulationPerimeterPathV2);
-            modulation_mode_manually_changed = true;
             top_surface_image_fixed_coloring_filaments = true;
         }
         if (!ShowExperimentalTopSurfaceContoningOptions) {
@@ -812,6 +811,7 @@ struct TextureMappingZone
         seam_hiding = DefaultSeamHiding;
         nonlinear_offset_adjustment = DefaultNonlinearOffsetAdjustment;
         use_modulated_overhang_geometry_for_support = DefaultUseModulatedOverhangGeometryForSupport;
+        join_extrusion_path_at_corners = DefaultJoinExtrusionPathAtCorners;
         modulation_mode = default_modulation_mode_for_surface_pattern(surface_pattern);
         modulation_mode_manually_changed = DefaultModulationModeManuallyChanged;
         recolor_small_perimeter_loops = DefaultRecolorSmallPerimeterLoops;
