@@ -19,6 +19,7 @@
 namespace Slic3r {
 
 const bool TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions = false;
+const bool TextureMappingZone::ShowAllTopSurfaceContoningInfillModes = false;
 
 namespace {
 

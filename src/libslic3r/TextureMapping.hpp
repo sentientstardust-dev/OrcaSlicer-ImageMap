@@ -230,7 +230,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultTopSurfaceContoningRecolorSurroundingPerimeters = false;
     static constexpr int   DefaultTopSurfaceContoningPerimeterMode = int(ContoningPerimeterDividedLine);
     static constexpr int   DefaultTopSurfaceContoningFlatSurfaceInfillMode = int(ContoningFlatSurfaceInfillDefault);
-    static constexpr int   SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode = int(ContoningFlatSurfaceInfillBoundarySkinVariable);
+    static constexpr int   SlicerDefaultTopSurfaceContoningFlatSurfaceInfillMode = int(ContoningFlatSurfaceInfillBoundarySkinVariableOverlap);
     static constexpr bool  DefaultTopSurfaceContoningLayerPhaseEnabled = false;
     static constexpr bool  DefaultTopSurfaceContoningVariedInfillAnglesEnabled = true;
     static constexpr bool  DefaultTopSurfaceContoningBlueNoiseErrorDiffusionEnabled = false;
@@ -279,6 +279,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultPreviewSimulateTopSurfaceLod = true;
     static constexpr bool  DefaultAutoAdjustFilamentSelection = true;
     static const bool      ShowExperimentalTopSurfaceContoningOptions;
+    static const bool      ShowAllTopSurfaceContoningInfillModes;
 
     static constexpr int default_modulation_mode_for_surface_pattern(int surface_pattern)
     {
@@ -309,12 +310,11 @@ struct TextureMappingZone
         const int clamped_mode = std::clamp(mode,
                                             int(ContoningFlatSurfaceInfillDefault),
                                             int(ContoningFlatSurfaceInfillBoundarySkinVariableOverlap));
-        if (ShowExperimentalTopSurfaceContoningOptions)
+        if (ShowExperimentalTopSurfaceContoningOptions || ShowAllTopSurfaceContoningInfillModes)
             return clamped_mode;
         return clamped_mode == int(ContoningFlatSurfaceInfillRectilinear) ||
                clamped_mode == int(ContoningFlatSurfaceInfillBoundarySkinVariable) ||
-               clamped_mode == int(ContoningFlatSurfaceInfillBoundarySkinVariableOverlap) ||
-               clamped_mode == int(ContoningFlatSurfaceInfillAdaptiveLines) ?
+               clamped_mode == int(ContoningFlatSurfaceInfillBoundarySkinVariableOverlap) ?
             clamped_mode :
             DefaultTopSurfaceContoningFlatSurfaceInfillMode;
     }
