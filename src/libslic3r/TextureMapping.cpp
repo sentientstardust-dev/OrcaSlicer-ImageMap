@@ -853,7 +853,7 @@ static std::string top_surface_contoning_flat_surface_infill_mode_name(int mode)
 {
     switch (clamp_int(mode,
                       int(TextureMappingZone::ContoningFlatSurfaceInfillDefault),
-                      int(TextureMappingZone::ContoningFlatSurfaceInfillAdaptiveLines))) {
+                      int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariableOverlap))) {
     case int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinear):
         return "rectilinear";
     case int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithBoundary):
@@ -866,6 +866,8 @@ static std::string top_surface_contoning_flat_surface_infill_mode_name(int mode)
         return "boundary_skin_fixed";
     case int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariable):
         return "boundary_skin_variable";
+    case int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariableOverlap):
+        return "boundary_skin_variable_overlap";
     case int(TextureMappingZone::ContoningFlatSurfaceInfillSpiral):
         return "spiral";
     case int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinHybrid):
@@ -889,6 +891,8 @@ static int top_surface_contoning_flat_surface_infill_mode_from_name(const std::s
         return int(TextureMappingZone::ContoningFlatSurfaceInfillConcentric);
     if (name == "boundary_skin" || name == "boundary_skin_variable")
         return int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariable);
+    if (name == "boundary_skin_variable_overlap" || name == "boundary_skin_overlap")
+        return int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariableOverlap);
     if (name == "boundary_skin_fixed")
         return int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinFixed);
     if (name == "spiral")
@@ -2435,6 +2439,8 @@ bool TextureMappingZone::operator==(const TextureMappingZone &rhs) const
            nonlinear_offset_adjustment == rhs.nonlinear_offset_adjustment &&
            modulation_mode == rhs.modulation_mode &&
            use_modulated_overhang_geometry_for_support == rhs.use_modulated_overhang_geometry_for_support &&
+           (!uses_perimeter_path_modulation_v2() ||
+            disable_v2_perimeter_path_modulation_smoothing == rhs.disable_v2_perimeter_path_modulation_smoothing) &&
            modulation_mode_manually_changed == rhs.modulation_mode_manually_changed &&
            recolor_small_perimeter_loops == rhs.recolor_small_perimeter_loops &&
            recolor_top_visible_perimeter_sections == rhs.recolor_top_visible_perimeter_sections &&
@@ -2812,6 +2818,7 @@ std::string TextureMappingManager::serialize_entries()
         texture["nonlinear_offset_adjustment"] = zone.nonlinear_offset_adjustment;
         texture["modulation_mode"] = modulation_mode_name(zone.modulation_mode);
         texture["use_modulated_overhang_geometry_for_support"] = zone.use_modulated_overhang_geometry_for_support;
+        texture["disable_v2_perimeter_path_modulation_smoothing"] = zone.disable_v2_perimeter_path_modulation_smoothing;
         texture["modulation_mode_manually_changed"] = zone.modulation_mode_manually_changed;
         texture["recolor_small_perimeter_loops"] = zone.recolor_small_perimeter_loops || zone.recolor_top_visible_perimeter_sections;
         texture["recolor_top_visible_perimeter_sections"] = zone.recolor_top_visible_perimeter_sections;
@@ -3099,6 +3106,9 @@ void TextureMappingManager::load_entries(const std::string &serialized,
         zone.use_modulated_overhang_geometry_for_support =
             texture.value("use_modulated_overhang_geometry_for_support",
                           TextureMappingZone::DefaultUseModulatedOverhangGeometryForSupport);
+        zone.disable_v2_perimeter_path_modulation_smoothing =
+            texture.value("disable_v2_perimeter_path_modulation_smoothing",
+                          TextureMappingZone::DefaultDisableV2PerimeterPathModulationSmoothing);
         const auto modulation_mode_it = texture.find("modulation_mode");
         const bool has_modulation_mode =
             modulation_mode_it != texture.end() && modulation_mode_it->is_string();
@@ -3220,7 +3230,7 @@ void TextureMappingManager::load_entries(const std::string &serialized,
                               flat_surface_infill_mode_it->get<int>() :
                               TextureMappingZone::DefaultTopSurfaceContoningFlatSurfaceInfillMode,
                           int(TextureMappingZone::ContoningFlatSurfaceInfillDefault),
-                          int(TextureMappingZone::ContoningFlatSurfaceInfillAdaptiveLines));
+                          int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariableOverlap));
         zone.top_surface_contoning_layer_phase_enabled =
             texture.value("top_surface_contoning_layer_phase_enabled",
                           TextureMappingZone::DefaultTopSurfaceContoningLayerPhaseEnabled);

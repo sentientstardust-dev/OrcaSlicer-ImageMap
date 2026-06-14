@@ -2503,6 +2503,7 @@ public:
                                         bool nonlinear_offset_adjustment,
                                         int modulation_mode,
                                         bool use_modulated_overhang_geometry_for_support,
+                                        bool disable_v2_perimeter_path_modulation_smoothing,
                                         bool modulation_mode_manually_changed,
                                         bool recolor_small_perimeter_loops,
                                         bool recolor_top_visible_perimeter_sections,
@@ -2882,7 +2883,7 @@ public:
         auto *modulation_mode_row = new wxBoxSizer(wxHORIZONTAL);
         modulation_mode_row->Add(new wxStaticText(print_settings_page, wxID_ANY, _L("Modulation mode:")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap);
         m_modulation_mode_choice = new wxChoice(print_settings_page, wxID_ANY);
-        update_modulation_mode_choices(false, modulation_mode);
+        update_modulation_mode_choices(modulation_mode);
         modulation_mode_row->Add(m_modulation_mode_choice, 1, wxALIGN_CENTER_VERTICAL);
         print_settings_root->Add(modulation_mode_row, 0, wxEXPAND | wxALL, gap);
         m_modulation_mode_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent &) {
@@ -2984,6 +2985,14 @@ public:
             new wxCheckBox(experimental_page, wxID_ANY, _L("Use modulated overhang geometry in support generation"));
         m_use_modulated_overhang_geometry_for_support_checkbox->SetValue(use_modulated_overhang_geometry_for_support);
         experimental_box->Add(m_use_modulated_overhang_geometry_for_support_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        m_disable_v2_perimeter_path_modulation_smoothing_checkbox =
+            new wxCheckBox(experimental_page, wxID_ANY, _L("Disable v2 perimeter path modulation smoothing"));
+        m_disable_v2_perimeter_path_modulation_smoothing_checkbox->SetValue(
+            modulation_mode == int(TextureMappingZone::ModulationPerimeterPathV2) &&
+            disable_v2_perimeter_path_modulation_smoothing);
+        m_disable_v2_perimeter_path_modulation_smoothing_checkbox->SetToolTip(
+            _L("Leaves v2 perimeter path modulation insets unsmoothed so fine texture changes can produce bumpier path geometry."));
+        experimental_box->Add(m_disable_v2_perimeter_path_modulation_smoothing_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
         m_top_visible_perimeter_recolor_point_sampling_checkbox =
             new wxCheckBox(experimental_page, wxID_ANY, _L("Point-sample visible layer-line recolor"));
         m_top_visible_perimeter_recolor_point_sampling_checkbox->SetValue(top_visible_perimeter_recolor_point_sampling);
@@ -3295,6 +3304,9 @@ public:
         if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
             add_contoning_flat_infill_choice(_L("Boundary Skin (variable width)"),
                                              int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariable));
+        if (!TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions)
+            add_contoning_flat_infill_choice(_L("Boundary Skin (variable width, more overlap)"),
+                                             int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariableOverlap));
         if (TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions) {
             add_contoning_flat_infill_choice(_L("Concentric"),
                                              int(TextureMappingZone::ContoningFlatSurfaceInfillConcentric));
@@ -3302,6 +3314,8 @@ public:
                                              int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinFixed));
             add_contoning_flat_infill_choice(_L("Boundary Skin (variable width)"),
                                              int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariable));
+            add_contoning_flat_infill_choice(_L("Boundary Skin (variable width, more overlap)"),
+                                             int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariableOverlap));
             add_contoning_flat_infill_choice(_L("Spiral"),
                                              int(TextureMappingZone::ContoningFlatSurfaceInfillSpiral));
             add_contoning_flat_infill_choice(_L("Boundary Skin Hybrid"),
@@ -3900,6 +3914,12 @@ public:
     {
         return m_use_modulated_overhang_geometry_for_support_checkbox != nullptr &&
                m_use_modulated_overhang_geometry_for_support_checkbox->GetValue();
+    }
+    bool disable_v2_perimeter_path_modulation_smoothing() const
+    {
+        return modulation_mode() == int(TextureMappingZone::ModulationPerimeterPathV2) &&
+               m_disable_v2_perimeter_path_modulation_smoothing_checkbox != nullptr &&
+               m_disable_v2_perimeter_path_modulation_smoothing_checkbox->GetValue();
     }
     int modulation_mode() const
     {
@@ -5435,6 +5455,8 @@ private:
             m_recolor_top_visible_perimeter_sections_checkbox->Enable(perimeter_path_mode);
         if (m_use_modulated_overhang_geometry_for_support_checkbox != nullptr)
             m_use_modulated_overhang_geometry_for_support_checkbox->Enable(perimeter_path_v2_mode);
+        if (m_disable_v2_perimeter_path_modulation_smoothing_checkbox != nullptr)
+            m_disable_v2_perimeter_path_modulation_smoothing_checkbox->Enable(perimeter_path_v2_mode);
         if (m_top_visible_perimeter_recolor_point_sampling_checkbox != nullptr)
             m_top_visible_perimeter_recolor_point_sampling_checkbox->Enable(perimeter_path_v2_mode);
         const bool top_visible_enabled =
@@ -5458,20 +5480,16 @@ private:
         }
     }
 
-    void update_modulation_mode_choices(bool force_perimeter_path_v2, int preferred_mode)
+    void update_modulation_mode_choices(int preferred_mode)
     {
         if (m_modulation_mode_choice == nullptr)
             return;
-        const int mode = force_perimeter_path_v2 ?
-            int(TextureMappingZone::ModulationPerimeterPathV2) :
-            std::clamp(preferred_mode,
-                       int(TextureMappingZone::ModulationLineWidth),
-                       int(TextureMappingZone::ModulationPerimeterPathV2));
+        const int mode = std::clamp(preferred_mode,
+                                    int(TextureMappingZone::ModulationLineWidth),
+                                    int(TextureMappingZone::ModulationPerimeterPathV2));
         m_modulation_mode_choice->Clear();
         m_modulation_mode_choice_values.clear();
-        auto append_mode = [this, force_perimeter_path_v2](int value, const wxString &label) {
-            if (force_perimeter_path_v2 && value != int(TextureMappingZone::ModulationPerimeterPathV2))
-                return;
+        auto append_mode = [this](int value, const wxString &label) {
             m_modulation_mode_choice->Append(label);
             m_modulation_mode_choice_values.emplace_back(value);
         };
@@ -5532,6 +5550,9 @@ private:
                                   int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariable) ||
                               TextureMappingZone::effective_top_surface_contoning_flat_surface_infill_mode(
                                   top_surface_contoning_flat_surface_infill_mode()) ==
+                                  int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariableOverlap) ||
+                              TextureMappingZone::effective_top_surface_contoning_flat_surface_infill_mode(
+                                  top_surface_contoning_flat_surface_infill_mode()) ==
                                   int(TextureMappingZone::ContoningFlatSurfaceInfillAdaptiveLines);
         int resolution = TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(preferred_resolution);
         if (!allow_x8 && resolution == 8)
@@ -5579,10 +5600,7 @@ private:
         const bool contoning = enabled && contoning_selected;
         if (m_modulation_mode_choice != nullptr) {
             const int preferred_mode = modulation_mode();
-            update_modulation_mode_choices(contoning, preferred_mode);
-        }
-        if (contoning) {
-            m_modulation_mode_manually_changed = true;
+            update_modulation_mode_choices(preferred_mode);
             update_modulation_mode_options_visibility(false);
         }
         const bool same_layer =
@@ -5758,6 +5776,7 @@ private:
     wxCheckBox *m_nonlinear_offset_adjustment_checkbox {nullptr};
     wxSpinCtrl *m_filament_overhang_contrast_spin {nullptr};
     wxCheckBox *m_use_modulated_overhang_geometry_for_support_checkbox {nullptr};
+    wxCheckBox *m_disable_v2_perimeter_path_modulation_smoothing_checkbox {nullptr};
     wxChoice *m_modulation_mode_choice {nullptr};
     std::vector<int> m_modulation_mode_choice_values;
     bool m_modulation_mode_manually_changed {false};
@@ -10862,6 +10881,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.nonlinear_offset_adjustment,
                                                     updated.modulation_mode,
                                                     updated.use_modulated_overhang_geometry_for_support,
+                                                    updated.disable_v2_perimeter_path_modulation_smoothing,
                                                     updated.modulation_mode_manually_changed,
                                                     updated.recolor_small_perimeter_loops,
                                                     updated.recolor_top_visible_perimeter_sections,
@@ -10958,6 +10978,9 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.use_modulated_overhang_geometry_for_support = dlg.use_modulated_overhang_geometry_for_support();
             updated.modulation_mode_manually_changed = dlg.modulation_mode_manually_changed();
             updated.apply_default_modulation_mode();
+            updated.disable_v2_perimeter_path_modulation_smoothing =
+                updated.uses_perimeter_path_modulation_v2() &&
+                dlg.disable_v2_perimeter_path_modulation_smoothing();
             updated.recolor_small_perimeter_loops = dlg.recolor_small_perimeter_loops();
             updated.recolor_top_visible_perimeter_sections = dlg.recolor_top_visible_perimeter_sections();
             updated.top_visible_perimeter_recolor_aggressiveness = dlg.top_visible_perimeter_recolor_aggressiveness();
@@ -11037,11 +11060,6 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                 dlg.side_surface_color_calibration_name();
             updated.side_surface_color_calibration_json =
                 dlg.side_surface_color_calibration_json();
-            if (updated.top_surface_image_printing_enabled &&
-                updated.top_surface_image_printing_method == int(TextureMappingZone::TopSurfaceImageContoning)) {
-                updated.modulation_mode = int(TextureMappingZone::ModulationPerimeterPathV2);
-                updated.modulation_mode_manually_changed = true;
-            }
             if (updated.dithering_enabled)
                 updated.compact_offset_mode = true;
             updated.minimum_visibility_offset_enabled = dlg.minimum_visibility_offset_enabled();
@@ -17392,16 +17410,21 @@ void Plater::priv::clear_warnings()
 }
 bool Plater::priv::warnings_dialog()
 {
-    if (current_warnings.empty())
+    std::vector<const std::pair<Slic3r::PrintStateBase::Warning, size_t>*> critical_warnings;
+    for (auto const& it : current_warnings)
+        if (it.first.level == PrintStateBase::WarningLevel::CRITICAL)
+            critical_warnings.emplace_back(&it);
+
+    if (critical_warnings.empty())
         return true;
     std::string text = _u8L("There are warnings after slicing models:") + "\n";
-    for (auto const& it : current_warnings) {
-        size_t next_n = it.first.message.find_first_of('\n', 0);
+    for (auto const* it : critical_warnings) {
+        size_t next_n = it->first.message.find_first_of('\n', 0);
         text += "\n";
         if (next_n != std::string::npos)
-            text += it.first.message.substr(0, next_n);
+            text += it->first.message.substr(0, next_n);
         else
-            text += it.first.message;
+            text += it->first.message;
     }
     //text += "\n\nDo you still wish to export?";
     MessageDialog msg_window(this->q, from_u8(text), _L("warnings"), wxOK);

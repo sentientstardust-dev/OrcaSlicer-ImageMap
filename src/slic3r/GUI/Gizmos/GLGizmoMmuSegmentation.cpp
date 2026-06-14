@@ -8462,14 +8462,6 @@ static std::vector<unsigned int> auto_enable_raw_top_surface_projection_zones(co
             zone->top_surface_contoning_color_lower_surfaces = true;
             changed = true;
         }
-        if (zone->modulation_mode != int(TextureMappingZone::ModulationPerimeterPathV2)) {
-            zone->modulation_mode = int(TextureMappingZone::ModulationPerimeterPathV2);
-            changed = true;
-        }
-        if (!zone->modulation_mode_manually_changed) {
-            zone->modulation_mode_manually_changed = true;
-            changed = true;
-        }
     }
 
     if (changed)

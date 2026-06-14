@@ -2358,6 +2358,7 @@ static std::vector<PerimeterPathBoundarySample> perimeter_texture_sample_polygon
     const ExPolygon                  &source,
     const std::vector<ExPolygons>    &erode_ladder,
     float                             erode_step_mm,
+    bool                              disable_smoothing,
     const PerimeterTextureMaskIndex  *top_visible_recolor_mask = nullptr,
     const PerimeterTextureTopVisibleRecolorThresholds *top_visible_recolor_thresholds = nullptr)
 {
@@ -2450,7 +2451,8 @@ static std::vector<PerimeterPathBoundarySample> perimeter_texture_sample_polygon
             samples[idx].inset_mm = smoothed[idx];
     };
 
-    smooth_insets(std::max(0.30f, 1.15f * context.base_outer_width_mm));
+    if (!disable_smoothing)
+        smooth_insets(std::max(0.30f, 1.15f * context.base_outer_width_mm));
 
     for (int pass = 0; pass < 4; ++pass) {
         for (size_t idx = 0; idx < samples.size(); ++idx) {
@@ -2467,7 +2469,8 @@ static std::vector<PerimeterPathBoundarySample> perimeter_texture_sample_polygon
         }
     }
 
-    smooth_insets(std::max(0.20f, 0.45f * context.base_outer_width_mm));
+    if (!disable_smoothing)
+        smooth_insets(std::max(0.20f, 0.45f * context.base_outer_width_mm));
 
     return samples;
 }
@@ -2496,6 +2499,7 @@ static Polygon perimeter_texture_moved_polygon_from_samples(const std::vector<Pe
 
 static ExPolygons perimeter_texture_modulated_expolygon(const ExPolygon &source,
                                                         const TextureMappingOffsetContext &context,
+                                                        bool disable_smoothing,
                                                         const ExPolygons *top_visible_recolor_mask,
                                                         const PerimeterTextureTopVisibleRecolorThresholds *top_visible_recolor_thresholds,
                                                         bool &ok)
@@ -2522,6 +2526,7 @@ static ExPolygons perimeter_texture_modulated_expolygon(const ExPolygon &source,
                                                   source,
                                                   erode_ladder,
                                                   erode_step_mm,
+                                                  disable_smoothing,
                                                   protection_mask_ptr,
                                                   top_visible_recolor_thresholds);
     if (contour_samples.size() < 3)
@@ -2542,6 +2547,7 @@ static ExPolygons perimeter_texture_modulated_expolygon(const ExPolygon &source,
                                                                             source,
                                                                             erode_ladder,
                                                                             erode_step_mm,
+                                                                            disable_smoothing,
                                                                             protection_mask_ptr,
                                                                             top_visible_recolor_thresholds));
         if (hole_samples.back().size() < 3)
@@ -2633,10 +2639,18 @@ static SurfaceCollection perimeter_path_modulated_surfaces(const LayerRegion    
 
     SurfaceCollection out;
     out.surfaces.reserve(slices.surfaces.size());
+    const bool disable_smoothing =
+        zone.uses_perimeter_path_modulation_v2() &&
+        zone.disable_v2_perimeter_path_modulation_smoothing;
     for (const Surface &surface : slices.surfaces) {
         bool ok = false;
         ExPolygons modulated =
-            perimeter_texture_modulated_expolygon(surface.expolygon, *context, top_visible_recolor_mask, top_visible_recolor_thresholds, ok);
+            perimeter_texture_modulated_expolygon(surface.expolygon,
+                                                  *context,
+                                                  disable_smoothing,
+                                                  top_visible_recolor_mask,
+                                                  top_visible_recolor_thresholds,
+                                                  ok);
         if (ok && !modulated.empty())
             out.append(std::move(modulated), surface);
         else

@@ -548,6 +548,15 @@ TextureMappingContoningSolver::nearest_measured_sample_fallback_issues(bool lowe
     return out;
 }
 
+TextureMappingContoningNearestMeasuredSampleFallbackArea
+TextureMappingContoningSolver::nearest_measured_sample_fallback_area(bool lower_surface) const
+{
+    if (!m_nearest_measured_sample_fallback_area_mutex || !m_nearest_measured_sample_fallback_areas)
+        return {};
+    std::lock_guard<std::mutex> lock(*m_nearest_measured_sample_fallback_area_mutex);
+    return (*m_nearest_measured_sample_fallback_areas)[lower_surface ? 1 : 0];
+}
+
 std::string TextureMappingContoningSolver::nearest_measured_sample_fallback_name() const
 {
     if (m_nearest_measured_sample_fallback_model.valid()) {
@@ -557,6 +566,39 @@ std::string TextureMappingContoningSolver::nearest_measured_sample_fallback_name
             return "calibrated depth kernel linear";
     }
     return "default uncalibrated";
+}
+
+bool TextureMappingContoningSolver::nearest_measured_sample_stack_compatible(
+    int stack_layers,
+    int visible_depth,
+    const std::vector<float> &surface_to_deep_layer_heights_mm,
+    const std::vector<int> &surface_to_deep_layer_ids,
+    bool lower_surface) const
+{
+    return nearest_measured_sample_compatible(stack_layers,
+                                              visible_depth,
+                                              surface_to_deep_layer_heights_mm,
+                                              surface_to_deep_layer_ids,
+                                              lower_surface,
+                                              false);
+}
+
+void TextureMappingContoningSolver::record_nearest_measured_sample_fallback_area(
+    bool lower_surface,
+    double fallback_area_mm2,
+    double total_area_mm2) const
+{
+    if (!m_nearest_measured_sample_fallback_area_mutex || !m_nearest_measured_sample_fallback_areas)
+        return;
+    if (!std::isfinite(total_area_mm2) || total_area_mm2 <= 0.)
+        return;
+    if (!std::isfinite(fallback_area_mm2))
+        fallback_area_mm2 = 0.;
+    std::lock_guard<std::mutex> lock(*m_nearest_measured_sample_fallback_area_mutex);
+    TextureMappingContoningNearestMeasuredSampleFallbackArea &area =
+        (*m_nearest_measured_sample_fallback_areas)[lower_surface ? 1 : 0];
+    area.fallback_area_mm2 += std::clamp(fallback_area_mm2, 0., total_area_mm2);
+    area.total_area_mm2 += total_area_mm2;
 }
 
 const std::vector<TextureMappingContoningSolver::Candidate>&

@@ -2098,6 +2098,87 @@ static int top_surface_image_contoning_label_valid_depth(const TopSurfaceImageCo
     return label.valid_depth > 0 ? label.valid_depth : int(label.bottom_to_top.size());
 }
 
+static double top_surface_image_contoning_grid_cell_area_mm2(
+    int row,
+    int col,
+    coord_t min_x,
+    coord_t min_y,
+    coord_t step,
+    const BoundingBox &bbox)
+{
+    const coord_t x0 = min_x + coord_t(col) * step;
+    const coord_t y0 = min_y + coord_t(row) * step;
+    const coord_t x1 = std::min<coord_t>(x0 + step, bbox.max.x());
+    const coord_t y1 = std::min<coord_t>(y0 + step, bbox.max.y());
+    if (x1 <= x0 || y1 <= y0)
+        return 0.;
+    return unscale<double>(x1 - x0) * unscale<double>(y1 - y0);
+}
+
+static void top_surface_image_contoning_record_nearest_measured_sample_fallback_area(
+    const std::vector<int>                                               &label_grid,
+    int                                                                   cols,
+    int                                                                   rows,
+    const std::vector<TopSurfaceImageContoningVectorLabel>               &labels,
+    const std::vector<std::optional<TopSurfaceImageContoningCellSample>> &cell_samples,
+    const TextureMappingContoningSolver                                  &solver,
+    bool                                                                  lower_surface,
+    const std::vector<float>                                             &surface_to_deep_layer_heights_mm,
+    const std::vector<int>                                               &surface_to_deep_layer_ids,
+    coord_t                                                               min_x,
+    coord_t                                                               min_y,
+    coord_t                                                               step,
+    const BoundingBox                                                    &bbox,
+    const ThrowIfCanceled                                                *throw_if_canceled)
+{
+    if (!solver.nearest_measured_sample_mode() ||
+        label_grid.empty() ||
+        labels.empty() ||
+        cols <= 0 ||
+        rows <= 0 ||
+        label_grid.size() != size_t(cols) * size_t(rows) ||
+        cell_samples.size() != label_grid.size())
+        return;
+
+    std::vector<unsigned char> fallback_labels(labels.size(), 0);
+    for (size_t label_idx = 0; label_idx < labels.size(); ++label_idx) {
+        const TopSurfaceImageContoningVectorLabel &label = labels[label_idx];
+        if (label.bottom_to_top.empty())
+            continue;
+        const int visible_depth = top_surface_image_contoning_label_valid_depth(label);
+        fallback_labels[label_idx] =
+            !solver.nearest_measured_sample_stack_compatible(int(label.bottom_to_top.size()),
+                                                             visible_depth,
+                                                             surface_to_deep_layer_heights_mm,
+                                                             surface_to_deep_layer_ids,
+                                                             lower_surface);
+    }
+
+    double fallback_area_mm2 = 0.;
+    double total_area_mm2 = 0.;
+    for (int row = 0; row < rows; ++row) {
+        if ((row & 15) == 0)
+            check_canceled(throw_if_canceled);
+        for (int col = 0; col < cols; ++col) {
+            const size_t grid_idx = size_t(row * cols + col);
+            if (!cell_samples[grid_idx])
+                continue;
+            const int label = label_grid[grid_idx];
+            if (label < 0 || label >= int(labels.size()))
+                continue;
+            const double area_mm2 =
+                top_surface_image_contoning_grid_cell_area_mm2(row, col, min_x, min_y, step, bbox);
+            if (area_mm2 <= 0.)
+                continue;
+            total_area_mm2 += area_mm2;
+            if (fallback_labels[size_t(label)])
+                fallback_area_mm2 += area_mm2;
+        }
+    }
+
+    solver.record_nearest_measured_sample_fallback_area(lower_surface, fallback_area_mm2, total_area_mm2);
+}
+
 struct TopSurfaceImageContoningDepthRegionPlan {
     std::vector<std::vector<TopSurfaceImageContoningVectorRegion>> fill_regions_by_depth;
     std::vector<std::vector<TopSurfaceImageContoningVectorRegion>> perimeter_regions_by_depth;
@@ -6363,6 +6444,20 @@ static void top_surface_image_contoning_solve_anchored_region(
                                                            top_surface_image_debug_elapsed_ms(debug_step_start),
                                                            grid_cells,
                                                            true);
+        top_surface_image_contoning_record_nearest_measured_sample_fallback_area(grid,
+                                                                                 cols,
+                                                                                 rows,
+                                                                                 labels,
+                                                                                 cell_samples,
+                                                                                 solver,
+                                                                                 lower_surface,
+                                                                                 source_context.surface_to_deep_layer_heights_mm,
+                                                                                 source_context.surface_to_deep_layer_ids,
+                                                                                 min_x,
+                                                                                 min_y,
+                                                                                 step,
+                                                                                 bbox,
+                                                                                 throw_if_canceled);
     }
     check_canceled(throw_if_canceled);
     if (debug_enabled)
@@ -8016,6 +8111,20 @@ static std::vector<TopSurfaceImageContoningVectorRegion> top_surface_image_conto
                                                                 source->surface_to_deep_layer_heights_mm,
                                                                 source->surface_to_deep_layer_ids,
                                                                 throw_if_canceled);
+        top_surface_image_contoning_record_nearest_measured_sample_fallback_area(grid,
+                                                                                 cols,
+                                                                                 rows,
+                                                                                 labels,
+                                                                                 cell_samples,
+                                                                                 solver,
+                                                                                 source_surface == TopSurfaceImageSourceSurface::Bottom,
+                                                                                 source->surface_to_deep_layer_heights_mm,
+                                                                                 source->surface_to_deep_layer_ids,
+                                                                                 min_x,
+                                                                                 min_y,
+                                                                                 step,
+                                                                                 bbox,
+                                                                                 throw_if_canceled);
     }
     check_canceled(throw_if_canceled);
 
@@ -8247,6 +8356,20 @@ static std::shared_ptr<const TopSurfaceImageContoningStackPlan> top_surface_imag
                                                                 source_context->surface_to_deep_layer_heights_mm,
                                                                 source_context->surface_to_deep_layer_ids,
                                                                 throw_if_canceled);
+        top_surface_image_contoning_record_nearest_measured_sample_fallback_area(grid,
+                                                                                 cols,
+                                                                                 rows,
+                                                                                 out->labels,
+                                                                                 cell_samples,
+                                                                                 solver,
+                                                                                 source_surface == TopSurfaceImageSourceSurface::Bottom,
+                                                                                 source_context->surface_to_deep_layer_heights_mm,
+                                                                                 source_context->surface_to_deep_layer_ids,
+                                                                                 min_x,
+                                                                                 min_y,
+                                                                                 step,
+                                                                                 bbox,
+                                                                                 throw_if_canceled);
     }
     for (size_t idx = 0; idx < out->cells.size(); ++idx)
         out->cells[idx].label = grid[idx];
@@ -8660,6 +8783,95 @@ static std::string top_surface_image_contoning_nearest_measured_sample_fallback_
     if (issues.size() > emitted)
         ss << "; plus " << (issues.size() - emitted) << " more mismatch records";
     ss << ".";
+    return ss.str();
+}
+
+static std::string top_surface_image_contoning_format_area_value(double value, int large_precision, int medium_precision, int small_precision)
+{
+    std::ostringstream ss;
+    const double abs_value = std::abs(value);
+    int precision = small_precision;
+    if (abs_value >= 100.)
+        precision = large_precision;
+    else if (abs_value >= 1.)
+        precision = medium_precision;
+    ss << std::fixed << std::setprecision(precision) << value;
+    return ss.str();
+}
+
+static std::string top_surface_image_contoning_format_fallback_percentage(double fallback_area_mm2, double total_area_mm2)
+{
+    if (!std::isfinite(fallback_area_mm2) ||
+        !std::isfinite(total_area_mm2) ||
+        total_area_mm2 <= 0.)
+        return {};
+    const double pct = std::clamp(100. * fallback_area_mm2 / total_area_mm2, 0., 100.);
+    std::ostringstream ss;
+    int precision = 5;
+    if (pct >= 10.)
+        precision = 1;
+    else if (pct >= 1.)
+        precision = 2;
+    else if (pct >= 0.01)
+        precision = 3;
+    ss << std::fixed << std::setprecision(precision) << pct;
+    return ss.str();
+}
+
+static double top_surface_image_contoning_fallback_percentage_value(
+    const TextureMappingContoningNearestMeasuredSampleFallbackArea &area)
+{
+    if (!std::isfinite(area.fallback_area_mm2) ||
+        !std::isfinite(area.total_area_mm2) ||
+        area.total_area_mm2 <= 0.)
+        return std::numeric_limits<double>::quiet_NaN();
+    return std::clamp(100. * area.fallback_area_mm2 / area.total_area_mm2, 0., 100.);
+}
+
+static std::optional<TextureMappingContoningNearestMeasuredSampleFallbackArea>
+top_surface_image_contoning_nearest_measured_sample_total_fallback_area(
+    const TextureMappingContoningSolver &solver,
+    bool upper_nearest_sample_fallback,
+    bool lower_nearest_sample_fallback)
+{
+    TextureMappingContoningNearestMeasuredSampleFallbackArea total_area;
+    bool has_area = false;
+    auto add_area = [&](bool lower_surface) {
+        const TextureMappingContoningNearestMeasuredSampleFallbackArea area =
+            solver.nearest_measured_sample_fallback_area(lower_surface);
+        if (!std::isfinite(area.total_area_mm2) || area.total_area_mm2 <= 0.)
+            return;
+        total_area.fallback_area_mm2 += std::max(0., area.fallback_area_mm2);
+        total_area.total_area_mm2 += area.total_area_mm2;
+        has_area = true;
+    };
+
+    if (upper_nearest_sample_fallback)
+        add_area(false);
+    if (lower_nearest_sample_fallback)
+        add_area(true);
+    if (!has_area || total_area.total_area_mm2 <= 0.)
+        return std::nullopt;
+    return total_area;
+}
+
+static std::string top_surface_image_contoning_nearest_measured_sample_fallback_area_details(
+    const TextureMappingContoningNearestMeasuredSampleFallbackArea &total_area)
+{
+    if (total_area.total_area_mm2 <= 0.)
+        return {};
+
+    const std::string pct =
+        top_surface_image_contoning_format_fallback_percentage(total_area.fallback_area_mm2, total_area.total_area_mm2);
+    if (pct.empty())
+        return {};
+
+    std::ostringstream ss;
+    ss << "Fallback affected " << pct << "% of sampled surface area ("
+       << top_surface_image_contoning_format_area_value(total_area.fallback_area_mm2, 1, 2, 3)
+       << " mm2 of "
+       << top_surface_image_contoning_format_area_value(total_area.total_area_mm2, 1, 2, 3)
+       << " mm2).";
     return ss.str();
 }
 
@@ -9135,7 +9347,7 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
         plan.contoning_flat_surface_infill_mode =
             std::clamp(zone->effective_top_surface_contoning_flat_surface_infill_mode(),
                        int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinear),
-                       int(TextureMappingZone::ContoningFlatSurfaceInfillAdaptiveLines));
+                       int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariableOverlap));
         plan.contoning_layer_phase_enabled = zone->effective_top_surface_contoning_layer_phase_enabled();
         plan.contoning_varied_infill_angles_enabled = zone->top_surface_contoning_varied_infill_angles_enabled;
         plan.contoning_blue_noise_error_diffusion_enabled =
@@ -9279,32 +9491,47 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
             const bool upper_nearest_sample_fallback = contoning_solver.nearest_measured_sample_fallback_used(false);
             const bool lower_nearest_sample_fallback = contoning_solver.nearest_measured_sample_fallback_used(true);
             if ((upper_nearest_sample_fallback || lower_nearest_sample_fallback) && object != nullptr) {
-                const char *surface_name =
-                    upper_nearest_sample_fallback && lower_nearest_sample_fallback ?
-                        "upper and lower surfaces" :
-                        (upper_nearest_sample_fallback ? "upper surfaces" : "lower surfaces");
-                std::vector<TextureMappingContoningNearestMeasuredSampleFallbackIssue> fallback_issues;
-                if (upper_nearest_sample_fallback) {
-                    std::vector<TextureMappingContoningNearestMeasuredSampleFallbackIssue> upper_issues =
-                        contoning_solver.nearest_measured_sample_fallback_issues(false);
-                    fallback_issues.insert(fallback_issues.end(), upper_issues.begin(), upper_issues.end());
+                const std::optional<TextureMappingContoningNearestMeasuredSampleFallbackArea> fallback_area =
+                    top_surface_image_contoning_nearest_measured_sample_total_fallback_area(contoning_solver,
+                                                                                           upper_nearest_sample_fallback,
+                                                                                           lower_nearest_sample_fallback);
+                const double fallback_pct =
+                    fallback_area ? top_surface_image_contoning_fallback_percentage_value(*fallback_area) :
+                                    std::numeric_limits<double>::quiet_NaN();
+                if (!std::isfinite(fallback_pct) || fallback_pct >= 0.01) {
+                    const char *surface_name =
+                        upper_nearest_sample_fallback && lower_nearest_sample_fallback ?
+                            "upper and lower surfaces" :
+                            (upper_nearest_sample_fallback ? "upper surfaces" : "lower surfaces");
+                    std::vector<TextureMappingContoningNearestMeasuredSampleFallbackIssue> fallback_issues;
+                    if (upper_nearest_sample_fallback) {
+                        std::vector<TextureMappingContoningNearestMeasuredSampleFallbackIssue> upper_issues =
+                            contoning_solver.nearest_measured_sample_fallback_issues(false);
+                        fallback_issues.insert(fallback_issues.end(), upper_issues.begin(), upper_issues.end());
+                    }
+                    if (lower_nearest_sample_fallback) {
+                        std::vector<TextureMappingContoningNearestMeasuredSampleFallbackIssue> lower_issues =
+                            contoning_solver.nearest_measured_sample_fallback_issues(true);
+                        fallback_issues.insert(fallback_issues.end(), lower_issues.begin(), lower_issues.end());
+                    }
+                    std::string warning = Slic3r::format(
+                        L("Top-surface color prediction fell back from calibrated nearest measured sample to %1% for %2% because the current layer heights or stack depth do not match the calibration sheet."),
+                        contoning_solver.nearest_measured_sample_fallback_name(),
+                        surface_name);
+                    const std::string details =
+                        top_surface_image_contoning_nearest_measured_sample_fallback_details(fallback_issues);
+                    if (!details.empty())
+                        warning += " " + details;
+                    if (fallback_area) {
+                        const std::string area_details =
+                            top_surface_image_contoning_nearest_measured_sample_fallback_area_details(*fallback_area);
+                        if (!area_details.empty())
+                            warning += " " + area_details;
+                    }
+                    object->add_slicing_warning(
+                        PrintStateBase::WarningLevel::NON_CRITICAL,
+                        warning);
                 }
-                if (lower_nearest_sample_fallback) {
-                    std::vector<TextureMappingContoningNearestMeasuredSampleFallbackIssue> lower_issues =
-                        contoning_solver.nearest_measured_sample_fallback_issues(true);
-                    fallback_issues.insert(fallback_issues.end(), lower_issues.begin(), lower_issues.end());
-                }
-                std::string warning = Slic3r::format(
-                    L("Top-surface color prediction fell back from calibrated nearest measured sample to %1% for %2% because the current layer heights or stack depth do not match the calibration sheet."),
-                    contoning_solver.nearest_measured_sample_fallback_name(),
-                    surface_name);
-                const std::string details =
-                    top_surface_image_contoning_nearest_measured_sample_fallback_details(fallback_issues);
-                if (!details.empty())
-                    warning += " " + details;
-                object->add_slicing_warning(
-                    PrintStateBase::WarningLevel::NON_CRITICAL,
-                    warning);
             }
         } else {
             for (int depth = 0; depth < stack_depth; ++depth) {
@@ -10867,6 +11094,7 @@ static bool top_surface_image_contoning_boundary_skin_mode(int mode)
 {
     return mode == int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinFixed) ||
            mode == int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariable) ||
+           mode == int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariableOverlap) ||
            mode == int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinHybrid);
 }
 
@@ -14599,7 +14827,12 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree,
                            surface_fill.params.texture_mapping_top_surface_contoning_flat_surface_infill_mode)) {
                 const bool variable_width_boundary_skin =
                     surface_fill.params.texture_mapping_top_surface_contoning_flat_surface_infill_mode ==
-                    int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariable);
+                        int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariable) ||
+                    surface_fill.params.texture_mapping_top_surface_contoning_flat_surface_infill_mode ==
+                        int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariableOverlap);
+                const bool overlap_boundary_skin =
+                    surface_fill.params.texture_mapping_top_surface_contoning_flat_surface_infill_mode ==
+                    int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariableOverlap);
                 const bool hybrid_boundary_skin =
                     surface_fill.params.texture_mapping_top_surface_contoning_flat_surface_infill_mode ==
                     int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinHybrid);
@@ -14626,7 +14859,8 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree,
                 fallback_params.flow = fallback_flow;
                 fallback_params.pattern = ipRectilinear;
                 fallback_params.no_edge_overlap = true;
-                fallback_params.edge_overlap_width_factor = 0.0f;
+                fallback_params.edge_overlap_width_factor =
+                    overlap_boundary_skin ? 1.0f : (variable_width_boundary_skin ? 0.5f : 0.0f);
                 ExtrusionEntitiesPtr hybrid_interior_entities;
                 if (!hybrid_boundary_skin && collection && !collection->empty()) {
                     apply_top_surface_image_collection_metadata(*collection, surface_fill.params, std::nullopt, throw_if_canceled_ptr);

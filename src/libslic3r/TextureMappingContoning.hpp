@@ -38,6 +38,11 @@ struct TextureMappingContoningNearestMeasuredSampleFallbackIssue {
     float expected_layer_height_mm { 0.f };
 };
 
+struct TextureMappingContoningNearestMeasuredSampleFallbackArea {
+    double fallback_area_mm2 { 0. };
+    double total_area_mm2 { 0. };
+};
+
 class TextureMappingContoningSolver
 {
 public:
@@ -56,7 +61,16 @@ public:
     bool nearest_measured_sample_fallback_used() const;
     bool nearest_measured_sample_fallback_used(bool lower_surface) const;
     std::vector<TextureMappingContoningNearestMeasuredSampleFallbackIssue> nearest_measured_sample_fallback_issues(bool lower_surface) const;
+    TextureMappingContoningNearestMeasuredSampleFallbackArea nearest_measured_sample_fallback_area(bool lower_surface) const;
     std::string nearest_measured_sample_fallback_name() const;
+    bool nearest_measured_sample_stack_compatible(int                       stack_layers,
+                                                  int                       visible_depth,
+                                                  const std::vector<float> &surface_to_deep_layer_heights_mm,
+                                                  const std::vector<int>   &surface_to_deep_layer_ids,
+                                                  bool                      lower_surface) const;
+    void record_nearest_measured_sample_fallback_area(bool lower_surface,
+                                                      double fallback_area_mm2,
+                                                      double total_area_mm2) const;
 
     TextureMappingContoningStack solve(const std::array<float, 3> &target_rgb,
                                        int                         stack_layers,
@@ -153,6 +167,8 @@ private:
     mutable std::shared_ptr<std::atomic<bool>> m_nearest_measured_sample_lower_fallback_used { std::make_shared<std::atomic<bool>>(false) };
     mutable std::shared_ptr<std::mutex> m_nearest_measured_sample_fallback_issue_mutex { std::make_shared<std::mutex>() };
     mutable std::shared_ptr<std::vector<TextureMappingContoningNearestMeasuredSampleFallbackIssue>> m_nearest_measured_sample_fallback_issues { std::make_shared<std::vector<TextureMappingContoningNearestMeasuredSampleFallbackIssue>>() };
+    mutable std::shared_ptr<std::mutex> m_nearest_measured_sample_fallback_area_mutex { std::make_shared<std::mutex>() };
+    mutable std::shared_ptr<std::array<TextureMappingContoningNearestMeasuredSampleFallbackArea, 2>> m_nearest_measured_sample_fallback_areas { std::make_shared<std::array<TextureMappingContoningNearestMeasuredSampleFallbackArea, 2>>() };
 };
 
 std::vector<unsigned int> texture_mapping_contoning_components_bottom_to_top(const TextureMappingZone      &zone,
