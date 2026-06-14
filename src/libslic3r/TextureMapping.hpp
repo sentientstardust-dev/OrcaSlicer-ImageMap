@@ -192,6 +192,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultModulationModeManuallyChanged = false;
     static constexpr bool  DefaultUseModulatedOverhangGeometryForSupport = false;
     static constexpr bool  DefaultDisableV2PerimeterPathModulationSmoothing = false;
+    static constexpr bool  DefaultJoinExtrusionPathAtCorners = false;
     static constexpr bool  DefaultRecolorSmallPerimeterLoops = false;
     static constexpr bool  DefaultRecolorTopVisiblePerimeterSections = false;
     static constexpr int   DefaultTopVisiblePerimeterRecolorAggressiveness = int(TopVisibleRecolorAggressive);
@@ -489,6 +490,7 @@ struct TextureMappingZone
     int         modulation_mode = DefaultModulationMode;
     bool        use_modulated_overhang_geometry_for_support = DefaultUseModulatedOverhangGeometryForSupport;
     bool        disable_v2_perimeter_path_modulation_smoothing = DefaultDisableV2PerimeterPathModulationSmoothing;
+    bool        join_extrusion_path_at_corners = DefaultJoinExtrusionPathAtCorners;
     bool        modulation_mode_manually_changed = DefaultModulationModeManuallyChanged;
     bool        recolor_small_perimeter_loops = DefaultRecolorSmallPerimeterLoops;
     bool        recolor_top_visible_perimeter_sections = DefaultRecolorTopVisiblePerimeterSections;
@@ -816,6 +818,7 @@ struct TextureMappingZone
         nonlinear_offset_adjustment = DefaultNonlinearOffsetAdjustment;
         use_modulated_overhang_geometry_for_support = DefaultUseModulatedOverhangGeometryForSupport;
         disable_v2_perimeter_path_modulation_smoothing = DefaultDisableV2PerimeterPathModulationSmoothing;
+        join_extrusion_path_at_corners = DefaultJoinExtrusionPathAtCorners;
         modulation_mode = default_modulation_mode_for_surface_pattern(surface_pattern);
         modulation_mode_manually_changed = DefaultModulationModeManuallyChanged;
         recolor_small_perimeter_loops = DefaultRecolorSmallPerimeterLoops;

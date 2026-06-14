@@ -2504,6 +2504,7 @@ public:
                                         int modulation_mode,
                                         bool use_modulated_overhang_geometry_for_support,
                                         bool disable_v2_perimeter_path_modulation_smoothing,
+                                        bool join_extrusion_path_at_corners,
                                         bool modulation_mode_manually_changed,
                                         bool recolor_small_perimeter_loops,
                                         bool recolor_top_visible_perimeter_sections,
@@ -2993,6 +2994,10 @@ public:
         m_disable_v2_perimeter_path_modulation_smoothing_checkbox->SetToolTip(
             _L("Leaves v2 perimeter path modulation insets unsmoothed so fine texture changes can produce bumpier path geometry."));
         experimental_box->Add(m_disable_v2_perimeter_path_modulation_smoothing_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
+        m_join_extrusion_path_at_corners_checkbox =
+            new wxCheckBox(experimental_page, wxID_ANY, _L("Join extrusion path at corners"));
+        m_join_extrusion_path_at_corners_checkbox->SetValue(join_extrusion_path_at_corners);
+        experimental_box->Add(m_join_extrusion_path_at_corners_checkbox, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, gap);
         m_top_visible_perimeter_recolor_point_sampling_checkbox =
             new wxCheckBox(experimental_page, wxID_ANY, _L("Point-sample visible layer-line recolor"));
         m_top_visible_perimeter_recolor_point_sampling_checkbox->SetValue(top_visible_perimeter_recolor_point_sampling);
@@ -3920,6 +3925,11 @@ public:
         return modulation_mode() == int(TextureMappingZone::ModulationPerimeterPathV2) &&
                m_disable_v2_perimeter_path_modulation_smoothing_checkbox != nullptr &&
                m_disable_v2_perimeter_path_modulation_smoothing_checkbox->GetValue();
+    }
+    bool join_extrusion_path_at_corners() const
+    {
+        return m_join_extrusion_path_at_corners_checkbox != nullptr &&
+               m_join_extrusion_path_at_corners_checkbox->GetValue();
     }
     int modulation_mode() const
     {
@@ -5457,6 +5467,8 @@ private:
             m_use_modulated_overhang_geometry_for_support_checkbox->Enable(perimeter_path_v2_mode);
         if (m_disable_v2_perimeter_path_modulation_smoothing_checkbox != nullptr)
             m_disable_v2_perimeter_path_modulation_smoothing_checkbox->Enable(perimeter_path_v2_mode);
+        if (m_join_extrusion_path_at_corners_checkbox != nullptr)
+            m_join_extrusion_path_at_corners_checkbox->Enable(modulation_mode() == int(TextureMappingZone::ModulationLineWidth));
         if (m_top_visible_perimeter_recolor_point_sampling_checkbox != nullptr)
             m_top_visible_perimeter_recolor_point_sampling_checkbox->Enable(perimeter_path_v2_mode);
         const bool top_visible_enabled =
@@ -5777,6 +5789,7 @@ private:
     wxSpinCtrl *m_filament_overhang_contrast_spin {nullptr};
     wxCheckBox *m_use_modulated_overhang_geometry_for_support_checkbox {nullptr};
     wxCheckBox *m_disable_v2_perimeter_path_modulation_smoothing_checkbox {nullptr};
+    wxCheckBox *m_join_extrusion_path_at_corners_checkbox {nullptr};
     wxChoice *m_modulation_mode_choice {nullptr};
     std::vector<int> m_modulation_mode_choice_values;
     bool m_modulation_mode_manually_changed {false};
@@ -10882,6 +10895,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
                                                     updated.modulation_mode,
                                                     updated.use_modulated_overhang_geometry_for_support,
                                                     updated.disable_v2_perimeter_path_modulation_smoothing,
+                                                    updated.join_extrusion_path_at_corners,
                                                     updated.modulation_mode_manually_changed,
                                                     updated.recolor_small_perimeter_loops,
                                                     updated.recolor_top_visible_perimeter_sections,
@@ -10976,6 +10990,7 @@ void Sidebar::update_texture_mapping_panel(bool sync_manager)
             updated.nonlinear_offset_adjustment = dlg.nonlinear_offset_adjustment();
             updated.modulation_mode = dlg.modulation_mode();
             updated.use_modulated_overhang_geometry_for_support = dlg.use_modulated_overhang_geometry_for_support();
+            updated.join_extrusion_path_at_corners = dlg.join_extrusion_path_at_corners();
             updated.modulation_mode_manually_changed = dlg.modulation_mode_manually_changed();
             updated.apply_default_modulation_mode();
             updated.disable_v2_perimeter_path_modulation_smoothing =
