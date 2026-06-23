@@ -9,7 +9,6 @@
 #include <atomic>
 #include <array>
 #include <cstdint>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -96,12 +95,6 @@ public:
                                                  bool                             record_nearest_measured_sample_fallback = true) const;
 
 private:
-    struct Candidate {
-        std::array<float, 3> rgb { { 0.f, 0.f, 0.f } };
-        std::array<float, 3> oklab { { 0.f, 0.f, 0.f } };
-        std::vector<int> counts;
-        float dark_score { 0.f };
-    };
     struct PredictionOptions {
         const ColorSolverCalibratedStackModel *calibrated_stack_model { nullptr };
         bool beer_lambert_rgb_correction_enabled { false };
@@ -109,7 +102,6 @@ private:
         bool adaptive_spectral_correction_enabled { false };
     };
 
-    const std::vector<Candidate>& candidates_for_depth(int stack_layers) const;
     void arrange_stack_for_light_path(std::vector<unsigned int> &bottom_to_top,
                                       const std::array<float, 3> &target_rgb) const;
     std::optional<size_t> component_index(unsigned int component_id) const;
@@ -142,7 +134,6 @@ private:
     std::vector<unsigned int> m_components_bottom_to_top;
     std::vector<std::array<float, 3>> m_component_colors;
     std::array<float, 3> m_background_rgb { { 0.f, 0.f, 0.f } };
-    std::vector<float> m_component_luminance;
     std::vector<float> m_effective_transmission_distances_mm;
     std::vector<float> m_component_layer_opacity;
     float m_layer_height_mm { 0.2f };
@@ -159,8 +150,6 @@ private:
     ColorSolverCalibratedStackModel m_nearest_measured_sample_fallback_model;
     int m_nearest_measured_sample_fallback_mode { TextureMappingZone::SlicerDefaultTopSurfaceContoningColorPredictionMode };
     std::vector<ColorSolverStackComponentRole> m_component_roles;
-    mutable std::map<int, std::vector<Candidate>> m_candidates_by_depth;
-    mutable std::shared_ptr<std::mutex> m_candidate_mutex { std::make_shared<std::mutex>() };
     mutable std::shared_ptr<ColorSolverOrderedStackCandidateCache> m_ordered_candidate_cache { std::make_shared<ColorSolverOrderedStackCandidateCache>() };
     mutable std::shared_ptr<std::mutex> m_ordered_candidate_cache_mutex { std::make_shared<std::mutex>() };
     mutable std::shared_ptr<std::atomic<bool>> m_nearest_measured_sample_upper_fallback_used { std::make_shared<std::atomic<bool>>(false) };

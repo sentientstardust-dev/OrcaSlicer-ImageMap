@@ -9,9 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
-#include <functional>
 #include <limits>
-#include <numeric>
 
 namespace Slic3r {
 namespace {
@@ -188,22 +186,6 @@ float perceptual_error(const std::array<float, 3> &lhs, const std::array<float, 
     const float da = lhs[1] - rhs[1];
     const float db = lhs[2] - rhs[2];
     return dl * dl + 4.f * da * da + 4.f * db * db;
-}
-
-void enumerate_counts(size_t component_idx,
-                      int remaining,
-                      std::vector<int> &counts,
-                      std::vector<std::vector<int>> &out)
-{
-    if (component_idx + 1 == counts.size()) {
-        counts[component_idx] = remaining;
-        out.emplace_back(counts);
-        return;
-    }
-    for (int count = 0; count <= remaining; ++count) {
-        counts[component_idx] = count;
-        enumerate_counts(component_idx + 1, remaining - count, counts, out);
-    }
 }
 
 bool can_finish_without_repeat(const std::vector<unsigned int> &ids,
@@ -442,9 +424,6 @@ TextureMappingContoningSolver::TextureMappingContoningSolver(const TextureMappin
         return;
     m_component_roles = texture_mapping_contoning_component_roles(zone, m_component_ids.size());
 
-    m_component_luminance.reserve(m_component_ids.size());
-    for (const unsigned int id : m_component_ids)
-        m_component_luminance.emplace_back(filament_luminance(config, id));
     std::vector<float> background_weights(m_component_colors.size(), 1.f / float(m_component_colors.size()));
     m_background_rgb = mix_color_solver_components(m_component_colors, background_weights, m_mix_model);
     m_effective_transmission_distances_mm =
@@ -593,42 +572,6 @@ void TextureMappingContoningSolver::record_nearest_measured_sample_fallback_area
         (*m_nearest_measured_sample_fallback_areas)[lower_surface ? 1 : 0];
     area.fallback_area_mm2 += std::clamp(fallback_area_mm2, 0., total_area_mm2);
     area.total_area_mm2 += total_area_mm2;
-}
-
-const std::vector<TextureMappingContoningSolver::Candidate>&
-TextureMappingContoningSolver::candidates_for_depth(int stack_layers) const
-{
-    const int depth = std::clamp(stack_layers,
-                                 TextureMappingZone::MinTopSurfaceContoningStackLayers,
-                                 TextureMappingZone::MaxTopSurfaceContoningStackLayers);
-    std::lock_guard<std::mutex> lock(*m_candidate_mutex);
-    auto found = m_candidates_by_depth.find(depth);
-    if (found != m_candidates_by_depth.end())
-        return found->second;
-
-    std::vector<Candidate> candidates;
-    if (!valid())
-        return m_candidates_by_depth.emplace(depth, std::move(candidates)).first->second;
-
-    std::vector<std::vector<int>> counts_list;
-    std::vector<int> counts(m_component_ids.size(), 0);
-    enumerate_counts(0, depth, counts, counts_list);
-    candidates.reserve(counts_list.size());
-    for (std::vector<int> &candidate_counts : counts_list) {
-        std::vector<float> weights(candidate_counts.size(), 0.f);
-        for (size_t idx = 0; idx < candidate_counts.size(); ++idx)
-            weights[idx] = float(candidate_counts[idx]) / float(std::max(1, depth));
-
-        Candidate candidate;
-        candidate.counts = std::move(candidate_counts);
-        candidate.rgb = mix_color_solver_components(m_component_colors, weights, m_mix_model);
-        candidate.oklab = color_solver_oklab_from_srgb(candidate.rgb);
-        for (size_t idx = 0; idx < candidate.counts.size() && idx < m_component_luminance.size(); ++idx)
-            candidate.dark_score += float(candidate.counts[idx]) * (1.f - clamp01(m_component_luminance[idx]));
-        candidates.emplace_back(std::move(candidate));
-    }
-
-    return m_candidates_by_depth.emplace(depth, std::move(candidates)).first->second;
 }
 
 std::optional<size_t> TextureMappingContoningSolver::component_index(unsigned int component_id) const
@@ -1059,45 +1002,6 @@ TextureMappingContoningStack TextureMappingContoningSolver::solve_impl(
         }
     }
 
-    const std::vector<Candidate> &candidates = candidates_for_depth(depth);
-    if (candidates.empty())
-        return out;
-
-    const std::array<float, 3> target_oklab = color_solver_oklab_from_srgb(target_rgb);
-    size_t best_idx = size_t(-1);
-    float best_error = std::numeric_limits<float>::max();
-    float best_dark_score = -std::numeric_limits<float>::max();
-    for (size_t idx = 0; idx < candidates.size(); ++idx) {
-        const Candidate &candidate = candidates[idx];
-        const float error = perceptual_error(candidate.oklab, target_oklab);
-        const bool near_tie = std::isfinite(best_error) && error <= best_error * 1.03f + 1e-6f;
-        if (error < best_error || (near_tie && candidate.dark_score > best_dark_score)) {
-            best_idx = idx;
-            best_error = error;
-            best_dark_score = candidate.dark_score;
-        }
-    }
-    if (best_idx >= candidates.size())
-        return out;
-
-    const Candidate &best = candidates[best_idx];
-    out.bottom_to_top.reserve(size_t(depth));
-    for (const unsigned int ordered_id : m_components_bottom_to_top) {
-        const auto component_it = std::find(m_component_ids.begin(), m_component_ids.end(), ordered_id);
-        if (component_it == m_component_ids.end())
-            continue;
-        const size_t component_idx = size_t(component_it - m_component_ids.begin());
-        const int count = component_idx < best.counts.size() ? best.counts[component_idx] : 0;
-        for (int i = 0; i < count; ++i)
-            out.bottom_to_top.emplace_back(ordered_id);
-    }
-    while (int(out.bottom_to_top.size()) < depth)
-        out.bottom_to_top.emplace_back(m_components_bottom_to_top.empty() ? m_component_ids.front() : m_components_bottom_to_top.back());
-    if (int(out.bottom_to_top.size()) > depth)
-        out.bottom_to_top.resize(size_t(depth));
-    arrange_stack_for_light_path(out.bottom_to_top, target_rgb);
-    if (lower_surface && m_td_adjustment_enabled)
-        std::reverse(out.bottom_to_top.begin(), out.bottom_to_top.end());
     return out;
 }
 
