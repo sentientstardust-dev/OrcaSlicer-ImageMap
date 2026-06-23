@@ -1377,10 +1377,7 @@ static std::string encode_texture_mapping_component_ids(const std::vector<unsign
 static std::vector<unsigned int> texture_mapping_selected_ids(const TextureMappingZone &zone, size_t num_physical)
 {
     std::vector<unsigned int> ids = TextureMappingManager::selected_component_ids(zone, num_physical);
-    ids.erase(std::remove_if(ids.begin(), ids.end(), [num_physical](unsigned int id) {
-        return id == 0 || id > num_physical || id > 9;
-    }), ids.end());
-    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    ids = TextureMappingManager::canonical_component_ids(ids, std::min<size_t>(num_physical, 9));
     if (zone.is_linear_gradient())
         return ids;
     if (ids.size() < 2) {

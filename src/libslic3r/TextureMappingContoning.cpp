@@ -337,10 +337,7 @@ std::vector<unsigned int> texture_mapping_contoning_components_bottom_to_top(
     const PrintConfig &config,
     std::vector<unsigned int> component_ids)
 {
-    component_ids.erase(std::remove_if(component_ids.begin(), component_ids.end(), [](unsigned int id) {
-        return id == 0;
-    }), component_ids.end());
-    component_ids.erase(std::unique(component_ids.begin(), component_ids.end()), component_ids.end());
+    component_ids = TextureMappingManager::canonical_component_ids(component_ids, config.filament_colour.values.size());
     if (component_ids.empty())
         return component_ids;
 
@@ -437,10 +434,7 @@ TextureMappingContoningSolver::TextureMappingContoningSolver(const TextureMappin
         m_layer_height_mm = 0.2f;
     m_surface_scatter = zone.effective_top_surface_contoning_surface_scatter_enabled() ? CONTONING_SURFACE_SCATTER : 0.f;
 
-    component_ids.erase(std::remove_if(component_ids.begin(), component_ids.end(), [&config](unsigned int id) {
-        return id == 0 || id > config.filament_colour.values.size();
-    }), component_ids.end());
-    component_ids.erase(std::unique(component_ids.begin(), component_ids.end()), component_ids.end());
+    component_ids = TextureMappingManager::canonical_component_ids(component_ids, config.filament_colour.values.size());
     m_component_ids = component_ids;
     if (!texture_mapping_contoning_component_colors(config, m_component_ids, m_component_colors))
         m_component_ids.clear();

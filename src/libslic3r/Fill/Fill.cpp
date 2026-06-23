@@ -1531,8 +1531,7 @@ static std::vector<unsigned int> top_surface_image_components_bottom_to_top(cons
                                                                             const PrintConfig &config,
                                                                             std::vector<unsigned int> components)
 {
-    components.erase(std::remove_if(components.begin(), components.end(), [](unsigned int id) { return id == 0; }), components.end());
-    components.erase(std::unique(components.begin(), components.end()), components.end());
+    components = TextureMappingManager::canonical_component_ids(components, config.filament_colour.values.size());
     if (components.empty())
         return components;
 
@@ -9283,10 +9282,7 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
                                                                  filament_colours,
                                                                  components,
                                                                  num_physical);
-        components.erase(std::remove_if(components.begin(), components.end(), [num_physical](unsigned int id) {
-            return id == 0 || id > num_physical;
-        }), components.end());
-        components.erase(std::unique(components.begin(), components.end()), components.end());
+        components = TextureMappingManager::canonical_component_ids(components, num_physical);
         if (components.empty())
             continue;
 

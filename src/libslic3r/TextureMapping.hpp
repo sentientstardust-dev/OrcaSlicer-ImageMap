@@ -1090,6 +1090,8 @@ public:
     static std::string filament_color_mode_name(int filament_color_mode);
     static size_t expected_component_count(int mapping_mode, int filament_color_mode);
     static bool component_count_mismatch(const TextureMappingZone &zone, size_t num_physical);
+    static std::vector<unsigned int> canonical_component_ids(const std::vector<unsigned int> &ids,
+                                                             size_t                           num_physical);
     static std::vector<unsigned int> effective_texture_component_ids(const TextureMappingZone      &zone,
                                                                      size_t                         num_physical,
                                                                      const std::vector<std::string> &filament_colours);

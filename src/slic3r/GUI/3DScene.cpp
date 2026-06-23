@@ -372,10 +372,7 @@ bool model_volume_uses_texture_mapping_zone(const ModelVolume &model_volume, uns
 std::vector<unsigned int> linear_gradient_component_ids_for_arrow(const TextureMappingZone &zone, size_t num_physical)
 {
     std::vector<unsigned int> ids = TextureMappingManager::selected_component_ids(zone, num_physical);
-    ids.erase(std::remove_if(ids.begin(), ids.end(), [num_physical](unsigned int id) {
-        return id == 0 || id > num_physical;
-    }), ids.end());
-    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    ids = TextureMappingManager::canonical_component_ids(ids, num_physical);
     if (ids.empty() && num_physical >= 1)
         ids = {1};
     return ids;

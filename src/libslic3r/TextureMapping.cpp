@@ -3606,6 +3606,24 @@ bool TextureMappingManager::component_count_mismatch(const TextureMappingZone &z
     return expected != 0 && selected_component_ids(zone, num_physical).size() != expected;
 }
 
+std::vector<unsigned int> TextureMappingManager::canonical_component_ids(const std::vector<unsigned int> &ids,
+                                                                         size_t                           num_physical)
+{
+    std::vector<unsigned int> result;
+    if (num_physical == 0)
+        return result;
+
+    std::vector<char> seen(num_physical + 1, 0);
+    result.reserve(ids.size());
+    for (const unsigned int id : ids) {
+        if (id == 0 || id > num_physical || seen[id] != 0)
+            continue;
+        seen[id] = 1;
+        result.emplace_back(id);
+    }
+    return result;
+}
+
 std::vector<TextureMappingZone::LinearGradientStop> TextureMappingManager::normalized_linear_gradient_stops(const TextureMappingZone &zone,
                                                                                                             size_t                    num_physical)
 {
@@ -3723,25 +3741,25 @@ std::vector<float> TextureMappingManager::linear_gradient_compact_weights(float 
 std::vector<unsigned int> TextureMappingManager::selected_component_ids(const TextureMappingZone &zone, size_t num_physical)
 {
     if (zone.is_linear_gradient())
-        return linear_gradient_component_ids_from_stops(zone, num_physical);
+        return canonical_component_ids(linear_gradient_component_ids_from_stops(zone, num_physical), num_physical);
 
     std::vector<unsigned int> ids = decode_component_ids(zone.component_ids, num_physical);
     if (!ids.empty()) {
-        return ids;
+        return canonical_component_ids(ids, num_physical);
     }
 
     if (zone.component_a >= 1 && zone.component_a <= num_physical)
         ids.emplace_back(zone.component_a);
     if (zone.component_b >= 1 && zone.component_b <= num_physical && zone.component_b != zone.component_a)
         ids.emplace_back(zone.component_b);
-    return ids;
+    return canonical_component_ids(ids, num_physical);
 }
 
 std::vector<unsigned int> TextureMappingManager::effective_texture_component_ids(const TextureMappingZone      &zone,
                                                                                  size_t                         num_physical,
                                                                                  const std::vector<std::string> &filament_colours)
 {
-    std::vector<unsigned int> selected = selected_component_ids(zone, num_physical);
+    std::vector<unsigned int> selected = canonical_component_ids(selected_component_ids(zone, num_physical), num_physical);
     const size_t expected = expected_component_count(zone.texture_mapping_mode, zone.filament_color_mode);
     if (expected == 0)
         return selected;
@@ -3785,7 +3803,7 @@ std::vector<unsigned int> TextureMappingManager::effective_texture_component_ids
             if (id != 0)
                 result.emplace_back(id);
         }
-        return result;
+        return canonical_component_ids(result, num_physical);
     }
 
     std::vector<bool> selected_used(selected.size(), false);
@@ -3816,7 +3834,7 @@ std::vector<unsigned int> TextureMappingManager::effective_texture_component_ids
             result.emplace_back(id);
     }
 
-    return result;
+    return canonical_component_ids(result, num_physical);
 }
 
 bool TextureMappingManager::auto_adjust_texture_component_ids(TextureMappingZone            &zone,
@@ -3937,11 +3955,7 @@ unsigned int TextureMappingManager::resolve_zone_component(const TextureMappingZ
     std::vector<unsigned int> component_ids = zone.is_image_texture() ?
         effective_texture_component_ids(zone, num_physical, filament_colours) :
         selected_component_ids(zone, num_physical);
-    component_ids.erase(std::remove_if(component_ids.begin(),
-                                       component_ids.end(),
-                                       [num_physical](unsigned int id) { return id == 0 || id > num_physical; }),
-                        component_ids.end());
-    component_ids.erase(std::unique(component_ids.begin(), component_ids.end()), component_ids.end());
+    component_ids = canonical_component_ids(component_ids, num_physical);
     if (component_ids.empty())
         return 0;
 

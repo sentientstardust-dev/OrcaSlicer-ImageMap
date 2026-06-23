@@ -3347,6 +3347,8 @@ void append_texture_mapping_raw_top_surface_component_ids(const PrintObject &pri
     if (num_physical == 0)
         return;
 
+    component_ids = TextureMappingManager::canonical_component_ids(component_ids, num_physical);
+
     const ModelObject *model_object = print_object.model_object();
     if (model_object == nullptr)
         return;
@@ -3502,6 +3504,7 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
                                                              component_ids,
                                                              num_physical,
                                                              raw_top_surface_depth_override);
+    component_ids = TextureMappingManager::canonical_component_ids(component_ids, num_physical);
     if (component_ids.empty())
         return std::nullopt;
 
