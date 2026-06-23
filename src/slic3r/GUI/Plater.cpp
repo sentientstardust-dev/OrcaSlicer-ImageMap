@@ -3297,30 +3297,30 @@ public:
         const bool show_all_contoning_flat_infill_modes =
             TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions ||
             TextureMappingZone::ShowAllTopSurfaceContoningInfillModes;
-        add_contoning_flat_infill_choice(_L("Default (Boundary Skin - variable, more overlap)"),
+        add_contoning_flat_infill_choice(_L("Default (Concentric)"),
                                          int(TextureMappingZone::ContoningFlatSurfaceInfillDefault));
-        add_contoning_flat_infill_choice(_L("Rectilinear (faster to print, may leave small holes)"),
+        add_contoning_flat_infill_choice(_L("Rectilinear (faster to print, edges between colors less smooth)"),
                                          int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinear));
+        add_contoning_flat_infill_choice(_L("Concentric"),
+                                         int(TextureMappingZone::ContoningFlatSurfaceInfillConcentric));
         if (show_all_contoning_flat_infill_modes)
             add_contoning_flat_infill_choice(_L("Rectilinear with repair"),
                                              int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithRepair));
         if (show_all_contoning_flat_infill_modes)
             add_contoning_flat_infill_choice(_L("Adaptive Lines"),
                                              int(TextureMappingZone::ContoningFlatSurfaceInfillAdaptiveLines));
+        // if (!show_all_contoning_flat_infill_modes)
+        //     add_contoning_flat_infill_choice(_L("Boundary Skin (variable width, less overlap)"),
+        //                                      int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariable));
         if (!show_all_contoning_flat_infill_modes)
             add_contoning_flat_infill_choice(_L("Boundary Skin (variable width)"),
-                                             int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariable));
-        if (!show_all_contoning_flat_infill_modes)
-            add_contoning_flat_infill_choice(_L("Boundary Skin (variable width, more overlap)"),
                                              int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariableOverlap));
         if (show_all_contoning_flat_infill_modes) {
-            add_contoning_flat_infill_choice(_L("Concentric"),
-                                             int(TextureMappingZone::ContoningFlatSurfaceInfillConcentric));
             add_contoning_flat_infill_choice(_L("Boundary Skin (fixed width)"),
                                              int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinFixed));
-            add_contoning_flat_infill_choice(_L("Boundary Skin (variable width)"),
+            add_contoning_flat_infill_choice(_L("Boundary Skin (variable width, less overlap)"),
                                              int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariable));
-            add_contoning_flat_infill_choice(_L("Boundary Skin (variable width, more overlap)"),
+            add_contoning_flat_infill_choice(_L("Boundary Skin (variable width)"),
                                              int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariableOverlap));
             add_contoning_flat_infill_choice(_L("Spiral"),
                                              int(TextureMappingZone::ContoningFlatSurfaceInfillSpiral));
