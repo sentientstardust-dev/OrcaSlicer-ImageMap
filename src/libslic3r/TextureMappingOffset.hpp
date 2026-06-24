@@ -41,9 +41,11 @@ struct TextureMappingOffsetWeightField {
     std::vector<float> sample_g;
     std::vector<float> sample_b;
     std::vector<float> sample_normal_z;
+    std::vector<uint8_t> sample_has_surface_normal_z;
     std::vector<float> sample_component_weights;
     std::vector<std::vector<uint32_t>> buckets;
     std::vector<float> fallback_weights;
+    size_t invalid_normal_sample_count { 0 };
     bool raw_component_weights_from_texture { false };
     bool raw_top_surface_labels_from_texture { false };
     bool binary_dithered { false };
@@ -56,6 +58,7 @@ struct TextureMappingOffsetWeightField {
                sample_x_mm.empty() ||
                sample_y_mm.size() != sample_x_mm.size() ||
                sample_weight.size() != sample_x_mm.size() ||
+               sample_has_surface_normal_z.size() != sample_x_mm.size() ||
                sample_component_weights.size() != sample_x_mm.size() * component_count;
     }
 };

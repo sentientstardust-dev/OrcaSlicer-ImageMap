@@ -6134,6 +6134,11 @@ static std::optional<TopSurfaceImageContoningSourceContext> top_surface_image_co
 
     TopSurfaceImageContoningSourceContext out;
     out.offset_context = std::move(*offset_context);
+    if (out.offset_context.weight_field.invalid_normal_sample_count > 0) {
+        object.add_slicing_warning(
+            PrintStateBase::WarningLevel::NON_CRITICAL,
+            L("Top-surface coloring skipped one or more sampled mesh normals on this object because they were invalid."));
+    }
     out.threshold_deg =
         std::clamp(zone.effective_top_surface_contoning_angle_threshold_deg(),
                    TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg,

@@ -376,15 +376,18 @@ float texture_mapping_contoning_min_feature_mm(const TextureMappingZone &zone,
 
 bool texture_mapping_contoning_normal_eligible(float normal_z, float threshold_deg)
 {
-    if (!std::isfinite(threshold_deg) || threshold_deg >= TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg - 1e-4f)
-        return true;
-    if (!std::isfinite(normal_z))
-        return true;
-    const float clamped_z = std::clamp(normal_z, -1.f, 1.f);
-    const float angle = float(std::acos(clamped_z) * 180.0 / PI);
-    return angle <= std::clamp(threshold_deg,
+    if (!std::isfinite(threshold_deg))
+        threshold_deg = TextureMappingZone::DefaultTopSurfaceContoningAngleThresholdDeg;
+    threshold_deg = std::clamp(threshold_deg,
                                TextureMappingZone::MinTopSurfaceContoningAngleThresholdDeg,
                                TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg);
+    if (threshold_deg >= TextureMappingZone::MaxTopSurfaceContoningAngleThresholdDeg - 1e-4f)
+        return true;
+    if (!std::isfinite(normal_z))
+        return false;
+    const float clamped_z = std::clamp(normal_z, -1.f, 1.f);
+    const float angle = float(std::acos(clamped_z) * 180.0 / PI);
+    return angle <= threshold_deg;
 }
 
 TextureMappingContoningSolver::TextureMappingContoningSolver(const TextureMappingZone &zone,

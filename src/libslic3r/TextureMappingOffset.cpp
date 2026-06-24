@@ -34,6 +34,7 @@ struct TextureSampleData {
     std::vector<float> raw_component_weights;
     bool raw_component_weights_from_texture { false };
     float normal_z { std::numeric_limits<float>::quiet_NaN() };
+    bool has_surface_normal_z { false };
     bool raw_top_surface_labels_from_texture { false };
 };
 
@@ -44,6 +45,7 @@ struct WeightedTextureSample {
     std::vector<float> raw_component_weights;
     bool raw_component_weights_from_texture { false };
     float normal_z { std::numeric_limits<float>::quiet_NaN() };
+    bool has_surface_normal_z { false };
     bool raw_top_surface_labels_from_texture { false };
     float weight { 0.f };
 };
@@ -1622,7 +1624,8 @@ bool accumulate_layer_plane_triangle_samples(const Vec3d &p0,
                           std::move(sample_data.raw_component_weights),
                           sample_data.raw_component_weights_from_texture,
                           sample_data.normal_z,
-                          sample_data.raw_top_surface_labels_from_texture);
+                          sample_data.raw_top_surface_labels_from_texture,
+                          sample_data.has_surface_normal_z);
     }
 
     return true;
@@ -1789,7 +1792,8 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
                                                          std::vector<float> raw_component_weights = {},
                                                          bool raw_component_weights_from_texture = false,
                                                          float normal_z = std::numeric_limits<float>::quiet_NaN(),
-                                                         bool raw_top_surface_labels_from_texture = false) {
+                                                         bool raw_top_surface_labels_from_texture = false,
+                                                         bool has_surface_normal_z = false) {
         if (!std::isfinite(x_mm) || !std::isfinite(y_mm) || sample_weight <= EPSILON)
             return;
         if (!std::isfinite(sample_weight) ||
@@ -1808,6 +1812,7 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
                             std::move(raw_component_weights),
                             raw_component_weights_from_texture,
                             normal_z,
+                            has_surface_normal_z,
                             raw_top_surface_labels_from_texture,
                             sample_weight });
     };
@@ -1817,10 +1822,17 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
                                                             const Vec3d &p2,
                                                             const std::array<float, 4> &rgba) {
         const Vec3d normal = (p1 - p0).cross(p2 - p0).normalized();
+        const bool has_surface_normal_z = true;
         const float normal_z = normal.allFinite() ? float(normal.z()) : std::numeric_limits<float>::quiet_NaN();
         if (accumulate_layer_plane_triangle_samples(p0, p1, p2, layer_z_mm, safe_layer_z_falloff_mm, high_resolution_texture_sampling,
                 physical_sample_pitch_mm,
-                [&rgba, normal_z](const Vec3f &) { return TextureSampleData{ rgba, {}, false, normal_z }; }, accumulate_sample))
+                [&rgba, normal_z, has_surface_normal_z](const Vec3f &) {
+                    TextureSampleData sample;
+                    sample.rgba = rgba;
+                    sample.normal_z = normal_z;
+                    sample.has_surface_normal_z = has_surface_normal_z;
+                    return sample;
+                }, accumulate_sample))
             return;
 
         const float max_world_edge_mm = std::max({ float((p1 - p0).norm()), float((p2 - p1).norm()), float((p0 - p2).norm()) });
@@ -1854,7 +1866,7 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
                 const float z_weight = std::exp(-0.5f * z_norm * z_norm);
                 if (!std::isfinite(z_weight) || z_weight <= EPSILON)
                     continue;
-                accumulate_sample(float(world_pos.x()), float(world_pos.y()), rgba, area_weight * z_weight, {}, false, normal_z);
+                accumulate_sample(float(world_pos.x()), float(world_pos.y()), rgba, area_weight * z_weight, {}, false, normal_z, false, has_surface_normal_z);
             }
         }
     };
@@ -2039,6 +2051,7 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
                 if (!p0.allFinite() || !p1.allFinite() || !p2.allFinite())
                     continue;
                 const Vec3d normal = (p1 - p0).cross(p2 - p0).normalized();
+                const bool has_surface_normal_z = true;
                 const float normal_z = normal.allFinite() ? float(normal.z()) : std::numeric_limits<float>::quiet_NaN();
 
                 const size_t uv_off = tri_idx * 6;
@@ -2049,10 +2062,11 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
 
                 if (accumulate_layer_plane_triangle_samples(p0, p1, p2, layer_z_mm, safe_layer_z_falloff_mm, high_resolution_texture_sampling,
                         physical_sample_pitch_mm,
-                        [&uvs, &sample_data_for_uv, normal_z](const Vec3f &barycentric) {
+                        [&uvs, &sample_data_for_uv, normal_z, has_surface_normal_z](const Vec3f &barycentric) {
                             const Vec2f uv = uvs[0] * barycentric.x() + uvs[1] * barycentric.y() + uvs[2] * barycentric.z();
                             TextureSampleData sample_data = sample_data_for_uv(uv);
                             sample_data.normal_z = normal_z;
+                            sample_data.has_surface_normal_z = has_surface_normal_z;
                             return sample_data;
                         }, accumulate_sample))
                     continue;
@@ -2102,7 +2116,8 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
                                           std::move(sample_data.raw_component_weights),
                                           sample_data.raw_component_weights_from_texture,
                                           normal_z,
-                                          sample_data.raw_top_surface_labels_from_texture);
+                                          sample_data.raw_top_surface_labels_from_texture,
+                                          has_surface_normal_z);
                     }
                 }
             }
@@ -2300,6 +2315,7 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
     weight_field.sample_g.resize(sample_count);
     weight_field.sample_b.resize(sample_count);
     weight_field.sample_normal_z.resize(sample_count);
+    weight_field.sample_has_surface_normal_z.resize(sample_count, 0);
     weight_field.sample_component_weights.assign(sample_count * component_count, 0.f);
     weight_field.raw_component_weights_from_texture = false;
     weight_field.raw_top_surface_labels_from_texture = false;
@@ -2323,6 +2339,9 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
         weight_field.sample_g[sample_idx] = target_rgb[1];
         weight_field.sample_b[sample_idx] = target_rgb[2];
         weight_field.sample_normal_z[sample_idx] = sample.normal_z;
+        weight_field.sample_has_surface_normal_z[sample_idx] = sample.has_surface_normal_z ? 1 : 0;
+        if (sample.has_surface_normal_z && !std::isfinite(sample.normal_z))
+            ++weight_field.invalid_normal_sample_count;
 
         std::vector<float> desired(component_count, 0.f);
         const bool has_binary_dither = sample_idx < binary_dither_masks.size() && binary_dither_masks[sample_idx] != 0;
@@ -3111,6 +3130,7 @@ std::optional<float> sample_weight_field_normal_z(const TextureMappingOffsetWeig
 {
     if (weight_field.empty() ||
         weight_field.sample_normal_z.size() != weight_field.sample_x_mm.size() ||
+        weight_field.sample_has_surface_normal_z.size() != weight_field.sample_x_mm.size() ||
         !std::isfinite(x_mm) ||
         !std::isfinite(y_mm))
         return std::nullopt;
@@ -3127,6 +3147,8 @@ std::optional<float> sample_weight_field_normal_z(const TextureMappingOffsetWeig
             (high_resolution_texture_sampling ?
                 std::max(0.18f, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * 2.5f) :
                 std::max(0.32f, std::max(weight_field.bucket_width_mm, weight_field.bucket_height_mm) * 3.0f));
+    const float max_radius_sq = max_radius_mm * max_radius_mm;
+    const float kernel_denominator = std::max(max_radius_sq * 0.16f, 1e-6f);
     const int max_ring = std::clamp(int(std::ceil(max_radius_mm / std::max(std::min(weight_field.bucket_width_mm,
                                                                                        weight_field.bucket_height_mm),
                                                                                1e-3f))),
@@ -3135,7 +3157,10 @@ std::optional<float> sample_weight_field_normal_z(const TextureMappingOffsetWeig
     double weighted_normal_z = 0.0;
     double total_weight = 0.0;
     size_t nearest_sample_idx = size_t(-1);
+    size_t nearest_invalid_sample_idx = size_t(-1);
     float nearest_d2 = std::numeric_limits<float>::max();
+    float nearest_invalid_d2 = std::numeric_limits<float>::max();
+    bool invalid_weighted_normal = false;
 
     for (int ring = 0; ring <= max_ring; ++ring) {
         const int min_x = std::max(0, cx - ring);
@@ -3149,21 +3174,37 @@ std::optional<float> sample_weight_field_normal_z(const TextureMappingOffsetWeig
                     continue;
                 for (const uint32_t sample_idx_u32 : weight_field.buckets[bucket_idx]) {
                     const size_t sample_idx = size_t(sample_idx_u32);
-                    if (sample_idx >= weight_field.sample_x_mm.size() || sample_idx >= weight_field.sample_normal_z.size())
+                    if (sample_idx >= weight_field.sample_x_mm.size() ||
+                        sample_idx >= weight_field.sample_normal_z.size() ||
+                        sample_idx >= weight_field.sample_has_surface_normal_z.size() ||
+                        weight_field.sample_has_surface_normal_z[sample_idx] == 0)
                         continue;
                     const float normal_z = weight_field.sample_normal_z[sample_idx];
-                    if (!std::isfinite(normal_z))
-                        continue;
                     const float dx = x_mm - weight_field.sample_x_mm[sample_idx];
                     const float dy = y_mm - weight_field.sample_y_mm[sample_idx];
                     const float d2 = dx * dx + dy * dy;
+                    if (!std::isfinite(d2))
+                        continue;
+                    if (!std::isfinite(normal_z)) {
+                        if (d2 < nearest_invalid_d2) {
+                            nearest_invalid_d2 = d2;
+                            nearest_invalid_sample_idx = sample_idx;
+                        }
+                        if (d2 <= max_radius_sq) {
+                            const float kernel = std::exp(-0.5f * d2 / kernel_denominator);
+                            const float sample_w = weight_field.sample_weight[sample_idx] * kernel;
+                            if (std::isfinite(sample_w) && sample_w > EPSILON)
+                                invalid_weighted_normal = true;
+                        }
+                        continue;
+                    }
                     if (d2 < nearest_d2) {
                         nearest_d2 = d2;
                         nearest_sample_idx = sample_idx;
                     }
-                    if (d2 > max_radius_mm * max_radius_mm)
+                    if (d2 > max_radius_sq)
                         continue;
-                    const float kernel = std::exp(-0.5f * d2 / std::max(max_radius_mm * max_radius_mm * 0.16f, 1e-6f));
+                    const float kernel = std::exp(-0.5f * d2 / kernel_denominator);
                     const float sample_w = weight_field.sample_weight[sample_idx] * kernel;
                     if (!std::isfinite(sample_w) || sample_w <= EPSILON)
                         continue;
@@ -3176,10 +3217,14 @@ std::optional<float> sample_weight_field_normal_z(const TextureMappingOffsetWeig
             break;
     }
 
+    if (invalid_weighted_normal)
+        return std::numeric_limits<float>::quiet_NaN();
     if (total_weight > EPSILON)
         return std::clamp(float(weighted_normal_z / total_weight), -1.f, 1.f);
     if (nearest_sample_idx != size_t(-1) && nearest_sample_idx < weight_field.sample_normal_z.size())
         return std::clamp(weight_field.sample_normal_z[nearest_sample_idx], -1.f, 1.f);
+    if (nearest_invalid_sample_idx != size_t(-1))
+        return std::numeric_limits<float>::quiet_NaN();
     return std::nullopt;
 }
 
