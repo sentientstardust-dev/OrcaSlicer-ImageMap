@@ -58,67 +58,74 @@ bool explicit_transmission_distance_mm(const TextureMappingZone &zone, unsigned 
     return true;
 }
 
-bool black_role_component(int filament_color_mode, size_t component_idx, size_t component_count)
-{
-    switch (std::clamp(filament_color_mode,
-                       int(TextureMappingZone::FilamentColorAny),
-                       int(TextureMappingZone::FilamentColorRGBKW))) {
-    case int(TextureMappingZone::FilamentColorCMYK):
-    case int(TextureMappingZone::FilamentColorRGBK):
-        return component_count == 4 && component_idx == 3;
-    case int(TextureMappingZone::FilamentColorBW):
-        return component_count == 2 && component_idx == 0;
-    case int(TextureMappingZone::FilamentColorCMYKW):
-    case int(TextureMappingZone::FilamentColorRGBKW):
-        return component_count == 5 && component_idx == 3;
-    default:
-        return false;
-    }
-}
-
-ColorSolverStackComponentRole cmy_component_role(int filament_color_mode, size_t component_idx, size_t component_count)
+ColorSolverStackComponentRole color_mode_component_role(int filament_color_mode, size_t component_idx)
 {
     switch (std::clamp(filament_color_mode,
                        int(TextureMappingZone::FilamentColorAny),
                        int(TextureMappingZone::FilamentColorRGBKW))) {
     case int(TextureMappingZone::FilamentColorCMY):
-        if (component_count == 3) {
-            if (component_idx == 0)
-                return ColorSolverStackComponentRole::Cyan;
-            if (component_idx == 1)
-                return ColorSolverStackComponentRole::Magenta;
-            if (component_idx == 2)
-                return ColorSolverStackComponentRole::Yellow;
-        }
+        if (component_idx == 0)
+            return ColorSolverStackComponentRole::Cyan;
+        if (component_idx == 1)
+            return ColorSolverStackComponentRole::Magenta;
+        if (component_idx == 2)
+            return ColorSolverStackComponentRole::Yellow;
         break;
     case int(TextureMappingZone::FilamentColorCMYK):
-        if (component_count == 4) {
-            if (component_idx == 0)
-                return ColorSolverStackComponentRole::Cyan;
-            if (component_idx == 1)
-                return ColorSolverStackComponentRole::Magenta;
-            if (component_idx == 2)
-                return ColorSolverStackComponentRole::Yellow;
-            if (component_idx == 3)
-                return ColorSolverStackComponentRole::Black;
-        }
-        break;
     case int(TextureMappingZone::FilamentColorCMYW):
-        if (component_count == 4) {
-            if (component_idx == 0)
-                return ColorSolverStackComponentRole::Cyan;
-            if (component_idx == 1)
-                return ColorSolverStackComponentRole::Magenta;
-            if (component_idx == 2)
-                return ColorSolverStackComponentRole::Yellow;
-            if (component_idx == 3)
-                return ColorSolverStackComponentRole::White;
-        }
+        if (component_idx == 0)
+            return ColorSolverStackComponentRole::Cyan;
+        if (component_idx == 1)
+            return ColorSolverStackComponentRole::Magenta;
+        if (component_idx == 2)
+            return ColorSolverStackComponentRole::Yellow;
+        if (component_idx == 3)
+            return filament_color_mode == int(TextureMappingZone::FilamentColorCMYK) ?
+                ColorSolverStackComponentRole::Black :
+                ColorSolverStackComponentRole::White;
+        break;
+    case int(TextureMappingZone::FilamentColorRGBK):
+        if (component_idx == 3)
+            return ColorSolverStackComponentRole::Black;
+        break;
+    case int(TextureMappingZone::FilamentColorRGBW):
+        if (component_idx == 3)
+            return ColorSolverStackComponentRole::White;
+        break;
+    case int(TextureMappingZone::FilamentColorBW):
+        if (component_idx == 0)
+            return ColorSolverStackComponentRole::Black;
+        if (component_idx == 1)
+            return ColorSolverStackComponentRole::White;
+        break;
+    case int(TextureMappingZone::FilamentColorCMYKW):
+        if (component_idx == 0)
+            return ColorSolverStackComponentRole::Cyan;
+        if (component_idx == 1)
+            return ColorSolverStackComponentRole::Magenta;
+        if (component_idx == 2)
+            return ColorSolverStackComponentRole::Yellow;
+        if (component_idx == 3)
+            return ColorSolverStackComponentRole::Black;
+        if (component_idx == 4)
+            return ColorSolverStackComponentRole::White;
+        break;
+    case int(TextureMappingZone::FilamentColorRGBKW):
+        if (component_idx == 3)
+            return ColorSolverStackComponentRole::Black;
+        if (component_idx == 4)
+            return ColorSolverStackComponentRole::White;
         break;
     default:
         break;
     }
     return ColorSolverStackComponentRole::Generic;
+}
+
+bool black_role_component(int filament_color_mode, size_t component_idx, size_t component_count)
+{
+    return component_idx < component_count &&
+           color_mode_component_role(filament_color_mode, component_idx) == ColorSolverStackComponentRole::Black;
 }
 
 bool is_black_color_filament(const PrintConfig &config, unsigned int component_id)
@@ -310,7 +317,7 @@ std::vector<ColorSolverStackComponentRole> texture_mapping_contoning_component_r
 {
     std::vector<ColorSolverStackComponentRole> roles(component_count, ColorSolverStackComponentRole::Generic);
     for (size_t idx = 0; idx < component_count; ++idx)
-        roles[idx] = cmy_component_role(zone.filament_color_mode, idx, component_count);
+        roles[idx] = color_mode_component_role(zone.filament_color_mode, idx);
     return roles;
 }
 

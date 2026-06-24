@@ -594,17 +594,19 @@ float texture_preview_filament_luminance(const std::array<float, 3> &color)
 
 bool texture_preview_black_role_component(int filament_color_mode, size_t component_idx, size_t component_count)
 {
+    if (component_idx >= component_count)
+        return false;
     switch (std::clamp(filament_color_mode,
                        int(TextureMappingZone::FilamentColorAny),
                        int(TextureMappingZone::FilamentColorRGBKW))) {
     case int(TextureMappingZone::FilamentColorCMYK):
     case int(TextureMappingZone::FilamentColorRGBK):
-        return component_count == 4 && component_idx == 3;
+        return component_idx == 3;
     case int(TextureMappingZone::FilamentColorBW):
-        return component_count == 2 && component_idx == 0;
+        return component_idx == 0;
     case int(TextureMappingZone::FilamentColorCMYKW):
     case int(TextureMappingZone::FilamentColorRGBKW):
-        return component_count == 5 && component_idx == 3;
+        return component_idx == 3;
     default:
         return false;
     }

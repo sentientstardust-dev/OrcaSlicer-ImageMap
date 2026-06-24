@@ -6,6 +6,7 @@
 #include "Color.hpp"
 #include "ColorSolver.hpp"
 #include "Config.hpp"
+#include "Exception.hpp"
 #include "Geometry.hpp"
 #include "ImageMapRawFilamentOffsetAtlas.hpp"
 #include "Layer.hpp"
@@ -551,6 +552,11 @@ std::array<float, 3> raw_filament_channel_color(const ImageMapRawFilament &filam
     return { { 1.f, 1.f, 1.f } };
 }
 
+unsigned int raw_filament_slot(const ImageMapRawFilament &filament, size_t channel_idx)
+{
+    return filament.slot != 0 ? filament.slot : unsigned(channel_idx + 1);
+}
+
 std::vector<std::string> raw_filament_color_mode_channel_keys(int filament_color_mode, size_t component_count)
 {
     std::vector<std::string> keys;
@@ -732,6 +738,8 @@ std::map<unsigned int, unsigned int> raw_top_surface_slot_component_id_map(
                 raw_filament_channel_color({ 0, target_keys[component_idx], std::string() }, component_idx);
             size_t best_source = filaments.size();
             float best_distance_sq = std::numeric_limits<float>::max();
+            const float max_match_distance_sq =
+                TextureMappingManager::poor_color_match_distance() * TextureMappingManager::poor_color_match_distance();
             for (size_t source_idx = 0; source_idx < source_colors.size(); ++source_idx) {
                 if (used[source_idx] != 0)
                     continue;
@@ -741,7 +749,7 @@ std::map<unsigned int, unsigned int> raw_top_surface_slot_component_id_map(
                     best_source = source_idx;
                 }
             }
-            if (best_source < source_colors.size()) {
+            if (best_source < source_colors.size() && best_distance_sq <= max_match_distance_sq) {
                 mapping[component_idx] = best_source;
                 used[best_source] = 1;
             }
@@ -777,7 +785,11 @@ std::map<unsigned int, unsigned int> raw_top_surface_slot_component_id_map(
         });
         std::vector<uint8_t> used_components(component_ids.size(), 0);
         std::vector<uint8_t> used_sources(filaments.size(), 0);
+        const float max_match_distance_sq =
+            TextureMappingManager::poor_color_match_distance() * TextureMappingManager::poor_color_match_distance();
         for (const Candidate &candidate : candidates) {
+            if (candidate.distance_sq > max_match_distance_sq)
+                break;
             if (used_components[candidate.component_idx] != 0 || used_sources[candidate.source_idx] != 0)
                 continue;
             mapping[candidate.component_idx] = candidate.source_idx;
@@ -790,7 +802,7 @@ std::map<unsigned int, unsigned int> raw_top_surface_slot_component_id_map(
         const size_t source_idx = component_idx < mapping.size() ? mapping[component_idx] : sentinel;
         if (source_idx == sentinel || source_idx >= filaments.size())
             continue;
-        const unsigned int slot = filaments[source_idx].slot;
+        const unsigned int slot = raw_filament_slot(filaments[source_idx], source_idx);
         const unsigned int component_id = component_ids[component_idx];
         if (slot > 0 && component_id > 0)
             out.emplace(slot, component_id);
@@ -1782,6 +1794,8 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
         has_texture_sample_pitch_override ?
             std::min(default_physical_sample_pitch_mm, std::max(0.02f, *texture_sample_pitch_mm_override)) :
             default_physical_sample_pitch_mm;
+    bool unmatched_raw_top_surface_label = false;
+    unsigned int unmatched_raw_top_surface_slot = 0;
 
     std::vector<WeightedTextureSample> samples;
     samples.reserve(8192);
@@ -2000,8 +2014,14 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
                                                                 uv.y());
                     unsigned int component_id = unsigned(slot);
                     const auto mapped_it = raw_top_surface_slot_component_ids.find(component_id);
-                    if (mapped_it != raw_top_surface_slot_component_ids.end())
+                    if (mapped_it != raw_top_surface_slot_component_ids.end()) {
                         component_id = mapped_it->second;
+                    } else {
+                        if (!unmatched_raw_top_surface_label)
+                            unmatched_raw_top_surface_slot = component_id;
+                        unmatched_raw_top_surface_label = true;
+                        component_id = 0;
+                    }
                     const auto component_it = std::find(component_ids.begin(), component_ids.end(), component_id);
                     if (component_it != component_ids.end()) {
                         const size_t component_idx = size_t(component_it - component_ids.begin());
@@ -2142,6 +2162,13 @@ TextureMappingOffsetWeightField build_texture_mapping_offset_weight_field(const 
                 composite_rgba_over_background(unpack_rgba_u32(volume->imported_vertex_colors_rgba[i]), background_color);
             accumulate_sample(float(world_pos.x()), float(world_pos.y()), rgba, sample_weight);
         }
+    }
+
+    if (unmatched_raw_top_surface_label) {
+        throw SlicingError(
+            "A raw top-surface atlas label references filament slot " +
+            std::to_string(unmatched_raw_top_surface_slot) +
+            ", but that slot is not mapped to any filament selected by the texture mapping zone.");
     }
 
     if (samples.empty())
@@ -3389,74 +3416,11 @@ void append_texture_mapping_raw_top_surface_component_ids(const PrintObject &pri
                                                           size_t num_physical,
                                                           std::optional<int> depth)
 {
-    if (num_physical == 0)
-        return;
-
     component_ids = TextureMappingManager::canonical_component_ids(component_ids, num_physical);
-
-    const ModelObject *model_object = print_object.model_object();
-    if (model_object == nullptr)
-        return;
-
-    std::vector<uint8_t> component_present(num_physical + 1, 0);
-    size_t present_count = 0;
-    for (unsigned int component_id : component_ids) {
-        if (component_id == 0 || component_id > num_physical || component_present[component_id] != 0)
-            continue;
-        component_present[component_id] = 1;
-        ++present_count;
-    }
-    if (present_count >= num_physical)
-        return;
-
-    auto append_component = [&component_ids, &component_present, &present_count, num_physical](unsigned int component_id) {
-        if (component_id == 0 || component_id > num_physical)
-            return;
-        if (component_present[component_id] != 0)
-            return;
-        component_present[component_id] = 1;
-        ++present_count;
-        component_ids.emplace_back(component_id);
-    };
-
-    for (const ModelVolume *volume : model_object->volumes) {
-        if (present_count >= num_physical)
-            break;
-        if (volume == nullptr ||
-            !volume->is_model_part() ||
-            volume->imported_texture_width == 0 ||
-            volume->imported_texture_height == 0 ||
-            volume->imported_texture_raw_top_surface_depths.empty())
-            continue;
-
-        const size_t pixel_count =
-            size_t(volume->imported_texture_width) * size_t(volume->imported_texture_height);
-        const size_t depth_count = volume->imported_texture_raw_top_surface_depths.size();
-        if (pixel_count == 0 ||
-            volume->imported_texture_raw_top_surface_filament_slots.size() < pixel_count * depth_count)
-            continue;
-
-        const std::map<unsigned int, unsigned int> slot_component_ids =
-            raw_top_surface_slot_component_id_map(volume->imported_texture_raw_metadata_json,
-                                                  zone,
-                                                  component_ids,
-                                                  filament_colours);
-        for (size_t depth_idx = 0; depth_idx < depth_count; ++depth_idx) {
-            if (present_count >= num_physical)
-                break;
-            if (depth && volume->imported_texture_raw_top_surface_depths[depth_idx] != *depth)
-                continue;
-            const size_t begin = depth_idx * pixel_count;
-            const size_t end = begin + pixel_count;
-            for (size_t slot_idx = begin; slot_idx < end; ++slot_idx) {
-                const unsigned int raw_slot = unsigned(volume->imported_texture_raw_top_surface_filament_slots[slot_idx]);
-                const auto mapped_it = slot_component_ids.find(raw_slot);
-                append_component(mapped_it != slot_component_ids.end() ? mapped_it->second : raw_slot);
-                if (present_count >= num_physical)
-                    break;
-            }
-        }
-    }
+    (void)print_object;
+    (void)zone;
+    (void)filament_colours;
+    (void)depth;
 }
 
 float normalize_texture_mapping_offset_angle_deg(float angle)
