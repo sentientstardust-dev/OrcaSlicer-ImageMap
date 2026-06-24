@@ -202,7 +202,7 @@ struct TextureMappingZone
     static constexpr bool  DefaultTopVisiblePerimeterRecolorPointSampling = true;
     static constexpr bool  DefaultTopSurfaceImagePrintingEnabled = false;
     static constexpr int   DefaultTopSurfaceImagePrintingMethod = int(TopSurfaceImageContoning);
-    static constexpr float MinTopSurfaceImageLineWidthMm = 0.32f;
+    static constexpr float MinTopSurfaceImageLineWidthMm = 0.05f;
     static constexpr float MaxTopSurfaceImageLineWidthMm = 0.80f;
     static constexpr float DefaultTopSurfaceImageMinLineWidthMm = 0.32f;
     static constexpr float DefaultTopSurfaceImageMaxLineWidthMm = 0.64f;

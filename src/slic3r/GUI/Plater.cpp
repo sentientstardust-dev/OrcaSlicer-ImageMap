@@ -3140,6 +3140,14 @@ public:
                                    0,
                                    wxALIGN_CENTER_VERTICAL | wxRIGHT,
                                    gap);
+        const double initial_top_surface_min_line_width_mm =
+            std::clamp(double(top_surface_image_min_line_width_mm),
+                       double(TextureMappingZone::MinTopSurfaceImageLineWidthMm),
+                       double(TextureMappingZone::MaxTopSurfaceImageLineWidthMm));
+        const double initial_top_surface_max_line_width_mm =
+            std::clamp(double(top_surface_image_max_line_width_mm),
+                       initial_top_surface_min_line_width_mm,
+                       double(TextureMappingZone::MaxTopSurfaceImageLineWidthMm));
         m_top_surface_image_min_line_width_spin =
             new wxSpinCtrlDouble(top_surface_page,
                                  wxID_ANY,
@@ -3148,10 +3156,8 @@ public:
                                  wxSize(FromDIP(84), -1),
                                  wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER,
                                  double(TextureMappingZone::MinTopSurfaceImageLineWidthMm),
-                                 double(TextureMappingZone::MaxTopSurfaceImageLineWidthMm),
-                                 std::clamp(double(top_surface_image_min_line_width_mm),
-                                            double(TextureMappingZone::MinTopSurfaceImageLineWidthMm),
-                                            double(TextureMappingZone::MaxTopSurfaceImageLineWidthMm)),
+                                 initial_top_surface_max_line_width_mm,
+                                 initial_top_surface_min_line_width_mm,
                                  0.01);
         m_top_surface_image_min_line_width_spin->SetDigits(2);
         top_surface_width_row->Add(m_top_surface_image_min_line_width_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
@@ -3166,11 +3172,9 @@ public:
                                  wxDefaultPosition,
                                  wxSize(FromDIP(84), -1),
                                  wxSP_ARROW_KEYS | wxALIGN_RIGHT | wxTE_PROCESS_ENTER,
-                                 double(TextureMappingZone::MinTopSurfaceImageLineWidthMm),
+                                 initial_top_surface_min_line_width_mm,
                                  double(TextureMappingZone::MaxTopSurfaceImageLineWidthMm),
-                                 std::clamp(double(top_surface_image_max_line_width_mm),
-                                            double(TextureMappingZone::MinTopSurfaceImageLineWidthMm),
-                                            double(TextureMappingZone::MaxTopSurfaceImageLineWidthMm)),
+                                 initial_top_surface_max_line_width_mm,
                                  0.01);
         m_top_surface_image_max_line_width_spin->SetDigits(2);
         top_surface_width_row->Add(m_top_surface_image_max_line_width_spin, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, gap / 2);
@@ -3715,6 +3719,22 @@ public:
                 update_top_surface_image_options_visibility(true);
             });
         }
+        if (m_top_surface_image_min_line_width_spin != nullptr) {
+            m_top_surface_image_min_line_width_spin->Bind(wxEVT_SPINCTRLDOUBLE, [this](wxSpinDoubleEvent &) {
+                enforce_top_surface_image_line_width_order(m_top_surface_image_min_line_width_spin);
+            });
+            m_top_surface_image_min_line_width_spin->Bind(wxEVT_TEXT, [this](wxCommandEvent &) {
+                enforce_top_surface_image_line_width_order(m_top_surface_image_min_line_width_spin);
+            });
+        }
+        if (m_top_surface_image_max_line_width_spin != nullptr) {
+            m_top_surface_image_max_line_width_spin->Bind(wxEVT_SPINCTRLDOUBLE, [this](wxSpinDoubleEvent &) {
+                enforce_top_surface_image_line_width_order(m_top_surface_image_max_line_width_spin);
+            });
+            m_top_surface_image_max_line_width_spin->Bind(wxEVT_TEXT, [this](wxCommandEvent &) {
+                enforce_top_surface_image_line_width_order(m_top_surface_image_max_line_width_spin);
+            });
+        }
         m_top_surface_image_printing_enabled_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent &) {
             update_top_surface_image_options_visibility(true);
         });
@@ -4013,25 +4033,25 @@ public:
     }
     float top_surface_image_min_line_width_mm() const
     {
-        const double max_width = m_top_surface_image_max_line_width_spin != nullptr ?
-            m_top_surface_image_max_line_width_spin->GetValue() :
-            double(TextureMappingZone::DefaultTopSurfaceImageMaxLineWidthMm);
         const double value = m_top_surface_image_min_line_width_spin != nullptr ?
             m_top_surface_image_min_line_width_spin->GetValue() :
             double(TextureMappingZone::DefaultTopSurfaceImageMinLineWidthMm);
         return float(std::clamp(value,
                                 double(TextureMappingZone::MinTopSurfaceImageLineWidthMm),
-                                std::clamp(max_width,
-                                           double(TextureMappingZone::MinTopSurfaceImageLineWidthMm),
-                                           double(TextureMappingZone::MaxTopSurfaceImageLineWidthMm))));
+                                double(TextureMappingZone::MaxTopSurfaceImageLineWidthMm)));
     }
     float top_surface_image_max_line_width_mm() const
     {
+        const double min_width = m_top_surface_image_min_line_width_spin != nullptr ?
+            m_top_surface_image_min_line_width_spin->GetValue() :
+            double(TextureMappingZone::DefaultTopSurfaceImageMinLineWidthMm);
         const double value = m_top_surface_image_max_line_width_spin != nullptr ?
             m_top_surface_image_max_line_width_spin->GetValue() :
             double(TextureMappingZone::DefaultTopSurfaceImageMaxLineWidthMm);
         return float(std::clamp(value,
-                                double(TextureMappingZone::MinTopSurfaceImageLineWidthMm),
+                                std::clamp(min_width,
+                                           double(TextureMappingZone::MinTopSurfaceImageLineWidthMm),
+                                           double(TextureMappingZone::MaxTopSurfaceImageLineWidthMm)),
                                 double(TextureMappingZone::MaxTopSurfaceImageLineWidthMm)));
     }
     int top_surface_image_colored_top_layers() const
@@ -5557,16 +5577,12 @@ private:
         if (m_top_surface_contoning_polygonize_resolution_choice == nullptr)
             return;
 
+        const int effective_flat_mode = TextureMappingZone::effective_top_surface_contoning_flat_surface_infill_mode(
+            top_surface_contoning_flat_surface_infill_mode());
         const bool allow_x8 = TextureMappingZone::ShowExperimentalTopSurfaceContoningOptions ||
-                              TextureMappingZone::effective_top_surface_contoning_flat_surface_infill_mode(
-                                  top_surface_contoning_flat_surface_infill_mode()) ==
-                                  int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariable) ||
-                              TextureMappingZone::effective_top_surface_contoning_flat_surface_infill_mode(
-                                  top_surface_contoning_flat_surface_infill_mode()) ==
-                                  int(TextureMappingZone::ContoningFlatSurfaceInfillBoundarySkinVariableOverlap) ||
-                              TextureMappingZone::effective_top_surface_contoning_flat_surface_infill_mode(
-                                  top_surface_contoning_flat_surface_infill_mode()) ==
-                                  int(TextureMappingZone::ContoningFlatSurfaceInfillAdaptiveLines);
+                              (effective_flat_mode != int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinear) &&
+                               effective_flat_mode != int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithBoundary) &&
+                               effective_flat_mode != int(TextureMappingZone::ContoningFlatSurfaceInfillRectilinearWithRepair));
         int resolution = TextureMappingZone::normalize_top_surface_contoning_polygonize_resolution(preferred_resolution);
         if (!allow_x8 && resolution == 8)
             resolution = 4;
@@ -5594,6 +5610,29 @@ private:
             }
         }
         m_top_surface_contoning_polygonize_resolution_choice->SetSelection(selection);
+    }
+
+    void enforce_top_surface_image_line_width_order(wxSpinCtrlDouble *changed_spin)
+    {
+        if (m_top_surface_image_min_line_width_spin == nullptr ||
+            m_top_surface_image_max_line_width_spin == nullptr)
+            return;
+
+        const double lower = double(TextureMappingZone::MinTopSurfaceImageLineWidthMm);
+        const double upper = double(TextureMappingZone::MaxTopSurfaceImageLineWidthMm);
+        double min_width = std::clamp(m_top_surface_image_min_line_width_spin->GetValue(), lower, upper);
+        double max_width = std::clamp(m_top_surface_image_max_line_width_spin->GetValue(), lower, upper);
+        if (changed_spin == m_top_surface_image_max_line_width_spin)
+            max_width = std::max(max_width, min_width);
+        else
+            min_width = std::min(min_width, max_width);
+
+        m_top_surface_image_min_line_width_spin->SetRange(lower, max_width);
+        m_top_surface_image_max_line_width_spin->SetRange(min_width, upper);
+        if (m_top_surface_image_min_line_width_spin->GetValue() != min_width)
+            m_top_surface_image_min_line_width_spin->SetValue(min_width);
+        if (m_top_surface_image_max_line_width_spin->GetValue() != max_width)
+            m_top_surface_image_max_line_width_spin->SetValue(max_width);
     }
 
     void update_top_surface_image_options_visibility(bool fit_dialog)

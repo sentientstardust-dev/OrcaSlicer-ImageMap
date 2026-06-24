@@ -2835,16 +2835,18 @@ std::string TextureMappingManager::serialize_entries()
         texture["top_surface_image_printing_enabled"] = zone.top_surface_image_printing_enabled;
         texture["top_surface_image_printing_method"] =
             top_surface_image_printing_method_name(zone.top_surface_image_printing_method);
-        const float top_surface_max_width =
-            std::clamp(finite_or(zone.top_surface_image_max_line_width_mm,
-                                 TextureMappingZone::DefaultTopSurfaceImageMaxLineWidthMm),
-                       TextureMappingZone::MinTopSurfaceImageLineWidthMm,
-                       TextureMappingZone::MaxTopSurfaceImageLineWidthMm);
-        texture["top_surface_image_min_line_width_mm"] =
+        const float top_surface_min_width =
             std::clamp(finite_or(zone.top_surface_image_min_line_width_mm,
                                  TextureMappingZone::DefaultTopSurfaceImageMinLineWidthMm),
                        TextureMappingZone::MinTopSurfaceImageLineWidthMm,
-                       top_surface_max_width);
+                       TextureMappingZone::MaxTopSurfaceImageLineWidthMm);
+        const float top_surface_max_width =
+            std::clamp(finite_or(zone.top_surface_image_max_line_width_mm,
+                                 TextureMappingZone::DefaultTopSurfaceImageMaxLineWidthMm),
+                       top_surface_min_width,
+                       TextureMappingZone::MaxTopSurfaceImageLineWidthMm);
+        texture["top_surface_image_min_line_width_mm"] =
+            top_surface_min_width;
         texture["top_surface_image_max_line_width_mm"] = top_surface_max_width;
         texture["top_surface_image_colored_top_layers"] =
             clamp_int(zone.top_surface_image_colored_top_layers,
@@ -3150,18 +3152,18 @@ void TextureMappingManager::load_entries(const std::string &serialized,
             top_surface_image_printing_method_from_name(
                 texture.value("top_surface_image_printing_method",
                               top_surface_image_printing_method_name(TextureMappingZone::DefaultTopSurfaceImagePrintingMethod)));
-        zone.top_surface_image_max_line_width_mm =
-            std::clamp(finite_or(texture.value("top_surface_image_max_line_width_mm",
-                                               TextureMappingZone::DefaultTopSurfaceImageMaxLineWidthMm),
-                                 TextureMappingZone::DefaultTopSurfaceImageMaxLineWidthMm),
-                       TextureMappingZone::MinTopSurfaceImageLineWidthMm,
-                       TextureMappingZone::MaxTopSurfaceImageLineWidthMm);
         zone.top_surface_image_min_line_width_mm =
             std::clamp(finite_or(texture.value("top_surface_image_min_line_width_mm",
                                                TextureMappingZone::DefaultTopSurfaceImageMinLineWidthMm),
                                  TextureMappingZone::DefaultTopSurfaceImageMinLineWidthMm),
                        TextureMappingZone::MinTopSurfaceImageLineWidthMm,
-                       zone.top_surface_image_max_line_width_mm);
+                       TextureMappingZone::MaxTopSurfaceImageLineWidthMm);
+        zone.top_surface_image_max_line_width_mm =
+            std::clamp(finite_or(texture.value("top_surface_image_max_line_width_mm",
+                                               TextureMappingZone::DefaultTopSurfaceImageMaxLineWidthMm),
+                                 TextureMappingZone::DefaultTopSurfaceImageMaxLineWidthMm),
+                       zone.top_surface_image_min_line_width_mm,
+                       TextureMappingZone::MaxTopSurfaceImageLineWidthMm);
         zone.top_surface_image_colored_top_layers =
             clamp_int(texture.value("top_surface_image_colored_top_layers",
                                     TextureMappingZone::DefaultTopSurfaceImageColoredTopLayers),

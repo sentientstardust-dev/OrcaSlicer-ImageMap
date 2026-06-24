@@ -3476,7 +3476,8 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     std::optional<float>     texture_sample_pitch_mm_override,
     std::optional<int>       raw_top_surface_depth_override,
     std::optional<float>     filament_overhang_contrast_pct_override,
-    TextureMappingRawSurfaceUsage raw_surface_usage)
+    TextureMappingRawSurfaceUsage raw_surface_usage,
+    bool                          allow_zero_width_delta_for_sampling)
 {
     const Print *print = print_object.print();
     if (print == nullptr)
@@ -3637,7 +3638,8 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     const float max_width_delta_mm = std::max(0.f, base_outer_width_mm - safe_min_gradient_width_mm);
     const float effective_max_width_delta_mm = max_width_delta_mm * global_strength_factor;
     const float max_width_delta_limit_mm = std::min(effective_max_width_delta_mm, 2.f * max_allowed_distance_mm);
-    if (!std::isfinite(max_width_delta_limit_mm) || max_width_delta_limit_mm <= EPSILON)
+    if (!std::isfinite(max_width_delta_limit_mm) ||
+        (max_width_delta_limit_mm <= EPSILON && !allow_zero_width_delta_for_sampling))
         return std::nullopt;
 
     const bool dithering_enabled = zone.dithering_enabled && !raw_texture_mapping_mode;

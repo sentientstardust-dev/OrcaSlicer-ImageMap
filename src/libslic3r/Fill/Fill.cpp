@@ -6127,7 +6127,8 @@ static std::optional<TopSurfaceImageContoningSourceContext> top_surface_image_co
                                                        top_surface_image_contoning_texture_sample_pitch_mm(plan),
                                                        raw_top_surface_depth_override,
                                                        TextureMappingZone::DefaultFilamentOverhangContrastPct,
-                                                       TextureMappingRawSurfaceUsage::Flat);
+                                                       TextureMappingRawSurfaceUsage::Flat,
+                                                       true);
     if (!offset_context)
         return std::nullopt;
 
@@ -9301,12 +9302,12 @@ static std::vector<TopSurfaceImageRegionPlan> top_surface_image_region_plans(
                  top_surface_image_components_bottom_to_top(*zone, print_config, components));
         if (plan.components_bottom_to_top.empty())
             continue;
-        plan.max_width_mm = std::clamp(zone->top_surface_image_max_line_width_mm,
-                                       TextureMappingZone::MinTopSurfaceImageLineWidthMm,
-                                       TextureMappingZone::MaxTopSurfaceImageLineWidthMm);
         plan.min_width_mm = std::clamp(zone->top_surface_image_min_line_width_mm,
                                        TextureMappingZone::MinTopSurfaceImageLineWidthMm,
-                                       plan.max_width_mm);
+                                       TextureMappingZone::MaxTopSurfaceImageLineWidthMm);
+        plan.max_width_mm = std::clamp(zone->top_surface_image_max_line_width_mm,
+                                       plan.min_width_mm,
+                                       TextureMappingZone::MaxTopSurfaceImageLineWidthMm);
         plan.fixed_coloring = zone->top_surface_image_fixed_coloring_filaments_active();
         plan.color_upper_surfaces = zone->top_surface_contoning_colors_upper_surfaces();
         plan.color_lower_surfaces = zone->top_surface_contoning_colors_lower_surfaces();

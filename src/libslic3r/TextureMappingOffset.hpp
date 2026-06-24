@@ -128,7 +128,8 @@ std::optional<TextureMappingOffsetContext> build_texture_mapping_offset_context_
     std::optional<float>     texture_sample_pitch_mm_override = std::nullopt,
     std::optional<int>       raw_top_surface_depth_override = std::nullopt,
     std::optional<float>     filament_overhang_contrast_pct_override = std::nullopt,
-    TextureMappingRawSurfaceUsage raw_surface_usage = TextureMappingRawSurfaceUsage::Side);
+    TextureMappingRawSurfaceUsage raw_surface_usage = TextureMappingRawSurfaceUsage::Side,
+    bool                          allow_zero_width_delta_for_sampling = false);
 
 std::vector<float> sample_weight_field_components(const TextureMappingOffsetWeightField &weight_field,
                                                   float                                  x_mm,
