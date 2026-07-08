@@ -7283,7 +7283,7 @@ bool CLI::export_project(Model *model, std::string& path, PlateDataPtrs &partpla
     bool success = false;
 
     StoreParams store_params;
-    store_params.path = path.c_str();
+    store_params.path = path;
     store_params.model = model;
     store_params.plate_data_list = partplate_data;
     store_params.project_presets = project_presets;

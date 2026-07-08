@@ -7069,7 +7069,7 @@ static void append_triangle_material_data(std::vector<uint8_t> &uv_valid,
                 m_thumbnail_middle = iter->second;
         }
         boost::system::error_code ec;
-        std::string filename = std::string(store_params.path);
+        std::string filename = store_params.path;
         boost::filesystem::remove(filename + ".tmp", ec);
 
         bool result = _save_model_to_file(filename + ".tmp", *store_params.model, store_params.plate_data_list, store_params.project_presets, store_params.config,
@@ -10414,7 +10414,7 @@ bool store_bbs_3mf(StoreParams& store_params)
     // All export should use "C" locales for number formatting.
     CNumericLocalesSetter locales_setter;
 
-    if (store_params.path == nullptr || store_params.model == nullptr)
+    if (store_params.path.empty() || store_params.model == nullptr)
         return false;
 
     _BBS_3MF_Exporter exporter;
