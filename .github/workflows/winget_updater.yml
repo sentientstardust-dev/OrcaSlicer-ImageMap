@@ -8,7 +8,7 @@ jobs:
     steps:
       - uses: vedantmgoyal9/winget-releaser@main
         with:
-          identifier: SoftFever.OrcaSlicer
+          identifier: SentientStardust.OrcaSlicer-ImageMap
           version: ${{ github.event.release.tag_name }}
           token: ${{ secrets.WINGET_TOKEN }}
           installers-regex: '\.exe$'

@@ -224,7 +224,7 @@ void DownPluginFrame::OnScriptMessage(wxWebViewEvent &evt)
             this->Close();
         }
         else if (strCmd == "open_plugin_folder") {
-            auto plugin_folder = (boost::filesystem::path(wxStandardPaths::Get().GetUserDataDir().ToUTF8().data()) / "plugins").make_preferred().string();
+            auto plugin_folder = (boost::filesystem::path(Slic3r::data_dir()) / "plugins").make_preferred().string();
             desktop_open_any_folder(plugin_folder);
         }
     } catch (std::exception &) {

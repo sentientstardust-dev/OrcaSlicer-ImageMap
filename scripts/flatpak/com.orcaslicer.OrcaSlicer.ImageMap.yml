@@ -1,4 +1,4 @@
-app-id: com.orcaslicer.OrcaSlicer
+app-id: com.orcaslicer.OrcaSlicer.ImageMap
 runtime: org.gnome.Platform
 runtime-version: "49"
 sdk: org.gnome.Sdk
@@ -6,7 +6,7 @@ sdk-extensions:
   - org.freedesktop.Sdk.Extension.llvm21
 command: entrypoint
 separate-locales: true
-rename-icon: OrcaSlicer
+rename-icon: OrcaSlicer-ImageMap
 build-options:
   append-path: /usr/lib/sdk/llvm21/bin
   prepend-ld-library-path: /usr/lib/sdk/llvm21/lib
@@ -20,16 +20,22 @@ finish-args:
   - --socket=wayland
   - --share=network
   - --device=all
-  - --filesystem=home
+  - --filesystem=home:ro
+  - --filesystem=xdg-desktop
+  - --filesystem=xdg-documents
+  - --filesystem=xdg-download
+  - --filesystem=xdg-pictures
   - --filesystem=xdg-run/gvfs
   - --filesystem=/run/media
   - --filesystem=/media
   - --filesystem=/run/spnav.sock:ro
   # Allow read-only access to OrcaSlicer's legacy config and cache directories (if they exist) for migration purposes.
+  - --filesystem=~/.config/OrcaSlicer:ro
+  - --filesystem=~/.var/app/com.orcaslicer.OrcaSlicer:ro
   - --filesystem=~/.var/app/io.github.orcaslicer.OrcaSlicer:ro
   # Allow OrcaSlicer to own and talk to instance-check D-Bus names (InstanceCheck.cpp)
-  - --talk-name=com.orcaslicer.OrcaSlicer.InstanceCheck.*
-  - --own-name=com.orcaslicer.OrcaSlicer.InstanceCheck.*
+  - --talk-name=com.orcaslicer.OrcaSlicer.ImageMap.InstanceCheck.*
+  - --own-name=com.orcaslicer.OrcaSlicer.ImageMap.InstanceCheck.*
   - --system-talk-name=org.freedesktop.UDisks2
   - --env=SPNAV_SOCKET=/run/spnav.sock
 
@@ -328,13 +334,14 @@ modules:
     post-install:
 
       - | # Desktop integration files
-        install -Dm644 resources/images/OrcaSlicer_32px.png /app/share/icons/hicolor/32x32/apps/OrcaSlicer.png
-        install -Dm644 resources/images/OrcaSlicer_64.png /app/share/icons/hicolor/64x64/apps/OrcaSlicer.png
-        install -Dm644 resources/images/OrcaSlicer_128px.png /app/share/icons/hicolor/128x128/apps/OrcaSlicer.png
-        install -Dm644 resources/images/OrcaSlicer_192px.png /app/share/icons/hicolor/192x192/apps/OrcaSlicer.png
-        install -Dm644 resources/images/OrcaSlicer.png /app/share/icons/hicolor/256x256/apps/OrcaSlicer.png
+        install -Dm644 resources/images/OrcaSlicer_32px.png /app/share/icons/hicolor/32x32/apps/${FLATPAK_ID}.png
+        install -Dm644 resources/images/OrcaSlicer_64.png /app/share/icons/hicolor/64x64/apps/${FLATPAK_ID}.png
+        install -Dm644 resources/images/OrcaSlicer_128px.png /app/share/icons/hicolor/128x128/apps/${FLATPAK_ID}.png
+        install -Dm644 resources/images/OrcaSlicer_192px.png /app/share/icons/hicolor/192x192/apps/${FLATPAK_ID}.png
+        install -Dm644 resources/images/OrcaSlicer.png /app/share/icons/hicolor/256x256/apps/${FLATPAK_ID}.png
         install -Dm644 ${FLATPAK_ID}.metainfo.xml /app/share/metainfo/${FLATPAK_ID}.metainfo.xml
         desktop-file-edit --set-key=Exec --set-value="entrypoint %U" /app/share/applications/${FLATPAK_ID}.desktop
+        desktop-file-edit --set-key=Icon --set-value="${FLATPAK_ID}" /app/share/applications/${FLATPAK_ID}.desktop
         install -Dm755 entrypoint /app/bin
         install -Dm755 umount /app/bin
 
@@ -342,8 +349,8 @@ modules:
 
       - | # Install fonts into fontconfig-scanned directory so Pango finds them
         # before initialization (avoids ensure_faces crash from AddPrivateFont)
-        install -Dm644 -t /app/share/fonts/OrcaSlicer/ resources/fonts/*.ttf
-        fc-cache -f /app/share/fonts/OrcaSlicer/
+        install -Dm644 -t /app/share/fonts/OrcaSlicer-ImageMap/ resources/fonts/*.ttf
+        fc-cache -f /app/share/fonts/OrcaSlicer-ImageMap/
 
     sources:
       # OrcaSlicer source tree (specific dirs to avoid copying .git from worktree)
@@ -377,7 +384,7 @@ modules:
 
       # AppData metainfo for GNOME Software & Co.
       - type: file
-        path: com.orcaslicer.OrcaSlicer.metainfo.xml
+        path: com.orcaslicer.OrcaSlicer.ImageMap.metainfo.xml
 
       # Startup script
       - type: file

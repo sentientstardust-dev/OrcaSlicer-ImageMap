@@ -146,8 +146,8 @@ jobs:
             -name "OrcaSlicer-ImageMap_Mac_*_V$version.dmg" -o \
             -name "OrcaSlicer-ImageMap_Windows_V${version}_portable.zip" -o \
             -name "OrcaSlicer-ImageMap_Windows_Installer_V${version}.exe" -o \
-            -name "OrcaSlicer_Linux_AppImage*_V${version}.AppImage" -o \
-            -name "OrcaSlicer-Linux-flatpak_V${version}_*.flatpak" \
+            -name "OrcaSlicer-ImageMap_Linux_AppImage*_V${version}.AppImage" -o \
+            -name "OrcaSlicer-ImageMap-Linux-flatpak_V${version}_*.flatpak" \
           \) ! -name '*profile_validator*' | sort)
 
           if [ "${#assets[@]}" -eq 0 ]; then
@@ -281,32 +281,32 @@ jobs:
     - name: Disable debug info for faster CI builds
       run: |
         sed -i '/^build-options:/a\  no-debuginfo: true\n  strip: true' \
-          scripts/flatpak/com.orcaslicer.OrcaSlicer.yml
+          scripts/flatpak/com.orcaslicer.OrcaSlicer.ImageMap.yml
       shell: bash
     - name: Inject git commit hash into Flatpak manifest
       run: |
         sed -i "/name: OrcaSlicer/{n;s|buildsystem: simple|buildsystem: simple\n    build-options:\n      env:\n        git_commit_hash: \"$git_commit_hash\"|}" \
-          scripts/flatpak/com.orcaslicer.OrcaSlicer.yml
+          scripts/flatpak/com.orcaslicer.OrcaSlicer.ImageMap.yml
       shell: bash
     - uses: flatpak/flatpak-github-actions/flatpak-builder@master
       with:
-        bundle: OrcaSlicer-Linux-flatpak_${{ env.ver }}_${{ matrix.variant.arch }}.flatpak
-        manifest-path: scripts/flatpak/com.orcaslicer.OrcaSlicer.yml
+        bundle: OrcaSlicer-ImageMap-Linux-flatpak_${{ env.ver }}_${{ matrix.variant.arch }}.flatpak
+        manifest-path: scripts/flatpak/com.orcaslicer.OrcaSlicer.ImageMap.yml
         cache: false
         arch: ${{ matrix.variant.arch }}
         upload-artifact: false
     - name: Upload artifacts Flatpak
       uses: actions/upload-artifact@v7
       with:
-        name: OrcaSlicer-Linux-flatpak_${{ env.ver }}_${{ matrix.variant.arch }}.flatpak
-        path: '/__w/OrcaSlicer/OrcaSlicer/OrcaSlicer-Linux-flatpak_${{ env.ver }}_${{ matrix.variant.arch }}.flatpak'
+        name: OrcaSlicer-ImageMap-Linux-flatpak_${{ env.ver }}_${{ matrix.variant.arch }}.flatpak
+        path: '/__w/OrcaSlicer/OrcaSlicer/OrcaSlicer-ImageMap-Linux-flatpak_${{ env.ver }}_${{ matrix.variant.arch }}.flatpak'
     - name: Deploy Flatpak to nightly release
       if: github.repository == 'OrcaSlicer/OrcaSlicer' && github.ref == 'refs/heads/main'
       uses: WebFreak001/deploy-nightly@v3.2.0
       with:
         upload_url: https://uploads.github.com/repos/OrcaSlicer/OrcaSlicer/releases/137995723/assets{?name,label}
         release_id: 137995723
-        asset_path: /__w/OrcaSlicer/OrcaSlicer/OrcaSlicer-Linux-flatpak_${{ env.ver }}_${{ matrix.variant.arch }}.flatpak
-        asset_name: OrcaSlicer-Linux-flatpak_nightly_${{ matrix.variant.arch }}.flatpak
+        asset_path: /__w/OrcaSlicer/OrcaSlicer/OrcaSlicer-ImageMap-Linux-flatpak_${{ env.ver }}_${{ matrix.variant.arch }}.flatpak
+        asset_name: OrcaSlicer-ImageMap-Linux-flatpak_nightly_${{ matrix.variant.arch }}.flatpak
         asset_content_type: application/octet-stream
         max_releases: 1 # optional, if there are more releases than this matching the asset_name, the oldest ones are going to be deleted

@@ -457,6 +457,7 @@ bool generate_image(const std::string &filename, wxImage &image, wxSize img_size
 int get_dpi_for_window(const wxWindow *window);
 
 #ifdef __WXOSX__
+void activate_application();
 void dataview_remove_insets(wxDataViewCtrl* dv);
 void staticbox_remove_margin(wxStaticBox* sb);
 #endif

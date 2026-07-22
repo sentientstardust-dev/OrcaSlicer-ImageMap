@@ -7190,9 +7190,13 @@ void CLI::print_help(bool include_print_options, PrinterTechnology printer_techn
     attach_console_on_demand();
 
     boost::nowide::cout
-        << SLIC3R_APP_KEY <<"-"<< SoftFever_VERSION << ":"
+        << SLIC3R_APP_NAME << "-" << SoftFever_VERSION << ":"
         << std::endl
+#if defined(__linux__)
+        << "Usage: " SLIC3R_LINUX_APP_CMD " [ OPTIONS ] [ file.3mf/file.stl ... ]" << std::endl
+#else
         << "Usage: orca-slicer [ OPTIONS ] [ file.3mf/file.stl ... ]" << std::endl
+#endif
         << std::endl
         << "OPTIONS:" << std::endl;
     cli_misc_config_def.print_cli_help(boost::nowide::cout, false);

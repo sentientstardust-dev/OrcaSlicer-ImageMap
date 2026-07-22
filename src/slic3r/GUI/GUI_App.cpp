@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <optional>
 #include <regex>
+#include <set>
 #include <thread>
 #include <string_view>
 #include <boost/algorithm/string/predicate.hpp>
@@ -50,6 +51,7 @@
 #include <wx/filefn.h>
 #include <wx/sysopt.h>
 #include <wx/richmsgdlg.h>
+#include <wx/msgdlg.h>
 #include <wx/log.h>
 #include <wx/intl.h>
 
@@ -265,7 +267,7 @@ bool is_associate_files(std::wstring extend)
     wchar_t app_path[MAX_PATH];
     ::GetModuleFileNameW(nullptr, app_path, sizeof(app_path));
 
-    std::wstring prog_id             = L" Orca.Slicer.1";
+    std::wstring prog_id             = boost::nowide::widen(SLIC3R_WINDOWS_PROG_ID);
     std::wstring reg_base            = L"Software\\Classes";
     std::wstring reg_extension       = reg_base + L"\\." + extend;
 
@@ -479,38 +481,136 @@ private:
     m_constant_text;
 };
 
-#ifdef __linux__
-static void migrate_flatpak_legacy_datadir(const boost::filesystem::path &data_dir_path)
+static bool skip_import_path(const boost::filesystem::path &relative_path)
 {
-    if(!boost::filesystem::exists("/.flatpak-info"))
-        return; // Not running as a Flatpak, nothing to migrate.
-    
-    namespace fs = boost::filesystem;
-
-    if (fs::exists(data_dir_path)){
-        std::cerr << "New Flatpak data dir: " << data_dir_path << std::endl;
-        return;
+    auto component = relative_path.begin();
+    if (component != relative_path.end()) {
+        const std::string first = component->string();
+        if (first == "cache" || first == "log" || first == "ota" || first == "tmp" || first == "temp")
+            return true;
+        if (first == "resources" && ++component != relative_path.end() && component->string() == "tooltip")
+            return true;
     }
-    std::cerr << "Migrating Flatpak data dir: " << data_dir_path << std::endl;
 
-    std::string legacy_data_dir_str = data_dir_path.string();
-    boost::replace_first(legacy_data_dir_str, "com.orcaslicer.OrcaSlicer", "io.github.orcaslicer.OrcaSlicer");
-    const fs::path legacy_data_dir(legacy_data_dir_str);
+    const std::string filename = relative_path.filename().string();
+    if (filename == "video.h264" || filename == "video.info")
+        return true;
+    if (boost::ends_with(filename, ".lock") || boost::ends_with(filename, ".pid") ||
+        boost::ends_with(filename, ".tmp") || boost::ends_with(filename, ".temp") ||
+        boost::ends_with(filename, ".part") || boost::ends_with(filename, ".partial") ||
+        boost::ends_with(filename, ".download") || boost::ends_with(filename, ".crdownload") ||
+        boost::ends_with(filename, "~"))
+        return true;
+    if (boost::starts_with(filename, SLIC3R_APP_KEY ".conf.") || boost::starts_with(filename, SLIC3R_APP_KEY ".ini."))
+        return true;
+    return false;
+}
 
-    std::cerr << "Legacy Flatpak data dir: " << legacy_data_dir << std::endl;
-
-    if ( ! fs::exists(legacy_data_dir) || ! fs::is_directory(legacy_data_dir))
-        return;
-    std::cerr << "Legacy Flatpak data dir exists: " << legacy_data_dir << std::endl;
-
+static bool has_importable_data(const boost::filesystem::path &path,
+                                const boost::filesystem::path &relative_path = {})
+{
+    namespace fs = boost::filesystem;
     try {
-        std::cerr << "Migrating Flatpak data dir from " << legacy_data_dir << " to " << data_dir_path << std::endl;
-        copy_directory_recursively(legacy_data_dir, data_dir_path);
-    } catch (const std::exception &ex) {
-        std::cerr << "Failed to migrate Flatpak data dir from " << legacy_data_dir << " to " << data_dir_path << ": " << ex.what() << std::endl;
+        if (!fs::is_directory(path))
+            return false;
+        for (const fs::directory_entry &entry : fs::directory_iterator(path)) {
+            const fs::path entry_relative = relative_path / entry.path().filename();
+            if (skip_import_path(entry_relative))
+                continue;
+            const fs::file_status status = fs::symlink_status(entry.path());
+            if (fs::is_regular_file(status) || (fs::is_directory(status) && has_importable_data(entry.path(), entry_relative)))
+                return true;
+        }
+    } catch (const std::exception &) {
+    }
+    return false;
+}
+
+static void copy_import_data(const boost::filesystem::path &source, const boost::filesystem::path &target,
+                             const boost::filesystem::path &relative_path = {})
+{
+    namespace fs = boost::filesystem;
+    fs::create_directories(target);
+    for (const fs::directory_entry &entry : fs::directory_iterator(source)) {
+        const fs::path entry_relative = relative_path / entry.path().filename();
+        if (skip_import_path(entry_relative))
+            continue;
+
+        const fs::path destination = target / entry.path().filename();
+        if (fs::is_directory(fs::symlink_status(entry.path())))
+            copy_import_data(entry.path(), destination, entry_relative);
+        else if (fs::is_regular_file(fs::symlink_status(entry.path())))
+            fs::copy_file(entry.path(), destination);
     }
 }
 
+static bool import_default_data_dir(const boost::filesystem::path &source, const boost::filesystem::path &target)
+{
+    namespace fs = boost::filesystem;
+    for (;;) {
+        const fs::path temporary = target.parent_path() /
+            (target.filename().string() + ".import-" + fs::unique_path("%%%%-%%%%-%%%%").string());
+        try {
+            copy_import_data(source, temporary);
+            if (fs::exists(target)) {
+                fs::remove_all(temporary);
+                return true;
+            }
+            fs::rename(temporary, target);
+            return true;
+        } catch (const std::exception &ex) {
+            boost::system::error_code ec;
+            fs::remove_all(temporary, ec);
+            if (fs::exists(target, ec) && !ec)
+                return true;
+            wxMessageDialog dialog(nullptr,
+                wxString::Format("Copying OrcaSlicer settings failed:\n\n%s\n\n%s",
+                                 from_path(source), from_u8(ex.what())),
+                "OrcaSlicer-ImageMap setup", wxYES_NO | wxICON_ERROR);
+            dialog.SetYesNoLabels("Retry", "Start clean");
+            if (dialog.ShowModal() != wxID_YES)
+                return false;
+        }
+    }
+}
+
+static std::optional<boost::filesystem::path> find_upstream_data_dir(const boost::filesystem::path &target)
+{
+    namespace fs = boost::filesystem;
+    std::vector<fs::path> candidates;
+#ifdef __linux__
+    if (fs::exists("/.flatpak-info")) {
+        const fs::path home = into_path(wxFileName::GetHomeDir());
+        candidates.emplace_back(home / ".var/app/com.orcaslicer.OrcaSlicer/config" / SLIC3R_APP_KEY);
+        candidates.emplace_back(home / ".var/app/io.github.orcaslicer.OrcaSlicer/config" / SLIC3R_APP_KEY);
+        candidates.emplace_back(home / ".config" / SLIC3R_APP_KEY);
+    }
+#endif
+    candidates.emplace_back(target.parent_path() / SLIC3R_APP_KEY);
+
+    std::set<std::string> visited;
+    for (const fs::path &candidate : candidates) {
+        const std::string candidate_string = candidate.lexically_normal().string();
+        if (visited.insert(candidate_string).second && has_importable_data(candidate))
+            return candidate;
+    }
+    return std::nullopt;
+}
+
+static bool prompt_to_import_upstream_data(const boost::filesystem::path &source)
+{
+#ifdef __WXOSX__
+    activate_application();
+#endif
+    wxMessageDialog dialog(nullptr,
+        wxString::Format("Existing OrcaSlicer settings were found at:\n\n%s\n\nCopy them into OrcaSlicer-ImageMap? The original settings will not be changed.",
+                         from_path(source)),
+        "OrcaSlicer-ImageMap setup", wxYES_NO | wxICON_QUESTION);
+    dialog.SetYesNoLabels("Copy OrcaSlicer settings", "Start clean");
+    return dialog.ShowModal() == wxID_YES;
+}
+
+#ifdef __linux__
 bool static check_old_linux_datadir(const wxString& app_name) {
     // If we are on Linux and the datadir does not exist yet, look into the old
     // location where the datadir was before version 2.3. If we find it there,
@@ -1105,13 +1205,7 @@ GUI_App::GUI_App()
     , m_downloader(std::make_unique<Downloader>())
 	, m_other_instance_message_handler(std::make_unique<OtherInstanceMessageHandler>())
 {
-	//app config initializes early becasuse it is used in instance checking in OrcaSlicer.cpp
-    this->init_app_config();
-    this->init_download_path();
-#if wxUSE_WEBVIEW_EDGE
-    this->init_webview_runtime();
-#endif
-
+    SetAppName(SLIC3R_APP_DATA_DIR);
     reset_to_active();
 }
 
@@ -2374,7 +2468,7 @@ void GUI_App::init_webview_runtime()
 void GUI_App::init_app_config()
 {
 	// Profiles for the alpha are stored into the PrusaSlicer-alpha directory to not mix with the current release.
-    SetAppName(SLIC3R_APP_KEY);
+    SetAppName(SLIC3R_APP_DATA_DIR);
 //	SetAppName(SLIC3R_APP_KEY "-alpha");
 //  SetAppName(SLIC3R_APP_KEY "-beta");
 //	SetAppDisplayName(SLIC3R_APP_NAME);
@@ -2403,10 +2497,7 @@ void GUI_App::init_app_config()
         else{
             boost::filesystem::path data_dir_path;
             #ifndef __linux__
-                std::string data_dir = wxStandardPaths::Get().GetUserDataDir().ToUTF8().data();
-                //BBS create folder if not exists
-                data_dir_path = boost::filesystem::path(data_dir);
-                set_data_dir(data_dir);
+                data_dir_path = boost::filesystem::path(wxStandardPaths::Get().GetUserDataDir().ToUTF8().data());
             #else
                 // Since version 2.3, config dir on Linux is in ${XDG_CONFIG_HOME}.
                 // https://github.com/prusa3d/PrusaSlicer/issues/2911
@@ -2414,12 +2505,16 @@ void GUI_App::init_app_config()
                 if (! wxGetEnv(wxS("XDG_CONFIG_HOME"), &dir) || dir.empty() )
                     dir = wxFileName::GetHomeDir() + wxS("/.config");
                 data_dir_path = boost::filesystem::path((dir + "/" + GetAppName()).ToUTF8().data());
-                migrate_flatpak_legacy_datadir(data_dir_path);
-                set_data_dir(data_dir_path.string());
             #endif
-            if (!boost::filesystem::exists(data_dir_path)){
-                boost::filesystem::create_directory(data_dir_path);
+
+            if (!boost::filesystem::exists(data_dir_path)) {
+                const std::optional<boost::filesystem::path> upstream_data_dir = find_upstream_data_dir(data_dir_path);
+                if (upstream_data_dir && prompt_to_import_upstream_data(*upstream_data_dir))
+                    m_imported_upstream_data = import_default_data_dir(*upstream_data_dir, data_dir_path);
+                if (!boost::filesystem::exists(data_dir_path))
+                    boost::filesystem::create_directories(data_dir_path);
             }
+            set_data_dir(data_dir_path.string());
         }
 
         // Change current dirtory of application
@@ -2457,7 +2552,7 @@ void GUI_App::init_app_config()
     m_config_corrupted = false;
 	// load settings
 	m_app_conf_exists = app_config->exists();
-	if (m_app_conf_exists) {
+    if (m_app_conf_exists) {
         std::string error = app_config->load();
         if (!error.empty()) {
             // Orca: if the config file is corrupted, we will show a error dialog and create a default config file.
@@ -2466,12 +2561,22 @@ void GUI_App::init_app_config()
         }
         // Save orig_version here, so its empty if no app_config existed before this run.
         m_last_config_version = app_config->orig_version();//parse_semver_from_ini(app_config->config_path());
+        if (m_imported_upstream_data) {
+            for (const char *key : { "desktop_integration_app_path", "desktop_integration_icon_slicer_path",
+                                     "desktop_integration_app_viewer_path", "desktop_integration_icon_viewer_path",
+                                     "desktop_integration_URL_path", "desktop_integration_URL_path_orcaslicer",
+                                     "desktop_integration_URL_path_orcaslicer-imagemap" })
+                app_config->erase("app", key);
+        }
     }
     else {
 #ifdef _WIN32
         // update associate files from registry information
         if (is_associate_files(L"3mf")) {
             app_config->set("associate_3mf", "true");
+        }
+        if (is_associate_files(L"drc")) {
+            app_config->set("associate_drc", "true");
         }
         if (is_associate_files(L"stl")) {
             app_config->set("associate_stl", "true");
@@ -2588,6 +2693,14 @@ void GUI_App::init_single_instance_checker(const std::string &name, const std::s
 bool GUI_App::OnInit()
 {
     try {
+        init_app_config();
+        init_download_path();
+#if wxUSE_WEBVIEW_EDGE
+        init_webview_runtime();
+#endif
+        const bool single_instance = app_config->get("app", "single_instance") == "true";
+        if (init_params != nullptr && Slic3r::instance_check(init_params->argc, init_params->argv, single_instance))
+            return false;
         return on_init_inner();
     } catch (const std::exception& e) {
         BOOST_LOG_TRIVIAL(fatal) << "OnInit Got Fatal error: " << e.what();
@@ -2927,12 +3040,15 @@ bool GUI_App::on_init_inner()
 #ifdef __WXMSW__
         if (app_config->get("associate_3mf") == "true")
             associate_files(L"3mf");
+        if (app_config->get("associate_drc") == "true")
+            associate_files(L"drc");
         if (app_config->get("associate_stl") == "true")
             associate_files(L"stl");
         if (app_config->get("associate_step") == "true") {
             associate_files(L"step");
             associate_files(L"stp");
         }
+        associate_url(boost::nowide::widen(SLIC3R_APP_URL_SCHEME));
         associate_url(L"orcaslicer");
 
         if (app_config->get("associate_gcode") == "true")
@@ -7011,12 +7127,15 @@ void GUI_App::open_preferences(size_t open_on_tab, const std::string& highlight_
             if (is_editor()) {
                 if (app_config->get("associate_3mf") == "true")
                     associate_files(L"3mf");
+                if (app_config->get("associate_drc") == "true")
+                    associate_files(L"drc");
                 if (app_config->get("associate_stl") == "true")
                     associate_files(L"stl");
                 if (app_config->get("associate_step") == "true") {
                     associate_files(L"step");
                     associate_files(L"stp");
                 }
+                associate_url(boost::nowide::widen(SLIC3R_APP_URL_SCHEME));
                 associate_url(L"orcaslicer");
             }
             else {
@@ -8068,19 +8187,16 @@ static bool del_win_registry(HKEY hkeyHive, const wchar_t *pszVar, const wchar_t
 
     int iRC = ::RegGetValueW(hkeyHive, pszVar, nullptr, RRF_RT_ANY, &dwType, szValueCurrent, &dwSize);
 
-    bool bDidntExist = iRC == ERROR_FILE_NOT_FOUND;
-
-    if ((iRC != ERROR_SUCCESS) && !bDidntExist)
+    if (iRC != ERROR_SUCCESS || dwType != REG_SZ || ::wcscmp(szValueCurrent, pszValue) != 0)
         return false;
 
-    if (!bDidntExist) {
-        iRC      = ::RegDeleteKeyExW(hkeyHive, pszVar, KEY_ALL_ACCESS, 0);
-        if (iRC == ERROR_SUCCESS) {
-            return true;
-        }
-    }
-
-    return false;
+    HKEY hkey;
+    iRC = ::RegOpenKeyExW(hkeyHive, pszVar, 0, KEY_SET_VALUE, &hkey);
+    if (iRC != ERROR_SUCCESS)
+        return false;
+    iRC = ::RegDeleteValueW(hkey, L"");
+    ::RegCloseKey(hkey);
+    return iRC == ERROR_SUCCESS;
 }
 
 #endif // __WXMSW__
@@ -8092,8 +8208,8 @@ void GUI_App::associate_files(std::wstring extend)
     ::GetModuleFileNameW(nullptr, app_path, sizeof(app_path));
 
     std::wstring prog_path = L"\"" + std::wstring(app_path) + L"\"";
-    std::wstring prog_id = L" Orca.Slicer.1";
-    std::wstring prog_desc = L"OrcaSlicer";
+    std::wstring prog_id = boost::nowide::widen(SLIC3R_WINDOWS_PROG_ID);
+    std::wstring prog_desc = boost::nowide::widen(SLIC3R_APP_NAME);
     std::wstring prog_command = prog_path + L" \"%1\"";
     std::wstring reg_base = L"Software\\Classes";
     std::wstring reg_extension = reg_base + L"\\." + extend;
@@ -8113,28 +8229,21 @@ void GUI_App::associate_files(std::wstring extend)
 void GUI_App::disassociate_files(std::wstring extend)
 {
 #ifdef WIN32
-    wchar_t app_path[MAX_PATH];
-    ::GetModuleFileNameW(nullptr, app_path, sizeof(app_path));
-
-    std::wstring prog_path = L"\"" + std::wstring(app_path) + L"\"";
-    std::wstring prog_id = L" Orca.Slicer.1";
-    std::wstring prog_desc = L"OrcaSlicer";
-    std::wstring prog_command = prog_path + L" \"%1\"";
+    std::wstring prog_id = boost::nowide::widen(SLIC3R_WINDOWS_PROG_ID);
     std::wstring reg_base = L"Software\\Classes";
     std::wstring reg_extension = reg_base + L"\\." + extend;
     std::wstring reg_prog_id = reg_base + L"\\" + prog_id;
-    std::wstring reg_prog_id_command = reg_prog_id + L"\\Shell\\Open\\Command";
 
     bool is_new = false;
     is_new |= del_win_registry(HKEY_CURRENT_USER, reg_extension.c_str(), prog_id.c_str());
 
-    bool is_associate_3mf  = app_config->get("associate_3mf") == "true";
-    bool is_associate_stl  = app_config->get("associate_stl") == "true";
-    bool is_associate_step = app_config->get("associate_step") == "true";
-    if (!is_associate_3mf && !is_associate_stl && !is_associate_step)
-    {
-        is_new |= del_win_registry(HKEY_CURRENT_USER, reg_prog_id.c_str(), prog_desc.c_str());
-        is_new |= del_win_registry(HKEY_CURRENT_USER, reg_prog_id_command.c_str(), prog_command.c_str());
+    bool has_association = false;
+    for (const wchar_t *extension : { L"3mf", L"drc", L"stl", L"step", L"stp", L"gcode" })
+        has_association |= is_associate_files(extension);
+    if (!has_association) {
+        wxRegKey prog_id_key(wxRegKey::HKCU, wxString(reg_prog_id));
+        if (prog_id_key.Exists())
+            is_new |= prog_id_key.DeleteSelf();
     }
 
     if (is_new)
@@ -8189,11 +8298,14 @@ void GUI_App::associate_url(std::wstring url_prefix)
 void GUI_App::disassociate_url(std::wstring url_prefix)
 {
 #ifdef WIN32
-    wxRegKey key_full(wxRegKey::HKCU, "Software\\Classes\\" + url_prefix + "\\shell\\open\\command");
-    if (!key_full.Exists()) {
+    std::wstring registered_binary;
+    if (!check_url_association(url_prefix, registered_binary))
         return;
-    }
-    key_full = "";
+    wxString registry_path(L"Software\\Classes\\");
+    registry_path += url_prefix;
+    wxRegKey key(wxRegKey::HKCU, registry_path);
+    if (key.Exists())
+        key.DeleteSelf();
 #endif // WIN32
 }
 

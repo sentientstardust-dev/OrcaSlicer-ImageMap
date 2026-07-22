@@ -43,7 +43,7 @@ namespace Slic3r {
 static const std::string VERSION_CHECK_URL = "https://gradients.garden/orcaslicer_imagemap/current_version.json";
 static const std::string VERSION_CHECK_URL_LEGACY = "https://check-version.orcaslicer.com/latest";
 static const std::string VERSION_CHECK_MODE = "platform_json";
-static const std::string VERSION_DOWNLOAD_URL = "https://gitlab.com/sentient_stardust/orcaslicer-imagemap";
+static const std::string VERSION_DOWNLOAD_URL = "https://github.com/sentientstardust-dev/OrcaSlicer-ImageMap/releases";
 static const std::string PROFILE_UPDATE_URL = "https://api.github.com/repos/OrcaSlicer/orcaslicer-profiles/releases/tags";
 static const std::string MODELS_STR = "models";
 

@@ -178,6 +178,7 @@ jobs:
           mkdir -p ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_dmg
           rm -rf ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_dmg/*
           cp -R ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer/OrcaSlicer.app ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_dmg/OrcaSlicer-ImageMap.app
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_dmg/OrcaSlicer-ImageMap.app/Contents/Info.plist)" = "com.orcaslicer.OrcaSlicer.ImageMap"
           ln -sfn /Applications ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_dmg/Applications
           hdiutil create -volname "OrcaSlicer-ImageMap" -srcfolder ${{ github.workspace }}/build/${{ inputs.arch }}/OrcaSlicer_dmg -ov -format UDZO OrcaSlicer-ImageMap_Mac_${{ inputs.arch }}_${{ env.ver }}.dmg
 
@@ -226,6 +227,7 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           ./build_release_macos.sh -u -x ${{ !vars.SELF_HOSTED && '-1' || '' }} -a universal -t 10.15
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' ${{ github.workspace }}/build/universal/OrcaSlicer/OrcaSlicer.app/Contents/Info.plist)" = "com.orcaslicer.OrcaSlicer.ImageMap"
 
       - name: Delete intermediate per-arch artifacts
         if: runner.os == 'macOS' && inputs.macos-combine-only
@@ -266,6 +268,7 @@ jobs:
           mkdir -p ${{ github.workspace }}/build/universal/OrcaSlicer_dmg
           rm -rf ${{ github.workspace }}/build/universal/OrcaSlicer_dmg/*
           cp -R ${{ github.workspace }}/build/universal/OrcaSlicer/OrcaSlicer.app ${{ github.workspace }}/build/universal/OrcaSlicer_dmg/OrcaSlicer-ImageMap.app
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' ${{ github.workspace }}/build/universal/OrcaSlicer_dmg/OrcaSlicer-ImageMap.app/Contents/Info.plist)" = "com.orcaslicer.OrcaSlicer.ImageMap"
           ln -sfn /Applications ${{ github.workspace }}/build/universal/OrcaSlicer_dmg/Applications
           hdiutil create -volname "OrcaSlicer-ImageMap" -srcfolder ${{ github.workspace }}/build/universal/OrcaSlicer_dmg -ov -format UDZO OrcaSlicer-ImageMap_Mac_universal_${{ env.ver }}.dmg
           codesign --deep --force --verbose --options runtime --timestamp --entitlements ${{ github.workspace }}/scripts/disable_validation.entitlements --sign "$CERTIFICATE_ID" OrcaSlicer-ImageMap_Mac_universal_${{ env.ver }}.dmg
@@ -297,6 +300,7 @@ jobs:
           mkdir -p ${{ github.workspace }}/build/universal/OrcaSlicer_dmg
           rm -rf ${{ github.workspace }}/build/universal/OrcaSlicer_dmg/*
           cp -R ${{ github.workspace }}/build/universal/OrcaSlicer/OrcaSlicer.app ${{ github.workspace }}/build/universal/OrcaSlicer_dmg/OrcaSlicer-ImageMap.app
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' ${{ github.workspace }}/build/universal/OrcaSlicer_dmg/OrcaSlicer-ImageMap.app/Contents/Info.plist)" = "com.orcaslicer.OrcaSlicer.ImageMap"
           ln -sfn /Applications ${{ github.workspace }}/build/universal/OrcaSlicer_dmg/Applications
           hdiutil create -volname "OrcaSlicer-ImageMap" -srcfolder ${{ github.workspace }}/build/universal/OrcaSlicer_dmg -ov -format UDZO OrcaSlicer-ImageMap_Mac_universal_${{ env.ver }}.dmg
           
@@ -384,9 +388,6 @@ jobs:
         working-directory: ${{ github.workspace }}/build
         run: |
           cpack -G NSIS
-          Get-ChildItem -Path . -Filter 'OrcaSlicer*.exe' | ForEach-Object {
-            Rename-Item -Path $_.FullName -NewName ($_.Name -replace '^OrcaSlicer_', 'OrcaSlicer-ImageMap_')
-          }
 
       - name: Pack app
         if: runner.os == 'Windows'
@@ -469,9 +470,9 @@ jobs:
         shell: bash
         run: |
           ./build_linux.sh -istrlL
-          ./scripts/check_appimage_libs.sh ./build/package ./build/package/bin/orca-slicer
-          mv -n ./build/OrcaSlicer_Linux_V${{ env.ver_pure }}.AppImage ./build/OrcaSlicer_Linux_AppImage${{ env.ubuntu-ver-str }}_${{ env.ver }}.AppImage
-          chmod +x ./build/OrcaSlicer_Linux_AppImage${{ env.ubuntu-ver-str }}_${{ env.ver }}.AppImage
+          ./scripts/check_appimage_libs.sh ./build/package ./build/package/bin/orca-slicer-imagemap
+          mv -n ./build/OrcaSlicer-ImageMap_Linux_V${{ env.ver_pure }}.AppImage ./build/OrcaSlicer-ImageMap_Linux_AppImage${{ env.ubuntu-ver-str }}_${{ env.ver }}.AppImage
+          chmod +x ./build/OrcaSlicer-ImageMap_Linux_AppImage${{ env.ubuntu-ver-str }}_${{ env.ver }}.AppImage
           tar -cvpf build_tests.tar build/tests
 
       - name: Show sccache stats Linux
@@ -516,7 +517,7 @@ jobs:
           test_repo_dir="${{ runner.temp }}/orca-test-repo"
           rm -rf "$test_repo_dir"
           git clone --depth 1 https://github.com/OrcaSlicer/orca-test-repo.git "$test_repo_dir"
-          python3 "$test_repo_dir/run_test.py" "${{ github.workspace }}/build/package/bin/orca-slicer"
+          python3 "$test_repo_dir/run_test.py" "${{ github.workspace }}/build/package/bin/orca-slicer-imagemap"
 
       - name: Build orca_custom_preset_tests
         if: github.ref == 'refs/heads/main' && runner.os == 'Linux' && !vars.SELF_HOSTED
@@ -531,8 +532,8 @@ jobs:
         if: ${{ ! env.ACT && runner.os == 'Linux' }}
         uses: actions/upload-artifact@v7
         with:
-          name: OrcaSlicer_Linux_ubuntu_${{ env.ubuntu-ver }}_${{ env.ver }}
-          path: './build/OrcaSlicer_Linux_AppImage${{ env.ubuntu-ver-str }}_${{ env.ver }}.AppImage'
+          name: OrcaSlicer-ImageMap_Linux_ubuntu_${{ env.ubuntu-ver }}_${{ env.ver }}
+          path: './build/OrcaSlicer-ImageMap_Linux_AppImage${{ env.ubuntu-ver-str }}_${{ env.ver }}.AppImage'
 
       - name: Upload OrcaSlicer_profile_validator Ubuntu
         if: ${{ ! env.ACT && runner.os == 'Linux' && !vars.SELF_HOSTED }}
@@ -547,8 +548,8 @@ jobs:
         with:
           upload_url: https://uploads.github.com/repos/OrcaSlicer/OrcaSlicer/releases/137995723/assets{?name,label}
           release_id: 137995723
-          asset_path: ./build/OrcaSlicer_Linux_AppImage${{ env.ubuntu-ver-str }}_${{ env.ver }}.AppImage
-          asset_name: OrcaSlicer_Linux_AppImage${{ env.ubuntu-ver-str }}_nightly.AppImage
+          asset_path: ./build/OrcaSlicer-ImageMap_Linux_AppImage${{ env.ubuntu-ver-str }}_${{ env.ver }}.AppImage
+          asset_name: OrcaSlicer-ImageMap_Linux_AppImage${{ env.ubuntu-ver-str }}_nightly.AppImage
           asset_content_type: application/octet-stream
           max_releases: 1 # optional, if there are more releases than this matching the asset_name, the oldest ones are going to be deleted
       - name: Deploy Ubuntu release

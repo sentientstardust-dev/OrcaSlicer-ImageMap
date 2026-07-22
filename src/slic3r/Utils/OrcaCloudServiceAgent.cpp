@@ -2193,7 +2193,7 @@ bool OrcaCloudServiceAgent::http_post_auth(const std::string& path, const std::s
 void OrcaCloudServiceAgent::compute_fallback_path()
 {
     if (!refresh_fallback_path.empty()) return;
-    wxFileName fallback(wxStandardPaths::Get().GetUserDataDir(), "orca_refresh_token.sec");
+    wxFileName fallback(wxString::FromUTF8(data_dir().c_str()), "orca_refresh_token.sec");
     fallback.Normalize();
     refresh_fallback_path = fallback.GetFullPath().ToStdString();
 }

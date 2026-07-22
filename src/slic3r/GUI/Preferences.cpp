@@ -988,8 +988,10 @@ wxBoxSizer *PreferencesDialog::create_item_checkbox(wxString title, wxString too
             bool pbool = app_config->get("associate_step") == "true" ? true : false;
             if (pbool) {
                 wxGetApp().associate_files(L"step");
+                wxGetApp().associate_files(L"stp");
             } else {
                 wxGetApp().disassociate_files(L"step");
+                wxGetApp().disassociate_files(L"stp");
             }
         }
 

@@ -738,6 +738,7 @@ private:
 
     bool                    m_init_app_config_from_older { false };
     bool                    m_datadir_redefined { false };
+    bool                    m_imported_upstream_data { false };
     std::string             m_older_data_dir_path;
     bool                    m_unsigned_plugin_warning_shown { false };
     boost::optional<Semver> m_last_config_version;

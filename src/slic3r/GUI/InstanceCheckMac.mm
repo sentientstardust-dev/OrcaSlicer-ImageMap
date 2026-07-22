@@ -12,10 +12,9 @@
 -(void)add_observer:(NSString *)version_hash
 {
 	//NSLog(@"adding observer");
-	//NSString *nsver = @"OtherOrcaSlicerInstanceMessage" + version_hash;
-	NSString *nsver = [NSString stringWithFormat: @"%@%@", @"OtherOrcaSlicerInstanceMessage", version_hash];
+	NSString *nsver = [NSString stringWithFormat: @"%@%@", @"OtherOrcaSlicerImageMapInstanceMessage", version_hash];
 	[[NSDistributedNotificationCenter defaultCenter] addObserver:self selector:@selector(message_update:) name:nsver object:nil suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
-	NSString *nsver2 = [NSString stringWithFormat: @"%@%@", @"OtherOrcaSlicerInstanceClosing", version_hash];
+	NSString *nsver2 = [NSString stringWithFormat: @"%@%@", @"OtherOrcaSlicerImageMapInstanceClosing", version_hash];
 	[[NSDistributedNotificationCenter defaultCenter] addObserver:self selector:@selector(closing_update:) name:nsver2 object:nil suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
 }
 
@@ -54,18 +53,16 @@ namespace Slic3r {
 void send_message_mac(const std::string &msg, const std::string &version)
 {
 	NSString *nsmsg = [NSString stringWithCString:msg.c_str() encoding:[NSString defaultCStringEncoding]];
-	//NSString *nsver = @"OtherOrcaSlicerInstanceMessage" + [NSString stringWithCString:version.c_str() encoding:[NSString defaultCStringEncoding]];
 	NSString *nsver = [NSString stringWithCString:version.c_str() encoding:[NSString defaultCStringEncoding]];
-	NSString *notifname = [NSString stringWithFormat: @"%@%@", @"OtherOrcaSlicerInstanceMessage", nsver];
+	NSString *notifname = [NSString stringWithFormat: @"%@%@", @"OtherOrcaSlicerImageMapInstanceMessage", nsver];
 	[[NSDistributedNotificationCenter defaultCenter] postNotificationName:notifname object:nil userInfo:[NSDictionary dictionaryWithObject:nsmsg forKey:@"data"] deliverImmediately:YES];
 }
 
 void send_message_mac_closing(const std::string &msg, const std::string &version)
 {
 	NSString *nsmsg = [NSString stringWithCString:msg.c_str() encoding:[NSString defaultCStringEncoding]];
-	//NSString *nsver = @"OtherOrcaSlicerInstanceMessage" + [NSString stringWithCString:version.c_str() encoding:[NSString defaultCStringEncoding]];
 	NSString *nsver = [NSString stringWithCString:version.c_str() encoding:[NSString defaultCStringEncoding]];
-	NSString *notifname = [NSString stringWithFormat: @"%@%@", @"OtherOrcaSlicerInstanceClosing", nsver];
+	NSString *notifname = [NSString stringWithFormat: @"%@%@", @"OtherOrcaSlicerImageMapInstanceClosing", nsver];
 	[[NSDistributedNotificationCenter defaultCenter] postNotificationName:notifname object:nil userInfo:[NSDictionary dictionaryWithObject:nsmsg forKey:@"data"] deliverImmediately:YES];
 }
 
@@ -98,5 +95,3 @@ void OtherInstanceMessageHandler::bring_instance_forward()
 }
 }//namespace GUI
 }//namespace Slicer
-
-

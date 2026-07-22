@@ -3,6 +3,13 @@
 
 set(SLIC3R_APP_NAME "OrcaSlicer-ImageMap")
 set(SLIC3R_APP_KEY "OrcaSlicer")
+set(SLIC3R_APP_DATA_DIR "OrcaSlicer-ImageMap")
+set(SLIC3R_APP_ID "com.orcaslicer.OrcaSlicer.ImageMap")
+set(SLIC3R_APP_DBUS_PATH "/com/orcaslicer/OrcaSlicer/ImageMap")
+set(SLIC3R_APP_URL_SCHEME "orcaslicer-imagemap")
+set(SLIC3R_WINDOWS_PROG_ID "OrcaSlicer.ImageMap.1")
+set(SLIC3R_PACKAGE_NAME "OrcaSlicer-ImageMap")
+set(SLIC3R_LINUX_APP_CMD "orca-slicer-imagemap")
 
 if(NOT DEFINED BBL_INTERNAL_TESTING)
 set(BBL_INTERNAL_TESTING "0")

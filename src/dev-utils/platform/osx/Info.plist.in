@@ -9,11 +9,11 @@
   <key>CFBundleIconFile</key>
   <string>images/OrcaSlicer.icns</string>
   <key>CFBundleName</key>
-  <string>@SLIC3R_APP_KEY@</string>
+  <string>@SLIC3R_APP_NAME@</string>
   <key>CFBundleShortVersionString</key>
   <string>@SLIC3R_APP_NAME@ @SLIC3R_BUILD_ID@</string>
   <key>CFBundleIdentifier</key>
-  <string>com.orcaslicer.OrcaSlicer</string>
+  <string>@SLIC3R_APP_ID@</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundlePackageType</key>
@@ -23,8 +23,6 @@
   <key>CFBundleVersion</key>
   <string>@SLIC3R_BUILD_ID@</string>
   <key>CFBundleURLTypes</key>
-  <key>ATSApplicationFontsPath</key>
-  <string>fonts/</string>
   <array>
     <dict>
       <key>CFBundleURLName</key>
@@ -32,10 +30,13 @@
       <key>CFBundleURLSchemes</key>
       <array>
         <string>orcasliceropen</string>
+        <string>@SLIC3R_APP_URL_SCHEME@</string>
         <string>orcaslicer</string>
       </array>
     </dict>
   </array>
+  <key>ATSApplicationFontsPath</key>
+  <string>fonts/</string>
   <key>CFBundleDocumentTypes</key>
   <array>
     <dict>

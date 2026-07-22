@@ -4,7 +4,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
 
 
-APP_IMAGE="@SLIC3R_APP_KEY@_Linux_V@SoftFever_VERSION@.AppImage"
+APP_IMAGE="@SLIC3R_PACKAGE_NAME@_Linux_V@SoftFever_VERSION@.AppImage"
 
 wget ${APPIMAGETOOLURL} -O ../appimagetool.AppImage
 chmod +x ../appimagetool.AppImage
@@ -16,29 +16,30 @@ fi
 mv @SLIC3R_APP_CMD@ AppRun
 chmod +x AppRun
 
-cp resources/images/@SLIC3R_APP_KEY@_192px.png @SLIC3R_APP_KEY@.png
+cp resources/images/@SLIC3R_APP_KEY@_192px.png @SLIC3R_PACKAGE_NAME@.png
 mkdir -p usr/share/icons/hicolor/192x192/apps
-cp resources/images/@SLIC3R_APP_KEY@_192px.png usr/share/icons/hicolor/192x192/apps/@SLIC3R_APP_KEY@.png
-cat <<EOF > com.orcaslicer.@SLIC3R_APP_KEY@.desktop
+cp resources/images/@SLIC3R_APP_KEY@_192px.png usr/share/icons/hicolor/192x192/apps/@SLIC3R_PACKAGE_NAME@.png
+cat <<EOF > @SLIC3R_APP_ID@.desktop
 [Desktop Entry]
-Name=@SLIC3R_APP_KEY@
-Exec=AppRun %F
-Icon=@SLIC3R_APP_KEY@
+Name=@SLIC3R_APP_NAME@
+Exec=AppRun %U
+Icon=@SLIC3R_PACKAGE_NAME@
 Type=Application
 PrefersNonDefaultGPU=true
 X-KDE-RunOnDiscreteGpu=true
 Categories=Utility;
-MimeType=model/stl;application/vnd.ms-3mfdocument;application/prs.wavefront-obj;application/x-amf;
+MimeType=model/stl;model/3mf;application/vnd.ms-3mfdocument;application/prs.wavefront-obj;application/x-amf;x-scheme-handler/@SLIC3R_APP_URL_SCHEME@;x-scheme-handler/orcaslicer;model/step;
+StartupWMClass=@SLIC3R_LINUX_APP_CMD@
 EOF
 
 mkdir -p usr/share/applications
-cp com.orcaslicer.@SLIC3R_APP_KEY@.desktop usr/share/applications/
+cp @SLIC3R_APP_ID@.desktop usr/share/applications/
 
 mkdir -p usr/share/metainfo
-cp "${REPO_ROOT}/scripts/flatpak/com.orcaslicer.@SLIC3R_APP_KEY@.metainfo.xml" \
-  "usr/share/metainfo/com.orcaslicer.@SLIC3R_APP_KEY@.metainfo.xml"
-cp "${REPO_ROOT}/scripts/flatpak/com.orcaslicer.@SLIC3R_APP_KEY@.metainfo.xml" \
-  "usr/share/metainfo/com.orcaslicer.@SLIC3R_APP_KEY@.appdata.xml"
+cp "${REPO_ROOT}/scripts/flatpak/@SLIC3R_APP_ID@.metainfo.xml" \
+  "usr/share/metainfo/@SLIC3R_APP_ID@.metainfo.xml"
+cp "${REPO_ROOT}/scripts/flatpak/@SLIC3R_APP_ID@.metainfo.xml" \
+  "usr/share/metainfo/@SLIC3R_APP_ID@.appdata.xml"
 
 
 export ARCH=$(uname -m)
@@ -49,5 +50,5 @@ else
   ../appimagetool.AppImage . $([ -n "${container}" ] && echo '--appimage-extract-and-run')
 fi
 
-mv @SLIC3R_APP_KEY@-$(uname -m).AppImage ${APP_IMAGE}
+mv @SLIC3R_PACKAGE_NAME@-$(uname -m).AppImage ${APP_IMAGE}
 chmod +x ${APP_IMAGE}

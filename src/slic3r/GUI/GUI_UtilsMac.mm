@@ -1,10 +1,15 @@
 #include <unistd.h>
 #include <sys/sysctl.h>
+#import <Cocoa/Cocoa.h>
 #import <wx/osx/cocoa/dataview.h>
 #import "GUI_Utils.hpp"
 
 namespace Slic3r {
 namespace GUI {
+
+void activate_application() {
+    [[NSApplication sharedApplication] activateIgnoringOtherApps:YES];
+}
 
 void dataview_remove_insets(wxDataViewCtrl* dv) {
     NSScrollView* scrollview = (NSScrollView*) ((wxCocoaDataViewControl*)dv->GetDataViewPeer())->GetWXWidget();
@@ -57,4 +62,3 @@ bool is_debugger_present()
 
 }
 }
-

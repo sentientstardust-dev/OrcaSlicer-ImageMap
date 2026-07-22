@@ -3,6 +3,13 @@
 
 #define SLIC3R_APP_NAME "@SLIC3R_APP_NAME@"
 #define SLIC3R_APP_KEY "@SLIC3R_APP_KEY@"
+#define SLIC3R_APP_DATA_DIR "@SLIC3R_APP_DATA_DIR@"
+#define SLIC3R_APP_ID "@SLIC3R_APP_ID@"
+#define SLIC3R_APP_DBUS_PATH "@SLIC3R_APP_DBUS_PATH@"
+#define SLIC3R_APP_URL_SCHEME "@SLIC3R_APP_URL_SCHEME@"
+#define SLIC3R_WINDOWS_PROG_ID "@SLIC3R_WINDOWS_PROG_ID@"
+#define SLIC3R_PACKAGE_NAME "@SLIC3R_PACKAGE_NAME@"
+#define SLIC3R_LINUX_APP_CMD "@SLIC3R_LINUX_APP_CMD@"
 #define SLIC3R_VERSION "@SLIC3R_VERSION@"
 namespace Slic3r { const char* softfever_version(); }
 namespace Slic3r { const char* git_commit_hash(); }

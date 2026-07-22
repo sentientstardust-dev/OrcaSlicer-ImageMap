@@ -11,7 +11,7 @@
 	<key>CFBundleIconFile</key>
 	<string>${MACOSX_BUNDLE_ICON_FILE}</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.orcaslicer.OrcaSlicer</string>
+	<string>${SLIC3R_APP_ID}</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleLongVersionString</key>
@@ -35,6 +35,7 @@
         <string>OrcaSlicer Downloads</string>
         <key>CFBundleURLSchemes</key>
         <array>
+          <string>${SLIC3R_APP_URL_SCHEME}</string>
           <string>orcaslicer</string>
         </array>
       </dict>

@@ -313,7 +313,7 @@ if [ "\$USE_BUNDLED_WEBKITGTK_STACK" = "1" ]; then
     if [ -d "\$APPDIR/lib/gdk-pixbuf-2.0/2.10.0/loaders" ]; then
         export GDK_PIXBUF_MODULEDIR="\$APPDIR/lib/gdk-pixbuf-2.0/2.10.0/loaders"
         if [ -x "\$APPDIR/libexec/gdk-pixbuf-query-loaders" ]; then
-            PIXBUF_CACHE_DIR="\${XDG_CACHE_HOME:-\$HOME/.cache}/@SLIC3R_APP_KEY@"
+            PIXBUF_CACHE_DIR="\${XDG_CACHE_HOME:-\$HOME/.cache}/@SLIC3R_PACKAGE_NAME@"
             PIXBUF_CACHE_FILE="\$PIXBUF_CACHE_DIR/gdk-pixbuf-loaders.cache"
             mkdir -p "\$PIXBUF_CACHE_DIR"
             if [ ! -s "\$PIXBUF_CACHE_FILE" ] || find "\$APPDIR/lib/gdk-pixbuf-2.0/2.10.0/loaders" -type f -newer "\$PIXBUF_CACHE_FILE" | grep -q .; then
@@ -402,7 +402,7 @@ echo -n "Creating Appimage for distribution..."
     chmod +x ../build_appimage.sh
     if ../build_appimage.sh; then
         popd > /dev/null
-        mv package_appimage/"@SLIC3R_APP_KEY@_Linux_V@SoftFever_VERSION@.AppImage" "@SLIC3R_APP_KEY@_Linux_V@SoftFever_VERSION@.AppImage"
+        mv package_appimage/"@SLIC3R_PACKAGE_NAME@_Linux_V@SoftFever_VERSION@.AppImage" "@SLIC3R_PACKAGE_NAME@_Linux_V@SoftFever_VERSION@.AppImage"
         rm -fR package_appimage
     else
         popd > /dev/null
