@@ -24166,12 +24166,15 @@ void Plater::on_filament_count_change(size_t num_filaments)
     }
 
     size_t total_filaments = num_filaments;
-    if (wxGetApp().preset_bundle != nullptr)
-        total_filaments = wxGetApp().preset_bundle->texture_mapping_zones.total_filaments(num_filaments);
+    const TextureMappingManager *texture_mapping_manager = nullptr;
+    if (wxGetApp().preset_bundle != nullptr) {
+        texture_mapping_manager = &wxGetApp().preset_bundle->texture_mapping_zones;
+        total_filaments = texture_mapping_manager->total_filaments(num_filaments);
+    }
 
     for (ModelObject* mo : wxGetApp().model().objects) {
         for (ModelVolume* mv : mo->volumes) {
-            mv->update_extruder_count(total_filaments);
+            mv->update_extruder_count(total_filaments, num_filaments, texture_mapping_manager);
         }
     }
 }
@@ -24243,7 +24246,10 @@ void Plater::on_filaments_delete(size_t num_filaments, size_t filament_id, int r
     // update mmu info
     for (ModelObject *mo : wxGetApp().model().objects) {
         for (ModelVolume *mv : mo->volumes) {
-            mv->update_extruder_count_when_delete_filament(num_filaments, filament_id + 1, replace_filament_id + 1);  // this function is 1 base
+            mv->update_extruder_count_when_delete_filament(num_filaments,
+                                                           filament_id + 1,
+                                                           replace_filament_id + 1,
+                                                           preset_bundle != nullptr ? &preset_bundle->texture_mapping_zones : nullptr);  // this function is 1 base
         }
     }
 

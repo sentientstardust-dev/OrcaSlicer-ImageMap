@@ -3262,7 +3262,19 @@ std::vector<int> ModelVolume::get_extruders() const
     return volume_extruders;
 }
 
-void ModelVolume::update_extruder_count(size_t extruder_count)
+static bool model_volume_extruder_is_available(int extruder_id,
+                                               size_t physical_filament_count,
+                                               const TextureMappingManager *texture_mapping_manager)
+{
+    return extruder_id <= 0 ||
+           size_t(extruder_id) <= physical_filament_count ||
+           (texture_mapping_manager != nullptr &&
+            texture_mapping_manager->is_texture_mapping_zone_id(unsigned(extruder_id)));
+}
+
+void ModelVolume::update_extruder_count(size_t extruder_count,
+                                        size_t physical_filament_count,
+                                        const TextureMappingManager *texture_mapping_manager)
 {
     std::vector<int> used_extruders = get_extruders();
     for (int extruder_id : used_extruders) {
@@ -3271,15 +3283,15 @@ void ModelVolume::update_extruder_count(size_t extruder_count)
             break;
         }
     }
-    // Clear a stale per-volume filament assignment that no longer exists after the extruder count
-    // shrank (e.g. printer switch to one with fewer filaments), so downstream readers never index
-    // per-filament config vectors out of range. Ported from BambuStudio (STUDIO-15763).
-    if (extruder_id() > extruder_count) {
+    if (const ConfigOption *opt = this->config.option("extruder");
+        opt != nullptr && !model_volume_extruder_is_available(opt->getInt(), physical_filament_count, texture_mapping_manager))
         this->config.erase("extruder");
-    }
 }
 
-void ModelVolume::update_extruder_count_when_delete_filament(size_t extruder_count, size_t filament_id, int replace_filament_id)
+void ModelVolume::update_extruder_count_when_delete_filament(size_t extruder_count,
+                                                             size_t filament_id,
+                                                             int replace_filament_id,
+                                                             const TextureMappingManager *texture_mapping_manager)
 {
     std::vector<int> used_extruders = get_extruders();
     for (int extruder_id : used_extruders) {
@@ -3288,11 +3300,9 @@ void ModelVolume::update_extruder_count_when_delete_filament(size_t extruder_cou
             break;
         }
     }
-    // Same stale-assignment cleanup as update_extruder_count, for the filament-delete path.
-    // Ported from BambuStudio (STUDIO-15763).
-    if (extruder_id() > extruder_count) {
+    if (const ConfigOption *opt = this->config.option("extruder");
+        opt != nullptr && !model_volume_extruder_is_available(opt->getInt(), extruder_count, texture_mapping_manager))
         this->config.erase("extruder");
-    }
 }
 
 void ModelVolume::center_geometry_after_creation(bool update_source_offset)

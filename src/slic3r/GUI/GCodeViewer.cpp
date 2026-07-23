@@ -2455,6 +2455,7 @@ void GCodeViewer::render_all_plates_stats(const std::vector<const GCodeProcessor
     std::vector<float> filament_densities = gcode_result_list.front()->filament_densities;
     std::vector<ColorRGBA> filament_colors;
     decode_colors(wxGetApp().plater()->get_extruder_colors_from_plater_config(gcode_result_list.back()), filament_colors);
+    const size_t physical_filament_count = std::min({filament_diameters.size(), filament_densities.size(), filament_colors.size()});
 
     for (int i = 0; i < filament_colors.size(); i++) {
         filament_colors[i] = adjust_color_for_rendering(filament_colors[i]);
@@ -2563,14 +2564,13 @@ void GCodeViewer::render_all_plates_stats(const std::vector<const GCodeProcessor
         for (auto plate : plate_list.get_nonempty_plate_list())
         {
             auto plate_print_statistics = plate->get_slice_result()->print_statistics;
-            auto plate_extruders = plate->get_extruders(true);
-            auto max_extruders_colors = wxGetApp().plater()->get_extruders_colors().size();
+            auto plate_extruders = plate->get_wipe_tower_extruders(true);
             for (size_t extruder_id : plate_extruders) {
                 extruder_id -= 1;
                 // Skip stale/overflow extruder indices (e.g. from object assignments that outlived a
                 // filament-count change) so downstream per-extruder lookups stay in range. Ported
                 // from BambuStudio (STUDIO-15763).
-                if (extruder_id >= max_extruders_colors)
+                if (extruder_id >= physical_filament_count)
                     continue;
                 if (plate_print_statistics.model_volumes_per_extruder.find(extruder_id) == plate_print_statistics.model_volumes_per_extruder.end())
                     model_volume_of_extruders_all_plates[extruder_id] += 0;

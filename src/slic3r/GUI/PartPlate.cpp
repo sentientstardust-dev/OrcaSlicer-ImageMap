@@ -1868,9 +1868,10 @@ std::vector<int> PartPlate::get_extruders(bool conside_custom_gcode) const
 	return plate_extruders;
 }
 
-std::vector<int> PartPlate::get_wipe_tower_extruders(bool conside_custom_gcode) const
+std::vector<int> PartPlate::get_wipe_tower_extruders(bool conside_custom_gcode, const DynamicPrintConfig *config) const
 {
-    const DynamicPrintConfig *config = wxGetApp().preset_bundle != nullptr ? &wxGetApp().preset_bundle->project_config : nullptr;
+    if (config == nullptr && wxGetApp().preset_bundle != nullptr)
+        config = &wxGetApp().preset_bundle->project_config;
     return expand_wipe_tower_extruders(get_extruders(conside_custom_gcode), config);
 }
 
@@ -2129,7 +2130,7 @@ bool PartPlate::check_filament_printable(const DynamicPrintConfig &config, wxStr
     if (mode != fmmManual)
         return true;
 
-    std::vector<int> used_filaments = get_extruders(true);  // 1 base
+    std::vector<int> used_filaments = get_wipe_tower_extruders(true, &config);  // 1 base
     if (!used_filaments.empty()) {
         const std::vector<std::string>& filament_types      = config.option<ConfigOptionStrings>("filament_type")->values;
         const std::vector<int>&         filament_printables = config.option<ConfigOptionInts>("filament_printable")->values;

@@ -335,7 +335,7 @@ public:
     bool check_objects_empty_and_gcode3mf(std::vector<int> &result) const;
     // get used filaments from config, 1 based idx
     std::vector<int> get_extruders(bool conside_custom_gcode = false) const;
-    std::vector<int> get_wipe_tower_extruders(bool conside_custom_gcode = false) const;
+    std::vector<int> get_wipe_tower_extruders(bool conside_custom_gcode = false, const DynamicPrintConfig *config = nullptr) const;
     std::vector<int> get_extruders_under_cli(bool conside_custom_gcode, DynamicPrintConfig& full_config) const;
     std::vector<int> get_wipe_tower_extruders_under_cli(bool conside_custom_gcode, DynamicPrintConfig& full_config) const;
     std::vector<int> get_extruders_without_support(bool conside_custom_gcode = false) const;
