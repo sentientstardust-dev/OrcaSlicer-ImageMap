@@ -1151,8 +1151,8 @@ public:
 
     // BBS
     std::vector<int>    get_extruders() const;
-    void                update_extruder_count(size_t extruder_count);
-    void                update_extruder_count_when_delete_filament(size_t extruder_count, size_t filament_id, int replace_filament_id = -1);
+    void                update_extruder_count(size_t extruder_count, size_t physical_filament_count, const TextureMappingManager *texture_mapping_manager);
+    void                update_extruder_count_when_delete_filament(size_t extruder_count, size_t filament_id, int replace_filament_id, const TextureMappingManager *texture_mapping_manager);
 
     // Split this volume, append the result to the object owning this volume.
     // Return the number of volumes created from this one.

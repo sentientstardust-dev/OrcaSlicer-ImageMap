@@ -2543,10 +2543,14 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
             if (!model_volume.is_model_part())
                 continue;
 
-            unsigned int filaments_count = (unsigned int)dynamic_cast<const ConfigOptionStrings*>(m_config->option("filament_colour"))->values.size();
-            if (wxGetApp().preset_bundle != nullptr)
-                filaments_count = (unsigned int)wxGetApp().preset_bundle->texture_mapping_zones.total_filaments(filaments_count);
-            model_volume.update_extruder_count(filaments_count);
+            const unsigned int physical_filaments_count = (unsigned int)dynamic_cast<const ConfigOptionStrings*>(m_config->option("filament_colour"))->values.size();
+            unsigned int filaments_count = physical_filaments_count;
+            const TextureMappingManager *texture_mapping_manager = nullptr;
+            if (wxGetApp().preset_bundle != nullptr) {
+                texture_mapping_manager = &wxGetApp().preset_bundle->texture_mapping_zones;
+                filaments_count = (unsigned int)texture_mapping_manager->total_filaments(filaments_count);
+            }
+            model_volume.update_extruder_count(filaments_count, physical_filaments_count, texture_mapping_manager);
         }
     }
 
