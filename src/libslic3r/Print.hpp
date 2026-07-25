@@ -500,6 +500,7 @@ public:
 private:
     void make_perimeters();
     void prepare_infill();
+    void validate_raw_top_surface_atlas_shell_depth() const;
     void infill();
     void ironing();
     void generate_support_material();

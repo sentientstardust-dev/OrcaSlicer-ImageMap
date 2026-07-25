@@ -976,6 +976,7 @@ void PrintObject::infill()
     this->prepare_infill();
 
     if (this->set_started(posInfill)) {
+        this->validate_raw_top_surface_atlas_shell_depth();
         const size_t total_layers = m_layers.size();
         const auto objects = m_print->objects();
         const auto object_it = std::find(objects.begin(), objects.end(), this);

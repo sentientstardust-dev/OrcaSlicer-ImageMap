@@ -916,12 +916,35 @@ struct TextureMappingZoneShellUsageSummary {
     int object_count { 0 };
     int min_top_shell_layers { 0 };
     int min_bottom_shell_layers { 0 };
+    int raw_top_surface_object_count { 0 };
+    int raw_top_surface_min_top_shell_layers { 0 };
 };
 
 static int texture_mapping_config_int_or(const ConfigOptionResolver &config, const char *key, int fallback)
 {
     const ConfigOptionInt *opt = dynamic_cast<const ConfigOptionInt *>(config.option(key));
     return opt != nullptr ? opt->getInt() : fallback;
+}
+
+static bool texture_mapping_object_has_raw_top_surface_layers(const ModelObject &object)
+{
+    for (const ModelVolume *volume : object.volumes) {
+        if (volume == nullptr ||
+            volume->imported_texture_width == 0 ||
+            volume->imported_texture_height == 0 ||
+            volume->imported_texture_raw_top_surface_depths.empty())
+            continue;
+        const size_t pixel_count =
+            size_t(volume->imported_texture_width) * size_t(volume->imported_texture_height);
+        if (pixel_count > 0 &&
+            volume->imported_texture_raw_top_surface_filament_slots.size() >=
+                pixel_count * volume->imported_texture_raw_top_surface_depths.size() &&
+            std::any_of(volume->imported_texture_raw_top_surface_depths.begin(),
+                        volume->imported_texture_raw_top_surface_depths.end(),
+                        [](int depth) { return depth >= 0; }))
+            return true;
+    }
+    return false;
 }
 
 static bool texture_mapping_effective_config_uses_zone_id(const ConfigOptionResolver  &config,
@@ -959,6 +982,7 @@ static TextureMappingZoneShellUsageSummary texture_mapping_zone_shell_usage_summ
     const int global_bottom_shell_layers = texture_mapping_config_int_or(print_config, "bottom_shell_layers", 0);
     int min_top_shell_layers = std::numeric_limits<int>::max();
     int min_bottom_shell_layers = std::numeric_limits<int>::max();
+    int raw_top_surface_min_top_shell_layers = std::numeric_limits<int>::max();
 
     for (const ModelObject *object : model.objects) {
         if (object == nullptr)
@@ -1010,12 +1034,22 @@ static TextureMappingZoneShellUsageSummary texture_mapping_zone_shell_usage_summ
         ++out.object_count;
         min_top_shell_layers = std::min(min_top_shell_layers, object_min_top_shell_layers);
         min_bottom_shell_layers = std::min(min_bottom_shell_layers, object_min_bottom_shell_layers);
+        if (texture_mapping_object_has_raw_top_surface_layers(*object)) {
+            ++out.raw_top_surface_object_count;
+            raw_top_surface_min_top_shell_layers =
+                std::min(raw_top_surface_min_top_shell_layers, object_min_top_shell_layers);
+        }
     }
 
     if (out.object_count > 0) {
         out.min_top_shell_layers = min_top_shell_layers == std::numeric_limits<int>::max() ? 0 : min_top_shell_layers;
         out.min_bottom_shell_layers = min_bottom_shell_layers == std::numeric_limits<int>::max() ? 0 : min_bottom_shell_layers;
     }
+    if (out.raw_top_surface_object_count > 0)
+        out.raw_top_surface_min_top_shell_layers =
+            raw_top_surface_min_top_shell_layers == std::numeric_limits<int>::max() ?
+                0 :
+                raw_top_surface_min_top_shell_layers;
     return out;
 }
 
@@ -5210,30 +5244,44 @@ private:
 
     wxString top_surface_contoning_shell_warning_text() const
     {
-        if (m_top_surface_contoning_shell_usage.object_count <= 0)
+        const int calibrated_pattern_layers = top_surface_contoning_calibrated_pattern_filaments();
+        const bool calibrated = calibrated_pattern_layers > 0;
+        const bool raw_top_surface =
+            m_top_surface_contoning_shell_usage.raw_top_surface_object_count > 0;
+        if ((calibrated && m_top_surface_contoning_shell_usage.object_count <= 0) ||
+            (!calibrated && !raw_top_surface))
             return wxEmptyString;
 
         const int pattern_layers = top_surface_contoning_pattern_filaments();
+        const int object_count =
+            calibrated ?
+                m_top_surface_contoning_shell_usage.object_count :
+                m_top_surface_contoning_shell_usage.raw_top_surface_object_count;
+        const int min_top_shell_layers =
+            calibrated ?
+                m_top_surface_contoning_shell_usage.min_top_shell_layers :
+                m_top_surface_contoning_shell_usage.raw_top_surface_min_top_shell_layers;
         const bool top_too_shallow =
             top_surface_contoning_color_upper_surfaces() &&
-            m_top_surface_contoning_shell_usage.min_top_shell_layers < pattern_layers;
+            min_top_shell_layers < pattern_layers;
         const bool bottom_too_shallow =
+            calibrated &&
             top_surface_contoning_color_lower_surfaces() &&
             m_top_surface_contoning_shell_usage.min_bottom_shell_layers < pattern_layers;
         if (!top_too_shallow && !bottom_too_shallow)
             return wxEmptyString;
 
-        const wxString object_text = m_top_surface_contoning_shell_usage.object_count == 1 ?
+        const wxString object_text = object_count == 1 ?
             _L("1 object") :
-            wxString::Format(_L("%d objects"), m_top_surface_contoning_shell_usage.object_count);
+            wxString::Format(_L("%d objects"), object_count);
         wxString shell_text;
         if (top_too_shallow && bottom_too_shallow) {
             shell_text = wxString::Format(_L("top shell (%d) and bottom shell count (%d)"),
-                                          m_top_surface_contoning_shell_usage.min_top_shell_layers,
+                                          min_top_shell_layers,
                                           m_top_surface_contoning_shell_usage.min_bottom_shell_layers);
         } else if (top_too_shallow) {
             shell_text = wxString::Format(_L("top shell count (%d)"),
-                                          m_top_surface_contoning_shell_usage.min_top_shell_layers);
+                                          min_top_shell_layers);
         } else {
             shell_text = wxString::Format(_L("bottom shell count (%d)"),
                                           m_top_surface_contoning_shell_usage.min_bottom_shell_layers);

@@ -1653,6 +1653,15 @@ static ExPolygons top_surface_image_current_layer_surface_mask(const LayerRegion
     return mask.size() > 1 ? top_surface_clip_union_ex(mask) : mask;
 }
 
+static ExPolygons top_surface_image_current_layer_visible_top_mask(const LayerRegion &layerm)
+{
+    ExPolygons mask;
+    for (const Surface &surface : layerm.fill_surfaces.surfaces)
+        if (surface.is_top())
+            mask.emplace_back(surface.expolygon);
+    return mask.size() > 1 ? top_surface_clip_union_ex(mask) : mask;
+}
+
 static bool top_surface_image_contoning_depth_within_shell(const Layer                   &target_layer,
                                                            const Layer                   &source_layer,
                                                            const PrintRegionConfig       &region_config,
@@ -1680,6 +1689,177 @@ static bool top_surface_image_contoning_depth_within_shell(const Layer          
     const double shell_thickness = region_config.bottom_shell_thickness.value;
     return shell_thickness > EPSILON &&
            target_layer.bottom_z() - source_layer.bottom_z() < shell_thickness - EPSILON;
+}
+
+static int top_surface_image_generated_contoning_shell_depth(
+    const Layer                         &source_layer,
+    size_t                               region_id,
+    unsigned int                         zone_id,
+    TopSurfaceImageSourceSurface         source_surface,
+    const ExPolygon                     &source_component,
+    int                                  requested_depth)
+{
+    ExPolygons projected_area { source_component };
+    const Layer *target_layer = &source_layer;
+    int generated_depth = 0;
+    for (int depth = 0; depth < requested_depth && target_layer != nullptr; ++depth) {
+        if (region_id >= target_layer->regions().size())
+            break;
+        const LayerRegion *target_layerm = target_layer->regions()[region_id];
+        if (target_layerm == nullptr ||
+            unsigned(std::max(0, target_layerm->region().config().solid_infill_filament.value)) != zone_id ||
+            !top_surface_image_contoning_depth_within_shell(*target_layer,
+                                                             source_layer,
+                                                             target_layerm->region().config(),
+                                                             source_surface,
+                                                             depth))
+            break;
+        const ExPolygons target_area =
+            top_surface_image_current_layer_surface_mask(*target_layerm, source_surface);
+        if (target_area.empty())
+            break;
+        projected_area =
+            top_surface_clip_intersection_ex(projected_area, target_area, ApplySafetyOffset::Yes);
+        if (projected_area.empty())
+            break;
+        if (!top_surface_clip_diff_ex(ExPolygons { source_component },
+                                       projected_area,
+                                       ApplySafetyOffset::Yes).empty())
+            return depth;
+        ++generated_depth;
+        target_layer = source_surface == TopSurfaceImageSourceSurface::Top ?
+            target_layer->lower_layer :
+            target_layer->upper_layer;
+    }
+    return generated_depth;
+}
+
+static bool top_surface_image_object_has_raw_top_surface_layers(const PrintObject &object)
+{
+    const ModelObject *model_object = object.model_object();
+    if (model_object == nullptr)
+        return false;
+    for (const ModelVolume *volume : model_object->volumes) {
+        if (volume == nullptr ||
+            volume->imported_texture_width == 0 ||
+            volume->imported_texture_height == 0 ||
+            volume->imported_texture_raw_top_surface_depths.empty())
+            continue;
+        const size_t pixel_count =
+            size_t(volume->imported_texture_width) * size_t(volume->imported_texture_height);
+        if (pixel_count > 0 &&
+            volume->imported_texture_raw_top_surface_filament_slots.size() >=
+                pixel_count * volume->imported_texture_raw_top_surface_depths.size() &&
+            std::any_of(volume->imported_texture_raw_top_surface_depths.begin(),
+                        volume->imported_texture_raw_top_surface_depths.end(),
+                        [](int depth) { return depth >= 0; }))
+            return true;
+    }
+    return false;
+}
+
+void PrintObject::validate_raw_top_surface_atlas_shell_depth() const
+{
+    const Print *print = this->print();
+    if (print == nullptr || !top_surface_image_object_has_raw_top_surface_layers(*this))
+        return;
+    const PrintConfig &print_config = print->config();
+    const size_t num_physical = print_config.filament_colour.values.size();
+    if (num_physical == 0)
+        return;
+
+    struct ZoneShellDepth {
+        int pattern_layers { 0 };
+        int min_top_layers { std::numeric_limits<int>::max() };
+        bool usable { false };
+    };
+    std::map<unsigned int, ZoneShellDepth> shell_depths;
+
+    for (const Layer *source_layer : m_layers) {
+        m_print->throw_if_canceled();
+        if (source_layer == nullptr)
+            continue;
+        for (size_t region_id = 0; region_id < source_layer->regions().size(); ++region_id) {
+            const LayerRegion *source_layerm = source_layer->regions()[region_id];
+            if (source_layerm == nullptr)
+                continue;
+            const int raw_zone_id = source_layerm->region().config().solid_infill_filament.value;
+            if (raw_zone_id <= 0)
+                continue;
+            const unsigned int zone_id = unsigned(raw_zone_id);
+            const TextureMappingZone *zone = print->texture_mapping_manager().zone_from_id(zone_id);
+            if (zone == nullptr ||
+                !zone->enabled ||
+                zone->deleted ||
+                !zone->is_image_texture() ||
+                !zone->top_surface_contoning_active() ||
+                !zone->top_surface_contoning_colors_upper_surfaces())
+                continue;
+
+            auto [depth_it, inserted] = shell_depths.try_emplace(zone_id);
+            ZoneShellDepth &shell_depth = depth_it->second;
+            if (inserted) {
+                std::vector<std::string> filament_colours = print_config.filament_colour.values;
+                filament_colours.resize(num_physical, "#FFFFFF");
+                std::vector<unsigned int> components =
+                    zone->is_image_texture() ?
+                        TextureMappingManager::effective_texture_component_ids(*zone,
+                                                                               num_physical,
+                                                                               filament_colours) :
+                        TextureMappingManager::selected_component_ids(*zone, num_physical);
+                append_texture_mapping_raw_top_surface_component_ids(*this,
+                                                                     *zone,
+                                                                     filament_colours,
+                                                                     components,
+                                                                     num_physical);
+                components = TextureMappingManager::canonical_component_ids(components, num_physical);
+                shell_depth.usable = !components.empty();
+                const int calibrated_pattern_layers =
+                    texture_mapping_top_surface_contoning_calibrated_pattern_filaments(*zone);
+                shell_depth.pattern_layers =
+                    calibrated_pattern_layers > 0 ?
+                        calibrated_pattern_layers :
+                        std::clamp(zone->top_surface_contoning_pattern_filaments,
+                                   TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
+                                   TextureMappingZone::MaxTopSurfaceContoningPatternFilaments);
+            }
+            if (!shell_depth.usable || shell_depth.pattern_layers <= 0)
+                continue;
+
+            const ExPolygons visible_area =
+                top_surface_image_current_layer_visible_top_mask(*source_layerm);
+            for (const ExPolygon &component : visible_area) {
+                m_print->throw_if_canceled();
+                shell_depth.min_top_layers =
+                    std::min(shell_depth.min_top_layers,
+                             top_surface_image_generated_contoning_shell_depth(*source_layer,
+                                                                              region_id,
+                                                                              zone_id,
+                                                                              TopSurfaceImageSourceSurface::Top,
+                                                                              component,
+                                                                              shell_depth.pattern_layers));
+            }
+        }
+    }
+
+    auto layer_count_text = [](int layers) {
+        return layers == 1 ?
+            L("1 layer") :
+            Slic3r::format(L("%1% layers"), layers);
+    };
+    for (const auto &[zone_id, shell_depth] : shell_depths) {
+        if (!shell_depth.usable || shell_depth.pattern_layers <= 0)
+            continue;
+        if (shell_depth.min_top_layers < shell_depth.pattern_layers) {
+            this->add_slicing_warning(
+                PrintStateBase::WarningLevel::NON_CRITICAL,
+                Slic3r::format(
+                    L("The top-surface raw atlas in texture mapping zone %1% is configured for a %2%-layer color pattern, but at least one generated top shell on this object is only %3% deep. Increase Top shell layers or use an object tall enough for the complete atlas depth."),
+                    zone_id,
+                    shell_depth.pattern_layers,
+                    layer_count_text(shell_depth.min_top_layers)));
+        }
+    }
 }
 
 static ExPolygon top_surface_image_cell_expolygon(coord_t min_x, coord_t min_y, coord_t max_x, coord_t max_y)

@@ -17,8 +17,12 @@
 #include "ColorSolver.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <exception>
 #include <functional>
 #include <future>
 #include <limits>
@@ -26,6 +30,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 
@@ -45,6 +50,13 @@ constexpr size_t k_temporary_simulated_texture_preview_max_pixels = 1024ull * 10
 constexpr size_t k_temporary_simulated_texture_preview_min_source_pixels = k_temporary_simulated_texture_preview_max_pixels * 3 / 2;
 constexpr unsigned int k_temporary_contoning_flat_surface_preview_max_edge = 384;
 constexpr size_t k_temporary_contoning_flat_surface_preview_max_pixels = 384ull * 384ull;
+constexpr unsigned int k_simulated_texture_preview_cache_channel_bits = 5;
+constexpr unsigned int k_simulated_texture_preview_cache_channel_levels =
+    1u << k_simulated_texture_preview_cache_channel_bits;
+constexpr size_t k_simulated_texture_preview_cache_entries =
+    size_t(k_simulated_texture_preview_cache_channel_levels) *
+    size_t(k_simulated_texture_preview_cache_channel_levels) *
+    size_t(k_simulated_texture_preview_cache_channel_levels);
 constexpr size_t k_surface_gradient_preview_max_components = 10;
 constexpr size_t k_surface_gradient_preview_lut_size = 33;
 constexpr size_t k_contoning_flat_surface_preview_max_candidates = 250000;
@@ -169,6 +181,7 @@ struct TexturePreviewSimulationResult
 
 struct TexturePreviewSimulationJobState
 {
+    std::atomic<bool> cancelled { false };
     std::mutex mutex;
     std::optional<TexturePreviewSimulationResult> temporary_result;
 };
@@ -204,6 +217,164 @@ struct TexturePreviewVertexColorSimulationCacheEntry
     std::optional<GUI::GLModel::Geometry> ready_geometry;
     std::future<TexturePreviewVertexColorSimulationResult> pending_future;
 };
+
+enum class TexturePreviewTaskKind : uint8_t
+{
+    Texture,
+    VertexColor
+};
+
+class TexturePreviewTaskQueue
+{
+    struct Task
+    {
+        TexturePreviewTaskKind kind { TexturePreviewTaskKind::Texture };
+        size_t key { 0 };
+        std::function<void()> run;
+        std::function<void()> cancel;
+    };
+
+public:
+    TexturePreviewTaskQueue()
+    {
+        std::thread([this]() { worker_loop(); }).detach();
+    }
+
+    template<class Result>
+    std::future<Result> enqueue(TexturePreviewTaskKind kind,
+                                size_t                 key,
+                                std::function<Result()> build_result)
+    {
+        auto promise = std::make_shared<std::promise<Result>>();
+        std::future<Result> future = promise->get_future();
+        auto build = std::make_shared<std::function<Result()>>(std::move(build_result));
+
+        Task task;
+        task.kind = kind;
+        task.key = key;
+        task.run = [promise, build]() {
+            try {
+                promise->set_value((*build)());
+            } catch (...) {
+                promise->set_exception(std::current_exception());
+            }
+        };
+        task.cancel = [promise]() {
+            promise->set_value(Result{});
+        };
+
+        std::vector<Task> cancelled;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            for (auto it = m_tasks.begin(); it != m_tasks.end();) {
+                if (it->kind == kind && it->key == key) {
+                    cancelled.emplace_back(std::move(*it));
+                    it = m_tasks.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            m_tasks.emplace_back(std::move(task));
+        }
+        for (Task &cancelled_task : cancelled)
+            cancelled_task.cancel();
+        m_condition.notify_one();
+        return future;
+    }
+
+    void cancel_queued(TexturePreviewTaskKind kind, size_t key)
+    {
+        std::vector<Task> cancelled;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            for (auto it = m_tasks.begin(); it != m_tasks.end();) {
+                if (it->kind == kind && it->key == key) {
+                    cancelled.emplace_back(std::move(*it));
+                    it = m_tasks.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        for (Task &cancelled_task : cancelled)
+            cancelled_task.cancel();
+    }
+
+    void cancel_all_queued()
+    {
+        std::deque<Task> cancelled;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            cancelled.swap(m_tasks);
+        }
+        for (Task &task : cancelled)
+            task.cancel();
+    }
+
+private:
+    void worker_loop()
+    {
+        for (;;) {
+            Task task;
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_condition.wait(lock, [this]() { return !m_tasks.empty(); });
+                task = std::move(m_tasks.front());
+                m_tasks.pop_front();
+            }
+            task.run();
+        }
+    }
+
+    std::mutex m_mutex;
+    std::condition_variable m_condition;
+    std::deque<Task> m_tasks;
+};
+
+TexturePreviewTaskQueue &texture_preview_task_queue()
+{
+    static auto *queue = new TexturePreviewTaskQueue();
+    return *queue;
+}
+
+struct TexturePreviewSimulatedColorCacheEntry
+{
+    std::array<unsigned char, 4> rgba {};
+    bool valid { false };
+};
+
+size_t simulated_texture_preview_quantized_cache_key(const std::array<unsigned char, 3> &rgb)
+{
+    constexpr unsigned int shift = 8u - k_simulated_texture_preview_cache_channel_bits;
+    const size_t r = size_t(rgb[0] >> shift);
+    const size_t g = size_t(rgb[1] >> shift);
+    const size_t b = size_t(rgb[2] >> shift);
+    return r |
+           (g << k_simulated_texture_preview_cache_channel_bits) |
+           (b << (2u * k_simulated_texture_preview_cache_channel_bits));
+}
+
+std::array<float, 4> simulated_texture_preview_quantized_sample(size_t cache_key)
+{
+    constexpr unsigned int shift = 8u - k_simulated_texture_preview_cache_channel_bits;
+    constexpr unsigned int mask = k_simulated_texture_preview_cache_channel_levels - 1u;
+    const unsigned int r = unsigned(cache_key) & mask;
+    const unsigned int g = (unsigned(cache_key) >> k_simulated_texture_preview_cache_channel_bits) & mask;
+    const unsigned int b = (unsigned(cache_key) >> (2u * k_simulated_texture_preview_cache_channel_bits)) & mask;
+    const float scale = 1.f / 255.f;
+    const unsigned int center = 1u << (shift - 1u);
+    return {
+        float((r << shift) + center) * scale,
+        float((g << shift) + center) * scale,
+        float((b << shift) + center) * scale,
+        1.f
+    };
+}
+
+bool texture_preview_simulation_cancelled(const std::shared_ptr<TexturePreviewSimulationJobState> &job_state)
+{
+    return job_state != nullptr && job_state->cancelled.load(std::memory_order_relaxed);
+}
 
 bool model_volume_has_texture_preview_data_impl(const ModelVolume &model_volume)
 {
@@ -1679,11 +1850,6 @@ std::vector<float> map_raw_sample_to_components_for_texture_preview(const std::v
     return mapped;
 }
 
-unsigned int texture_preview_rgb_cache_key(const std::array<unsigned char, 3> &rgb)
-{
-    return unsigned(rgb[0]) | (unsigned(rgb[1]) << 8) | (unsigned(rgb[2]) << 16);
-}
-
 unsigned int filament_id_for_state(size_t state_id, unsigned int base_filament_id)
 {
     return state_id == 0 ? base_filament_id : unsigned(state_id);
@@ -2890,13 +3056,15 @@ std::vector<float> optimized_primary_component_weights_for_target(const std::arr
     return {};
 }
 
-std::vector<float> component_weights_for_texture_preview(const TexturePreviewSimulationSettings &settings,
-                                                         const std::array<float, 4>            &sample_rgba,
-                                                         bool                                    apply_visibility_adjustments = true)
+void component_weights_for_texture_preview_into(const TexturePreviewSimulationSettings &settings,
+                                                const std::array<float, 4>            &sample_rgba,
+                                                std::vector<float>                    &desired,
+                                                bool                                    apply_visibility_adjustments = true)
 {
     const size_t component_count = settings.component_colors.size();
+    desired.assign(component_count, 0.f);
     if (component_count == 0)
-        return {};
+        return;
 
     if (settings.dithering_enabled &&
         settings.mapping_mode != int(TextureMappingZone::TextureMappingRawValues) &&
@@ -2906,8 +3074,13 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
         const std::array<float, 3> target_color = texture_preview_target_color(settings, sample_rgba);
         const size_t candidate_idx =
             nearest_binary_dither_candidate_for_texture_preview(candidates, target_color, settings.generic_solver_mode);
-        if (candidate_idx < candidates.size())
-            return binary_component_visibility_weights_for_texture_preview(settings, candidates[candidate_idx].mask);
+        if (candidate_idx < candidates.size()) {
+            const std::vector<float> binary =
+                binary_component_visibility_weights_for_texture_preview(settings, candidates[candidate_idx].mask);
+            if (binary.size() == component_count)
+                std::copy(binary.begin(), binary.end(), desired.begin());
+            return;
+        }
     }
 
     std::array<float, 3> target = {
@@ -2921,7 +3094,6 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
         target[2] = apply_texture_tone_gamma(target[2], settings.tone_gamma);
     }
 
-    std::vector<float> desired(component_count, 0.f);
     size_t mapped_component_count = component_count;
     if (settings.mapping_mode == int(TextureMappingZone::TextureMappingRawValues)) {
         const float channels[3] = { target[0], target[1], target[2] };
@@ -2930,9 +3102,9 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
             desired[channel_idx] = clamp01(channels[channel_idx]);
         mapped_component_count = channel_count;
     } else if (texture_preview_has_side_surface_calibrated_candidates(settings)) {
-        std::vector<float> calibrated = side_surface_calibrated_weights_for_texture_preview(settings, sample_rgba);
+        const std::vector<float> calibrated = side_surface_calibrated_weights_for_texture_preview(settings, sample_rgba);
         if (calibrated.size() == component_count)
-            desired = std::move(calibrated);
+            std::copy(calibrated.begin(), calibrated.end(), desired.begin());
     } else {
         std::vector<float> optimized;
         if (!settings.use_fixed_color_generic_solver)
@@ -2943,10 +3115,10 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
                                                                        settings.force_sequential_filaments,
                                                                        settings.semantic_component_indices);
         if (optimized.size() == component_count)
-            desired = std::move(optimized);
+            std::copy(optimized.begin(), optimized.end(), desired.begin());
         else {
-            std::vector<float> best = settings.generic_mix_candidate_cache != nullptr &&
-                                              !settings.generic_mix_candidate_cache->candidates.empty() ?
+            const std::vector<float> best = settings.generic_mix_candidate_cache != nullptr &&
+                                                    !settings.generic_mix_candidate_cache->candidates.empty() ?
                 solve_color_solver_weights_for_target(
                     settings.generic_mix_candidate_cache->candidates,
                     target,
@@ -2954,7 +3126,7 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
                     color_solver_mode_from_index(TextureMappingZone::effective_generic_solver_mode(settings.generic_solver_mode))) :
                 std::vector<float>{};
             if (best.size() == component_count)
-                desired = std::move(best);
+                std::copy(best.begin(), best.end(), desired.begin());
         }
     }
 
@@ -2978,6 +3150,15 @@ std::vector<float> component_weights_for_texture_preview(const TexturePreviewSim
             desired[idx] = clamp01(desired[idx] * settings.component_strength_factors[idx]);
         apply_minimum_visibility_offset(desired, settings.minimum_visibility_offset_factor);
     }
+}
+
+std::vector<float> component_weights_for_texture_preview(const TexturePreviewSimulationSettings &settings,
+                                                         const std::array<float, 4>            &sample_rgba,
+                                                         bool                                    apply_visibility_adjustments = true)
+{
+    std::vector<float> desired;
+    desired.reserve(settings.component_colors.size());
+    component_weights_for_texture_preview_into(settings, sample_rgba, desired, apply_visibility_adjustments);
     return desired;
 }
 
@@ -3477,12 +3658,15 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                                                                       const std::vector<int> &source_raw_top_surface_depths,
                                                                       ColorRGBA background_color,
                                                                       TexturePreviewSimulationSettings settings,
+                                                                      const std::shared_ptr<TexturePreviewSimulationJobState> &job_state,
+                                                                      std::vector<TexturePreviewSimulatedColorCacheEntry> &simulated_color_cache,
                                                                       unsigned int max_preview_edge = 0,
                                                                       size_t max_preview_pixels = 0)
 {
     TexturePreviewSimulationResult result;
     result.signature = signature;
-    if (width == 0 || height == 0 || source_rgba.size() < size_t(width) * size_t(height) * 4)
+    if (texture_preview_simulation_cancelled(job_state) ||
+        width == 0 || height == 0 || source_rgba.size() < size_t(width) * size_t(height) * 4)
         return result;
 
     const std::array<unsigned int, 2> preview_size =
@@ -3506,16 +3690,23 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
             mix_color_solver_components(settings.component_colors,
                                         weights,
                                         color_solver_mix_model_from_index(settings.generic_solver_mix_model));
-        for (size_t idx = 0; idx + 3 < result.rgba.size(); idx += 4) {
-            result.rgba[idx + 0] = to_u8(rgb[0]);
-            result.rgba[idx + 1] = to_u8(rgb[1]);
-            result.rgba[idx + 2] = to_u8(rgb[2]);
-            result.rgba[idx + 3] = 255;
+        for (unsigned int y = 0; y < result.height; ++y) {
+            if (texture_preview_simulation_cancelled(job_state))
+                return {};
+            for (unsigned int x = 0; x < result.width; ++x) {
+                const size_t idx = (size_t(y) * size_t(result.width) + size_t(x)) * 4;
+                result.rgba[idx + 0] = to_u8(rgb[0]);
+                result.rgba[idx + 1] = to_u8(rgb[1]);
+                result.rgba[idx + 2] = to_u8(rgb[2]);
+                result.rgba[idx + 3] = 255;
+            }
         }
         return result;
     }
 
     prepare_texture_preview_simulation_settings(settings);
+    if (texture_preview_simulation_cancelled(job_state))
+        return {};
     const int contoning_flat_surface_pattern_filaments =
         std::clamp(settings.contoning_flat_surface_pattern_filaments,
                    TextureMappingZone::MinTopSurfaceContoningPatternFilaments,
@@ -3604,9 +3795,18 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
         !raw_top_surface_layers.empty() &&
         !raw_top_surface_component_indices.empty() &&
         source_raw_top_surface_slots.size() >= size_t(width) * size_t(height) * source_raw_top_surface_depths.size();
+    const bool use_simulated_color_cache =
+        !use_raw_top_surface_source_preview &&
+        !use_raw_top_surface_stack_preview &&
+        !use_raw_offsets &&
+        !use_binary_dithering &&
+        !use_halftone_dithering;
 
-    std::unordered_map<unsigned int, std::array<unsigned char, 4>> simulated_color_cache;
-    simulated_color_cache.reserve(std::min(size_t(result.width) * size_t(result.height), size_t(65536)));
+    if (use_simulated_color_cache && simulated_color_cache.size() != k_simulated_texture_preview_cache_entries)
+        simulated_color_cache.assign(k_simulated_texture_preview_cache_entries,
+                                     TexturePreviewSimulatedColorCacheEntry{});
+    else if (!use_simulated_color_cache)
+        simulated_color_cache.clear();
     std::unordered_map<uint64_t, std::array<unsigned char, 4>> raw_top_surface_stack_color_cache;
     if (use_raw_top_surface_stack_preview)
         raw_top_surface_stack_color_cache.reserve(std::min(size_t(result.width) * size_t(result.height), size_t(65536)));
@@ -3615,6 +3815,12 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
         halftone_cell_tone_cache.reserve(std::min(size_t(result.width) * size_t(result.height), size_t(65536)));
     std::vector<std::array<float, 3>> floyd_error_current(result.width, { { 0.f, 0.f, 0.f } });
     std::vector<std::array<float, 3>> floyd_error_next(result.width, { { 0.f, 0.f, 0.f } });
+    std::vector<float> component_coverage_scratch;
+    component_coverage_scratch.reserve(settings.component_colors.size());
+    std::vector<float> component_weights;
+    component_weights.reserve(settings.component_colors.size());
+    std::vector<float> continuous_coverage;
+    continuous_coverage.reserve(settings.component_colors.size());
 
     auto halftone_cell_cache_key = [](size_t component_idx, int cell_x, int cell_y) {
         uint64_t key = 1469598103934665603ull;
@@ -3685,8 +3891,10 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
             blended_source_color.b(),
             1.f
         };
-        const std::vector<float> coverage = component_weights_for_texture_preview(settings, sampled_rgba, false);
-        return component_idx < coverage.size() ? clamp01(coverage[component_idx]) : 0.f;
+        component_weights_for_texture_preview_into(settings, sampled_rgba, component_coverage_scratch, false);
+        return component_idx < component_coverage_scratch.size() ?
+            clamp01(component_coverage_scratch[component_idx]) :
+            0.f;
     };
 
     auto halftone_cell_coverage = [&](size_t component_idx,
@@ -3744,6 +3952,8 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
     };
 
     for (unsigned int y = 0; y < result.height; ++y) {
+        if (texture_preview_simulation_cancelled(job_state))
+            return {};
         for (unsigned int x = 0; x < result.width; ++x) {
             const double src_x = (double(x) + 0.5) * double(width) / double(std::max(1u, result.width)) - 0.5;
             const double src_y = (double(y) + 0.5) * double(height) / double(std::max(1u, result.height)) - 0.5;
@@ -3753,25 +3963,18 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                 to_u8(blended_source_color.g()),
                 to_u8(blended_source_color.b())
             };
-            const unsigned int cache_key = use_raw_offsets ?
-                unsigned(std::numeric_limits<unsigned int>::max()) :
-                texture_preview_rgb_cache_key(source_rgb);
+            const size_t simulated_cache_key = use_simulated_color_cache ?
+                simulated_texture_preview_quantized_cache_key(source_rgb) :
+                size_t(0);
             const size_t idx = (size_t(y) * size_t(result.width) + size_t(x)) * 4;
 
-            const bool use_simulated_color_cache =
-                !use_raw_top_surface_source_preview &&
-                !use_raw_top_surface_stack_preview &&
-                !use_raw_offsets &&
-                !use_binary_dithering &&
-                !use_halftone_dithering;
-            auto cached_color = use_simulated_color_cache ?
-                simulated_color_cache.find(cache_key) :
-                simulated_color_cache.end();
-            if (use_simulated_color_cache && cached_color != simulated_color_cache.end()) {
-                result.rgba[idx + 0] = cached_color->second[0];
-                result.rgba[idx + 1] = cached_color->second[1];
-                result.rgba[idx + 2] = cached_color->second[2];
-                result.rgba[idx + 3] = cached_color->second[3];
+            if (use_simulated_color_cache && simulated_color_cache[simulated_cache_key].valid) {
+                const std::array<unsigned char, 4> &cached_color =
+                    simulated_color_cache[simulated_cache_key].rgba;
+                result.rgba[idx + 0] = cached_color[0];
+                result.rgba[idx + 1] = cached_color[1];
+                result.rgba[idx + 2] = cached_color[2];
+                result.rgba[idx + 3] = cached_color[3];
                 continue;
             }
 
@@ -3840,10 +4043,14 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                     continue;
                 }
             }
-            std::vector<float> component_weights;
+            const std::array<float, 4> simulation_sample_rgba =
+                use_simulated_color_cache ?
+                    simulated_texture_preview_quantized_sample(simulated_cache_key) :
+                    sample_rgba;
+            component_weights.clear();
             std::optional<std::array<float, 3>> forced_simulated_rgb;
             if (std::optional<std::array<float, 3>> calibrated_rgb =
-                    side_surface_calibrated_rgb_for_texture_preview(settings, sample_rgba))
+                    side_surface_calibrated_rgb_for_texture_preview(settings, simulation_sample_rgba))
                 forced_simulated_rgb = *calibrated_rgb;
             if (use_raw_offsets) {
                 const std::vector<float> raw_sample =
@@ -3862,15 +4069,17 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                 if (use_contoning_flat_surface_quantization) {
                     forced_simulated_rgb =
                         contoning_flat_surface_rgb_for_texture_preview(settings,
-                                                                       sample_rgba,
+                                                                       simulation_sample_rgba,
                                                                        contoning_flat_surface_ordered_candidates,
                                                                        contoning_flat_surface_candidates,
                                                                        contoning_flat_surface_nodes,
                                                                        contoning_flat_surface_root,
                                                                        contoning_flat_surface_pattern_filaments);
                 } else if (use_halftone_dithering) {
-                    const std::vector<float> continuous_coverage =
-                        component_weights_for_texture_preview(settings, sample_rgba, false);
+                    component_weights_for_texture_preview_into(settings,
+                                                               sample_rgba,
+                                                               continuous_coverage,
+                                                               false);
                     uint32_t mask = 0;
                     const float surface_x_mm = float((src_x + 0.5) * double(preview_mm_per_source_pixel));
                     const float surface_y_mm = float((src_y + 0.5) * double(preview_mm_per_source_pixel));
@@ -3940,7 +4149,9 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                         }
                     }
                 } else {
-                    component_weights = component_weights_for_texture_preview(settings, sample_rgba);
+                    component_weights_for_texture_preview_into(settings,
+                                                               simulation_sample_rgba,
+                                                               component_weights);
                 }
             }
             float activity = 0.f;
@@ -3960,7 +4171,11 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                 mix_color_solver_components(settings.component_colors,
                                             component_weights,
                                             color_solver_mix_model_from_index(settings.generic_solver_mix_model)) :
-                std::array<float, 3>{ sample_rgba[0], sample_rgba[1], sample_rgba[2] });
+                std::array<float, 3>{
+                    simulation_sample_rgba[0],
+                    simulation_sample_rgba[1],
+                    simulation_sample_rgba[2]
+                });
 
             const std::array<unsigned char, 4> out_rgba = {
                 to_u8(simulated_rgb[0]),
@@ -3968,8 +4183,10 @@ TexturePreviewSimulationResult build_simulated_texture_preview_result(size_t sig
                 to_u8(simulated_rgb[2]),
                 255
             };
-            if (use_simulated_color_cache)
-                simulated_color_cache.emplace(cache_key, out_rgba);
+            if (use_simulated_color_cache) {
+                simulated_color_cache[simulated_cache_key].rgba = out_rgba;
+                simulated_color_cache[simulated_cache_key].valid = true;
+            }
             result.rgba[idx + 0] = out_rgba[0];
             result.rgba[idx + 1] = out_rgba[1];
             result.rgba[idx + 2] = out_rgba[2];
@@ -4099,6 +4316,11 @@ void clear_texture_preview_simulation_cache()
     prune_abandoned_texture_preview_vertex_color_futures();
 
     auto &cache = texture_preview_simulation_cache();
+    for (const auto &item : cache)
+        if (item.second != nullptr && item.second->pending_job_state != nullptr)
+            item.second->pending_job_state->cancelled.store(true, std::memory_order_relaxed);
+    texture_preview_task_queue().cancel_all_queued();
+
     for (auto it = cache.begin(); it != cache.end();) {
         std::shared_ptr<TexturePreviewSimulationCacheEntry> &entry = it->second;
         if (entry == nullptr) {
@@ -4113,6 +4335,8 @@ void clear_texture_preview_simulation_cache()
         entry->uploaded_signature = 0;
         entry->pending_signature = 0;
         entry->temporary_pending_signature = 0;
+        if (entry->pending_job_state != nullptr)
+            entry->pending_job_state->cancelled.store(true, std::memory_order_relaxed);
         entry->pending_job_state.reset();
 
         if (entry->pending_future.valid()) {
@@ -4286,13 +4510,16 @@ bool upload_simulated_texture_preview_result(TexturePreviewSimulationCacheEntry 
 
 void consume_temporary_simulated_texture_preview_result(TexturePreviewSimulationCacheEntry &entry)
 {
-    if (entry.temporary_pending_signature == 0 || entry.pending_job_state == nullptr)
+    if (entry.temporary_pending_signature == 0 ||
+        entry.pending_job_state == nullptr ||
+        texture_preview_simulation_cancelled(entry.pending_job_state))
         return;
 
     std::optional<TexturePreviewSimulationResult> result;
     {
         std::lock_guard<std::mutex> lock(entry.pending_job_state->mutex);
-        if (!entry.pending_job_state->temporary_result.has_value())
+        if (texture_preview_simulation_cancelled(entry.pending_job_state) ||
+            !entry.pending_job_state->temporary_result.has_value())
             return;
         result = std::move(entry.pending_job_state->temporary_result);
         entry.pending_job_state->temporary_result.reset();
@@ -4390,6 +4617,20 @@ const GUI::GLTexture *simulated_texture_preview_texture_for_filament(const Model
         temporary_simulated_texture_preview_signature(simulation_signature, temporary_size_limit) :
         size_t(0);
 
+    if (entry.pending_future.valid() && entry.pending_signature != simulation_signature) {
+        if (entry.pending_job_state != nullptr)
+            entry.pending_job_state->cancelled.store(true, std::memory_order_relaxed);
+        texture_preview_task_queue().cancel_queued(TexturePreviewTaskKind::Texture, cache_key);
+        if (entry.pending_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+            discard_ready_texture_preview_future(entry.pending_future, entry.pending_signature);
+        else
+            abandoned_texture_preview_futures().emplace_back(std::move(entry.pending_future));
+        entry.pending_signature = 0;
+        entry.temporary_pending_signature = 0;
+        entry.ready_frame_requested = false;
+        entry.pending_job_state.reset();
+    }
+
     consume_temporary_simulated_texture_preview_result(entry);
 
     if (entry.pending_future.valid() && entry.pending_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
@@ -4440,54 +4681,70 @@ const GUI::GLTexture *simulated_texture_preview_texture_for_filament(const Model
                                                               simulation_settings.component_colors.size(),
                                                               simulation_settings.component_colors);
         std::shared_ptr<TexturePreviewSimulationJobState> job_state = entry.pending_job_state;
-        entry.pending_future = std::async(std::launch::async,
-                                          [simulation_signature,
-                                           temporary_signature,
-                                           width,
-                                           height,
-                                           source_rgba,
-                                           source_raw_offsets,
-                                           source_raw_metadata_json,
-                                           source_raw_top_surface_slots,
-                                           source_raw_top_surface_depths,
-                                           source_raw_channels,
-                                           source_raw_component_channels = std::move(source_raw_component_channels),
-                                           background_color,
-                                           job_state,
-                                           temporary_size_limit,
-                                           simulation_settings = std::move(simulation_settings)]() mutable {
-                                              if (temporary_signature != 0 && job_state != nullptr) {
-                                                  TexturePreviewSimulationResult temporary_result =
-                                                      build_simulated_texture_preview_result(temporary_signature,
-                                                                                             width,
-                                                                                             height,
-                                                                                             *source_rgba,
-                                                                                             *source_raw_offsets,
-                                                                                             source_raw_channels,
-                                                                                             *source_raw_metadata_json,
-                                                                                             source_raw_component_channels,
-                                                                                             *source_raw_top_surface_slots,
-                                                                                             *source_raw_top_surface_depths,
-                                                                                             background_color,
-                                                                                             simulation_settings,
-                                                                                             temporary_size_limit.max_edge,
-                                                                                             temporary_size_limit.max_pixels);
-                                                  std::lock_guard<std::mutex> lock(job_state->mutex);
-                                                  job_state->temporary_result = std::move(temporary_result);
-                                              }
-                                              return build_simulated_texture_preview_result(simulation_signature,
-                                                                                           width,
-                                                                                           height,
-                                                                                           *source_rgba,
-                                                                                           *source_raw_offsets,
-                                                                                           source_raw_channels,
-                                                                                           *source_raw_metadata_json,
-                                                                                           source_raw_component_channels,
-                                                                                           *source_raw_top_surface_slots,
-                                                                                           *source_raw_top_surface_depths,
-                                                                                           background_color,
-                                                                                           std::move(simulation_settings));
-                                          });
+        entry.pending_future =
+            texture_preview_task_queue().enqueue<TexturePreviewSimulationResult>(
+                TexturePreviewTaskKind::Texture,
+                cache_key,
+                [simulation_signature,
+                 temporary_signature,
+                 width,
+                 height,
+                 source_rgba,
+                 source_raw_offsets,
+                 source_raw_metadata_json,
+                 source_raw_top_surface_slots,
+                 source_raw_top_surface_depths,
+                 source_raw_channels,
+                 source_raw_component_channels = std::move(source_raw_component_channels),
+                 background_color,
+                 job_state,
+                 temporary_size_limit,
+                 simulation_settings = std::move(simulation_settings)]() mutable {
+                    if (texture_preview_simulation_cancelled(job_state))
+                        return TexturePreviewSimulationResult{};
+                    std::vector<TexturePreviewSimulatedColorCacheEntry> simulated_color_cache;
+                    if (temporary_signature != 0 && job_state != nullptr) {
+                        TexturePreviewSimulationResult temporary_result =
+                            build_simulated_texture_preview_result(temporary_signature,
+                                                                   width,
+                                                                   height,
+                                                                   *source_rgba,
+                                                                   *source_raw_offsets,
+                                                                   source_raw_channels,
+                                                                   *source_raw_metadata_json,
+                                                                   source_raw_component_channels,
+                                                                   *source_raw_top_surface_slots,
+                                                                   *source_raw_top_surface_depths,
+                                                                   background_color,
+                                                                   simulation_settings,
+                                                                   job_state,
+                                                                   simulated_color_cache,
+                                                                   temporary_size_limit.max_edge,
+                                                                   temporary_size_limit.max_pixels);
+                        if (!temporary_result.rgba.empty() &&
+                            !texture_preview_simulation_cancelled(job_state)) {
+                            std::lock_guard<std::mutex> lock(job_state->mutex);
+                            if (!texture_preview_simulation_cancelled(job_state))
+                                job_state->temporary_result = std::move(temporary_result);
+                        }
+                    }
+                    if (texture_preview_simulation_cancelled(job_state))
+                        return TexturePreviewSimulationResult{};
+                    return build_simulated_texture_preview_result(simulation_signature,
+                                                                  width,
+                                                                  height,
+                                                                  *source_rgba,
+                                                                  *source_raw_offsets,
+                                                                  source_raw_channels,
+                                                                  *source_raw_metadata_json,
+                                                                  source_raw_component_channels,
+                                                                  *source_raw_top_surface_slots,
+                                                                  *source_raw_top_surface_depths,
+                                                                  background_color,
+                                                                  std::move(simulation_settings),
+                                                                  job_state,
+                                                                  simulated_color_cache);
+                });
     }
 
     if (temporary_signature != 0 &&
@@ -5342,6 +5599,15 @@ bool consume_or_queue_vertex_color_simulation(size_t cache_key,
         entry_ref = std::make_shared<TexturePreviewVertexColorSimulationCacheEntry>();
     TexturePreviewVertexColorSimulationCacheEntry &entry = *entry_ref;
 
+    if (entry.pending_future.valid() && entry.pending_signature != simulation_signature) {
+        texture_preview_task_queue().cancel_queued(TexturePreviewTaskKind::VertexColor, cache_key);
+        if (entry.pending_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+            discard_ready_texture_preview_vertex_color_future(entry);
+        else
+            abandoned_texture_preview_vertex_color_futures().emplace_back(std::move(entry.pending_future));
+        entry.pending_signature = 0;
+    }
+
     if (entry.pending_future.valid() && entry.pending_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
         try {
             TexturePreviewVertexColorSimulationResult result = entry.pending_future.get();
@@ -5366,7 +5632,11 @@ bool consume_or_queue_vertex_color_simulation(size_t cache_key,
         entry.ready_signature = 0;
         entry.ready_generation_reported = false;
         entry.pending_signature = simulation_signature;
-        entry.pending_future = std::async(std::launch::async, std::move(build_result));
+        entry.pending_future =
+            texture_preview_task_queue().enqueue<TexturePreviewVertexColorSimulationResult>(
+                TexturePreviewTaskKind::VertexColor,
+                cache_key,
+                std::move(build_result));
     }
 
     return false;
