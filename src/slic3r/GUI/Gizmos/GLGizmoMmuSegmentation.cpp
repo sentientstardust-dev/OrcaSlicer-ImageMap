@@ -13,12 +13,15 @@
 #include "slic3r/GUI/MsgDialog.hpp"
 #include "slic3r/GUI/ObjColorDialog.hpp"
 #include "slic3r/GUI/MainFrame.hpp"
+#include "slic3r/GUI/OpenGLManager.hpp"
 #include "slic3r/GUI/Tab.hpp"
 #include "slic3r/GUI/3DScene.hpp"
 #include "slic3r/GUI/MMUPaintedTexturePreview.hpp"
 #include "slic3r/GUI/Jobs/Worker.hpp"
+#include "slic3r/GUI/Widgets/PopupWindow.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
+#include "libslic3r/Color.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/TextureMapping.hpp"
 #include "ColorSolver.hpp"
@@ -45,6 +48,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <thread>
 #include <unordered_map>
@@ -57,16 +61,25 @@
 #include <boost/log/trivial.hpp>
 #include <nlohmann/json.hpp>
 #include <wx/button.h>
+#include <wx/checkbox.h>
+#include <wx/choice.h>
 #include <wx/colordlg.h>
+#include <wx/dcclient.h>
 #include <wx/dialog.h>
+#include <wx/dcbuffer.h>
 #include <wx/dcmemory.h>
 #include <wx/filedlg.h>
 #include <wx/font.h>
 #include <wx/fontenum.h>
+#include <wx/glcanvas.h>
 #include <wx/image.h>
 #include <wx/menu.h>
 #include <wx/panel.h>
+#include <wx/popupwin.h>
+#include <wx/scrolwin.h>
+#include <wx/settings.h>
 #include <wx/sizer.h>
+#include <wx/slider.h>
 #include <wx/spinctrl.h>
 #include <wx/statline.h>
 #include <wx/stattext.h>
@@ -11067,217 +11080,1743 @@ bool GLGizmoTrueColorPainting::apply_image_texture_paint_result_to_volume(ModelV
     return volume_changed;
 }
 
-static bool append_dialog_vertex_colors_for_volume(const ModelVolume                    &volume,
-                                                   std::vector<RGBA>                   &input_colors,
-                                                   const ManagedColorDataCreateSource  &source)
+struct RegionColorMappingVolumeSource
 {
-    const indexed_triangle_set &its = volume.mesh().its;
-    if (its.vertices.empty())
+    ModelVolume                            *volume = nullptr;
+    std::unique_ptr<ColorFacetsAnnotation>  rgba_data;
+    ColorRGBA                               background = ColorRGBA::WHITE();
+};
+
+struct RegionColorSample
+{
+    ColorRGBA             color = ColorRGBA::WHITE();
+    std::array<float, 3>  oklab = { 1.f, 0.f, 0.f };
+    float                 weight = 0.f;
+};
+
+struct RegionColorMappingRowState
+{
+    ColorRGBA             source_color = ColorRGBA::WHITE();
+    std::array<float, 3>  source_oklab = { 1.f, 0.f, 0.f };
+    unsigned int          slot_id = 1;
+    ColorRGBA             filament_color = ColorRGBA::WHITE();
+    int                   tolerance = 50;
+    float                 coverage = 0.f;
+};
+
+struct RegionColorPreviewTriangle
+{
+    std::array<Vec3f, 3>  vertices;
+    ColorRGBA             original_color = ColorRGBA::WHITE();
+    std::array<float, 3>  original_oklab = { 1.f, 0.f, 0.f };
+};
+
+struct RegionColorHistogramBin
+{
+    double r = 0.0;
+    double g = 0.0;
+    double b = 0.0;
+    double weight = 0.0;
+};
+
+struct RegionColorPreviewAccumulator
+{
+    double r = 0.0;
+    double g = 0.0;
+    double b = 0.0;
+    double weight = 0.0;
+};
+
+static constexpr size_t REGION_COLOR_MAX_PHYSICAL_FILAMENT_COUNT =
+    MAXIMUM_EXTRUDER_NUMBER < 99 ? MAXIMUM_EXTRUDER_NUMBER : 98;
+
+static std::array<float, 3> region_color_oklab_from_color(const ColorRGBA &color)
+{
+    return color_solver_oklab_from_srgb({ std::clamp(color.r(), 0.f, 1.f),
+                                          std::clamp(color.g(), 0.f, 1.f),
+                                          std::clamp(color.b(), 0.f, 1.f) });
+}
+
+static ColorRGBA region_color_visible_color(uint32_t rgba, const ColorRGBA &background)
+{
+    const ColorRGBA color = unpack_vertex_color_rgba_for_conversion(rgba);
+    const float alpha = std::clamp(color.a(), 0.f, 1.f);
+    if (alpha >= 0.999f)
+        return ColorRGBA(std::clamp(color.r(), 0.f, 1.f),
+                         std::clamp(color.g(), 0.f, 1.f),
+                         std::clamp(color.b(), 0.f, 1.f),
+                         1.f);
+    if (alpha <= 0.001f)
+        return ColorRGBA(std::clamp(background.r(), 0.f, 1.f),
+                         std::clamp(background.g(), 0.f, 1.f),
+                         std::clamp(background.b(), 0.f, 1.f),
+                         1.f);
+
+    return ColorRGBA(std::clamp(color.r() * alpha + background.r() * (1.f - alpha), 0.f, 1.f),
+                     std::clamp(color.g() * alpha + background.g() * (1.f - alpha), 0.f, 1.f),
+                     std::clamp(color.b() * alpha + background.b() * (1.f - alpha), 0.f, 1.f),
+                     1.f);
+}
+
+static float region_color_oklab_distance_sq(const std::array<float, 3> &lhs, const std::array<float, 3> &rhs)
+{
+    const float dl = lhs[0] - rhs[0];
+    const float da = lhs[1] - rhs[1];
+    const float db = lhs[2] - rhs[2];
+    return dl * dl + da * da + db * db;
+}
+
+static float region_color_tolerance_scale(int tolerance)
+{
+    const float t = std::clamp(float(tolerance), 0.f, 100.f);
+    return std::exp((t - 50.f) / 50.f * std::log(3.0f));
+}
+
+static size_t region_color_best_row_for_oklab(const std::vector<RegionColorMappingRowState> &rows,
+                                              const std::array<float, 3>                    &oklab)
+{
+    size_t best_idx = 0;
+    float best_score = std::numeric_limits<float>::max();
+    for (size_t row_idx = 0; row_idx < rows.size(); ++row_idx) {
+        const float scale = std::max(region_color_tolerance_scale(rows[row_idx].tolerance), 0.01f);
+        const float score = region_color_oklab_distance_sq(oklab, rows[row_idx].source_oklab) / (scale * scale);
+        if (score < best_score) {
+            best_score = score;
+            best_idx = row_idx;
+        }
+    }
+    return best_idx;
+}
+
+static wxColour region_color_to_wx(const ColorRGBA &color)
+{
+    return wxColour(static_cast<unsigned char>(std::clamp(color.r(), 0.f, 1.f) * 255.f + 0.5f),
+                    static_cast<unsigned char>(std::clamp(color.g(), 0.f, 1.f) * 255.f + 0.5f),
+                    static_cast<unsigned char>(std::clamp(color.b(), 0.f, 1.f) * 255.f + 0.5f));
+}
+
+static ColorRGBA region_color_with_preview_shade(const ColorRGBA &color, float shade)
+{
+    shade = std::clamp(shade, 0.f, 1.3f);
+    return ColorRGBA(std::clamp(color.r() * shade, 0.f, 1.f),
+                     std::clamp(color.g() * shade, 0.f, 1.f),
+                     std::clamp(color.b() * shade, 0.f, 1.f),
+                     color.a());
+}
+
+static wxString region_color_slot_label(unsigned int slot_id, const ColorRGBA &color)
+{
+    return wxString::Format(_L("Filament %u  #%02X%02X%02X"),
+                            slot_id,
+                            static_cast<unsigned>(std::clamp(color.r(), 0.f, 1.f) * 255.f + 0.5f),
+                            static_cast<unsigned>(std::clamp(color.g(), 0.f, 1.f) * 255.f + 0.5f),
+                            static_cast<unsigned>(std::clamp(color.b(), 0.f, 1.f) * 255.f + 0.5f));
+}
+
+static void region_color_append_state_bits(std::vector<bool> &bits, unsigned int state)
+{
+    if (state < 3U) {
+        managed_color_data_append_nibble(bits, state << 2);
+        return;
+    }
+
+    managed_color_data_append_nibble(bits, 0x0CU);
+    unsigned int remainder = state - 3U;
+    while (remainder >= 15U) {
+        managed_color_data_append_nibble(bits, 0x0FU);
+        remainder -= 15U;
+    }
+    managed_color_data_append_nibble(bits, remainder);
+}
+
+static int region_color_data_read_nibble(const TriangleColorSplittingData &data, int bitstream_end, int &bit_idx)
+{
+    if (bit_idx < 0 || bit_idx + 4 > bitstream_end || size_t(bit_idx + 3) >= data.bitstream.size())
+        return -1;
+
+    int code = 0;
+    for (int bit = 0; bit < 4; ++bit)
+        code |= int(data.bitstream[size_t(bit_idx++)]) << bit;
+    return code;
+}
+
+static bool region_color_append_rgba_tree_as_region_tree(const TriangleColorSplittingData              &data,
+                                                         int                                           bitstream_end,
+                                                         int                                           color_end,
+                                                         int                                          &bit_idx,
+                                                         int                                          &color_idx,
+                                                         const ColorRGBA                              &background,
+                                                         const std::vector<RegionColorMappingRowState> &rows,
+                                                         unsigned int                                  base_filament_id,
+                                                         std::vector<bool>                            &out_bits,
+                                                         bool                                         &has_non_base_leaf)
+{
+    const int code = region_color_data_read_nibble(data, bitstream_end, bit_idx);
+    if (code < 0)
         return false;
 
-    const ManagedColorSourceFlags source_flags = managed_color_source_flags(source);
-    if (source_flags.use_vertex_colors && volume.imported_vertex_colors_rgba.size() == its.vertices.size()) {
-        input_colors.reserve(input_colors.size() + volume.imported_vertex_colors_rgba.size());
-        for (const uint32_t packed : volume.imported_vertex_colors_rgba) {
-            const ColorRGBA color = unpack_vertex_color_rgba_for_conversion(packed);
-            input_colors.emplace_back(RGBA{ color.r(), color.g(), color.b(), color.a() });
-        }
+    const int split_sides = code & 0b11;
+    if (split_sides != 0) {
+        const int special_side = code >> 2;
+        if (special_side < 0 || special_side >= 3 || (split_sides != 1 && split_sides != 2 && special_side != 0))
+            return false;
+
+        managed_color_data_append_nibble(out_bits, unsigned(code));
+        for (int child_idx = split_sides; child_idx >= 0; --child_idx)
+            if (!region_color_append_rgba_tree_as_region_tree(data,
+                                                              bitstream_end,
+                                                              color_end,
+                                                              bit_idx,
+                                                              color_idx,
+                                                              background,
+                                                              rows,
+                                                              base_filament_id,
+                                                              out_bits,
+                                                              has_non_base_leaf))
+                return false;
         return true;
     }
 
-    const ColorRGBA fallback_color = blank_color_for_managed_target(ManagedColorDataType::ColorRegions);
-    const VolumeColorSource rgba_source = build_volume_color_source(volume);
-    const ManagedRegionColorSource empty_region_source;
-    std::vector<std::array<float, 4>> accumulators(its.vertices.size(), { 0.f, 0.f, 0.f, 0.f });
-    std::vector<unsigned int> counts(its.vertices.size(), 0);
-
-    for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
-        const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
-        for (int corner = 0; corner < 3; ++corner) {
-            if (tri[corner] < 0 || size_t(tri[corner]) >= its.vertices.size())
-                continue;
-            Vec3f barycentric = Vec3f::Zero();
-            barycentric[corner] = 1.f;
-            const ColorRGBA color = sample_managed_volume_color_source(volume,
-                                                                       rgba_source,
-                                                                       empty_region_source,
-                                                                       tri_idx,
-                                                                       its.vertices[size_t(tri[corner])].cast<float>(),
-                                                                       barycentric,
-                                                                       source_flags.use_rgba,
-                                                                       source_flags.use_image_texture,
-                                                                       false,
-                                                                       false,
-                                                                       fallback_color);
-            std::array<float, 4> &accumulator = accumulators[size_t(tri[corner])];
-            accumulator[0] += color.r();
-            accumulator[1] += color.g();
-            accumulator[2] += color.b();
-            accumulator[3] += color.a();
-            ++counts[size_t(tri[corner])];
-        }
-    }
-
-    input_colors.reserve(input_colors.size() + its.vertices.size());
-    for (size_t idx = 0; idx < its.vertices.size(); ++idx) {
-        ColorRGBA color = fallback_color;
-        if (counts[idx] > 0) {
-            const float inv = 1.f / float(counts[idx]);
-            color = ColorRGBA(accumulators[idx][0] * inv,
-                              accumulators[idx][1] * inv,
-                              accumulators[idx][2] * inv,
-                              accumulators[idx][3] * inv);
-        }
-        input_colors.emplace_back(RGBA{ color.r(), color.g(), color.b(), color.a() });
-    }
-    return true;
-}
-
-static std::string encode_managed_region_state_to_hex(unsigned int state)
-{
-    std::vector<int> nibbles;
-    if (state < 3U) {
-        nibbles.emplace_back(int(state) << 2);
-    } else {
-        nibbles.emplace_back(0x0C);
-        unsigned int remainder = state - 3U;
-        while (remainder >= 15U) {
-            nibbles.emplace_back(0x0F);
-            remainder -= 15U;
-        }
-        nibbles.emplace_back(int(remainder));
-    }
-
-    std::string encoded;
-    encoded.reserve(nibbles.size());
-    for (auto it = nibbles.rbegin(); it != nibbles.rend(); ++it) {
-        const int nibble = *it;
-        encoded.push_back(char(nibble < 10 ? ('0' + nibble) : ('A' + (nibble - 10))));
-    }
-    return encoded;
-}
-
-static unsigned char normalized_region_filament_id(unsigned char filament_id, unsigned char first_extruder_id)
-{
-    if (filament_id == 0)
-        return first_extruder_id == 0 ? 1 : first_extruder_id;
-    return filament_id;
-}
-
-static bool set_volume_regions_from_vertex_filament_ids(ModelVolume                      &volume,
-                                                        const std::vector<unsigned char> &vertex_filament_ids,
-                                                        size_t                            offset,
-                                                        unsigned char                     first_extruder_id)
-{
-    const indexed_triangle_set &its = volume.mesh().its;
-    if (offset + its.vertices.size() > vertex_filament_ids.size())
+    if (color_idx < 0 || color_idx >= color_end || size_t(color_idx) >= data.colors_rgba.size())
         return false;
 
-    first_extruder_id = first_extruder_id == 0 ? 1 : first_extruder_id;
-    volume.config.set("extruder", int(first_extruder_id));
-    volume.mmu_segmentation_facets.reset();
-    volume.mmu_segmentation_facets.reserve(int(its.indices.size()));
-
-    auto filament_id = [&vertex_filament_ids, offset, first_extruder_id](int vertex_idx) {
-        return normalized_region_filament_id(vertex_filament_ids[offset + size_t(vertex_idx)], first_extruder_id);
-    };
-    auto encoded = [](unsigned char id) {
-        return encode_managed_region_state_to_hex(unsigned(id));
-    };
-    auto safe_angle = [](const Vec3f &a, const Vec3f &b) {
-        if (a.squaredNorm() <= EPSILON || b.squaredNorm() <= EPSILON)
-            return 0.f;
-        return std::acos(std::clamp(a.normalized().dot(b.normalized()), -1.f, 1.f));
-    };
-
-    for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
-        const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
-        if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
-            continue;
-        if (size_t(tri[0]) >= its.vertices.size() ||
-            size_t(tri[1]) >= its.vertices.size() ||
-            size_t(tri[2]) >= its.vertices.size())
-            continue;
-
-        const unsigned char id0 = filament_id(tri[0]);
-        const unsigned char id1 = filament_id(tri[1]);
-        const unsigned char id2 = filament_id(tri[2]);
-        if (id0 == first_extruder_id && id1 == first_extruder_id && id2 == first_extruder_id)
-            continue;
-
-        if (id0 == id1 && id1 == id2) {
-            volume.mmu_segmentation_facets.set_triangle_from_string(int(tri_idx), encoded(id0));
-            continue;
-        }
-
-        const std::string result0 = encoded(id0);
-        const std::string result1 = encoded(id1);
-        const std::string result2 = encoded(id2);
-        if (id0 != id1 && id1 != id2 && id0 != id2) {
-            const Vec3f v0 = its.vertices[size_t(tri[0])].cast<float>();
-            const Vec3f v1 = its.vertices[size_t(tri[1])].cast<float>();
-            const Vec3f v2 = its.vertices[size_t(tri[2])].cast<float>();
-            const float angle0 = safe_angle(v1 - v0, v2 - v0);
-            const float angle1 = safe_angle(v0 - v1, v2 - v1);
-            const float angle2 = PI - angle0 - angle1;
-            std::array<float, 3> angles = { angle0, angle1, angle2 };
-            int max_angle_vertex_index = 0;
-            for (size_t idx = 1; idx < angles.size(); ++idx)
-                if (angles[idx] > angles[size_t(max_angle_vertex_index)])
-                    max_angle_vertex_index = int(idx);
-
-            if (max_angle_vertex_index == 0)
-                volume.mmu_segmentation_facets.set_triangle_from_string(int(tri_idx),
-                                                                        result0 + result1 + result2 + (result1 + result2 + "5") + "3");
-            else if (max_angle_vertex_index == 1)
-                volume.mmu_segmentation_facets.set_triangle_from_string(int(tri_idx),
-                                                                        result0 + result1 + result2 + (result0 + result2 + "9") + "3");
-            else
-                volume.mmu_segmentation_facets.set_triangle_from_string(int(tri_idx),
-                                                                        result0 + result1 + result2 + (result1 + result0 + "1") + "3");
-            continue;
-        }
-
-        if (id0 == id1)
-            volume.mmu_segmentation_facets.set_triangle_from_string(int(tri_idx), result2 + result0 + result0 + "A");
-        else if (id1 == id2)
-            volume.mmu_segmentation_facets.set_triangle_from_string(int(tri_idx), result0 + result1 + result2 + "2");
-        else if (id0 == id2)
-            volume.mmu_segmentation_facets.set_triangle_from_string(int(tri_idx), result1 + result0 + result0 + "6");
-    }
-
+    const ColorRGBA color = region_color_visible_color(data.colors_rgba[size_t(color_idx++)], background);
+    const size_t row_idx = region_color_best_row_for_oklab(rows, region_color_oklab_from_color(color));
+    const unsigned int filament_id = row_idx < rows.size() ? rows[row_idx].slot_id : base_filament_id;
+    const unsigned int state = filament_id == base_filament_id ? 0U : filament_id;
+    has_non_base_leaf |= state != 0U;
+    region_color_append_state_bits(out_bits, state);
     return true;
 }
 
-static bool apply_dialog_vertex_filaments_to_color_regions(ModelObject                      &object,
-                                                           const std::vector<unsigned char> &vertex_filament_ids,
-                                                           unsigned char                     first_extruder_id)
+static bool region_color_apply_volume_mapping(ModelVolume                                    &volume,
+                                              const ColorFacetsAnnotation                    &rgba_data,
+                                              const ColorRGBA                                &background,
+                                              const std::vector<RegionColorMappingRowState>  &rows,
+                                              unsigned int                                    base_filament_id)
 {
-    size_t offset = 0;
-    bool changed = false;
-    first_extruder_id = first_extruder_id == 0 ? 1 : first_extruder_id;
-    object.config.set("extruder", int(first_extruder_id));
+    const TriangleColorSplittingData &data = rgba_data.get_data();
+    if (data.triangles_to_split.empty())
+        return false;
+
+    volume.config.set("extruder", int(base_filament_id));
+    volume.mmu_segmentation_facets.reset();
+    volume.mmu_segmentation_facets.reserve(int(data.triangles_to_split.size()));
+
+    for (size_t mapping_idx = 0; mapping_idx < data.triangles_to_split.size(); ++mapping_idx) {
+        const ColorTriangleBitStreamMapping &mapping = data.triangles_to_split[mapping_idx];
+        const int bitstream_start = mapping.bitstream_start_idx;
+        const int bitstream_end = mapping_idx + 1 == data.triangles_to_split.size() ?
+            int(data.bitstream.size()) :
+            data.triangles_to_split[mapping_idx + 1].bitstream_start_idx;
+        const int color_start = mapping.color_start_idx;
+        const int color_end = mapping_idx + 1 == data.triangles_to_split.size() ?
+            int(data.colors_rgba.size()) :
+            data.triangles_to_split[mapping_idx + 1].color_start_idx;
+
+        if (mapping.triangle_idx < 0 ||
+            bitstream_start < 0 ||
+            bitstream_start >= bitstream_end ||
+            color_start < 0 ||
+            color_start >= color_end ||
+            size_t(bitstream_end) > data.bitstream.size() ||
+            size_t(color_end) > data.colors_rgba.size())
+            continue;
+
+        int bit_idx = bitstream_start;
+        int color_idx = color_start;
+        bool has_non_base_leaf = false;
+        std::vector<bool> out_bits;
+        if (!region_color_append_rgba_tree_as_region_tree(data,
+                                                          bitstream_end,
+                                                          color_end,
+                                                          bit_idx,
+                                                          color_idx,
+                                                          background,
+                                                          rows,
+                                                          base_filament_id,
+                                                          out_bits,
+                                                          has_non_base_leaf) ||
+            bit_idx != bitstream_end ||
+            color_idx != color_end ||
+            out_bits.empty() ||
+            !has_non_base_leaf)
+            continue;
+
+        std::string encoded;
+        managed_color_data_bits_to_hex(out_bits, encoded);
+        volume.mmu_segmentation_facets.set_triangle_from_string(mapping.triangle_idx, encoded);
+    }
+
+    volume.mmu_segmentation_facets.shrink_to_fit();
+    return true;
+}
+
+static bool region_color_build_temporary_rgba_data(const ModelVolume                   &volume,
+                                                   const ManagedColorDataCreateSource &source,
+                                                   ColorFacetsAnnotation              &out)
+{
+    const indexed_triangle_set &its = volume.mesh().its;
+    if (its.indices.empty() || its.vertices.empty())
+        return false;
+
+    const ManagedColorSourceFlags source_flags = managed_color_source_flags(source);
+    if (source_flags.use_rgba) {
+        if (volume.texture_mapping_color_facets.empty())
+            return false;
+        out.assign(volume.texture_mapping_color_facets);
+        return !out.empty();
+    }
+
+    const ColorRGBA fallback_color = blank_color_for_managed_target(ManagedColorDataType::RgbaData);
+    const VolumeColorSource rgba_source = build_volume_color_source(volume);
+    const ManagedRegionColorSource region_source;
+    TextureMappingColorSampler sampler = [&volume, rgba_source, region_source, source_flags, fallback_color](
+                                             size_t tri_idx,
+                                             const Vec3f &point,
+                                             const Vec3f &barycentric) {
+        const ColorRGBA color = sample_managed_volume_color_source(volume,
+                                                                   rgba_source,
+                                                                   region_source,
+                                                                   tri_idx,
+                                                                   point,
+                                                                   barycentric,
+                                                                   source_flags.use_rgba,
+                                                                   source_flags.use_image_texture,
+                                                                   source_flags.use_vertex_colors,
+                                                                   source_flags.use_color_regions,
+                                                                   fallback_color);
+        return pack_vertex_color_rgba(color);
+    };
+
+    const bool has_image_texture_source = source_flags.use_image_texture && model_volume_has_bakeable_image_texture_data(&volume);
+    const bool has_geometry_color_source = source_flags.use_vertex_colors && !volume.imported_vertex_colors_rgba.empty();
+    const bool sampled = build_rgba_data_from_color_sampler(its,
+                                                            sampler,
+                                                            has_image_texture_source,
+                                                            has_geometry_color_source,
+                                                            [&volume](size_t tri_idx) {
+                                                                return texture_triangle_uv_pixel_span(&volume, tri_idx);
+                                                            },
+                                                            fallback_color,
+                                                            out);
+    if (out.metadata_json().empty())
+        out.set_metadata_json(rgb_metadata_json(fallback_color));
+    return sampled || !out.empty();
+}
+
+static std::vector<RegionColorMappingVolumeSource> region_color_build_sources(ModelObject                           &object,
+                                                                              const ManagedColorDataCreateSource    &source)
+{
+    std::vector<RegionColorMappingVolumeSource> sources;
     for (ModelVolume *volume : object.volumes) {
         if (volume == nullptr || !volume->is_model_part())
             continue;
-        const size_t vertex_count = volume->mesh().its.vertices.size();
-        if (!set_volume_regions_from_vertex_filament_ids(*volume, vertex_filament_ids, offset, first_extruder_id))
-            return false;
-        offset += vertex_count;
-        changed = true;
+
+        std::unique_ptr<ColorFacetsAnnotation> rgba_data = ColorFacetsAnnotation::make_temporary();
+        if (!rgba_data || !region_color_build_temporary_rgba_data(*volume, source, *rgba_data) || rgba_data->empty())
+            continue;
+
+        RegionColorMappingVolumeSource volume_source;
+        volume_source.volume = volume;
+        volume_source.background =
+            configured_texture_mapping_background_color_for_volume(*volume).value_or(rgb_metadata_background_color(*rgba_data));
+        volume_source.rgba_data = std::move(rgba_data);
+        sources.emplace_back(std::move(volume_source));
     }
-    return changed && offset == vertex_filament_ids.size();
+    return sources;
 }
 
-static std::unique_ptr<Model> build_color_region_dialog_preview_model(const ModelObject &object, size_t vertex_count)
+static void region_color_accumulate_histogram(const ColorRGBA &color, float weight, std::array<RegionColorHistogramBin, 32768> &bins)
 {
-    TriangleMesh mesh = object.raw_mesh();
-    if (mesh.empty() || mesh.its.vertices.size() != vertex_count)
-        return nullptr;
+    if (weight <= 0.f)
+        return;
 
-    std::unique_ptr<Model> preview_model = std::make_unique<Model>();
-    preview_model->add_object(object.name.c_str(), object.input_file.c_str(), std::move(mesh));
-    return preview_model;
+    const int r = std::clamp(int(color.r() * 31.f + 0.5f), 0, 31);
+    const int g = std::clamp(int(color.g() * 31.f + 0.5f), 0, 31);
+    const int b = std::clamp(int(color.b() * 31.f + 0.5f), 0, 31);
+    const size_t idx = size_t((r << 10) | (g << 5) | b);
+    bins[idx].r += double(color.r()) * double(weight);
+    bins[idx].g += double(color.g()) * double(weight);
+    bins[idx].b += double(color.b()) * double(weight);
+    bins[idx].weight += double(weight);
+}
+
+static void region_color_collect_samples_and_preview(const std::vector<RegionColorMappingVolumeSource> &sources,
+                                                     std::vector<RegionColorSample>                    &samples,
+                                                     std::vector<RegionColorPreviewTriangle>           &preview_triangles)
+{
+    std::array<RegionColorHistogramBin, 32768> bins{};
+    preview_triangles.clear();
+
+    for (const RegionColorMappingVolumeSource &source : sources) {
+        if (source.volume == nullptr || !source.rgba_data)
+            continue;
+
+        std::vector<ColorFacetTriangle> facets;
+        source.rgba_data->get_facet_triangles(*source.volume, facets);
+        const indexed_triangle_set &its = source.volume->mesh().its;
+        std::vector<RegionColorPreviewAccumulator> preview_accumulators(its.indices.size());
+        const Transform3d volume_matrix = source.volume->get_matrix();
+        for (const ColorFacetTriangle &facet : facets) {
+            const ColorRGBA color = region_color_visible_color(facet.rgba, source.background);
+            const float weight = float(std::max(managed_color_data_triangle_area(facet), 0.000001));
+            region_color_accumulate_histogram(color, weight, bins);
+
+            if (facet.source_triangle >= 0 && size_t(facet.source_triangle) < preview_accumulators.size()) {
+                RegionColorPreviewAccumulator &acc = preview_accumulators[size_t(facet.source_triangle)];
+                acc.r += double(color.r()) * double(weight);
+                acc.g += double(color.g()) * double(weight);
+                acc.b += double(color.b()) * double(weight);
+                acc.weight += double(weight);
+            }
+        }
+
+        preview_triangles.reserve(preview_triangles.size() + its.indices.size());
+        for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+            const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
+            if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0)
+                continue;
+            if (size_t(tri[0]) >= its.vertices.size() ||
+                size_t(tri[1]) >= its.vertices.size() ||
+                size_t(tri[2]) >= its.vertices.size())
+                continue;
+
+            RegionColorPreviewTriangle triangle;
+            const std::array<int, 3> vertex_indices = { tri[0], tri[1], tri[2] };
+            for (size_t vertex_idx = 0; vertex_idx < triangle.vertices.size(); ++vertex_idx) {
+                const Vec3d transformed = volume_matrix * its.vertices[size_t(vertex_indices[vertex_idx])].cast<double>();
+                triangle.vertices[vertex_idx] = transformed.cast<float>();
+            }
+
+            ColorRGBA color = source.background;
+            const RegionColorPreviewAccumulator &acc = preview_accumulators[tri_idx];
+            if (acc.weight > 0.0) {
+                const double inv_weight = 1.0 / acc.weight;
+                color = ColorRGBA(float(acc.r * inv_weight), float(acc.g * inv_weight), float(acc.b * inv_weight), 1.f);
+            }
+            triangle.original_color = color;
+            triangle.original_oklab = region_color_oklab_from_color(color);
+            preview_triangles.emplace_back(triangle);
+        }
+    }
+
+    samples.clear();
+    for (const RegionColorHistogramBin &bin : bins) {
+        if (bin.weight <= 0.0)
+            continue;
+        const double inv_weight = 1.0 / bin.weight;
+        RegionColorSample sample;
+        sample.color = ColorRGBA(float(bin.r * inv_weight), float(bin.g * inv_weight), float(bin.b * inv_weight), 1.f);
+        sample.oklab = region_color_oklab_from_color(sample.color);
+        sample.weight = float(bin.weight);
+        samples.emplace_back(sample);
+    }
+}
+
+static std::vector<ColorRGBA> region_color_extract_dominant_colors(const std::vector<RegionColorSample> &samples,
+                                                                   size_t                               count,
+                                                                   const std::vector<ColorRGBA>        &fallback_colors)
+{
+    std::vector<ColorRGBA> dominant;
+    if (count == 0)
+        return dominant;
+
+    if (samples.empty()) {
+        for (size_t idx = 0; idx < count; ++idx)
+            dominant.emplace_back(idx < fallback_colors.size() ? fallback_colors[idx] : ColorRGBA::WHITE());
+        return dominant;
+    }
+
+    std::vector<size_t> order(samples.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&samples](size_t lhs, size_t rhs) {
+        return samples[lhs].weight > samples[rhs].weight;
+    });
+
+    dominant.emplace_back(samples[order.front()].color);
+    while (dominant.size() < count && dominant.size() < samples.size()) {
+        size_t best_sample = order.front();
+        float best_score = -1.f;
+        for (const size_t sample_idx : order) {
+            const RegionColorSample &sample = samples[sample_idx];
+            float best_distance = std::numeric_limits<float>::max();
+            for (const ColorRGBA &center : dominant)
+                best_distance = std::min(best_distance, region_color_oklab_distance_sq(sample.oklab, region_color_oklab_from_color(center)));
+            const float score = best_distance * std::sqrt(std::max(sample.weight, 0.0001f));
+            if (score > best_score) {
+                best_score = score;
+                best_sample = sample_idx;
+            }
+        }
+        dominant.emplace_back(samples[best_sample].color);
+    }
+
+    std::vector<std::array<float, 3>> center_oklabs;
+    center_oklabs.reserve(dominant.size());
+    for (int iteration = 0; iteration < 14; ++iteration) {
+        center_oklabs.clear();
+        for (const ColorRGBA &center : dominant)
+            center_oklabs.emplace_back(region_color_oklab_from_color(center));
+
+        std::vector<double> accum_r(dominant.size(), 0.0);
+        std::vector<double> accum_g(dominant.size(), 0.0);
+        std::vector<double> accum_b(dominant.size(), 0.0);
+        std::vector<double> accum_w(dominant.size(), 0.0);
+        for (size_t sample_idx = 0; sample_idx < samples.size(); ++sample_idx) {
+            const RegionColorSample &sample = samples[sample_idx];
+            size_t best_center = 0;
+            float best_distance = std::numeric_limits<float>::max();
+            for (size_t center_idx = 0; center_idx < center_oklabs.size(); ++center_idx) {
+                const float distance = region_color_oklab_distance_sq(sample.oklab, center_oklabs[center_idx]);
+                if (distance < best_distance) {
+                    best_distance = distance;
+                    best_center = center_idx;
+                }
+            }
+            accum_r[best_center] += double(sample.color.r()) * double(sample.weight);
+            accum_g[best_center] += double(sample.color.g()) * double(sample.weight);
+            accum_b[best_center] += double(sample.color.b()) * double(sample.weight);
+            accum_w[best_center] += double(sample.weight);
+        }
+
+        for (size_t center_idx = 0; center_idx < dominant.size(); ++center_idx) {
+            if (accum_w[center_idx] <= 0.0)
+                continue;
+            const double inv_weight = 1.0 / accum_w[center_idx];
+            dominant[center_idx] = ColorRGBA(float(accum_r[center_idx] * inv_weight),
+                                             float(accum_g[center_idx] * inv_weight),
+                                             float(accum_b[center_idx] * inv_weight),
+                                             1.f);
+        }
+    }
+
+    std::vector<double> cluster_weights(dominant.size(), 0.0);
+    center_oklabs.clear();
+    for (const ColorRGBA &center : dominant)
+        center_oklabs.emplace_back(region_color_oklab_from_color(center));
+    for (const RegionColorSample &sample : samples) {
+        size_t best_center = 0;
+        float best_distance = std::numeric_limits<float>::max();
+        for (size_t center_idx = 0; center_idx < center_oklabs.size(); ++center_idx) {
+            const float distance = region_color_oklab_distance_sq(sample.oklab, center_oklabs[center_idx]);
+            if (distance < best_distance) {
+                best_distance = distance;
+                best_center = center_idx;
+            }
+        }
+        cluster_weights[best_center] += sample.weight;
+    }
+
+    std::vector<size_t> dominant_order(dominant.size());
+    std::iota(dominant_order.begin(), dominant_order.end(), 0);
+    std::sort(dominant_order.begin(), dominant_order.end(), [&cluster_weights](size_t lhs, size_t rhs) {
+        return cluster_weights[lhs] > cluster_weights[rhs];
+    });
+
+    std::vector<ColorRGBA> sorted;
+    sorted.reserve(count);
+    for (const size_t idx : dominant_order)
+        sorted.emplace_back(dominant[idx]);
+    while (sorted.size() < count)
+        sorted.emplace_back(sorted.empty() ? (fallback_colors.empty() ? ColorRGBA::WHITE() : fallback_colors[sorted.size() % fallback_colors.size()]) : sorted.back());
+    if (sorted.size() > count)
+        sorted.resize(count);
+    return sorted;
+}
+
+static void region_color_update_coverages(const std::vector<RegionColorSample> &samples,
+                                          std::vector<RegionColorMappingRowState> &rows)
+{
+    for (RegionColorMappingRowState &row : rows)
+        row.coverage = 0.f;
+
+    double total_weight = 0.0;
+    for (const RegionColorSample &sample : samples) {
+        if (sample.weight <= 0.f || rows.empty())
+            continue;
+        const size_t row_idx = region_color_best_row_for_oklab(rows, sample.oklab);
+        rows[row_idx].coverage += sample.weight;
+        total_weight += sample.weight;
+    }
+
+    if (total_weight <= 0.0)
+        return;
+    for (RegionColorMappingRowState &row : rows)
+        row.coverage = float(double(row.coverage) / total_weight);
+}
+
+struct RegionColorHsv
+{
+    float h = 0.f;
+    float s = 0.f;
+    float v = 1.f;
+};
+
+static RegionColorHsv region_color_rgb_to_hsv(const ColorRGBA &color)
+{
+    const float r = std::clamp(color.r(), 0.f, 1.f);
+    const float g = std::clamp(color.g(), 0.f, 1.f);
+    const float b = std::clamp(color.b(), 0.f, 1.f);
+    const float max_value = std::max({ r, g, b });
+    const float min_value = std::min({ r, g, b });
+    const float delta = max_value - min_value;
+
+    RegionColorHsv hsv;
+    hsv.v = max_value;
+    hsv.s = max_value <= EPSILON ? 0.f : delta / max_value;
+    if (delta <= EPSILON) {
+        hsv.h = 0.f;
+    } else if (max_value == r) {
+        hsv.h = std::fmod((g - b) / delta, 6.f) / 6.f;
+    } else if (max_value == g) {
+        hsv.h = ((b - r) / delta + 2.f) / 6.f;
+    } else {
+        hsv.h = ((r - g) / delta + 4.f) / 6.f;
+    }
+    if (hsv.h < 0.f)
+        hsv.h += 1.f;
+    return hsv;
+}
+
+static ColorRGBA region_color_hsv_to_rgb(const RegionColorHsv &hsv)
+{
+    const float h = std::fmod(std::clamp(hsv.h, 0.f, 1.f) * 6.f, 6.f);
+    const float s = std::clamp(hsv.s, 0.f, 1.f);
+    const float v = std::clamp(hsv.v, 0.f, 1.f);
+    const float c = v * s;
+    const float x = c * (1.f - std::fabs(std::fmod(h, 2.f) - 1.f));
+    const float m = v - c;
+
+    float r = 0.f;
+    float g = 0.f;
+    float b = 0.f;
+    if (h < 1.f) {
+        r = c;
+        g = x;
+    } else if (h < 2.f) {
+        r = x;
+        g = c;
+    } else if (h < 3.f) {
+        g = c;
+        b = x;
+    } else if (h < 4.f) {
+        g = x;
+        b = c;
+    } else if (h < 5.f) {
+        r = x;
+        b = c;
+    } else {
+        r = c;
+        b = x;
+    }
+    return ColorRGBA(r + m, g + m, b + m, 1.f);
+}
+
+class RegionColorHsvPickerPopup;
+
+class RegionColorSvPanel : public wxPanel
+{
+public:
+    explicit RegionColorSvPanel(RegionColorHsvPickerPopup *owner);
+
+private:
+    void on_paint(wxPaintEvent &event);
+    void on_mouse(wxMouseEvent &event);
+
+    RegionColorHsvPickerPopup *m_owner = nullptr;
+};
+
+class RegionColorHuePanel : public wxPanel
+{
+public:
+    explicit RegionColorHuePanel(RegionColorHsvPickerPopup *owner);
+
+private:
+    void on_paint(wxPaintEvent &event);
+    void on_mouse(wxMouseEvent &event);
+
+    RegionColorHsvPickerPopup *m_owner = nullptr;
+};
+
+class RegionColorHsvPickerPopup : public PopupWindow
+{
+public:
+    RegionColorHsvPickerPopup(wxWindow *parent, const ColorRGBA &color, std::function<void(const ColorRGBA &)> on_color)
+        : PopupWindow(parent, wxBORDER_SIMPLE | wxPU_CONTAINS_CONTROLS)
+        , m_hsv(region_color_rgb_to_hsv(color))
+        , m_on_color(std::move(on_color))
+    {
+        wxBoxSizer *sizer = new wxBoxSizer(wxHORIZONTAL);
+        m_sv_panel = new RegionColorSvPanel(this);
+        m_hue_panel = new RegionColorHuePanel(this);
+        sizer->Add(m_sv_panel, 1, wxEXPAND | wxALL, FromDIP(8));
+        sizer->Add(m_hue_panel, 0, wxEXPAND | wxTOP | wxBOTTOM | wxRIGHT, FromDIP(8));
+        SetSizerAndFit(sizer);
+        Bind(wxEVT_MOTION, &RegionColorHsvPickerPopup::on_mouse, this);
+        Bind(wxEVT_LEFT_UP, &RegionColorHsvPickerPopup::on_mouse, this);
+    }
+
+    void show_for(wxWindow *anchor)
+    {
+        if (anchor != nullptr)
+            Position(anchor->ClientToScreen(wxPoint(0, 0)), wxSize(0, anchor->GetSize().y));
+        Popup();
+    }
+
+    const RegionColorHsv& hsv() const { return m_hsv; }
+
+    void set_sv_from_point(const wxPoint &point, const wxSize &size)
+    {
+        if (size.x <= 1 || size.y <= 1)
+            return;
+        m_hsv.s = std::clamp(float(point.x) / float(size.x - 1), 0.f, 1.f);
+        m_hsv.v = std::clamp(1.f - float(point.y) / float(size.y - 1), 0.f, 1.f);
+        notify_color();
+    }
+
+    void set_hue_from_point(const wxPoint &point, const wxSize &size)
+    {
+        if (size.y <= 1)
+            return;
+        m_hsv.h = std::clamp(float(point.y) / float(size.y - 1), 0.f, 1.f);
+        notify_color();
+    }
+
+    void refresh_panels()
+    {
+        if (m_sv_panel != nullptr)
+            m_sv_panel->Refresh();
+        if (m_hue_panel != nullptr)
+            m_hue_panel->Refresh();
+    }
+
+    void OnDismiss() override {}
+
+    bool ProcessLeftDown(wxMouseEvent &event) override
+    {
+        const wxPoint screen_point = screen_point_from_event(event);
+        if (!GetScreenRect().Contains(screen_point))
+            return PopupWindow::ProcessLeftDown(event);
+
+        begin_drag_from_screen_point(screen_point);
+        return true;
+    }
+
+private:
+    enum class DragTarget
+    {
+        None,
+        SaturationValue,
+        Hue
+    };
+
+    wxPoint screen_point_from_event(wxMouseEvent &event) const
+    {
+        wxWindow *event_window = dynamic_cast<wxWindow*>(event.GetEventObject());
+        return event_window != nullptr ? event_window->ClientToScreen(event.GetPosition()) : wxGetMousePosition();
+    }
+
+    void apply_drag_target(const wxPoint &screen_point)
+    {
+        if (m_drag_target == DragTarget::SaturationValue && m_sv_panel != nullptr) {
+            const wxPoint panel_point = m_sv_panel->ScreenToClient(screen_point);
+            set_sv_from_point(panel_point, m_sv_panel->GetClientSize());
+        } else if (m_drag_target == DragTarget::Hue && m_hue_panel != nullptr) {
+            const wxPoint panel_point = m_hue_panel->ScreenToClient(screen_point);
+            set_hue_from_point(panel_point, m_hue_panel->GetClientSize());
+        }
+    }
+
+    void begin_drag_from_screen_point(const wxPoint &screen_point)
+    {
+        if (m_sv_panel != nullptr && m_sv_panel->GetScreenRect().Contains(screen_point)) {
+            m_drag_target = DragTarget::SaturationValue;
+            apply_drag_target(screen_point);
+        } else if (m_hue_panel != nullptr && m_hue_panel->GetScreenRect().Contains(screen_point)) {
+            m_drag_target = DragTarget::Hue;
+            apply_drag_target(screen_point);
+        } else {
+            m_drag_target = DragTarget::None;
+        }
+    }
+
+    void on_mouse(wxMouseEvent &event)
+    {
+        if (event.Dragging() && event.LeftIsDown() && m_drag_target != DragTarget::None) {
+            apply_drag_target(screen_point_from_event(event));
+            return;
+        }
+        if (event.LeftUp())
+            m_drag_target = DragTarget::None;
+        event.Skip();
+    }
+
+    void notify_color()
+    {
+        if (m_on_color)
+            m_on_color(region_color_hsv_to_rgb(m_hsv));
+        refresh_panels();
+    }
+
+    RegionColorHsv                         m_hsv;
+    std::function<void(const ColorRGBA &)> m_on_color;
+    RegionColorSvPanel                    *m_sv_panel = nullptr;
+    RegionColorHuePanel                   *m_hue_panel = nullptr;
+    DragTarget                             m_drag_target = DragTarget::None;
+};
+
+RegionColorSvPanel::RegionColorSvPanel(RegionColorHsvPickerPopup *owner)
+    : wxPanel(owner, wxID_ANY, wxDefaultPosition, wxSize(owner->FromDIP(172), owner->FromDIP(172)))
+    , m_owner(owner)
+{
+    SetMinSize(wxSize(owner->FromDIP(172), owner->FromDIP(172)));
+    SetBackgroundStyle(wxBG_STYLE_PAINT);
+    Bind(wxEVT_PAINT, &RegionColorSvPanel::on_paint, this);
+    Bind(wxEVT_LEFT_DOWN, &RegionColorSvPanel::on_mouse, this);
+    Bind(wxEVT_LEFT_UP, &RegionColorSvPanel::on_mouse, this);
+    Bind(wxEVT_MOTION, &RegionColorSvPanel::on_mouse, this);
+}
+
+void RegionColorSvPanel::on_paint(wxPaintEvent&)
+{
+    wxAutoBufferedPaintDC dc(this);
+    const wxSize size = GetClientSize();
+    if (size.x <= 0 || size.y <= 0)
+        return;
+
+    wxImage image(size.x, size.y);
+    RegionColorHsv hsv = m_owner->hsv();
+    for (int y = 0; y < size.y; ++y) {
+        hsv.v = 1.f - float(y) / float(std::max(size.y - 1, 1));
+        unsigned char *row = image.GetData() + size_t(y) * size_t(size.x) * 3u;
+        for (int x = 0; x < size.x; ++x) {
+            hsv.s = float(x) / float(std::max(size.x - 1, 1));
+            const wxColour color = region_color_to_wx(region_color_hsv_to_rgb(hsv));
+            row[size_t(x) * 3u + 0u] = color.Red();
+            row[size_t(x) * 3u + 1u] = color.Green();
+            row[size_t(x) * 3u + 2u] = color.Blue();
+        }
+    }
+    dc.DrawBitmap(wxBitmap(image), 0, 0, false);
+
+    const RegionColorHsv selected = m_owner->hsv();
+    const int x = int(selected.s * float(size.x - 1) + 0.5f);
+    const int y = int((1.f - selected.v) * float(size.y - 1) + 0.5f);
+    dc.SetPen(wxPen(*wxBLACK, FromDIP(2)));
+    dc.SetBrush(*wxTRANSPARENT_BRUSH);
+    dc.DrawCircle(wxPoint(x, y), FromDIP(5));
+    dc.SetPen(wxPen(*wxWHITE, FromDIP(1)));
+    dc.DrawCircle(wxPoint(x, y), FromDIP(4));
+}
+
+void RegionColorSvPanel::on_mouse(wxMouseEvent &event)
+{
+    if ((event.LeftDown() || event.Dragging()) && event.LeftIsDown() && m_owner != nullptr)
+        m_owner->set_sv_from_point(event.GetPosition(), GetClientSize());
+}
+
+RegionColorHuePanel::RegionColorHuePanel(RegionColorHsvPickerPopup *owner)
+    : wxPanel(owner, wxID_ANY, wxDefaultPosition, wxSize(owner->FromDIP(24), owner->FromDIP(172)))
+    , m_owner(owner)
+{
+    SetMinSize(wxSize(owner->FromDIP(24), owner->FromDIP(172)));
+    SetBackgroundStyle(wxBG_STYLE_PAINT);
+    Bind(wxEVT_PAINT, &RegionColorHuePanel::on_paint, this);
+    Bind(wxEVT_LEFT_DOWN, &RegionColorHuePanel::on_mouse, this);
+    Bind(wxEVT_LEFT_UP, &RegionColorHuePanel::on_mouse, this);
+    Bind(wxEVT_MOTION, &RegionColorHuePanel::on_mouse, this);
+}
+
+void RegionColorHuePanel::on_paint(wxPaintEvent&)
+{
+    wxAutoBufferedPaintDC dc(this);
+    const wxSize size = GetClientSize();
+    if (size.x <= 0 || size.y <= 0)
+        return;
+
+    wxImage image(size.x, size.y);
+    RegionColorHsv hsv;
+    hsv.s = 1.f;
+    hsv.v = 1.f;
+    for (int y = 0; y < size.y; ++y) {
+        hsv.h = float(y) / float(std::max(size.y - 1, 1));
+        const wxColour color = region_color_to_wx(region_color_hsv_to_rgb(hsv));
+        unsigned char *row = image.GetData() + size_t(y) * size_t(size.x) * 3u;
+        for (int x = 0; x < size.x; ++x) {
+            row[size_t(x) * 3u + 0u] = color.Red();
+            row[size_t(x) * 3u + 1u] = color.Green();
+            row[size_t(x) * 3u + 2u] = color.Blue();
+        }
+    }
+    dc.DrawBitmap(wxBitmap(image), 0, 0, false);
+
+    const int y = int(m_owner->hsv().h * float(size.y - 1) + 0.5f);
+    dc.SetPen(wxPen(*wxBLACK, FromDIP(2)));
+    dc.DrawLine(0, y, size.x, y);
+    dc.SetPen(wxPen(*wxWHITE, FromDIP(1)));
+    dc.DrawLine(0, y + 1, size.x, y + 1);
+}
+
+void RegionColorHuePanel::on_mouse(wxMouseEvent &event)
+{
+    if ((event.LeftDown() || event.Dragging()) && event.LeftIsDown() && m_owner != nullptr)
+        m_owner->set_hue_from_point(event.GetPosition(), GetClientSize());
+}
+
+class RegionColorSwatch : public wxPanel
+{
+public:
+    RegionColorSwatch(wxWindow *parent, const ColorRGBA &color, bool editable, std::function<void(const ColorRGBA &)> on_color = {})
+        : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxSize(parent->FromDIP(34), parent->FromDIP(24)))
+        , m_color(color)
+        , m_editable(editable)
+        , m_on_color(std::move(on_color))
+    {
+        SetMinSize(wxSize(parent->FromDIP(34), parent->FromDIP(24)));
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        Bind(wxEVT_PAINT, &RegionColorSwatch::on_paint, this);
+        Bind(wxEVT_LEFT_DOWN, &RegionColorSwatch::on_left_down, this);
+    }
+
+    void set_color(const ColorRGBA &color)
+    {
+        m_color = color;
+        Refresh();
+    }
+
+private:
+    void on_paint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC dc(this);
+        const wxSize size = GetClientSize();
+        dc.SetBrush(wxBrush(region_color_to_wx(m_color)));
+        dc.SetPen(wxPen(wxSystemSettings::GetColour(wxSYS_COLOUR_GRAYTEXT)));
+        dc.DrawRectangle(0, 0, size.x, size.y);
+    }
+
+    void on_left_down(wxMouseEvent&)
+    {
+        if (!m_editable)
+            return;
+        RegionColorHsvPickerPopup *popup = new RegionColorHsvPickerPopup(this, m_color, [this](const ColorRGBA &color) {
+            m_color = color;
+            Refresh();
+            if (m_on_color)
+                m_on_color(color);
+        });
+        popup->show_for(this);
+    }
+
+    ColorRGBA                             m_color;
+    bool                                  m_editable = false;
+    std::function<void(const ColorRGBA&)> m_on_color;
+};
+
+class RegionColorPreviewPanel : public wxPanel
+{
+public:
+    explicit RegionColorPreviewPanel(wxWindow *parent)
+        : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxSize(parent->FromDIP(420), parent->FromDIP(360)))
+    {
+        SetMinSize(wxSize(parent->FromDIP(360), parent->FromDIP(300)));
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+
+        m_canvas = OpenGLManager::create_wxglcanvas(*this);
+        m_canvas->SetMinSize(GetMinSize());
+        wxBoxSizer *sizer = new wxBoxSizer(wxVERTICAL);
+        sizer->Add(m_canvas, 1, wxEXPAND);
+        SetSizer(sizer);
+
+        m_context = wxGetApp().init_glcontext(*m_canvas);
+        m_canvas->Bind(wxEVT_PAINT, &RegionColorPreviewPanel::on_paint, this);
+        m_canvas->Bind(wxEVT_SIZE, &RegionColorPreviewPanel::on_size, this);
+        m_canvas->Bind(wxEVT_LEFT_DOWN, &RegionColorPreviewPanel::on_mouse, this);
+        m_canvas->Bind(wxEVT_LEFT_UP, &RegionColorPreviewPanel::on_mouse, this);
+        m_canvas->Bind(wxEVT_RIGHT_DOWN, &RegionColorPreviewPanel::on_mouse, this);
+        m_canvas->Bind(wxEVT_RIGHT_UP, &RegionColorPreviewPanel::on_mouse, this);
+        m_canvas->Bind(wxEVT_MOTION, &RegionColorPreviewPanel::on_mouse, this);
+        m_canvas->Bind(wxEVT_MOUSEWHEEL, &RegionColorPreviewPanel::on_mouse, this);
+    }
+
+    ~RegionColorPreviewPanel() override
+    {
+        destroy_gl_resources();
+        m_context = nullptr;
+    }
+
+    void set_triangles(std::vector<RegionColorPreviewTriangle> triangles)
+    {
+        m_triangles = std::move(triangles);
+        update_bounds();
+        m_buffer_dirty = true;
+        refresh_canvas();
+    }
+
+    void set_rows(const std::vector<RegionColorMappingRowState> &rows)
+    {
+        m_rows = rows;
+        m_buffer_dirty = true;
+        refresh_canvas();
+    }
+
+    void set_show_original(bool show_original)
+    {
+        m_show_original = show_original;
+        m_buffer_dirty = true;
+        refresh_canvas();
+    }
+
+private:
+    enum class DragMode
+    {
+        None,
+        Orbit,
+        Pan
+    };
+
+    void refresh_canvas()
+    {
+        if (m_canvas != nullptr)
+            m_canvas->Refresh(false);
+    }
+
+    void update_bounds()
+    {
+        if (m_triangles.empty()) {
+            m_center = Vec3f::Zero();
+            m_radius = 1.f;
+            return;
+        }
+
+        Vec3f min_corner = m_triangles.front().vertices.front();
+        Vec3f max_corner = min_corner;
+        for (const RegionColorPreviewTriangle &triangle : m_triangles) {
+            for (const Vec3f &vertex : triangle.vertices) {
+                min_corner = min_corner.cwiseMin(vertex);
+                max_corner = max_corner.cwiseMax(vertex);
+            }
+        }
+        m_center = (min_corner + max_corner) * 0.5f;
+        m_radius = std::max((max_corner - min_corner).norm() * 0.5f, 0.001f);
+    }
+
+    ColorRGBA preview_color_for_triangle(const RegionColorPreviewTriangle &triangle) const
+    {
+        if (m_show_original || m_rows.empty())
+            return triangle.original_color;
+        const size_t row_idx = region_color_best_row_for_oklab(m_rows, triangle.original_oklab);
+        return row_idx < m_rows.size() ? m_rows[row_idx].filament_color : triangle.original_color;
+    }
+
+    static Matrix4f ortho_matrix(float left, float right, float bottom, float top, float near_z, float far_z)
+    {
+        Matrix4f matrix = Matrix4f::Identity();
+        matrix(0, 0) = 2.f / (right - left);
+        matrix(1, 1) = 2.f / (top - bottom);
+        matrix(2, 2) = -2.f / (far_z - near_z);
+        matrix(0, 3) = -(right + left) / (right - left);
+        matrix(1, 3) = -(top + bottom) / (top - bottom);
+        matrix(2, 3) = -(far_z + near_z) / (far_z - near_z);
+        return matrix;
+    }
+
+    Matrix4f projection_matrix(int width, int height) const
+    {
+        const float aspect = std::max(float(width), 1.f) / std::max(float(height), 1.f);
+        const float base = m_radius / (0.84f * std::max(m_zoom, 0.001f));
+        const float half_width = aspect >= 1.f ? base * aspect : base;
+        const float half_height = aspect >= 1.f ? base : base / aspect;
+        const float depth = std::max(m_radius * 4.f, 1.f);
+        return ortho_matrix(-half_width, half_width, -half_height, half_height, -depth, depth);
+    }
+
+    Matrix4f model_view_matrix(int width, int height) const
+    {
+        const float cy = std::cos(m_yaw);
+        const float sy = std::sin(m_yaw);
+        const float cp = std::cos(m_pitch);
+        const float sp = std::sin(m_pitch);
+
+        Matrix3f yaw;
+        yaw << cy, -sy, 0.f,
+               sy,  cy, 0.f,
+               0.f, 0.f, 1.f;
+
+        Matrix3f pitch;
+        pitch << 1.f, 0.f, 0.f,
+                 0.f,  cp, -sp,
+                 0.f,  sp,  cp;
+
+        Matrix3f camera;
+        camera << 1.f,  0.f, 0.f,
+                  0.f,  0.f, 1.f,
+                  0.f, -1.f, 0.f;
+
+        const Matrix3f rotation = camera * pitch * yaw;
+        const int min_dim = std::max(std::min(width, height), 1);
+        const float world_per_pixel = m_radius / (0.42f * float(min_dim) * std::max(m_zoom, 0.001f));
+        Vec3f translation = -rotation * m_center;
+        translation.x() += m_pan.x() * world_per_pixel;
+        translation.y() -= m_pan.y() * world_per_pixel;
+
+        Matrix4f matrix = Matrix4f::Identity();
+        for (int row = 0; row < 3; ++row)
+            for (int col = 0; col < 3; ++col)
+                matrix(row, col) = rotation(row, col);
+        matrix(0, 3) = translation.x();
+        matrix(1, 3) = translation.y();
+        matrix(2, 3) = translation.z();
+        return matrix;
+    }
+
+    static GLuint compile_shader(GLenum shader_type, const char *source)
+    {
+        const GLuint shader = ::glCreateShader(shader_type);
+        ::glShaderSource(shader, 1, &source, nullptr);
+        ::glCompileShader(shader);
+        GLint status = GL_FALSE;
+        ::glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
+        if (status != GL_TRUE) {
+            ::glDeleteShader(shader);
+            return 0;
+        }
+        return shader;
+    }
+
+    static GLuint create_shader_program()
+    {
+        const bool core_profile = OpenGLManager::get_gl_info().is_core_profile();
+        const char *vertex_source_core =
+            "#version 150\n"
+            "in vec3 a_pos;\n"
+            "in vec3 a_color;\n"
+            "uniform mat4 u_mvp;\n"
+            "out vec3 v_color;\n"
+            "void main()\n"
+            "{\n"
+            "    v_color = a_color;\n"
+            "    gl_Position = u_mvp * vec4(a_pos, 1.0);\n"
+            "}\n";
+        const char *fragment_source_core =
+            "#version 150\n"
+            "in vec3 v_color;\n"
+            "out vec4 out_color;\n"
+            "void main()\n"
+            "{\n"
+            "    out_color = vec4(v_color, 1.0);\n"
+            "}\n";
+        const char *vertex_source_compat =
+            "#version 120\n"
+            "attribute vec3 a_pos;\n"
+            "attribute vec3 a_color;\n"
+            "uniform mat4 u_mvp;\n"
+            "varying vec3 v_color;\n"
+            "void main()\n"
+            "{\n"
+            "    v_color = a_color;\n"
+            "    gl_Position = u_mvp * vec4(a_pos, 1.0);\n"
+            "}\n";
+        const char *fragment_source_compat =
+            "#version 120\n"
+            "varying vec3 v_color;\n"
+            "void main()\n"
+            "{\n"
+            "    gl_FragColor = vec4(v_color, 1.0);\n"
+            "}\n";
+
+        const GLuint vertex_shader = compile_shader(GL_VERTEX_SHADER, core_profile ? vertex_source_core : vertex_source_compat);
+        const GLuint fragment_shader = compile_shader(GL_FRAGMENT_SHADER, core_profile ? fragment_source_core : fragment_source_compat);
+        if (vertex_shader == 0 || fragment_shader == 0) {
+            if (vertex_shader != 0)
+                ::glDeleteShader(vertex_shader);
+            if (fragment_shader != 0)
+                ::glDeleteShader(fragment_shader);
+            return 0;
+        }
+
+        const GLuint program = ::glCreateProgram();
+        ::glAttachShader(program, vertex_shader);
+        ::glAttachShader(program, fragment_shader);
+        ::glBindAttribLocation(program, 0, "a_pos");
+        ::glBindAttribLocation(program, 1, "a_color");
+        ::glLinkProgram(program);
+        ::glDetachShader(program, vertex_shader);
+        ::glDetachShader(program, fragment_shader);
+        ::glDeleteShader(vertex_shader);
+        ::glDeleteShader(fragment_shader);
+
+        GLint status = GL_FALSE;
+        ::glGetProgramiv(program, GL_LINK_STATUS, &status);
+        if (status != GL_TRUE) {
+            ::glDeleteProgram(program);
+            return 0;
+        }
+        return program;
+    }
+
+    void ensure_gl_resources()
+    {
+        if (m_program == 0) {
+            m_program = create_shader_program();
+            if (m_program != 0)
+                m_mvp_uniform = ::glGetUniformLocation(m_program, "u_mvp");
+        }
+
+        if (!m_vao_initialized) {
+            m_vao_initialized = true;
+            if (OpenGLManager::get_gl_info().is_core_profile()) {
+                ::glGenVertexArrays(1, &m_vao);
+                m_use_vao = m_vao != 0;
+            }
+        }
+
+        if (m_vbo == 0)
+            ::glGenBuffers(1, &m_vbo);
+    }
+
+    void destroy_gl_resources()
+    {
+        if (m_canvas == nullptr || m_context == nullptr)
+            return;
+
+        m_canvas->SetCurrent(*m_context);
+        if (m_vbo != 0) {
+            ::glDeleteBuffers(1, &m_vbo);
+            m_vbo = 0;
+        }
+        if (m_vao != 0) {
+            ::glDeleteVertexArrays(1, &m_vao);
+            m_vao = 0;
+        }
+        if (m_program != 0) {
+            ::glDeleteProgram(m_program);
+            m_program = 0;
+        }
+    }
+
+    void upload_vertices()
+    {
+        std::vector<float> vertices;
+        vertices.reserve(m_triangles.size() * 18);
+        for (const RegionColorPreviewTriangle &triangle : m_triangles) {
+            const Vec3f normal = (triangle.vertices[1] - triangle.vertices[0]).cross(triangle.vertices[2] - triangle.vertices[0]);
+            const float shade = normal.squaredNorm() <= EPSILON ? 1.f : 0.74f + 0.26f * std::abs(normal.normalized().y());
+            const ColorRGBA color = region_color_with_preview_shade(preview_color_for_triangle(triangle), shade);
+            for (const Vec3f &vertex : triangle.vertices) {
+                vertices.emplace_back(vertex.x());
+                vertices.emplace_back(vertex.y());
+                vertices.emplace_back(vertex.z());
+                vertices.emplace_back(std::clamp(color.r(), 0.f, 1.f));
+                vertices.emplace_back(std::clamp(color.g(), 0.f, 1.f));
+                vertices.emplace_back(std::clamp(color.b(), 0.f, 1.f));
+            }
+        }
+
+        if (m_use_vao)
+            ::glBindVertexArray(m_vao);
+        ::glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
+        ::glBufferData(GL_ARRAY_BUFFER,
+                       static_cast<GLsizeiptr>(vertices.size() * sizeof(float)),
+                       vertices.empty() ? nullptr : vertices.data(),
+                       GL_STATIC_DRAW);
+        ::glBindBuffer(GL_ARRAY_BUFFER, 0);
+        if (m_use_vao)
+            ::glBindVertexArray(0);
+
+        m_vertex_count = vertices.size() / 6;
+        m_buffer_dirty = false;
+    }
+
+    void render()
+    {
+        if (m_canvas == nullptr || m_context == nullptr)
+            return;
+
+        m_canvas->SetCurrent(*m_context);
+        ensure_gl_resources();
+
+        int width = 1;
+        int height = 1;
+        m_canvas->GetClientSize(&width, &height);
+#if defined(__APPLE__)
+        const double scale = m_canvas->GetDPIScaleFactor();
+        ::glViewport(0, 0, GLsizei(double(std::max(width, 1)) * scale), GLsizei(double(std::max(height, 1)) * scale));
+#else
+        ::glViewport(0, 0, std::max(width, 1), std::max(height, 1));
+#endif
+        ::glClearColor(0.149f, 0.153f, 0.165f, 1.f);
+        ::glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        if (m_program == 0 || m_vbo == 0 || m_triangles.empty()) {
+            m_canvas->SwapBuffers();
+            return;
+        }
+
+        if (m_buffer_dirty)
+            upload_vertices();
+
+        const Matrix4f mvp = projection_matrix(width, height) * model_view_matrix(width, height);
+        ::glEnable(GL_DEPTH_TEST);
+        ::glDisable(GL_CULL_FACE);
+        ::glUseProgram(m_program);
+        if (m_mvp_uniform >= 0)
+            ::glUniformMatrix4fv(m_mvp_uniform, 1, GL_FALSE, mvp.data());
+        if (m_use_vao)
+            ::glBindVertexArray(m_vao);
+        ::glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
+        ::glEnableVertexAttribArray(0);
+        ::glEnableVertexAttribArray(1);
+        ::glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (const void*)0);
+        ::glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (const void*)(intptr_t)(3 * sizeof(float)));
+        ::glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(m_vertex_count));
+        ::glDisableVertexAttribArray(1);
+        ::glDisableVertexAttribArray(0);
+        ::glBindBuffer(GL_ARRAY_BUFFER, 0);
+        if (m_use_vao)
+            ::glBindVertexArray(0);
+        ::glUseProgram(0);
+        ::glDisable(GL_DEPTH_TEST);
+
+        m_canvas->SwapBuffers();
+    }
+
+    void on_paint(wxPaintEvent&)
+    {
+        wxPaintDC dc(m_canvas);
+        render();
+    }
+
+    void on_size(wxSizeEvent &event)
+    {
+        event.Skip();
+        refresh_canvas();
+    }
+
+    void on_mouse(wxMouseEvent &event)
+    {
+        if (event.GetWheelRotation() != 0) {
+            const int wheel_delta = event.GetWheelDelta() == 0 ? 120 : event.GetWheelDelta();
+            const float steps = float(event.GetWheelRotation()) / float(wheel_delta);
+            m_zoom = std::clamp(m_zoom * std::pow(1.12f, steps), 0.2f, 8.f);
+            refresh_canvas();
+            return;
+        }
+
+        if (event.LeftDown()) {
+            m_drag_start = event.GetPosition();
+            m_drag_yaw = m_yaw;
+            m_drag_pitch = m_pitch;
+            m_drag_mode = DragMode::Orbit;
+            if (m_canvas != nullptr && !m_canvas->HasCapture())
+                m_canvas->CaptureMouse();
+        } else if (event.RightDown()) {
+            m_drag_start = event.GetPosition();
+            m_drag_pan = m_pan;
+            m_drag_mode = DragMode::Pan;
+            if (m_canvas != nullptr && !m_canvas->HasCapture())
+                m_canvas->CaptureMouse();
+        } else if (event.Dragging() && event.LeftIsDown() && m_canvas != nullptr && m_canvas->HasCapture() && m_drag_mode == DragMode::Orbit) {
+            const wxPoint pos = event.GetPosition();
+            m_yaw = m_drag_yaw + float(pos.x - m_drag_start.x) * 0.01f;
+            m_pitch = std::clamp(m_drag_pitch + float(pos.y - m_drag_start.y) * 0.01f, -1.55f, 1.55f);
+            refresh_canvas();
+        } else if (event.Dragging() && event.RightIsDown() && m_canvas != nullptr && m_canvas->HasCapture() && m_drag_mode == DragMode::Pan) {
+            const wxPoint pos = event.GetPosition();
+            m_pan = Vec2f(m_drag_pan.x() + float(pos.x - m_drag_start.x),
+                          m_drag_pan.y() + float(pos.y - m_drag_start.y));
+            refresh_canvas();
+        } else if ((event.LeftUp() || event.RightUp()) && m_canvas != nullptr && m_canvas->HasCapture()) {
+            m_drag_mode = DragMode::None;
+            m_canvas->ReleaseMouse();
+        }
+    }
+
+    wxGLCanvas                            *m_canvas = nullptr;
+    wxGLContext                           *m_context = nullptr;
+    GLuint                                  m_program = 0;
+    GLuint                                  m_vbo = 0;
+    GLuint                                  m_vao = 0;
+    GLint                                   m_mvp_uniform = -1;
+    bool                                    m_use_vao = false;
+    bool                                    m_vao_initialized = false;
+    bool                                    m_buffer_dirty = true;
+    size_t                                  m_vertex_count = 0;
+    std::vector<RegionColorPreviewTriangle> m_triangles;
+    std::vector<RegionColorMappingRowState> m_rows;
+    Vec3f                                   m_center = Vec3f::Zero();
+    float                                   m_radius = 1.f;
+    float                                   m_yaw = 0.f;
+    float                                   m_pitch = 0.f;
+    float                                   m_zoom = 1.f;
+    Vec2f                                   m_pan = Vec2f::Zero();
+    bool                                    m_show_original = false;
+    DragMode                                m_drag_mode = DragMode::None;
+    wxPoint                                 m_drag_start;
+    float                                   m_drag_yaw = 0.f;
+    float                                   m_drag_pitch = 0.f;
+    Vec2f                                   m_drag_pan = Vec2f::Zero();
+};
+
+class RegionColorMappingDialog : public wxDialog
+{
+public:
+    RegionColorMappingDialog(wxWindow                                       *parent,
+                             const std::vector<RegionColorMappingVolumeSource> &sources,
+                             const std::vector<ColorRGBA>                   &filament_colors)
+        : wxDialog(parent, wxID_ANY, _L("Map RGBA Colors to Filaments"), wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
+        , m_sources(sources)
+        , m_filament_colors(filament_colors)
+        , m_initial_filament_count(filament_colors.size())
+    {
+        region_color_collect_samples_and_preview(m_sources, m_samples, m_preview_triangles);
+        const int slot_limit = std::max(1, int(REGION_COLOR_MAX_PHYSICAL_FILAMENT_COUNT));
+
+        wxBoxSizer *main_sizer = new wxBoxSizer(wxVERTICAL);
+        wxBoxSizer *body_sizer = new wxBoxSizer(wxHORIZONTAL);
+
+        wxBoxSizer *preview_sizer = new wxBoxSizer(wxVERTICAL);
+        m_preview_panel = new RegionColorPreviewPanel(this);
+        m_preview_panel->set_triangles(m_preview_triangles);
+        preview_sizer->Add(m_preview_panel, 1, wxEXPAND);
+        m_show_original = new wxCheckBox(this, wxID_ANY, _L("Show original RGBA colors"));
+        preview_sizer->Add(m_show_original, 0, wxTOP, FromDIP(8));
+        body_sizer->Add(preview_sizer, 1, wxEXPAND | wxALL, FromDIP(12));
+
+        wxBoxSizer *controls_sizer = new wxBoxSizer(wxVERTICAL);
+        wxFlexGridSizer *top_grid = new wxFlexGridSizer(2, FromDIP(8), FromDIP(8));
+        top_grid->AddGrowableCol(1, 1);
+        top_grid->Add(new wxStaticText(this, wxID_ANY, _L("Filaments")), 0, wxALIGN_CENTER_VERTICAL);
+        m_count_spin = new wxSpinCtrl(this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(90), -1),
+                                      wxSP_ARROW_KEYS, 1, slot_limit, std::min(slot_limit, int(std::min<size_t>(std::max<size_t>(m_initial_filament_count, 1), 4))));
+        top_grid->Add(m_count_spin, 0, wxALIGN_CENTER_VERTICAL);
+        controls_sizer->Add(top_grid, 0, wxEXPAND | wxBOTTOM, FromDIP(8));
+
+        wxBoxSizer *header = new wxBoxSizer(wxHORIZONTAL);
+        auto add_header_label = [this, header](const wxString &label, int width, int margin) {
+            wxStaticText *text = new wxStaticText(this, wxID_ANY, label, wxDefaultPosition, wxSize(FromDIP(width), -1), wxALIGN_CENTER);
+            header->Add(text, 0, wxALIGN_CENTER_VERTICAL | (margin > 0 ? wxRIGHT : 0), FromDIP(margin));
+        };
+        add_header_label(_L("Source"), 56, 8);
+        add_header_label(_L("Filament slot"), 190, 8);
+        add_header_label(_L("Color"), 34, 8);
+        add_header_label(_L("Tolerance"), 150, 8);
+        add_header_label(_L("Coverage"), 74, 0);
+        controls_sizer->Add(header, 0, wxEXPAND | wxBOTTOM, FromDIP(4));
+
+        m_rows_scroller = new wxScrolledWindow(this, wxID_ANY, wxDefaultPosition, wxSize(FromDIP(560), FromDIP(420)), wxVSCROLL | wxBORDER_SIMPLE);
+        m_rows_scroller->SetScrollRate(0, FromDIP(10));
+        m_rows_sizer = new wxBoxSizer(wxVERTICAL);
+        m_rows_scroller->SetSizer(m_rows_sizer);
+        controls_sizer->Add(m_rows_scroller, 1, wxEXPAND);
+        body_sizer->Add(controls_sizer, 0, wxEXPAND | wxTOP | wxRIGHT | wxBOTTOM, FromDIP(12));
+
+        main_sizer->Add(body_sizer, 1, wxEXPAND);
+        main_sizer->Add(new wxStaticLine(this), 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(12));
+
+        wxStdDialogButtonSizer *buttons = new wxStdDialogButtonSizer();
+        buttons->AddButton(new wxButton(this, wxID_OK, _L("OK")));
+        buttons->AddButton(new wxButton(this, wxID_CANCEL, _L("Cancel")));
+        buttons->Realize();
+        main_sizer->Add(buttons, 0, wxEXPAND | wxALL, FromDIP(12));
+
+        SetSizer(main_sizer);
+        rebuild_rows(size_t(m_count_spin->GetValue()));
+        Layout();
+        Fit();
+        SetMinSize(wxSize(FromDIP(920), FromDIP(600)));
+
+        m_count_spin->Bind(wxEVT_SPINCTRL, [this](wxSpinEvent&) { rebuild_rows(size_t(m_count_spin->GetValue())); });
+        m_count_spin->Bind(wxEVT_TEXT, [this](wxCommandEvent&) { rebuild_rows(size_t(m_count_spin->GetValue())); });
+        m_show_original->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) {
+            if (m_preview_panel != nullptr)
+                m_preview_panel->set_show_original(m_show_original->GetValue());
+        });
+    }
+
+    const std::vector<RegionColorMappingRowState>& rows() const { return m_rows; }
+    const std::vector<ColorRGBA>& filament_colors() const { return m_filament_colors; }
+    size_t filament_count() const { return m_active_filament_count; }
+
+private:
+    struct RowControls
+    {
+        RegionColorSwatch *source_swatch = nullptr;
+        wxChoice          *slot_choice = nullptr;
+        RegionColorSwatch *filament_swatch = nullptr;
+        wxSlider          *tolerance_slider = nullptr;
+        wxStaticText      *coverage_label = nullptr;
+    };
+
+    void rebuild_rows(size_t count)
+    {
+        count = std::clamp<size_t>(count, 1, REGION_COLOR_MAX_PHYSICAL_FILAMENT_COUNT);
+        const std::vector<ColorRGBA> dominant_colors = region_color_extract_dominant_colors(m_samples, count, m_filament_colors);
+        ensure_filament_color_count(count, dominant_colors);
+        m_active_filament_count = count;
+        m_rows.clear();
+        m_rows.reserve(count);
+        for (size_t row_idx = 0; row_idx < count; ++row_idx) {
+            RegionColorMappingRowState row;
+            row.source_color = dominant_colors[row_idx];
+            row.source_oklab = region_color_oklab_from_color(row.source_color);
+            row.slot_id = unsigned(row_idx + 1);
+            row.filament_color = row_idx < m_filament_colors.size() ? m_filament_colors[row_idx] : row.source_color;
+            row.tolerance = 50;
+            m_rows.emplace_back(row);
+        }
+        refresh_coverages();
+        recreate_row_controls();
+        update_preview_rows();
+    }
+
+    void recreate_row_controls()
+    {
+        m_rows_sizer->Clear(true);
+        m_row_controls.clear();
+        m_row_controls.resize(m_rows.size());
+
+        for (size_t row_idx = 0; row_idx < m_rows.size(); ++row_idx) {
+            RegionColorMappingRowState &row = m_rows[row_idx];
+            wxPanel *row_panel = new wxPanel(m_rows_scroller);
+            wxBoxSizer *row_sizer = new wxBoxSizer(wxHORIZONTAL);
+            RegionColorSwatch *source_swatch = new RegionColorSwatch(row_panel, row.source_color, false);
+            source_swatch->Bind(wxEVT_LEFT_DCLICK, [this, row_idx](wxMouseEvent&) {
+                if (row_idx < m_rows.size())
+                    set_row_filament_color(row_idx, m_rows[row_idx].source_color);
+            });
+            row_sizer->Add(source_swatch, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(30));
+
+            wxChoice *slot_choice = new wxChoice(row_panel, wxID_ANY, wxDefaultPosition, wxSize(FromDIP(190), -1));
+            for (size_t slot_idx = 0; slot_idx < m_active_filament_count; ++slot_idx)
+                slot_choice->Append(region_color_slot_label(unsigned(slot_idx + 1), m_filament_colors[slot_idx]));
+            slot_choice->SetSelection(int(row.slot_id - 1));
+            row_sizer->Add(slot_choice, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
+
+            RegionColorSwatch *filament_swatch = new RegionColorSwatch(row_panel, row.filament_color, true, [this, row_idx](const ColorRGBA &color) {
+                set_row_filament_color(row_idx, color);
+            });
+            row_sizer->Add(filament_swatch, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
+
+            wxSlider *tolerance_slider = new wxSlider(row_panel, wxID_ANY, row.tolerance, 0, 100, wxDefaultPosition, wxSize(FromDIP(150), -1));
+            row_sizer->Add(tolerance_slider, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
+
+            wxStaticText *coverage_label = new wxStaticText(row_panel, wxID_ANY, wxString::Format(_L("%4.1f%%"), row.coverage * 100.f),
+                                                            wxDefaultPosition, wxSize(FromDIP(74), -1), wxALIGN_RIGHT);
+            row_sizer->Add(coverage_label, 0, wxALIGN_CENTER_VERTICAL);
+
+            row_panel->SetSizer(row_sizer);
+            m_rows_sizer->Add(row_panel, 0, wxEXPAND | wxBOTTOM, FromDIP(6));
+
+            RowControls &controls = m_row_controls[row_idx];
+            controls.source_swatch = source_swatch;
+            controls.slot_choice = slot_choice;
+            controls.filament_swatch = filament_swatch;
+            controls.tolerance_slider = tolerance_slider;
+            controls.coverage_label = coverage_label;
+
+            slot_choice->Bind(wxEVT_CHOICE, [this, row_idx](wxCommandEvent&) {
+                if (row_idx >= m_rows.size() || row_idx >= m_row_controls.size())
+                    return;
+                const int selection = m_row_controls[row_idx].slot_choice->GetSelection();
+                if (selection < 0 || size_t(selection) >= m_active_filament_count)
+                    return;
+                m_rows[row_idx].slot_id = unsigned(selection + 1);
+                m_rows[row_idx].filament_color = m_filament_colors[size_t(selection)];
+                update_row_swatch_colors();
+                update_preview_rows();
+            });
+
+            tolerance_slider->Bind(wxEVT_SLIDER, [this, row_idx](wxCommandEvent&) {
+                if (row_idx >= m_rows.size() || row_idx >= m_row_controls.size())
+                    return;
+                m_rows[row_idx].tolerance = m_row_controls[row_idx].tolerance_slider->GetValue();
+                refresh_coverages();
+                update_coverage_labels();
+                update_preview_rows();
+            });
+        }
+
+        m_rows_scroller->FitInside();
+        m_rows_scroller->Layout();
+        Layout();
+    }
+
+    void set_row_filament_color(size_t row_idx, const ColorRGBA &color)
+    {
+        if (row_idx >= m_rows.size())
+            return;
+        const unsigned int slot_id = m_rows[row_idx].slot_id;
+        if (slot_id == 0 || size_t(slot_id - 1) >= m_filament_colors.size())
+            return;
+        m_filament_colors[size_t(slot_id - 1)] = color;
+        for (RegionColorMappingRowState &row_state : m_rows)
+            if (row_state.slot_id == slot_id)
+                row_state.filament_color = color;
+        update_slot_labels();
+        update_row_swatch_colors();
+        update_preview_rows();
+    }
+
+    void ensure_filament_color_count(size_t count, const std::vector<ColorRGBA> &dominant_colors)
+    {
+        while (m_filament_colors.size() < count) {
+            const size_t idx = m_filament_colors.size();
+            if (idx < dominant_colors.size()) {
+                m_filament_colors.emplace_back(dominant_colors[idx]);
+            } else {
+                RegionColorHsv hsv;
+                hsv.h = std::fmod(float(idx) * 0.61803398875f, 1.f);
+                hsv.s = 0.72f;
+                hsv.v = 0.95f;
+                m_filament_colors.emplace_back(region_color_hsv_to_rgb(hsv));
+            }
+        }
+    }
+
+    void refresh_coverages()
+    {
+        region_color_update_coverages(m_samples, m_rows);
+    }
+
+    void update_coverage_labels()
+    {
+        for (size_t row_idx = 0; row_idx < m_rows.size() && row_idx < m_row_controls.size(); ++row_idx)
+            if (m_row_controls[row_idx].coverage_label != nullptr)
+                m_row_controls[row_idx].coverage_label->SetLabel(wxString::Format(_L("%4.1f%%"), m_rows[row_idx].coverage * 100.f));
+    }
+
+    void update_slot_labels()
+    {
+        for (RowControls &controls : m_row_controls) {
+            if (controls.slot_choice == nullptr)
+                continue;
+            const int selection = controls.slot_choice->GetSelection();
+            controls.slot_choice->Clear();
+            for (size_t slot_idx = 0; slot_idx < m_active_filament_count; ++slot_idx)
+                controls.slot_choice->Append(region_color_slot_label(unsigned(slot_idx + 1), m_filament_colors[slot_idx]));
+            if (selection >= 0 && size_t(selection) < m_active_filament_count)
+                controls.slot_choice->SetSelection(selection);
+        }
+    }
+
+    void update_row_swatch_colors()
+    {
+        for (size_t row_idx = 0; row_idx < m_rows.size() && row_idx < m_row_controls.size(); ++row_idx)
+            if (m_row_controls[row_idx].filament_swatch != nullptr)
+                m_row_controls[row_idx].filament_swatch->set_color(m_rows[row_idx].filament_color);
+    }
+
+    void update_preview_rows()
+    {
+        if (m_preview_panel != nullptr)
+            m_preview_panel->set_rows(m_rows);
+    }
+
+    const std::vector<RegionColorMappingVolumeSource> &m_sources;
+    std::vector<ColorRGBA>                             m_filament_colors;
+    size_t                                             m_initial_filament_count = 0;
+    size_t                                             m_active_filament_count = 1;
+    std::vector<RegionColorSample>                     m_samples;
+    std::vector<RegionColorPreviewTriangle>            m_preview_triangles;
+    std::vector<RegionColorMappingRowState>            m_rows;
+    std::vector<RowControls>                           m_row_controls;
+    wxSpinCtrl                                        *m_count_spin = nullptr;
+    wxCheckBox                                        *m_show_original = nullptr;
+    wxScrolledWindow                                  *m_rows_scroller = nullptr;
+    wxBoxSizer                                        *m_rows_sizer = nullptr;
+    RegionColorPreviewPanel                           *m_preview_panel = nullptr;
+};
+
+static unsigned int region_color_base_filament_id(const ColorRGBA                                &background,
+                                                  const std::vector<RegionColorMappingRowState>  &rows)
+{
+    if (rows.empty())
+        return 1U;
+    const size_t row_idx = region_color_best_row_for_oklab(rows, region_color_oklab_from_color(background));
+    return row_idx < rows.size() ? std::max(rows[row_idx].slot_id, 1U) : 1U;
+}
+
+static bool region_color_apply_filament_colors(const std::vector<ColorRGBA> &filament_colors, size_t active_filament_count)
+{
+    if (wxGetApp().preset_bundle == nullptr)
+        return false;
+
+    ConfigOptionStrings *filament_color = wxGetApp().preset_bundle->project_config.option<ConfigOptionStrings>("filament_colour");
+    ConfigOptionStrings *filament_multi_color = wxGetApp().preset_bundle->project_config.option<ConfigOptionStrings>("filament_multi_colour");
+    if (filament_color == nullptr)
+        return false;
+
+    const size_t previous_count = filament_color->values.size();
+    const size_t target_count = std::min(std::max(previous_count, active_filament_count), REGION_COLOR_MAX_PHYSICAL_FILAMENT_COUNT);
+    if (target_count > previous_count) {
+        std::vector<std::string> new_colors;
+        new_colors.reserve(target_count - previous_count);
+        for (size_t idx = previous_count; idx < target_count && idx < filament_colors.size(); ++idx)
+            new_colors.emplace_back(encode_color(filament_colors[idx]));
+        while (new_colors.size() < target_count - previous_count)
+            new_colors.emplace_back("#FFFFFF");
+        wxGetApp().preset_bundle->set_num_filaments(unsigned(target_count), new_colors);
+        filament_color = wxGetApp().preset_bundle->project_config.option<ConfigOptionStrings>("filament_colour");
+        filament_multi_color = wxGetApp().preset_bundle->project_config.option<ConfigOptionStrings>("filament_multi_colour");
+        if (filament_color == nullptr)
+            return false;
+    }
+
+    const size_t count = std::min({ filament_colors.size(), filament_color->values.size(), target_count });
+    bool changed = false;
+    for (size_t idx = 0; idx < count; ++idx) {
+        const std::string encoded = encode_color(filament_colors[idx]);
+        if (filament_color->values[idx] != encoded) {
+            filament_color->values[idx] = encoded;
+            changed = true;
+        }
+        if (filament_multi_color != nullptr && idx < filament_multi_color->values.size() && filament_multi_color->values[idx] != encoded) {
+            filament_multi_color->values[idx] = encoded;
+            changed = true;
+        }
+    }
+
+    if (changed || target_count > previous_count) {
+        wxGetApp().preset_bundle->texture_mapping_zones.refresh(filament_color->values);
+        wxGetApp().preset_bundle->project_config.set_key_value("texture_mapping_definitions",
+                                                               new ConfigOptionString(wxGetApp().preset_bundle->texture_mapping_zones.serialize_entries()));
+        if (Plater *plater = wxGetApp().plater()) {
+            if (target_count > previous_count)
+                plater->on_filament_count_change(target_count);
+            plater->on_config_change(wxGetApp().preset_bundle->full_config());
+        }
+        if (auto *filament_tab = wxGetApp().get_tab(Preset::TYPE_FILAMENT))
+            filament_tab->update_dirty();
+    }
+    return changed;
+}
+
+static bool region_color_apply_mapping(ModelObject                                      &object,
+                                       const std::vector<RegionColorMappingVolumeSource> &sources,
+                                       const std::vector<RegionColorMappingRowState>     &rows)
+{
+    if (sources.empty() || rows.empty())
+        return false;
+
+    bool changed = false;
+    unsigned int object_base_filament_id = 1U;
+    bool has_object_base = false;
+    for (const RegionColorMappingVolumeSource &source : sources) {
+        if (source.volume == nullptr || !source.rgba_data)
+            continue;
+
+        const unsigned int base_filament_id = region_color_base_filament_id(source.background, rows);
+        if (!has_object_base) {
+            object_base_filament_id = base_filament_id;
+            has_object_base = true;
+        }
+        changed |= region_color_apply_volume_mapping(*source.volume, *source.rgba_data, source.background, rows, base_filament_id);
+    }
+
+    if (has_object_base)
+        object.config.set("extruder", int(object_base_filament_id));
+    return changed;
 }
 
 static bool convert_object_to_color_regions(ModelObject &object, const ManagedColorDataCreateSource &source, wxWindow *parent)
@@ -11285,45 +12824,30 @@ static bool convert_object_to_color_regions(ModelObject &object, const ManagedCo
     if (object_has_color_regions(object))
         return false;
 
-    std::vector<RGBA> input_colors;
-    for (const ModelVolume *volume : object.volumes) {
-        if (volume == nullptr || !volume->is_model_part())
-            continue;
-        append_dialog_vertex_colors_for_volume(*volume, input_colors, source);
-    }
-    if (input_colors.empty())
+    std::vector<RegionColorMappingVolumeSource> sources = region_color_build_sources(object, source);
+    if (sources.empty())
         return false;
 
-    bool is_single_color = true;
-    const RGBA first_color = input_colors.front();
-    for (const RGBA &color : input_colors) {
-        if (color != first_color) {
-            is_single_color = false;
-            break;
-        }
-    }
-
-    std::vector<unsigned char> filament_ids;
-    unsigned char first_extruder_id = 1;
-    std::unique_ptr<Model> preview_model = build_color_region_dialog_preview_model(object, input_colors.size());
     const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config(nullptr, false);
-    ObjDialogInOut in_out;
-    in_out.input_colors = input_colors;
-    in_out.is_single_color = is_single_color;
-    in_out.filament_ids = filament_ids;
-    in_out.first_extruder_id = first_extruder_id;
-    in_out.deal_vertex_color = true;
-    in_out.model = preview_model.get();
-    ObjColorDialog color_dlg(parent, in_out, extruder_colours);
-    if (color_dlg.ShowModal() != wxID_OK)
+    if (extruder_colours.empty())
         return false;
-    filament_ids = in_out.filament_ids;
-    first_extruder_id = in_out.first_extruder_id;
-    if (filament_ids.size() != input_colors.size())
+
+    std::vector<ColorRGBA> filament_colors;
+    if (!decode_colors(extruder_colours, filament_colors) || filament_colors.empty())
+        return false;
+
+    const size_t max_physical_filaments = std::min(filament_colors.size(), REGION_COLOR_MAX_PHYSICAL_FILAMENT_COUNT);
+    if (max_physical_filaments == 0)
+        return false;
+    filament_colors.resize(max_physical_filaments);
+
+    RegionColorMappingDialog color_dlg(parent, sources, filament_colors);
+    if (color_dlg.ShowModal() != wxID_OK)
         return false;
 
     Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Create 3mf color regions", UndoRedo::SnapshotType::GizmoAction);
-    return apply_dialog_vertex_filaments_to_color_regions(object, filament_ids, first_extruder_id);
+    region_color_apply_filament_colors(color_dlg.filament_colors(), color_dlg.filament_count());
+    return region_color_apply_mapping(object, sources, color_dlg.rows());
 }
 
 static bool convert_object_managed_color_data(ModelObject                           &object,
