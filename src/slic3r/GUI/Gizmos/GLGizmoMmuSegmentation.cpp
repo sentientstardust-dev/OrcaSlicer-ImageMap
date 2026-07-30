@@ -11111,6 +11111,16 @@ struct RegionColorPreviewTriangle
     std::array<float, 3>  original_oklab = { 1.f, 0.f, 0.f };
 };
 
+enum class RegionColorPreviewSubdivision
+{
+    Off,
+    Default,
+    Double,
+    Quadruple,
+    Octuple,
+    Exact
+};
+
 struct RegionColorHistogramBin
 {
     double r = 0.0;
@@ -11129,6 +11139,8 @@ struct RegionColorPreviewAccumulator
 
 static constexpr size_t REGION_COLOR_MAX_PHYSICAL_FILAMENT_COUNT =
     MAXIMUM_EXTRUDER_NUMBER < 99 ? MAXIMUM_EXTRUDER_NUMBER : 98;
+static constexpr size_t REGION_COLOR_PREVIEW_TRIANGLE_BUDGET = 800000;
+static constexpr float REGION_COLOR_PREVIEW_DEFAULT_SEGMENTS = 16.f;
 
 static std::array<float, 3> region_color_oklab_from_color(const ColorRGBA &color)
 {
@@ -11511,6 +11523,296 @@ static void region_color_collect_samples_and_preview(const std::vector<RegionCol
         sample.oklab = region_color_oklab_from_color(sample.color);
         sample.weight = float(bin.weight);
         samples.emplace_back(sample);
+    }
+}
+
+static void region_color_merge_preview_accumulator(RegionColorPreviewAccumulator       &target,
+                                                   const RegionColorPreviewAccumulator &source)
+{
+    target.r += source.r;
+    target.g += source.g;
+    target.b += source.b;
+    target.weight += source.weight;
+}
+
+static ColorRGBA region_color_preview_accumulator_color(const RegionColorPreviewAccumulator &accumulator,
+                                                        const ColorRGBA                     &fallback)
+{
+    if (accumulator.weight <= 0.0)
+        return fallback;
+    const double inv_weight = 1.0 / accumulator.weight;
+    return ColorRGBA(float(accumulator.r * inv_weight),
+                     float(accumulator.g * inv_weight),
+                     float(accumulator.b * inv_weight),
+                     1.f);
+}
+
+static void region_color_append_preview_triangle(const std::array<Vec3f, 3>             &vertices,
+                                                 const Transform3d                     &volume_matrix,
+                                                 const ColorRGBA                       &color,
+                                                 std::vector<RegionColorPreviewTriangle> &preview_triangles)
+{
+    RegionColorPreviewTriangle triangle;
+    for (size_t vertex_idx = 0; vertex_idx < triangle.vertices.size(); ++vertex_idx)
+        triangle.vertices[vertex_idx] = (volume_matrix * vertices[vertex_idx].cast<double>()).cast<float>();
+    triangle.original_color = color;
+    triangle.original_oklab = region_color_oklab_from_color(color);
+    preview_triangles.emplace_back(std::move(triangle));
+}
+
+static bool region_color_append_preview_tree(const TriangleColorSplittingData        &data,
+                                             int                                      bitstream_end,
+                                             size_t                                   color_end,
+                                             int                                     &bit_idx,
+                                             size_t                                  &color_idx,
+                                             const std::array<Vec3f, 3>              &vertices,
+                                             int                                      depth,
+                                             int                                      target_depth,
+                                             const ColorRGBA                         &background,
+                                             const Transform3d                       &volume_matrix,
+                                             std::vector<RegionColorPreviewTriangle> *preview_triangles,
+                                             RegionColorPreviewAccumulator           &accumulator)
+{
+    const int code = region_color_data_read_nibble(data, bitstream_end, bit_idx);
+    if (code < 0)
+        return false;
+
+    const int split_sides = code & 0b11;
+    if (split_sides == 0) {
+        if (color_idx >= color_end || color_idx >= data.colors_rgba.size())
+            return false;
+
+        const ColorRGBA color = region_color_visible_color(data.colors_rgba[color_idx++], background);
+        const double weight = std::max(managed_color_data_triangle_area(vertices), 0.000001);
+        accumulator.r += double(color.r()) * weight;
+        accumulator.g += double(color.g()) * weight;
+        accumulator.b += double(color.b()) * weight;
+        accumulator.weight += weight;
+        if (preview_triangles != nullptr)
+            region_color_append_preview_triangle(vertices, volume_matrix, color, *preview_triangles);
+        return true;
+    }
+
+    const int special_side = (code >> 2) & 0b11;
+    if (special_side < 0 || special_side >= 3 || (split_sides != 1 && split_sides != 2 && special_side != 0))
+        return false;
+
+    const bool expand = depth < target_depth;
+    const std::array<std::array<Vec3f, 3>, 4> children =
+        managed_color_data_split_rgba_triangle(vertices, split_sides, special_side);
+    for (int child_idx = split_sides; child_idx >= 0; --child_idx) {
+        RegionColorPreviewAccumulator child_accumulator;
+        if (!region_color_append_preview_tree(data,
+                                              bitstream_end,
+                                              color_end,
+                                              bit_idx,
+                                              color_idx,
+                                              children[size_t(child_idx)],
+                                              depth + 1,
+                                              target_depth,
+                                              background,
+                                              volume_matrix,
+                                              expand ? preview_triangles : nullptr,
+                                              child_accumulator))
+            return false;
+        region_color_merge_preview_accumulator(accumulator, child_accumulator);
+    }
+
+    if (!expand && preview_triangles != nullptr)
+        region_color_append_preview_triangle(vertices,
+                                             volume_matrix,
+                                             region_color_preview_accumulator_color(accumulator, background),
+                                             *preview_triangles);
+    return true;
+}
+
+static float region_color_preview_model_span(const std::vector<RegionColorMappingVolumeSource> &sources)
+{
+    Vec3f min_point = Vec3f::Zero();
+    Vec3f max_point = Vec3f::Zero();
+    bool has_point = false;
+    for (const RegionColorMappingVolumeSource &source : sources) {
+        if (source.volume == nullptr)
+            continue;
+        const Transform3d volume_matrix = source.volume->get_matrix();
+        for (const stl_vertex &vertex : source.volume->mesh().its.vertices) {
+            const Vec3f point = (volume_matrix * vertex.cast<double>()).cast<float>();
+            if (!has_point) {
+                min_point = point;
+                max_point = point;
+                has_point = true;
+            } else {
+                min_point = min_point.cwiseMin(point);
+                max_point = max_point.cwiseMax(point);
+            }
+        }
+    }
+    if (!has_point)
+        return 1.f;
+    const Vec3f span = max_point - min_point;
+    return std::max({ span.x(), span.y(), span.z(), 0.001f });
+}
+
+static float region_color_preview_subdivision_multiplier(RegionColorPreviewSubdivision subdivision)
+{
+    switch (subdivision) {
+    case RegionColorPreviewSubdivision::Double:
+        return 2.f;
+    case RegionColorPreviewSubdivision::Quadruple:
+        return 4.f;
+    case RegionColorPreviewSubdivision::Octuple:
+        return 8.f;
+    case RegionColorPreviewSubdivision::Off:
+    case RegionColorPreviewSubdivision::Default:
+    case RegionColorPreviewSubdivision::Exact:
+        return 1.f;
+    }
+    return 1.f;
+}
+
+static std::vector<std::vector<int>> region_color_preview_depths(
+    const std::vector<RegionColorMappingVolumeSource> &sources,
+    RegionColorPreviewSubdivision                       subdivision)
+{
+    std::vector<std::vector<int>> depths(sources.size());
+    const float model_span = region_color_preview_model_span(sources);
+    const float target_edge = model_span /
+        (REGION_COLOR_PREVIEW_DEFAULT_SEGMENTS * region_color_preview_subdivision_multiplier(subdivision));
+    double estimated_triangles = 0.0;
+
+    for (size_t source_idx = 0; source_idx < sources.size(); ++source_idx) {
+        const RegionColorMappingVolumeSource &source = sources[source_idx];
+        if (source.volume == nullptr || !source.rgba_data)
+            continue;
+
+        const indexed_triangle_set &its = source.volume->mesh().its;
+        depths[source_idx].assign(its.indices.size(), 0);
+        const std::vector<int> source_depths =
+            rgb_existing_source_triangle_depths(source.rgba_data->get_data(), its.indices.size());
+        if (subdivision == RegionColorPreviewSubdivision::Exact) {
+            depths[source_idx] = source_depths;
+        } else if (subdivision != RegionColorPreviewSubdivision::Off) {
+            const Transform3d volume_matrix = source.volume->get_matrix();
+            for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+                const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
+                if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0 ||
+                    size_t(tri[0]) >= its.vertices.size() ||
+                    size_t(tri[1]) >= its.vertices.size() ||
+                    size_t(tri[2]) >= its.vertices.size())
+                    continue;
+
+                const std::array<Vec3f, 3> vertices = {
+                    its.vertices[size_t(tri[0])].cast<float>(),
+                    its.vertices[size_t(tri[1])].cast<float>(),
+                    its.vertices[size_t(tri[2])].cast<float>()
+                };
+                const int physical_depth =
+                    texture_mapping_depth_from_span(transformed_triangle_max_edge_length(volume_matrix, vertices),
+                                                    target_edge,
+                                                    7);
+                depths[source_idx][tri_idx] = std::min(physical_depth, source_depths[tri_idx]);
+            }
+        }
+
+        for (const int depth : depths[source_idx])
+            estimated_triangles += std::ldexp(1.0, 2 * depth);
+    }
+
+    if (subdivision == RegionColorPreviewSubdivision::Exact)
+        return depths;
+
+    int depth_reduction = 0;
+    while (estimated_triangles > double(REGION_COLOR_PREVIEW_TRIANGLE_BUDGET) && depth_reduction < 7) {
+        ++depth_reduction;
+        estimated_triangles = 0.0;
+        for (const std::vector<int> &source_depths : depths)
+            for (const int depth : source_depths)
+                estimated_triangles += std::ldexp(1.0, 2 * std::max(depth - depth_reduction, 0));
+    }
+    if (depth_reduction > 0)
+        for (std::vector<int> &source_depths : depths)
+            for (int &depth : source_depths)
+                depth = std::max(depth - depth_reduction, 0);
+    return depths;
+}
+
+static void region_color_build_preview(const std::vector<RegionColorMappingVolumeSource> &sources,
+                                       RegionColorPreviewSubdivision                       subdivision,
+                                       std::vector<RegionColorPreviewTriangle>            &preview_triangles)
+{
+    preview_triangles.clear();
+    const std::vector<std::vector<int>> preview_depths = region_color_preview_depths(sources, subdivision);
+
+    for (size_t source_idx = 0; source_idx < sources.size(); ++source_idx) {
+        const RegionColorMappingVolumeSource &source = sources[source_idx];
+        if (source.volume == nullptr || !source.rgba_data)
+            continue;
+
+        const indexed_triangle_set &its = source.volume->mesh().its;
+        const Transform3d volume_matrix = source.volume->get_matrix();
+        const TriangleColorSplittingData &data = source.rgba_data->get_data();
+        size_t mapping_idx = 0;
+        for (size_t tri_idx = 0; tri_idx < its.indices.size(); ++tri_idx) {
+            const stl_triangle_vertex_indices &tri = its.indices[tri_idx];
+            if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0 ||
+                size_t(tri[0]) >= its.vertices.size() ||
+                size_t(tri[1]) >= its.vertices.size() ||
+                size_t(tri[2]) >= its.vertices.size())
+                continue;
+
+            const std::array<Vec3f, 3> vertices = {
+                its.vertices[size_t(tri[0])].cast<float>(),
+                its.vertices[size_t(tri[1])].cast<float>(),
+                its.vertices[size_t(tri[2])].cast<float>()
+            };
+            while (mapping_idx < data.triangles_to_split.size() &&
+                   data.triangles_to_split[mapping_idx].triangle_idx < int(tri_idx))
+                ++mapping_idx;
+            if (mapping_idx >= data.triangles_to_split.size() ||
+                data.triangles_to_split[mapping_idx].triangle_idx != int(tri_idx)) {
+                region_color_append_preview_triangle(vertices, volume_matrix, source.background, preview_triangles);
+                continue;
+            }
+
+            const ColorTriangleBitStreamMapping &mapping = data.triangles_to_split[mapping_idx];
+            const int bitstream_end = mapping_idx + 1 == data.triangles_to_split.size() ?
+                int(data.bitstream.size()) :
+                data.triangles_to_split[mapping_idx + 1].bitstream_start_idx;
+            const size_t color_end = mapping_idx + 1 == data.triangles_to_split.size() ?
+                data.colors_rgba.size() :
+                size_t(data.triangles_to_split[mapping_idx + 1].color_start_idx);
+            int bit_idx = mapping.bitstream_start_idx;
+            size_t color_idx = size_t(std::max(mapping.color_start_idx, 0));
+            const int target_depth =
+                source_idx < preview_depths.size() && tri_idx < preview_depths[source_idx].size() ?
+                    preview_depths[source_idx][tri_idx] :
+                    0;
+            const size_t preview_start = preview_triangles.size();
+            RegionColorPreviewAccumulator accumulator;
+            if (bit_idx < 0 ||
+                bit_idx >= bitstream_end ||
+                mapping.color_start_idx < 0 ||
+                color_idx >= color_end ||
+                size_t(bitstream_end) > data.bitstream.size() ||
+                color_end > data.colors_rgba.size() ||
+                !region_color_append_preview_tree(data,
+                                                  bitstream_end,
+                                                  color_end,
+                                                  bit_idx,
+                                                  color_idx,
+                                                  vertices,
+                                                  0,
+                                                  target_depth,
+                                                  source.background,
+                                                  volume_matrix,
+                                                  &preview_triangles,
+                                                  accumulator) ||
+                bit_idx != bitstream_end ||
+                color_idx != color_end) {
+                preview_triangles.resize(preview_start);
+                region_color_append_preview_triangle(vertices, volume_matrix, source.background, preview_triangles);
+            }
+        }
     }
 }
 
@@ -12470,6 +12772,7 @@ public:
         , m_initial_filament_count(filament_colors.size())
     {
         region_color_collect_samples_and_preview(m_sources, m_samples, m_preview_triangles);
+        region_color_build_preview(m_sources, RegionColorPreviewSubdivision::Exact, m_preview_triangles);
         const int slot_limit = std::max(1, int(REGION_COLOR_MAX_PHYSICAL_FILAMENT_COUNT));
 
         wxBoxSizer *main_sizer = new wxBoxSizer(wxVERTICAL);
@@ -12481,6 +12784,20 @@ public:
         preview_sizer->Add(m_preview_panel, 1, wxEXPAND);
         m_show_original = new wxCheckBox(this, wxID_ANY, _L("Show original RGBA colors"));
         preview_sizer->Add(m_show_original, 0, wxTOP, FromDIP(8));
+        wxBoxSizer *subdivision_row = new wxBoxSizer(wxHORIZONTAL);
+        subdivision_row->Add(new wxStaticText(this, wxID_ANY, _L("Subdivide preview")), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
+        m_preview_subdivision = new wxChoice(this, wxID_ANY);
+        m_preview_subdivision->Append(_L("Off"));
+        m_preview_subdivision->Append(_L("Default"));
+        m_preview_subdivision->Append(_L("2x"));
+        m_preview_subdivision->Append(_L("4x"));
+        m_preview_subdivision->Append(_L("8x"));
+        m_preview_subdivision->Append(_L("Exact"));
+        m_preview_subdivision->SetSelection(5);
+        m_preview_subdivision->SetToolTip(
+            _L("Controls only the detail shown in this preview. Exact shows every subdivision used by the converted region painting data."));
+        subdivision_row->Add(m_preview_subdivision, 0, wxALIGN_CENTER_VERTICAL);
+        preview_sizer->Add(subdivision_row, 0, wxTOP, FromDIP(8));
         body_sizer->Add(preview_sizer, 1, wxEXPAND | wxALL, FromDIP(12));
 
         wxBoxSizer *controls_sizer = new wxBoxSizer(wxVERTICAL);
@@ -12531,6 +12848,9 @@ public:
         m_show_original->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) {
             if (m_preview_panel != nullptr)
                 m_preview_panel->set_show_original(m_show_original->GetValue());
+        });
+        m_preview_subdivision->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) {
+            rebuild_preview_geometry();
         });
     }
 
@@ -12713,6 +13033,38 @@ private:
             m_preview_panel->set_rows(m_rows);
     }
 
+    void rebuild_preview_geometry()
+    {
+        RegionColorPreviewSubdivision subdivision = RegionColorPreviewSubdivision::Exact;
+        if (m_preview_subdivision != nullptr) {
+            switch (m_preview_subdivision->GetSelection()) {
+            case 0:
+                subdivision = RegionColorPreviewSubdivision::Off;
+                break;
+            case 1:
+                subdivision = RegionColorPreviewSubdivision::Default;
+                break;
+            case 2:
+                subdivision = RegionColorPreviewSubdivision::Double;
+                break;
+            case 3:
+                subdivision = RegionColorPreviewSubdivision::Quadruple;
+                break;
+            case 4:
+                subdivision = RegionColorPreviewSubdivision::Octuple;
+                break;
+            case 5:
+                subdivision = RegionColorPreviewSubdivision::Exact;
+                break;
+            default:
+                break;
+            }
+        }
+        region_color_build_preview(m_sources, subdivision, m_preview_triangles);
+        if (m_preview_panel != nullptr)
+            m_preview_panel->set_triangles(m_preview_triangles);
+    }
+
     const std::vector<RegionColorMappingVolumeSource> &m_sources;
     std::vector<ColorRGBA>                             m_filament_colors;
     size_t                                             m_initial_filament_count = 0;
@@ -12723,6 +13075,7 @@ private:
     std::vector<RowControls>                           m_row_controls;
     wxSpinCtrl                                        *m_count_spin = nullptr;
     wxCheckBox                                        *m_show_original = nullptr;
+    wxChoice                                          *m_preview_subdivision = nullptr;
     wxScrolledWindow                                  *m_rows_scroller = nullptr;
     wxBoxSizer                                        *m_rows_sizer = nullptr;
     RegionColorPreviewPanel                           *m_preview_panel = nullptr;

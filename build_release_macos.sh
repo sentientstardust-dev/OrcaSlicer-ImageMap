@@ -240,6 +240,7 @@ function build_slicer() {
             plutil -replace CFBundleIconFile -string "images/OrcaSlicer.icns" ./OrcaSlicer.app/Contents/Info.plist
             # delete .DS_Store file
             find ./OrcaSlicer.app/ -name '.DS_Store' -delete
+            touch -cm ./OrcaSlicer.app
             
             # Copy OrcaSlicer_profile_validator.app if it exists
             if [ -f "../src$BUILD_DIR_CONFIG_SUBDIR/OrcaSlicer_profile_validator.app/Contents/MacOS/OrcaSlicer_profile_validator" ]; then
