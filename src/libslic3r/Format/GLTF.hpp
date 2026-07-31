@@ -5,12 +5,21 @@
 #include "OBJ.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
 namespace Slic3r {
 
 class Model;
+class ModelObject;
+
+enum class GltfExportColorMode
+{
+    None,
+    ImageTexture,
+    VertexColors
+};
 
 struct GltfImportInfo
 {
@@ -27,6 +36,11 @@ struct GltfImportInfo
 };
 
 bool load_gltf(const char *path, Model *model, GltfImportInfo &import_info, std::string &message);
+bool store_glb(const char *path,
+               const ModelObject &object,
+               GltfExportColorMode color_mode,
+               std::string &message,
+               const std::function<void()> &check_cancel = {});
 
 } // namespace Slic3r
 

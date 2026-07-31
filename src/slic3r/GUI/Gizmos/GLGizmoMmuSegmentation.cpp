@@ -20,6 +20,7 @@
 #include "slic3r/GUI/Jobs/Worker.hpp"
 #include "slic3r/GUI/Widgets/PopupWindow.hpp"
 #include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/Format/GLTF.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/Color.hpp"
 #include "libslic3r/Model.hpp"
@@ -50,6 +51,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -58,6 +60,7 @@
 #include <tbb/parallel_for.h>
 #include <cereal/types/string.hpp>
 #include <cereal/types/vector.hpp>
+#include <boost/filesystem.hpp>
 #include <boost/log/trivial.hpp>
 #include <nlohmann/json.hpp>
 #include <wx/button.h>
@@ -76,6 +79,7 @@
 #include <wx/menu.h>
 #include <wx/panel.h>
 #include <wx/popupwin.h>
+#include <wx/progdlg.h>
 #include <wx/scrolwin.h>
 #include <wx/settings.h>
 #include <wx/sizer.h>
@@ -10228,7 +10232,8 @@ static bool convert_object_to_rgba_data(ModelObject &object, const ManagedColorD
 static bool rasterize_generated_image_texture_colors(
     ModelVolume &volume,
     const GeneratedImageTextureAtlas &atlas,
-    const std::function<ColorRGBA(size_t, const Vec3f &, const Vec3f &)> &sampler)
+    const std::function<ColorRGBA(size_t, const Vec3f &, const Vec3f &)> &sampler,
+    const ImageProjectionCancelCheckFn &check_cancel = {})
 {
     const indexed_triangle_set &its = volume.mesh().its;
     if (its.vertices.empty() ||
@@ -10241,6 +10246,8 @@ static bool rasterize_generated_image_texture_colors(
     const float texture_width = float(volume.imported_texture_width);
     const float texture_height = float(volume.imported_texture_height);
     for (const GeneratedImageTextureIsland &island : atlas.islands) {
+        if (check_cancel)
+            check_cancel();
         const size_t tri_idx = island.tri_idx;
         if (tri_idx >= its.indices.size() ||
             tri_idx >= volume.imported_texture_uv_valid.size() ||
@@ -10278,6 +10285,8 @@ static bool rasterize_generated_image_texture_colors(
         const int min_y = std::clamp(island.y, 0, int(volume.imported_texture_height) - 1);
         const int max_y = std::clamp(island.y + island.rect_height - 1, 0, int(volume.imported_texture_height) - 1);
         for (int y_px = min_y; y_px <= max_y; ++y_px) {
+            if ((y_px & 31) == 0 && check_cancel)
+                check_cancel();
             for (int x_px = min_x; x_px <= max_x; ++x_px) {
                 Vec3f barycentric = Vec3f::Zero();
                 const Vec2f pixel(float(x_px) + 0.5f, float(y_px) + 0.5f);
@@ -10359,6 +10368,162 @@ static bool convert_volume_rgba_data_to_image_texture_for_painting(ModelObject &
     changed |= set_texture_mapping_background_config(volume.config, background);
     refresh_imported_texture_storage(volume);
     return changed || model_volume_has_bakeable_image_texture_data(&volume);
+}
+
+enum class ManagedColorDataGlbSource
+{
+    None,
+    RgbaData,
+    ImageTexture,
+    VertexColors,
+    ColorRegions
+};
+
+struct ManagedColorDataGlbExportCancelled
+{
+};
+
+static ManagedColorDataGlbSource managed_color_data_glb_source(const ModelVolume &volume, std::string &error)
+{
+    const indexed_triangle_set &its = volume.mesh().its;
+    if (its.vertices.empty() || its.indices.empty())
+        return ManagedColorDataGlbSource::None;
+
+    if (!volume.texture_mapping_color_facets.empty())
+        return ManagedColorDataGlbSource::RgbaData;
+
+    const bool has_declared_image =
+        !volume.imported_texture_rgba.empty() ||
+        !volume.imported_texture_uvs_per_face.empty() ||
+        !volume.imported_texture_uv_valid.empty() ||
+        !volume.imported_texture_raw_filament_offsets.empty() ||
+        !volume.imported_texture_raw_top_surface_filament_slots.empty() ||
+        !volume.imported_texture_raw_top_surface_depths.empty() ||
+        volume.imported_texture_raw_channels != 0 ||
+        !volume.imported_texture_raw_metadata_json.empty() ||
+        volume.imported_texture_width != 0 ||
+        volume.imported_texture_height != 0;
+    if (has_declared_image) {
+        if (!model_volume_has_bakeable_image_texture_data(&volume))
+            error = "An image texture contains inconsistent image or UV data.";
+        return ManagedColorDataGlbSource::ImageTexture;
+    }
+
+    if (!volume.imported_vertex_colors_rgba.empty()) {
+        if (volume.imported_vertex_colors_rgba.size() != its.vertices.size())
+            error = "A vertex-color payload does not match its mesh vertices.";
+        return ManagedColorDataGlbSource::VertexColors;
+    }
+
+    if (!volume.mmu_segmentation_facets.empty())
+        return ManagedColorDataGlbSource::ColorRegions;
+
+    return ManagedColorDataGlbSource::None;
+}
+
+static bool prepare_managed_color_data_glb_export(ModelObject &object,
+                                                  GltfExportColorMode &color_mode,
+                                                  std::string &error,
+                                                  const ImageProjectionCancelCheckFn &check_cancel)
+{
+    std::vector<ManagedColorDataGlbSource> sources;
+    sources.reserve(object.volumes.size());
+    bool needs_image_texture = false;
+    bool has_vertex_colors = false;
+    for (ModelVolume *volume : object.volumes) {
+        if (check_cancel)
+            check_cancel();
+        if (volume == nullptr || !volume->is_model_part()) {
+            sources.emplace_back(ManagedColorDataGlbSource::None);
+            continue;
+        }
+        const ManagedColorDataGlbSource source = managed_color_data_glb_source(*volume, error);
+        if (!error.empty())
+            return false;
+        sources.emplace_back(source);
+        needs_image_texture |= source == ManagedColorDataGlbSource::RgbaData ||
+                               source == ManagedColorDataGlbSource::ImageTexture ||
+                               source == ManagedColorDataGlbSource::ColorRegions;
+        has_vertex_colors |= source == ManagedColorDataGlbSource::VertexColors;
+    }
+
+    color_mode = needs_image_texture ? GltfExportColorMode::ImageTexture :
+                 has_vertex_colors ? GltfExportColorMode::VertexColors :
+                                     GltfExportColorMode::None;
+    if (color_mode != GltfExportColorMode::ImageTexture)
+        return true;
+
+    const ColorRGBA object_background = managed_color_data_background_color(&object);
+    for (size_t volume_idx = 0; volume_idx < object.volumes.size(); ++volume_idx) {
+        if (check_cancel)
+            check_cancel();
+        ModelVolume *volume = object.volumes[volume_idx];
+        if (volume == nullptr || !volume->is_model_part())
+            continue;
+        const ManagedColorDataGlbSource source = sources[volume_idx];
+        if (source == ManagedColorDataGlbSource::None ||
+            source == ManagedColorDataGlbSource::ImageTexture)
+            continue;
+
+        ColorRGBA background = configured_texture_mapping_background_color_for_volume(*volume).value_or(object_background);
+        VolumeColorSource rgba_source;
+        ManagedRegionColorSource region_source;
+        if (source == ManagedColorDataGlbSource::RgbaData) {
+            rgba_source = build_volume_color_source(*volume);
+            if (!rgba_source.rgb_background_color || rgba_source.rgb_facets.empty()) {
+                error = "An RGBA payload could not be decoded for GLB export.";
+                return false;
+            }
+            background = *rgba_source.rgb_background_color;
+        } else if (source == ManagedColorDataGlbSource::ColorRegions) {
+            region_source = build_managed_region_color_source(*volume);
+            const bool has_region_triangles = std::any_of(
+                region_source.triangles_per_type.begin(),
+                region_source.triangles_per_type.end(),
+                [](const std::vector<TriangleSelector::FacetStateTriangle> &triangles) { return !triangles.empty(); });
+            if (!has_region_triangles) {
+                error = "A 3MF color-region payload could not be decoded for GLB export.";
+                return false;
+            }
+            background = managed_color_data_region_background_color(region_source, object_background);
+        }
+
+        GeneratedImageTextureAtlas atlas;
+        const Transform3d metric_matrix = volume->get_matrix();
+        if (!initialize_generated_image_texture(*volume, background, &atlas, &metric_matrix, check_cancel)) {
+            error = "Failed to generate a temporary UV map for GLB export.";
+            return false;
+        }
+
+        rasterize_generated_image_texture_colors(
+            *volume,
+            atlas,
+            [volume,
+             &rgba_source,
+             &region_source,
+             source,
+             background](size_t triangle_idx, const Vec3f &point, const Vec3f &barycentric) {
+                return sample_managed_volume_color_source(*volume,
+                                                          rgba_source,
+                                                          region_source,
+                                                          triangle_idx,
+                                                          point,
+                                                          barycentric,
+                                                          source == ManagedColorDataGlbSource::RgbaData,
+                                                          false,
+                                                          source == ManagedColorDataGlbSource::VertexColors,
+                                                          source == ManagedColorDataGlbSource::ColorRegions,
+                                                          background);
+            },
+            check_cancel);
+        refresh_imported_texture_storage(*volume);
+        if (!model_volume_has_bakeable_image_texture_data(volume)) {
+            error = "Failed to create a temporary image texture for GLB export.";
+            return false;
+        }
+    }
+
+    return true;
 }
 
 static bool build_texture_uv_core_coverage(const ModelVolume &volume, std::vector<uint8_t> &coverage)
@@ -13421,11 +13586,16 @@ public:
         main_sizer->Add(grid, 1, wxEXPAND | wxALL, 16);
         main_sizer->Add(new wxStaticLine(this), 0, wxEXPAND | wxLEFT | wxRIGHT, 16);
 
+        wxBoxSizer *footer = new wxBoxSizer(wxHORIZONTAL);
+        m_export_glb = new wxButton(this, wxID_ANY, _L("Export GLB..."));
+        footer->Add(m_export_glb, 0, wxALIGN_CENTER_VERTICAL);
+        footer->AddStretchSpacer();
         wxStdDialogButtonSizer *buttons = new wxStdDialogButtonSizer();
         wxButton *close_button = new wxButton(this, wxID_CLOSE, _L("Close"));
         buttons->AddButton(close_button);
         buttons->Realize();
-        main_sizer->Add(buttons, 0, wxEXPAND | wxALL, 16);
+        footer->Add(buttons, 0, wxALIGN_CENTER_VERTICAL);
+        main_sizer->Add(footer, 0, wxEXPAND | wxALL, 16);
 
         SetSizer(main_sizer);
         refresh_rows();
@@ -13447,6 +13617,7 @@ public:
         });
         m_background_picker->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent &) { pick_background_color(); });
         m_background_clear->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { clear_background_color(); });
+        m_export_glb->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { export_glb(); });
     }
 
     bool changed() const { return m_changed; }
@@ -13547,6 +13718,17 @@ private:
         for (wxWindow *window : m_raw_image_texture_info_windows)
             if (window != nullptr)
                 window->Show(show_raw_info);
+        if (m_export_glb != nullptr) {
+            const bool has_exportable_geometry =
+                m_object != nullptr &&
+                std::any_of(m_object->volumes.begin(), m_object->volumes.end(), [](const ModelVolume *volume) {
+                    return volume != nullptr &&
+                           volume->is_model_part() &&
+                           !volume->mesh().its.vertices.empty() &&
+                           !volume->mesh().its.indices.empty();
+                });
+            m_export_glb->Enable(has_exportable_geometry);
+        }
         Layout();
         Fit();
     }
@@ -13729,6 +13911,97 @@ private:
         refresh_rows();
     }
 
+    void export_glb()
+    {
+        if (m_object == nullptr)
+            return;
+
+        boost::filesystem::path default_path(m_object->get_export_filename());
+        if (default_path.empty())
+            default_path = m_object->name.empty() ? "model.glb" : m_object->name;
+        default_path.replace_extension(".glb");
+
+        const std::string fallback_directory = default_path.parent_path().string();
+        const std::string start_directory =
+            wxGetApp().app_config != nullptr ?
+                wxGetApp().app_config->get_last_output_dir(fallback_directory) :
+                fallback_directory;
+        wxFileDialog dialog(this,
+                            _L("Export GLB file:"),
+                            from_path(boost::filesystem::path(start_directory)),
+                            from_path(default_path.filename()),
+                            _L("glTF Binary") + " (*.glb)|*.glb",
+                            wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+        if (dialog.ShowModal() != wxID_OK)
+            return;
+
+        boost::filesystem::path output_path = into_path(dialog.GetPath());
+        std::string extension = output_path.extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch) {
+            return char(std::tolower(ch));
+        });
+        if (extension != ".glb") {
+            output_path.replace_extension(".glb");
+            boost::system::error_code exists_error;
+            if (boost::filesystem::exists(output_path, exists_error) && !exists_error) {
+                const int answer = wxMessageBox(
+                    wxString::Format(_L("The file %s already exists.\nDo you want to replace it?"), from_path(output_path)),
+                    _L("Confirm Save As"),
+                    wxYES_NO | wxNO_DEFAULT | wxICON_WARNING,
+                    this);
+                if (answer != wxYES)
+                    return;
+            }
+        }
+
+        wxProgressDialog progress(_L("Export GLB"),
+                                  _L("Preparing model data..."),
+                                  100,
+                                  this,
+                                  wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_ELAPSED_TIME);
+        wxString progress_message = _L("Preparing model data...");
+        size_t cancel_check_count = 0;
+        auto check_cancel = [&progress, &progress_message, &cancel_check_count]() {
+            if ((cancel_check_count++ & 63u) != 0u)
+                return;
+            if (!progress.Pulse(progress_message))
+                throw ManagedColorDataGlbExportCancelled();
+        };
+
+        try {
+            check_cancel();
+            {
+                Model export_model;
+                ModelObject *export_object = export_model.add_object(*m_object);
+                if (export_object == nullptr)
+                    throw std::runtime_error("Failed to clone the object for GLB export.");
+
+                GltfExportColorMode color_mode = GltfExportColorMode::None;
+                std::string error;
+                if (!prepare_managed_color_data_glb_export(*export_object, color_mode, error, check_cancel))
+                    throw std::runtime_error(error.empty() ? "Failed to prepare color data for GLB export." : error);
+
+                progress_message = _L("Writing GLB file...");
+                if (!progress.Pulse(progress_message))
+                    throw ManagedColorDataGlbExportCancelled();
+                const std::string output_path_utf8 = into_u8(from_path(output_path));
+                if (!store_glb(output_path_utf8.c_str(), *export_object, color_mode, error, check_cancel))
+                    throw std::runtime_error(error.empty() ? "Failed to write the GLB file." : error);
+            }
+
+            progress.Update(100, _L("GLB export complete."));
+            progress.Hide();
+            if (wxGetApp().app_config != nullptr)
+                wxGetApp().app_config->update_last_output_dir(output_path.parent_path().string());
+            show_info(this, _L("The GLB file was exported successfully."), _L("Export GLB"));
+        } catch (const ManagedColorDataGlbExportCancelled &) {
+            progress.Hide();
+        } catch (const std::exception &exception) {
+            progress.Hide();
+            show_error(this, from_u8(exception.what()));
+        }
+    }
+
     void create_data(ManagedColorDataType type, const ManagedColorDataCreateSource &source)
     {
         if (m_object == nullptr || object_has_managed_color_data(*m_object, type) || (source.type && *source.type == type))
@@ -13846,6 +14119,7 @@ private:
     std::function<void()> m_on_object_changed;
     wxPanel          *m_background_picker = nullptr;
     wxButton          *m_background_clear = nullptr;
+    wxButton          *m_export_glb = nullptr;
     bool               m_changed = false;
     std::vector<Row>   m_rows;
     std::vector<wxWindow *> m_raw_image_texture_info_windows;

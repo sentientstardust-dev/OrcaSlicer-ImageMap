@@ -4,24 +4,37 @@
 
 #include "libslic3r/Model.hpp"
 #include "libslic3r/TriangleMesh.hpp"
+#include "libslic3r/Utils.hpp"
+#include "libslic3r/miniz_extension.hpp"
 
 #include <tiny_gltf_v3.h>
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <string>
+#include <system_error>
+#include <sys/stat.h>
+#include <vector>
 
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/log/trivial.hpp>
+#include <boost/nowide/cstdio.hpp>
 #include <boost/nowide/fstream.hpp>
 
 #include <Eigen/Geometry>
+
+#ifdef _WIN32
+#include <io.h>
+#endif
 
 namespace Slic3r {
 namespace {
@@ -915,6 +928,712 @@ static void finish_import_info(GltfImportInfo &info)
     }
 }
 
+static tg3_str gltf_string(const char *value)
+{
+    return value == nullptr ? tg3_str{} : tg3_str{value, uint32_t(std::strlen(value))};
+}
+
+static constexpr uint64_t GLTF_EXPORT_MAX_BINARY_SIZE = 2ull * 1024ull * 1024ull * 1024ull;
+
+struct GltfExportPrimitive
+{
+    tg3_primitive                value{};
+    std::vector<tg3_str_int_pair> attributes;
+};
+
+struct GltfExportMesh
+{
+    tg3_str                         name{};
+    std::vector<GltfExportPrimitive> primitives;
+    std::vector<tg3_primitive>       values;
+};
+
+static tg3_material gltf_export_material(const tg3_str &name, int texture_index, bool blend)
+{
+    tg3_material material{};
+    material.name = name;
+    material.alpha_mode = gltf_string(blend ? "BLEND" : "OPAQUE");
+    material.alpha_cutoff = 0.5;
+    material.pbr_metallic_roughness.base_color_factor[0] = 1.0;
+    material.pbr_metallic_roughness.base_color_factor[1] = 1.0;
+    material.pbr_metallic_roughness.base_color_factor[2] = 1.0;
+    material.pbr_metallic_roughness.base_color_factor[3] = 1.0;
+    material.pbr_metallic_roughness.base_color_texture.index = texture_index;
+    material.pbr_metallic_roughness.base_color_texture.tex_coord = 0;
+    material.pbr_metallic_roughness.metallic_factor = 0.0;
+    material.pbr_metallic_roughness.roughness_factor = 1.0;
+    material.pbr_metallic_roughness.metallic_roughness_texture.index = TG3_INDEX_NONE;
+    material.normal_texture.index = TG3_INDEX_NONE;
+    material.normal_texture.scale = 1.0;
+    material.occlusion_texture.index = TG3_INDEX_NONE;
+    material.occlusion_texture.strength = 1.0;
+    material.emissive_texture.index = TG3_INDEX_NONE;
+    return material;
+}
+
+static tg3_node gltf_export_node(const tg3_str &name, int mesh)
+{
+    tg3_node node{};
+    node.name = name;
+    node.camera = TG3_INDEX_NONE;
+    node.skin = TG3_INDEX_NONE;
+    node.mesh = mesh;
+    node.light = TG3_INDEX_NONE;
+    node.emitter = TG3_INDEX_NONE;
+    node.rotation[3] = 1.0;
+    node.scale[0] = 1.0;
+    node.scale[1] = 1.0;
+    node.scale[2] = 1.0;
+    return node;
+}
+
+static bool gltf_export_triangle_valid(const indexed_triangle_set &its, size_t triangle_idx)
+{
+    if (triangle_idx >= its.indices.size())
+        return false;
+    const stl_triangle_vertex_indices &triangle = its.indices[triangle_idx];
+    return triangle[0] >= 0 &&
+           triangle[1] >= 0 &&
+           triangle[2] >= 0 &&
+           size_t(triangle[0]) < its.vertices.size() &&
+           size_t(triangle[1]) < its.vertices.size() &&
+           size_t(triangle[2]) < its.vertices.size();
+}
+
+static bool gltf_export_triangle_has_uvs(const ModelVolume &volume, size_t triangle_idx)
+{
+    if (triangle_idx >= volume.imported_texture_uv_valid.size() ||
+        volume.imported_texture_uv_valid[triangle_idx] == 0)
+        return false;
+    const size_t offset = triangle_idx * 6;
+    if (offset + 5 >= volume.imported_texture_uvs_per_face.size())
+        return false;
+    for (size_t idx = 0; idx < 6; ++idx)
+        if (!std::isfinite(volume.imported_texture_uvs_per_face[offset + idx]))
+            return false;
+    return true;
+}
+
+static bool gltf_export_texture_valid(const ModelVolume &volume)
+{
+    const indexed_triangle_set &its = volume.mesh().its;
+    const uint64_t pixel_count = uint64_t(volume.imported_texture_width) *
+                                 uint64_t(volume.imported_texture_height);
+    if (volume.imported_texture_width == 0 ||
+        volume.imported_texture_height == 0 ||
+        volume.imported_texture_width > uint32_t(std::numeric_limits<int>::max()) ||
+        volume.imported_texture_height > uint32_t(std::numeric_limits<int>::max()) ||
+        pixel_count > std::numeric_limits<size_t>::max() / 4 ||
+        volume.imported_texture_rgba.size() < size_t(pixel_count) * 4 ||
+        volume.imported_texture_uv_valid.size() != its.indices.size() ||
+        volume.imported_texture_uvs_per_face.size() < its.indices.size() * 6)
+        return false;
+    for (size_t triangle_idx = 0; triangle_idx < its.indices.size(); ++triangle_idx)
+        if (gltf_export_triangle_valid(its, triangle_idx) &&
+            gltf_export_triangle_has_uvs(volume, triangle_idx))
+            return true;
+    return false;
+}
+
+class GltfExportBuilder
+{
+public:
+    GltfExportBuilder(const ModelObject &object,
+                      GltfExportColorMode color_mode,
+                      const std::function<void()> &check_cancel)
+        : m_object(object)
+        , m_color_mode(color_mode)
+        , m_check_cancel(check_cancel)
+    {
+    }
+
+    bool build(tg3_model &model, std::string &message)
+    {
+        const size_t model_part_count = std::count_if(m_object.volumes.begin(), m_object.volumes.end(), [](const ModelVolume *volume) {
+            return volume != nullptr && volume->is_model_part();
+        });
+        m_meshes.reserve(model_part_count);
+        m_mesh_values.reserve(model_part_count);
+        m_nodes.reserve(model_part_count + 1);
+        m_root_children.reserve(model_part_count);
+        m_buffer_views.reserve(model_part_count * 7);
+        m_accessors.reserve(model_part_count * 6);
+        m_images.reserve(model_part_count);
+        m_textures.reserve(model_part_count);
+        m_materials.reserve(model_part_count + 1);
+
+        m_materials.emplace_back(gltf_export_material(add_string("Untextured"), TG3_INDEX_NONE, false));
+        m_nodes.emplace_back(gltf_export_node(add_string(m_object.name.empty() ? "Object" : m_object.name), TG3_INDEX_NONE));
+
+        bool vertex_alpha = false;
+        for (const ModelVolume *volume : m_object.volumes) {
+            if (m_check_cancel)
+                m_check_cancel();
+            if (volume == nullptr || !volume->is_model_part())
+                continue;
+            if (!append_volume(*volume, vertex_alpha, message))
+                return false;
+        }
+
+        if (m_meshes.empty()) {
+            message = "The object contains no exportable model-part triangles.";
+            return false;
+        }
+
+        if (m_color_mode == GltfExportColorMode::VertexColors && vertex_alpha)
+            m_materials.front().alpha_mode = gltf_string("BLEND");
+
+        for (GltfExportMesh &mesh : m_meshes) {
+            mesh.values.reserve(mesh.primitives.size());
+            for (GltfExportPrimitive &primitive : mesh.primitives) {
+                primitive.value.attributes = primitive.attributes.data();
+                primitive.value.attributes_count = uint32_t(primitive.attributes.size());
+                mesh.values.emplace_back(primitive.value);
+            }
+            tg3_mesh value{};
+            value.name = mesh.name;
+            value.primitives = mesh.values.data();
+            value.primitives_count = uint32_t(mesh.values.size());
+            m_mesh_values.emplace_back(value);
+        }
+
+        m_nodes.front().children = m_root_children.data();
+        m_nodes.front().children_count = uint32_t(m_root_children.size());
+
+        tg3_scene scene{};
+        scene.name = add_string("Scene");
+        m_scene_nodes.emplace_back(0);
+        scene.nodes = m_scene_nodes.data();
+        scene.nodes_count = uint32_t(m_scene_nodes.size());
+        m_scenes.emplace_back(scene);
+
+        tg3_buffer buffer{};
+        buffer.name = add_string("Buffer");
+        buffer.data = tg3_span_u8{m_binary.data(), uint64_t(m_binary.size())};
+        m_buffers.emplace_back(buffer);
+
+        model = {};
+        model.asset.version = gltf_string("2.0");
+        model.asset.generator = gltf_string("OrcaSlicer");
+        model.accessors = m_accessors.data();
+        model.accessors_count = uint32_t(m_accessors.size());
+        model.buffers = m_buffers.data();
+        model.buffers_count = uint32_t(m_buffers.size());
+        model.buffer_views = m_buffer_views.data();
+        model.buffer_views_count = uint32_t(m_buffer_views.size());
+        model.materials = m_materials.data();
+        model.materials_count = uint32_t(m_materials.size());
+        model.meshes = m_mesh_values.data();
+        model.meshes_count = uint32_t(m_mesh_values.size());
+        model.nodes = m_nodes.data();
+        model.nodes_count = uint32_t(m_nodes.size());
+        model.textures = m_textures.data();
+        model.textures_count = uint32_t(m_textures.size());
+        model.images = m_images.data();
+        model.images_count = uint32_t(m_images.size());
+        model.samplers = m_samplers.data();
+        model.samplers_count = uint32_t(m_samplers.size());
+        model.scenes = m_scenes.data();
+        model.scenes_count = uint32_t(m_scenes.size());
+        model.default_scene = 0;
+        return true;
+    }
+
+private:
+    tg3_str add_string(const std::string &value)
+    {
+        m_strings.emplace_back(value);
+        const std::string &stored = m_strings.back();
+        return tg3_str{stored.data(), uint32_t(stored.size())};
+    }
+
+    int append_buffer_view(const void *data, size_t size, int target, std::string &message)
+    {
+        if (data == nullptr || size == 0) {
+            message = "The GLB export encountered an empty data buffer.";
+            return TG3_INDEX_NONE;
+        }
+        while ((m_binary.size() & 3u) != 0u)
+            m_binary.emplace_back(0);
+        if (m_binary.size() > GLTF_EXPORT_MAX_BINARY_SIZE ||
+            size > GLTF_EXPORT_MAX_BINARY_SIZE - m_binary.size()) {
+            message = "The GLB export exceeds the 2 GiB binary buffer limit.";
+            return TG3_INDEX_NONE;
+        }
+        const uint64_t offset = m_binary.size();
+        const uint8_t *bytes = static_cast<const uint8_t *>(data);
+        m_binary.insert(m_binary.end(), bytes, bytes + size);
+
+        tg3_buffer_view view{};
+        view.buffer = 0;
+        view.byte_offset = offset;
+        view.byte_length = size;
+        view.target = target;
+        m_buffer_views.emplace_back(view);
+        return int(m_buffer_views.size() - 1);
+    }
+
+    int append_accessor(int buffer_view,
+                        int component_type,
+                        uint64_t count,
+                        int type,
+                        bool normalized,
+                        const std::array<double, 3> *minimum,
+                        const std::array<double, 3> *maximum)
+    {
+        tg3_accessor accessor{};
+        accessor.buffer_view = buffer_view;
+        accessor.component_type = component_type;
+        accessor.count = count;
+        accessor.type = type;
+        accessor.normalized = normalized ? 1 : 0;
+        accessor.sparse.indices.buffer_view = TG3_INDEX_NONE;
+        accessor.sparse.values.buffer_view = TG3_INDEX_NONE;
+        if (minimum != nullptr && maximum != nullptr) {
+            m_minimums.emplace_back(*minimum);
+            m_maximums.emplace_back(*maximum);
+            accessor.min_values = m_minimums.back().data();
+            accessor.min_values_count = 3;
+            accessor.max_values = m_maximums.back().data();
+            accessor.max_values_count = 3;
+        }
+        m_accessors.emplace_back(accessor);
+        return int(m_accessors.size() - 1);
+    }
+
+    bool append_texture(const ModelVolume &volume, int &material_index, std::string &message)
+    {
+        if (m_check_cancel)
+            m_check_cancel();
+        size_t png_size = 0;
+        void *png_data = tdefl_write_image_to_png_file_in_memory_ex(
+            volume.imported_texture_rgba.data(),
+            int(volume.imported_texture_width),
+            int(volume.imported_texture_height),
+            4,
+            &png_size,
+            MZ_DEFAULT_LEVEL,
+            1);
+        if (png_data == nullptr || png_size == 0) {
+            if (png_data != nullptr)
+                mz_free(png_data);
+            message = "Failed to encode an image texture as PNG.";
+            return false;
+        }
+        const int buffer_view = append_buffer_view(png_data, png_size, 0, message);
+        mz_free(png_data);
+        if (buffer_view < 0)
+            return false;
+        if (m_check_cancel)
+            m_check_cancel();
+
+        if (m_samplers.empty()) {
+            tg3_sampler sampler{};
+            sampler.name = add_string("Linear repeat");
+            sampler.min_filter = TG3_TEXTURE_FILTER_LINEAR;
+            sampler.mag_filter = TG3_TEXTURE_FILTER_LINEAR;
+            sampler.wrap_s = TG3_TEXTURE_WRAP_REPEAT;
+            sampler.wrap_t = TG3_TEXTURE_WRAP_REPEAT;
+            m_samplers.emplace_back(sampler);
+        }
+
+        const int image_index = int(m_images.size());
+        tg3_image image{};
+        image.name = add_string(volume.name.empty() ? "Texture" : volume.name);
+        image.width = int(volume.imported_texture_width);
+        image.height = int(volume.imported_texture_height);
+        image.component = 4;
+        image.bits = 8;
+        image.pixel_type = TG3_COMPONENT_TYPE_UNSIGNED_BYTE;
+        image.buffer_view = buffer_view;
+        image.mime_type = gltf_string("image/png");
+        image.as_is = 1;
+        m_images.emplace_back(image);
+
+        const int texture_index = int(m_textures.size());
+        tg3_texture texture{};
+        texture.name = image.name;
+        texture.sampler = 0;
+        texture.source = image_index;
+        m_textures.emplace_back(texture);
+
+        bool blend = false;
+        const uint64_t pixel_count = uint64_t(volume.imported_texture_width) *
+                                     uint64_t(volume.imported_texture_height);
+        for (uint64_t pixel = 0; pixel < pixel_count; ++pixel) {
+            if (volume.imported_texture_rgba[size_t(pixel) * 4 + 3] < 255) {
+                blend = true;
+                break;
+            }
+        }
+        material_index = int(m_materials.size());
+        m_materials.emplace_back(gltf_export_material(image.name, texture_index, blend));
+        return true;
+    }
+
+    bool append_primitive(const ModelVolume &volume,
+                          const std::vector<size_t> &triangles,
+                          bool include_uvs,
+                          bool include_colors,
+                          int material_index,
+                          bool &vertex_alpha,
+                          GltfExportMesh &mesh,
+                          std::string &message)
+    {
+        if (triangles.empty())
+            return true;
+
+        const indexed_triangle_set &its = volume.mesh().its;
+        std::vector<float> positions;
+        std::vector<float> normals;
+        std::vector<float> uvs;
+        std::vector<uint8_t> colors;
+        positions.reserve(triangles.size() * 9);
+        normals.reserve(triangles.size() * 9);
+        if (include_uvs)
+            uvs.reserve(triangles.size() * 6);
+        if (include_colors)
+            colors.reserve(triangles.size() * 12);
+
+        std::array<double, 3> minimum = {
+            std::numeric_limits<double>::max(),
+            std::numeric_limits<double>::max(),
+            std::numeric_limits<double>::max()
+        };
+        std::array<double, 3> maximum = {
+            -std::numeric_limits<double>::max(),
+            -std::numeric_limits<double>::max(),
+            -std::numeric_limits<double>::max()
+        };
+
+        const Transform3d transform = volume.get_matrix();
+        const bool mirrored = transform.linear().determinant() < 0.0;
+        const std::array<int, 3> corner_order = mirrored ? std::array<int, 3>{0, 2, 1} :
+                                                           std::array<int, 3>{0, 1, 2};
+        for (size_t triangle_offset = 0; triangle_offset < triangles.size(); ++triangle_offset) {
+            if (m_check_cancel && (triangle_offset & 1023u) == 0u)
+                m_check_cancel();
+            const size_t triangle_idx = triangles[triangle_offset];
+            if (!gltf_export_triangle_valid(its, triangle_idx))
+                continue;
+            const stl_triangle_vertex_indices &triangle = its.indices[triangle_idx];
+            std::array<Vec3f, 3> transformed;
+            for (size_t output_corner = 0; output_corner < 3; ++output_corner) {
+                const int source_corner = corner_order[output_corner];
+                const Vec3d local = its.vertices[size_t(triangle[source_corner])].cast<double>();
+                const Vec3d millimetres = transform * local - m_object.origin_translation;
+                if (!millimetres.allFinite()) {
+                    message = "The object contains a non-finite transformed vertex.";
+                    return false;
+                }
+                transformed[output_corner] = Vec3f(float(millimetres.x() * 0.001),
+                                                   float(millimetres.z() * 0.001),
+                                                   float(-millimetres.y() * 0.001));
+                if (!transformed[output_corner].allFinite()) {
+                    message = "The object contains a transformed vertex outside the GLB float range.";
+                    return false;
+                }
+            }
+
+            Vec3f normal = (transformed[1] - transformed[0]).cross(transformed[2] - transformed[0]);
+            const float length = normal.norm();
+            normal = normal.allFinite() &&
+                     std::isfinite(length) &&
+                     length > std::numeric_limits<float>::epsilon() ?
+                         normal / length :
+                         Vec3f(0.f, 1.f, 0.f);
+
+            const size_t uv_offset = triangle_idx * 6;
+            for (size_t output_corner = 0; output_corner < 3; ++output_corner) {
+                const int source_corner = corner_order[output_corner];
+                const Vec3f &position = transformed[output_corner];
+                positions.insert(positions.end(), {position.x(), position.y(), position.z()});
+                normals.insert(normals.end(), {normal.x(), normal.y(), normal.z()});
+                for (size_t axis = 0; axis < 3; ++axis) {
+                    minimum[axis] = std::min(minimum[axis], double(position[int(axis)]));
+                    maximum[axis] = std::max(maximum[axis], double(position[int(axis)]));
+                }
+
+                if (include_uvs) {
+                    const float u = volume.imported_texture_uvs_per_face[uv_offset + size_t(source_corner) * 2];
+                    const float v = volume.imported_texture_uvs_per_face[uv_offset + size_t(source_corner) * 2 + 1];
+                    uvs.insert(uvs.end(), {u, 1.f - v});
+                }
+
+                if (include_colors) {
+                    const uint32_t rgba = volume.imported_vertex_colors_rgba[size_t(triangle[source_corner])];
+                    colors.insert(colors.end(), {
+                        uint8_t((rgba >> 24) & 0xFFu),
+                        uint8_t((rgba >> 16) & 0xFFu),
+                        uint8_t((rgba >> 8) & 0xFFu),
+                        uint8_t(rgba & 0xFFu)
+                    });
+                    vertex_alpha |= (rgba & 0xFFu) < 0xFFu;
+                }
+            }
+        }
+
+        if (positions.empty())
+            return true;
+
+        GltfExportPrimitive primitive;
+        primitive.value.material = material_index;
+        primitive.value.indices = TG3_INDEX_NONE;
+        primitive.value.mode = TG3_MODE_TRIANGLES;
+
+        const int position_view = append_buffer_view(positions.data(), positions.size() * sizeof(float), TG3_TARGET_ARRAY_BUFFER, message);
+        if (position_view < 0)
+            return false;
+        const int position_accessor = append_accessor(position_view,
+                                                      TG3_COMPONENT_TYPE_FLOAT,
+                                                      positions.size() / 3,
+                                                      TG3_TYPE_VEC3,
+                                                      false,
+                                                      &minimum,
+                                                      &maximum);
+        primitive.attributes.push_back({gltf_string("POSITION"), position_accessor});
+
+        const int normal_view = append_buffer_view(normals.data(), normals.size() * sizeof(float), TG3_TARGET_ARRAY_BUFFER, message);
+        if (normal_view < 0)
+            return false;
+        const int normal_accessor = append_accessor(normal_view,
+                                                    TG3_COMPONENT_TYPE_FLOAT,
+                                                    normals.size() / 3,
+                                                    TG3_TYPE_VEC3,
+                                                    false,
+                                                    nullptr,
+                                                    nullptr);
+        primitive.attributes.push_back({gltf_string("NORMAL"), normal_accessor});
+
+        if (include_uvs) {
+            const int uv_view = append_buffer_view(uvs.data(), uvs.size() * sizeof(float), TG3_TARGET_ARRAY_BUFFER, message);
+            if (uv_view < 0)
+                return false;
+            const int uv_accessor = append_accessor(uv_view,
+                                                    TG3_COMPONENT_TYPE_FLOAT,
+                                                    uvs.size() / 2,
+                                                    TG3_TYPE_VEC2,
+                                                    false,
+                                                    nullptr,
+                                                    nullptr);
+            primitive.attributes.push_back({gltf_string("TEXCOORD_0"), uv_accessor});
+        }
+
+        if (include_colors) {
+            const int color_view = append_buffer_view(colors.data(), colors.size(), TG3_TARGET_ARRAY_BUFFER, message);
+            if (color_view < 0)
+                return false;
+            const int color_accessor = append_accessor(color_view,
+                                                       TG3_COMPONENT_TYPE_UNSIGNED_BYTE,
+                                                       colors.size() / 4,
+                                                       TG3_TYPE_VEC4,
+                                                       true,
+                                                       nullptr,
+                                                       nullptr);
+            primitive.attributes.push_back({gltf_string("COLOR_0"), color_accessor});
+        }
+
+        mesh.primitives.emplace_back(std::move(primitive));
+        return true;
+    }
+
+    bool append_volume(const ModelVolume &volume, bool &vertex_alpha, std::string &message)
+    {
+        const indexed_triangle_set &its = volume.mesh().its;
+        std::vector<size_t> all_triangles;
+        all_triangles.reserve(its.indices.size());
+        for (size_t triangle_idx = 0; triangle_idx < its.indices.size(); ++triangle_idx)
+            if (gltf_export_triangle_valid(its, triangle_idx))
+                all_triangles.emplace_back(triangle_idx);
+        if (all_triangles.empty())
+            return true;
+
+        GltfExportMesh mesh;
+        mesh.name = add_string(volume.name.empty() ? "Volume" : volume.name);
+
+        if (m_color_mode == GltfExportColorMode::ImageTexture && !volume.imported_texture_rgba.empty()) {
+            if (!gltf_export_texture_valid(volume)) {
+                message = "A selected image texture contains inconsistent image or UV data.";
+                return false;
+            }
+
+            int material_index = TG3_INDEX_NONE;
+            if (!append_texture(volume, material_index, message))
+                return false;
+
+            std::vector<size_t> textured_triangles;
+            std::vector<size_t> untextured_triangles;
+            textured_triangles.reserve(all_triangles.size());
+            untextured_triangles.reserve(all_triangles.size());
+            for (const size_t triangle_idx : all_triangles) {
+                if (gltf_export_triangle_has_uvs(volume, triangle_idx))
+                    textured_triangles.emplace_back(triangle_idx);
+                else
+                    untextured_triangles.emplace_back(triangle_idx);
+            }
+            if (!append_primitive(volume, textured_triangles, true, false, material_index, vertex_alpha, mesh, message) ||
+                !append_primitive(volume, untextured_triangles, false, false, 0, vertex_alpha, mesh, message))
+                return false;
+        } else if (m_color_mode == GltfExportColorMode::VertexColors &&
+                   !volume.imported_vertex_colors_rgba.empty()) {
+            if (volume.imported_vertex_colors_rgba.size() != its.vertices.size()) {
+                message = "A selected vertex-color payload does not match its mesh vertices.";
+                return false;
+            }
+            if (!append_primitive(volume, all_triangles, false, true, 0, vertex_alpha, mesh, message))
+                return false;
+        } else {
+            if (!append_primitive(volume, all_triangles, false, false, 0, vertex_alpha, mesh, message))
+                return false;
+        }
+
+        if (mesh.primitives.empty())
+            return true;
+
+        const int mesh_index = int(m_meshes.size());
+        m_meshes.emplace_back(std::move(mesh));
+        const int node_index = int(m_nodes.size());
+        m_nodes.emplace_back(gltf_export_node(m_meshes.back().name, mesh_index));
+        m_root_children.emplace_back(node_index);
+        return true;
+    }
+
+    const ModelObject              &m_object;
+    GltfExportColorMode             m_color_mode;
+    const std::function<void()>     &m_check_cancel;
+    std::deque<std::string>         m_strings;
+    std::vector<uint8_t>            m_binary;
+    std::vector<tg3_buffer>         m_buffers;
+    std::vector<tg3_buffer_view>    m_buffer_views;
+    std::vector<tg3_accessor>       m_accessors;
+    std::deque<std::array<double, 3>> m_minimums;
+    std::deque<std::array<double, 3>> m_maximums;
+    std::vector<tg3_image>          m_images;
+    std::vector<tg3_sampler>        m_samplers;
+    std::vector<tg3_texture>        m_textures;
+    std::vector<tg3_material>       m_materials;
+    std::vector<GltfExportMesh>     m_meshes;
+    std::vector<tg3_mesh>           m_mesh_values;
+    std::vector<tg3_node>           m_nodes;
+    std::vector<int32_t>            m_root_children;
+    std::vector<int32_t>            m_scene_nodes;
+    std::vector<tg3_scene>          m_scenes;
+};
+
+enum class GltfDestinationState {
+    Missing,
+    RegularFile,
+    Invalid
+};
+
+static GltfDestinationState inspect_glb_destination(const std::string &path, std::string &message)
+{
+    errno = 0;
+    std::FILE *file = boost::nowide::fopen(path.c_str(), "rb");
+    if (file == nullptr) {
+        const int open_error = errno;
+        if (open_error == ENOENT)
+            return GltfDestinationState::Missing;
+
+        message = "Failed to inspect the selected GLB destination";
+        if (open_error != 0)
+            message += ": " + std::string(std::strerror(open_error));
+        message += ".";
+        return GltfDestinationState::Invalid;
+    }
+
+#ifdef _WIN32
+    struct _stat64 status;
+    errno = 0;
+    const int status_result = _fstat64(_fileno(file), &status);
+    const bool is_regular_file = status_result == 0 && (status.st_mode & _S_IFREG) != 0;
+#else
+    struct stat status;
+    errno = 0;
+    const int status_result = ::fstat(::fileno(file), &status);
+    const bool is_regular_file = status_result == 0 && S_ISREG(status.st_mode);
+#endif
+    const int status_error = errno;
+    std::fclose(file);
+
+    if (status_result != 0) {
+        message = "Failed to inspect the selected GLB destination";
+        if (status_error != 0)
+            message += ": " + std::string(std::strerror(status_error));
+        message += ".";
+        return GltfDestinationState::Invalid;
+    }
+    if (!is_regular_file) {
+        message = "The selected GLB destination is not a regular file.";
+        return GltfDestinationState::Invalid;
+    }
+
+    return GltfDestinationState::RegularFile;
+}
+
+static bool write_glb_file(const std::string &path, const uint8_t *data, uint64_t size, std::string &message)
+{
+    if (data == nullptr || size == 0 || size > uint64_t(std::numeric_limits<std::streamsize>::max())) {
+        message = "The generated GLB data is invalid or too large to write.";
+        return false;
+    }
+
+    const boost::filesystem::path target(path);
+    const boost::filesystem::path parent = target.parent_path().empty() ? boost::filesystem::current_path() :
+                                                                          target.parent_path();
+    const GltfDestinationState destination_state = inspect_glb_destination(path, message);
+    if (destination_state == GltfDestinationState::Invalid)
+        return false;
+    const bool target_exists = destination_state == GltfDestinationState::RegularFile;
+    const boost::filesystem::path temporary =
+        parent / boost::filesystem::unique_path(".orcaslicer-glb-%%%%-%%%%-%%%%.tmp");
+    const boost::filesystem::path backup =
+        parent / boost::filesystem::unique_path(".orcaslicer-glb-%%%%-%%%%-%%%%.bak");
+
+    {
+        errno = 0;
+        boost::nowide::ofstream output(temporary.string(), std::ios::binary | std::ios::trunc);
+        if (!output.is_open()) {
+            const int open_error = errno;
+            message = "Failed to create a temporary GLB file in the selected folder";
+            if (open_error != 0)
+                message += ": " + std::string(std::strerror(open_error));
+            message += ".";
+            return false;
+        }
+        output.write(reinterpret_cast<const char *>(data), std::streamsize(size));
+        output.flush();
+        if (!output.good()) {
+            output.close();
+            boost::nowide::remove(temporary.string().c_str());
+            message = "Failed while writing the GLB output file.";
+            return false;
+        }
+    }
+
+    if (target_exists) {
+        const std::error_code backup_error = rename_file(target.string(), backup.string());
+        if (backup_error) {
+            boost::nowide::remove(temporary.string().c_str());
+            message = "Failed to preserve the existing destination GLB file.";
+            return false;
+        }
+    }
+
+    const std::error_code replace_error = rename_file(temporary.string(), target.string());
+    if (replace_error) {
+        boost::nowide::remove(temporary.string().c_str());
+        if (target_exists)
+            rename_file(backup.string(), target.string());
+        message = "Failed to move the completed GLB file to its destination.";
+        return false;
+    }
+
+    if (target_exists)
+        boost::nowide::remove(backup.string().c_str());
+    return true;
+}
+
 } // namespace
 
 bool load_gltf(const char *path, Model *model, GltfImportInfo &import_info, std::string &message)
@@ -989,6 +1708,68 @@ bool load_gltf(const char *path, Model *model, GltfImportInfo &import_info, std:
     tg3_model_free(&parsed_model);
     tg3_error_stack_free(&errors);
     return true;
+}
+
+bool store_glb(const char *path,
+               const ModelObject &object,
+               GltfExportColorMode color_mode,
+               std::string &message,
+               const std::function<void()> &check_cancel)
+{
+    message.clear();
+    if (path == nullptr || *path == '\0') {
+        message = "No GLB output path was provided.";
+        return false;
+    }
+
+    tg3_model export_model{};
+    GltfExportBuilder builder(object, color_mode, check_cancel);
+    if (!builder.build(export_model, message))
+        return false;
+    if (check_cancel)
+        check_cancel();
+
+    tg3_error_stack errors{};
+    tg3_error_stack_init(&errors);
+    tg3_write_options options{};
+    tg3_write_options_init(&options);
+    options.pretty_print = 0;
+    options.write_binary = 1;
+
+    uint8_t *output_data = nullptr;
+    uint64_t output_size = 0;
+    const tg3_error_code write_result =
+        tg3_write_to_memory(&export_model, &errors, &output_data, &output_size, &options);
+    if (write_result != TG3_OK || output_data == nullptr || output_size == 0) {
+        message = first_error_message(errors);
+        if (message.empty())
+            message = "Failed to serialize the object as GLB.";
+        if (output_data != nullptr)
+            tg3_write_free(output_data, &options);
+        tg3_error_stack_free(&errors);
+        return false;
+    }
+
+    if (check_cancel) {
+        try {
+            check_cancel();
+        } catch (...) {
+            tg3_write_free(output_data, &options);
+            tg3_error_stack_free(&errors);
+            throw;
+        }
+    }
+    bool written = false;
+    try {
+        written = write_glb_file(path, output_data, output_size, message);
+    } catch (...) {
+        tg3_write_free(output_data, &options);
+        tg3_error_stack_free(&errors);
+        throw;
+    }
+    tg3_write_free(output_data, &options);
+    tg3_error_stack_free(&errors);
+    return written;
 }
 
 } // namespace Slic3r
