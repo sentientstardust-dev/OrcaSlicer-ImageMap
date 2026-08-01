@@ -4,6 +4,14 @@ endif()
 
 cmake_minimum_required(VERSION 3.13)
 
+if(POLICY CMP0141)
+    cmake_policy(SET CMP0141 NEW)
+    if(CMAKE_C_COMPILER_LAUNCHER STREQUAL "sccache" OR
+       CMAKE_CXX_COMPILER_LAUNCHER STREQUAL "sccache")
+        set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>")
+    endif()
+endif()
+
 
 # The following line used to be in tests/CMakeLists.txt
 # Having it there causes rebuilds of all targets on any CMakeLists.txt change under tests/
@@ -219,7 +227,6 @@ if (MSVC)
     # /bigobj (Increase Number of Sections in .Obj file)
     # error C3859: virtual memory range for PCH exceeded; please recompile with a command line option of '-Zm90' or greater
     add_compile_options(-bigobj -Zm520)
-    add_compile_options($<$<OR:$<CONFIG:Debug>,$<CONFIG:RelWithDebInfo>>:/Zi>)
     # Disable STL4007: Many result_type typedefs and all argument_type, first_argument_type, and second_argument_type typedefs are deprecated in C++17.
     #FIXME Remove this line after eigen library adapts to the new C++17 adaptor rules.
     add_compile_options(-D_SILENCE_CXX17_ADAPTOR_TYPEDEFS_DEPRECATION_WARNING)
